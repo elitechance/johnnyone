@@ -1,0 +1,40 @@
+project:
+  name: JohnnyOne
+  slug: johnnyone
+  tenant_id: johnnyone-default
+
+cloudflare:
+  account: static
+
+apps:
+  main:
+    worker:
+      dir: worker
+      modules:
+        - auth
+    frontend:
+      dir: desktop
+      framework: angular
+      dist: dist/desktop
+      build: nx build desktop
+    d1:
+      name: johnnyone-db
+      migrations: worker/d1/migrations
+      seeds: worker/d1/seeds
+
+environments:
+  local:
+    worker_port: 7714
+    domain: localhost:4200
+    worker_domain: localhost:7714
+  dev:
+    domain: dev.johnnyone.app
+    worker_domain: api-dev.johnnyone.app
+  prod:
+    domain: johnnyone.app
+    worker_domain: api.johnnyone.app
+
+secrets:
+  - ANTHROPIC_API_KEY
+  - OPENAI_API_KEY
+  - JWT_SECRET

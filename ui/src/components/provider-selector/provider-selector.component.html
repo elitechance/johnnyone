@@ -1,0 +1,46 @@
+<div class="provider-selector">
+  <ion-item lines="none" class="select-item">
+    <ion-icon name="cloud-outline" slot="start"></ion-icon>
+    <ion-select
+      label="Provider"
+      labelPlacement="stacked"
+      interface="popover"
+      [value]="selectedProvider"
+      (ionChange)="onProviderChange($event)">
+      @for (provider of providers; track provider.value) {
+        <ion-select-option [value]="provider.value">
+          {{ provider.label }}
+        </ion-select-option>
+      }
+    </ion-select>
+  </ion-item>
+
+  <ion-item lines="none" class="select-item">
+    <ion-icon name="hardware-chip-outline" slot="start"></ion-icon>
+    <ion-select
+      label="Model"
+      labelPlacement="stacked"
+      interface="popover"
+      [value]="selectedModel"
+      (ionChange)="onModelChange($event)">
+      @for (model of availableModels; track model.value) {
+        <ion-select-option [value]="model.value">
+          {{ model.label }}
+        </ion-select-option>
+      }
+    </ion-select>
+  </ion-item>
+
+  @if (currentConfig?.baseUrl) {
+    <ion-item lines="none" class="endpoint-info">
+      <ion-icon name="link-outline" slot="start" color="medium"></ion-icon>
+      <ion-label color="medium">
+        <p>{{ currentConfig.baseUrl }}</p>
+      </ion-label>
+    </ion-item>
+  }
+
+  @if (currentConfig?.isDefault) {
+    <ion-badge color="primary" class="default-badge">Default</ion-badge>
+  }
+</div>

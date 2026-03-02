@@ -1,0 +1,108 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Settings</ion-title>
+  </ion-toolbar>
+</ion-header>
+<ion-content>
+  <ion-list>
+    <!-- LLM Provider Configuration -->
+    <ion-item-group>
+      <ion-item-divider>
+        <ion-label>LLM Provider</ion-label>
+      </ion-item-divider>
+
+      <ion-item>
+        <ion-select
+          label="Provider"
+          labelPlacement="stacked"
+          [value]="config().provider"
+          (ionChange)="onProviderChange($any($event).detail.value)"
+        >
+          @for (provider of providers(); track provider) {
+            <ion-select-option [value]="provider">
+              {{ provider | titlecase }}
+            </ion-select-option>
+          }
+        </ion-select>
+      </ion-item>
+
+      <ion-item>
+        <ion-input
+          label="API Key"
+          labelPlacement="stacked"
+          type="password"
+          placeholder="Enter your API key"
+          [value]="config().apiKey"
+          (ionInput)="onApiKeyChange($any($event).detail.value ?? '')"
+        />
+      </ion-item>
+
+      <ion-item>
+        <ion-select
+          label="Model"
+          labelPlacement="stacked"
+          [value]="config().model"
+          (ionChange)="onModelChange($any($event).detail.value)"
+        >
+          @for (model of availableModels(); track model) {
+            <ion-select-option [value]="model">{{ model }}</ion-select-option>
+          }
+        </ion-select>
+      </ion-item>
+
+      <ion-item>
+        <ion-input
+          label="Base URL (optional)"
+          labelPlacement="stacked"
+          type="url"
+          placeholder="Custom endpoint URL"
+          [value]="config().baseUrl"
+          (ionInput)="onBaseUrlChange($any($event).detail.value ?? '')"
+        />
+        <ion-note slot="helper">
+          Only needed for self-hosted providers like Ollama
+        </ion-note>
+      </ion-item>
+    </ion-item-group>
+
+    <!-- Channel Bindings -->
+    <ion-item-group>
+      <ion-item-divider>
+        <ion-label>Channel Bindings</ion-label>
+      </ion-item-divider>
+
+      @for (channel of channels(); track channel.name; let i = $index) {
+        <ion-item>
+          <ion-toggle
+            [checked]="channel.enabled"
+            (ionChange)="onChannelToggle(i, $any($event).detail.checked)"
+          >
+            {{ channel.name }}
+          </ion-toggle>
+        </ion-item>
+
+        @if (channel.enabled) {
+          <ion-item>
+            <ion-input
+              label="Endpoint"
+              labelPlacement="stacked"
+              type="url"
+              [value]="channel.endpoint"
+              (ionInput)="onChannelEndpointChange(i, $any($event).detail.value ?? '')"
+            />
+          </ion-item>
+        }
+      }
+    </ion-item-group>
+  </ion-list>
+
+  <div class="save-button-container">
+    <ion-button
+      expand="block"
+      [disabled]="isSaving()"
+      (click)="saveSettings()"
+    >
+      {{ isSaving() ? 'Saving...' : 'Save Settings' }}
+    </ion-button>
+  </div>
+</ion-content>

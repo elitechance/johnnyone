@@ -1,0 +1,67 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-back-button defaultHref="/chat"></ion-back-button>
+    </ion-buttons>
+    <ion-title>Sessions</ion-title>
+    <ion-buttons slot="end">
+      <ion-button (click)="createSession()">
+        New Session
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <ion-refresher slot="fixed" (ionRefresh)="handleRefresh($event)">
+    <ion-refresher-content></ion-refresher-content>
+  </ion-refresher>
+
+  <!-- Empty State -->
+  <div *ngIf="sessions.length === 0 && !loading" class="empty-state">
+    <h2>No Sessions</h2>
+    <p>Create a new session to start chatting with your AI agent.</p>
+    <ion-button (click)="createSession()">
+      Create Session
+    </ion-button>
+  </div>
+
+  <!-- Session List -->
+  <ion-list *ngIf="sessions.length > 0">
+    <ion-item-sliding *ngFor="let session of sessions">
+      <ion-item
+        [button]="true"
+        (click)="openSession(session)"
+        [detail]="true"
+      >
+        <ion-label>
+          <h2>{{ session.name }}</h2>
+          <p>{{ session.provider }} / {{ session.model }}</p>
+          <ion-note>
+            {{ session.messageCount }} messages &middot;
+            Last active {{ session.lastMessageAt | date:'short' }}
+          </ion-note>
+        </ion-label>
+        <ion-badge slot="end" [color]="getStatusColor(session.status)">
+          {{ session.status }}
+        </ion-badge>
+      </ion-item>
+
+      <ion-item-options side="end">
+        <ion-item-option
+          *ngIf="session.status === 'active'"
+          color="warning"
+          (click)="archiveSession(session)"
+        >
+          Archive
+        </ion-item-option>
+        <ion-item-option
+          color="danger"
+          (click)="deleteSession(session)"
+        >
+          Delete
+        </ion-item-option>
+      </ion-item-options>
+    </ion-item-sliding>
+  </ion-list>
+</ion-content>

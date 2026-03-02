@@ -1,0 +1,242 @@
+# JohnnyOne AI GraphQL Schema
+# Core types, queries, mutations, and subscriptions for the AI agent system
+
+# --- Enums ---
+
+enum AiSessionStatus {
+  active
+  archived
+  completed
+}
+
+enum MessageRole {
+  user
+  assistant
+  system
+  tool
+}
+
+enum ToolCategory {
+  shell
+  filesystem
+  process
+  browser
+}
+
+enum ToolExecutor {
+  desktop
+  cloud
+}
+
+enum ToolExecutionStatus {
+  pending
+  approved
+  running
+  completed
+  failed
+  rejected
+  cancelled
+}
+
+enum DesktopNodeStatus {
+  online
+  offline
+  busy
+}
+
+enum AiProvider {
+  claude
+  openai
+  ollama
+}
+
+# --- Types ---
+
+type AiSession {
+  id: ID!
+  tenantId: String!
+  userId: String!
+  title: String
+  provider: String
+  model: String
+  status: AiSessionStatus!
+  systemPrompt: String
+  totalInputTokens: Int!
+  totalOutputTokens: Int!
+  totalCost: Float!
+  messages: [AiMessage!]
+  createdAt: String!
+  updatedAt: String!
+}
+
+type AiMessage {
+  id: ID!
+  tenantId: String!
+  sessionId: String!
+  role: MessageRole!
+  content: String
+  toolCalls: String
+  toolCallId: String
+  sourceChannel: String
+  finishReason: String
+  inputTokens: Int
+  outputTokens: Int
+  createdAt: String!
+}
+
+type AiMessageDelta {
+  sessionId: String!
+  messageId: String!
+  delta: String!
+  finishReason: String
+  index: Int!
+}
+
+type ToolDefinition {
+  id: ID!
+  tenantId: String!
+  slug: String!
+  name: String!
+  description: String
+  category: ToolCategory!
+  parametersSchema: String!
+  executor: ToolExecutor!
+  requiresApproval: Boolean!
+  isEnabled: Boolean!
+  createdAt: String!
+  updatedAt: String!
+}
+
+type ToolExecution {
+  id: ID!
+  tenantId: String!
+  sessionId: String!
+  messageId: String!
+  toolDefinitionId: String
+  toolSlug: String!
+  input: String!
+  output: String
+  status: ToolExecutionStatus!
+  error: String
+  durationMs: Int
+  executorNodeId: String
+  createdAt: String!
+  updatedAt: String!
+}
+
+type DesktopNode {
+  id: ID!
+  tenantId: String!
+  userId: String!
+  hostname: String!
+  os: String
+  arch: String
+  version: String
+  status: DesktopNodeStatus!
+  capabilities: String!
+  lastHeartbeatAt: String
+  createdAt: String!
+  updatedAt: String!
+}
+
+type ProviderConfig {
+  id: ID!
+  tenantId: String!
+  userId: String!
+  provider: AiProvider!
+  model: String
+  apiKeyRef: String
+  baseUrl: String
+  isDefault: Boolean!
+  settings: String!
+  createdAt: String!
+  updatedAt: String!
+}
+
+type AiUsageSummary {
+  totalInputTokens: Int!
+  totalOutputTokens: Int!
+  totalTokens: Int!
+  totalCost: Float!
+  sessionCount: Int!
+  messageCount: Int!
+  byProvider: [ProviderUsage!]!
+}
+
+type ProviderUsage {
+  provider: String!
+  model: String!
+  inputTokens: Int!
+  outputTokens: Int!
+  totalTokens: Int!
+  cost: Float!
+}
+
+# --- Inputs ---
+
+input CreateAiSessionInput {
+  title: String
+  provider: String
+  model: String
+  systemPrompt: String
+}
+
+input SendAgentMessageInput {
+  sessionId: String!
+  content: String!
+  sourceChannel: String
+}
+
+input UpsertProviderConfigInput {
+  id: String
+  provider: AiProvider!
+  model: String
+  apiKeyRef: String
+  baseUrl: String
+  isDefault: Boolean
+  settings: String
+}
+
+input RegisterDesktopNodeInput {
+  hostname: String!
+  os: String
+  arch: String
+  version: String
+  capabilities: String
+}
+
+# --- Queries ---
+
+type Query {
+  getAiSession(id: ID!): AiSession
+  listAiSessions(status: AiSessionStatus, limit: Int, offset: Int): [AiSession!]!
+  listAiMessages(sessionId: String!, limit: Int, offset: Int): [AiMessage!]!
+  listToolDefinitions(category: ToolCategory): [ToolDefinition!]!
+  listDesktopNodes: [DesktopNode!]!
+  getAiUsageSummary(from: String, to: String): AiUsageSummary!
+}
+
+# --- Mutations ---
+
+type Mutation {
+  createAiSession(input: CreateAiSessionInput!): AiSession!
+  sendAgentMessage(input: SendAgentMessageInput!): AiMessage!
+  archiveAiSession(id: ID!): AiSession!
+  updateAiSessionTitle(id: ID!, title: String!): AiSession!
+  approveToolExecution(id: ID!): ToolExecution!
+  rejectToolExecution(id: ID!): ToolExecution!
+  cancelToolExecution(id: ID!): ToolExecution!
+  upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
+  deleteProviderConfig(id: ID!): ProviderConfig!
+  registerDesktopNode(input: RegisterDesktopNodeInput!): DesktopNode!
+  updateDesktopNodeStatus(id: ID!, status: DesktopNodeStatus!): DesktopNode!
+}
+
+# --- Subscriptions ---
+
+type Subscription {
+  onAgentMessage(sessionId: String!): AiMessage!
+  onAgentMessageDelta(sessionId: String!): AiMessageDelta!
+  onToolExecution(sessionId: String!): ToolExecution!
+  onDesktopNodeStatus: DesktopNode!
+}

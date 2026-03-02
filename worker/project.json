@@ -1,0 +1,16 @@
+{
+  "name": "worker",
+  "projectType": "application",
+  "sourceRoot": "worker",
+  "targets": {
+    "dev": {
+      "command": "lokal cf worker sim"
+    },
+    "deploy": {
+      "command": "lokal cf worker deploy"
+    },
+    "migrate": {
+      "command": "lokal cf db migrate --local"
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "name": "@johnnyone/source",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "start:desktop": "nx serve desktop",
+    "start:mobile": "nx serve mobile",
+    "start:worker": "nx dev worker",
+    "build:desktop": "nx build desktop",
+    "build:mobile": "nx build mobile",
+    "build:worker": "nx build worker",
+    "lint": "nx run-many -t lint",
+    "test": "nx run-many -t test"
+  },
+  "dependencies": {
+    "@angular/animations": "^19.0.0",
+    "@angular/common": "^19.0.0",
+    "@angular/compiler": "^19.0.0",
+    "@angular/core": "^19.0.0",
+    "@angular/forms": "^19.0.0",
+    "@angular/platform-browser": "^19.0.0",
+    "@angular/platform-browser-dynamic": "^19.0.0",
+    "@angular/router": "^19.0.0",
+    "@ionic/angular": "^8.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/push-notifications": "^6.0.0",
+    "@capacitor/haptics": "^6.0.0",
+    "graphql": "^16.9.0",
+    "graphql-ws": "^5.16.0",
+    "rxjs": "^7.8.0",
+    "tslib": "^2.6.0",
+    "zone.js": "~0.14.0",
+    "ionicons": "^7.4.0",
+    "marked": "^14.0.0"
+  },
+  "devDependencies": {
+    "@angular-devkit/build-angular": "^19.0.0",
+    "@angular/cli": "^19.0.0",
+    "@angular/compiler-cli": "^19.0.0",
+    "@capacitor/cli": "^6.0.0",
+    "@nx/angular": "^20.0.0",
+    "@nx/js": "^20.0.0",
+    "@nx/workspace": "^20.0.0",
+    "ng-packagr": "^19.0.0",
+    "nx": "^20.0.0",
+    "typescript": "~5.6.0",
+    "wrangler": "^3.80.0"
+  }
+}

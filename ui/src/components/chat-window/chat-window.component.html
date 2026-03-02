@@ -1,0 +1,36 @@
+<div class="chat-window">
+  <ion-content
+    class="chat-content"
+    [scrollEvents]="true"
+    (ionScroll)="onContentScroll($event)">
+
+    <div class="messages-container">
+      @if (messages.length === 0 && !isStreaming) {
+        <div class="empty-state">
+          <ion-icon name="chatbubbles-outline" size="large"></ion-icon>
+          <p>No messages yet. Start a conversation!</p>
+        </div>
+      }
+
+      @for (message of messages; track trackByMessageId($index, message)) {
+        <johnny-message-bubble
+          [message]="message"
+          class="message-item">
+        </johnny-message-bubble>
+      }
+
+      @if (isStreaming) {
+        <div class="streaming-indicator">
+          <ion-spinner name="dots" color="medium"></ion-spinner>
+        </div>
+      }
+    </div>
+  </ion-content>
+
+  <div class="composer-container">
+    <johnny-message-composer
+      (messageSent)="onMessageSent($event)"
+      [disabled]="isStreaming">
+    </johnny-message-composer>
+  </div>
+</div>

@@ -1,0 +1,83 @@
+<ion-card class="tool-card" [class]="'status-' + execution.status">
+  <ion-card-header>
+    <div class="card-header-row">
+      <ion-icon name="construct-outline" class="tool-icon"></ion-icon>
+      <ion-card-title>{{ execution.toolSlug }}</ion-card-title>
+      <ion-badge [color]="statusColor" class="status-badge">
+        <ion-icon [name]="statusIcon"></ion-icon>
+        {{ execution.status }}
+      </ion-badge>
+    </div>
+    @if (formattedDuration) {
+      <ion-card-subtitle>
+        Duration: {{ formattedDuration }}
+      </ion-card-subtitle>
+    }
+  </ion-card-header>
+
+  <ion-card-content>
+    <!-- Input section -->
+    <div class="collapsible-section">
+      <button class="section-toggle" (click)="toggleInput()">
+        <ion-icon [name]="showInput ? 'chevron-down-outline' : 'chevron-forward-outline'"></ion-icon>
+        <span>Input</span>
+      </button>
+      @if (showInput) {
+        <pre class="code-block"><code>{{ formattedInput }}</code></pre>
+      }
+    </div>
+
+    <!-- Output section -->
+    @if (execution.output) {
+      <div class="collapsible-section">
+        <button class="section-toggle" (click)="toggleOutput()">
+          <ion-icon [name]="showOutput ? 'chevron-down-outline' : 'chevron-forward-outline'"></ion-icon>
+          <span>Output</span>
+        </button>
+        @if (showOutput) {
+          <pre class="code-block"><code>{{ execution.output }}</code></pre>
+        }
+      </div>
+    }
+
+    <!-- Error display -->
+    @if (execution.error) {
+      <div class="error-section">
+        <ion-icon name="alert-circle-outline" color="danger"></ion-icon>
+        <span class="error-text">{{ execution.error }}</span>
+      </div>
+    }
+
+    <!-- Executor node info -->
+    @if (execution.executorNodeId) {
+      <div class="executor-info">
+        <ion-icon name="desktop-outline"></ion-icon>
+        <span>Node: {{ execution.executorNodeId | slice:0:8 }}</span>
+      </div>
+    }
+  </ion-card-content>
+
+  <!-- Action buttons for pending executions -->
+  @if (isPending) {
+    <div class="action-buttons">
+      <ion-button fill="solid" color="success" size="small" (click)="onApprove()">
+        <ion-icon slot="start" name="checkmark-outline"></ion-icon>
+        Approve
+      </ion-button>
+      <ion-button fill="solid" color="danger" size="small" (click)="onReject()">
+        <ion-icon slot="start" name="close-outline"></ion-icon>
+        Reject
+      </ion-button>
+    </div>
+  }
+
+  <!-- Cancel button for running executions -->
+  @if (isRunning) {
+    <div class="action-buttons">
+      <ion-button fill="outline" color="warning" size="small" (click)="onCancel()">
+        <ion-icon slot="start" name="stop-outline"></ion-icon>
+        Cancel
+      </ion-button>
+    </div>
+  }
+</ion-card>

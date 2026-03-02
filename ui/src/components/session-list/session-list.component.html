@@ -1,0 +1,78 @@
+<div class="session-list">
+  @if (sessions.length === 0) {
+    <div class="empty-state">
+      <ion-icon name="chatbubbles-outline"></ion-icon>
+      <p>No sessions yet</p>
+    </div>
+  }
+
+  @if (activeSessions.length > 0) {
+    <div class="section">
+      <div class="section-header">
+        <ion-label color="medium">Active</ion-label>
+      </div>
+      <ion-list lines="none" class="session-items">
+        @for (session of activeSessions; track trackBySessionId($index, session)) {
+          <ion-item
+            button
+            detail="false"
+            (click)="onSelect(session)"
+            class="session-item">
+            <div class="session-content" slot="start">
+              <div class="session-title-row">
+                <span class="status-dot" [class]="'status-' + session.status"></span>
+                <span class="session-title">{{ session.title || 'Untitled Session' }}</span>
+              </div>
+              <div class="session-meta">
+                <span class="provider-model">{{ session.provider }}/{{ session.model }}</span>
+                <span class="separator">-</span>
+                <span class="date">{{ formatDate(session.updatedAt) }}</span>
+              </div>
+              @if (session.totalInputTokens > 0 || session.totalOutputTokens > 0) {
+                <div class="session-tokens">
+                  <ion-icon name="analytics-outline"></ion-icon>
+                  <span>{{ formatTokens(session.totalInputTokens) }} in / {{ formatTokens(session.totalOutputTokens) }} out</span>
+                </div>
+              }
+            </div>
+            <ion-button
+              fill="clear"
+              color="medium"
+              size="small"
+              slot="end"
+              (click)="onArchive($event, session)">
+              <ion-icon slot="icon-only" name="archive-outline"></ion-icon>
+            </ion-button>
+          </ion-item>
+        }
+      </ion-list>
+    </div>
+  }
+
+  @if (archivedSessions.length > 0) {
+    <div class="section">
+      <div class="section-header">
+        <ion-label color="medium">Archived</ion-label>
+      </div>
+      <ion-list lines="none" class="session-items">
+        @for (session of archivedSessions; track trackBySessionId($index, session)) {
+          <ion-item
+            button
+            detail="false"
+            (click)="onSelect(session)"
+            class="session-item archived">
+            <div class="session-content" slot="start">
+              <div class="session-title-row">
+                <span class="status-dot" [class]="'status-' + session.status"></span>
+                <span class="session-title">{{ session.title || 'Untitled Session' }}</span>
+              </div>
+              <div class="session-meta">
+                <span class="date">{{ formatDate(session.updatedAt) }}</span>
+              </div>
+            </div>
+          </ion-item>
+        }
+      </ion-list>
+    </div>
+  }
+</div>

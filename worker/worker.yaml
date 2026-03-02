@@ -1,0 +1,21 @@
+name: johnnyone-hub
+
+modules:
+  - auth
+
+d1:
+  - name: johnnyone-db
+    migrations_dir: d1/migrations
+    seeds_dir: d1/seeds
+
+durable_objects:
+  - name: AgentSessionDO
+    class_name: AgentSessionDO
+    script_name: johnnyone-hub
+  - name: PubSubDO
+    class_name: PubSubDO
+    script_name: johnnyone-hub
+
+schema_dir: schema/
+d1_dir: d1/
+resolvers_dir: resolvers/

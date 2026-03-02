@@ -1,0 +1,39 @@
+:host {
+  display: inline;
+}
+
+.streaming-text {
+  display: inline;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+.text-content {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  background-color: currentColor;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  animation: blink 0.8s step-end infinite;
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.is-streaming .text-content {
+  /* Subtle indication that text is still arriving */
+}

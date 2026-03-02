@@ -1,0 +1,32 @@
+:host {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+ion-header {
+  ion-toolbar {
+    --background: var(--ion-toolbar-background, #fff);
+    --color: var(--ion-toolbar-color, #000);
+  }
+
+  ion-title {
+    font-weight: 700;
+    font-size: 1.1rem;
+  }
+
+  ion-button {
+    --color: var(--ion-color-primary);
+  }
+}
+
+ion-content {
+  --padding-start: 8px;
+  --padding-end: 8px;
+  --padding-top: 8px;
+
+  jno-session-list {
+    display: block;
+    width: 100%;
+  }
+}

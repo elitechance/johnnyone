@@ -1,0 +1,28 @@
+{
+  "name": "desktop",
+  "projectType": "application",
+  "sourceRoot": "desktop/src",
+  "targets": {
+    "serve": {
+      "executor": "@angular-devkit/build-angular:dev-server",
+      "options": { "buildTarget": "desktop:build", "port": 4200 }
+    },
+    "build": {
+      "executor": "@angular-devkit/build-angular:application",
+      "options": {
+        "outputPath": "dist/desktop",
+        "index": "desktop/src/index.html",
+        "browser": "desktop/src/main.ts",
+        "tsConfig": "desktop/tsconfig.app.json",
+        "styles": ["desktop/src/styles.scss"],
+        "scripts": []
+      }
+    },
+    "tauri-dev": {
+      "command": "cd desktop/src-tauri && cargo tauri dev"
+    },
+    "tauri-build": {
+      "command": "cd desktop/src-tauri && cargo tauri build"
+    }
+  }
+}

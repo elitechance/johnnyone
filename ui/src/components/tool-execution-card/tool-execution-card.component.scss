@@ -1,0 +1,148 @@
+:host {
+  display: block;
+}
+
+.tool-card {
+  margin: 8px 0;
+  border-radius: 12px;
+  overflow: hidden;
+
+  &.status-pending {
+    border-left: 3px solid var(--ion-color-warning);
+  }
+
+  &.status-approved,
+  &.status-running {
+    border-left: 3px solid var(--ion-color-primary);
+  }
+
+  &.status-completed {
+    border-left: 3px solid var(--ion-color-success);
+  }
+
+  &.status-failed,
+  &.status-rejected {
+    border-left: 3px solid var(--ion-color-danger);
+  }
+
+  &.status-cancelled {
+    border-left: 3px solid var(--ion-color-medium);
+  }
+}
+
+.card-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-icon {
+  font-size: 20px;
+  color: var(--ion-color-tertiary);
+}
+
+ion-card-title {
+  flex: 1;
+  font-size: 16px;
+  font-family: 'Fira Code', 'Consolas', monospace;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  text-transform: capitalize;
+
+  ion-icon {
+    font-size: 12px;
+  }
+}
+
+ion-card-subtitle {
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.collapsible-section {
+  margin-bottom: 8px;
+}
+
+.section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 4px 0;
+  cursor: pointer;
+  color: var(--ion-color-primary);
+  font-size: 13px;
+  font-weight: 500;
+
+  &:hover {
+    opacity: 0.8;
+  }
+
+  ion-icon {
+    font-size: 14px;
+  }
+}
+
+.code-block {
+  margin: 4px 0 0;
+  padding: 8px 12px;
+  background: var(--ion-color-light, #f5f5f5);
+  border-radius: 6px;
+  font-size: 12px;
+  overflow-x: auto;
+  max-height: 200px;
+  overflow-y: auto;
+
+  code {
+    font-family: 'Fira Code', 'Consolas', monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+}
+
+.error-section {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px;
+  background: var(--ion-color-danger-tint, #fde8e8);
+  border-radius: 6px;
+  margin-bottom: 8px;
+
+  ion-icon {
+    font-size: 18px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .error-text {
+    font-size: 13px;
+    color: var(--ion-color-danger-shade, #c62828);
+    word-break: break-word;
+  }
+}
+
+.executor-info {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--ion-color-medium);
+
+  ion-icon {
+    font-size: 14px;
+  }
+}
+
+.action-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 16px 12px;
+}

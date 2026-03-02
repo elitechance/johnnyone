@@ -1,0 +1,25 @@
+<div class="composer">
+  <ion-item lines="none" class="input-wrapper">
+    <ion-textarea
+      #messageInput
+      [(ngModel)]="messageText"
+      [placeholder]="placeholder"
+      [disabled]="disabled"
+      [autoGrow]="true"
+      [rows]="1"
+      [maxlength]="10000"
+      (keydown)="onKeyDown($event)"
+      class="message-input">
+    </ion-textarea>
+  </ion-item>
+
+  <ion-button
+    fill="solid"
+    shape="round"
+    size="default"
+    [disabled]="disabled || !messageText.trim()"
+    (click)="send()"
+    class="send-button">
+    <ion-icon slot="icon-only" name="send"></ion-icon>
+  </ion-button>
+</div>

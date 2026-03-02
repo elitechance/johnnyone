@@ -1,0 +1,52 @@
+<div
+  class="bubble-wrapper"
+  [class.user]="isUser"
+  [class.assistant]="isAssistant"
+  [class.system]="isSystem"
+  [class.tool]="isTool">
+
+  <div class="bubble-header">
+    <ion-icon [name]="roleIcon" class="role-icon"></ion-icon>
+    <span class="role-label">{{ roleLabel }}</span>
+    <span class="timestamp">{{ formattedTime }}</span>
+  </div>
+
+  <div class="bubble-body">
+    <div class="message-content">{{ message.content }}</div>
+
+    @if (hasToolCalls) {
+      <div class="tool-calls">
+        @for (toolCall of message.toolCalls; track toolCall.id) {
+          <div class="tool-call-item">
+            <div class="tool-call-header">
+              <ion-icon name="construct-outline"></ion-icon>
+              <span class="tool-name">{{ toolCall.name }}</span>
+              <ion-badge color="tertiary" class="tool-id">{{ toolCall.id | slice:0:8 }}</ion-badge>
+            </div>
+            <pre class="tool-call-input"><code>{{ formatToolCallInput(toolCall) }}</code></pre>
+          </div>
+        }
+      </div>
+    }
+
+    @if (message.toolCallId) {
+      <div class="tool-result-badge">
+        <ion-badge color="secondary">
+          <ion-icon name="return-down-back-outline"></ion-icon>
+          Tool Result: {{ message.toolCallId | slice:0:8 }}
+        </ion-badge>
+      </div>
+    }
+  </div>
+
+  @if (message.inputTokens || message.outputTokens) {
+    <div class="bubble-footer">
+      @if (message.inputTokens) {
+        <span class="token-count">In: {{ message.inputTokens }}</span>
+      }
+      @if (message.outputTokens) {
+        <span class="token-count">Out: {{ message.outputTokens }}</span>
+      }
+    </div>
+  }
+</div>

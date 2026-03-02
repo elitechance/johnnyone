@@ -1,0 +1,31 @@
+:host {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+ion-header {
+  ion-toolbar {
+    --background: var(--ion-toolbar-background, #fff);
+    --color: var(--ion-toolbar-color, #000);
+  }
+
+  ion-title {
+    font-weight: 700;
+    font-size: 1.1rem;
+    letter-spacing: 0.02em;
+  }
+}
+
+ion-content {
+  --padding-start: 0;
+  --padding-end: 0;
+  --padding-top: 0;
+  --padding-bottom: 0;
+
+  jno-chat-window {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+}

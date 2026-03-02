@@ -1,0 +1,10 @@
+{
+  "name": "@johnnyone/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JohnnyOne desktop application — Tauri 2 + Ionic/Angular",
+  "keywords": [],
+  "license": "UNLICENSED",
+  "dependencies": {},
+  "devDependencies": {}
+}

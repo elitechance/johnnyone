@@ -1,0 +1,45 @@
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 60%;
+  text-align: center;
+  color: var(--ion-color-step-500, #64748b);
+  padding: 24px;
+
+  h2 {
+    font-size: 1.4rem;
+    margin-bottom: 8px;
+  }
+
+  p {
+    font-size: 1rem;
+    margin-bottom: 24px;
+  }
+}
+
+ion-item {
+  --padding-start: 16px;
+  --padding-end: 16px;
+
+  h2 {
+    font-weight: 600;
+    font-size: 1rem;
+  }
+
+  p {
+    font-size: 0.85rem;
+    color: var(--ion-color-step-500, #64748b);
+  }
+
+  ion-note {
+    font-size: 0.8rem;
+    margin-top: 4px;
+  }
+}
+
+ion-badge {
+  text-transform: capitalize;
+  font-size: 0.75rem;
+}

@@ -1,0 +1,35 @@
+# JohnnyOne Channels GraphQL Schema (Phase 2)
+# Channel bindings for multi-platform messaging
+
+enum ChannelType {
+  telegram
+  discord
+  whatsapp
+}
+
+type ChannelBinding {
+  id: ID!
+  tenantId: String!
+  userId: String!
+  channelType: ChannelType!
+  channelIdentifier: String!
+  channelConfig: String!
+  isActive: Boolean!
+  createdAt: String!
+  updatedAt: String!
+}
+
+input BindChannelInput {
+  channelType: ChannelType!
+  channelIdentifier: String!
+  channelConfig: String
+}
+
+extend type Query {
+  listChannelBindings(channelType: ChannelType): [ChannelBinding!]!
+}
+
+extend type Mutation {
+  bindChannel(input: BindChannelInput!): ChannelBinding!
+  unbindChannel(id: ID!): ChannelBinding!
+}

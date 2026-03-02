@@ -1,0 +1,20 @@
+<ion-chip [color]="statusColor" [outline]="true" class="node-chip">
+  <span class="status-dot" [class]="statusDotClass"></span>
+
+  @if (node) {
+    <ion-icon [name]="osIcon" class="os-icon"></ion-icon>
+    <ion-label>
+      <span class="hostname">{{ displayName }}</span>
+      <span class="status-text">{{ statusLabel }}</span>
+    </ion-label>
+  } @else {
+    <ion-icon name="cloud-offline-outline" class="os-icon"></ion-icon>
+    <ion-label>
+      <span class="hostname">{{ displayName }}</span>
+    </ion-label>
+  }
+</ion-chip>
+
+@if (node && lastSeenText) {
+  <span class="last-seen">{{ lastSeenText }}</span>
+}

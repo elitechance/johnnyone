@@ -1,0 +1,15 @@
+<div class="streaming-text" [class.is-streaming]="isStreaming">
+  @if (hasText) {
+    <span class="text-content">
+      @for (segment of textSegments; track $index; let last = $last) {
+        <span>{{ segment }}</span>
+        @if (!last) {
+          <br />
+        }
+      }
+    </span>
+  }
+  @if (isStreaming) {
+    <span class="cursor" aria-hidden="true"></span>
+  }
+</div>

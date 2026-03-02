@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+.npm
+
+# Build output
+dist/
+tmp/
+out-tsc/
+
+# Tauri
+desktop/src-tauri/target/
+
+# Angular
+.angular/
+
+# Capacitor
+mobile/android/.gradle/
+mobile/android/app/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.local
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# Nx
+.nx/cache
+.nx/workspace-data

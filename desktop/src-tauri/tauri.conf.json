@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicklasoverworlds/tauri-settings-schema/master/schema.json",
+  "productName": "JohnnyOne",
+  "version": "0.1.0",
+  "identifier": "app.johnnyone.desktop",
+  "build": {
+    "frontendDist": "../../dist/desktop/browser",
+    "devUrl": "http://localhost:4200",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "JohnnyOne",
+        "width": 1400,
+        "height": 900,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

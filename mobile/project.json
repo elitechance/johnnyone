@@ -1,0 +1,28 @@
+{
+  "name": "mobile",
+  "projectType": "application",
+  "sourceRoot": "mobile/src",
+  "targets": {
+    "serve": {
+      "executor": "@angular-devkit/build-angular:dev-server",
+      "options": { "buildTarget": "mobile:build", "port": 4201 }
+    },
+    "build": {
+      "executor": "@angular-devkit/build-angular:application",
+      "options": {
+        "outputPath": "dist/mobile",
+        "index": "mobile/src/index.html",
+        "browser": "mobile/src/main.ts",
+        "tsConfig": "mobile/tsconfig.app.json",
+        "styles": ["mobile/src/styles.scss"],
+        "scripts": []
+      }
+    },
+    "cap-sync": {
+      "command": "cd mobile && npx cap sync android"
+    },
+    "cap-run": {
+      "command": "cd mobile && npx cap run android"
+    }
+  }
+}

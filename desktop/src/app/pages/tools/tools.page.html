@@ -1,0 +1,79 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-back-button defaultHref="/chat"></ion-back-button>
+    </ion-buttons>
+    <ion-title>Tool Executions</ion-title>
+    <ion-buttons slot="end">
+      <ion-chip color="primary" outline>
+        {{ toolExecutions.length }} total
+      </ion-chip>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <ion-refresher slot="fixed" (ionRefresh)="handleRefresh($event)">
+    <ion-refresher-content></ion-refresher-content>
+  </ion-refresher>
+
+  <!-- Empty State -->
+  <div *ngIf="toolExecutions.length === 0 && !loading" class="empty-state">
+    <h2>No Tool Executions</h2>
+    <p>Tool execution logs will appear here when your agent uses tools.</p>
+  </div>
+
+  <!-- Tool Execution Cards -->
+  <div class="tool-list">
+    <ion-card *ngFor="let exec of toolExecutions" class="tool-card">
+      <ion-progress-bar
+        *ngIf="exec.status === 'running'"
+        type="indeterminate"
+        color="primary"
+      ></ion-progress-bar>
+
+      <ion-card-header>
+        <div class="card-header-row">
+          <ion-card-subtitle>
+            {{ exec.tool_name | uppercase }}
+          </ion-card-subtitle>
+          <ion-badge [color]="getStatusColor(exec.status)">
+            {{ exec.status }}
+          </ion-badge>
+        </div>
+        <ion-card-title>{{ exec.call_id }}</ion-card-title>
+      </ion-card-header>
+
+      <ion-card-content>
+        <!-- Input Parameters -->
+        <div class="execution-section">
+          <h4>Input</h4>
+          <pre class="code-block">{{ exec.input | json }}</pre>
+        </div>
+
+        <!-- Output (if completed) -->
+        <div *ngIf="exec.output" class="execution-section">
+          <h4>Output</h4>
+          <pre class="code-block">{{ exec.output | json }}</pre>
+        </div>
+
+        <!-- Error (if failed) -->
+        <div *ngIf="exec.error" class="execution-section error-section">
+          <h4>Error</h4>
+          <pre class="code-block error">{{ exec.error }}</pre>
+        </div>
+
+        <!-- Metadata -->
+        <div class="execution-meta">
+          <span>Started: {{ exec.started_at | date:'medium' }}</span>
+          <span *ngIf="exec.completed_at">
+            Duration: {{ formatDuration(exec.started_at, exec.completed_at) }}
+          </span>
+          <span *ngIf="!exec.completed_at && exec.status === 'running'">
+            Running: {{ formatDuration(exec.started_at) }}
+          </span>
+        </div>
+      </ion-card-content>
+    </ion-card>
+  </div>
+</ion-content>

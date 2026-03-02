@@ -1,0 +1,8 @@
+{
+  "name": "@johnnyone/ui",
+  "version": "0.0.0",
+  "peerDependencies": {
+    "@angular/core": "^19.0.0",
+    "@ionic/angular": "^8.0.0"
+  }
+}

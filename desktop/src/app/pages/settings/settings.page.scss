@@ -1,0 +1,47 @@
+.provider-card,
+.node-card {
+  margin: 12px;
+  border-radius: 12px;
+}
+
+.provider-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+
+  ion-card-title {
+    font-size: 1.1rem;
+  }
+}
+
+ion-item-divider {
+  --background: transparent;
+  --padding-start: 16px;
+  font-weight: 600;
+  font-size: 1rem;
+  margin-top: 24px;
+  margin-bottom: 8px;
+  border: none;
+}
+
+.section-actions {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+ion-input {
+  --padding-start: 0;
+}
+
+ion-list {
+  --ion-item-background: transparent;
+}
+
+ion-item {
+  --padding-start: 0;
+  --inner-padding-end: 0;
+  margin-bottom: 8px;
+}

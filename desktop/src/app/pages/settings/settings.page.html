@@ -1,0 +1,158 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-back-button defaultHref="/chat"></ion-back-button>
+    </ion-buttons>
+    <ion-title>Settings</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <!-- Provider Configuration -->
+  <ion-card *ngFor="let provider of providers" class="provider-card">
+    <ion-card-header>
+      <div class="provider-header">
+        <ion-card-title>{{ provider.name }}</ion-card-title>
+        <ion-toggle
+          [(ngModel)]="provider.enabled"
+          [enableOnOffLabels]="true"
+        ></ion-toggle>
+      </div>
+    </ion-card-header>
+
+    <ion-card-content *ngIf="provider.enabled">
+      <ion-list lines="none">
+        <ion-item>
+          <ion-input
+            label="API Key"
+            labelPlacement="stacked"
+            type="password"
+            [(ngModel)]="provider.apiKey"
+            placeholder="Enter API key (not needed for Ollama)"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-input
+            label="Base URL"
+            labelPlacement="stacked"
+            type="url"
+            [(ngModel)]="provider.baseUrl"
+            placeholder="https://api.example.com"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-select
+            label="Default Model"
+            labelPlacement="stacked"
+            [(ngModel)]="provider.defaultModel"
+            interface="popover"
+          >
+            <ion-select-option
+              *ngFor="let model of provider.availableModels"
+              [value]="model"
+            >
+              {{ model }}
+            </ion-select-option>
+          </ion-select>
+        </ion-item>
+      </ion-list>
+    </ion-card-content>
+  </ion-card>
+
+  <div class="section-actions">
+    <ion-button expand="block" (click)="saveProviderSettings()">
+      Save Provider Settings
+    </ion-button>
+  </div>
+
+  <!-- Node Configuration -->
+  <ion-item-divider>
+    <ion-label>Node Configuration</ion-label>
+  </ion-item-divider>
+
+  <ion-card class="node-card">
+    <ion-card-content>
+      <ion-list lines="none">
+        <ion-item>
+          <ion-input
+            label="Node ID"
+            labelPlacement="stacked"
+            [value]="nodeConfig.nodeId"
+            [readonly]="true"
+          ></ion-input>
+          <ion-button
+            slot="end"
+            fill="clear"
+            size="small"
+            (click)="regenerateNodeId()"
+          >
+            Regenerate
+          </ion-button>
+        </ion-item>
+
+        <ion-item>
+          <ion-input
+            label="Node Name"
+            labelPlacement="stacked"
+            [(ngModel)]="nodeConfig.nodeName"
+            placeholder="my-desktop-node"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-input
+            label="Registration URL"
+            labelPlacement="stacked"
+            type="url"
+            [(ngModel)]="nodeConfig.registrationUrl"
+            placeholder="https://johnnyone.app/api/nodes/register"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-input
+            label="Heartbeat Interval (ms)"
+            labelPlacement="stacked"
+            type="number"
+            [(ngModel)]="nodeConfig.heartbeatIntervalMs"
+            [min]="5000"
+            [max]="120000"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-toggle
+            [(ngModel)]="nodeConfig.autoConnect"
+            [enableOnOffLabels]="true"
+          >
+            Auto-connect on launch
+          </ion-toggle>
+        </ion-item>
+      </ion-list>
+    </ion-card-content>
+  </ion-card>
+
+  <div class="section-actions">
+    <ion-button expand="block" (click)="saveNodeSettings()">
+      Save Node Settings
+    </ion-button>
+    <ion-button
+      expand="block"
+      color="secondary"
+      (click)="registerNode()"
+      [disabled]="!nodeConfig.registrationUrl"
+    >
+      Register Node
+    </ion-button>
+  </div>
+
+  <ion-toast
+    [isOpen]="showSaveToast"
+    [message]="saveToastMessage"
+    [duration]="2000"
+    position="bottom"
+    color="success"
+  ></ion-toast>
+</ion-content>
