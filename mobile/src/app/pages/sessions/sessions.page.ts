@@ -1,4 +1,4 @@
-import { Component, inject, signal, OnInit, OnDestroy } from '@angular/core';
+import { Component, inject, signal, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import {
   IonHeader,
@@ -11,9 +11,12 @@ import {
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
 import { addOutline } from 'ionicons/icons';
-import { SessionListComponent } from '@johnnyone/ui';
-import { SessionService, Session } from '@johnnyone/core';
-import { Subscription } from 'rxjs';
+import {
+  SessionListComponent,
+  JohnnyApiService,
+  AiSession,
+} from '@johnnyone/ui';
+import { Router } from '@angular/router';
 
 @Component({
   selector: 'app-sessions',
@@ -32,36 +35,35 @@ import { Subscription } from 'rxjs';
   templateUrl: './sessions.page.html',
   styleUrls: ['./sessions.page.scss'],
 })
-export class SessionsPage implements OnInit, OnDestroy {
-  private readonly sessionService = inject(SessionService);
-  private subscription: Subscription | null = null;
+export class SessionsPage implements OnInit {
+  private readonly api = inject(JohnnyApiService);
+  private readonly router = inject(Router);
 
-  readonly sessions = signal<Session[]>([]);
+  readonly sessions = signal<AiSession[]>([]);
 
   constructor() {
     addIcons({ 'add-outline': addOutline });
   }
 
   ngOnInit(): void {
-    this.subscription = this.sessionService.sessions$.subscribe((sessions) => {
+    this.api.listSessions().subscribe((sessions) => {
       this.sessions.set(sessions);
     });
-    this.sessionService.loadSessions();
-  }
-
-  ngOnDestroy(): void {
-    this.subscription?.unsubscribe();
   }
 
   createSession(): void {
-    this.sessionService.createSession();
+    this.api.createSession({}).subscribe((session) => {
+      this.router.navigate(['/chat'], { queryParams: { sessionId: session.id } });
+    });
   }
 
-  openSession(session: Session): void {
-    this.sessionService.setActiveSession(session.id);
+  openSession(sessionId: string): void {
+    this.router.navigate(['/chat'], { queryParams: { sessionId } });
   }
 
-  archiveSession(session: Session): void {
-    this.sessionService.archiveSession(session.id);
+  archiveSession(sessionId: string): void {
+    this.api.archiveSession(sessionId).subscribe(() => {
+      this.sessions.update((s) => s.filter((x) => x.id !== sessionId));
+    });
   }
 }

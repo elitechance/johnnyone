@@ -2,12 +2,12 @@
   <ion-toolbar>
     <ion-title>JohnnyOne</ion-title>
     <ion-buttons slot="end">
-      <jno-node-status />
+      <johnny-node-status />
     </ion-buttons>
   </ion-toolbar>
 </ion-header>
 <ion-content>
-  <jno-chat-window
+  <johnny-chat-window
     [messages]="messages()"
     [isStreaming]="isStreaming()"
     (messageSent)="onSend($event)"

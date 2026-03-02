@@ -67,7 +67,7 @@ export class ChatPage implements OnInit, OnDestroy {
       });
   }
 
-  async sendMessage(): void {
+  async sendMessage(): Promise<void> {
     const text = this.currentMessage.trim();
     if (!text) return;
 

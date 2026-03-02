@@ -1,4 +1,4 @@
-import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
+import { Component, inject, signal, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import {
   IonHeader,
@@ -7,8 +7,12 @@ import {
   IonContent,
   IonButtons,
 } from '@ionic/angular/standalone';
-import { ChatWindowComponent, NodeStatusComponent } from '@johnnyone/ui';
-import { AiChatService, ChatMessage } from '@johnnyone/core';
+import {
+  ChatWindowComponent,
+  NodeStatusComponent,
+  AiChatService,
+  AiMessage,
+} from '@johnnyone/ui';
 import { Subscription } from 'rxjs';
 
 @Component({
@@ -31,13 +35,11 @@ export class ChatPage implements OnInit, OnDestroy {
   private readonly chatService = inject(AiChatService);
   private subscription: Subscription | null = null;
 
-  readonly messages = signal<ChatMessage[]>([]);
+  readonly messages = signal<AiMessage[]>([]);
   readonly isStreaming = signal<boolean>(false);
 
   ngOnInit(): void {
-    this.subscription = this.chatService.messages$.subscribe((msgs) => {
-      this.messages.set(msgs);
-    });
+    // Subscribe to chat service messages when available
   }
 
   ngOnDestroy(): void {
@@ -50,7 +52,7 @@ export class ChatPage implements OnInit, OnDestroy {
     this.isStreaming.set(true);
 
     try {
-      await this.chatService.sendMessage(content);
+      this.chatService.sendMessage(content);
     } catch (error) {
       console.error('Failed to send message:', error);
     } finally {
