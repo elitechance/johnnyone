@@ -3,7 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS ai_sessions (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   user_id TEXT NOT NULL REFERENCES users(id),
   title TEXT,
   provider TEXT,
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS ai_sessions (
 
 CREATE TABLE IF NOT EXISTS ai_messages (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   session_id TEXT NOT NULL REFERENCES ai_sessions(id),
   role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
   content TEXT,
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS ai_messages (
 
 CREATE TABLE IF NOT EXISTS ai_tool_definitions (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   slug TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL,
   description TEXT,
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS ai_tool_definitions (
 
 CREATE TABLE IF NOT EXISTS ai_tool_executions (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   session_id TEXT NOT NULL REFERENCES ai_sessions(id),
   message_id TEXT NOT NULL REFERENCES ai_messages(id),
   tool_definition_id TEXT REFERENCES ai_tool_definitions(id),
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS ai_tool_executions (
 
 CREATE TABLE IF NOT EXISTS ai_provider_configs (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   user_id TEXT NOT NULL REFERENCES users(id),
   provider TEXT NOT NULL CHECK (provider IN ('claude', 'openai', 'ollama')),
   model TEXT,
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS ai_provider_configs (
 
 CREATE TABLE IF NOT EXISTS desktop_nodes (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   user_id TEXT NOT NULL REFERENCES users(id),
   hostname TEXT NOT NULL,
   os TEXT,
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS desktop_nodes (
 
 CREATE TABLE IF NOT EXISTS channel_bindings (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   user_id TEXT NOT NULL REFERENCES users(id),
   channel_type TEXT NOT NULL CHECK (channel_type IN ('telegram', 'discord', 'whatsapp')),
   channel_identifier TEXT NOT NULL,
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS channel_bindings (
 
 CREATE TABLE IF NOT EXISTS ai_usage_log (
   id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
   user_id TEXT NOT NULL REFERENCES users(id),
   session_id TEXT REFERENCES ai_sessions(id),
   provider TEXT NOT NULL,

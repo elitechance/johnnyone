@@ -24,7 +24,7 @@ interface AiSessionRow {
   updated_at: string;
 }
 
-export default async function archiveAiSession(
+export default async function closeAiSession(
   parent: unknown,
   args: { id: string },
   ctx: ResolverContext,

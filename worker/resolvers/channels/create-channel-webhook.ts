@@ -1,4 +1,4 @@
-import { normalizeMessage, type NormalizedMessage } from './adapters/normalize';
+import { normalizeMessage, type NormalizedMessage } from '../../lib/channels/normalize';
 
 interface ResolverContext {
   db: D1Database;
@@ -37,12 +37,12 @@ interface ChannelBindingRow {
  *
  * Phase 2: This is a placeholder that establishes the pattern.
  */
-export default async function processChannelWebhook(
+export default async function createChannelWebhook(
   parent: unknown,
-  args: { input: ProcessChannelWebhookInput },
+  args: { channelType: string; payload: string },
   ctx: ResolverContext,
 ) {
-  const { channelType, payload } = args.input;
+  const { channelType, payload } = args;
 
   // Normalize the incoming message based on channel type
   let normalized: NormalizedMessage;

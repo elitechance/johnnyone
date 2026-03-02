@@ -221,10 +221,10 @@ type Query {
 type Mutation {
   createAiSession(input: CreateAiSessionInput!): AiSession!
   sendAgentMessage(input: SendAgentMessageInput!): AiMessage!
-  archiveAiSession(id: ID!): AiSession!
+  closeAiSession(id: ID!): AiSession!
   updateAiSessionTitle(id: ID!, title: String!): AiSession!
-  approveToolExecution(id: ID!): ToolExecution!
-  rejectToolExecution(id: ID!): ToolExecution!
+  acceptToolExecution(id: ID!): ToolExecution!
+  revokeToolExecution(id: ID!): ToolExecution!
   cancelToolExecution(id: ID!): ToolExecution!
   upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
   deleteProviderConfig(id: ID!): ProviderConfig!

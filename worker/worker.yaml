@@ -1,21 +1,23 @@
-name: johnnyone-hub
-
-modules:
-  - auth
+worker:
+  name: johnnyone-hub
+  compatibility_date: "2026-03-02"
 
 d1:
-  - name: johnnyone-db
-    migrations_dir: d1/migrations
-    seeds_dir: d1/seeds
+  database: johnnyone-db
 
-durable_objects:
-  - name: AgentSessionDO
-    class_name: AgentSessionDO
-    script_name: johnnyone-hub
-  - name: PubSubDO
-    class_name: PubSubDO
-    script_name: johnnyone-hub
+modules:
+  builtin:
+    - name: auth
+      features:
+        password: true
+        oauth: []
+        passkey: false
+  custom:
+    schema: schema/
+    d1: d1/
+    resolvers: resolvers/
 
-schema_dir: schema/
-d1_dir: d1/
-resolvers_dir: resolvers/
+auth:
+  provider: email
+  jwt_expiry: 15m
+  refresh_expiry: 7d

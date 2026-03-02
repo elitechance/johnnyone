@@ -45,7 +45,7 @@ function mapToolExecutionRow(row: ToolExecutionRow) {
   };
 }
 
-export default async function approveToolExecution(
+export default async function revokeToolExecution(
   parent: unknown,
   args: { id: string },
   ctx: ResolverContext,
@@ -62,23 +62,23 @@ export default async function approveToolExecution(
   }
 
   if (existing.status !== 'pending') {
-    throw new Error(`Cannot approve tool execution with status: ${existing.status}`);
+    throw new Error(`Cannot reject tool execution with status: ${existing.status}`);
   }
 
   await ctx.db
     .prepare(
-      `UPDATE ai_tool_executions SET status = 'approved', updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`,
+      `UPDATE ai_tool_executions SET status = 'rejected', updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`,
     )
     .bind(args.id, ctx.auth.tenantId)
     .run();
 
-  // Notify the AgentSessionDO that the tool was approved so it can proceed
+  // Notify the AgentSessionDO that the tool was rejected
   const doId = ctx.env.AGENT_SESSION_DO.idFromName(existing.session_id);
   const stub = ctx.env.AGENT_SESSION_DO.get(doId);
 
   stub
     .fetch(
-      new Request('https://do.internal/tool-approved', {
+      new Request('https://do.internal/tool-rejected', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -88,7 +88,7 @@ export default async function approveToolExecution(
       }),
     )
     .catch((err: Error) => {
-      console.error('Failed to notify DO of tool approval:', err);
+      console.error('Failed to notify DO of tool rejection:', err);
     });
 
   const execution = await ctx.db
@@ -97,7 +97,7 @@ export default async function approveToolExecution(
     .first<ToolExecutionRow>();
 
   if (!execution) {
-    throw new Error('Failed to approve tool execution');
+    throw new Error('Failed to reject tool execution');
   }
 
   return mapToolExecutionRow(execution);

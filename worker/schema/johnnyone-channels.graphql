@@ -19,7 +19,7 @@ type ChannelBinding {
   updatedAt: String!
 }
 
-input BindChannelInput {
+input LinkChannelInput {
   channelType: ChannelType!
   channelIdentifier: String!
   channelConfig: String
@@ -30,6 +30,7 @@ extend type Query {
 }
 
 extend type Mutation {
-  bindChannel(input: BindChannelInput!): ChannelBinding!
-  unbindChannel(id: ID!): ChannelBinding!
+  linkChannel(input: LinkChannelInput!): ChannelBinding!
+  unlinkChannel(id: ID!): ChannelBinding!
+  createChannelWebhook(channelType: ChannelType!, payload: String!): Boolean!
 }

@@ -11,7 +11,11 @@ apps:
     worker:
       dir: worker
       modules:
-        - auth
+        - name: auth
+          features:
+            password: true
+            oauth: []
+            passkey: false
     frontend:
       dir: desktop
       framework: angular
