@@ -14,6 +14,7 @@
         "index": "desktop/src/index.html",
         "browser": "desktop/src/main.ts",
         "tsConfig": "desktop/tsconfig.app.json",
+        "polyfills": ["zone.js"],
         "styles": ["desktop/src/styles.scss"],
         "scripts": []
       }

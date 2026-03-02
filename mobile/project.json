@@ -14,6 +14,7 @@
         "index": "mobile/src/index.html",
         "browser": "mobile/src/main.ts",
         "tsConfig": "mobile/tsconfig.app.json",
+        "polyfills": ["zone.js"],
         "styles": ["mobile/src/styles.scss"],
         "scripts": []
       }
