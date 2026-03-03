@@ -2,7 +2,6 @@
 export { AiSession, CreateAiSessionInput } from './models/ai-session.model';
 export {
   AiMessage,
-  ToolCallRef,
   AiMessageDelta,
   SendAgentMessageInput,
 } from './models/ai-message.model';

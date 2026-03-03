@@ -11,8 +11,8 @@ use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use message_types::{
-    AgentEnvelope, AgentMessage, RelayChatDelta, RelayChatComplete, RelayChatMessage,
-    RelayChatRequest,
+    AgentEnvelope, AgentMessage, RelayChatDelta, RelayChatComplete, RelayChatRequest,
+    RpcMessageView, RpcRequest, RpcResponse, RpcSessionView,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -282,6 +282,28 @@ impl AgentService {
                     }
                 });
             }
+            AgentMessage::RpcRequest(rpc_req) => {
+                tracing::info!(
+                    request_id = %rpc_req.request_id,
+                    method = %rpc_req.method,
+                    "Received RPC request"
+                );
+
+                let ws = Arc::clone(ws_write);
+                let st = Arc::clone(state);
+                tokio::spawn(async move {
+                    let response = Self::handle_rpc(&rpc_req, &st).await;
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::RpcResponse(response),
+                    };
+                    if let Ok(msg) = serde_json::to_string(&envelope) {
+                        let mut writer = ws.lock().await;
+                        let _ = writer
+                            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                            .await;
+                    }
+                });
+            }
             AgentMessage::Heartbeat(hb) => {
                 tracing::debug!(ts = %hb.timestamp, "Received heartbeat ack");
                 let mut status = state.connection_status.lock().await;
@@ -289,6 +311,9 @@ impl AgentService {
             }
             AgentMessage::ToolResult(_) => {
                 tracing::debug!("Received tool result echo");
+            }
+            AgentMessage::RpcResponse(_) => {
+                tracing::debug!("Received RPC response echo");
             }
             AgentMessage::Error(err) => {
                 tracing::error!(code = %err.code, message = %err.message, "Server error");
@@ -299,6 +324,185 @@ impl AgentService {
         }
 
         Ok(())
+    }
+
+    /// Handle an RPC request by dispatching to the appropriate query method.
+    async fn handle_rpc(req: &RpcRequest, state: &Arc<AppState>) -> RpcResponse {
+        let result = match req.method.as_str() {
+            "list_sessions" => Self::rpc_list_sessions(&req.params, state),
+            "get_session" => Self::rpc_get_session(&req.params, state),
+            "list_messages" => Self::rpc_list_messages(&req.params, state),
+            "delete_session" => Self::rpc_delete_session(&req.params, state).await,
+            _ => Err(format!("Unknown RPC method: {}", req.method)),
+        };
+
+        match result {
+            Ok(data) => RpcResponse {
+                request_id: req.request_id.clone(),
+                success: true,
+                data: Some(data),
+                error: None,
+            },
+            Err(e) => RpcResponse {
+                request_id: req.request_id.clone(),
+                success: false,
+                data: None,
+                error: Some(e),
+            },
+        }
+    }
+
+    fn rpc_list_sessions(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let status = params.get("status").and_then(|v| v.as_str());
+
+        state.db.with_conn(|conn| {
+            let (sql, param_value);
+            let query_params: Vec<&dyn rusqlite::ToSql>;
+
+            if let Some(s) = status {
+                sql = "SELECT id, title, provider, model, working_directory, status, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions WHERE status = ?1 ORDER BY updated_at DESC";
+                param_value = s.to_string();
+                query_params = vec![&param_value as &dyn rusqlite::ToSql];
+            } else {
+                sql = "SELECT id, title, provider, model, working_directory, status, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions ORDER BY updated_at DESC";
+                query_params = vec![];
+            }
+
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let sessions: Vec<RpcSessionView> = stmt
+                .query_map(query_params.as_slice(), |row| {
+                    Ok(RpcSessionView {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        provider: row.get(2)?,
+                        model: row.get(3)?,
+                        working_directory: row.get(4)?,
+                        status: row.get(5)?,
+                        total_input_tokens: row.get(6)?,
+                        total_output_tokens: row.get(7)?,
+                        total_cost_cents: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            serde_json::to_value(&sessions).map_err(|e| e.to_string())
+        })
+    }
+
+    fn rpc_get_session(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+
+        state.db.with_conn(|conn| {
+            let session = conn
+                .query_row(
+                    "SELECT id, title, provider, model, working_directory, status, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| {
+                        Ok(RpcSessionView {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            provider: row.get(2)?,
+                            model: row.get(3)?,
+                            working_directory: row.get(4)?,
+                            status: row.get(5)?,
+                            total_input_tokens: row.get(6)?,
+                            total_output_tokens: row.get(7)?,
+                            total_cost_cents: row.get(8)?,
+                            created_at: row.get(9)?,
+                            updated_at: row.get(10)?,
+                        })
+                    },
+                )
+                .map_err(|e| format!("Session not found: {}", e))?;
+
+            serde_json::to_value(&session).map_err(|e| e.to_string())
+        })
+    }
+
+    fn rpc_list_messages(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(100);
+        let offset = params
+            .get("offset")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        state.db.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, session_id, role, content, tool_calls, finish_reason, input_tokens, output_tokens, cost_cents, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let messages: Vec<RpcMessageView> = stmt
+                .query_map(rusqlite::params![session_id, limit, offset], |row| {
+                    Ok(RpcMessageView {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        tool_calls: row.get(4)?,
+                        finish_reason: row.get(5)?,
+                        input_tokens: row.get(6)?,
+                        output_tokens: row.get(7)?,
+                        cost_cents: row.get(8)?,
+                        created_at: row.get(9)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            serde_json::to_value(&messages).map_err(|e| e.to_string())
+        })
+    }
+
+    async fn rpc_delete_session(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+
+        // Kill any active CLI process for this session
+        {
+            let mut processes = state.active_processes.lock().await;
+            if let Some(mut proc) = processes.remove(id) {
+                let _ = proc.kill().await;
+                tracing::info!(session_id = %id, "Killed active process before deleting session");
+            }
+        }
+
+        state.db.with_conn(|conn| {
+            conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(serde_json::json!({ "deleted": true }))
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Handle a relayed chat request from mobile.

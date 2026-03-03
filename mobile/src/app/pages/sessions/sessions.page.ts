@@ -51,19 +51,7 @@ export class SessionsPage implements OnInit {
     });
   }
 
-  createSession(): void {
-    this.api.createSession({}).subscribe((session) => {
-      this.router.navigate(['/chat'], { queryParams: { sessionId: session.id } });
-    });
-  }
-
   openSession(sessionId: string): void {
     this.router.navigate(['/chat'], { queryParams: { sessionId } });
-  }
-
-  archiveSession(sessionId: string): void {
-    this.api.archiveSession(sessionId).subscribe(() => {
-      this.sessions.update((s) => s.filter((x) => x.id !== sessionId));
-    });
   }
 }

@@ -43,6 +43,14 @@ pub enum AgentMessage {
     /// Desktop → worker: a complete message (user or assistant).
     #[serde(rename = "chat_message")]
     RelayChatMessage(RelayChatMessage),
+
+    /// Worker → desktop: RPC request (query sessions/messages from SQLite).
+    #[serde(rename = "rpc_request")]
+    RpcRequest(RpcRequest),
+
+    /// Desktop → worker: RPC response with query results.
+    #[serde(rename = "rpc_response")]
+    RpcResponse(RpcResponse),
 }
 
 // ── Existing Types ───────────────────────────────────────────────────────────
@@ -173,6 +181,63 @@ pub struct RelayChatMessage {
     pub session_id: String,
     pub role: String,
     pub content: String,
+}
+
+// ── RPC Types (Worker ↔ Desktop for query relay) ─────────────────────────────
+
+/// RPC request from the worker to query desktop SQLite data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcRequest {
+    pub request_id: String,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// RPC response from the desktop with query results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcResponse {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Session view for RPC responses (camelCase for GraphQL compatibility).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSessionView {
+    pub id: String,
+    pub title: String,
+    pub provider: String,
+    pub model: String,
+    pub working_directory: String,
+    pub status: String,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cost_cents: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Message view for RPC responses (camelCase for GraphQL compatibility).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcMessageView {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub tool_calls: Option<String>,
+    pub finish_reason: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_cents: i64,
+    pub created_at: String,
 }
 
 #[cfg(test)]

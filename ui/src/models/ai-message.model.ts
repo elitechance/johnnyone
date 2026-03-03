@@ -3,19 +3,12 @@ export interface AiMessage {
   sessionId: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
-  toolCalls: ToolCallRef[];
-  toolCallId?: string;
-  sourceChannel?: string;
+  toolCalls?: string;
   finishReason?: string;
-  inputTokens?: number;
-  outputTokens?: number;
+  inputTokens: number;
+  outputTokens: number;
+  costCents: number;
   createdAt: string;
-}
-
-export interface ToolCallRef {
-  id: string;
-  name: string;
-  input: Record<string, unknown>;
 }
 
 export interface AiMessageDelta {

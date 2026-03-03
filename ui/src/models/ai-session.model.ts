@@ -1,14 +1,13 @@
 export interface AiSession {
   id: string;
-  userId: string;
   title: string;
   provider: string;
   model: string;
+  workingDirectory?: string;
   status: 'active' | 'archived' | 'completed';
-  systemPrompt?: string;
   totalInputTokens: number;
   totalOutputTokens: number;
-  totalCost: number;
+  totalCostCents: number;
   createdAt: string;
   updatedAt: string;
 }

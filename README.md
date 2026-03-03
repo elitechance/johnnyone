@@ -2,26 +2,24 @@
 
 > "Number 5 is alive!" -- Short Circuit (1986)
 
-Personal AI agent platform. Your desktop is the always-on compute node (Tauri + Ionic/Angular), your phone is the remote control (Ionic/Angular + Capacitor), and Cloudflare Workers orchestrate everything in between. Multi-provider LLM support with Claude, OpenAI, and Ollama for fully offline operation.
+Personal AI agent platform. Your desktop is the always-on compute node (Tauri + Ionic/Angular), your phone is the remote control (Ionic/Angular + Capacitor), and a Cloudflare Worker acts as a thin relay in between. Multi-provider CLI support with Claude Code, Codex, Cline, and Ollama for fully offline operation.
 
 ## Architecture
 
+All AI processing happens on the desktop. The worker is a thin relay layer.
+
 ```
-                          +-------------------+
-                          |   LLM Providers   |
-                          | Claude | OpenAI   |
-                          +--------+----------+
-                                   |
-  +----------+           +---------+---------+           +-----------------+
-  |  Mobile  | <-------> |   CF Worker (Hub) | <-------> | Desktop Agent   |
-  |  App     |  GraphQL  |                   |    WSS    | (Tauri)         |
-  |          |  + WS     | +---------------+ |           |                 |
-  +----------+           | | D1 (SQLite)   | |           | +-------------+ |
-                         | | R2 (Storage)  | |           | | Tool Exec   | |
-  +----------+           | | Durable Objs  | |           | | Shell       | |
-  |  Web Hub | <-------> | | (Agent Loop)  | |           | | Filesystem  | |
-  |          |  GraphQL  | +---------------+ |           | | Process     | |
-  +----------+           +-------------------+           | | Ollama      | |
+  +----------+           +-------------------+           +-----------------+
+  |  Mobile  | <-------> |   CF Worker       | <-------> | Desktop Agent   |
+  |  App     |  GraphQL  |   (Relay Hub)     |    WSS    | (Tauri)         |
+  |          |  + WS     |                   |           |                 |
+  +----------+           | +---------------+ |           | +-------------+ |
+                         | | D1 (nodes)    | |           | | SQLite DB   | |
+  +----------+           | | ChatRelayDO   | |           | | CLI Runner  | |
+  |  Desktop | <-------> | | (WebSocket    | |           | | Claude Code | |
+  |  Web UI  |  Angular  | |  relay)       | |           | | Codex       | |
+  +----------+           | +---------------+ |           | | Cline       | |
+                         +-------------------+           | | Ollama      | |
                                                          | +-------------+ |
                                                          +-----------------+
 ```
@@ -32,10 +30,10 @@ Personal AI agent platform. Your desktop is the always-on compute node (Tauri + 
 johnnyone/
   desktop/              Ionic/Angular desktop frontend + Tauri backend
     src/                  Angular app (chat, sessions, tools, settings pages)
-    src-tauri/            Rust backend (WS client, tool executors, Ollama)
+    src-tauri/            Rust backend (WS agent, CLI runners, RPC handlers, SQLite)
   mobile/               Ionic/Angular + Capacitor mobile app (Android)
     src/                  Angular app (chat, sessions, settings pages)
-  worker/               Cloudflare Worker -- API hub + agent orchestration
+  worker/               Cloudflare Worker -- GraphQL API + WebSocket relay
     d1/                   D1 migrations and seed data
     resolvers/            GraphQL resolvers (ai/, channels/)
     schema/               GraphQL schema definitions
@@ -62,7 +60,7 @@ johnnyone/
 | Backend       | Cloudflare Workers                      |
 | Database      | D1 (SQLite at the edge)                 |
 | Real-time     | Durable Objects + WebSockets            |
-| LLM Providers | Claude (Anthropic), OpenAI, Ollama      |
+| LLM Providers | Claude Code, Codex, Cline, Ollama (CLI)  |
 | Monorepo      | Nx 20                                   |
 | GraphQL       | Custom resolver layer + graphql-ws      |
 
@@ -111,23 +109,34 @@ npm run build:worker     # Build Cloudflare Worker
 
 ## Key Features
 
-- **Multi-provider LLM** -- Claude (Anthropic Messages API), OpenAI (Chat Completions), and Ollama for local/offline inference
-- **Desktop tool execution** -- Shell commands (with timeout and blocked-command safety), filesystem operations (with path sandboxing), process listing (via sysinfo)
-- **Real-time streaming** -- Token-by-token response streaming via Durable Objects and WebSockets
-- **Tool approval flow** -- Tools that require approval are held in `pending` state until the user approves, rejects, or cancels
-- **Offline mode** -- Ollama integration on the desktop node means the agent works without internet
-- **Mobile remote control** -- Send messages, approve tool calls, and monitor sessions from your phone
-- **Channel adapters** -- Telegram, Discord, WhatsApp adapter stubs ready for Phase 2
+- **Relay architecture** -- Worker is a thin relay; all AI processing, sessions, and messages live on the desktop
+- **Multi-provider CLI** -- Claude Code, Codex, Cline, and Ollama CLI runners with streaming output
+- **RPC-over-relay** -- Mobile queries desktop SQLite (sessions, messages) via Worker → ChatRelayDO → WebSocket → Desktop RPC
+- **Real-time streaming** -- Token-by-token response streaming through ChatRelayDO WebSocket relay
+- **Offline mode** -- Ollama CLI integration means the agent works without internet
+- **Mobile remote control** -- List sessions, view messages, send chat, and delete sessions from your phone via swipe-to-delete
+- **Desktop-local storage** -- Sessions and messages stored in local SQLite with `ON DELETE CASCADE` for clean session removal
+- **Channel adapters** -- Telegram, Discord, WhatsApp adapter stubs (channel resolvers)
 
 ## Data Flow
 
-1. Mobile (or Web Hub) sends a message via GraphQL `sendAgentMessage` mutation
-2. Worker creates the message in D1 and routes the request to the `AgentSessionDO` Durable Object
-3. The DO assembles conversation context and calls the configured LLM provider (streaming)
-4. If the LLM returns a `tool_use` block, the DO creates a `ToolExecution` record and dispatches it to the Desktop Agent via the WebSocket connection
-5. Desktop Agent executes the tool (shell, filesystem, process) and returns the result over WebSocket
-6. The DO feeds the tool result back into the LLM as a `tool` role message
-7. The LLM produces a final text response, streamed token-by-token to all connected clients via `onAgentMessageDelta` subscription
+### Chat (relay)
+
+1. Mobile sends a message via GraphQL `sendRelayChatMessage` mutation
+2. Worker finds an online desktop node in D1 and forwards the request to `ChatRelayDO`
+3. ChatRelayDO relays the message over WebSocket to the desktop agent
+4. Desktop spawns the configured CLI provider (Claude Code, Codex, Cline, or Ollama) as a subprocess
+5. CLI output is streamed line-by-line, parsed into chunks, and sent back through the WebSocket as `chat_delta` frames
+6. Worker relays deltas to the mobile client's WebSocket connection in real time
+7. On completion, desktop saves user + assistant messages to local SQLite
+
+### RPC queries (read/delete)
+
+1. Mobile calls a GraphQL query or mutation (e.g. `listAiSessions`, `deleteAiSession`)
+2. Worker resolver finds an online node and POSTs to `ChatRelayDO` at `/relay-rpc`
+3. ChatRelayDO forwards the RPC request over WebSocket to the desktop agent
+4. Desktop executes the query against local SQLite and returns the result
+5. Worker resolver returns the data to the mobile client via GraphQL
 
 ## Ports
 
@@ -141,21 +150,33 @@ npm run build:worker     # Build Cloudflare Worker
 
 The worker exposes a GraphQL API with:
 
-- **6 queries** -- `getAiSession`, `listAiSessions`, `listAiMessages`, `listToolDefinitions`, `listDesktopNodes`, `getAiUsageSummary`
-- **11 mutations** -- Session CRUD, `sendAgentMessage`, tool approval/rejection/cancellation, provider config management, desktop node registration
-- **4 subscriptions** -- `onAgentMessage`, `onAgentMessageDelta` (streaming), `onToolExecution`, `onDesktopNodeStatus`
+- **4 queries** -- `listDesktopNodes`, `listAiSessions`, `getAiSession`, `listAiMessages` (sessions/messages resolve via RPC to desktop SQLite)
+- **4 mutations** -- `registerDesktopNode`, `updateDesktopNodeStatus`, `sendRelayChatMessage`, `deleteAiSession`
+- **3 subscriptions** -- `onDesktopNodeStatus`, `onRelayChatDelta` (streaming), `onRelayChatMessage`
 
 Schema: [`worker/schema/johnnyone-ai.graphql`](worker/schema/johnnyone-ai.graphql)
+
+### Desktop RPC Methods
+
+The desktop agent handles these RPC methods over the WebSocket relay:
+
+| Method | Params | Description |
+|--------|--------|-------------|
+| `list_sessions` | `status?` | List all sessions from local SQLite |
+| `get_session` | `id` | Get a single session by ID |
+| `list_messages` | `sessionId`, `limit?`, `offset?` | List messages for a session |
+| `delete_session` | `id` | Kill active process + delete session (cascades to messages) |
 
 ## Roadmap
 
 | Phase  | Description                                         | Status      |
 |--------|-----------------------------------------------------|-------------|
 | 0      | Nx monorepo scaffold, project structure             | Done        |
-| 1A     | Foundation + basic AI chat                          | In progress |
-| 1B     | Streaming responses + AgentSessionDO                | Planned     |
-| 1C     | Tool system + desktop agent execution               | Planned     |
-| 1D     | Multi-provider support + node management            | Planned     |
+| 1A     | Foundation + basic AI chat                          | Done        |
+| 1B     | Relay architecture + ChatRelayDO streaming          | Done        |
+| 1C     | Multi-provider CLI runners (Claude Code, Codex, Cline, Ollama) | Done |
+| 1D     | Desktop node registration + heartbeat               | Done        |
+| 1E     | Mobile RPC (list/view/delete sessions & messages)   | Done        |
 | 2      | Channel adapters (Telegram, Discord, WhatsApp)      | Planned     |
 | 3      | Browser automation, cron scheduling, voice input    | Planned     |
 

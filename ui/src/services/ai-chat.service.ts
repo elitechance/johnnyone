@@ -1,7 +1,7 @@
 import { Injectable, inject, signal, computed } from '@angular/core';
 import { Subscription } from 'rxjs';
 import { JohnnyApiService } from './johnny-api.service';
-import { AiSession, CreateAiSessionInput } from '../models/ai-session.model';
+import { AiSession } from '../models/ai-session.model';
 import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
 
 @Injectable({ providedIn: 'root' })
@@ -67,7 +67,9 @@ export class AiChatService {
       sessionId: session.id,
       role: 'user',
       content,
-      toolCalls: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costCents: 0,
       createdAt: new Date().toISOString(),
     };
 
@@ -75,12 +77,9 @@ export class AiChatService {
     this.isStreaming.set(true);
     this.streamingContent = '';
 
-    this.api.sendMessage({ sessionId: session.id, content }).subscribe({
-      next: (message) => {
-        // Replace the optimistic message with the real one
-        this.messages.update((msgs) =>
-          msgs.map((m) => (m.id === optimisticMessage.id ? message : m))
-        );
+    this.api.sendRelayMessage({ sessionId: session.id, content }).subscribe({
+      next: () => {
+        // Message relayed to desktop — deltas will arrive via subscription
       },
       error: (err) => {
         console.error('[AiChatService] Failed to send message:', err);
@@ -123,20 +122,6 @@ export class AiChatService {
       },
       error: (err) => {
         console.error('[AiChatService] Message subscription error:', err);
-      },
-    });
-  }
-
-  /**
-   * Create a new session and switch to it.
-   */
-  createNewSession(input?: CreateAiSessionInput): void {
-    this.api.createSession(input ?? {}).subscribe({
-      next: (session) => {
-        this.loadSession(session.id);
-      },
-      error: (err) => {
-        console.error('[AiChatService] Failed to create session:', err);
       },
     });
   }
@@ -187,7 +172,9 @@ export class AiChatService {
             sessionId: delta.sessionId,
             role: 'assistant' as const,
             content: this.streamingContent,
-            toolCalls: [],
+            inputTokens: 0,
+            outputTokens: 0,
+            costCents: 0,
             createdAt: new Date().toISOString(),
           },
         ];

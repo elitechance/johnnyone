@@ -57,9 +57,9 @@ export default async function sendRelayChatMessage(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       type: 'chat_request',
-      relayId,
-      sessionId,
       data: {
+        relayId,
+        sessionId,
         content,
         provider: provider ?? 'claude_code',
         model: model ?? '',

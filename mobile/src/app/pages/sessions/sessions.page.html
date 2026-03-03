@@ -1,17 +1,11 @@
 <ion-header>
   <ion-toolbar>
     <ion-title>Sessions</ion-title>
-    <ion-buttons slot="end">
-      <ion-button (click)="createSession()">
-        <ion-icon name="add-outline" slot="icon-only"></ion-icon>
-      </ion-button>
-    </ion-buttons>
   </ion-toolbar>
 </ion-header>
 <ion-content>
   <johnny-session-list
     [sessions]="sessions()"
     (sessionSelected)="openSession($event)"
-    (sessionArchived)="archiveSession($event)"
   />
 </ion-content>

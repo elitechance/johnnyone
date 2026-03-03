@@ -8,26 +8,27 @@
  * Mobile → desktop: forward relay envelope with chat request
  * Desktop → mobile: broadcast relay envelope with deltas/responses
  * No AI logic — pure message relay.
+ *
+ * Uses WebSocket Hibernation API with tags so that client metadata
+ * survives DO hibernation/wake cycles.
  */
 
 interface RelayEnvelope {
-  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'heartbeat' | 'ping' | 'pong';
+  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response';
   relayId?: string;
   sessionId?: string;
+  requestId?: string;
   data?: unknown;
 }
 
 type ClientType = 'mobile' | 'desktop';
 
-interface ClientMeta {
-  clientType: ClientType;
-  userId: string;
-  tenantId: string;
-}
-
 export class ChatRelayDO implements DurableObject {
   private state: DurableObjectState;
-  private clients: Map<WebSocket, ClientMeta> = new Map();
+  private pendingRpc: Map<string, {
+    resolve: (value: unknown) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = new Map();
 
   constructor(state: DurableObjectState, _env: Record<string, unknown>) {
     this.state = state;
@@ -45,6 +46,10 @@ export class ChatRelayDO implements DurableObject {
       return this.handleRelayPost(request);
     }
 
+    if (path === '/relay-rpc') {
+      return this.handleRelayRpc(request);
+    }
+
     return new Response('Not found', { status: 404 });
   }
 
@@ -58,12 +63,10 @@ export class ChatRelayDO implements DurableObject {
     const [client, server] = [pair[0], pair[1]];
 
     const url = new URL(request.url);
-    const clientType = (url.searchParams.get('clientType') ?? 'mobile') as ClientType;
-    const userId = url.searchParams.get('userId') ?? '';
-    const tenantId = url.searchParams.get('tenantId') ?? '';
+    const clientType = url.searchParams.get('clientType') ?? 'mobile';
 
-    this.state.acceptWebSocket(server);
-    this.clients.set(server, { clientType, userId, tenantId });
+    // Tag the WebSocket with its client type so it survives hibernation
+    this.state.acceptWebSocket(server, [clientType]);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -84,13 +87,58 @@ export class ChatRelayDO implements DurableObject {
     return new Response('Unknown relay type', { status: 400 });
   }
 
+  /**
+   * RPC endpoint: forward a query to the desktop and wait for the response.
+   * The connection stays open until the desktop replies or a 15s timeout.
+   */
+  private async handleRelayRpc(request: Request): Promise<Response> {
+    const body = (await request.json()) as { method: string; params?: unknown };
+
+    // Check that at least one desktop client is connected (uses tags, survives hibernation)
+    const desktopSockets = this.state.getWebSockets('desktop');
+    if (desktopSockets.length === 0) {
+      return Response.json({ success: false, error: 'Desktop not connected' }, { status: 503 });
+    }
+
+    const requestId = crypto.randomUUID();
+
+    // Create a promise that will be resolved when the desktop responds
+    const result = await new Promise<{ data?: unknown; error?: string; timedOut?: boolean }>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingRpc.delete(requestId);
+        resolve({ timedOut: true });
+      }, 15_000);
+
+      this.pendingRpc.set(requestId, { resolve, timer });
+
+      // Forward the RPC request to the desktop
+      const envelope: RelayEnvelope = {
+        type: 'rpc_request',
+        requestId,
+        data: {
+          requestId,
+          method: body.method,
+          params: body.params ?? {},
+        },
+      };
+      this.broadcastTo('desktop', envelope);
+    });
+
+    if (result.timedOut) {
+      return Response.json({ success: false, error: 'Desktop RPC timed out' }, { status: 504 });
+    }
+
+    return Response.json(result);
+  }
+
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
     try {
       const raw = typeof message === 'string' ? message : new TextDecoder().decode(message);
       const envelope = JSON.parse(raw) as RelayEnvelope;
 
-      const meta = this.clients.get(ws);
-      if (!meta) return;
+      // Determine client type from WebSocket tags (survives hibernation)
+      const tags = this.state.getTags(ws);
+      const clientType = tags.includes('desktop') ? 'desktop' : 'mobile';
 
       switch (envelope.type) {
         case 'heartbeat':
@@ -104,41 +152,57 @@ export class ChatRelayDO implements DurableObject {
 
         case 'chat_request':
           // Mobile → desktop: forward the chat request
-          this.broadcastTo('desktop', envelope);
+          if (clientType === 'mobile') {
+            this.broadcastTo('desktop', envelope);
+          }
           break;
 
         case 'chat_delta':
         case 'chat_complete':
         case 'chat_message':
           // Desktop → mobile: broadcast response data
-          this.broadcastTo('mobile', envelope);
+          if (clientType === 'desktop') {
+            this.broadcastTo('mobile', envelope);
+          }
           break;
+
+        case 'rpc_response': {
+          // Desktop responding to an RPC query — resolve the pending promise
+          const rpcData = envelope.data as { requestId?: string; success?: boolean; data?: unknown; error?: string } | undefined;
+          const rpcRequestId = rpcData?.requestId;
+          if (rpcRequestId && this.pendingRpc.has(rpcRequestId)) {
+            const pending = this.pendingRpc.get(rpcRequestId)!;
+            clearTimeout(pending.timer);
+            this.pendingRpc.delete(rpcRequestId);
+            pending.resolve({ success: rpcData?.success, data: rpcData?.data, error: rpcData?.error });
+          }
+          break;
+        }
       }
     } catch {
       // Ignore malformed messages
     }
   }
 
-  webSocketClose(ws: WebSocket): void {
-    this.clients.delete(ws);
+  webSocketClose(): void {
+    // No cleanup needed — runtime manages tagged WebSockets
   }
 
-  webSocketError(ws: WebSocket): void {
-    this.clients.delete(ws);
+  webSocketError(): void {
+    // No cleanup needed — runtime manages tagged WebSockets
   }
 
   /**
-   * Broadcast a message to all clients of a specific type.
+   * Broadcast a message to all clients of a specific type using WebSocket tags.
    */
   private broadcastTo(targetType: ClientType, envelope: RelayEnvelope): void {
     const payload = JSON.stringify(envelope);
-    for (const [ws, meta] of this.clients.entries()) {
-      if (meta.clientType === targetType) {
-        try {
-          ws.send(payload);
-        } catch {
-          // Client disconnected
-        }
+    const sockets = this.state.getWebSockets(targetType);
+    for (const ws of sockets) {
+      try {
+        ws.send(payload);
+      } catch {
+        // Client disconnected — runtime will clean up
       }
     }
   }

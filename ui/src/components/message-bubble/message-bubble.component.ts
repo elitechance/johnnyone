@@ -2,7 +2,7 @@ import { Component, Input, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { IonicModule } from '@ionic/angular';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
-import { AiMessage, ToolCallRef } from '../../models/ai-message.model';
+import { AiMessage } from '../../models/ai-message.model';
 import { marked } from 'marked';
 
 @Component({
@@ -42,7 +42,16 @@ export class MessageBubbleComponent {
   }
 
   get hasToolCalls(): boolean {
-    return this.message.toolCalls?.length > 0;
+    return !!this.message.toolCalls && this.message.toolCalls.length > 0;
+  }
+
+  get parsedToolCalls(): Array<{ id: string; name: string; input: unknown }> {
+    if (!this.message.toolCalls) return [];
+    try {
+      return JSON.parse(this.message.toolCalls);
+    } catch {
+      return [];
+    }
   }
 
   get roleLabel(): string {
@@ -100,7 +109,7 @@ export class MessageBubbleComponent {
     return this.isAssistant;
   }
 
-  formatToolCallInput(toolCall: ToolCallRef): string {
+  formatToolCallInput(toolCall: { id: string; name: string; input: unknown }): string {
     try {
       return JSON.stringify(toolCall.input, null, 2);
     } catch {

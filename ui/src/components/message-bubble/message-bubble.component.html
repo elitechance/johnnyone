@@ -21,7 +21,7 @@
 
     @if (hasToolCalls) {
       <div class="tool-calls">
-        @for (toolCall of message.toolCalls; track toolCall.id) {
+        @for (toolCall of parsedToolCalls; track toolCall.id) {
           <div class="tool-call-item">
             <div class="tool-call-header">
               <ion-icon name="construct-outline"></ion-icon>
@@ -31,15 +31,6 @@
             <pre class="tool-call-input"><code>{{ formatToolCallInput(toolCall) }}</code></pre>
           </div>
         }
-      </div>
-    }
-
-    @if (message.toolCallId) {
-      <div class="tool-result-badge">
-        <ion-badge color="secondary">
-          <ion-icon name="return-down-back-outline"></ion-icon>
-          Tool Result: {{ message.toolCallId | slice:0:8 }}
-        </ion-badge>
       </div>
     }
   </div>

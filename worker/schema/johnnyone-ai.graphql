@@ -26,6 +26,33 @@ type DesktopNode {
   updatedAt: String!
 }
 
+type AiSession {
+  id: ID!
+  title: String!
+  provider: String!
+  model: String!
+  workingDirectory: String
+  status: String!
+  totalInputTokens: Int!
+  totalOutputTokens: Int!
+  totalCostCents: Int!
+  createdAt: String!
+  updatedAt: String!
+}
+
+type AiMessage {
+  id: ID!
+  sessionId: String!
+  role: String!
+  content: String!
+  toolCalls: String
+  finishReason: String
+  inputTokens: Int!
+  outputTokens: Int!
+  costCents: Int!
+  createdAt: String!
+}
+
 type RelayChatResponse {
   success: Boolean!
   relayId: String!
@@ -69,6 +96,9 @@ input RelayChatMessageInput {
 
 type Query {
   listDesktopNodes: [DesktopNode!]!
+  listAiSessions(status: String): [AiSession!]!
+  getAiSession(id: ID!): AiSession
+  listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!
 }
 
 # --- Mutations ---
@@ -77,6 +107,7 @@ type Mutation {
   registerDesktopNode(input: RegisterDesktopNodeInput!): DesktopNode!
   updateDesktopNodeStatus(id: ID!, status: DesktopNodeStatus!): DesktopNode!
   sendRelayChatMessage(input: RelayChatMessageInput!): RelayChatResponse!
+  deleteAiSession(id: ID!): Boolean!
 }
 
 # --- Subscriptions ---

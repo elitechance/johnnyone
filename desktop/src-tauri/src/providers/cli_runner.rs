@@ -61,7 +61,11 @@ where
         .stderr(Stdio::piped());
 
     for (key, val) in &config.env_vars {
-        cmd.env(key, val);
+        if val.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, val);
+        }
     }
 
     let mut child = cmd

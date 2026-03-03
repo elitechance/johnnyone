@@ -2,8 +2,8 @@ import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { GraphQLClient } from './graphql-client';
-import { AiSession, CreateAiSessionInput } from '../models/ai-session.model';
-import { AiMessage, AiMessageDelta, SendAgentMessageInput } from '../models/ai-message.model';
+import { AiSession } from '../models/ai-session.model';
+import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
 import { ToolDefinition, ToolExecution } from '../models/tool.model';
 import { ProviderConfig, AiUsageSummary } from '../models/provider.model';
 import { DesktopNode } from '../models/desktop-node.model';
@@ -14,106 +14,74 @@ export class JohnnyApiService {
 
   // ── Sessions ──────────────────────────────────────────────────────────
 
-  listSessions(): Observable<AiSession[]> {
+  listSessions(status?: string): Observable<AiSession[]> {
     return this.gql
-      .query<{ aiSessions: AiSession[] }>(
-        `query ListSessions {
-          aiSessions {
-            id userId title provider model status
-            systemPrompt totalInputTokens totalOutputTokens totalCost
+      .query<{ listAiSessions: AiSession[] }>(
+        `query ListSessions($status: String) {
+          listAiSessions(status: $status) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
             createdAt updatedAt
           }
-        }`
+        }`,
+        { status }
       )
-      .pipe(map((data) => data.aiSessions));
+      .pipe(map((data) => data.listAiSessions));
   }
 
   getSession(id: string): Observable<AiSession> {
     return this.gql
-      .query<{ aiSession: AiSession }>(
+      .query<{ getAiSession: AiSession }>(
         `query GetSession($id: ID!) {
-          aiSession(id: $id) {
-            id userId title provider model status
-            systemPrompt totalInputTokens totalOutputTokens totalCost
+          getAiSession(id: $id) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
             createdAt updatedAt
           }
         }`,
         { id }
       )
-      .pipe(map((data) => data.aiSession));
+      .pipe(map((data) => data.getAiSession));
   }
 
-  createSession(input: CreateAiSessionInput): Observable<AiSession> {
+  deleteSession(id: string): Observable<boolean> {
     return this.gql
-      .mutate<{ createAiSession: AiSession }>(
-        `mutation CreateSession($input: CreateAiSessionInput!) {
-          createAiSession(input: $input) {
-            id userId title provider model status
-            systemPrompt totalInputTokens totalOutputTokens totalCost
-            createdAt updatedAt
-          }
-        }`,
-        { input }
-      )
-      .pipe(map((data) => data.createAiSession));
-  }
-
-  archiveSession(id: string): Observable<AiSession> {
-    return this.gql
-      .mutate<{ archiveAiSession: AiSession }>(
-        `mutation ArchiveSession($id: ID!) {
-          archiveAiSession(id: $id) {
-            id status updatedAt
-          }
+      .mutate<{ deleteAiSession: boolean }>(
+        `mutation DeleteAiSession($id: ID!) {
+          deleteAiSession(id: $id)
         }`,
         { id }
       )
-      .pipe(map((data) => data.archiveAiSession));
-  }
-
-  updateSessionTitle(id: string, title: string): Observable<AiSession> {
-    return this.gql
-      .mutate<{ updateAiSessionTitle: AiSession }>(
-        `mutation UpdateSessionTitle($id: ID!, $title: String!) {
-          updateAiSessionTitle(id: $id, title: $title) {
-            id title updatedAt
-          }
-        }`,
-        { id, title }
-      )
-      .pipe(map((data) => data.updateAiSessionTitle));
+      .pipe(map((data) => data.deleteAiSession));
   }
 
   // ── Messages ──────────────────────────────────────────────────────────
 
   listMessages(sessionId: string, limit?: number, offset?: number): Observable<AiMessage[]> {
     return this.gql
-      .query<{ aiMessages: AiMessage[] }>(
+      .query<{ listAiMessages: AiMessage[] }>(
         `query ListMessages($sessionId: ID!, $limit: Int, $offset: Int) {
-          aiMessages(sessionId: $sessionId, limit: $limit, offset: $offset) {
-            id sessionId role content toolCalls { id name input }
-            toolCallId sourceChannel finishReason
-            inputTokens outputTokens createdAt
+          listAiMessages(sessionId: $sessionId, limit: $limit, offset: $offset) {
+            id sessionId role content toolCalls
+            finishReason inputTokens outputTokens costCents createdAt
           }
         }`,
         { sessionId, limit, offset }
       )
-      .pipe(map((data) => data.aiMessages));
+      .pipe(map((data) => data.listAiMessages));
   }
 
-  sendMessage(input: SendAgentMessageInput): Observable<AiMessage> {
+  sendRelayMessage(input: { sessionId: string; content: string; provider?: string; model?: string; workingDirectory?: string }): Observable<{ success: boolean; relayId: string; desktopNodeId: string }> {
     return this.gql
-      .mutate<{ sendAgentMessage: AiMessage }>(
-        `mutation SendMessage($input: SendAgentMessageInput!) {
-          sendAgentMessage(input: $input) {
-            id sessionId role content toolCalls { id name input }
-            toolCallId sourceChannel finishReason
-            inputTokens outputTokens createdAt
+      .mutate<{ sendRelayChatMessage: { success: boolean; relayId: string; desktopNodeId: string } }>(
+        `mutation SendRelayChatMessage($input: RelayChatMessageInput!) {
+          sendRelayChatMessage(input: $input) {
+            success relayId desktopNodeId
           }
         }`,
         { input }
       )
-      .pipe(map((data) => data.sendAgentMessage));
+      .pipe(map((data) => data.sendRelayChatMessage));
   }
 
   // ── Message Subscriptions ─────────────────────────────────────────────
@@ -136,9 +104,8 @@ export class JohnnyApiService {
       .subscribe<{ aiMessageCreated: AiMessage }>(
         `subscription OnNewMessage($sessionId: ID!) {
           aiMessageCreated(sessionId: $sessionId) {
-            id sessionId role content toolCalls { id name input }
-            toolCallId sourceChannel finishReason
-            inputTokens outputTokens createdAt
+            id sessionId role content toolCalls
+            finishReason inputTokens outputTokens costCents createdAt
           }
         }`,
         { sessionId }
