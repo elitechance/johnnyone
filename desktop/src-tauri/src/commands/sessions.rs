@@ -115,6 +115,7 @@ pub async fn update_session_title(
 }
 
 /// Update a session's working directory.
+/// Also clears cli_session_id since Claude CLI sessions are tied to the project directory.
 #[tauri::command]
 pub async fn update_session_working_directory(
     id: String,
@@ -123,7 +124,7 @@ pub async fn update_session_working_directory(
 ) -> Result<Session, String> {
     state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE sessions SET working_directory = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE sessions SET working_directory = ?1, cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?2",
             params![working_directory, id],
         )
         .map_err(|e| format!("Failed to update working directory: {}", e))?;

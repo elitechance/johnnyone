@@ -1,4 +1,4 @@
-use crate::agent::AgentService;
+use crate::agent::{AgentConfig, AgentService};
 use crate::state::app_state::AppState;
 use serde::Serialize;
 use tauri::State;
@@ -10,18 +10,28 @@ pub struct ConnectionStatusResponse {
     pub last_heartbeat: Option<String>,
 }
 
-/// Start the agent WebSocket connection for the given session.
+/// Helper to read a setting from the DB, returning a default if not found.
+fn get_setting(state: &AppState, key: &str, default: &str) -> String {
+    state
+        .db
+        .with_conn(|conn| {
+            let result = conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get::<_, String>(0),
+            );
+            Ok(result.unwrap_or_else(|_| default.to_string()))
+        })
+        .unwrap_or_else(|_| default.to_string())
+}
+
+/// Start the agent WebSocket connection.
+/// Reads worker_url, user_id, and tenant_id from settings DB.
 #[tauri::command]
 pub async fn start_agent(
-    session_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    tracing::info!(session_id = %session_id, "Starting agent connection");
-
-    // Validate session ID
-    if session_id.is_empty() {
-        return Err("Session ID cannot be empty".to_string());
-    }
+    tracing::info!("Starting agent connection");
 
     // Check if already connected
     {
@@ -31,22 +41,31 @@ pub async fn start_agent(
         }
     }
 
-    // Update state with new session
-    {
-        let mut status = state.connection_status.lock().await;
-        status.session_id = Some(session_id.clone());
+    // Read config from settings DB
+    let worker_url = get_setting(&state, "worker_url", "http://localhost:7714");
+    let user_id = get_setting(&state, "user_id", "");
+    let tenant_id = get_setting(&state, "tenant_id", "johnnyone-default");
+
+    if user_id.is_empty() {
+        return Err("user_id not configured. Set it in settings first.".to_string());
     }
 
-    // Build the WebSocket URL from the session ID
-    let ws_url = format!(
-        "wss://johnnyone.app/api/agent/session/{}/ws",
-        session_id
-    );
+    // Mark session as active
+    {
+        let mut status = state.connection_status.lock().await;
+        status.session_id = Some("agent".to_string());
+    }
+
+    let config = AgentConfig {
+        worker_url,
+        user_id,
+        tenant_id,
+    };
 
     // Start the agent service in a background task
     let agent_state = state.inner().clone();
     tokio::spawn(async move {
-        match AgentService::start(ws_url, agent_state).await {
+        match AgentService::start(config, agent_state).await {
             Ok(()) => tracing::info!("Agent service stopped cleanly"),
             Err(e) => tracing::error!(error = %e, "Agent service error"),
         }

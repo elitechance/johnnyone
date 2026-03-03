@@ -2,6 +2,7 @@ use rusqlite::Connection;
 
 const MIGRATION_001: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_add_cli_session_id.sql");
+const MIGRATION_003: &str = include_str!("../../migrations/003_add_worker_settings.sql");
 
 /// Run all pending migrations. Uses a simple version table to track applied migrations.
 pub fn run_migrations(conn: &Connection) -> Result<(), String> {
@@ -29,6 +30,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
     let migrations: Vec<(i64, &str, &str)> = vec![
         (1, "001_initial", MIGRATION_001),
         (2, "002_add_cli_session_id", MIGRATION_002),
+        (3, "003_add_worker_settings", MIGRATION_003),
     ];
 
     for (version, name, sql) in migrations {

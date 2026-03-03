@@ -106,6 +106,7 @@ export class ChatPage implements OnInit, OnDestroy {
     this.subscribeToDelta();
     this.subscribeToComplete();
     this.loadLastWorkingDirectory();
+    this.ensureSettingsAndConnect();
   }
 
   ngOnDestroy(): void {
@@ -314,6 +315,20 @@ export class ChatPage implements OnInit, OnDestroy {
       );
     } catch (err) {
       console.error('Failed to auto-title:', err);
+    }
+  }
+
+  // ── Agent Auto-Connect ─────────────────────────────────────────────
+
+  private async ensureSettingsAndConnect(): Promise<void> {
+    try {
+      // Auto-connect the agent to the worker
+      const status = await this.tauriBridge.getConnectionStatus();
+      if (!status.connected) {
+        await this.tauriBridge.connectAgent();
+      }
+    } catch (err) {
+      console.error('Agent auto-connect failed:', err);
     }
   }
 

@@ -231,15 +231,15 @@ export class JohnnyApiService {
 
   listDesktopNodes(): Observable<DesktopNode[]> {
     return this.gql
-      .query<{ desktopNodes: DesktopNode[] }>(
+      .query<{ listDesktopNodes: DesktopNode[] }>(
         `query ListDesktopNodes {
-          desktopNodes {
+          listDesktopNodes {
             id hostname os arch version status
             capabilities lastHeartbeatAt createdAt
           }
         }`
       )
-      .pipe(map((data) => data.desktopNodes));
+      .pipe(map((data) => data.listDesktopNodes));
   }
 
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {

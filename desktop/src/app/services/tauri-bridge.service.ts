@@ -134,8 +134,8 @@ export interface PendingApproval {
 export class TauriBridgeService {
   // ── Agent Connection ─────────────────────────────────────────────────
 
-  async connectAgent(sessionId: string): Promise<void> {
-    await invoke('start_agent', { sessionId });
+  async connectAgent(): Promise<void> {
+    await invoke('start_agent');
   }
 
   async disconnectAgent(): Promise<void> {

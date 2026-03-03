@@ -87,6 +87,30 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
             })
         }
         "result" => {
+            // Check for error results (e.g. failed --resume with invalid session ID)
+            let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+            if is_error {
+                let errors = v.get("errors")
+                    .and_then(|e| e.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "))
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                return Some(StreamChunk {
+                    chunk_type: ChunkType::Error,
+                    content: errors,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    cost_usd: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    is_final: true,
+                    session_id: None,
+                });
+            }
+
             // Actual format: total_cost_usd at top level, tokens under usage object
             let cost = v.get("total_cost_usd").and_then(|c| c.as_f64());
             let usage = v.get("usage");

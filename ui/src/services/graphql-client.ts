@@ -7,6 +7,11 @@ export const GRAPHQL_API_URL = new InjectionToken<string>('GRAPHQL_API_URL', {
   factory: () => '/graphql',
 });
 
+export const GRAPHQL_EXTRA_HEADERS = new InjectionToken<Record<string, string>>('GRAPHQL_EXTRA_HEADERS', {
+  providedIn: 'root',
+  factory: () => ({}),
+});
+
 export const GRAPHQL_WS_URL = new InjectionToken<string>('GRAPHQL_WS_URL', {
   providedIn: 'root',
   factory: () => {
@@ -32,6 +37,7 @@ export interface GraphQLError {
 export class GraphQLClient {
   private readonly apiUrl = inject(GRAPHQL_API_URL);
   private readonly wsUrl = inject(GRAPHQL_WS_URL);
+  private readonly extraHeaders = inject(GRAPHQL_EXTRA_HEADERS);
 
   query<T>(query: string, variables?: Record<string, unknown>): Observable<T> {
     return this.request<T>(query, variables);
@@ -122,6 +128,7 @@ export class GraphQLClient {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
+          ...this.extraHeaders,
         },
         body,
         credentials: 'include',

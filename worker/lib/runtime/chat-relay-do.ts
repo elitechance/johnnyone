@@ -11,7 +11,7 @@
  */
 
 interface RelayEnvelope {
-  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'ping' | 'pong';
+  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'heartbeat' | 'ping' | 'pong';
   relayId?: string;
   sessionId?: string;
   data?: unknown;
@@ -93,6 +93,11 @@ export class ChatRelayDO implements DurableObject {
       if (!meta) return;
 
       switch (envelope.type) {
+        case 'heartbeat':
+          // Desktop keepalive — respond with pong
+          ws.send(JSON.stringify({ type: 'heartbeat', data: { timestamp: new Date().toISOString() } }));
+          break;
+
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           break;

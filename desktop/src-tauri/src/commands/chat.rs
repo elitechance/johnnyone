@@ -133,6 +133,17 @@ pub async fn send_chat_message(
                 captured_cli_session_id = chunk.session_id.clone();
             }
 
+            // On error, clear cli_session_id so next attempt starts fresh
+            if chunk.chunk_type == ChunkType::Error {
+                let _ = db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE sessions SET cli_session_id = NULL WHERE id = ?1",
+                        params![sid],
+                    )
+                    .map_err(|e| format!("Failed to clear cli_session_id: {}", e))
+                });
+            }
+
             // Capture usage from result chunks
             if chunk.chunk_type == ChunkType::Result {
                 if let Some(tokens) = chunk.input_tokens {

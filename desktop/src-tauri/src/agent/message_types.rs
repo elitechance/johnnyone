@@ -96,6 +96,7 @@ impl ToolResult {
 
 /// Heartbeat message for connection keepalive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Heartbeat {
     pub timestamp: String,
     #[serde(default)]
@@ -106,6 +107,7 @@ pub struct Heartbeat {
 
 /// Brief system info included with periodic heartbeats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SystemInfoSnapshot {
     pub cpu_usage_percent: f32,
     pub memory_used_mb: u64,
@@ -126,6 +128,7 @@ pub struct ErrorMessage {
 
 /// Chat request relayed from mobile through the worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayChatRequest {
     pub relay_id: String,
     pub session_id: String,
@@ -144,6 +147,7 @@ pub struct RelayChatRequest {
 
 /// Streaming delta sent from desktop back through the relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayChatDelta {
     pub relay_id: String,
     pub session_id: String,
@@ -154,6 +158,7 @@ pub struct RelayChatDelta {
 
 /// Completion signal for a relayed chat request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayChatComplete {
     pub relay_id: String,
     pub session_id: String,
@@ -162,6 +167,7 @@ pub struct RelayChatComplete {
 
 /// A complete message sent through the relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayChatMessage {
     pub relay_id: String,
     pub session_id: String,
@@ -208,6 +214,9 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains("chat_request"));
         assert!(json.contains("Hello from mobile"));
+        // Verify camelCase serialization
+        assert!(json.contains("relayId"));
+        assert!(json.contains("sessionId"));
     }
 
     #[test]

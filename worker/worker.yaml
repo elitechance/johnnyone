@@ -21,3 +21,9 @@ auth:
   provider: email
   jwt_expiry: 15m
   refresh_expiry: 7d
+
+durable_objects:
+  - name: CHAT_RELAY_DO
+    class_name: ChatRelayDO
+    file: lib/runtime/chat-relay-do.ts
+    websocket_route: /api/relay/ws

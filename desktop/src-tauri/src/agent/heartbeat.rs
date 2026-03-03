@@ -20,6 +20,7 @@ const SYSTEM_INFO_EVERY_N: u64 = 4;
 pub async fn run_heartbeat(
     ws_write: Arc<Mutex<WsWrite>>,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    node_id: String,
 ) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let mut cycle: u64 = 0;
@@ -53,7 +54,7 @@ pub async fn run_heartbeat(
                 let heartbeat = AgentEnvelope {
                     message: AgentMessage::Heartbeat(Heartbeat {
                         timestamp: chrono::Utc::now().to_rfc3339(),
-                        node_id: None, // Will be populated from app state in future
+                        node_id: Some(node_id.clone()),
                         system_info,
                     }),
                 };

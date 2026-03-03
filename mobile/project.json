@@ -5,7 +5,7 @@
   "targets": {
     "serve": {
       "executor": "@angular-devkit/build-angular:dev-server",
-      "options": { "buildTarget": "mobile:build", "port": 4201 }
+      "options": { "buildTarget": "mobile:build", "port": 4201, "proxyConfig": "mobile/proxy.conf.json" }
     },
     "build": {
       "executor": "@angular-devkit/build-angular:application",

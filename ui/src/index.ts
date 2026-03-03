@@ -22,6 +22,7 @@ export {
   GraphQLError,
   GRAPHQL_API_URL,
   GRAPHQL_WS_URL,
+  GRAPHQL_EXTRA_HEADERS,
 } from './services/graphql-client';
 export { JohnnyApiService } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';

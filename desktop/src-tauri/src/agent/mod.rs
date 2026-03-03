@@ -1,6 +1,7 @@
 pub mod heartbeat;
 pub mod message_types;
 pub mod reconnect;
+pub mod registration;
 pub mod ws_client;
 
 use crate::providers::{
@@ -17,6 +18,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing;
 
+/// Configuration for connecting the agent to the worker.
+pub struct AgentConfig {
+    pub worker_url: String,
+    pub user_id: String,
+    pub tenant_id: String,
+}
+
 /// AgentService manages the lifecycle of the WebSocket connection to the
 /// Cloudflare Worker ChatRelayDO. It handles connecting, message routing,
 /// heartbeats, and reconnection.
@@ -24,14 +32,57 @@ pub struct AgentService;
 
 impl AgentService {
     /// Start the agent service. This will:
-    /// 1. Connect to the WebSocket endpoint
-    /// 2. Start the heartbeat sender
-    /// 3. Listen for incoming messages and route them
-    /// 4. Handle reconnection on disconnect
-    pub async fn start(ws_url: String, state: AppState) -> Result<(), String> {
+    /// 1. Register this desktop node with the worker via GraphQL
+    /// 2. Connect to the WebSocket endpoint
+    /// 3. Start the heartbeat sender
+    /// 4. Listen for incoming messages and route them
+    /// 5. Handle reconnection on disconnect
+    pub async fn start(config: AgentConfig, state: AppState) -> Result<(), String> {
         let state = Arc::new(state);
         let reconnector = reconnect::ReconnectPolicy::new();
         let tool_dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+
+        // Register this desktop node with the worker
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+
+        tracing::info!(
+            worker_url = %config.worker_url,
+            user_id = %config.user_id,
+            hostname = %hostname,
+            "Registering desktop node"
+        );
+
+        let registered = registration::register_node(
+            &config.worker_url,
+            &config.user_id,
+            &config.tenant_id,
+            &hostname,
+        )
+        .await?;
+
+        let node_id = registered.id;
+        tracing::info!(
+            node_id = %node_id,
+            status = %registered.status,
+            "Desktop node registered"
+        );
+
+        // Build WebSocket URL
+        let ws_scheme = if config.worker_url.starts_with("https") {
+            "wss"
+        } else {
+            "ws"
+        };
+        let host = config
+            .worker_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let ws_url = format!(
+            "{}://{}/api/relay/ws?nodeId={}&clientType=desktop&userId={}&tenantId={}",
+            ws_scheme, host, node_id, config.user_id, config.tenant_id
+        );
 
         loop {
             tracing::info!(url = %ws_url, "Connecting to agent session");
@@ -54,8 +105,9 @@ impl AgentService {
                         let ws_write = Arc::clone(&ws_write);
                         let state = Arc::clone(&state);
                         let mut shutdown_rx = state.shutdown_tx.subscribe();
+                        let hb_node_id = node_id.clone();
                         tokio::spawn(async move {
-                            heartbeat::run_heartbeat(ws_write, &mut shutdown_rx).await;
+                            heartbeat::run_heartbeat(ws_write, &mut shutdown_rx, hb_node_id).await;
                         })
                     };
 
