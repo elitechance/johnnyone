@@ -1,98 +1,206 @@
-<ion-header>
-  <ion-toolbar>
-    <ion-title>JohnnyOne</ion-title>
-    <ion-buttons slot="end">
-      <ion-chip
-        [color]="connectionStatus.connected ? 'success' : 'danger'"
-        outline
-      >
-        <ion-label>{{ connectionStatus.connected ? 'Connected' : 'Offline' }}</ion-label>
-      </ion-chip>
-      <ion-button (click)="navigateTo('/sessions')">
-        Sessions
+<div class="chat-layout" (keydown)="onGlobalKeyDown($event)">
+  <!-- Sidebar: Session List -->
+  <aside class="sidebar" [class.collapsed]="!sidebarOpen()">
+    <div class="sidebar-header">
+      <span class="sidebar-title">Sessions</span>
+      <ion-button fill="clear" size="small" (click)="createNewSession()">
+        <ion-icon name="add-outline"></ion-icon>
       </ion-button>
-      <ion-button (click)="navigateTo('/tools')">
-        Tools
-      </ion-button>
-      <ion-button (click)="navigateTo('/settings')">
-        Settings
-      </ion-button>
-    </ion-buttons>
-  </ion-toolbar>
-</ion-header>
-
-<ion-content class="chat-content">
-  <!-- Node Status Bar -->
-  <div class="node-status-bar">
-    <div class="status-indicator">
-      <span
-        class="status-dot"
-        [class.connected]="connectionStatus.connected"
-        [class.disconnected]="!connectionStatus.connected"
-      ></span>
-      <span class="status-text">
-        {{ connectionStatus.connected ? 'Agent Connected' : 'Agent Disconnected' }}
-      </span>
-    </div>
-    <div class="status-actions">
-      <ion-button
-        *ngIf="!connectionStatus.connected"
-        size="small"
-        (click)="connectAgent()"
-      >
-        Connect
-      </ion-button>
-      <ion-button
-        *ngIf="connectionStatus.connected"
-        size="small"
-        color="danger"
-        fill="outline"
-        (click)="disconnectAgent()"
-      >
-        Disconnect
+      <ion-button fill="clear" size="small" (click)="sidebarOpen.set(false)">
+        <ion-icon name="chevron-back-outline"></ion-icon>
       </ion-button>
     </div>
-  </div>
 
-  <!-- Chat Messages -->
-  <div class="chat-messages">
-    <div
-      *ngFor="let msg of messages"
-      class="message"
-      [class.user]="msg.role === 'user'"
-      [class.assistant]="msg.role === 'assistant'"
-      [class.system]="msg.role === 'system'"
-    >
-      <div class="message-header">
-        <span class="message-role">{{ msg.role }}</span>
-        <span class="message-time">{{ msg.timestamp | date:'shortTime' }}</span>
+    <div class="sidebar-search">
+      <input
+        type="text"
+        class="search-input"
+        [(ngModel)]="searchQuery"
+        placeholder="Search sessions..."
+      />
+    </div>
+
+    <div class="session-list">
+      @for (session of filteredSessions(); track session.id) {
+        <div
+          class="session-item"
+          [class.active]="currentSession()?.id === session.id"
+          (click)="selectSession(session.id)"
+        >
+          <div class="session-item-header">
+            <ion-icon [name]="providerIcon(session.provider)" class="provider-icon"></ion-icon>
+            <span class="session-title">{{ session.title }}</span>
+          </div>
+          <div class="session-item-meta">
+            <span class="session-date">{{ formatDate(session.updated_at) }}</span>
+            <ion-button
+              fill="clear"
+              size="small"
+              class="archive-btn"
+              (click)="archiveSession($event, session.id)"
+            >
+              <ion-icon name="archive-outline" size="small"></ion-icon>
+            </ion-button>
+          </div>
+        </div>
+      }
+
+      @if (filteredSessions().length === 0) {
+        <div class="empty-sessions">
+          <p>No sessions yet</p>
+          <ion-button size="small" (click)="createNewSession()">New Session</ion-button>
+        </div>
+      }
+    </div>
+  </aside>
+
+  <!-- Sidebar toggle when collapsed -->
+  @if (!sidebarOpen()) {
+    <button class="sidebar-toggle" (click)="sidebarOpen.set(true)">
+      <ion-icon name="menu-outline"></ion-icon>
+    </button>
+  }
+
+  <!-- Main Chat Area -->
+  <main class="chat-main">
+    <!-- Chat Header -->
+    <header class="chat-header">
+      <div class="header-left">
+        @if (!sidebarOpen()) {
+          <ion-button fill="clear" size="small" (click)="sidebarOpen.set(true)">
+            <ion-icon name="menu-outline"></ion-icon>
+          </ion-button>
+        }
+        <h2 class="chat-title">{{ currentSession()?.title || 'JohnnyOne' }}</h2>
       </div>
-      <div class="message-content">{{ msg.content }}</div>
+
+      <div class="header-center">
+        <!-- Working Directory Indicator -->
+        <div class="working-dir" *ngIf="currentSession()" (click)="pickWorkingDirectory()">
+          <ion-icon name="folder-outline" size="small"></ion-icon>
+          <span class="dir-path">{{ workingDirectory() || '~ (click to set)' }}</span>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <!-- Provider Selector -->
+        <div class="provider-select">
+          <ion-icon [name]="providerIcon(selectedProvider())" size="small"></ion-icon>
+          <select
+            [value]="selectedProvider()"
+            (change)="onProviderChange($any($event.target).value)"
+            class="provider-dropdown"
+          >
+            @for (tool of detectedTools(); track tool.provider) {
+              <option [value]="tool.provider" [disabled]="!tool.found">
+                {{ providerLabel(tool.provider) }}{{ !tool.found ? ' (not found)' : '' }}
+              </option>
+            }
+          </select>
+        </div>
+
+        <ion-button fill="clear" size="small" (click)="navigateTo('/settings')">
+          <ion-icon name="settings-outline"></ion-icon>
+        </ion-button>
+      </div>
+    </header>
+
+    <!-- Chat Messages -->
+    <div class="chat-messages" #chatMessages>
+      @for (msg of messages(); track msg.id) {
+        <div
+          class="message"
+          [class.user]="msg.role === 'user'"
+          [class.assistant]="msg.role === 'assistant'"
+          [class.system]="msg.role === 'system'"
+          [class.tool]="msg.role === 'tool'"
+        >
+          <div class="message-header">
+            <span class="message-role">{{ msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Johnny' : msg.role }}</span>
+            <span class="message-time">{{ formatDate(msg.created_at) }}</span>
+          </div>
+          <div
+            class="message-content"
+            [class.streaming]="isStreamingMessage(msg)"
+            [innerHTML]="getDisplayContent(msg)"
+          ></div>
+          @if (msg.role === 'assistant' && !isStreamingMessage(msg) && msg.content) {
+            <div class="message-actions">
+              @if (msg.input_tokens || msg.output_tokens) {
+                <span class="token-info">
+                  {{ formatTokens(msg.input_tokens) }} in / {{ formatTokens(msg.output_tokens) }} out
+                </span>
+              }
+            </div>
+          }
+        </div>
+      }
+
+      <!-- Streaming indicator -->
+      @if (isStreaming() && !streamingContent()) {
+        <div class="message assistant">
+          <div class="message-header">
+            <span class="message-role">Johnny</span>
+          </div>
+          <div class="typing-indicator">
+            <span></span><span></span><span></span>
+          </div>
+        </div>
+      }
+
+      @if (messages().length === 0 && !currentSession()) {
+        <div class="empty-state">
+          <h2>Welcome to JohnnyOne</h2>
+          <p>Create a new session or select one from the sidebar to start chatting.</p>
+          <ion-button (click)="createNewSession()">New Session</ion-button>
+        </div>
+      }
     </div>
 
-    <div *ngIf="messages.length === 0" class="empty-state">
-      <h2>Welcome to JohnnyOne</h2>
-      <p>Connect your agent and start a conversation.</p>
-    </div>
-  </div>
+    <!-- Usage Bar -->
+    @if (currentSession()) {
+      <div class="usage-bar">
+        <span>{{ formatTokens(sessionTokens().input) }} in</span>
+        <span>{{ formatTokens(sessionTokens().output) }} out</span>
+        @if (sessionTokens().cost > 0) {
+          <span>${{ sessionTokens().cost.toFixed(2) }}</span>
+        }
+      </div>
+    }
 
-  <!-- Message Input -->
-  <div class="chat-input-container">
-    <div class="chat-input-wrapper">
-      <textarea
-        class="chat-input"
-        [(ngModel)]="currentMessage"
-        placeholder="Type a message..."
-        (keydown.enter)="$event.shiftKey || sendMessage(); $event.shiftKey || $event.preventDefault()"
-        rows="2"
-      ></textarea>
-      <ion-button
-        class="send-button"
-        [disabled]="!currentMessage.trim() || !connectionStatus.connected"
-        (click)="sendMessage()"
-      >
-        Send
-      </ion-button>
+    <!-- Message Input -->
+    <div class="chat-input-container">
+      <div class="chat-input-wrapper">
+        <textarea
+          class="chat-input"
+          [(ngModel)]="currentMessage"
+          placeholder="Type a message... (Enter to send, Shift+Enter for new line)"
+          (keydown)="onKeyDown($event)"
+          rows="2"
+          [disabled]="isStreaming()"
+        ></textarea>
+        <div class="input-actions">
+          @if (isStreaming()) {
+            <ion-button
+              class="stop-button"
+              color="danger"
+              size="small"
+              (click)="stopGeneration()"
+            >
+              <ion-icon name="stop-outline" slot="start"></ion-icon>
+              Stop
+            </ion-button>
+          } @else {
+            <ion-button
+              class="send-button"
+              [disabled]="!currentMessage.trim()"
+              (click)="sendMessage()"
+            >
+              <ion-icon name="send-outline" slot="icon-only"></ion-icon>
+            </ion-button>
+          }
+        </div>
+      </div>
     </div>
-  </div>
-</ion-content>
+  </main>
+</div>

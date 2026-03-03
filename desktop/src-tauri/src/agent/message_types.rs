@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Top-level envelope for all WebSocket messages between the desktop agent
-/// and the Cloudflare Worker AgentSessionDO.
+/// and the Cloudflare Worker ChatRelayDO.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEnvelope {
     #[serde(flatten)]
@@ -27,21 +27,34 @@ pub enum AgentMessage {
     /// Error message from either side.
     #[serde(rename = "error")]
     Error(ErrorMessage),
+
+    /// Mobile relay: a chat request forwarded from mobile via worker.
+    #[serde(rename = "chat_request")]
+    RelayChatRequest(RelayChatRequest),
+
+    /// Desktop → worker: streaming delta from CLI subprocess.
+    #[serde(rename = "chat_delta")]
+    RelayChatDelta(RelayChatDelta),
+
+    /// Desktop → worker: final response from CLI subprocess.
+    #[serde(rename = "chat_complete")]
+    RelayChatComplete(RelayChatComplete),
+
+    /// Desktop → worker: a complete message (user or assistant).
+    #[serde(rename = "chat_message")]
+    RelayChatMessage(RelayChatMessage),
 }
+
+// ── Existing Types ───────────────────────────────────────────────────────────
 
 /// A request to execute a tool on the desktop agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
-    /// Unique identifier for this tool call.
     pub call_id: String,
-    /// Name of the tool to execute (e.g., "shell", "filesystem", "process").
     pub tool_name: String,
-    /// Input parameters for the tool, as a JSON object.
     pub input: serde_json::Value,
-    /// Optional timeout in milliseconds for the tool execution.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// Whether this tool call requires user approval before execution.
     #[serde(default)]
     pub requires_approval: bool,
 }
@@ -49,23 +62,17 @@ pub struct ToolCall {
 /// The result of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
-    /// The call_id this result corresponds to.
     pub call_id: String,
-    /// Whether the tool execution was successful.
     pub success: bool,
-    /// The output data from the tool (if successful).
     #[serde(default)]
     pub output: Option<serde_json::Value>,
-    /// Error message (if failed).
     #[serde(default)]
     pub error: Option<String>,
-    /// Execution duration in milliseconds.
     #[serde(default)]
     pub duration_ms: Option<u64>,
 }
 
 impl ToolResult {
-    /// Create a successful tool result.
     pub fn success(call_id: String, output: serde_json::Value, duration_ms: u64) -> Self {
         Self {
             call_id,
@@ -76,7 +83,6 @@ impl ToolResult {
         }
     }
 
-    /// Create a failed tool result.
     pub fn failure(call_id: String, error: String, duration_ms: u64) -> Self {
         Self {
             call_id,
@@ -91,12 +97,9 @@ impl ToolResult {
 /// Heartbeat message for connection keepalive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
-    /// ISO 8601 timestamp of when the heartbeat was sent.
     pub timestamp: String,
-    /// The node ID sending the heartbeat.
     #[serde(default)]
     pub node_id: Option<String>,
-    /// System info snapshot (optional, sent periodically).
     #[serde(default)]
     pub system_info: Option<SystemInfoSnapshot>,
 }
@@ -113,13 +116,57 @@ pub struct SystemInfoSnapshot {
 /// Error message in the agent protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorMessage {
-    /// Error code (e.g., "AUTH_FAILED", "TOOL_NOT_FOUND", "TIMEOUT").
     pub code: String,
-    /// Human-readable error message.
     pub message: String,
-    /// Optional call_id if the error relates to a specific tool call.
     #[serde(default)]
     pub call_id: Option<String>,
+}
+
+// ── Relay Types (Mobile ↔ Desktop via Worker) ────────────────────────────────
+
+/// Chat request relayed from mobile through the worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayChatRequest {
+    pub relay_id: String,
+    pub session_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+/// Streaming delta sent from desktop back through the relay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayChatDelta {
+    pub relay_id: String,
+    pub session_id: String,
+    pub delta: String,
+    pub chunk_type: String,
+    pub is_final: bool,
+}
+
+/// Completion signal for a relayed chat request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayChatComplete {
+    pub relay_id: String,
+    pub session_id: String,
+    pub message_id: String,
+}
+
+/// A complete message sent through the relay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayChatMessage {
+    pub relay_id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
 }
 
 #[cfg(test)]
@@ -144,16 +191,23 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_tool_result() {
-        let result = ToolResult::success(
-            "abc-123".to_string(),
-            serde_json::json!({ "stdout": "hello world" }),
-            150,
-        );
+    fn test_serialize_relay_request() {
+        let envelope = AgentEnvelope {
+            message: AgentMessage::RelayChatRequest(RelayChatRequest {
+                relay_id: "relay-1".to_string(),
+                session_id: "sess-1".to_string(),
+                content: "Hello from mobile".to_string(),
+                provider: Some("claude_code".to_string()),
+                model: None,
+                working_directory: Some("/home/user".to_string()),
+                user_id: None,
+                tenant_id: None,
+            }),
+        };
 
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("abc-123"));
-        assert!(json.contains("true")); // success
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("chat_request"));
+        assert!(json.contains("Hello from mobile"));
     }
 
     #[test]

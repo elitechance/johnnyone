@@ -270,31 +270,33 @@ impl FilesystemTool {
 
     async fn list_recursive(
         &self,
-        path: &Path,
-        depth: u32,
+        root_path: &Path,
+        _depth: u32,
         max_depth: u32,
     ) -> Result<Vec<serde_json::Value>, String> {
-        if depth > max_depth {
-            return Ok(vec![]);
-        }
+        // Iterative approach using a stack to avoid recursive async fn issues
+        let mut all_entries = Vec::new();
+        let mut stack: Vec<(PathBuf, u32)> = vec![(root_path.to_path_buf(), 0)];
 
-        let mut entries = self.list_flat(path).await?;
-
-        let subdirs: Vec<PathBuf> = entries
-            .iter()
-            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("directory"))
-            .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(PathBuf::from))
-            .collect();
-
-        for subdir in subdirs {
-            if entries.len() >= MAX_DIR_ENTRIES {
-                break;
+        while let Some((path, depth)) = stack.pop() {
+            if depth > max_depth || all_entries.len() >= MAX_DIR_ENTRIES {
+                continue;
             }
-            let sub_entries = self.list_recursive(&subdir, depth + 1, max_depth).await?;
-            entries.extend(sub_entries);
+
+            let entries = self.list_flat(&path).await?;
+
+            for entry in &entries {
+                if entry.get("type").and_then(|t| t.as_str()) == Some("directory") {
+                    if let Some(p) = entry.get("path").and_then(|p| p.as_str()) {
+                        stack.push((PathBuf::from(p), depth + 1));
+                    }
+                }
+            }
+
+            all_entries.extend(entries);
         }
 
-        Ok(entries)
+        Ok(all_entries)
     }
 
     /// Search for files matching a pattern.
@@ -326,45 +328,49 @@ impl FilesystemTool {
 
     async fn search_recursive(
         &self,
-        path: &Path,
+        root_path: &Path,
         pattern: &str,
-        depth: u32,
+        _depth: u32,
         max_depth: u32,
         matches: &mut Vec<serde_json::Value>,
     ) -> Result<(), String> {
-        if depth > max_depth || matches.len() >= MAX_DIR_ENTRIES {
-            return Ok(());
-        }
+        // Iterative approach using a stack to avoid recursive async fn issues
+        let mut stack: Vec<(std::path::PathBuf, u32)> = vec![(root_path.to_path_buf(), 0)];
 
-        let mut dir = fs::read_dir(path)
-            .await
-            .map_err(|e| format!("Failed to read directory: {}", e))?;
-
-        while let Some(entry) = dir
-            .next_entry()
-            .await
-            .map_err(|e| format!("Failed to read entry: {}", e))?
-        {
-            if matches.len() >= MAX_DIR_ENTRIES {
-                break;
+        while let Some((path, depth)) = stack.pop() {
+            if depth > max_depth || matches.len() >= MAX_DIR_ENTRIES {
+                continue;
             }
 
-            let name = entry.file_name().to_string_lossy().to_string();
+            let mut dir = match fs::read_dir(&path).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
 
-            // Simple glob matching: * matches any sequence, ? matches single char
-            if glob_match(pattern, &name) {
-                matches.push(serde_json::json!({
-                    "name": name,
-                    "path": entry.path().to_string_lossy(),
-                }));
-            }
+            while let Some(entry) = dir
+                .next_entry()
+                .await
+                .map_err(|e| format!("Failed to read entry: {}", e))?
+            {
+                if matches.len() >= MAX_DIR_ENTRIES {
+                    break;
+                }
 
-            // Recurse into subdirectories
-            if let Ok(metadata) = entry.metadata().await {
-                if metadata.is_dir() {
-                    let _ = self
-                        .search_recursive(&entry.path(), pattern, depth + 1, max_depth, matches)
-                        .await;
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                // Simple glob matching: * matches any sequence, ? matches single char
+                if glob_match(pattern, &name) {
+                    matches.push(serde_json::json!({
+                        "name": name,
+                        "path": entry.path().to_string_lossy(),
+                    }));
+                }
+
+                // Queue subdirectories for processing
+                if let Ok(metadata) = entry.metadata().await {
+                    if metadata.is_dir() {
+                        stack.push((entry.path(), depth + 1));
+                    }
                 }
             }
         }

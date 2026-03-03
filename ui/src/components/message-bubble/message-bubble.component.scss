@@ -85,6 +85,107 @@
 
 .message-content {
   white-space: pre-wrap;
+
+  &.markdown-content {
+    white-space: normal;
+
+    p {
+      margin: 0 0 8px;
+
+      &:last-child {
+        margin-bottom: 0;
+      }
+    }
+
+    pre {
+      position: relative;
+      margin: 8px 0;
+      padding: 12px;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.15);
+      overflow-x: auto;
+      font-size: 13px;
+      line-height: 1.4;
+
+      code {
+        font-family: 'Fira Code', 'Consolas', 'Monaco', monospace;
+        background: none;
+        padding: 0;
+        border-radius: 0;
+      }
+    }
+
+    code {
+      font-family: 'Fira Code', 'Consolas', 'Monaco', monospace;
+      background: rgba(0, 0, 0, 0.1);
+      padding: 2px 4px;
+      border-radius: 3px;
+      font-size: 0.9em;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+      margin: 12px 0 4px;
+      font-weight: 600;
+    }
+
+    h1 { font-size: 1.3em; }
+    h2 { font-size: 1.15em; }
+    h3 { font-size: 1.05em; }
+
+    ul, ol {
+      margin: 4px 0;
+      padding-left: 24px;
+    }
+
+    li {
+      margin-bottom: 2px;
+    }
+
+    blockquote {
+      margin: 8px 0;
+      padding: 4px 12px;
+      border-left: 3px solid rgba(0, 0, 0, 0.2);
+      opacity: 0.85;
+    }
+
+    strong { font-weight: 600; }
+    em { font-style: italic; }
+
+    a {
+      color: var(--ion-color-primary);
+      text-decoration: underline;
+    }
+
+    table {
+      border-collapse: collapse;
+      margin: 8px 0;
+      font-size: 0.9em;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+    }
+
+    th, td {
+      border: 1px solid rgba(0, 0, 0, 0.15);
+      padding: 4px 8px;
+      text-align: left;
+    }
+
+    th {
+      font-weight: 600;
+      background: rgba(0, 0, 0, 0.05);
+    }
+  }
+}
+
+.bubble-wrapper.streaming .message-content::after {
+  content: '|';
+  animation: blink 0.7s infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }
 
 .tool-calls {
@@ -158,4 +259,27 @@
 
 .token-count {
   font-family: monospace;
+}
+
+.copy-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 4px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: inherit;
+
+  ion-icon {
+    font-size: 14px;
+  }
+}
+
+.bubble-wrapper:hover .copy-btn {
+  opacity: 0.6;
+
+  &:hover {
+    opacity: 1;
+  }
 }

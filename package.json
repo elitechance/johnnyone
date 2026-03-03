@@ -26,6 +26,7 @@
     "@capacitor/push-notifications": "^6.0.0",
     "@ionic/angular": "^8.0.0",
     "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
     "graphql": "^16.13.0",
     "graphql-ws": "^5.16.2",
     "graphql-yoga": "^5.18.0",
@@ -47,6 +48,7 @@
     "@tauri-apps/cli": "^2.10.0",
     "ng-packagr": "^19.0.0",
     "nx": "^20.0.0",
+    "puppeteer": "^24.37.5",
     "typescript": "~5.6.0",
     "wrangler": "^3.80.0"
   }

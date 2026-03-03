@@ -3,7 +3,8 @@
   [class.user]="isUser"
   [class.assistant]="isAssistant"
   [class.system]="isSystem"
-  [class.tool]="isTool">
+  [class.tool]="isTool"
+  [class.streaming]="isStreamingMessage">
 
   <div class="bubble-header">
     <ion-icon [name]="roleIcon" class="role-icon"></ion-icon>
@@ -12,7 +13,11 @@
   </div>
 
   <div class="bubble-body">
-    <div class="message-content">{{ message.content }}</div>
+    @if (useHtml) {
+      <div class="message-content markdown-content" [innerHTML]="renderedContent"></div>
+    } @else {
+      <div class="message-content">{{ message.content }}</div>
+    }
 
     @if (hasToolCalls) {
       <div class="tool-calls">
@@ -39,14 +44,19 @@
     }
   </div>
 
-  @if (message.inputTokens || message.outputTokens) {
-    <div class="bubble-footer">
+  <div class="bubble-footer">
+    @if (message.inputTokens || message.outputTokens) {
       @if (message.inputTokens) {
         <span class="token-count">In: {{ message.inputTokens }}</span>
       }
       @if (message.outputTokens) {
         <span class="token-count">Out: {{ message.outputTokens }}</span>
       }
-    </div>
-  }
+    }
+    @if (isAssistant && message.content) {
+      <button class="copy-btn" (click)="copyContent()" title="Copy">
+        <ion-icon name="copy-outline"></ion-icon>
+      </button>
+    }
+  </div>
 </div>

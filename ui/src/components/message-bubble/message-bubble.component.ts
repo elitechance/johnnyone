@@ -1,7 +1,9 @@
 import { Component, Input, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { IonicModule } from '@ionic/angular';
+import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { AiMessage, ToolCallRef } from '../../models/ai-message.model';
+import { marked } from 'marked';
 
 @Component({
   selector: 'johnny-message-bubble',
@@ -13,6 +15,15 @@ import { AiMessage, ToolCallRef } from '../../models/ai-message.model';
 })
 export class MessageBubbleComponent {
   @Input({ required: true }) message!: AiMessage;
+  @Input() isStreamingMessage = false;
+
+  constructor(private sanitizer: DomSanitizer) {
+    // Configure marked for safe rendering
+    marked.setOptions({
+      gfm: true,
+      breaks: true,
+    });
+  }
 
   get isUser(): boolean {
     return this.message.role === 'user';
@@ -70,11 +81,38 @@ export class MessageBubbleComponent {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  /** Render message content as markdown (for assistant) or plain text (for user). */
+  get renderedContent(): SafeHtml {
+    if (!this.message.content) {
+      return '';
+    }
+
+    // Only render markdown for assistant messages
+    if (this.isAssistant) {
+      const html = marked.parse(this.message.content) as string;
+      return this.sanitizer.bypassSecurityTrustHtml(html);
+    }
+
+    return this.message.content;
+  }
+
+  get useHtml(): boolean {
+    return this.isAssistant;
+  }
+
   formatToolCallInput(toolCall: ToolCallRef): string {
     try {
       return JSON.stringify(toolCall.input, null, 2);
     } catch {
       return String(toolCall.input);
+    }
+  }
+
+  async copyContent(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(this.message.content);
+    } catch {
+      // Clipboard API not available
     }
   }
 }

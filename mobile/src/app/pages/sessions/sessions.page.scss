@@ -25,8 +25,12 @@ ion-content {
   --padding-end: 8px;
   --padding-top: 8px;
 
-  jno-session-list {
+  jno-session-list,
+  johnny-session-list {
     display: block;
     width: 100%;
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
   }
 }

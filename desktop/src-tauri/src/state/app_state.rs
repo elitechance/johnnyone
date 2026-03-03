@@ -1,5 +1,10 @@
+use crate::db::Database;
+use crate::providers::cli_runner::CliProcess;
 use crate::tools::tool_schema::ToolExecutionRecord;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
@@ -28,23 +33,27 @@ impl Default for ConnectionStatus {
 ///
 /// Uses `tokio::sync::Mutex` for async-safe access from Tauri command handlers
 /// and the agent service background task.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
+    /// Local SQLite database.
+    pub db: Database,
     /// Current WebSocket connection status.
-    pub connection_status: std::sync::Arc<Mutex<ConnectionStatus>>,
+    pub connection_status: Arc<Mutex<ConnectionStatus>>,
     /// Unique node ID for this desktop agent instance.
     pub node_id: String,
     /// Human-readable node name.
     pub node_name: String,
     /// History of tool executions.
-    pub tool_executions: std::sync::Arc<Mutex<Vec<ToolExecutionRecord>>>,
+    pub tool_executions: Arc<Mutex<Vec<ToolExecutionRecord>>>,
+    /// Currently running CLI subprocesses, keyed by session_id.
+    pub active_processes: Arc<Mutex<HashMap<String, CliProcess>>>,
     /// Broadcast channel sender for shutdown signals.
     pub shutdown_tx: broadcast::Sender<()>,
 }
 
 impl AppState {
-    /// Create a new AppState with default values.
-    pub fn new() -> Self {
+    /// Create a new AppState with a database.
+    pub fn new(db: Database) -> Self {
         let node_id = Uuid::new_v4().to_string();
         let node_name = format!("desktop-{}", &node_id[..8]);
         let (shutdown_tx, _) = broadcast::channel(16);
@@ -56,23 +65,27 @@ impl AppState {
         );
 
         Self {
-            connection_status: std::sync::Arc::new(Mutex::new(ConnectionStatus::default())),
+            db,
+            connection_status: Arc::new(Mutex::new(ConnectionStatus::default())),
             node_id,
             node_name,
-            tool_executions: std::sync::Arc::new(Mutex::new(Vec::new())),
+            tool_executions: Arc::new(Mutex::new(Vec::new())),
+            active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
         }
     }
 
     /// Create a new AppState with a specific node ID and name.
-    pub fn with_node_info(node_id: String, node_name: String) -> Self {
+    pub fn with_node_info(db: Database, node_id: String, node_name: String) -> Self {
         let (shutdown_tx, _) = broadcast::channel(16);
 
         Self {
-            connection_status: std::sync::Arc::new(Mutex::new(ConnectionStatus::default())),
+            db,
+            connection_status: Arc::new(Mutex::new(ConnectionStatus::default())),
             node_id,
             node_name,
-            tool_executions: std::sync::Arc::new(Mutex::new(Vec::new())),
+            tool_executions: Arc::new(Mutex::new(Vec::new())),
+            active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
         }
     }
@@ -92,8 +105,11 @@ impl AppState {
     }
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
+impl fmt::Debug for AppState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppState")
+            .field("node_id", &self.node_id)
+            .field("node_name", &self.node_name)
+            .finish_non_exhaustive()
     }
 }

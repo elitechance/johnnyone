@@ -25,6 +25,12 @@ export {
 } from './services/graphql-client';
 export { JohnnyApiService } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
+export type {
+  ChatBackend,
+  ChatMessage,
+  ChatSession,
+  ChatDeltaEvent,
+} from './services/chat-backend.interface';
 
 // ── Components ───────────────────────────────────────────────────────────────
 export { ChatWindowComponent } from './components/chat-window/chat-window.component';

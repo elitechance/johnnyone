@@ -1,0 +1,82 @@
+interface ResolverContext {
+  db: D1Database;
+  env: WorkerEnv;
+  auth: { userId: string; tenantId: string };
+}
+
+interface WorkerEnv {
+  CHAT_RELAY_DO: DurableObjectNamespace;
+  [key: string]: unknown;
+}
+
+interface RelayChatMessageInput {
+  sessionId: string;
+  content: string;
+  provider?: string;
+  model?: string;
+  workingDirectory?: string;
+}
+
+/**
+ * Relay a chat message from mobile to the desktop via ChatRelayDO.
+ *
+ * 1. Find an online desktop node for this user
+ * 2. Route the request to the ChatRelayDO for that node
+ * 3. The DO forwards to the desktop via WebSocket
+ */
+export default async function sendRelayChatMessage(
+  _parent: unknown,
+  args: { input: RelayChatMessageInput },
+  ctx: ResolverContext,
+) {
+  const { sessionId, content, provider, model, workingDirectory } = args.input;
+
+  // Find an online desktop node for this user
+  const node = await ctx.db
+    .prepare(
+      `SELECT id FROM desktop_nodes
+       WHERE tenant_id = ? AND user_id = ? AND status = 'online' AND is_deleted = 0
+       ORDER BY last_heartbeat_at DESC LIMIT 1`,
+    )
+    .bind(ctx.auth.tenantId, ctx.auth.userId)
+    .first<{ id: string }>();
+
+  if (!node) {
+    throw new Error('No online desktop node found. Please ensure your desktop app is running and connected.');
+  }
+
+  // Get or create a ChatRelayDO instance for this desktop node
+  const doId = (ctx.env.CHAT_RELAY_DO as DurableObjectNamespace).idFromName(node.id);
+  const doStub = (ctx.env.CHAT_RELAY_DO as DurableObjectNamespace).get(doId);
+
+  const relayId = crypto.randomUUID();
+
+  // Send the relay request to the DO
+  const response = await doStub.fetch('https://internal/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'chat_request',
+      relayId,
+      sessionId,
+      data: {
+        content,
+        provider: provider ?? 'claude_code',
+        model: model ?? '',
+        workingDirectory: workingDirectory ?? '',
+        userId: ctx.auth.userId,
+        tenantId: ctx.auth.tenantId,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to relay message to desktop node');
+  }
+
+  return {
+    success: true,
+    relayId,
+    desktopNodeId: node.id,
+  };
+}

@@ -102,3 +102,23 @@ body {
 ion-content {
   --keyboard-offset: 0px !important;
 }
+
+/* Desktop-friendly responsive constraints */
+@media (min-width: 768px) {
+  ion-content {
+    --padding-start: 16px;
+    --padding-end: 16px;
+  }
+
+  /* Center content with max-width on wide screens */
+  ion-list,
+  .page-content,
+  .save-button-container,
+  .settings-content,
+  .chat-messages,
+  .chat-input-container {
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
