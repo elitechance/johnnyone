@@ -1,4 +1,15 @@
-import { Component, OnInit, OnDestroy, inject, signal, computed } from '@angular/core';
+import {
+  Component,
+  OnInit,
+  OnDestroy,
+  AfterViewInit,
+  inject,
+  signal,
+  computed,
+  effect,
+  ViewChild,
+  ElementRef,
+} from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import {
@@ -37,11 +48,14 @@ import { Subscription } from 'rxjs';
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.scss'],
 })
-export class ChatPage implements OnInit, OnDestroy {
+export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
   private readonly tauriBridge = inject(TauriBridgeService);
   private readonly router = inject(Router);
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
+  @ViewChild('chatMessages') private chatMessagesRef?: ElementRef<HTMLDivElement>;
+  private shouldAutoScroll = true;
+  private autoScrollScheduled = false;
 
   // State
   sessions = signal<Session[]>([]);
@@ -87,6 +101,16 @@ export class ChatPage implements OnInit, OnDestroy {
     };
   });
 
+  // Keep viewport pinned when user is near bottom.
+  private readonly autoScrollEffect = effect(() => {
+    this.currentSession();
+    this.aiMessages();
+    this.streamingContent();
+    if (this.shouldAutoScroll) {
+      this.scheduleAutoScroll();
+    }
+  });
+
   ngOnInit(): void {
     this.loadSessions();
     this.detectTools();
@@ -94,6 +118,10 @@ export class ChatPage implements OnInit, OnDestroy {
     this.subscribeToComplete();
     this.loadLastWorkingDirectory();
     this.ensureSettingsAndConnect();
+  }
+
+  ngAfterViewInit(): void {
+    this.scheduleAutoScroll();
   }
 
   ngOnDestroy(): void {
@@ -152,6 +180,7 @@ export class ChatPage implements OnInit, OnDestroy {
         working_directory: this.workingDirectory(),
       });
       this.sessions.update(s => [session, ...s]);
+      this.shouldAutoScroll = true;
       await this.selectSession(session.id);
     } catch (err) {
       console.error('Failed to create session:', err);
@@ -167,6 +196,7 @@ export class ChatPage implements OnInit, OnDestroy {
 
       const messages = await this.tauriBridge.listMessages(id);
       this.messages.set(messages);
+      this.shouldAutoScroll = true;
 
       this.isStreaming.set(false);
       this.streamingContent.set('');
@@ -213,8 +243,16 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   onMessageSent(text: string): void {
+    this.shouldAutoScroll = true;
     this.currentMessage = text;
     this.sendMessage();
+  }
+
+  onChatScroll(): void {
+    const el = this.chatMessagesRef?.nativeElement;
+    if (!el) return;
+    const threshold = 96;
+    this.shouldAutoScroll = el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
   }
 
   // ── Chat ───────────────────────────────────────────────────────────
@@ -231,6 +269,7 @@ export class ChatPage implements OnInit, OnDestroy {
     }
 
     this.currentMessage = '';
+    this.shouldAutoScroll = true;
     this.isStreaming.set(true);
     this.streamingContent.set('');
 
@@ -411,6 +450,18 @@ export class ChatPage implements OnInit, OnDestroy {
     if (dir) {
       await this.onWorkingDirectoryChange(dir);
     }
+  }
+
+  private scheduleAutoScroll(): void {
+    if (this.autoScrollScheduled) return;
+    this.autoScrollScheduled = true;
+
+    requestAnimationFrame(() => {
+      this.autoScrollScheduled = false;
+      const el = this.chatMessagesRef?.nativeElement;
+      if (!el || !this.shouldAutoScroll) return;
+      el.scrollTop = el.scrollHeight;
+    });
   }
 
   // ── Helpers ────────────────────────────────────────────────────────

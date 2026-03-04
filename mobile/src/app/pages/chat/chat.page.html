@@ -28,7 +28,7 @@
   </ion-header>
 }
 
-<ion-content class="chat-content">
+<ion-content class="chat-content" #chatContent [scrollEvents]="true" (ionScroll)="onContentScroll()">
   <ion-refresher slot="fixed" (ionRefresh)="onRefresh($event)">
     <ion-refresher-content></ion-refresher-content>
   </ion-refresher>

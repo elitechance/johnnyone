@@ -8,12 +8,17 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { IonicModule, IonTextarea } from '@ionic/angular';
+import {
+  IonTextarea,
+  IonItem,
+  IonButton,
+  IonIcon,
+} from '@ionic/angular/standalone';
 
 @Component({
   selector: 'johnny-message-composer',
   standalone: true,
-  imports: [CommonModule, FormsModule, IonicModule],
+  imports: [CommonModule, FormsModule, IonTextarea, IonItem, IonButton, IonIcon],
   templateUrl: './message-composer.component.html',
   styleUrls: ['./message-composer.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,

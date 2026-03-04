@@ -5,9 +5,11 @@
 }
 
 ion-header {
+  border-bottom: 1px solid var(--app-border, #2a3b5f);
+
   ion-toolbar {
-    --background: var(--ion-toolbar-background, #fff);
-    --color: var(--ion-toolbar-color, #000);
+    --background: var(--app-surface-1, var(--ion-toolbar-background, #fff));
+    --color: var(--app-text, var(--ion-toolbar-color, #000));
   }
 
   ion-title {
@@ -41,6 +43,8 @@ ion-header {
   align-items: center;
   justify-content: space-between;
   padding: 16px;
+  border-bottom: 1px solid var(--app-border, #2a3b5f);
+  margin-bottom: 8px;
 
   h2 {
     margin: 0;
@@ -102,7 +106,7 @@ ion-header {
   align-items: center;
   justify-content: center;
   text-align: center;
-  color: var(--ion-color-step-500, #64748b);
+  color: var(--app-text-muted, var(--ion-color-step-500, #64748b));
   padding: 24px;
 
   h2 {
@@ -126,6 +130,7 @@ ion-header {
 .chat-input-container {
   padding: 12px 16px;
   padding-bottom: max(12px, env(safe-area-inset-bottom));
-  border-top: 1px solid var(--ion-color-step-150, #e2e8f0);
-  background: var(--ion-toolbar-background, #fff);
+  border-top: 1px solid var(--app-border, var(--ion-color-step-150, #e2e8f0));
+  background: var(--app-surface-1, var(--ion-toolbar-background, #fff));
+  box-shadow: 0 -8px 20px rgba(2, 8, 23, 0.35);
 }

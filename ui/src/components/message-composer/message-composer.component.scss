@@ -10,18 +10,27 @@
 
 .input-wrapper {
   flex: 1;
-  --background: var(--ion-color-light, #f4f4f4);
+  --background: var(--app-surface-2, #16243f);
+  --color: var(--app-text, #e6edf9);
   --border-radius: 20px;
   --padding-start: 16px;
   --padding-end: 8px;
   --inner-padding-end: 0;
   --min-height: 42px;
   border-radius: 20px;
+  border: 1px solid var(--app-border, #2a3b5f);
 }
 
 .message-input {
+  display: block;
+  width: 100%;
+  min-height: 22px;
+  flex: 1 1 auto;
   --padding-top: 8px;
   --padding-bottom: 8px;
+  --placeholder-color: var(--app-text-muted, #9fb0cd);
+  --placeholder-opacity: 0.7;
+  color: var(--app-text, #e6edf9);
   font-size: 15px;
   max-height: 150px;
 }

@@ -1,4 +1,14 @@
-import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
+import {
+  Component,
+  inject,
+  signal,
+  computed,
+  effect,
+  ViewChild,
+  OnInit,
+  OnDestroy,
+  AfterViewInit,
+} from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import {
@@ -68,10 +78,18 @@ interface RelayEnvelope {
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.scss'],
 })
-export class ChatPage implements OnInit, OnDestroy {
+export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
+  private static readonly ACTIVE_SESSION_KEY = 'johnnyone_mobile_active_session';
   private readonly api = inject(JohnnyApiService);
   private relayWs: WebSocket | null = null;
   private onlineNodeId: string | null = null;
+  private streamingTimeout: ReturnType<typeof setTimeout> | null = null;
+  @ViewChild('chatContent') private chatContent?: IonContent;
+  private chatScrollEl: HTMLElement | null = null;
+  private shouldAutoScroll = true;
+  private autoScrollScheduled = false;
+  private preferNewSession = false;
+  private initializedSessionView = false;
 
   /** View state: 'sessions' shows session list, 'chat' shows messages */
   view = signal<'sessions' | 'chat'>('sessions');
@@ -98,11 +116,30 @@ export class ChatPage implements OnInit, OnDestroy {
     return msgs;
   });
 
+  // Keep viewport pinned while user stays near the bottom.
+  private readonly autoScrollEffect = effect(() => {
+    if (this.view() !== 'chat') return;
+    this.aiMessages();
+    this.streamingContent();
+    if (this.shouldAutoScroll) {
+      this.scheduleAutoScroll();
+    }
+  });
+
   ngOnInit(): void {
     this.checkDesktopStatus();
   }
 
+  ngAfterViewInit(): void {
+    this.chatContent?.getScrollElement().then((el) => {
+      this.chatScrollEl = el;
+      this.scheduleAutoScroll();
+    });
+    this.scheduleAutoScroll();
+  }
+
   ngOnDestroy(): void {
+    this.clearStreamingTimeout();
     this.disconnectRelayWs();
   }
 
@@ -141,8 +178,17 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   onMessageSent(text: string): void {
+    this.shouldAutoScroll = true;
     this.currentMessage = text;
     this.sendMessage();
+  }
+
+  onContentScroll(): void {
+    if (this.view() !== 'chat') return;
+    const el = this.chatScrollEl;
+    if (!el) return;
+    const threshold = 96;
+    this.shouldAutoScroll = el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
   }
 
   // ── Desktop Status & WebSocket ─────────────────────────────────────
@@ -181,6 +227,12 @@ export class ChatPage implements OnInit, OnDestroy {
     };
 
     this.relayWs.onclose = () => {
+      if (this.isStreaming()) {
+        this.clearStreamingTimeout();
+        this.isStreaming.set(false);
+        this.streamingContent.set('');
+      }
+
       if (this.desktopOnline() && this.onlineNodeId) {
         setTimeout(() => {
           if (this.onlineNodeId) this.connectRelayWs(this.onlineNodeId);
@@ -215,6 +267,7 @@ export class ChatPage implements OnInit, OnDestroy {
     switch (envelope.type) {
       case 'chat_delta': {
         if (data.chunkType === 'text' && data.delta) {
+          this.bumpStreamingTimeout();
           this.streamingContent.update((c) => c + data.delta);
 
           const msgs = this.messages();
@@ -262,6 +315,7 @@ export class ChatPage implements OnInit, OnDestroy {
           });
           this.isStreaming.set(false);
           this.streamingContent.set('');
+          this.clearStreamingTimeout();
         }
         break;
       }
@@ -282,6 +336,7 @@ export class ChatPage implements OnInit, OnDestroy {
     }
     this.isStreaming.set(false);
     this.streamingContent.set('');
+    this.clearStreamingTimeout();
   }
 
   // ── Sessions ───────────────────────────────────────────────────────
@@ -291,6 +346,19 @@ export class ChatPage implements OnInit, OnDestroy {
     this.api.listSessions().subscribe({
       next: (sessions) => {
         this.sessions.set(sessions);
+        const preferredSession = this.syncActiveSession(sessions);
+
+        // On first load, behave like desktop and reopen the latest/preferred session.
+        if (!this.initializedSessionView && preferredSession && !this.preferNewSession) {
+          this.initializedSessionView = true;
+          this.selectSession(preferredSession);
+          return;
+        }
+
+        if (!this.initializedSessionView) {
+          this.initializedSessionView = true;
+        }
+
         this.loading.set(false);
       },
       error: (err) => {
@@ -302,8 +370,11 @@ export class ChatPage implements OnInit, OnDestroy {
 
   selectSession(session: AiSession): void {
     this.activeSession.set(session);
+    this.setStoredActiveSessionId(session.id);
+    this.preferNewSession = false;
     this.view.set('chat');
     this.messages.set([]);
+    this.shouldAutoScroll = true;
     this.loading.set(true);
 
     this.api.listMessages(session.id).subscribe({
@@ -337,8 +408,11 @@ export class ChatPage implements OnInit, OnDestroy {
     const sessionId = crypto.randomUUID();
     localStorage.setItem('johnnyone_mobile_session', sessionId);
     this.activeSession.set(null);
+    this.setStoredActiveSessionId(null);
+    this.preferNewSession = true;
     this.messages.set([]);
     this.view.set('chat');
+    this.shouldAutoScroll = true;
   }
 
   onRefresh(event: CustomEvent): void {
@@ -364,19 +438,47 @@ export class ChatPage implements OnInit, OnDestroy {
     };
     this.messages.update((msgs) => [...msgs, userMsg]);
     this.currentMessage = '';
+    this.shouldAutoScroll = true;
     this.isStreaming.set(true);
     this.streamingContent.set('');
+    this.bumpStreamingTimeout();
 
-    const sessionId = this.activeSession()?.id ?? this.getOrCreateSessionId();
+    let sessionId = this.activeSession()?.id;
+    if (!sessionId && !this.preferNewSession) {
+      const existing = this.sessions()[0];
+      if (existing) {
+        sessionId = existing.id;
+        this.activeSession.set(existing);
+        this.setStoredActiveSessionId(existing.id);
+      }
+    }
+    sessionId = sessionId ?? this.getOrCreateSessionId();
+    this.preferNewSession = false;
+
+    const active = this.activeSession();
+    const relayInput: {
+      sessionId: string;
+      content: string;
+      provider?: string;
+      model?: string;
+      workingDirectory?: string;
+    } = {
+      sessionId,
+      content: text,
+      provider: active?.provider || undefined,
+      model: active?.model || undefined,
+      workingDirectory: active?.workingDirectory || undefined,
+    };
 
     this.api
-      .sendRelayMessage({ sessionId, content: text })
+      .sendRelayMessage(relayInput)
       .subscribe({
         next: (result) => {
           this.currentRelayId.set(result.relayId);
         },
         error: (err) => {
           console.error('Failed to relay message:', err);
+          this.clearStreamingTimeout();
           this.isStreaming.set(false);
           this.messages.update((msgs) => [
             ...msgs,
@@ -389,6 +491,83 @@ export class ChatPage implements OnInit, OnDestroy {
           ]);
         },
       });
+  }
+
+  private bumpStreamingTimeout(): void {
+    this.clearStreamingTimeout();
+    this.streamingTimeout = setTimeout(() => {
+      if (!this.isStreaming()) return;
+      this.isStreaming.set(false);
+      this.streamingContent.set('');
+      this.messages.update((msgs) => [
+        ...msgs,
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: 'Response timed out. Please try again.',
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+    }, 45000);
+  }
+
+  private clearStreamingTimeout(): void {
+    if (this.streamingTimeout) {
+      clearTimeout(this.streamingTimeout);
+      this.streamingTimeout = null;
+    }
+  }
+
+  private scheduleAutoScroll(): void {
+    if (this.autoScrollScheduled) return;
+    this.autoScrollScheduled = true;
+
+    requestAnimationFrame(() => {
+      this.autoScrollScheduled = false;
+      const el = this.chatScrollEl;
+      if (!el || !this.shouldAutoScroll || this.view() !== 'chat') return;
+      el.scrollTop = el.scrollHeight;
+    });
+  }
+
+  private syncActiveSession(sessions: AiSession[]): AiSession | null {
+    const current = this.activeSession();
+    if (current) {
+      const refreshed = sessions.find((s) => s.id === current.id);
+      if (refreshed) {
+        this.activeSession.set(refreshed);
+        return refreshed;
+      }
+    }
+
+    const storedId = this.getStoredActiveSessionId();
+    if (storedId) {
+      const stored = sessions.find((s) => s.id === storedId);
+      if (stored) {
+        this.activeSession.set(stored);
+        return stored;
+      }
+    }
+
+    if (!this.preferNewSession && sessions.length > 0) {
+      this.activeSession.set(sessions[0]);
+      this.setStoredActiveSessionId(sessions[0].id);
+      return sessions[0];
+    }
+
+    return null;
+  }
+
+  private getStoredActiveSessionId(): string | null {
+    return localStorage.getItem(ChatPage.ACTIVE_SESSION_KEY);
+  }
+
+  private setStoredActiveSessionId(id: string | null): void {
+    if (id) {
+      localStorage.setItem(ChatPage.ACTIVE_SESSION_KEY, id);
+    } else {
+      localStorage.removeItem(ChatPage.ACTIVE_SESSION_KEY);
+    }
   }
 
   private getOrCreateSessionId(): string {

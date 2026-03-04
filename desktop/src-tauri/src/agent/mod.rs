@@ -5,13 +5,13 @@ pub mod registration;
 pub mod ws_client;
 
 use crate::providers::{
-    cli_runner, claude_code, codex, cline, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
 use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use message_types::{
-    AgentEnvelope, AgentMessage, RelayChatDelta, RelayChatComplete, RelayChatRequest,
+    AgentEnvelope, AgentMessage, RelayChatComplete, RelayChatDelta, RelayChatRequest,
     RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted,
 };
 use std::sync::Arc;
@@ -43,9 +43,7 @@ impl AgentService {
         let tool_dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
 
         // Register this desktop node with the worker
-        let hostname = gethostname::gethostname()
-            .to_string_lossy()
-            .to_string();
+        let hostname = gethostname::gethostname().to_string_lossy().to_string();
 
         tracing::info!(
             worker_url = %config.worker_url,
@@ -264,7 +262,10 @@ impl AgentService {
                 // Update the execution record
                 {
                     let mut executions = state.tool_executions.lock().await;
-                    if let Some(rec) = executions.iter_mut().find(|r| r.call_id == tool_call.call_id) {
+                    if let Some(rec) = executions
+                        .iter_mut()
+                        .find(|r| r.call_id == tool_call.call_id)
+                    {
                         rec.complete(result.clone());
                     }
                 }
@@ -278,7 +279,9 @@ impl AgentService {
 
                 let mut writer = ws_write.lock().await;
                 writer
-                    .send(tokio_tungstenite::tungstenite::Message::Text(response_text.into()))
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        response_text.into(),
+                    ))
                     .await
                     .map_err(|e| format!("Send error: {}", e))?;
             }
@@ -456,14 +459,8 @@ impl AgentService {
             .get("sessionId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
-        let limit = params
-            .get("limit")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(100);
-        let offset = params
-            .get("offset")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+        let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
 
         state.db.with_conn(|conn| {
             let mut stmt = conn
@@ -516,8 +513,7 @@ impl AgentService {
         state.db.with_conn(|conn| {
             conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])
                 .map_err(|e| e.to_string())?;
-            serde_json::to_value(serde_json::json!({ "deleted": true }))
-                .map_err(|e| e.to_string())
+            serde_json::to_value(serde_json::json!({ "deleted": true })).map_err(|e| e.to_string())
         })
     }
 
@@ -528,29 +524,109 @@ impl AgentService {
         ws_write: Arc<Mutex<ws_client::WsWrite>>,
         state: Arc<AppState>,
     ) -> Result<(), String> {
-        let provider_str = req.provider.as_deref().unwrap_or("claude_code");
-        let model = req.model.as_deref().unwrap_or("");
-        let working_dir = req.working_directory.as_deref().unwrap_or("");
+        // Prefer the existing local session config to avoid resetting provider/model/cwd
+        // when relay callers omit metadata (or send generic defaults).
+        let existing_session: Option<(String, String, String, Option<String>)> =
+            state.db.with_conn(|conn| {
+                match conn.query_row(
+                    "SELECT provider, model, working_directory, cli_session_id FROM sessions WHERE id = ?1",
+                    rusqlite::params![req.session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                ) {
+                    Ok(row) => Ok(Some(row)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                }
+            })?;
 
-        let provider = CliProvider::from_str(provider_str)
+        let req_provider = req
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let req_model = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let req_working_dir = req
+            .working_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let provider_str = existing_session
+            .as_ref()
+            .map(|(provider, _, _, _)| provider.clone())
+            .or_else(|| req_provider.map(str::to_string))
+            .unwrap_or_else(|| "claude_code".to_string());
+
+        let model = req_model
+            .map(str::to_string)
+            .or_else(|| {
+                existing_session
+                    .as_ref()
+                    .map(|(_, model, _, _)| model.clone())
+            })
+            .unwrap_or_default();
+
+        let working_dir = req_working_dir
+            .map(str::to_string)
+            .or_else(|| {
+                existing_session
+                    .as_ref()
+                    .map(|(_, _, working_dir, _)| working_dir.clone())
+            })
+            .unwrap_or_default();
+
+        let persisted_cli_session_id = existing_session
+            .as_ref()
+            .and_then(|(_, _, _, cli_session_id)| cli_session_id.clone());
+
+        let provider = CliProvider::from_str(&provider_str)
             .ok_or_else(|| format!("Unknown provider: {}", provider_str))?;
 
         // Look up CLI path from config
+        let provider_key = provider.as_str();
         let cli_path: Option<String> = state.db.with_conn(|conn| {
             let result = conn.query_row(
                 "SELECT cli_path FROM provider_configs WHERE provider = ?1",
-                rusqlite::params![provider_str],
+                rusqlite::params![provider_key],
                 |row| row.get::<_, String>(0),
             );
             Ok(result.ok().filter(|p| !p.is_empty()))
         })?;
 
         let cli_path_ref = cli_path.as_deref();
+        let cli_sid_ref = if provider == CliProvider::ClaudeCode {
+            persisted_cli_session_id.as_deref()
+        } else {
+            None
+        };
         let config = match provider {
-            CliProvider::ClaudeCode => claude_code::build_config(&req.content, working_dir, model, cli_path_ref, None),
-            CliProvider::Codex => codex::build_config(&req.content, working_dir, model, cli_path_ref),
-            CliProvider::Cline => cline::build_config(&req.content, working_dir, model, cli_path_ref),
-            CliProvider::Ollama => ollama_cli::build_config(&req.content, working_dir, model, cli_path_ref),
+            CliProvider::ClaudeCode => claude_code::build_config(
+                &req.content,
+                &working_dir,
+                &model,
+                cli_path_ref,
+                cli_sid_ref,
+            ),
+            CliProvider::Codex => {
+                codex::build_config(&req.content, &working_dir, &model, cli_path_ref)
+            }
+            CliProvider::Cline => {
+                cline::build_config(&req.content, &working_dir, &model, cli_path_ref)
+            }
+            CliProvider::Ollama => {
+                ollama_cli::build_config(&req.content, &working_dir, &model, cli_path_ref)
+            }
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -565,10 +641,37 @@ impl AgentService {
 
         // Stream chunks back through WebSocket as relay deltas
         let mut full_content = String::new();
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+        let mut total_cost_cents: i64 = 0;
+        let mut captured_cli_session_id: Option<String> = None;
+        let mut clear_cli_session_id = false;
 
         while let Some(chunk) = rx.recv().await {
             if chunk.chunk_type == ChunkType::Text {
                 full_content.push_str(&chunk.content);
+            }
+
+            if (chunk.chunk_type == ChunkType::System || chunk.chunk_type == ChunkType::Result)
+                && chunk.session_id.is_some()
+            {
+                captured_cli_session_id = chunk.session_id.clone();
+            }
+
+            if chunk.chunk_type == ChunkType::Error {
+                clear_cli_session_id = true;
+            }
+
+            if chunk.chunk_type == ChunkType::Result {
+                if let Some(tokens) = chunk.input_tokens {
+                    total_input_tokens = tokens;
+                }
+                if let Some(tokens) = chunk.output_tokens {
+                    total_output_tokens = tokens;
+                }
+                if let Some(cost) = chunk.cost_usd {
+                    total_cost_cents = (cost * 100.0) as i64;
+                }
             }
 
             let delta = RelayChatDelta {
@@ -583,8 +686,8 @@ impl AgentService {
                 message: AgentMessage::RelayChatDelta(delta),
             };
 
-            let msg = serde_json::to_string(&envelope)
-                .map_err(|e| format!("Serialize error: {}", e))?;
+            let msg =
+                serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
 
             let mut writer = ws_write.lock().await;
             let _ = writer
@@ -607,8 +710,8 @@ impl AgentService {
             message: AgentMessage::RelayChatComplete(complete),
         };
 
-        let msg = serde_json::to_string(&envelope)
-            .map_err(|e| format!("Serialize error: {}", e))?;
+        let msg =
+            serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
 
         let mut writer = ws_write.lock().await;
         let _ = writer
@@ -624,7 +727,13 @@ impl AgentService {
             // Ensure session exists locally
             conn.execute(
                 "INSERT OR IGNORE INTO sessions (id, title, provider, model, working_directory) VALUES (?1, 'Mobile Session', ?2, ?3, ?4)",
-                rusqlite::params![session_id, provider_str, model, working_dir],
+                rusqlite::params![session_id, provider_key, model, working_dir],
+            ).map_err(|e| e.to_string())?;
+
+            // Keep local session config aligned with the resolved relay config.
+            conn.execute(
+                "UPDATE sessions SET provider = ?1, model = ?2, working_directory = ?3, updated_at = datetime('now') WHERE id = ?4",
+                rusqlite::params![provider_key, model, working_dir, session_id],
             ).map_err(|e| e.to_string())?;
 
             conn.execute(
@@ -633,9 +742,37 @@ impl AgentService {
             ).map_err(|e| e.to_string())?;
 
             conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, finish_reason) VALUES (?1, ?2, 'assistant', ?3, 'stop')",
-                rusqlite::params![assistant_msg_id, session_id, full_content],
-            ).map_err(|e| e.to_string())
+                "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents) VALUES (?1, ?2, 'assistant', ?3, 'stop', ?4, ?5, ?6)",
+                rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents],
+            ).map_err(|e| e.to_string())?;
+
+            if provider == CliProvider::ClaudeCode {
+                if clear_cli_session_id {
+                    conn.execute(
+                        "UPDATE sessions SET cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+                        rusqlite::params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else if let Some(ref cli_sid) = captured_cli_session_id {
+                    conn.execute(
+                        "UPDATE sessions SET cli_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        rusqlite::params![cli_sid, session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+
+            conn.execute(
+                "UPDATE sessions SET total_input_tokens = total_input_tokens + ?1, total_output_tokens = total_output_tokens + ?2, total_cost_cents = total_cost_cents + ?3, updated_at = datetime('now') WHERE id = ?4",
+                rusqlite::params![total_input_tokens, total_output_tokens, total_cost_cents, session_id],
+            )
+            .map_err(|e| e.to_string())?;
+
+            conn.execute(
+                "INSERT INTO usage_log (session_id, message_id, provider, model, input_tokens, output_tokens, cost_cents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![session_id, assistant_msg_id, provider_key, model, total_input_tokens, total_output_tokens, total_cost_cents],
+            )
+            .map_err(|e| e.to_string())
         });
 
         Ok(())

@@ -83,7 +83,7 @@
     </header>
 
     <!-- Chat Messages -->
-    <div class="chat-messages" #chatMessages>
+    <div class="chat-messages" #chatMessages (scroll)="onChatScroll()">
       @for (msg of aiMessages(); track msg.id) {
         <johnny-message-bubble
           [message]="msg"

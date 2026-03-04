@@ -50,6 +50,17 @@ export default async function sendRelayChatMessage(
   const doStub = (ctx.env.CHAT_RELAY_DO as DurableObjectNamespace).get(doId);
 
   const relayId = crypto.randomUUID();
+  const relayData: Record<string, unknown> = {
+    relayId,
+    sessionId,
+    content,
+    userId: ctx.auth.userId,
+    tenantId: ctx.auth.tenantId,
+  };
+
+  if (provider?.trim()) relayData.provider = provider.trim();
+  if (model?.trim()) relayData.model = model.trim();
+  if (workingDirectory?.trim()) relayData.workingDirectory = workingDirectory.trim();
 
   // Send the relay request to the DO
   const response = await doStub.fetch('https://internal/relay', {
@@ -57,16 +68,7 @@ export default async function sendRelayChatMessage(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       type: 'chat_request',
-      data: {
-        relayId,
-        sessionId,
-        content,
-        provider: provider ?? 'claude_code',
-        model: model ?? '',
-        workingDirectory: workingDirectory ?? '',
-        userId: ctx.auth.userId,
-        tenantId: ctx.auth.tenantId,
-      },
+      data: relayData,
     }),
   });
 
