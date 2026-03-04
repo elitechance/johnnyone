@@ -7,16 +7,23 @@ pub fn build_config(
     working_directory: &str,
     model: &str,
     cli_path: Option<&str>,
+    cli_session_id: Option<&str>,
 ) -> CliSpawnConfig {
     let command = cli_path.unwrap_or("codex").to_string();
     let mut args = vec![
-        "--quiet".to_string(),
+        "exec".to_string(),
         "--json".to_string(),
+        "--skip-git-repo-check".to_string(),
     ];
 
     if !model.is_empty() {
-        args.push("--model".to_string());
+        args.push("-m".to_string());
         args.push(model.to_string());
+    }
+
+    if let Some(session_id) = cli_session_id {
+        args.push("resume".to_string());
+        args.push(session_id.to_string());
     }
 
     args.push(prompt.to_string());

@@ -168,6 +168,10 @@ export class TauriBridgeService {
     return await invoke<Session>('update_session_working_directory', { id, workingDirectory });
   }
 
+  async updateSessionProvider(id: string, provider: string): Promise<Session> {
+    return await invoke<Session>('update_session_provider', { id, provider });
+  }
+
   async archiveSession(id: string): Promise<Session> {
     return await invoke<Session>('archive_session', { id });
   }

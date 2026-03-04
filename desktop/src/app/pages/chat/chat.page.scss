@@ -151,6 +151,13 @@
   gap: 8px;
 }
 
+.new-session-top {
+  --padding-start: 12px;
+  --padding-end: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 .provider-select {
   display: flex;
   align-items: center;

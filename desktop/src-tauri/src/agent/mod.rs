@@ -605,7 +605,7 @@ impl AgentService {
         })?;
 
         let cli_path_ref = cli_path.as_deref();
-        let cli_sid_ref = if provider == CliProvider::ClaudeCode {
+        let cli_sid_ref = if provider == CliProvider::ClaudeCode || provider == CliProvider::Codex {
             persisted_cli_session_id.as_deref()
         } else {
             None
@@ -619,7 +619,7 @@ impl AgentService {
                 cli_sid_ref,
             ),
             CliProvider::Codex => {
-                codex::build_config(&req.content, &working_dir, &model, cli_path_ref)
+                codex::build_config(&req.content, &working_dir, &model, cli_path_ref, cli_sid_ref)
             }
             CliProvider::Cline => {
                 cline::build_config(&req.content, &working_dir, &model, cli_path_ref)
@@ -746,7 +746,7 @@ impl AgentService {
                 rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents],
             ).map_err(|e| e.to_string())?;
 
-            if provider == CliProvider::ClaudeCode {
+            if provider == CliProvider::ClaudeCode || provider == CliProvider::Codex {
                 if clear_cli_session_id {
                     conn.execute(
                         "UPDATE sessions SET cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",

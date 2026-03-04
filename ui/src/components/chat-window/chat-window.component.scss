@@ -50,6 +50,12 @@
     margin-top: 8px;
     color: var(--ion-color-danger, #ef4444);
   }
+
+  .empty-actions {
+    margin-top: 14px;
+    display: flex;
+    justify-content: center;
+  }
 }
 
 .message-item {

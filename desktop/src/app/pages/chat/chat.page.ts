@@ -145,6 +145,24 @@ export class ChatPage implements OnInit, OnDestroy {
     try {
       const sessions = await this.tauriBridge.listSessions();
       this.sessions.set(sessions);
+
+      // Reopen the latest session on startup (desktop parity with mobile),
+      // but keep current selection when it still exists.
+      const current = this.currentSession();
+      if (current) {
+        const refreshed = sessions.find((s) => s.id === current.id);
+        if (refreshed) {
+          this.currentSession.set(refreshed);
+        } else {
+          this.currentSession.set(null);
+          this.messages.set([]);
+        }
+        return;
+      }
+
+      if (sessions.length > 0) {
+        await this.selectSession(sessions[0].id);
+      }
     } catch (err) {
       console.error('Failed to load sessions:', err);
     }
@@ -235,6 +253,21 @@ export class ChatPage implements OnInit, OnDestroy {
       if (!session) return;
     }
 
+    const desiredProvider = this.selectedProvider();
+    if (session.provider !== desiredProvider) {
+      try {
+        const updated = await this.tauriBridge.updateSessionProvider(session.id, desiredProvider);
+        session = updated;
+        this.currentSession.set(updated);
+        this.sessions.update((all) =>
+          all.map((s) => (s.id === updated.id ? { ...s, provider: updated.provider } : s))
+        );
+      } catch (err) {
+        console.error('Failed to sync provider before send:', err);
+        return;
+      }
+    }
+
     this.currentMessage = '';
     this.isStreaming.set(true);
     this.streamingContent.set('');
@@ -245,6 +278,7 @@ export class ChatPage implements OnInit, OnDestroy {
     } catch (err) {
       console.error('Failed to send message:', err);
       this.isStreaming.set(false);
+      this.currentMessage = text;
     }
   }
 
@@ -398,6 +432,21 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async onProviderChange(provider: string): Promise<void> {
     this.selectedProvider.set(provider);
+
+    const session = this.currentSession();
+    if (!session) return;
+
+    try {
+      const updated = await this.tauriBridge.updateSessionProvider(session.id, provider);
+      this.currentSession.set(updated);
+      this.sessions.update((all) =>
+        all.map((s) => (s.id === updated.id ? { ...s, provider: updated.provider } : s))
+      );
+    } catch (err) {
+      console.error('Failed to update session provider:', err);
+      // Revert UI selection to persisted value on error.
+      this.selectedProvider.set(session.provider);
+    }
   }
 
   async onWorkingDirectoryChange(dir: string): Promise<void> {

@@ -197,11 +197,34 @@ pub fn parse_codex_line(line: &str) -> Option<StreamChunk> {
     let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match msg_type {
-        "message" | "" => {
-            let content = v
-                .get("content")
-                .or_else(|| v.get("message").and_then(|m| m.get("content")))
-                .and_then(|c| c.as_str())
+        "thread.started" => {
+            let session_id = v
+                .get("thread_id")
+                .and_then(|id| id.as_str())
+                .map(|id| id.to_string());
+            Some(StreamChunk {
+                chunk_type: ChunkType::System,
+                content: "Session initialized".to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_final: false,
+                session_id,
+            })
+        }
+        "item.completed" => {
+            let item = v.get("item")?;
+            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if item_type != "agent_message" {
+                return None;
+            }
+
+            let content = item
+                .get("text")
+                .and_then(|text| text.as_str())
                 .unwrap_or("")
                 .to_string();
             if content.is_empty() {
@@ -217,6 +240,52 @@ pub fn parse_codex_line(line: &str) -> Option<StreamChunk> {
                 input_tokens: None,
                 output_tokens: None,
                 is_final: false,
+                session_id: None,
+            })
+        }
+        "turn.completed" => {
+            let usage = v.get("usage");
+            let input_tokens = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|t| t.as_i64());
+            let output_tokens = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|t| t.as_i64());
+
+            Some(StreamChunk {
+                chunk_type: ChunkType::Result,
+                content: String::new(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                cost_usd: None,
+                input_tokens,
+                output_tokens,
+                is_final: true,
+                session_id: None,
+            })
+        }
+        "error" => {
+            let content = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                })
+                .unwrap_or("Codex returned an error")
+                .to_string();
+            Some(StreamChunk {
+                chunk_type: ChunkType::Error,
+                content,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_final: true,
                 session_id: None,
             })
         }

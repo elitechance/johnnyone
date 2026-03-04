@@ -1,4 +1,5 @@
 use crate::db::models::{CreateSessionInput, Session};
+use crate::providers::CliProvider;
 use crate::state::app_state::AppState;
 use rusqlite::params;
 use tauri::State;
@@ -128,6 +129,29 @@ pub async fn update_session_working_directory(
             params![working_directory, id],
         )
         .map_err(|e| format!("Failed to update working directory: {}", e))?;
+
+        query_session(conn, &id)
+    })
+}
+
+/// Update a session's provider.
+/// Clears cli_session_id to avoid invalid cross-provider resume state.
+#[tauri::command]
+pub async fn update_session_provider(
+    id: String,
+    provider: String,
+    state: State<'_, AppState>,
+) -> Result<Session, String> {
+    let normalized = provider.trim().to_string();
+    let parsed = CliProvider::from_str(&normalized)
+        .ok_or_else(|| format!("Unsupported provider: {}", provider))?;
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions SET provider = ?1, cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?2",
+            params![parsed.as_str(), id],
+        )
+        .map_err(|e| format!("Failed to update provider: {}", e))?;
 
         query_session(conn, &id)
     })

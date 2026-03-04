@@ -10,6 +10,9 @@
         @if (emptyHint) {
           <p class="empty-hint">{{ emptyHint }}</p>
         }
+        <div class="empty-actions">
+          <ng-content select="[chat-empty-actions]"></ng-content>
+        </div>
       </div>
     }
 
@@ -32,6 +35,8 @@
       </div>
     }
   </div>
+
+  <ng-content select="[chat-meta]"></ng-content>
 
   <div class="composer-container">
     <johnny-message-composer

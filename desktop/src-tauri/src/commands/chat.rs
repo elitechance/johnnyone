@@ -75,7 +75,7 @@ pub async fn send_chat_message(
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
         CliProvider::ClaudeCode => claude_code::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref),
-        CliProvider::Codex => codex::build_config(&content, &working_dir, &model, cli_path_ref),
+        CliProvider::Codex => codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref),
         CliProvider::Cline => cline::build_config(&content, &working_dir, &model, cli_path_ref),
         CliProvider::Ollama => ollama_cli::build_config(&content, &working_dir, &model, cli_path_ref),
     };

@@ -60,6 +60,10 @@
       </div>
 
       <div class="header-right">
+        <ion-button size="small" class="new-session-top" (click)="createNewSession()">
+          New Session
+        </ion-button>
+
         <!-- Provider Selector -->
         <div class="provider-select">
           <ion-icon [name]="providerIcon(selectedProvider())" size="small"></ion-icon>
@@ -82,17 +86,6 @@
       </div>
     </header>
 
-    <!-- Usage Bar -->
-    @if (currentSession()) {
-      <div class="usage-bar">
-        <span>{{ formatTokens(sessionTokens().input) }} in</span>
-        <span>{{ formatTokens(sessionTokens().output) }} out</span>
-        @if (sessionTokens().cost > 0) {
-          <span>${{ sessionTokens().cost.toFixed(2) }}</span>
-        }
-      </div>
-    }
-
     <!-- Shared Chat Thread -->
     <johnny-chat-window
       class="chat-thread"
@@ -107,7 +100,16 @@
       (messageSent)="onMessageSent($event)"
     >
       @if (messages().length === 0 && !currentSession()) {
-        <ion-button chat-actions (click)="createNewSession()">New Session</ion-button>
+        <ion-button chat-empty-actions (click)="createNewSession()">New Session</ion-button>
+      }
+      @if (currentSession()) {
+        <div chat-meta class="usage-bar">
+          <span>{{ formatTokens(sessionTokens().input) }} in</span>
+          <span>{{ formatTokens(sessionTokens().output) }} out</span>
+          @if (sessionTokens().cost > 0) {
+            <span>${{ sessionTokens().cost.toFixed(2) }}</span>
+          }
+        </div>
       }
       @if (isStreaming()) {
         <ion-button chat-actions color="danger" size="small" class="stop-button" (click)="stopGeneration()">
