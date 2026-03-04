@@ -158,6 +158,35 @@ pub async fn archive_session(
     })
 }
 
+/// Delete a session and all its messages.
+#[tauri::command]
+pub async fn delete_session(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    // Kill any running process for this session
+    {
+        let mut processes = state.active_processes.lock().await;
+        if let Some(mut proc) = processes.remove(&id) {
+            let _ = proc.kill().await;
+        }
+    }
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to delete session: {}", e))?;
+        Ok(())
+    })?;
+
+    // Notify the agent to broadcast session_deleted to mobile clients
+    let _ = state.session_deleted_tx.send(id);
+
+    Ok(true)
+}
+
 /// Helper to query a single session by ID.
 fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, String> {
     conn.query_row(

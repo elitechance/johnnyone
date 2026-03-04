@@ -35,13 +35,15 @@
         [detail]="true"
       >
         <ion-label>
-          <h2>{{ session.name }}</h2>
+          <h2>{{ session.title }}</h2>
           <p>{{ session.provider }} / {{ session.model }}</p>
           <ion-note>
-            {{ session.messageCount }} messages &middot;
-            Last active {{ session.lastMessageAt | date:'short' }}
+            Updated {{ session.updated_at | date:'short' }}
           </ion-note>
         </ion-label>
+        <ion-button fill="clear" color="danger" slot="end" (click)="deleteSession(session); $event.stopPropagation()">
+          <ion-icon name="trash-outline" slot="icon-only"></ion-icon>
+        </ion-button>
         <ion-badge slot="end" [color]="getStatusColor(session.status)">
           {{ session.status }}
         </ion-badge>

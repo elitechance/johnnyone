@@ -51,6 +51,10 @@ pub enum AgentMessage {
     /// Desktop → worker: RPC response with query results.
     #[serde(rename = "rpc_response")]
     RpcResponse(RpcResponse),
+
+    /// Desktop → mobile: a session was deleted on the desktop.
+    #[serde(rename = "session_deleted")]
+    SessionDeleted(SessionDeleted),
 }
 
 // ── Existing Types ───────────────────────────────────────────────────────────
@@ -205,6 +209,13 @@ pub struct RpcResponse {
     pub data: Option<serde_json::Value>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Notification that a session was deleted on the desktop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeleted {
+    pub session_id: String,
 }
 
 /// Session view for RPC responses (camelCase for GraphQL compatibility).

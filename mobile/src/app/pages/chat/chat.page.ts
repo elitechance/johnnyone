@@ -1,4 +1,4 @@
-import { Component, inject, signal, OnInit, OnDestroy } from '@angular/core';
+import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import {
@@ -13,17 +13,14 @@ import {
   IonLabel,
   IonRefresher,
   IonRefresherContent,
-  IonList,
-  IonItem,
-  IonNote,
-  IonItemSliding,
-  IonItemOptions,
-  IonItemOption,
 } from '@ionic/angular/standalone';
 import {
   JohnnyApiService,
   AiSession,
-  DesktopNode,
+  AiMessage,
+  SessionListComponent,
+  MessageBubbleComponent,
+  MessageComposerComponent,
 } from '@johnnyone/ui';
 
 interface RelayMessage {
@@ -64,12 +61,9 @@ interface RelayEnvelope {
     IonLabel,
     IonRefresher,
     IonRefresherContent,
-    IonList,
-    IonItem,
-    IonNote,
-    IonItemSliding,
-    IonItemOptions,
-    IonItemOption,
+    SessionListComponent,
+    MessageBubbleComponent,
+    MessageComposerComponent,
   ],
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.scss'],
@@ -92,6 +86,18 @@ export class ChatPage implements OnInit, OnDestroy {
   currentRelayId = signal<string | null>(null);
   loading = signal(false);
 
+  aiMessages = computed<AiMessage[]>(() => {
+    const msgs = this.messages().map(m => this.mapRelayMessage(m));
+    const content = this.streamingContent();
+    if (this.isStreaming() && content && msgs.length > 0) {
+      const last = msgs[msgs.length - 1];
+      if (last.role === 'assistant') {
+        return [...msgs.slice(0, -1), { ...last, content }];
+      }
+    }
+    return msgs;
+  });
+
   ngOnInit(): void {
     this.checkDesktopStatus();
   }
@@ -99,6 +105,47 @@ export class ChatPage implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     this.disconnectRelayWs();
   }
+
+  // ── Type Mapper ────────────────────────────────────────────────────
+
+  private mapRelayMessage(m: RelayMessage): AiMessage {
+    return {
+      id: m.id,
+      sessionId: '',
+      role: m.role,
+      content: m.content,
+      inputTokens: 0,
+      outputTokens: 0,
+      costCents: 0,
+      createdAt: m.createdAt,
+    };
+  }
+
+  // ── Event Handlers (from shared components) ────────────────────────
+
+  onSessionSelected(id: string): void {
+    const session = this.sessions().find(s => s.id === id);
+    if (session) this.selectSession(session);
+  }
+
+  onSessionDeleted(id: string): void {
+    this.api.deleteSession(id).subscribe({
+      next: () => {
+        this.sessions.update(s => s.filter(item => item.id !== id));
+        if (this.activeSession()?.id === id) {
+          this.backToSessions();
+        }
+      },
+      error: (err) => console.error('Failed to delete session:', err),
+    });
+  }
+
+  onMessageSent(text: string): void {
+    this.currentMessage = text;
+    this.sendMessage();
+  }
+
+  // ── Desktop Status & WebSocket ─────────────────────────────────────
 
   async checkDesktopStatus(): Promise<void> {
     this.api.listDesktopNodes().subscribe({
@@ -134,7 +181,6 @@ export class ChatPage implements OnInit, OnDestroy {
     };
 
     this.relayWs.onclose = () => {
-      // Reconnect after a short delay if desktop is still online
       if (this.desktopOnline() && this.onlineNodeId) {
         setTimeout(() => {
           if (this.onlineNodeId) this.connectRelayWs(this.onlineNodeId);
@@ -152,6 +198,17 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   private handleRelayMessage(envelope: RelayEnvelope): void {
+    if (envelope.type === 'session_deleted') {
+      const sessionId = (envelope.data as { sessionId?: string })?.sessionId;
+      if (sessionId) {
+        this.sessions.update((s) => s.filter((item) => item.id !== sessionId));
+        if (this.activeSession()?.id === sessionId) {
+          this.backToSessions();
+        }
+      }
+      return;
+    }
+
     const data = envelope.data;
     if (!data) return;
 
@@ -160,7 +217,6 @@ export class ChatPage implements OnInit, OnDestroy {
         if (data.chunkType === 'text' && data.delta) {
           this.streamingContent.update((c) => c + data.delta);
 
-          // Ensure we have an assistant message placeholder
           const msgs = this.messages();
           const last = msgs[msgs.length - 1];
           if (!last || last.role !== 'assistant' || !this.isStreaming()) {
@@ -189,15 +245,11 @@ export class ChatPage implements OnInit, OnDestroy {
 
       case 'chat_message': {
         if (data.role === 'assistant' && data.content) {
-          // Full message received — replace streaming content
           this.messages.update((msgs) => {
             const updated = [...msgs];
             const lastIdx = updated.length - 1;
             if (lastIdx >= 0 && updated[lastIdx].role === 'assistant' && !updated[lastIdx].content) {
-              updated[lastIdx] = {
-                ...updated[lastIdx],
-                content: data.content!,
-              };
+              updated[lastIdx] = { ...updated[lastIdx], content: data.content! };
             } else {
               updated.push({
                 id: crypto.randomUUID(),
@@ -219,7 +271,6 @@ export class ChatPage implements OnInit, OnDestroy {
   private finishStreaming(): void {
     const content = this.streamingContent();
     if (content) {
-      // Update the last assistant message with accumulated content
       this.messages.update((msgs) => {
         const updated = [...msgs];
         const lastIdx = updated.length - 1;
@@ -232,6 +283,8 @@ export class ChatPage implements OnInit, OnDestroy {
     this.isStreaming.set(false);
     this.streamingContent.set('');
   }
+
+  // ── Sessions ───────────────────────────────────────────────────────
 
   loadSessions(): void {
     this.loading.set(true);
@@ -273,18 +326,6 @@ export class ChatPage implements OnInit, OnDestroy {
     });
   }
 
-  deleteSession(event: Event, session: AiSession): void {
-    event.stopPropagation();
-    this.api.deleteSession(session.id).subscribe({
-      next: () => {
-        this.sessions.update((s) => s.filter((item) => item.id !== session.id));
-      },
-      error: (err) => {
-        console.error('Failed to delete session:', err);
-      },
-    });
-  }
-
   backToSessions(): void {
     this.view.set('sessions');
     this.activeSession.set(null);
@@ -292,11 +333,29 @@ export class ChatPage implements OnInit, OnDestroy {
     this.loadSessions();
   }
 
+  startNewChat(): void {
+    const sessionId = crypto.randomUUID();
+    localStorage.setItem('johnnyone_mobile_session', sessionId);
+    this.activeSession.set(null);
+    this.messages.set([]);
+    this.view.set('chat');
+  }
+
+  onRefresh(event: CustomEvent): void {
+    this.checkDesktopStatus();
+    if (this.view() === 'sessions') {
+      this.loadSessions();
+    }
+    const refresher = event.target as HTMLIonRefresherElement;
+    setTimeout(() => refresher.complete(), 1000);
+  }
+
+  // ── Chat ───────────────────────────────────────────────────────────
+
   async sendMessage(): Promise<void> {
     const text = this.currentMessage.trim();
     if (!text || this.isStreaming()) return;
 
-    // Add user message to local list
     const userMsg: RelayMessage = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -308,7 +367,6 @@ export class ChatPage implements OnInit, OnDestroy {
     this.isStreaming.set(true);
     this.streamingContent.set('');
 
-    // Send via relay
     const sessionId = this.activeSession()?.id ?? this.getOrCreateSessionId();
 
     this.api
@@ -333,47 +391,6 @@ export class ChatPage implements OnInit, OnDestroy {
       });
   }
 
-  startNewChat(): void {
-    const sessionId = crypto.randomUUID();
-    localStorage.setItem('johnnyone_mobile_session', sessionId);
-    this.activeSession.set(null);
-    this.messages.set([]);
-    this.view.set('chat');
-  }
-
-  onRefresh(event: CustomEvent): void {
-    this.checkDesktopStatus();
-    if (this.view() === 'sessions') {
-      this.loadSessions();
-    }
-    const refresher = event.target as HTMLIonRefresherElement;
-    setTimeout(() => refresher.complete(), 1000);
-  }
-
-  onKeyDown(event: KeyboardEvent): void {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault();
-      this.sendMessage();
-    }
-  }
-
-  getDisplayContent(msg: RelayMessage): string {
-    if (msg.role === 'assistant' && this.isStreaming() && !msg.content && this.streamingContent()) {
-      return this.streamingContent();
-    }
-    return msg.content;
-  }
-
-  formatTime(dateStr: string): string {
-    const date = new Date(dateStr);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-
-  formatDate(dateStr: string): string {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  }
-
   private getOrCreateSessionId(): string {
     const key = 'johnnyone_mobile_session';
     let sessionId = localStorage.getItem(key);
@@ -382,13 +399,5 @@ export class ChatPage implements OnInit, OnDestroy {
       localStorage.setItem(key, sessionId);
     }
     return sessionId;
-  }
-
-  trackByMessageId(_index: number, msg: RelayMessage): string {
-    return msg.id;
-  }
-
-  trackBySessionId(_index: number, session: AiSession): string {
-    return session.id;
   }
 }

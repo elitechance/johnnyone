@@ -49,6 +49,8 @@ pub struct AppState {
     pub active_processes: Arc<Mutex<HashMap<String, CliProcess>>>,
     /// Broadcast channel sender for shutdown signals.
     pub shutdown_tx: broadcast::Sender<()>,
+    /// Broadcast channel for session deletion events (sends session ID).
+    pub session_deleted_tx: broadcast::Sender<String>,
 }
 
 impl AppState {
@@ -57,6 +59,7 @@ impl AppState {
         let node_id = Uuid::new_v4().to_string();
         let node_name = format!("desktop-{}", &node_id[..8]);
         let (shutdown_tx, _) = broadcast::channel(16);
+        let (session_deleted_tx, _) = broadcast::channel(16);
 
         tracing::info!(
             node_id = %node_id,
@@ -72,12 +75,14 @@ impl AppState {
             tool_executions: Arc::new(Mutex::new(Vec::new())),
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
+            session_deleted_tx,
         }
     }
 
     /// Create a new AppState with a specific node ID and name.
     pub fn with_node_info(db: Database, node_id: String, node_name: String) -> Self {
         let (shutdown_tx, _) = broadcast::channel(16);
+        let (session_deleted_tx, _) = broadcast::channel(16);
 
         Self {
             db,
@@ -87,6 +92,7 @@ impl AppState {
             tool_executions: Arc::new(Mutex::new(Vec::new())),
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
+            session_deleted_tx,
         }
     }
 

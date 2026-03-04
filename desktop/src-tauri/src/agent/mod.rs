@@ -12,7 +12,7 @@ use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use message_types::{
     AgentEnvelope, AgentMessage, RelayChatDelta, RelayChatComplete, RelayChatRequest,
-    RpcMessageView, RpcRequest, RpcResponse, RpcSessionView,
+    RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -168,6 +168,7 @@ impl AgentService {
         tool_dispatcher: Arc<Mutex<ToolDispatcher>>,
     ) -> Result<(), String> {
         let mut shutdown_rx = state.shutdown_tx.subscribe();
+        let mut session_deleted_rx = state.session_deleted_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -198,6 +199,21 @@ impl AgentService {
                         _ => {
                             // Ignore binary and other frame types
                         }
+                    }
+                }
+                Ok(session_id) = session_deleted_rx.recv() => {
+                    // Broadcast session_deleted to mobile clients via relay
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::SessionDeleted(SessionDeleted {
+                            session_id: session_id.clone(),
+                        }),
+                    };
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        let mut writer = ws_write.lock().await;
+                        let _ = writer.send(
+                            tokio_tungstenite::tungstenite::Message::Text(json.into())
+                        ).await;
+                        tracing::info!(session_id = %session_id, "Broadcast session_deleted to relay");
                     }
                 }
                 _ = shutdown_rx.recv() => {

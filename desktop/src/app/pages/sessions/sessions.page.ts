@@ -23,17 +23,7 @@ import {
   IonRefresherContent,
 } from '@ionic/angular/standalone';
 import { Router } from '@angular/router';
-
-export interface AiSession {
-  id: string;
-  name: string;
-  createdAt: Date;
-  lastMessageAt: Date;
-  messageCount: number;
-  status: 'active' | 'archived' | 'expired';
-  provider: string;
-  model: string;
-}
+import { TauriBridgeService, Session } from '../../services/tauri-bridge.service';
 
 @Component({
   selector: 'app-sessions',
@@ -66,8 +56,9 @@ export interface AiSession {
 })
 export class SessionsPage implements OnInit {
   private readonly router = inject(Router);
+  private readonly tauriBridge = inject(TauriBridgeService);
 
-  sessions: AiSession[] = [];
+  sessions: Session[] = [];
   loading = false;
 
   ngOnInit(): void {
@@ -77,9 +68,7 @@ export class SessionsPage implements OnInit {
   async loadSessions(): Promise<void> {
     this.loading = true;
     try {
-      // In production, this would call JohnnyApiService to fetch sessions
-      // For now, populate with placeholder data structure
-      this.sessions = [];
+      this.sessions = await this.tauriBridge.listSessions();
     } catch (err) {
       console.error('Failed to load sessions:', err);
     } finally {
@@ -94,40 +83,34 @@ export class SessionsPage implements OnInit {
 
   async createSession(): Promise<void> {
     try {
-      const newSession: AiSession = {
-        id: crypto.randomUUID(),
-        name: `Session ${new Date().toLocaleDateString()}`,
-        createdAt: new Date(),
-        lastMessageAt: new Date(),
-        messageCount: 0,
-        status: 'active',
-        provider: 'ollama',
-        model: 'llama3',
-      };
-      this.sessions.unshift(newSession);
-      this.openSession(newSession);
+      const session = await this.tauriBridge.createSession({});
+      this.sessions.unshift(session);
+      this.openSession(session);
     } catch (err) {
       console.error('Failed to create session:', err);
     }
   }
 
-  openSession(session: AiSession): void {
+  openSession(session: Session): void {
     this.router.navigate(['/chat'], { queryParams: { sessionId: session.id } });
   }
 
-  async archiveSession(session: AiSession): Promise<void> {
+  async archiveSession(session: Session): Promise<void> {
     try {
-      session.status = 'archived';
-      // In production, persist via JohnnyApiService
+      const updated = await this.tauriBridge.archiveSession(session.id);
+      const idx = this.sessions.findIndex((s) => s.id === session.id);
+      if (idx >= 0) {
+        this.sessions[idx] = updated;
+      }
     } catch (err) {
       console.error('Failed to archive session:', err);
     }
   }
 
-  async deleteSession(session: AiSession): Promise<void> {
+  async deleteSession(session: Session): Promise<void> {
     try {
+      await this.tauriBridge.deleteSession(session.id);
       this.sessions = this.sessions.filter((s) => s.id !== session.id);
-      // In production, delete via JohnnyApiService
     } catch (err) {
       console.error('Failed to delete session:', err);
     }
@@ -139,8 +122,6 @@ export class SessionsPage implements OnInit {
         return 'success';
       case 'archived':
         return 'medium';
-      case 'expired':
-        return 'danger';
       default:
         return 'medium';
     }

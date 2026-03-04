@@ -1,25 +1,32 @@
-<ion-header>
-  <ion-toolbar>
-    @if (view() === 'chat') {
+@if (view() === 'chat') {
+  <ion-header>
+    <ion-toolbar>
       <ion-buttons slot="start">
         <ion-button (click)="backToSessions()">
-          <ion-icon name="arrow-back-outline" slot="icon-only"></ion-icon>
+          <ion-icon name="arrow-back-outline" slot="start"></ion-icon>
+          Sessions
         </ion-button>
       </ion-buttons>
       <ion-title>{{ activeSession()?.title ?? 'New Chat' }}</ion-title>
-    } @else {
+      <ion-buttons slot="end">
+        <ion-chip [color]="desktopOnline() ? 'success' : 'danger'" outline>
+          <ion-label>{{ desktopOnline() ? 'Online' : 'Offline' }}</ion-label>
+        </ion-chip>
+      </ion-buttons>
+    </ion-toolbar>
+  </ion-header>
+} @else {
+  <ion-header>
+    <ion-toolbar>
       <ion-title>JohnnyOne</ion-title>
-    }
-    <ion-buttons slot="end">
-      <ion-chip
-        [color]="desktopOnline() ? 'success' : 'danger'"
-        outline
-      >
-        <ion-label>{{ desktopOnline() ? 'Online' : 'Offline' }}</ion-label>
-      </ion-chip>
-    </ion-buttons>
-  </ion-toolbar>
-</ion-header>
+      <ion-buttons slot="end">
+        <ion-chip [color]="desktopOnline() ? 'success' : 'danger'" outline>
+          <ion-label>{{ desktopOnline() ? 'Online' : 'Offline' }}</ion-label>
+        </ion-chip>
+      </ion-buttons>
+    </ion-toolbar>
+  </ion-header>
+}
 
 <ion-content class="chat-content">
   <ion-refresher slot="fixed" (ionRefresh)="onRefresh($event)">
@@ -51,24 +58,11 @@
           }
         </div>
       } @else {
-        <ion-list>
-          @for (session of sessions(); track session.id) {
-            <ion-item-sliding>
-              <ion-item button (click)="selectSession(session)">
-                <ion-label>
-                  <h3>{{ session.title }}</h3>
-                  <p>{{ session.provider }} &middot; {{ formatDate(session.updatedAt) }}</p>
-                </ion-label>
-                <ion-note slot="end">{{ session.status }}</ion-note>
-              </ion-item>
-              <ion-item-options side="end">
-                <ion-item-option color="danger" (click)="deleteSession($event, session)">
-                  <ion-icon name="trash-outline" slot="icon-only"></ion-icon>
-                </ion-item-option>
-              </ion-item-options>
-            </ion-item-sliding>
-          }
-        </ion-list>
+        <johnny-session-list
+          [sessions]="sessions()"
+          (sessionSelected)="onSessionSelected($event)"
+          (sessionDeleted)="onSessionDeleted($event)"
+        />
       }
     </div>
   }
@@ -76,21 +70,14 @@
   <!-- Chat View -->
   @if (view() === 'chat') {
     <div class="chat-messages">
-      @for (msg of messages(); track msg.id) {
-        <div
-          class="message"
-          [class.user]="msg.role === 'user'"
-          [class.assistant]="msg.role === 'assistant'"
-        >
-          <div class="message-header">
-            <span class="message-role">{{ msg.role === 'user' ? 'You' : 'Johnny' }}</span>
-            <span class="message-time">{{ formatTime(msg.createdAt) }}</span>
-          </div>
-          <div class="message-content">{{ getDisplayContent(msg) }}</div>
-        </div>
+      @for (msg of aiMessages(); track msg.id) {
+        <johnny-message-bubble
+          [message]="msg"
+          [isStreamingMessage]="isStreaming() && $last && msg.role === 'assistant'"
+        />
       }
 
-      <!-- Streaming indicator -->
+      <!-- Typing indicator: before first delta arrives -->
       @if (isStreaming() && !streamingContent()) {
         <div class="message assistant">
           <div class="message-header">
@@ -102,7 +89,7 @@
         </div>
       }
 
-      @if (messages().length === 0 && !loading()) {
+      @if (aiMessages().length === 0 && !loading()) {
         <div class="empty-state">
           <h2>New Chat</h2>
           <p>Send a message to your desktop agent.</p>
@@ -115,23 +102,11 @@
 
     <!-- Message Input -->
     <div class="chat-input-container">
-      <div class="chat-input-wrapper">
-        <textarea
-          class="chat-input"
-          [(ngModel)]="currentMessage"
-          placeholder="Type a message..."
-          (keydown)="onKeyDown($event)"
-          rows="2"
-          [disabled]="!desktopOnline() || isStreaming()"
-        ></textarea>
-        <ion-button
-          class="send-button"
-          [disabled]="!currentMessage.trim() || !desktopOnline() || isStreaming()"
-          (click)="sendMessage()"
-        >
-          <ion-icon name="send-outline" slot="icon-only"></ion-icon>
-        </ion-button>
-      </div>
+      <johnny-message-composer
+        [disabled]="!desktopOnline() || isStreaming()"
+        placeholder="Type a message..."
+        (messageSent)="onMessageSent($event)"
+      />
     </div>
   }
 </ion-content>

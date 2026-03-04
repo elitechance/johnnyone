@@ -13,9 +13,11 @@ import { AiSession } from '../../models/ai-session.model';
 })
 export class SessionListComponent {
   @Input() sessions: AiSession[] = [];
+  @Input() activeSessionId: string | null = null;
 
   @Output() sessionSelected = new EventEmitter<string>();
   @Output() sessionArchived = new EventEmitter<string>();
+  @Output() sessionDeleted = new EventEmitter<string>();
 
   get activeSessions(): AiSession[] {
     return this.sessions.filter((s) => s.status === 'active');
@@ -32,6 +34,11 @@ export class SessionListComponent {
   onArchive(event: Event, session: AiSession): void {
     event.stopPropagation();
     this.sessionArchived.emit(session.id);
+  }
+
+  onDelete(event: Event, session: AiSession): void {
+    event.stopPropagation();
+    this.sessionDeleted.emit(session.id);
   }
 
   formatDate(dateStr: string): string {

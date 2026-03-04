@@ -45,6 +45,7 @@ fn main() {
             commands::sessions::update_session_title,
             commands::sessions::update_session_working_directory,
             commands::sessions::archive_session,
+            commands::sessions::delete_session,
             // Chat
             commands::chat::send_chat_message,
             commands::chat::stop_generation,

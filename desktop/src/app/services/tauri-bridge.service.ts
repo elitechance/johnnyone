@@ -172,6 +172,10 @@ export class TauriBridgeService {
     return await invoke<Session>('archive_session', { id });
   }
 
+  async deleteSession(id: string): Promise<boolean> {
+    return await invoke<boolean>('delete_session', { id });
+  }
+
   // ── Chat Messages ────────────────────────────────────────────────────
 
   async sendChatMessage(sessionId: string, content: string): Promise<Message> {

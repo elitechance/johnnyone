@@ -55,6 +55,11 @@
     --background: var(--ion-color-light-tint, rgba(0, 0, 0, 0.03));
   }
 
+  &.active {
+    --background: var(--ion-color-primary-shade, var(--ion-color-primary));
+    --color: var(--ion-color-primary-contrast, white);
+  }
+
   &.archived {
     opacity: 0.65;
   }

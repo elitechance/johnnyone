@@ -20,38 +20,13 @@
       />
     </div>
 
-    <div class="session-list">
-      @for (session of filteredSessions(); track session.id) {
-        <div
-          class="session-item"
-          [class.active]="currentSession()?.id === session.id"
-          (click)="selectSession(session.id)"
-        >
-          <div class="session-item-header">
-            <ion-icon [name]="providerIcon(session.provider)" class="provider-icon"></ion-icon>
-            <span class="session-title">{{ session.title }}</span>
-          </div>
-          <div class="session-item-meta">
-            <span class="session-date">{{ formatDate(session.updated_at) }}</span>
-            <ion-button
-              fill="clear"
-              size="small"
-              class="archive-btn"
-              (click)="archiveSession($event, session.id)"
-            >
-              <ion-icon name="archive-outline" size="small"></ion-icon>
-            </ion-button>
-          </div>
-        </div>
-      }
-
-      @if (filteredSessions().length === 0) {
-        <div class="empty-sessions">
-          <p>No sessions yet</p>
-          <ion-button size="small" (click)="createNewSession()">New Session</ion-button>
-        </div>
-      }
-    </div>
+    <johnny-session-list
+      [sessions]="aiSessions()"
+      [activeSessionId]="currentSession()?.id ?? null"
+      (sessionSelected)="onSessionSelected($event)"
+      (sessionArchived)="onSessionArchived($event)"
+      (sessionDeleted)="onSessionDeleted($event)"
+    />
   </aside>
 
   <!-- Sidebar toggle when collapsed -->
@@ -76,10 +51,12 @@
 
       <div class="header-center">
         <!-- Working Directory Indicator -->
-        <div class="working-dir" *ngIf="currentSession()" (click)="pickWorkingDirectory()">
-          <ion-icon name="folder-outline" size="small"></ion-icon>
-          <span class="dir-path">{{ workingDirectory() || '~ (click to set)' }}</span>
-        </div>
+        @if (currentSession()) {
+          <div class="working-dir" (click)="pickWorkingDirectory()">
+            <ion-icon name="folder-outline" size="small"></ion-icon>
+            <span class="dir-path">{{ workingDirectory() || '~ (click to set)' }}</span>
+          </div>
+        }
       </div>
 
       <div class="header-right">
@@ -107,36 +84,14 @@
 
     <!-- Chat Messages -->
     <div class="chat-messages" #chatMessages>
-      @for (msg of messages(); track msg.id) {
-        <div
-          class="message"
-          [class.user]="msg.role === 'user'"
-          [class.assistant]="msg.role === 'assistant'"
-          [class.system]="msg.role === 'system'"
-          [class.tool]="msg.role === 'tool'"
-        >
-          <div class="message-header">
-            <span class="message-role">{{ msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Johnny' : msg.role }}</span>
-            <span class="message-time">{{ formatDate(msg.created_at) }}</span>
-          </div>
-          <div
-            class="message-content"
-            [class.streaming]="isStreamingMessage(msg)"
-            [innerHTML]="getDisplayContent(msg)"
-          ></div>
-          @if (msg.role === 'assistant' && !isStreamingMessage(msg) && msg.content) {
-            <div class="message-actions">
-              @if (msg.input_tokens || msg.output_tokens) {
-                <span class="token-info">
-                  {{ formatTokens(msg.input_tokens) }} in / {{ formatTokens(msg.output_tokens) }} out
-                </span>
-              }
-            </div>
-          }
-        </div>
+      @for (msg of aiMessages(); track msg.id) {
+        <johnny-message-bubble
+          [message]="msg"
+          [isStreamingMessage]="streamingMessageId() === msg.id"
+        />
       }
 
-      <!-- Streaming indicator -->
+      <!-- Typing indicator: before first delta arrives -->
       @if (isStreaming() && !streamingContent()) {
         <div class="message assistant">
           <div class="message-header">
@@ -170,37 +125,17 @@
 
     <!-- Message Input -->
     <div class="chat-input-container">
-      <div class="chat-input-wrapper">
-        <textarea
-          class="chat-input"
-          [(ngModel)]="currentMessage"
-          placeholder="Type a message... (Enter to send, Shift+Enter for new line)"
-          (keydown)="onKeyDown($event)"
-          rows="2"
-          [disabled]="isStreaming()"
-        ></textarea>
-        <div class="input-actions">
-          @if (isStreaming()) {
-            <ion-button
-              class="stop-button"
-              color="danger"
-              size="small"
-              (click)="stopGeneration()"
-            >
-              <ion-icon name="stop-outline" slot="start"></ion-icon>
-              Stop
-            </ion-button>
-          } @else {
-            <ion-button
-              class="send-button"
-              [disabled]="!currentMessage.trim()"
-              (click)="sendMessage()"
-            >
-              <ion-icon name="send-outline" slot="icon-only"></ion-icon>
-            </ion-button>
-          }
-        </div>
-      </div>
+      <johnny-message-composer
+        [disabled]="isStreaming()"
+        placeholder="Type a message... (Enter to send)"
+        (messageSent)="onMessageSent($event)"
+      />
+      @if (isStreaming()) {
+        <ion-button color="danger" size="small" class="stop-button" (click)="stopGeneration()">
+          <ion-icon name="stop-outline" slot="start"></ion-icon>
+          Stop
+        </ion-button>
+      }
     </div>
   </main>
 </div>

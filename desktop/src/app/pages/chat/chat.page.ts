@@ -2,25 +2,8 @@ import { Component, OnInit, OnDestroy, inject, signal, computed } from '@angular
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import {
-  IonHeader,
-  IonToolbar,
-  IonTitle,
-  IonContent,
-  IonButtons,
   IonButton,
   IonIcon,
-  IonBadge,
-  IonChip,
-  IonLabel,
-  IonSplitPane,
-  IonMenu,
-  IonList,
-  IonItem,
-  IonMenuButton,
-  IonSearchbar,
-  IonSelect,
-  IonSelectOption,
-  IonFooter,
 } from '@ionic/angular/standalone';
 import { Router } from '@angular/router';
 import {
@@ -28,9 +11,15 @@ import {
   Session,
   Message,
   ChatDelta,
-  StreamChunk,
   DetectedTool,
 } from '../../services/tauri-bridge.service';
+import {
+  SessionListComponent,
+  MessageBubbleComponent,
+  MessageComposerComponent,
+  AiSession as AiSessionUI,
+  AiMessage,
+} from '@johnnyone/ui';
 import { Subscription } from 'rxjs';
 
 @Component({
@@ -39,25 +28,11 @@ import { Subscription } from 'rxjs';
   imports: [
     CommonModule,
     FormsModule,
-    IonHeader,
-    IonToolbar,
-    IonTitle,
-    IonContent,
-    IonButtons,
     IonButton,
     IonIcon,
-    IonBadge,
-    IonChip,
-    IonLabel,
-    IonSplitPane,
-    IonMenu,
-    IonList,
-    IonItem,
-    IonMenuButton,
-    IonSearchbar,
-    IonSelect,
-    IonSelectOption,
-    IonFooter,
+    SessionListComponent,
+    MessageBubbleComponent,
+    MessageComposerComponent,
   ],
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.scss'],
@@ -90,6 +65,18 @@ export class ChatPage implements OnInit, OnDestroy {
     return all.filter(s => s.title.toLowerCase().includes(query));
   });
 
+  aiSessions = computed<AiSessionUI[]>(() =>
+    this.filteredSessions().map(s => this.mapSession(s))
+  );
+
+  aiMessages = computed<AiMessage[]>(() => {
+    const streamingId = this.streamingMessageId();
+    const content = this.streamingContent();
+    return this.messages().map(m =>
+      m.id === streamingId ? { ...this.mapMessage(m), content } : this.mapMessage(m)
+    );
+  });
+
   sessionTokens = computed(() => {
     const session = this.currentSession();
     if (!session) return { input: 0, output: 0, cost: 0 };
@@ -112,6 +99,39 @@ export class ChatPage implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     this.deltaSubscription?.unsubscribe();
     this.completeSubscription?.unsubscribe();
+  }
+
+  // ── Type Mappers ───────────────────────────────────────────────────
+
+  private mapSession(s: Session): AiSessionUI {
+    return {
+      id: s.id,
+      title: s.title,
+      provider: s.provider,
+      model: s.model,
+      workingDirectory: s.working_directory,
+      status: s.status as 'active' | 'archived' | 'completed',
+      totalInputTokens: s.total_input_tokens,
+      totalOutputTokens: s.total_output_tokens,
+      totalCostCents: s.total_cost_cents,
+      createdAt: s.created_at,
+      updatedAt: s.updated_at,
+    };
+  }
+
+  private mapMessage(m: Message): AiMessage {
+    return {
+      id: m.id,
+      sessionId: m.session_id,
+      role: m.role,
+      content: m.content,
+      toolCalls: m.tool_calls,
+      finishReason: m.finish_reason,
+      inputTokens: m.input_tokens,
+      outputTokens: m.output_tokens,
+      costCents: m.cost_cents,
+      createdAt: m.created_at,
+    };
   }
 
   // ── Session Management ─────────────────────────────────────────────
@@ -156,8 +176,7 @@ export class ChatPage implements OnInit, OnDestroy {
     }
   }
 
-  async archiveSession(event: Event, id: string): Promise<void> {
-    event.stopPropagation();
+  async archiveSession(id: string): Promise<void> {
     try {
       await this.tauriBridge.archiveSession(id);
       this.sessions.update(s => s.filter(sess => sess.id !== id));
@@ -168,6 +187,34 @@ export class ChatPage implements OnInit, OnDestroy {
     } catch (err) {
       console.error('Failed to archive session:', err);
     }
+  }
+
+  // ── Event Handlers (from shared components) ────────────────────────
+
+  onSessionSelected(id: string): void {
+    this.selectSession(id);
+  }
+
+  onSessionArchived(id: string): void {
+    this.archiveSession(id);
+  }
+
+  async onSessionDeleted(id: string): Promise<void> {
+    try {
+      await this.tauriBridge.deleteSession(id);
+      this.sessions.update(s => s.filter(sess => sess.id !== id));
+      if (this.currentSession()?.id === id) {
+        this.currentSession.set(null);
+        this.messages.set([]);
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+  }
+
+  onMessageSent(text: string): void {
+    this.currentMessage = text;
+    this.sendMessage();
   }
 
   // ── Chat ───────────────────────────────────────────────────────────
@@ -209,10 +256,8 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async retryLastMessage(): Promise<void> {
     const msgs = this.messages();
-    // Find the last user message
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'user') {
-        // Remove all messages after this user message
         this.messages.set(msgs.slice(0, i));
         this.currentMessage = msgs[i].content;
         await this.sendMessage();
@@ -236,7 +281,6 @@ export class ChatPage implements OnInit, OnDestroy {
         this.isStreaming.set(false);
         this.streamingMessageId.set(null);
 
-        // Finalize the streaming message
         const content = this.streamingContent();
         if (content && complete.message_id) {
           this.messages.update(msgs => {
@@ -251,11 +295,8 @@ export class ChatPage implements OnInit, OnDestroy {
         }
 
         this.streamingContent.set('');
-
-        // Auto-title: if this is the first exchange, title the session
         this.autoTitleIfNeeded();
 
-        // Refresh session to get updated token counts
         const session = this.currentSession();
         if (session) {
           this.tauriBridge.getSession(session.id).then(s => this.currentSession.set(s));
@@ -274,7 +315,6 @@ export class ChatPage implements OnInit, OnDestroy {
       this.streamingContent.update(c => c + delta.chunk.content);
     }
 
-    // Ensure assistant message exists in the list
     this.messages.update(msgs => {
       const exists = msgs.some(m => m.id === delta.message_id);
       if (!exists) {
@@ -322,7 +362,6 @@ export class ChatPage implements OnInit, OnDestroy {
 
   private async ensureSettingsAndConnect(): Promise<void> {
     try {
-      // Auto-connect the agent to the worker
       const status = await this.tauriBridge.getConnectionStatus();
       if (!status.connected) {
         await this.tauriBridge.connectAgent();
@@ -354,17 +393,12 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async onProviderChange(provider: string): Promise<void> {
     this.selectedProvider.set(provider);
-    const session = this.currentSession();
-    if (session) {
-      // Update session provider
-    }
   }
 
   async onWorkingDirectoryChange(dir: string): Promise<void> {
     this.workingDirectory.set(dir);
     await this.tauriBridge.setSetting('last_working_directory', dir);
 
-    // Update the current session's working directory in the DB
     const session = this.currentSession();
     if (session) {
       const updated = await this.tauriBridge.updateSessionWorkingDirectory(session.id, dir);
@@ -380,29 +414,6 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   // ── Helpers ────────────────────────────────────────────────────────
-
-  getDisplayContent(msg: Message): string {
-    if (this.streamingMessageId() === msg.id) {
-      return this.streamingContent();
-    }
-    return msg.content;
-  }
-
-  isStreamingMessage(msg: Message): boolean {
-    return this.streamingMessageId() === msg.id;
-  }
-
-  formatDate(dateStr: string): string {
-    if (!dateStr) return '';
-    const date = new Date(dateStr);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-    if (diffDays === 0) return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    if (diffDays === 1) return 'Yesterday';
-    if (diffDays < 7) return date.toLocaleDateString([], { weekday: 'short' });
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  }
 
   formatTokens(n: number): string {
     if (n < 1000) return String(n);
@@ -434,19 +445,6 @@ export class ChatPage implements OnInit, OnDestroy {
     this.router.navigate([path]);
   }
 
-  onKeyDown(event: KeyboardEvent): void {
-    // Ctrl+Enter to send
-    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-      event.preventDefault();
-      this.sendMessage();
-    }
-    // Enter without shift to send (single line mode)
-    if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
-      event.preventDefault();
-      this.sendMessage();
-    }
-  }
-
   // Keyboard shortcuts (handled at document level)
   onGlobalKeyDown(event: KeyboardEvent): void {
     if (event.ctrlKey || event.metaKey) {
@@ -468,13 +466,5 @@ export class ChatPage implements OnInit, OnDestroy {
     if (event.key === 'Escape' && this.isStreaming()) {
       this.stopGeneration();
     }
-  }
-
-  trackByMessageId(_index: number, msg: Message): string {
-    return msg.id;
-  }
-
-  trackBySessionId(_index: number, session: Session): string {
-    return session.id;
   }
 }
