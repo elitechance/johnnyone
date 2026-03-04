@@ -9,7 +9,6 @@ import {
   ChangeDetectionStrategy,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { IonicModule, IonContent } from '@ionic/angular';
 import { AiMessage } from '../../models/ai-message.model';
 import { MessageBubbleComponent } from '../message-bubble/message-bubble.component';
 import { MessageComposerComponent } from '../message-composer/message-composer.component';
@@ -17,7 +16,7 @@ import { MessageComposerComponent } from '../message-composer/message-composer.c
 @Component({
   selector: 'johnny-chat-window',
   standalone: true,
-  imports: [CommonModule, IonicModule, MessageBubbleComponent, MessageComposerComponent],
+  imports: [CommonModule, MessageBubbleComponent, MessageComposerComponent],
   templateUrl: './chat-window.component.html',
   styleUrls: ['./chat-window.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -25,20 +24,29 @@ import { MessageComposerComponent } from '../message-composer/message-composer.c
 export class ChatWindowComponent implements AfterViewChecked {
   @Input() messages: AiMessage[] = [];
   @Input() isStreaming = false;
+  @Input() streamingMessageId: string | null = null;
+  @Input() disabled = false;
+  @Input() placeholder = 'Type a message...';
+  @Input() emptyTitle = 'No messages yet';
+  @Input() emptyDescription = 'Start a conversation.';
+  @Input() emptyHint = '';
+  @Input() showEmpty = true;
 
   @Output() messageSent = new EventEmitter<string>();
 
-  @ViewChild(IonContent) private content?: IonContent;
+  @ViewChild('messagesContainer') private messagesContainerRef?: ElementRef<HTMLDivElement>;
 
   private shouldAutoScroll = true;
-  private lastMessageCount = 0;
+  private lastScrollKey = '';
 
   ngAfterViewChecked(): void {
-    if (this.messages.length !== this.lastMessageCount) {
-      this.lastMessageCount = this.messages.length;
-      if (this.shouldAutoScroll) {
-        this.scrollToBottom();
-      }
+    const last = this.messages[this.messages.length - 1];
+    const scrollKey = `${this.messages.length}:${last?.id ?? ''}:${last?.content?.length ?? 0}:${this.isStreaming}`;
+    if (scrollKey === this.lastScrollKey) return;
+    this.lastScrollKey = scrollKey;
+
+    if (this.shouldAutoScroll) {
+      this.scrollToBottom();
     }
   }
 
@@ -47,23 +55,36 @@ export class ChatWindowComponent implements AfterViewChecked {
     this.messageSent.emit(content);
   }
 
-  onContentScroll(event: CustomEvent): void {
-    const detail = event.detail;
-    if (detail && detail.scrollTop !== undefined) {
-      const threshold = 100;
-      const atBottom =
-        detail.scrollTop + detail.contentHeight >= detail.scrollHeight - threshold;
-      this.shouldAutoScroll = atBottom;
-    }
+  onMessagesScroll(): void {
+    const el = this.messagesContainerRef?.nativeElement;
+    if (!el) return;
+    const threshold = 96;
+    this.shouldAutoScroll = el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
   }
 
   trackByMessageId(_index: number, message: AiMessage): string {
     return message.id;
   }
 
+  isStreamingMessage(message: AiMessage, index: number): boolean {
+    if (!this.isStreaming || message.role !== 'assistant') return false;
+    if (this.streamingMessageId) return message.id === this.streamingMessageId;
+    const isLast = index === this.messages.length - 1;
+    return isLast && message.role === 'assistant';
+  }
+
+  get showTypingIndicator(): boolean {
+    if (!this.isStreaming) return false;
+    const last = this.messages[this.messages.length - 1];
+    if (!last || last.role !== 'assistant') return true;
+    return !last.content;
+  }
+
   private scrollToBottom(): void {
-    setTimeout(() => {
-      this.content?.scrollToBottom(200);
-    }, 50);
+    requestAnimationFrame(() => {
+      const el = this.messagesContainerRef?.nativeElement;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+    });
   }
 }

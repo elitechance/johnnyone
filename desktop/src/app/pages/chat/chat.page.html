@@ -82,36 +82,6 @@
       </div>
     </header>
 
-    <!-- Chat Messages -->
-    <div class="chat-messages" #chatMessages (scroll)="onChatScroll()">
-      @for (msg of aiMessages(); track msg.id) {
-        <johnny-message-bubble
-          [message]="msg"
-          [isStreamingMessage]="streamingMessageId() === msg.id"
-        />
-      }
-
-      <!-- Typing indicator: before first delta arrives -->
-      @if (isStreaming() && !streamingContent()) {
-        <div class="message assistant">
-          <div class="message-header">
-            <span class="message-role">Johnny</span>
-          </div>
-          <div class="typing-indicator">
-            <span></span><span></span><span></span>
-          </div>
-        </div>
-      }
-
-      @if (messages().length === 0 && !currentSession()) {
-        <div class="empty-state">
-          <h2>Welcome to JohnnyOne</h2>
-          <p>Create a new session or select one from the sidebar to start chatting.</p>
-          <ion-button (click)="createNewSession()">New Session</ion-button>
-        </div>
-      }
-    </div>
-
     <!-- Usage Bar -->
     @if (currentSession()) {
       <div class="usage-bar">
@@ -123,19 +93,29 @@
       </div>
     }
 
-    <!-- Message Input -->
-    <div class="chat-input-container">
-      <johnny-message-composer
-        [disabled]="isStreaming()"
-        placeholder="Type a message... (Enter to send)"
-        (messageSent)="onMessageSent($event)"
-      />
+    <!-- Shared Chat Thread -->
+    <johnny-chat-window
+      class="chat-thread"
+      [messages]="aiMessages()"
+      [isStreaming]="isStreaming()"
+      [streamingMessageId]="streamingMessageId()"
+      [disabled]="isStreaming()"
+      placeholder="Type a message... (Enter to send)"
+      emptyTitle="Welcome to JohnnyOne"
+      emptyDescription="Create a new session or select one from the sidebar to start chatting."
+      [showEmpty]="!currentSession()"
+      (messageSent)="onMessageSent($event)"
+    >
+      @if (messages().length === 0 && !currentSession()) {
+        <ion-button chat-actions (click)="createNewSession()">New Session</ion-button>
+      }
       @if (isStreaming()) {
-        <ion-button color="danger" size="small" class="stop-button" (click)="stopGeneration()">
+        <ion-button chat-actions color="danger" size="small" class="stop-button" (click)="stopGeneration()">
           <ion-icon name="stop-outline" slot="start"></ion-icon>
           Stop
         </ion-button>
       }
-    </div>
+    </johnny-chat-window>
+
   </main>
 </div>

@@ -3,11 +3,8 @@ import {
   inject,
   signal,
   computed,
-  effect,
-  ViewChild,
   OnInit,
   OnDestroy,
-  AfterViewInit,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -28,9 +25,8 @@ import {
   JohnnyApiService,
   AiSession,
   AiMessage,
+  ChatWindowComponent,
   SessionListComponent,
-  MessageBubbleComponent,
-  MessageComposerComponent,
 } from '@johnnyone/ui';
 
 interface RelayMessage {
@@ -71,23 +67,18 @@ interface RelayEnvelope {
     IonLabel,
     IonRefresher,
     IonRefresherContent,
+    ChatWindowComponent,
     SessionListComponent,
-    MessageBubbleComponent,
-    MessageComposerComponent,
   ],
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.scss'],
 })
-export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
+export class ChatPage implements OnInit, OnDestroy {
   private static readonly ACTIVE_SESSION_KEY = 'johnnyone_mobile_active_session';
   private readonly api = inject(JohnnyApiService);
   private relayWs: WebSocket | null = null;
   private onlineNodeId: string | null = null;
   private streamingTimeout: ReturnType<typeof setTimeout> | null = null;
-  @ViewChild('chatContent') private chatContent?: IonContent;
-  private chatScrollEl: HTMLElement | null = null;
-  private shouldAutoScroll = true;
-  private autoScrollScheduled = false;
   private preferNewSession = false;
   private initializedSessionView = false;
 
@@ -116,26 +107,8 @@ export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
     return msgs;
   });
 
-  // Keep viewport pinned while user stays near the bottom.
-  private readonly autoScrollEffect = effect(() => {
-    if (this.view() !== 'chat') return;
-    this.aiMessages();
-    this.streamingContent();
-    if (this.shouldAutoScroll) {
-      this.scheduleAutoScroll();
-    }
-  });
-
   ngOnInit(): void {
     this.checkDesktopStatus();
-  }
-
-  ngAfterViewInit(): void {
-    this.chatContent?.getScrollElement().then((el) => {
-      this.chatScrollEl = el;
-      this.scheduleAutoScroll();
-    });
-    this.scheduleAutoScroll();
   }
 
   ngOnDestroy(): void {
@@ -178,17 +151,8 @@ export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
   }
 
   onMessageSent(text: string): void {
-    this.shouldAutoScroll = true;
     this.currentMessage = text;
     this.sendMessage();
-  }
-
-  onContentScroll(): void {
-    if (this.view() !== 'chat') return;
-    const el = this.chatScrollEl;
-    if (!el) return;
-    const threshold = 96;
-    this.shouldAutoScroll = el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
   }
 
   // ── Desktop Status & WebSocket ─────────────────────────────────────
@@ -374,7 +338,6 @@ export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
     this.preferNewSession = false;
     this.view.set('chat');
     this.messages.set([]);
-    this.shouldAutoScroll = true;
     this.loading.set(true);
 
     this.api.listMessages(session.id).subscribe({
@@ -412,7 +375,6 @@ export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
     this.preferNewSession = true;
     this.messages.set([]);
     this.view.set('chat');
-    this.shouldAutoScroll = true;
   }
 
   onRefresh(event: CustomEvent): void {
@@ -438,7 +400,6 @@ export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
     };
     this.messages.update((msgs) => [...msgs, userMsg]);
     this.currentMessage = '';
-    this.shouldAutoScroll = true;
     this.isStreaming.set(true);
     this.streamingContent.set('');
     this.bumpStreamingTimeout();
@@ -516,18 +477,6 @@ export class ChatPage implements OnInit, OnDestroy, AfterViewInit {
       clearTimeout(this.streamingTimeout);
       this.streamingTimeout = null;
     }
-  }
-
-  private scheduleAutoScroll(): void {
-    if (this.autoScrollScheduled) return;
-    this.autoScrollScheduled = true;
-
-    requestAnimationFrame(() => {
-      this.autoScrollScheduled = false;
-      const el = this.chatScrollEl;
-      if (!el || !this.shouldAutoScroll || this.view() !== 'chat') return;
-      el.scrollTop = el.scrollHeight;
-    });
   }
 
   private syncActiveSession(sessions: AiSession[]): AiSession | null {

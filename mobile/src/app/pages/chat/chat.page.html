@@ -6,6 +6,14 @@
           <ion-icon name="arrow-back-outline" slot="start"></ion-icon>
           Sessions
         </ion-button>
+        <ion-button
+          class="chat-quick-new"
+          fill="clear"
+          [disabled]="!desktopOnline() || isStreaming()"
+          (click)="startNewChat()"
+        >
+          <ion-icon name="add-outline" slot="icon-only"></ion-icon>
+        </ion-button>
       </ion-buttons>
       <ion-title>{{ activeSession()?.title ?? 'New Chat' }}</ion-title>
       <ion-buttons slot="end">
@@ -28,7 +36,7 @@
   </ion-header>
 }
 
-<ion-content class="chat-content" #chatContent [scrollEvents]="true" (ionScroll)="onContentScroll()">
+<ion-content class="chat-content">
   <ion-refresher slot="fixed" (ionRefresh)="onRefresh($event)">
     <ion-refresher-content></ion-refresher-content>
   </ion-refresher>
@@ -69,44 +77,17 @@
 
   <!-- Chat View -->
   @if (view() === 'chat') {
-    <div class="chat-messages">
-      @for (msg of aiMessages(); track msg.id) {
-        <johnny-message-bubble
-          [message]="msg"
-          [isStreamingMessage]="isStreaming() && $last && msg.role === 'assistant'"
-        />
-      }
-
-      <!-- Typing indicator: before first delta arrives -->
-      @if (isStreaming() && !streamingContent()) {
-        <div class="message assistant">
-          <div class="message-header">
-            <span class="message-role">Johnny</span>
-          </div>
-          <div class="typing-indicator">
-            <span></span><span></span><span></span>
-          </div>
-        </div>
-      }
-
-      @if (aiMessages().length === 0 && !loading()) {
-        <div class="empty-state">
-          <h2>New Chat</h2>
-          <p>Send a message to your desktop agent.</p>
-          @if (!desktopOnline()) {
-            <p class="offline-hint">Start the desktop app to connect.</p>
-          }
-        </div>
-      }
-    </div>
-
-    <!-- Message Input -->
-    <div class="chat-input-container">
-      <johnny-message-composer
-        [disabled]="!desktopOnline() || isStreaming()"
-        placeholder="Type a message..."
-        (messageSent)="onMessageSent($event)"
-      />
-    </div>
+    <johnny-chat-window
+      class="chat-thread"
+      [messages]="aiMessages()"
+      [isStreaming]="isStreaming()"
+      [disabled]="!desktopOnline() || isStreaming()"
+      placeholder="Type a message..."
+      emptyTitle="New Chat"
+      emptyDescription="Send a message to your desktop agent."
+      [emptyHint]="desktopOnline() ? '' : 'Start the desktop app to connect.'"
+      [showEmpty]="!loading()"
+      (messageSent)="onMessageSent($event)"
+    />
   }
 </ion-content>

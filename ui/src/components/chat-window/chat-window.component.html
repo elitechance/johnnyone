@@ -1,36 +1,44 @@
 <div class="chat-window">
-  <ion-content
-    class="chat-content"
-    [scrollEvents]="true"
-    (ionScroll)="onContentScroll($event)">
+  <div
+    #messagesContainer
+    class="messages-container"
+    (scroll)="onMessagesScroll()">
+    @if (showEmpty && messages.length === 0 && !isStreaming) {
+      <div class="empty-state">
+        <h3>{{ emptyTitle }}</h3>
+        <p>{{ emptyDescription }}</p>
+        @if (emptyHint) {
+          <p class="empty-hint">{{ emptyHint }}</p>
+        }
+      </div>
+    }
 
-    <div class="messages-container">
-      @if (messages.length === 0 && !isStreaming) {
-        <div class="empty-state">
-          <ion-icon name="chatbubbles-outline" size="large"></ion-icon>
-          <p>No messages yet. Start a conversation!</p>
+    @for (message of messages; track trackByMessageId($index, message)) {
+      <johnny-message-bubble
+        [message]="message"
+        [isStreamingMessage]="isStreamingMessage(message, $index)"
+        class="message-item">
+      </johnny-message-bubble>
+    }
+
+    @if (showTypingIndicator) {
+      <div class="typing-indicator">
+        <div class="message-header">
+          <span class="message-role">Johnny</span>
         </div>
-      }
-
-      @for (message of messages; track trackByMessageId($index, message)) {
-        <johnny-message-bubble
-          [message]="message"
-          class="message-item">
-        </johnny-message-bubble>
-      }
-
-      @if (isStreaming) {
-        <div class="streaming-indicator">
-          <ion-spinner name="dots" color="medium"></ion-spinner>
+        <div class="typing-dots">
+          <span></span><span></span><span></span>
         </div>
-      }
-    </div>
-  </ion-content>
+      </div>
+    }
+  </div>
 
   <div class="composer-container">
     <johnny-message-composer
       (messageSent)="onMessageSent($event)"
-      [disabled]="isStreaming">
+      [disabled]="disabled"
+      [placeholder]="placeholder">
     </johnny-message-composer>
+    <ng-content select="[chat-actions]"></ng-content>
   </div>
 </div>
