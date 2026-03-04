@@ -22,6 +22,8 @@ pub fn build_config(
         "stream-json".to_string(),
         "--verbose".to_string(),
         "--print".to_string(),
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
     ];
 
     if !model.is_empty() {

@@ -14,6 +14,8 @@ pub fn build_config(
         "exec".to_string(),
         "--json".to_string(),
         "--skip-git-repo-check".to_string(),
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
     ];
 
     if !model.is_empty() {

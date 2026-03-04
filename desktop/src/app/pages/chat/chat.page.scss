@@ -46,7 +46,7 @@
 
   .sidebar-title {
     flex: 1;
-    font-size: 0.9rem;
+    font-size: 1rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -60,12 +60,12 @@
 
   .search-input {
     width: 100%;
-    padding: 6px 10px;
+    padding: 8px 12px;
     border: 1px solid var(--app-border, var(--ion-color-step-200, #334155));
     border-radius: 6px;
     background: var(--app-surface-2, var(--ion-background-color, #0f172a));
     color: var(--app-text, var(--ion-text-color));
-    font-size: 0.85rem;
+    font-size: 0.95rem;
     outline: none;
 
     &:focus {
@@ -105,7 +105,7 @@
   padding: 8px 16px;
   border-bottom: 1px solid var(--app-border, var(--ion-color-step-200, #1e293b));
   background: var(--app-surface-1, var(--ion-toolbar-background, #0f172a));
-  min-height: 48px;
+  min-height: 56px;
 }
 
 .header-left {
@@ -114,7 +114,7 @@
   gap: 8px;
 
   .chat-title {
-    font-size: 1rem;
+    font-size: 1.15rem;
     font-weight: 500;
     margin: 0;
     white-space: nowrap;
@@ -129,10 +129,10 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 4px 10px;
+    padding: 6px 12px;
     border-radius: 6px;
     background: var(--app-surface-2, var(--ion-color-step-100, #1e293b));
-    font-size: 0.8rem;
+    font-size: 0.9rem;
     cursor: pointer;
     font-family: monospace;
 
@@ -162,7 +162,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px;
+  padding: 6px 10px;
   border-radius: 6px;
   background: var(--app-surface-2, var(--ion-color-step-100, #1e293b));
 
@@ -170,7 +170,7 @@
     background: transparent;
     border: none;
     color: #e2e8f0;
-    font-size: 0.8rem;
+    font-size: 0.95rem;
     cursor: pointer;
     outline: none;
     -webkit-appearance: none;
@@ -201,8 +201,8 @@
   align-items: center;
   justify-content: center;
   gap: 16px;
-  padding: 4px 16px;
-  font-size: 0.7rem;
+  padding: 6px 16px;
+  font-size: 0.82rem;
   font-family: monospace;
   color: var(--ion-color-step-400, #64748b);
   border-top: 1px solid var(--ion-color-step-100, #1e293b);
