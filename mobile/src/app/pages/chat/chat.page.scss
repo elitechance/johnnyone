@@ -30,7 +30,8 @@ ion-header {
 // ── Sessions View ──────────────────────────────────────────────────────────
 
 .sessions-view {
-  height: 100%;
+  // min-height (not height) so content can grow beyond viewport and IonContent scrolls
+  min-height: 100%;
   display: flex;
   flex-direction: column;
 }

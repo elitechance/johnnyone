@@ -20,12 +20,19 @@
   flex-direction: column;
   background: var(--ion-toolbar-background, #0f172a);
   transition: width 0.2s, min-width 0.2s, opacity 0.2s;
+  overflow: hidden;
 
   &.collapsed {
     width: 0;
     min-width: 0;
-    overflow: hidden;
     opacity: 0;
+  }
+
+  // Session list fills remaining sidebar space and scrolls independently
+  johnny-session-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
   }
 }
 

@@ -3,8 +3,9 @@
 }
 
 .session-list {
-  height: 100%;
-  overflow-y: auto;
+  // No own scroll — parent provides the scroll context:
+  // • desktop: .sidebar > johnny-session-list has overflow-y: auto (chat.page.scss)
+  // • mobile: IonContent is the scroll root; IonItemSliding finds it automatically
 }
 
 .empty-state {

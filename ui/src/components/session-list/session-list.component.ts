@@ -1,12 +1,31 @@
-import { Component, Input, Output, EventEmitter, ChangeDetectionStrategy } from '@angular/core';
+import { Component, Input, Output, EventEmitter, ChangeDetectionStrategy, ViewChildren, QueryList } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { IonicModule } from '@ionic/angular';
+import {
+  IonList,
+  IonItem,
+  IonButton,
+  IonIcon,
+  IonLabel,
+  IonItemSliding,
+  IonItemOptions,
+  IonItemOption,
+} from '@ionic/angular/standalone';
 import { AiSession } from '../../models/ai-session.model';
 
 @Component({
   selector: 'johnny-session-list',
   standalone: true,
-  imports: [CommonModule, IonicModule],
+  imports: [
+    CommonModule,
+    IonList,
+    IonItem,
+    IonButton,
+    IonIcon,
+    IonLabel,
+    IonItemSliding,
+    IonItemOptions,
+    IonItemOption,
+  ],
   templateUrl: './session-list.component.html',
   styleUrls: ['./session-list.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -19,6 +38,12 @@ export class SessionListComponent {
   @Output() sessionArchived = new EventEmitter<string>();
   @Output() sessionDeleted = new EventEmitter<string>();
 
+  @ViewChildren(IonItemSliding) slidingItems!: QueryList<IonItemSliding>;
+
+  private closeAllSliding(): void {
+    this.slidingItems?.forEach(item => item.close());
+  }
+
   get activeSessions(): AiSession[] {
     return this.sessions.filter((s) => s.status === 'active');
   }
@@ -28,16 +53,19 @@ export class SessionListComponent {
   }
 
   onSelect(session: AiSession): void {
+    this.closeAllSliding();
     this.sessionSelected.emit(session.id);
   }
 
   onArchive(event: Event, session: AiSession): void {
     event.stopPropagation();
+    this.closeAllSliding();
     this.sessionArchived.emit(session.id);
   }
 
   onDelete(event: Event, session: AiSession): void {
     event.stopPropagation();
+    this.closeAllSliding();
     this.sessionDeleted.emit(session.id);
   }
 
