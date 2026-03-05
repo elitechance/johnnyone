@@ -1,6 +1,11 @@
-<div class="chat-layout" (keydown)="onGlobalKeyDown($event)">
+<div class="chat-layout" [class.resizing-sidebar]="isResizingSidebar()" (keydown)="onGlobalKeyDown($event)">
   <!-- Sidebar: Session List -->
-  <aside class="sidebar" [class.collapsed]="!sidebarOpen()">
+  <aside
+    class="sidebar"
+    [class.collapsed]="!sidebarOpen()"
+    [style.width.px]="sidebarOpen() ? sidebarWidth() : 0"
+    [style.minWidth.px]="sidebarOpen() ? sidebarWidth() : 0"
+  >
     <div class="sidebar-header">
       <span class="sidebar-title">Sessions</span>
       <ion-button fill="clear" size="small" (click)="createNewSession()">
@@ -23,11 +28,24 @@
     <johnny-session-list
       [sessions]="aiSessions()"
       [activeSessionId]="currentSession()?.id ?? null"
+      [allowRename]="true"
       (sessionSelected)="onSessionSelected($event)"
       (sessionArchived)="onSessionArchived($event)"
       (sessionDeleted)="onSessionDeleted($event)"
+      (sessionRenamed)="onSessionRenamed($event)"
     />
   </aside>
+
+  @if (sidebarOpen()) {
+    <div
+      class="sidebar-resizer"
+      role="separator"
+      aria-orientation="vertical"
+      tabindex="0"
+      (mousedown)="startSidebarResize($event)"
+      (dblclick)="resetSidebarWidth()"
+    ></div>
+  }
 
   <!-- Sidebar toggle when collapsed -->
   @if (!sidebarOpen()) {

@@ -32,13 +32,9 @@ environments:
     domain: localhost:4200
     worker_domain: localhost:7714
   dev:
-    domain: dev.johnnyone.app
-    worker_domain: api-dev.johnnyone.app
+    worker_domain: dev-johnnyone.lokalbase.app
   prod:
-    domain: johnnyone.app
-    worker_domain: api.johnnyone.app
+    worker_domain: johnnyone.lokalbase.app
 
 secrets:
-  - ANTHROPIC_API_KEY
-  - OPENAI_API_KEY
   - JWT_SECRET

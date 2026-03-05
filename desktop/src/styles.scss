@@ -16,6 +16,9 @@
 
 /* Dark Theme Variables */
 :root {
+  --app-font-size-base: 21px;
+  --ion-font-size: var(--app-font-size-base);
+
   --app-bg: #0b1220;
   --app-surface-1: #111d34;
   --app-surface-2: #16243f;
@@ -124,7 +127,12 @@ html, body {
   height: 100%;
   margin: 0;
   padding: 0;
+  font-size: var(--app-font-size-base, 21px);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+ion-app {
+  font-size: var(--app-font-size-base, 21px);
 }
 
 ion-content {

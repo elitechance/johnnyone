@@ -33,10 +33,12 @@ import { AiSession } from '../../models/ai-session.model';
 export class SessionListComponent {
   @Input() sessions: AiSession[] = [];
   @Input() activeSessionId: string | null = null;
+  @Input() allowRename = false;
 
   @Output() sessionSelected = new EventEmitter<string>();
   @Output() sessionArchived = new EventEmitter<string>();
   @Output() sessionDeleted = new EventEmitter<string>();
+  @Output() sessionRenamed = new EventEmitter<string>();
 
   @ViewChildren(IonItemSliding) slidingItems!: QueryList<IonItemSliding>;
 
@@ -67,6 +69,12 @@ export class SessionListComponent {
     event.stopPropagation();
     this.closeAllSliding();
     this.sessionDeleted.emit(session.id);
+  }
+
+  onRename(event: Event, session: AiSession): void {
+    event.stopPropagation();
+    this.closeAllSliding();
+    this.sessionRenamed.emit(session.id);
   }
 
   formatDate(dateStr: string): string {

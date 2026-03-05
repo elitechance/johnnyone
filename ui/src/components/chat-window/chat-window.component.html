@@ -44,6 +44,8 @@
       [disabled]="disabled"
       [placeholder]="placeholder">
     </johnny-message-composer>
-    <ng-content select="[chat-actions]"></ng-content>
+    <div class="chat-actions-slot">
+      <ng-content select="[chat-actions]"></ng-content>
+    </div>
   </div>
 </div>

@@ -43,10 +43,16 @@ import { Subscription } from 'rxjs';
   styleUrls: ['./chat.page.scss'],
 })
 export class ChatPage implements OnInit, OnDestroy {
+  private static readonly SIDEBAR_WIDTH_KEY = 'johnnyone_desktop_sidebar_width';
   private readonly tauriBridge = inject(TauriBridgeService);
   private readonly router = inject(Router);
+  private readonly minSidebarWidth = 260;
+  private readonly maxSidebarWidth = 560;
+  private readonly defaultSidebarWidth = 360;
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
+  private resizeMoveHandler: ((event: MouseEvent) => void) | null = null;
+  private resizeUpHandler: (() => void) | null = null;
 
   // State
   sessions = signal<Session[]>([]);
@@ -61,6 +67,8 @@ export class ChatPage implements OnInit, OnDestroy {
   selectedProvider = signal('claude_code');
   workingDirectory = signal('');
   sidebarOpen = signal(true);
+  sidebarWidth = signal(this.defaultSidebarWidth);
+  isResizingSidebar = signal(false);
 
   // Computed
   filteredSessions = computed(() => {
@@ -93,6 +101,7 @@ export class ChatPage implements OnInit, OnDestroy {
   });
 
   ngOnInit(): void {
+    this.loadSidebarWidth();
     this.loadSessions();
     this.detectTools();
     this.subscribeToDelta();
@@ -102,6 +111,7 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.stopSidebarResize();
     this.deltaSubscription?.unsubscribe();
     this.completeSubscription?.unsubscribe();
   }
@@ -232,6 +242,31 @@ export class ChatPage implements OnInit, OnDestroy {
       }
     } catch (err) {
       console.error('Failed to delete session:', err);
+    }
+  }
+
+  async onSessionRenamed(id: string): Promise<void> {
+    const target = this.sessions().find((session) => session.id === id);
+    if (!target) return;
+
+    const nextTitle = window.prompt('Enter a new session name:', target.title);
+    if (nextTitle === null) return;
+
+    const trimmedTitle = nextTitle.trim();
+    if (!trimmedTitle || trimmedTitle === target.title) return;
+
+    try {
+      const updated = await this.tauriBridge.updateSessionTitle(id, trimmedTitle);
+
+      this.sessions.update((all) =>
+        all.map((session) => (session.id === id ? { ...session, title: updated.title, updated_at: updated.updated_at } : session))
+      );
+
+      if (this.currentSession()?.id === id) {
+        this.currentSession.set(updated);
+      }
+    } catch (err) {
+      console.error('Failed to rename session:', err);
     }
   }
 
@@ -465,6 +500,80 @@ export class ChatPage implements OnInit, OnDestroy {
     if (dir) {
       await this.onWorkingDirectoryChange(dir);
     }
+  }
+
+  // ── Sidebar Resizing ───────────────────────────────────────────────
+
+  startSidebarResize(event: MouseEvent): void {
+    if (!this.sidebarOpen()) return;
+
+    event.preventDefault();
+    this.stopSidebarResize();
+
+    const startX = event.clientX;
+    const startWidth = this.sidebarWidth();
+    this.isResizingSidebar.set(true);
+
+    this.resizeMoveHandler = (moveEvent: MouseEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const nextWidth = this.clampSidebarWidth(startWidth + deltaX);
+      this.sidebarWidth.set(nextWidth);
+    };
+
+    this.resizeUpHandler = () => {
+      const width = this.sidebarWidth();
+      this.saveSidebarWidth(width);
+      this.stopSidebarResize();
+    };
+
+    window.addEventListener('mousemove', this.resizeMoveHandler);
+    window.addEventListener('mouseup', this.resizeUpHandler);
+  }
+
+  resetSidebarWidth(): void {
+    const width = this.defaultSidebarWidth;
+    this.sidebarWidth.set(width);
+    this.saveSidebarWidth(width);
+  }
+
+  private stopSidebarResize(): void {
+    if (this.resizeMoveHandler) {
+      window.removeEventListener('mousemove', this.resizeMoveHandler);
+      this.resizeMoveHandler = null;
+    }
+
+    if (this.resizeUpHandler) {
+      window.removeEventListener('mouseup', this.resizeUpHandler);
+      this.resizeUpHandler = null;
+    }
+
+    this.isResizingSidebar.set(false);
+  }
+
+  private loadSidebarWidth(): void {
+    try {
+      const raw = localStorage.getItem(ChatPage.SIDEBAR_WIDTH_KEY);
+      if (!raw) return;
+
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed)) {
+        this.sidebarWidth.set(this.clampSidebarWidth(parsed));
+      }
+    } catch {
+      // Ignore malformed or unavailable localStorage.
+    }
+  }
+
+  private saveSidebarWidth(width: number): void {
+    try {
+      localStorage.setItem(ChatPage.SIDEBAR_WIDTH_KEY, String(width));
+    } catch {
+      // Ignore localStorage write failures.
+    }
+  }
+
+  private clampSidebarWidth(width: number): number {
+    return Math.min(this.maxSidebarWidth, Math.max(this.minSidebarWidth, width));
   }
 
   // ── Helpers ────────────────────────────────────────────────────────

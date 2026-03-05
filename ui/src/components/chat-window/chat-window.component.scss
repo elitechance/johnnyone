@@ -102,6 +102,21 @@
   padding: 8px 16px;
   padding-bottom: max(8px, env(safe-area-inset-bottom));
   display: flex;
-  flex-direction: column;
+  align-items: flex-end;
   gap: 8px;
+}
+
+.composer-container > johnny-message-composer {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-actions-slot {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+
+  &:empty {
+    display: none;
+  }
 }

@@ -10,13 +10,19 @@
     radial-gradient(circle at 20% 0%, rgba(var(--ion-color-primary-rgb, 47, 125, 246), 0.12), transparent 28%),
     var(--app-bg, var(--ion-background-color, #0f172a));
   color: var(--app-text, var(--ion-text-color, #e2e8f0));
+
+  &.resizing-sidebar {
+    cursor: col-resize;
+    user-select: none;
+  }
 }
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 
 .sidebar {
-  width: 280px;
-  min-width: 280px;
+  width: 360px;
+  min-width: 360px;
+  flex: 0 0 auto;
   border-right: 1px solid var(--app-border, var(--ion-color-step-200, #1e293b));
   display: flex;
   flex-direction: column;
@@ -35,6 +41,38 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    --johnny-session-item-min-height: 68px;
+    --johnny-session-header-font-size: 0.72rem;
+    --johnny-session-title-font-size: 1rem;
+    --johnny-session-meta-font-size: 0.82rem;
+    --johnny-session-provider-font-size: 0.78rem;
+    --johnny-session-tokens-font-size: 0.78rem;
+    --johnny-session-empty-font-size: 0.88rem;
+  }
+}
+
+.sidebar-resizer {
+  width: 12px;
+  flex: 0 0 12px;
+  position: relative;
+  cursor: col-resize;
+  background: transparent;
+
+  &::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 5px;
+    width: 2px;
+    border-radius: 99px;
+    background: rgba(159, 176, 205, 0.35);
+    transition: background 0.15s ease;
+  }
+
+  &:hover::after,
+  .chat-layout.resizing-sidebar &::after {
+    background: rgba(var(--ion-color-primary-rgb, 47, 125, 246), 0.8);
   }
 }
 
@@ -192,6 +230,16 @@
 .chat-thread {
   flex: 1;
   min-height: 0;
+  --johnny-composer-input-font-size: 1.02rem;
+  --johnny-composer-min-height: 52px;
+  --johnny-composer-input-padding-vertical: 10px;
+  --johnny-composer-button-size: 46px;
+  --johnny-composer-send-icon-size: 22px;
+  --johnny-bubble-body-font-size: 1rem;
+  --johnny-bubble-line-height: 1.58;
+  --johnny-bubble-header-font-size: 0.8rem;
+  --johnny-bubble-timestamp-font-size: 0.72rem;
+  --johnny-bubble-code-font-size: 0.82rem;
 }
 
 // ── Usage Bar ──────────────────────────────────────────────────────────────
@@ -209,7 +257,7 @@
 }
 
 .stop-button {
-  align-self: flex-end;
+  align-self: center;
   --padding-start: 12px;
   --padding-end: 12px;
   margin: 0;

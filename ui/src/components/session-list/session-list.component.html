@@ -47,8 +47,15 @@
               </ion-button>
             </ion-item>
             <ion-item-options side="end">
-              <ion-item-option color="danger" expandable (click)="onDelete($event, session)">
-                <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+              @if (allowRename) {
+                <ion-item-option color="primary" (click)="onRename($event, session)">
+                  <ion-icon slot="start" name="create-outline" aria-hidden="true"></ion-icon>
+                  Rename
+                </ion-item-option>
+              }
+              <ion-item-option color="danger" (click)="onDelete($event, session)">
+                <ion-icon slot="start" name="trash-outline" aria-hidden="true"></ion-icon>
+                Delete
               </ion-item-option>
             </ion-item-options>
           </ion-item-sliding>
@@ -82,8 +89,15 @@
               </div>
             </ion-item>
             <ion-item-options side="end">
-              <ion-item-option color="danger" expandable (click)="onDelete($event, session)">
-                <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+              @if (allowRename) {
+                <ion-item-option color="primary" (click)="onRename($event, session)">
+                  <ion-icon slot="start" name="create-outline" aria-hidden="true"></ion-icon>
+                  Rename
+                </ion-item-option>
+              }
+              <ion-item-option color="danger" (click)="onDelete($event, session)">
+                <ion-icon slot="start" name="trash-outline" aria-hidden="true"></ion-icon>
+                Delete
               </ion-item-option>
             </ion-item-options>
           </ion-item-sliding>
