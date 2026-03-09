@@ -6,5 +6,6 @@ pub mod host;
 pub mod paths;
 pub mod providers;
 pub mod services;
+pub mod simulator;
 pub mod state;
 pub mod tools;

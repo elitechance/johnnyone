@@ -10,22 +10,18 @@ interface WorkerEnv {
   [key: string]: unknown;
 }
 
-export default async function detectCliTools(
+export default async function updateSetting(
   _parent: unknown,
-  _args: Record<string, never>,
+  args: { key: string; value: string },
   ctx: ResolverContext,
 ) {
-  const result = await hostGraphqlRequest<{ detectCliTools: unknown[] }>(
+  const result = await hostGraphqlRequest<{ setSetting: boolean }>(
     ctx.env,
-    `mutation DetectCliTools {
-      detectCliTools {
-        provider
-        command
-        found
-        path
-      }
+    `mutation SetSetting($key: String!, $value: String!) {
+      setSetting(key: $key, value: $value)
     }`,
+    args,
   );
 
-  return result.detectCliTools;
+  return result.setSetting;
 }

@@ -141,9 +141,9 @@ export class JohnnyApiService {
 
   archiveSession(id: string): Observable<AiSession> {
     return this.gql
-      .mutate<{ archiveAiSession: AiSession }>(
-        `mutation ArchiveAiSession($id: ID!) {
-          archiveAiSession(id: $id) {
+      .mutate<{ updateAiSessionArchived: AiSession }>(
+        `mutation UpdateAiSessionArchived($id: ID!) {
+          updateAiSessionArchived(id: $id) {
             id title provider model workingDirectory status
             totalInputTokens totalOutputTokens totalCostCents
             createdAt updatedAt
@@ -151,7 +151,7 @@ export class JohnnyApiService {
         }`,
         { id }
       )
-      .pipe(map((data) => data.archiveAiSession));
+      .pipe(map((data) => data.updateAiSessionArchived));
   }
 
   // ── Messages ──────────────────────────────────────────────────────────
@@ -205,13 +205,13 @@ export class JohnnyApiService {
 
   stopAiGeneration(sessionId: string): Observable<boolean> {
     return this.gql
-      .mutate<{ stopAiGeneration: boolean }>(
-        `mutation StopAiGeneration($sessionId: ID!) {
-          stopAiGeneration(sessionId: $sessionId)
+      .mutate<{ cancelAiGeneration: boolean }>(
+        `mutation CancelAiGeneration($sessionId: ID!) {
+          cancelAiGeneration(sessionId: $sessionId)
         }`,
         { sessionId }
       )
-      .pipe(map((data) => data.stopAiGeneration));
+      .pipe(map((data) => data.cancelAiGeneration));
   }
 
   // ── Message Subscriptions ─────────────────────────────────────────────
@@ -393,14 +393,14 @@ export class JohnnyApiService {
 
   detectCliTools(): Observable<DetectedCliTool[]> {
     return this.gql
-      .mutate<{ detectCliTools: DetectedCliTool[] }>(
-        `mutation DetectCliTools {
-          detectCliTools {
+      .query<{ listDetectedCliTools: DetectedCliTool[] }>(
+        `query ListDetectedCliTools {
+          listDetectedCliTools {
             provider command found path
           }
         }`
       )
-      .pipe(map((data) => data.detectCliTools));
+      .pipe(map((data) => data.listDetectedCliTools));
   }
 
   getSetting(key: string): Observable<string> {
@@ -416,13 +416,13 @@ export class JohnnyApiService {
 
   setSetting(key: string, value: string): Observable<boolean> {
     return this.gql
-      .mutate<{ setSetting: boolean }>(
-        `mutation SetSetting($key: String!, $value: String!) {
-          setSetting(key: $key, value: $value)
+      .mutate<{ updateSetting: boolean }>(
+        `mutation UpdateSetting($key: String!, $value: String!) {
+          updateSetting(key: $key, value: $value)
         }`,
         { key, value }
       )
-      .pipe(map((data) => data.setSetting));
+      .pipe(map((data) => data.updateSetting));
   }
 
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {

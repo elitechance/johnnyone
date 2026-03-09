@@ -156,6 +156,7 @@ type Query {
   getAiSession(id: ID!): AiSession
   listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!
   listProviderConfigs: [ProviderConfig!]!
+  listDetectedCliTools: [DetectedTool!]!
   getSetting(key: String!): String!
 }
 
@@ -166,17 +167,16 @@ type Mutation {
   updateAiSessionTitle(id: ID!, title: String!): AiSession!
   updateAiSessionWorkingDirectory(id: ID!, workingDirectory: String!): AiSession!
   updateAiSessionProvider(id: ID!, provider: String!): AiSession!
-  archiveAiSession(id: ID!): AiSession!
+  updateAiSessionArchived(id: ID!): AiSession!
   registerDesktopNode(input: RegisterDesktopNodeInput!): DesktopNode!
   updateDesktopNodeStatus(id: ID!, status: DesktopNodeStatus!): DesktopNode!
   sendRelayChatMessage(input: RelayChatMessageInput!): RelayChatResponse!
   sendAiChatMessage(input: SendAiChatMessageInput!): AiChatRunResult!
-  stopAiGeneration(sessionId: ID!): Boolean!
+  cancelAiGeneration(sessionId: ID!): Boolean!
   deleteAiSession(id: ID!): Boolean!
   upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
   deleteProviderConfig(provider: String!): Boolean!
-  detectCliTools: [DetectedTool!]!
-  setSetting(key: String!, value: String!): Boolean!
+  updateSetting(key: String!, value: String!): Boolean!
 }
 
 # --- Subscriptions ---

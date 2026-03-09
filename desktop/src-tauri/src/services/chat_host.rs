@@ -3,9 +3,10 @@ use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::providers::{
     claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
+use crate::simulator;
 use crate::state::app_state::AppState;
 use rusqlite::params;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +51,18 @@ pub async fn send_chat_message_blocking(
 
         query_message(conn, &user_msg_id)
     })?;
+
+    if simulator::host_simulator_enabled() {
+        return send_simulated_chat_message(
+            state,
+            session_id,
+            provider_str,
+            model,
+            content,
+            user_message,
+        )
+        .await;
+    }
 
     let cli_path: Option<String> = state.db.with_conn(|conn| {
         let result = conn.query_row(
@@ -274,6 +287,77 @@ pub async fn send_chat_message_blocking(
             params![&session_id, &assistant_msg_id, provider.as_str(), "", total_input_tokens, total_output_tokens, total_cost_cents],
         )
         .map_err(|e| format!("Failed to log usage: {}", e))?;
+
+        query_message(conn, &assistant_msg_id)
+    })?;
+
+    let _ = state.chat_complete_tx.send(ChatCompleteEvent {
+        session_id,
+        message_id: assistant_message.id.clone(),
+    });
+
+    Ok(ChatRunResult {
+        user_message,
+        assistant_message,
+    })
+}
+
+async fn send_simulated_chat_message(
+    state: &AppState,
+    session_id: String,
+    provider: String,
+    model: String,
+    content: String,
+    user_message: Message,
+) -> Result<ChatRunResult, String> {
+    let assistant_msg_id = Uuid::new_v4().to_string();
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content) VALUES (?1, ?2, 'assistant', '')",
+            params![assistant_msg_id, session_id],
+        )
+        .map_err(|e| format!("Failed to create assistant message: {}", e))
+    })?;
+
+    let full_content = simulator::simulated_chat_response(&provider, &model, &content);
+    let deltas = full_content
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(12)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>();
+    let total_input_tokens = content.split_whitespace().count() as i64;
+    let total_output_tokens = full_content.split_whitespace().count() as i64;
+
+    for (index, delta) in deltas.iter().enumerate() {
+        sleep(Duration::from_millis(180)).await;
+        let _ = state.chat_delta_tx.send(ChatDeltaEvent {
+            session_id: session_id.clone(),
+            message_id: assistant_msg_id.clone(),
+            delta: delta.clone(),
+            chunk_type: "text".to_string(),
+            is_final: index + 1 == deltas.len(),
+        });
+    }
+
+    let assistant_message = state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE messages SET content = ?1, input_tokens = ?2, output_tokens = ?3, cost_cents = 0, finish_reason = 'stop' WHERE id = ?4",
+            params![full_content, total_input_tokens, total_output_tokens, assistant_msg_id],
+        )
+        .map_err(|e| format!("Failed to update simulated assistant message: {}", e))?;
+
+        conn.execute(
+            "UPDATE sessions SET total_input_tokens = total_input_tokens + ?1, total_output_tokens = total_output_tokens + ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![total_input_tokens, total_output_tokens, &session_id],
+        )
+        .map_err(|e| format!("Failed to update simulated session totals: {}", e))?;
+
+        conn.execute(
+            "INSERT INTO usage_log (session_id, message_id, provider, model, input_tokens, output_tokens, cost_cents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![&session_id, &assistant_msg_id, &provider, &model, total_input_tokens, total_output_tokens],
+        )
+        .map_err(|e| format!("Failed to log simulated usage: {}", e))?;
 
         query_message(conn, &assistant_msg_id)
     })?;

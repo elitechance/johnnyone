@@ -10,18 +10,22 @@ interface WorkerEnv {
   [key: string]: unknown;
 }
 
-export default async function stopAiGeneration(
+export default async function listDetectedCliTools(
   _parent: unknown,
-  args: { sessionId: string },
+  _args: Record<string, never>,
   ctx: ResolverContext,
 ) {
-  const result = await hostGraphqlRequest<{ stopAiGeneration: boolean }>(
+  const result = await hostGraphqlRequest<{ detectCliTools: unknown[] }>(
     ctx.env,
-    `mutation StopAiGeneration($sessionId: String!) {
-      stopAiGeneration(sessionId: $sessionId)
+    `mutation DetectCliTools {
+      detectCliTools {
+        provider
+        command
+        found
+        path
+      }
     }`,
-    { sessionId: args.sessionId },
   );
 
-  return result.stopAiGeneration;
+  return result.detectCliTools;
 }

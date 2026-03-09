@@ -10,7 +10,7 @@ interface WorkerEnv {
   [key: string]: unknown;
 }
 
-export default async function archiveAiSession(
+export default async function updateAiSessionArchived(
   _parent: unknown,
   args: { id: string },
   ctx: ResolverContext,

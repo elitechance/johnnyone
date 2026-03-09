@@ -6,30 +6,143 @@ project:
 cloudflare:
   account: static
 
-apps:
-  main:
-    worker:
-      dir: worker
-      modules:
-        - name: auth
-          features:
-            password: true
-            oauth: []
-            passkey: false
-    frontend:
-      dir: desktop
-      framework: angular
-      dist: dist/desktop
-      pre_build: nx build mobile
-      build: nx build desktop
-    d1:
-      name: johnnyone-db
-      migrations: worker/d1/migrations
-      seeds: worker/d1/seeds
+app:
+  worker:
+    dir: worker
+    modules:
+      - name: auth
+        features:
+          password: true
+          oauth: []
+          passkey: false
+
+  d1:
+    name: johnnyone-db
+    migrations: worker/d1/migrations
+    seeds: worker/d1/seeds
+
+  builds:
+    edge:
+      kind: worker
+      cwd: .
+      command:
+        local: nx build worker
+        dev: nx build worker
+        prod: nx build worker
+      outputs:
+        - dist/worker
+
+    host:
+      kind: binary
+      cwd: desktop/src-tauri
+      command:
+        local: cargo build --bin johnnyone-host
+        dev: cargo build --bin johnnyone-host
+        prod: cargo build --release --bin johnnyone-host
+      outputs:
+        - target/debug/johnnyone-host
+
+    desktop-web:
+      kind: web
+      cwd: .
+      command:
+        local: nx build desktop
+        dev: nx build desktop
+        prod: nx build desktop
+      outputs:
+        - dist/desktop
+
+    mobile-web:
+      kind: mobile
+      cwd: .
+      command:
+        local: nx build mobile
+        dev: nx build mobile
+        prod: nx build mobile
+      outputs:
+        - dist/mobile
+
+local:
+  hooks:
+    pre_sim:
+      - nx build desktop
+  processes:
+    host:
+      kind: service
+      cwd: desktop/src-tauri
+      command: cargo run --bin johnnyone-host
+      env:
+        JOHNNYONE_HOST_ADDR: 127.0.0.1:7788
+      ready:
+        type: graphql
+        url: http://127.0.0.1:7788/graphql
+        query: "query { health }"
+    edge:
+      kind: worker
+      cwd: .
+      command: npx lokal cf worker sim --project johnnyone --worker-dir worker --port 7714
+      env:
+        HOST_GRAPHQL_URL: http://127.0.0.1:7788/graphql
+      depends_on:
+        - host
+      ready:
+        type: graphql
+        url: http://127.0.0.1:7714/graphql
+        query: "query { __typename }"
+    desktop:
+      kind: frontend
+      cwd: desktop
+      command: npx ng serve --port 4200
+      depends_on:
+        - edge
+      ready:
+        type: http
+        url: http://127.0.0.1:4200
+    mobile:
+      kind: mobile
+      cwd: mobile
+      command: npx ng serve --port 4201
+      depends_on:
+        - edge
+      ready:
+        type: http
+        url: http://127.0.0.1:4201
+  profiles:
+    desktop:
+      build:
+        - host
+        - edge
+        - desktop-web
+      run:
+        - host
+        - edge
+        - desktop
+    mobile:
+      build:
+        - host
+        - edge
+        - mobile-web
+      run:
+        - host
+        - edge
+        - mobile
+    full:
+      build:
+        - host
+        - edge
+        - desktop-web
+        - mobile-web
+      run:
+        - host
+        - edge
+        - desktop
+        - mobile
+  default_profile: desktop
 
 environments:
   local:
     worker_port: 7714
+    frontend_port: 4200
     domain: localhost:4200
     worker_domain: localhost:7714
   dev:

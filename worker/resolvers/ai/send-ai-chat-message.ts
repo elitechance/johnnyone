@@ -7,11 +7,13 @@ import {
 interface ResolverContext {
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
+  pubsub?: {
+    publish: (topic: string, data: unknown) => void;
+  };
 }
 
 interface WorkerEnv {
   HOST_GRAPHQL_URL?: string;
-  PUBSUB_DO?: DurableObjectNamespace;
   [key: string]: unknown;
 }
 
@@ -33,20 +35,6 @@ interface AiChatCompletePayload {
   messageId: string;
 }
 
-async function publishTopic(
-  pubsub: DurableObjectStub,
-  topic: string,
-  payload: unknown,
-): Promise<void> {
-  await pubsub.fetch(
-    new Request('https://do.internal/publish', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic, payload }),
-    }),
-  );
-}
-
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -56,10 +44,7 @@ export default async function sendAiChatMessage(
   args: { input: SendAiChatMessageInput },
   ctx: ResolverContext,
 ) {
-  const pubsubNamespace = ctx.env.PUBSUB_DO as DurableObjectNamespace | undefined;
-  const pubsub = pubsubNamespace
-    ? pubsubNamespace.get(pubsubNamespace.idFromName('global'))
-    : null;
+  const pubsub = ctx.pubsub;
   const sessionId = args.input.sessionId;
   let sawDelta = false;
   let sawComplete = false;
@@ -86,13 +71,10 @@ export default async function sendAiChatMessage(
           { sessionId },
           (payload) => {
             sawDelta = true;
-            void publishTopic(
-              pubsub,
+            pubsub.publish(
               `ai-chat-delta:${payload.onAiChatDelta.sessionId}`,
               payload.onAiChatDelta,
-            ).catch((err: Error) => {
-              console.error('Failed to publish streamed ai chat delta:', err);
-            });
+            );
           },
         ),
         hostGraphqlSubscribe<{ onAiChatComplete: AiChatCompletePayload }>(
@@ -108,13 +90,10 @@ export default async function sendAiChatMessage(
             sawComplete = true;
             resolveCompletionEvent?.();
             resolveCompletionEvent = null;
-            void publishTopic(
-              pubsub,
+            pubsub.publish(
               `ai-chat-complete:${payload.onAiChatComplete.sessionId}`,
               payload.onAiChatComplete,
-            ).catch((err: Error) => {
-              console.error('Failed to publish streamed ai chat completion:', err);
-            });
+            );
           },
         ),
       ]);
@@ -197,23 +176,19 @@ export default async function sendAiChatMessage(
       await Promise.race([completionEvent, wait(250)]);
 
       if (!sawDelta) {
-        await publishTopic(pubsub, `ai-chat-delta:${payload.assistantMessage.sessionId}`, {
+        pubsub.publish(`ai-chat-delta:${payload.assistantMessage.sessionId}`, {
           sessionId: payload.assistantMessage.sessionId,
           messageId: payload.assistantMessage.id,
           delta: payload.assistantMessage.content,
           chunkType: 'text',
           isFinal: true,
-        }).catch((err: Error) => {
-          console.error('Failed to publish fallback ai chat delta:', err);
         });
       }
 
       if (!sawComplete) {
-        await publishTopic(pubsub, `ai-chat-complete:${payload.assistantMessage.sessionId}`, {
+        pubsub.publish(`ai-chat-complete:${payload.assistantMessage.sessionId}`, {
           sessionId: payload.assistantMessage.sessionId,
           messageId: payload.assistantMessage.id,
-        }).catch((err: Error) => {
-          console.error('Failed to publish fallback ai chat completion:', err);
         });
       }
     }

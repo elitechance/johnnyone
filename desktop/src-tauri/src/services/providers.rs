@@ -1,5 +1,6 @@
 use crate::db::models::{ProviderConfig, UpsertProviderConfigInput};
 use crate::providers::CliProvider;
+use crate::simulator;
 use crate::state::app_state::AppState;
 use rusqlite::params;
 use serde::Serialize;
@@ -119,6 +120,39 @@ pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, Str
         CliProvider::Cline,
         CliProvider::Ollama,
     ];
+
+    if simulator::host_simulator_enabled() {
+        let simulated_tools = providers
+            .iter()
+            .map(|provider| DetectedTool {
+                provider: provider.as_str().to_string(),
+                command: provider.default_command().to_string(),
+                found: true,
+                path: Some(simulator::simulated_cli_path(provider.default_command())),
+            })
+            .collect::<Vec<_>>();
+
+        for tool in &simulated_tools {
+            let _ = state.db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO provider_configs (id, provider, cli_path, is_available, updated_at)
+                     VALUES (?1, ?2, ?3, 1, datetime('now'))
+                     ON CONFLICT(provider) DO UPDATE SET
+                       cli_path = ?3,
+                       is_available = 1,
+                       updated_at = datetime('now')",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        tool.provider,
+                        tool.path.as_deref().unwrap_or(""),
+                    ],
+                )
+                .map_err(|e| e.to_string())
+            });
+        }
+
+        return Ok(simulated_tools);
+    }
 
     let mut results = Vec::new();
 

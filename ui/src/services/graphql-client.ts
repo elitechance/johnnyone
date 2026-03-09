@@ -139,7 +139,7 @@ export class GraphQLClient {
           ...this.extraHeaders,
         },
         body,
-        credentials: 'include',
+        credentials: 'same-origin',
       })
     ).pipe(
       switchMap((response) => {

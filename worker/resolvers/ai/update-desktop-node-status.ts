@@ -1,12 +1,9 @@
 interface ResolverContext {
   db: D1Database;
-  env: WorkerEnv;
   auth: { userId: string; tenantId: string };
-}
-
-interface WorkerEnv {
-  PUBSUB_DO: DurableObjectNamespace;
-  [key: string]: unknown;
+  pubsub?: {
+    publish: (topic: string, data: unknown) => void;
+  };
 }
 
 interface DesktopNodeRow {
@@ -62,37 +59,20 @@ export default async function updateDesktopNodeStatus(
     throw new Error('Failed to update desktop node status');
   }
 
-  // Publish node status change via PubSub DO
-  const pubsubId = ctx.env.PUBSUB_DO.idFromName('global');
-  const pubsub = ctx.env.PUBSUB_DO.get(pubsubId);
-
-  pubsub
-    .fetch(
-      new Request('https://do.internal/publish', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic: `desktop-node-status:${ctx.auth.tenantId}`,
-          payload: {
-            id: node.id,
-            tenantId: node.tenant_id,
-            userId: node.user_id,
-            hostname: node.hostname,
-            os: node.os,
-            arch: node.arch,
-            version: node.version,
-            status: node.status,
-            capabilities: node.capabilities,
-            lastHeartbeatAt: node.last_heartbeat_at,
-            createdAt: node.created_at,
-            updatedAt: node.updated_at,
-          },
-        }),
-      }),
-    )
-    .catch((err: Error) => {
-      console.error('Failed to publish node status change:', err);
-    });
+  ctx.pubsub?.publish(`desktop-node-status:${ctx.auth.tenantId}`, {
+    id: node.id,
+    tenantId: node.tenant_id,
+    userId: node.user_id,
+    hostname: node.hostname,
+    os: node.os,
+    arch: node.arch,
+    version: node.version,
+    status: node.status,
+    capabilities: node.capabilities,
+    lastHeartbeatAt: node.last_heartbeat_at,
+    createdAt: node.created_at,
+    updatedAt: node.updated_at,
+  });
 
   return {
     id: node.id,
