@@ -1,11 +1,16 @@
 export interface ProviderConfig {
   id: string;
-  provider: 'claude' | 'openai' | 'ollama';
-  model: string;
+  provider: string;
+  model?: string;
+  cliPath?: string;
+  apiKey?: string;
   apiKeyRef?: string;
   baseUrl?: string;
-  isDefault: boolean;
-  settings: Record<string, unknown>;
+  defaultModel?: string;
+  isDefault?: boolean;
+  isAvailable?: boolean;
+  settings: Record<string, unknown> | string;
+  updatedAt?: string;
 }
 
 export interface LlmModel {

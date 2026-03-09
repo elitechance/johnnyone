@@ -13,33 +13,33 @@ import {
   IonItem,
   IonLabel,
   IonInput,
-  IonSelect,
-  IonSelectOption,
-  IonToggle,
   IonItemDivider,
   IonCard,
   IonCardHeader,
   IonCardTitle,
   IonCardContent,
   IonToast,
+  IonBadge,
+  IonNote,
 } from '@ionic/angular/standalone';
 import { Router } from '@angular/router';
+import {
+  DetectedCliTool,
+  JohnnyApiService,
+  ProviderConfig,
+} from '@johnnyone/ui';
+import { firstValueFrom } from 'rxjs';
 
-export interface ProviderConfig {
-  name: string;
-  enabled: boolean;
-  apiKey: string;
-  baseUrl: string;
-  defaultModel: string;
-  availableModels: string[];
+interface EdgeConfig {
+  workerUrl: string;
+  tenantId: string;
+  userId: string;
 }
 
-export interface NodeConfig {
-  nodeId: string;
-  nodeName: string;
-  registrationUrl: string;
-  autoConnect: boolean;
-  heartbeatIntervalMs: number;
+interface ProviderRuntimeRow {
+  provider: string;
+  config: ProviderConfig | null;
+  tool: DetectedCliTool | null;
 }
 
 @Component({
@@ -59,129 +59,181 @@ export interface NodeConfig {
     IonItem,
     IonLabel,
     IonInput,
-    IonSelect,
-    IonSelectOption,
-    IonToggle,
     IonItemDivider,
     IonCard,
     IonCardHeader,
     IonCardTitle,
     IonCardContent,
     IonToast,
+    IonBadge,
+    IonNote,
   ],
   templateUrl: './settings.page.html',
   styleUrls: ['./settings.page.scss'],
 })
 export class SettingsPage implements OnInit {
+  private static readonly DEFAULT_WORKER_URL = 'http://127.0.0.1:7714';
+  private static readonly DEFAULT_TENANT_ID = '00000000-0000-0000-0000-000000000001';
+  private static readonly DEFAULT_USER_ID = '00000000-0000-0000-0000-000000000002';
+
+  private readonly api = inject(JohnnyApiService);
   private readonly router = inject(Router);
 
-  providers: ProviderConfig[] = [
-    {
-      name: 'Ollama',
-      enabled: true,
-      apiKey: '',
-      baseUrl: 'http://localhost:11434',
-      defaultModel: 'llama3',
-      availableModels: ['llama3', 'llama3:70b', 'codellama', 'mistral', 'mixtral'],
-    },
-    {
-      name: 'OpenAI',
-      enabled: false,
-      apiKey: '',
-      baseUrl: 'https://api.openai.com/v1',
-      defaultModel: 'gpt-4o',
-      availableModels: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o1-preview'],
-    },
-    {
-      name: 'Anthropic',
-      enabled: false,
-      apiKey: '',
-      baseUrl: 'https://api.anthropic.com',
-      defaultModel: 'claude-sonnet-4-20250514',
-      availableModels: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-3-5-haiku-20241022'],
-    },
-  ];
-
-  nodeConfig: NodeConfig = {
-    nodeId: '',
-    nodeName: '',
-    registrationUrl: '',
-    autoConnect: true,
-    heartbeatIntervalMs: 30000,
+  edgeConfig: EdgeConfig = {
+    workerUrl: SettingsPage.DEFAULT_WORKER_URL,
+    tenantId: SettingsPage.DEFAULT_TENANT_ID,
+    userId: SettingsPage.DEFAULT_USER_ID,
   };
 
+  providerConfigs: ProviderConfig[] = [];
+  detectedTools: DetectedCliTool[] = [];
+  lastWorkingDirectory = '';
+  loadingHostState = false;
   showSaveToast = false;
   saveToastMessage = '';
+  saveToastColor: 'success' | 'warning' | 'danger' = 'success';
+
+  get providerRuntimeRows(): ProviderRuntimeRow[] {
+    const providers = new Set<string>();
+
+    for (const config of this.providerConfigs) {
+      providers.add(config.provider);
+    }
+
+    for (const tool of this.detectedTools) {
+      providers.add(tool.provider);
+    }
+
+    return Array.from(providers)
+      .sort((a, b) => a.localeCompare(b))
+      .map((provider) => ({
+        provider,
+        config: this.providerConfigs.find((item) => item.provider === provider) ?? null,
+        tool: this.detectedTools.find((item) => item.provider === provider) ?? null,
+      }));
+  }
 
   ngOnInit(): void {
-    this.loadSettings();
+    this.loadEdgeSettings();
+    void this.loadHostState();
   }
 
-  private loadSettings(): void {
-    // Load settings from Tauri store / local storage
+  private loadEdgeSettings(): void {
     try {
-      const savedProviders = localStorage.getItem('jno_providers');
-      if (savedProviders) {
-        this.providers = JSON.parse(savedProviders);
-      }
-
-      const savedNode = localStorage.getItem('jno_node_config');
-      if (savedNode) {
-        this.nodeConfig = JSON.parse(savedNode);
-      }
-
-      if (!this.nodeConfig.nodeId) {
-        this.nodeConfig.nodeId = crypto.randomUUID();
-      }
-      if (!this.nodeConfig.nodeName) {
-        this.nodeConfig.nodeName = `node-${this.nodeConfig.nodeId.substring(0, 8)}`;
-      }
+      this.edgeConfig = {
+        workerUrl: localStorage.getItem('johnnyone_worker_url')?.trim() || SettingsPage.DEFAULT_WORKER_URL,
+        tenantId: localStorage.getItem('johnnyone_tenant_id')?.trim() || SettingsPage.DEFAULT_TENANT_ID,
+        userId: localStorage.getItem('johnnyone_user_id')?.trim() || SettingsPage.DEFAULT_USER_ID,
+      };
     } catch (err) {
-      console.error('Failed to load settings:', err);
+      console.error('Failed to load edge settings:', err);
     }
   }
 
-  saveProviderSettings(): void {
+  async loadHostState(): Promise<void> {
+    this.loadingHostState = true;
+
     try {
-      localStorage.setItem('jno_providers', JSON.stringify(this.providers));
-      this.showToast('Provider settings saved');
+      const [providerConfigs, detectedTools, lastWorkingDirectory] = await Promise.all([
+        firstValueFrom(this.api.listProviderConfigs()),
+        firstValueFrom(this.api.detectCliTools()),
+        firstValueFrom(this.api.getSetting('last_working_directory')).catch(() => ''),
+      ]);
+
+      this.providerConfigs = providerConfigs;
+      this.detectedTools = detectedTools;
+      this.lastWorkingDirectory = lastWorkingDirectory;
     } catch (err) {
-      console.error('Failed to save provider settings:', err);
-      this.showToast('Failed to save settings');
+      console.error('Failed to load host state:', err);
+      this.showToast('Failed to load host settings', 'danger');
+    } finally {
+      this.loadingHostState = false;
     }
   }
 
-  saveNodeSettings(): void {
+  saveConnectionSettings(): void {
     try {
-      localStorage.setItem('jno_node_config', JSON.stringify(this.nodeConfig));
-      this.showToast('Node settings saved');
+      localStorage.setItem('johnnyone_worker_url', this.edgeConfig.workerUrl.trim() || SettingsPage.DEFAULT_WORKER_URL);
+      localStorage.setItem('johnnyone_tenant_id', this.edgeConfig.tenantId.trim() || SettingsPage.DEFAULT_TENANT_ID);
+      localStorage.setItem('johnnyone_user_id', this.edgeConfig.userId.trim() || SettingsPage.DEFAULT_USER_ID);
+      this.showToast('Edge settings saved. Reload desktop to apply.', 'success');
     } catch (err) {
-      console.error('Failed to save node settings:', err);
-      this.showToast('Failed to save settings');
+      console.error('Failed to save edge settings:', err);
+      this.showToast('Failed to save edge settings', 'danger');
     }
   }
 
-  async registerNode(): Promise<void> {
+  async saveHostSettings(): Promise<void> {
     try {
-      // In production, POST to registration endpoint via Tauri HTTP plugin
-      this.showToast(`Node ${this.nodeConfig.nodeName} registration requested`);
+      await firstValueFrom(
+        this.api.setSetting('last_working_directory', this.lastWorkingDirectory.trim())
+      );
+      this.showToast('Host settings saved', 'success');
     } catch (err) {
-      console.error('Failed to register node:', err);
-      this.showToast('Node registration failed');
+      console.error('Failed to save host settings:', err);
+      this.showToast('Failed to save host settings', 'danger');
     }
   }
 
-  regenerateNodeId(): void {
-    this.nodeConfig.nodeId = crypto.randomUUID();
-    this.nodeConfig.nodeName = `node-${this.nodeConfig.nodeId.substring(0, 8)}`;
+  reloadDesktop(): void {
+    window.location.reload();
   }
 
-  private showToast(message: string): void {
+  providerLabel(provider: string): string {
+    switch (provider) {
+      case 'claude_code':
+        return 'Claude Code';
+      case 'codex':
+        return 'Codex';
+      case 'cline':
+        return 'Cline';
+      case 'ollama':
+        return 'Ollama';
+      default:
+        return provider;
+    }
+  }
+
+  providerStatusColor(row: ProviderRuntimeRow): 'success' | 'warning' | 'medium' {
+    if (row.tool?.found && row.config?.isAvailable) {
+      return 'success';
+    }
+
+    if (row.tool?.found || row.config) {
+      return 'warning';
+    }
+
+    return 'medium';
+  }
+
+  providerStatusLabel(row: ProviderRuntimeRow): string {
+    if (row.tool?.found && row.config?.isAvailable) {
+      return 'ready';
+    }
+
+    if (row.tool?.found) {
+      return 'tool found';
+    }
+
+    if (row.config) {
+      return 'configured';
+    }
+
+    return 'not configured';
+  }
+
+  maskedApiKeyStatus(config: ProviderConfig | null): string {
+    if (!config?.apiKey) {
+      return 'Not configured';
+    }
+
+    return `Configured (${Math.max(config.apiKey.length - 4, 0)} hidden chars)`;
+  }
+
+  showToast(message: string, color: 'success' | 'warning' | 'danger'): void {
     this.saveToastMessage = message;
+    this.saveToastColor = color;
     this.showSaveToast = true;
-    setTimeout(() => {
-      this.showSaveToast = false;
-    }, 2000);
   }
 
   goBack(): void {

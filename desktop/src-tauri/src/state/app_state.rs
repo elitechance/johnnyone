@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::providers::cli_runner::CliProcess;
 use crate::tools::tool_schema::ToolExecutionRecord;
 use chrono::{DateTime, Utc};
@@ -51,6 +52,10 @@ pub struct AppState {
     pub shutdown_tx: broadcast::Sender<()>,
     /// Broadcast channel for session deletion events (sends session ID).
     pub session_deleted_tx: broadcast::Sender<String>,
+    /// Broadcast channel for host chat deltas.
+    pub chat_delta_tx: broadcast::Sender<ChatDeltaEvent>,
+    /// Broadcast channel for host chat completion notifications.
+    pub chat_complete_tx: broadcast::Sender<ChatCompleteEvent>,
 }
 
 impl AppState {
@@ -60,6 +65,8 @@ impl AppState {
         let node_name = format!("desktop-{}", &node_id[..8]);
         let (shutdown_tx, _) = broadcast::channel(16);
         let (session_deleted_tx, _) = broadcast::channel(16);
+        let (chat_delta_tx, _) = broadcast::channel(256);
+        let (chat_complete_tx, _) = broadcast::channel(64);
 
         tracing::info!(
             node_id = %node_id,
@@ -76,6 +83,8 @@ impl AppState {
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
             session_deleted_tx,
+            chat_delta_tx,
+            chat_complete_tx,
         }
     }
 
@@ -83,6 +92,8 @@ impl AppState {
     pub fn with_node_info(db: Database, node_id: String, node_name: String) -> Self {
         let (shutdown_tx, _) = broadcast::channel(16);
         let (session_deleted_tx, _) = broadcast::channel(16);
+        let (chat_delta_tx, _) = broadcast::channel(256);
+        let (chat_complete_tx, _) = broadcast::channel(64);
 
         Self {
             db,
@@ -93,6 +104,8 @@ impl AppState {
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
             session_deleted_tx,
+            chat_delta_tx,
+            chat_complete_tx,
         }
     }
 

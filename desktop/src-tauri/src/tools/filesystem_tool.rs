@@ -118,7 +118,10 @@ impl FilesystemTool {
                 .parent()
                 .ok_or_else(|| "Path has no parent directory".to_string())?;
             if !parent.exists() {
-                return Err(format!("Parent directory does not exist: {}", parent.display()));
+                return Err(format!(
+                    "Parent directory does not exist: {}",
+                    parent.display()
+                ));
             }
             let canonical_parent = parent
                 .canonicalize()
@@ -207,11 +210,7 @@ impl FilesystemTool {
     }
 
     /// List directory contents.
-    async fn list_dir(
-        &self,
-        path_str: &str,
-        recursive: bool,
-    ) -> Result<serde_json::Value, String> {
+    async fn list_dir(&self, path_str: &str, recursive: bool) -> Result<serde_json::Value, String> {
         let path = self.validate_path(path_str)?;
 
         tracing::info!(path = %path.display(), recursive = recursive, "Listing directory");

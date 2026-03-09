@@ -39,13 +39,18 @@ impl ToolDispatcher {
         );
 
         let result = match tool_call.tool_name.as_str() {
-            "shell" => self.shell.execute(&tool_call.input, tool_call.timeout_ms).await,
+            "shell" => {
+                self.shell
+                    .execute(&tool_call.input, tool_call.timeout_ms)
+                    .await
+            }
             "filesystem" => self.filesystem.execute(&tool_call.input).await,
             "process" => self.process.execute(&tool_call.input).await,
             "browser" => self.browser.execute(&tool_call.input).await,
-            unknown => {
-                Err(format!("Unknown tool: {}. Available tools: shell, filesystem, process, browser", unknown))
-            }
+            unknown => Err(format!(
+                "Unknown tool: {}. Available tools: shell, filesystem, process, browser",
+                unknown
+            )),
         };
 
         let duration_ms = start.elapsed().as_millis() as u64;

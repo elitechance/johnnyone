@@ -53,6 +53,42 @@ type AiMessage {
   createdAt: String!
 }
 
+type ProviderConfig {
+  id: ID!
+  provider: String!
+  cliPath: String!
+  apiKey: String!
+  defaultModel: String!
+  settings: String!
+  isAvailable: Boolean!
+  updatedAt: String!
+}
+
+type DetectedTool {
+  provider: String!
+  command: String!
+  found: Boolean!
+  path: String
+}
+
+type AiChatRunResult {
+  userMessage: AiMessage!
+  assistantMessage: AiMessage!
+}
+
+type AiChatDelta {
+  sessionId: String!
+  messageId: String!
+  delta: String!
+  chunkType: String!
+  isFinal: Boolean!
+}
+
+type AiChatComplete {
+  sessionId: String!
+  messageId: String!
+}
+
 type RelayChatResponse {
   success: Boolean!
   relayId: String!
@@ -92,6 +128,26 @@ input RelayChatMessageInput {
   workingDirectory: String
 }
 
+input CreateAiSessionInput {
+  title: String
+  provider: String
+  model: String
+  workingDirectory: String
+}
+
+input SendAiChatMessageInput {
+  sessionId: String!
+  content: String!
+}
+
+input UpsertProviderConfigInput {
+  provider: String!
+  cliPath: String
+  apiKey: String
+  defaultModel: String
+  settings: String
+}
+
 # --- Queries ---
 
 type Query {
@@ -99,21 +155,36 @@ type Query {
   listAiSessions(status: String): [AiSession!]!
   getAiSession(id: ID!): AiSession
   listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!
+  listProviderConfigs: [ProviderConfig!]!
+  getSetting(key: String!): String!
 }
 
 # --- Mutations ---
 
 type Mutation {
+  createAiSession(input: CreateAiSessionInput!): AiSession!
+  updateAiSessionTitle(id: ID!, title: String!): AiSession!
+  updateAiSessionWorkingDirectory(id: ID!, workingDirectory: String!): AiSession!
+  updateAiSessionProvider(id: ID!, provider: String!): AiSession!
+  archiveAiSession(id: ID!): AiSession!
   registerDesktopNode(input: RegisterDesktopNodeInput!): DesktopNode!
   updateDesktopNodeStatus(id: ID!, status: DesktopNodeStatus!): DesktopNode!
   sendRelayChatMessage(input: RelayChatMessageInput!): RelayChatResponse!
+  sendAiChatMessage(input: SendAiChatMessageInput!): AiChatRunResult!
+  stopAiGeneration(sessionId: ID!): Boolean!
   deleteAiSession(id: ID!): Boolean!
+  upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
+  deleteProviderConfig(provider: String!): Boolean!
+  detectCliTools: [DetectedTool!]!
+  setSetting(key: String!, value: String!): Boolean!
 }
 
 # --- Subscriptions ---
 
 type Subscription {
   onDesktopNodeStatus: DesktopNode!
+  onAiChatDelta(sessionId: String!): AiChatDelta!
+  onAiChatComplete(sessionId: String!): AiChatComplete!
   onRelayChatDelta(relayId: String!): RelayChatDelta!
   onRelayChatMessage(sessionId: String!): RelayChatMessage!
 }

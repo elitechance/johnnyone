@@ -20,7 +20,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         let mut stmt = conn
             .prepare("SELECT version FROM _migrations ORDER BY version")
             .map_err(|e| format!("Failed to query migrations: {}", e))?;
-        let result = stmt.query_map([], |row| row.get(0))
+        let result = stmt
+            .query_map([], |row| row.get(0))
             .map_err(|e| format!("Failed to read migrations: {}", e))?
             .filter_map(|r| r.ok())
             .collect();

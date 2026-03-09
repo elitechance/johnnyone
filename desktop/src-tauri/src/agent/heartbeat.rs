@@ -22,7 +22,8 @@ pub async fn run_heartbeat(
     shutdown_rx: &mut broadcast::Receiver<()>,
     node_id: String,
 ) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    let mut interval =
+        tokio::time::interval(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let mut cycle: u64 = 0;
     let mut sys = System::new();
 

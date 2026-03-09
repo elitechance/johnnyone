@@ -3,6 +3,9 @@
   "projectType": "application",
   "sourceRoot": "worker",
   "targets": {
+    "build": {
+      "command": "npx tsc -p worker/tsconfig.json --noEmit"
+    },
     "dev": {
       "command": "lokal cf worker sim"
     },

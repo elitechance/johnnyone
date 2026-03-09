@@ -12,21 +12,50 @@ import {
   IonButton,
   IonIcon,
 } from '@ionic/angular/standalone';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import {
   TauriBridgeService,
-  Session,
-  Message,
-  ChatDelta,
-  DetectedTool,
 } from '../../services/tauri-bridge.service';
 import {
+  JohnnyApiService,
   SessionListComponent,
   ChatWindowComponent,
-  AiSession as AiSessionUI,
-  AiMessage,
+  AiSession as SharedAiSession,
+  AiMessage as SharedAiMessage,
+  AiMessageDelta,
+  AiChatComplete,
+  DetectedCliTool,
 } from '@johnnyone/ui';
-import { Subscription } from 'rxjs';
+import { firstValueFrom, Subscription } from 'rxjs';
+
+interface Session {
+  id: string;
+  title: string;
+  provider: string;
+  model: string;
+  working_directory: string;
+  status: 'active' | 'archived' | 'completed';
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_cents: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Message {
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string;
+  tool_calls?: string;
+  finish_reason?: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_cents: number;
+  created_at: string;
+}
+
+interface DetectedTool extends DetectedCliTool {}
 
 @Component({
   selector: 'app-chat',
@@ -46,17 +75,19 @@ export class ChatPage implements OnInit, OnDestroy {
   private static readonly SIDEBAR_WIDTH_KEY = 'johnnyone_desktop_sidebar_width';
   private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
   private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
+  private readonly api = inject(JohnnyApiService);
+  private readonly route = inject(ActivatedRoute);
   private readonly tauriBridge = inject(TauriBridgeService);
   private readonly router = inject(Router);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
   private readonly defaultSidebarWidth = 360;
-  private deltaSubscription: Subscription | null = null;
-  private completeSubscription: Subscription | null = null;
   private resizeMoveHandler: ((event: MouseEvent) => void) | null = null;
   private resizeUpHandler: (() => void) | null = null;
   private streamingStatusInterval: ReturnType<typeof setInterval> | null = null;
   private sessionIdCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
+  private deltaSubscription: Subscription | null = null;
+  private completeSubscription: Subscription | null = null;
 
   // State
   sessions = signal<Session[]>([]);
@@ -86,11 +117,11 @@ export class ChatPage implements OnInit, OnDestroy {
     return all.filter(s => s.title.toLowerCase().includes(query));
   });
 
-  aiSessions = computed<AiSessionUI[]>(() =>
+  aiSessions = computed<SharedAiSession[]>(() =>
     this.filteredSessions().map(s => this.mapSession(s))
   );
 
-  aiMessages = computed<AiMessage[]>(() => {
+  aiMessages = computed<SharedAiMessage[]>(() => {
     const streamingId = this.streamingMessageId();
     const content = this.streamingContent();
     return this.messages().map(m =>
@@ -160,25 +191,21 @@ export class ChatPage implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     this.loadSidebarWidth();
-    this.loadSessions();
-    this.detectTools();
-    this.subscribeToDelta();
-    this.subscribeToComplete();
-    this.loadLastWorkingDirectory();
-    this.ensureSettingsAndConnect();
+    void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
+    void this.detectTools();
+    void this.loadLastWorkingDirectory();
   }
 
   ngOnDestroy(): void {
+    this.teardownChatSubscriptions();
     this.clearSessionIdCopiedTimeout();
     this.resetStreamingStatus();
     this.stopSidebarResize();
-    this.deltaSubscription?.unsubscribe();
-    this.completeSubscription?.unsubscribe();
   }
 
   // ── Type Mappers ───────────────────────────────────────────────────
 
-  private mapSession(s: Session): AiSessionUI {
+  private mapSession(s: Session): SharedAiSession {
     return {
       id: s.id,
       title: s.title,
@@ -194,7 +221,7 @@ export class ChatPage implements OnInit, OnDestroy {
     };
   }
 
-  private mapMessage(m: Message): AiMessage {
+  private mapMessage(m: Message): SharedAiMessage {
     return {
       id: m.id,
       sessionId: m.session_id,
@@ -209,20 +236,58 @@ export class ChatPage implements OnInit, OnDestroy {
     };
   }
 
+  private mapApiSessionToState(session: SharedAiSession): Session {
+    return {
+      id: session.id,
+      title: session.title,
+      provider: session.provider,
+      model: session.model,
+      working_directory: session.workingDirectory || '',
+      status: session.status,
+      total_input_tokens: session.totalInputTokens,
+      total_output_tokens: session.totalOutputTokens,
+      total_cost_cents: session.totalCostCents,
+      created_at: session.createdAt,
+      updated_at: session.updatedAt,
+    };
+  }
+
+  private mapApiMessageToState(message: SharedAiMessage): Message {
+    return {
+      id: message.id,
+      session_id: message.sessionId,
+      role: message.role,
+      content: message.content,
+      tool_calls: message.toolCalls,
+      finish_reason: message.finishReason,
+      input_tokens: message.inputTokens,
+      output_tokens: message.outputTokens,
+      cost_cents: message.costCents,
+      created_at: message.createdAt,
+    };
+  }
+
   // ── Session Management ─────────────────────────────────────────────
 
-  async loadSessions(): Promise<void> {
+  async loadSessions(targetSessionId?: string): Promise<void> {
     try {
-      const sessions = await this.tauriBridge.listSessions();
-      this.sessions.set(sessions);
+      const sessions = (await firstValueFrom(this.api.listSessions('active')))
+        .map((session) => this.mapApiSessionToState(session));
+      this.sessions.set(this.sortSessions(sessions));
 
-      // Reopen the latest session on startup (desktop parity with mobile),
-      // but keep current selection when it still exists.
       const current = this.currentSession();
+      if (targetSessionId) {
+        const target = sessions.find((session) => session.id === targetSessionId);
+        if (target) {
+          await this.selectSession(target.id);
+          return;
+        }
+      }
+
       if (current) {
         const refreshed = sessions.find((s) => s.id === current.id);
         if (refreshed) {
-          this.currentSession.set(refreshed);
+          await this.selectSession(refreshed.id);
         } else {
           this.currentSession.set(null);
           this.messages.set([]);
@@ -240,11 +305,11 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async createNewSession(): Promise<void> {
     try {
-      const session = await this.tauriBridge.createSession({
+      const session = this.mapApiSessionToState(await firstValueFrom(this.api.createSession({
         provider: this.selectedProvider(),
-        working_directory: this.workingDirectory(),
-      });
-      this.sessions.update(s => [session, ...s]);
+        workingDirectory: this.workingDirectory(),
+      })));
+      this.upsertSession(session);
       await this.selectSession(session.id);
     } catch (err) {
       console.error('Failed to create session:', err);
@@ -253,13 +318,18 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async selectSession(id: string): Promise<void> {
     try {
-      const session = await this.tauriBridge.getSession(id);
-      this.currentSession.set(session);
-      this.selectedProvider.set(session.provider);
-      this.workingDirectory.set(session.working_directory);
+      const [session, messages] = await Promise.all([
+        firstValueFrom(this.api.getSession(id)),
+        firstValueFrom(this.api.listMessages(id)),
+      ]);
 
-      const messages = await this.tauriBridge.listMessages(id);
-      this.messages.set(messages);
+      const mappedSession = this.mapApiSessionToState(session);
+      this.upsertSession(mappedSession);
+      this.currentSession.set(mappedSession);
+      this.selectedProvider.set(mappedSession.provider);
+      this.workingDirectory.set(mappedSession.working_directory);
+      this.messages.set(messages.map((message) => this.mapApiMessageToState(message)));
+      this.subscribeToSessionEvents(id);
 
       this.isStreaming.set(false);
       this.streamingContent.set('');
@@ -272,9 +342,10 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async archiveSession(id: string): Promise<void> {
     try {
-      await this.tauriBridge.archiveSession(id);
+      await firstValueFrom(this.api.archiveSession(id));
       this.sessions.update(s => s.filter(sess => sess.id !== id));
       if (this.currentSession()?.id === id) {
+        this.teardownChatSubscriptions();
         this.currentSession.set(null);
         this.messages.set([]);
       }
@@ -295,9 +366,10 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async onSessionDeleted(id: string): Promise<void> {
     try {
-      await this.tauriBridge.deleteSession(id);
+      await firstValueFrom(this.api.deleteSession(id));
       this.sessions.update(s => s.filter(sess => sess.id !== id));
       if (this.currentSession()?.id === id) {
+        this.teardownChatSubscriptions();
         this.currentSession.set(null);
         this.messages.set([]);
       }
@@ -317,11 +389,10 @@ export class ChatPage implements OnInit, OnDestroy {
     if (!trimmedTitle || trimmedTitle === target.title) return;
 
     try {
-      const updated = await this.tauriBridge.updateSessionTitle(id, trimmedTitle);
-
-      this.sessions.update((all) =>
-        all.map((session) => (session.id === id ? { ...session, title: updated.title, updated_at: updated.updated_at } : session))
+      const updated = this.mapApiSessionToState(
+        await firstValueFrom(this.api.updateSessionTitle(id, trimmedTitle))
       );
+      this.upsertSession(updated);
 
       if (this.currentSession()?.id === id) {
         this.currentSession.set(updated);
@@ -352,12 +423,12 @@ export class ChatPage implements OnInit, OnDestroy {
     const desiredProvider = this.selectedProvider();
     if (session.provider !== desiredProvider) {
       try {
-        const updated = await this.tauriBridge.updateSessionProvider(session.id, desiredProvider);
+        const updated = this.mapApiSessionToState(
+          await firstValueFrom(this.api.updateSessionProvider(session.id, desiredProvider))
+        );
         session = updated;
         this.currentSession.set(updated);
-        this.sessions.update((all) =>
-          all.map((s) => (s.id === updated.id ? { ...s, provider: updated.provider } : s))
-        );
+        this.upsertSession(updated);
       } catch (err) {
         console.error('Failed to sync provider before send:', err);
         return;
@@ -369,14 +440,28 @@ export class ChatPage implements OnInit, OnDestroy {
     this.streamingContent.set('');
     this.streamingMessageId.set(null);
     this.beginStreamingStatus();
+    const optimisticUserMessage = this.createOptimisticUserMessage(session.id, text);
+    this.messages.update((msgs) => [...msgs, optimisticUserMessage]);
 
     try {
-      const userMessage = await this.tauriBridge.sendChatMessage(session.id, text);
-      this.messages.update(msgs => [...msgs, userMessage]);
+      const result = await firstValueFrom(this.api.sendAiChatMessage({
+        sessionId: session.id,
+        content: text,
+      }));
+      const userMessage = this.mapApiMessageToState(result.userMessage);
+      const assistantMessage = this.mapApiMessageToState(result.assistantMessage);
+
+      this.messages.update((msgs) => {
+        const withoutOptimistic = msgs.filter((msg) => msg.id !== optimisticUserMessage.id);
+        return this.upsertMessage(this.upsertMessage(withoutOptimistic, userMessage), assistantMessage);
+      });
+      this.finishStreamingState();
+      await this.refreshSession(session.id);
+      await this.autoTitleIfNeeded();
     } catch (err) {
       console.error('Failed to send message:', err);
-      this.isStreaming.set(false);
-      this.resetStreamingStatus();
+      this.messages.update((msgs) => msgs.filter((msg) => msg.id !== optimisticUserMessage.id));
+      this.finishStreamingState();
       this.currentMessage = text;
     }
   }
@@ -385,7 +470,7 @@ export class ChatPage implements OnInit, OnDestroy {
     const session = this.currentSession();
     if (!session) return;
     try {
-      await this.tauriBridge.stopGeneration(session.id);
+      await firstValueFrom(this.api.stopAiGeneration(session.id));
       this.isStreaming.set(false);
       this.streamingMessageId.set(null);
       this.resetStreamingStatus();
@@ -398,7 +483,6 @@ export class ChatPage implements OnInit, OnDestroy {
     const msgs = this.messages();
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'user') {
-        this.messages.set(msgs.slice(0, i));
         this.currentMessage = msgs[i].content;
         await this.sendMessage();
         return;
@@ -406,76 +490,93 @@ export class ChatPage implements OnInit, OnDestroy {
     }
   }
 
-  // ── Streaming ──────────────────────────────────────────────────────
+  private subscribeToSessionEvents(sessionId: string): void {
+    this.teardownChatSubscriptions();
 
-  private subscribeToDelta(): void {
-    this.deltaSubscription = this.tauriBridge.onChatDelta().subscribe({
-      next: (delta: ChatDelta) => this.handleDelta(delta),
-      error: (err) => console.error('Delta subscription error:', err),
+    this.deltaSubscription = this.api.onAiChatDelta(sessionId).subscribe({
+      next: (delta) => this.handleDelta(delta),
+      error: (err) => console.error('Failed to subscribe to ai chat deltas:', err),
     });
-  }
 
-  private subscribeToComplete(): void {
-    this.completeSubscription = this.tauriBridge.onChatComplete().subscribe({
+    this.completeSubscription = this.api.onAiChatComplete(sessionId).subscribe({
       next: (complete) => {
-        this.isStreaming.set(false);
-        this.streamingMessageId.set(null);
-        this.resetStreamingStatus();
-
-        const content = this.streamingContent();
-        if (content && complete.message_id) {
-          this.messages.update(msgs => {
-            const existing = msgs.find(m => m.id === complete.message_id);
-            if (existing) {
-              return msgs.map(m =>
-                m.id === complete.message_id ? { ...m, content, finish_reason: 'stop' } : m
-              );
-            }
-            return msgs;
-          });
-        }
-
-        this.streamingContent.set('');
-        this.autoTitleIfNeeded();
-
-        const session = this.currentSession();
-        if (session) {
-          this.tauriBridge.getSession(session.id).then(s => this.currentSession.set(s));
-        }
+        void this.handleComplete(complete);
       },
+      error: (err) => console.error('Failed to subscribe to ai chat completion:', err),
     });
   }
 
-  private handleDelta(delta: ChatDelta): void {
+  private teardownChatSubscriptions(): void {
+    this.deltaSubscription?.unsubscribe();
+    this.deltaSubscription = null;
+    this.completeSubscription?.unsubscribe();
+    this.completeSubscription = null;
+  }
+
+  private handleDelta(delta: AiMessageDelta): void {
     const session = this.currentSession();
-    if (!session || delta.session_id !== session.id) return;
+    if (!session || delta.sessionId !== session.id) return;
 
-    this.markStreamingActivity();
-    this.streamingMessageId.set(delta.message_id);
-
-    if (delta.chunk.chunk_type === 'text') {
-      this.streamingContent.update(c => c + delta.chunk.content);
+    if (delta.chunkType && delta.chunkType !== 'text') {
+      if (delta.finishReason) {
+        this.finishStreamingState();
+      }
+      return;
     }
 
-    this.messages.update(msgs => {
-      const exists = msgs.some(m => m.id === delta.message_id);
-      if (!exists) {
-        return [
-          ...msgs,
-          {
-            id: delta.message_id,
-            session_id: delta.session_id,
-            role: 'assistant' as const,
-            content: '',
-            input_tokens: 0,
-            output_tokens: 0,
-            cost_cents: 0,
-            created_at: new Date().toISOString(),
-          },
-        ];
+    if (this.streamingMessageId() !== delta.messageId) {
+      this.streamingContent.set('');
+    }
+
+    this.markStreamingActivity();
+    this.isStreaming.set(true);
+    this.streamingMessageId.set(delta.messageId);
+    this.streamingContent.update((content) => content + delta.delta);
+
+    this.messages.update((msgs) => {
+      const existing = msgs.find((msg) => msg.id === delta.messageId);
+      const nextContent = this.streamingContent();
+
+      if (existing) {
+        return msgs.map((msg) =>
+          msg.id === delta.messageId
+            ? {
+                ...msg,
+                content: nextContent,
+                finish_reason: delta.finishReason ?? msg.finish_reason,
+              }
+            : msg
+        );
       }
-      return msgs;
+
+      return [
+        ...msgs,
+        {
+          id: delta.messageId,
+          session_id: delta.sessionId,
+          role: 'assistant',
+          content: nextContent,
+          finish_reason: delta.finishReason,
+          input_tokens: 0,
+          output_tokens: 0,
+          cost_cents: 0,
+          created_at: new Date().toISOString(),
+        },
+      ];
     });
+
+    if (delta.finishReason) {
+      this.finishStreamingState();
+    }
+  }
+
+  private async handleComplete(complete: AiChatComplete): Promise<void> {
+    const session = this.currentSession();
+    if (!session || complete.sessionId !== session.id) return;
+
+    this.finishStreamingState();
+    await this.refreshMessages(session.id);
+    await this.refreshSession(session.id);
   }
 
   // ── Auto-title ─────────────────────────────────────────────────────
@@ -490,26 +591,13 @@ export class ChatPage implements OnInit, OnDestroy {
 
     const title = firstUserMsg.content.slice(0, 40) + (firstUserMsg.content.length > 40 ? '...' : '');
     try {
-      const updated = await this.tauriBridge.updateSessionTitle(session.id, title);
-      this.currentSession.set(updated);
-      this.sessions.update(s =>
-        s.map(sess => (sess.id === updated.id ? { ...sess, title: updated.title } : sess))
+      const updated = this.mapApiSessionToState(
+        await firstValueFrom(this.api.updateSessionTitle(session.id, title))
       );
+      this.currentSession.set(updated);
+      this.upsertSession(updated);
     } catch (err) {
       console.error('Failed to auto-title:', err);
-    }
-  }
-
-  // ── Agent Auto-Connect ─────────────────────────────────────────────
-
-  private async ensureSettingsAndConnect(): Promise<void> {
-    try {
-      const status = await this.tauriBridge.getConnectionStatus();
-      if (!status.connected) {
-        await this.tauriBridge.connectAgent();
-      }
-    } catch (err) {
-      console.error('Agent auto-connect failed:', err);
     }
   }
 
@@ -517,7 +605,7 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async detectTools(): Promise<void> {
     try {
-      const tools = await this.tauriBridge.detectCliTools();
+      const tools = await firstValueFrom(this.api.detectCliTools());
       this.detectedTools.set(tools);
     } catch (err) {
       console.error('Failed to detect tools:', err);
@@ -526,7 +614,7 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async loadLastWorkingDirectory(): Promise<void> {
     try {
-      const dir = await this.tauriBridge.getSetting('last_working_directory');
+      const dir = await firstValueFrom(this.api.getSetting('last_working_directory'));
       if (dir) this.workingDirectory.set(dir);
     } catch {
       // Setting may not exist yet
@@ -540,11 +628,11 @@ export class ChatPage implements OnInit, OnDestroy {
     if (!session) return;
 
     try {
-      const updated = await this.tauriBridge.updateSessionProvider(session.id, provider);
-      this.currentSession.set(updated);
-      this.sessions.update((all) =>
-        all.map((s) => (s.id === updated.id ? { ...s, provider: updated.provider } : s))
+      const updated = this.mapApiSessionToState(
+        await firstValueFrom(this.api.updateSessionProvider(session.id, provider))
       );
+      this.currentSession.set(updated);
+      this.upsertSession(updated);
     } catch (err) {
       console.error('Failed to update session provider:', err);
       // Revert UI selection to persisted value on error.
@@ -554,12 +642,15 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async onWorkingDirectoryChange(dir: string): Promise<void> {
     this.workingDirectory.set(dir);
-    await this.tauriBridge.setSetting('last_working_directory', dir);
+    await firstValueFrom(this.api.setSetting('last_working_directory', dir));
 
     const session = this.currentSession();
     if (session) {
-      const updated = await this.tauriBridge.updateSessionWorkingDirectory(session.id, dir);
+      const updated = this.mapApiSessionToState(
+        await firstValueFrom(this.api.updateSessionWorkingDirectory(session.id, dir))
+      );
       this.currentSession.set(updated);
+      this.upsertSession(updated);
     }
   }
 
@@ -672,6 +763,59 @@ export class ChatPage implements OnInit, OnDestroy {
     if (!this.streamingStatusInterval) return;
     clearInterval(this.streamingStatusInterval);
     this.streamingStatusInterval = null;
+  }
+
+  private sortSessions(sessions: Session[]): Session[] {
+    return [...sessions].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }
+
+  private upsertSession(session: Session): void {
+    this.sessions.update((sessions) =>
+      this.sortSessions([
+        session,
+        ...sessions.filter((existing) => existing.id !== session.id),
+      ])
+    );
+  }
+
+  private upsertMessage(messages: Message[], message: Message): Message[] {
+    const existingIndex = messages.findIndex((item) => item.id === message.id);
+    if (existingIndex === -1) {
+      return [...messages, message];
+    }
+
+    return messages.map((item) => (item.id === message.id ? message : item));
+  }
+
+  private createOptimisticUserMessage(sessionId: string, content: string): Message {
+    return {
+      id: `temp-user-${Date.now()}`,
+      session_id: sessionId,
+      role: 'user',
+      content,
+      input_tokens: 0,
+      output_tokens: 0,
+      cost_cents: 0,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  private finishStreamingState(): void {
+    this.isStreaming.set(false);
+    this.streamingContent.set('');
+    this.streamingMessageId.set(null);
+    this.resetStreamingStatus();
+  }
+
+  private async refreshSession(sessionId: string): Promise<void> {
+    const refreshed = this.mapApiSessionToState(await firstValueFrom(this.api.getSession(sessionId)));
+    this.currentSession.set(refreshed);
+    this.upsertSession(refreshed);
+  }
+
+  private async refreshMessages(sessionId: string): Promise<void> {
+    const messages = await firstValueFrom(this.api.listMessages(sessionId));
+    this.messages.set(messages.map((message) => this.mapApiMessageToState(message)));
   }
 
   // ── Helpers ────────────────────────────────────────────────────────

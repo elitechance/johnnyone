@@ -50,12 +50,20 @@ export class GraphQLClient {
   subscribe<T>(subscription: string, variables?: Record<string, unknown>): Observable<T> {
     return new Observable<T>((subscriber) => {
       let ws: WebSocket | null = null;
+      const operationId = crypto.randomUUID();
 
       const connect = () => {
         ws = new WebSocket(this.wsUrl, 'graphql-transport-ws');
 
         ws.onopen = () => {
-          ws!.send(JSON.stringify({ type: 'connection_init' }));
+          ws!.send(
+            JSON.stringify({
+              type: 'connection_init',
+              payload: {
+                headers: this.extraHeaders,
+              },
+            })
+          );
         };
 
         ws.onmessage = (event) => {
@@ -65,7 +73,7 @@ export class GraphQLClient {
             case 'connection_ack':
               ws!.send(
                 JSON.stringify({
-                  id: '1',
+                  id: operationId,
                   type: 'subscribe',
                   payload: { query: subscription, variables },
                 })
@@ -110,7 +118,7 @@ export class GraphQLClient {
       return () => {
         if (ws) {
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ id: '1', type: 'complete' }));
+            ws.send(JSON.stringify({ id: operationId, type: 'complete' }));
           }
           ws.close();
           ws = null;

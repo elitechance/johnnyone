@@ -32,14 +32,7 @@ const BLOCKED_COMMANDS: &[&str] = &[
 ];
 
 /// Commands that trigger a warning but are still allowed.
-const WARNED_PREFIXES: &[&str] = &[
-    "rm -rf",
-    "sudo",
-    "chmod",
-    "chown",
-    "kill -9",
-    "pkill",
-];
+const WARNED_PREFIXES: &[&str] = &["rm -rf", "sudo", "chmod", "chown", "kill -9", "pkill"];
 
 #[derive(Debug, Deserialize)]
 struct ShellInput {
@@ -64,18 +57,15 @@ impl ShellTool {
         input: &serde_json::Value,
         timeout_ms: Option<u64>,
     ) -> Result<serde_json::Value, String> {
-        let params: ShellInput =
-            serde_json::from_value(input.clone()).map_err(|e| format!("Invalid shell input: {}", e))?;
+        let params: ShellInput = serde_json::from_value(input.clone())
+            .map_err(|e| format!("Invalid shell input: {}", e))?;
 
         // Validate the command against the blocked list
         self.validate_command(&params.command)?;
 
         // Determine timeout
-        let timeout = Duration::from_millis(
-            timeout_ms
-                .unwrap_or(DEFAULT_TIMEOUT_MS)
-                .min(MAX_TIMEOUT_MS),
-        );
+        let timeout =
+            Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
 
         // Log warnings for potentially dangerous commands
         for prefix in WARNED_PREFIXES {

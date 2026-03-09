@@ -3,8 +3,8 @@
 
 use johnnyone_desktop_lib::commands;
 use johnnyone_desktop_lib::db::Database;
+use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::state::app_state::AppState;
-use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -19,7 +19,7 @@ fn main() {
     tracing::info!("Starting JohnnyOne Desktop Agent");
 
     // Initialize SQLite database
-    let db_path = get_db_path();
+    let db_path = default_db_path();
     let db = Database::open(&db_path).expect("Failed to initialize database");
 
     let app_state = AppState::new(db);
@@ -64,19 +64,4 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running JohnnyOne");
-}
-
-/// Get the database file path.
-/// Uses `~/.local/share/johnnyone/johnnyone.db` on Linux,
-/// or the platform-specific data directory.
-fn get_db_path() -> PathBuf {
-    let data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".local/share")
-        })
-        .join("johnnyone");
-
-    data_dir.join("johnnyone.db")
 }

@@ -88,9 +88,7 @@ impl ReconnectPolicy {
     /// Not cryptographically secure, but fine for jitter purposes.
     fn pseudo_random_jitter(&self, seed: u32) -> u64 {
         // Simple LCG-style pseudo-random for jitter
-        let hash = seed
-            .wrapping_mul(1103515245)
-            .wrapping_add(12345);
+        let hash = seed.wrapping_mul(1103515245).wrapping_add(12345);
         (hash as u64 % self.base_delay_ms).min(self.base_delay_ms)
     }
 }

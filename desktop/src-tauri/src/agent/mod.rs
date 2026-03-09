@@ -620,9 +620,13 @@ impl AgentService {
                 cli_path_ref,
                 cli_sid_ref,
             ),
-            CliProvider::Codex => {
-                codex::build_config(&req.content, &working_dir, &model, cli_path_ref, cli_sid_ref)
-            }
+            CliProvider::Codex => codex::build_config(
+                &req.content,
+                &working_dir,
+                &model,
+                cli_path_ref,
+                cli_sid_ref,
+            ),
             CliProvider::Cline => {
                 cline::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }

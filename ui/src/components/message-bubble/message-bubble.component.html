@@ -1,5 +1,8 @@
 <div
   class="bubble-wrapper"
+  data-testid="message-bubble"
+  [attr.data-message-id]="message.id"
+  [attr.data-message-role]="message.role"
   [class.user]="isUser"
   [class.assistant]="isAssistant"
   [class.system]="isSystem"

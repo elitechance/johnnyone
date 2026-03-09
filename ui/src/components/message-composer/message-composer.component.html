@@ -9,6 +9,7 @@
     <ion-item lines="none" class="input-wrapper">
       <ion-textarea
         #messageInput
+        data-testid="message-input"
         [(ngModel)]="messageText"
         [placeholder]="placeholder"
         [disabled]="disabled"
@@ -43,6 +44,7 @@
   </div>
 
   <ion-button
+    data-testid="send-button"
     fill="solid"
     shape="round"
     size="default"

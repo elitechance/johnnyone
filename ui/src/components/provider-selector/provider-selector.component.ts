@@ -28,27 +28,34 @@ export class ProviderSelectorComponent implements OnInit {
 
   @Output() configChanged = new EventEmitter<ProviderConfig>();
 
-  selectedProvider: ProviderConfig['provider'] = 'claude';
+  selectedProvider: ProviderConfig['provider'] = 'claude_code';
   selectedModel = '';
 
   readonly providers: ProviderOption[] = [
     {
-      value: 'claude',
-      label: 'Anthropic Claude',
+      value: 'claude_code',
+      label: 'Claude Code',
       models: [
-        { value: 'claude-opus-4-0', label: 'Claude Opus 4' },
-        { value: 'claude-sonnet-4-0', label: 'Claude Sonnet 4' },
-        { value: 'claude-3-5-haiku-latest', label: 'Claude 3.5 Haiku' },
+        { value: 'sonnet', label: 'Claude Sonnet' },
+        { value: 'opus', label: 'Claude Opus' },
       ],
     },
     {
-      value: 'openai',
-      label: 'OpenAI',
+      value: 'codex',
+      label: 'Codex',
       models: [
         { value: 'gpt-4o', label: 'GPT-4o' },
         { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
         { value: 'o1-preview', label: 'o1 Preview' },
         { value: 'o1-mini', label: 'o1 Mini' },
+      ],
+    },
+    {
+      value: 'cline',
+      label: 'Cline',
+      models: [
+        { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4' },
+        { value: 'openai/gpt-4o', label: 'GPT-4o' },
       ],
     },
     {
@@ -75,10 +82,14 @@ export class ProviderSelectorComponent implements OnInit {
   ngOnInit(): void {
     if (this.currentConfig) {
       this.selectedProvider = this.currentConfig.provider;
-      this.selectedModel = this.currentConfig.model;
+      const preferredModel = this.currentConfig.model ?? this.currentConfig.defaultModel;
+      this.selectedModel = preferredModel ?? '';
     } else {
-      this.selectedProvider = 'claude';
-      this.selectedModel = 'claude-opus-4-0';
+      this.selectedProvider = 'claude_code';
+    }
+
+    if (!this.selectedModel) {
+      this.selectedModel = this.availableModels[0]?.value ?? '';
     }
   }
 
@@ -100,6 +111,7 @@ export class ProviderSelectorComponent implements OnInit {
       id: this.currentConfig?.id ?? '',
       provider: this.selectedProvider,
       model: this.selectedModel,
+      defaultModel: this.selectedModel,
       apiKeyRef: this.currentConfig?.apiKeyRef,
       baseUrl: this.currentConfig?.baseUrl,
       isDefault: this.currentConfig?.isDefault ?? true,

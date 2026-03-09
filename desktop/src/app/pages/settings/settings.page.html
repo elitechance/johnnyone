@@ -8,151 +8,159 @@
 </ion-header>
 
 <ion-content>
-  <!-- Provider Configuration -->
-  <ion-card *ngFor="let provider of providers" class="provider-card">
-    <ion-card-header>
-      <div class="provider-header">
-        <ion-card-title>{{ provider.name }}</ion-card-title>
-        <ion-toggle
-          [(ngModel)]="provider.enabled"
-          [enableOnOffLabels]="true"
-        ></ion-toggle>
-      </div>
-    </ion-card-header>
-
-    <ion-card-content *ngIf="provider.enabled">
-      <ion-list lines="none">
-        <ion-item>
-          <ion-input
-            label="API Key"
-            labelPlacement="stacked"
-            type="password"
-            [(ngModel)]="provider.apiKey"
-            placeholder="Enter API key (not needed for Ollama)"
-          ></ion-input>
-        </ion-item>
-
-        <ion-item>
-          <ion-input
-            label="Base URL"
-            labelPlacement="stacked"
-            type="url"
-            [(ngModel)]="provider.baseUrl"
-            placeholder="https://api.example.com"
-          ></ion-input>
-        </ion-item>
-
-        <ion-item>
-          <ion-select
-            label="Default Model"
-            labelPlacement="stacked"
-            [(ngModel)]="provider.defaultModel"
-            interface="popover"
-          >
-            <ion-select-option
-              *ngFor="let model of provider.availableModels"
-              [value]="model"
-            >
-              {{ model }}
-            </ion-select-option>
-          </ion-select>
-        </ion-item>
-      </ion-list>
-    </ion-card-content>
-  </ion-card>
-
-  <div class="section-actions">
-    <ion-button expand="block" (click)="saveProviderSettings()">
-      Save Provider Settings
-    </ion-button>
-  </div>
-
-  <!-- Node Configuration -->
   <ion-item-divider>
-    <ion-label>Node Configuration</ion-label>
+    <ion-label>Cloudflare Edge</ion-label>
   </ion-item-divider>
 
   <ion-card class="node-card">
+    <ion-card-header>
+      <ion-card-title>Desktop Client Connection</ion-card-title>
+    </ion-card-header>
     <ion-card-content>
       <ion-list lines="none">
         <ion-item>
           <ion-input
-            label="Node ID"
-            labelPlacement="stacked"
-            [value]="nodeConfig.nodeId"
-            [readonly]="true"
-          ></ion-input>
-          <ion-button
-            slot="end"
-            fill="clear"
-            size="small"
-            (click)="regenerateNodeId()"
-          >
-            Regenerate
-          </ion-button>
-        </ion-item>
-
-        <ion-item>
-          <ion-input
-            label="Node Name"
-            labelPlacement="stacked"
-            [(ngModel)]="nodeConfig.nodeName"
-            placeholder="my-desktop-node"
-          ></ion-input>
-        </ion-item>
-
-        <ion-item>
-          <ion-input
-            label="Registration URL"
+            label="Worker Base URL"
             labelPlacement="stacked"
             type="url"
-            [(ngModel)]="nodeConfig.registrationUrl"
-            placeholder="https://johnnyone.lokalbase.app/api/nodes/register"
+            [(ngModel)]="edgeConfig.workerUrl"
+            placeholder="http://127.0.0.1:7714"
           ></ion-input>
         </ion-item>
 
         <ion-item>
           <ion-input
-            label="Heartbeat Interval (ms)"
+            label="Tenant ID Header"
             labelPlacement="stacked"
-            type="number"
-            [(ngModel)]="nodeConfig.heartbeatIntervalMs"
-            [min]="5000"
-            [max]="120000"
+            [(ngModel)]="edgeConfig.tenantId"
           ></ion-input>
         </ion-item>
 
         <ion-item>
-          <ion-toggle
-            [(ngModel)]="nodeConfig.autoConnect"
-            [enableOnOffLabels]="true"
-          >
-            Auto-connect on launch
-          </ion-toggle>
+          <ion-input
+            label="User ID Header"
+            labelPlacement="stacked"
+            [(ngModel)]="edgeConfig.userId"
+          ></ion-input>
         </ion-item>
       </ion-list>
+
+      <ion-note color="medium">
+        These values are stored locally in the desktop client. Reload the desktop app after saving to recreate the GraphQL HTTP and WebSocket clients with the new edge settings.
+      </ion-note>
     </ion-card-content>
   </ion-card>
 
   <div class="section-actions">
-    <ion-button expand="block" (click)="saveNodeSettings()">
-      Save Node Settings
+    <ion-button expand="block" (click)="saveConnectionSettings()">
+      Save Edge Settings
     </ion-button>
-    <ion-button
-      expand="block"
-      color="secondary"
-      (click)="registerNode()"
-      [disabled]="!nodeConfig.registrationUrl"
-    >
-      Register Node
+    <ion-button expand="block" fill="outline" (click)="reloadDesktop()">
+      Reload Desktop
     </ion-button>
   </div>
+
+  <ion-item-divider>
+    <ion-label>Host Runtime</ion-label>
+  </ion-item-divider>
+
+  <ion-card class="node-card">
+    <ion-card-header>
+      <ion-card-title>Host Settings</ion-card-title>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="none">
+        <ion-item>
+          <ion-input
+            label="Last Working Directory"
+            labelPlacement="stacked"
+            [(ngModel)]="lastWorkingDirectory"
+            placeholder="/path/to/project"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+
+      <ion-note color="medium">
+        This value is stored on the on-prem host through the GraphQL API and becomes the default working directory for new sessions.
+      </ion-note>
+    </ion-card-content>
+  </ion-card>
+
+  <div class="section-actions">
+    <ion-button expand="block" (click)="saveHostSettings()">
+      Save Host Settings
+    </ion-button>
+    <ion-button expand="block" fill="outline" (click)="loadHostState()" [disabled]="loadingHostState">
+      Refresh Host State
+    </ion-button>
+  </div>
+
+  <ion-item-divider>
+    <ion-label>Provider Runtime</ion-label>
+  </ion-item-divider>
+
+  @if (providerRuntimeRows.length === 0 && !loadingHostState) {
+    <ion-card class="provider-card">
+      <ion-card-content>
+        No provider state returned by the host yet.
+      </ion-card-content>
+    </ion-card>
+  }
+
+  @for (row of providerRuntimeRows; track row.provider) {
+    <ion-card class="provider-card">
+      <ion-card-header>
+        <div class="provider-header">
+          <ion-card-title>{{ providerLabel(row.provider) }}</ion-card-title>
+          <ion-badge [color]="providerStatusColor(row)">
+            {{ providerStatusLabel(row) }}
+          </ion-badge>
+        </div>
+      </ion-card-header>
+
+      <ion-card-content>
+        <ion-list lines="none">
+          <ion-item>
+            <ion-label>
+              <h3>Detected CLI</h3>
+              <p>{{ row.tool?.command || 'Unknown command' }}</p>
+            </ion-label>
+            <ion-note slot="end">
+              {{ row.tool?.found ? 'Found' : 'Missing' }}
+            </ion-note>
+          </ion-item>
+
+          <ion-item>
+            <ion-label>
+              <h3>CLI Path</h3>
+              <p>{{ row.tool?.path || row.config?.cliPath || 'Not set' }}</p>
+            </ion-label>
+          </ion-item>
+
+          <ion-item>
+            <ion-label>
+              <h3>Default Model</h3>
+              <p>{{ row.config?.defaultModel || 'Not set' }}</p>
+            </ion-label>
+          </ion-item>
+
+          <ion-item>
+            <ion-label>
+              <h3>API Key</h3>
+              <p>{{ maskedApiKeyStatus(row.config) }}</p>
+            </ion-label>
+          </ion-item>
+        </ion-list>
+      </ion-card-content>
+    </ion-card>
+  }
 
   <ion-toast
     [isOpen]="showSaveToast"
     [message]="saveToastMessage"
-    [duration]="2000"
+    [duration]="2400"
+    [color]="saveToastColor"
+    (didDismiss)="showSaveToast = false"
     position="bottom"
-    color="success"
   ></ion-toast>
 </ion-content>

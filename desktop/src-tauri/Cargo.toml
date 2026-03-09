@@ -14,10 +14,18 @@ crate-type = ["lib", "cdylib", "staticlib"]
 name = "johnnyone-desktop"
 path = "src/main.rs"
 
+[[bin]]
+name = "johnnyone-host"
+path = "src/bin/johnnyone-host.rs"
+
 [dependencies]
+async-graphql = { version = "7", features = ["chrono", "uuid"] }
+async-graphql-axum = "7"
+axum = { version = "0.8", features = ["json"] }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 sysinfo = "0.32"
 serde = { version = "1", features = ["derive"] }

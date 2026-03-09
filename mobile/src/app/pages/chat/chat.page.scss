@@ -25,9 +25,23 @@ ion-header {
   }
 
   .copy-session-id-button {
-    --padding-start: 6px;
-    --padding-end: 6px;
+    --padding-start: 8px;
+    --padding-end: 8px;
+    --border-color: rgba(148, 163, 184, 0.6);
+    --color: #f8fafc;
+    --background: rgba(15, 23, 42, 0.35);
+    --background-hover: rgba(51, 65, 85, 0.55);
+    --background-activated: rgba(71, 85, 105, 0.65);
+    --ripple-color: rgba(248, 250, 252, 0.28);
     margin-inline-end: 2px;
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+  }
+
+  .copy-session-id-icon {
+    color: #f8fafc;
+    opacity: 1;
+    font-size: 0.9rem;
   }
 }
 

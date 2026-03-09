@@ -28,9 +28,7 @@ fn get_setting(state: &AppState, key: &str, default: &str) -> String {
 /// Start the agent WebSocket connection.
 /// Reads worker_url, user_id, and tenant_id from settings DB.
 #[tauri::command]
-pub async fn start_agent(
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn start_agent(state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("Starting agent connection");
 
     // Check if already started (connected or currently retrying)

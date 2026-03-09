@@ -21,7 +21,10 @@ pub async fn connect(ws_url: &str) -> Result<(WsWrite, WsRead), String> {
 
     let scheme = url.scheme();
     if scheme != "ws" && scheme != "wss" {
-        return Err(format!("Invalid WebSocket scheme: {}. Expected ws or wss.", scheme));
+        return Err(format!(
+            "Invalid WebSocket scheme: {}. Expected ws or wss.",
+            scheme
+        ));
     }
 
     tracing::debug!(url = %ws_url, "Initiating WebSocket connection");

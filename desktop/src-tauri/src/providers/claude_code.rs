@@ -1,5 +1,5 @@
-use super::{CliSpawnConfig, StreamChunk};
 use super::output_parser::parse_claude_code_line;
+use super::{CliSpawnConfig, StreamChunk};
 
 /// Build a CLI spawn config for Claude Code.
 ///
@@ -83,12 +83,16 @@ mod tests {
     #[test]
     fn test_unsets_claudecode_env() {
         let config = build_config("hello", "/tmp", "", None, None);
-        assert!(config.env_vars.iter().any(|(k, v)| k == "CLAUDECODE" && v.is_empty()));
+        assert!(config
+            .env_vars
+            .iter()
+            .any(|(k, v)| k == "CLAUDECODE" && v.is_empty()));
     }
 
     #[test]
     fn test_parse_assistant_message() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello!"}]}}"#;
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello!"}]}}"#;
         let chunk = parse_line(line).unwrap();
         assert_eq!(chunk.chunk_type, ChunkType::Text);
         assert_eq!(chunk.content, "Hello!");

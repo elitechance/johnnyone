@@ -19,8 +19,20 @@
         "scripts": []
       }
     },
+    "e2e-web": {
+      "command": "node desktop/e2e/desktop-web.e2e.cjs"
+    },
     "tauri-dev": {
       "command": "cd desktop/src-tauri && cargo tauri dev"
+    },
+    "host-dev": {
+      "command": "cd desktop/src-tauri && cargo run --bin johnnyone-host"
+    },
+    "host-check": {
+      "command": "cd desktop/src-tauri && cargo check --bin johnnyone-host"
+    },
+    "host-build": {
+      "command": "cd desktop/src-tauri && cargo build --bin johnnyone-host"
     },
     "tauri-build": {
       "command": "cd desktop/src-tauri && cargo tauri build"

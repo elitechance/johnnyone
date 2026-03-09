@@ -38,7 +38,7 @@
           <h2>{{ session.title }}</h2>
           <p>{{ session.provider }} / {{ session.model }}</p>
           <ion-note>
-            Updated {{ session.updated_at | date:'short' }}
+            Updated {{ session.updatedAt | date:'short' }}
           </ion-note>
         </ion-label>
         <ion-button fill="clear" color="danger" slot="end" (click)="deleteSession(session); $event.stopPropagation()">

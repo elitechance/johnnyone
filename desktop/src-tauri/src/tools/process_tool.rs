@@ -106,7 +106,11 @@ fn list_processes(
         .iter()
         .filter(|(_, proc_info)| {
             if let Some(ref f) = filter_lower {
-                proc_info.name().to_string_lossy().to_lowercase().contains(f)
+                proc_info
+                    .name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(f)
             } else {
                 true
             }
@@ -128,7 +132,9 @@ fn list_processes(
     processes.sort_by(|a, b| {
         let cpu_a = a.get("cpu_usage").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let cpu_b = b.get("cpu_usage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        cpu_b.partial_cmp(&cpu_a).unwrap_or(std::cmp::Ordering::Equal)
+        cpu_b
+            .partial_cmp(&cpu_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     Ok(serde_json::json!({

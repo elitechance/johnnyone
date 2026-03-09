@@ -1,5 +1,5 @@
-use super::{CliSpawnConfig, StreamChunk};
 use super::output_parser::parse_ollama_line;
+use super::{CliSpawnConfig, StreamChunk};
 
 /// Build a CLI spawn config for Ollama CLI.
 ///

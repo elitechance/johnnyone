@@ -8,6 +8,30 @@ import { ToolDefinition, ToolExecution } from '../models/tool.model';
 import { ProviderConfig, AiUsageSummary } from '../models/provider.model';
 import { DesktopNode } from '../models/desktop-node.model';
 
+export interface CreateAiSessionInput {
+  title?: string;
+  provider?: string;
+  model?: string;
+  workingDirectory?: string;
+}
+
+export interface AiChatRunResult {
+  userMessage: AiMessage;
+  assistantMessage: AiMessage;
+}
+
+export interface AiChatComplete {
+  sessionId: string;
+  messageId: string;
+}
+
+export interface DetectedCliTool {
+  provider: string;
+  command: string;
+  found: boolean;
+  path?: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class JohnnyApiService {
   private readonly gql = inject(GraphQLClient);
@@ -55,6 +79,81 @@ export class JohnnyApiService {
       .pipe(map((data) => data.deleteAiSession));
   }
 
+  createSession(input: CreateAiSessionInput): Observable<AiSession> {
+    return this.gql
+      .mutate<{ createAiSession: AiSession }>(
+        `mutation CreateAiSession($input: CreateAiSessionInput!) {
+          createAiSession(input: $input) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
+            createdAt updatedAt
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.createAiSession));
+  }
+
+  updateSessionTitle(id: string, title: string): Observable<AiSession> {
+    return this.gql
+      .mutate<{ updateAiSessionTitle: AiSession }>(
+        `mutation UpdateAiSessionTitle($id: ID!, $title: String!) {
+          updateAiSessionTitle(id: $id, title: $title) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
+            createdAt updatedAt
+          }
+        }`,
+        { id, title }
+      )
+      .pipe(map((data) => data.updateAiSessionTitle));
+  }
+
+  updateSessionWorkingDirectory(id: string, workingDirectory: string): Observable<AiSession> {
+    return this.gql
+      .mutate<{ updateAiSessionWorkingDirectory: AiSession }>(
+        `mutation UpdateAiSessionWorkingDirectory($id: ID!, $workingDirectory: String!) {
+          updateAiSessionWorkingDirectory(id: $id, workingDirectory: $workingDirectory) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
+            createdAt updatedAt
+          }
+        }`,
+        { id, workingDirectory }
+      )
+      .pipe(map((data) => data.updateAiSessionWorkingDirectory));
+  }
+
+  updateSessionProvider(id: string, provider: string): Observable<AiSession> {
+    return this.gql
+      .mutate<{ updateAiSessionProvider: AiSession }>(
+        `mutation UpdateAiSessionProvider($id: ID!, $provider: String!) {
+          updateAiSessionProvider(id: $id, provider: $provider) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
+            createdAt updatedAt
+          }
+        }`,
+        { id, provider }
+      )
+      .pipe(map((data) => data.updateAiSessionProvider));
+  }
+
+  archiveSession(id: string): Observable<AiSession> {
+    return this.gql
+      .mutate<{ archiveAiSession: AiSession }>(
+        `mutation ArchiveAiSession($id: ID!) {
+          archiveAiSession(id: $id) {
+            id title provider model workingDirectory status
+            totalInputTokens totalOutputTokens totalCostCents
+            createdAt updatedAt
+          }
+        }`,
+        { id }
+      )
+      .pipe(map((data) => data.archiveAiSession));
+  }
+
   // ── Messages ──────────────────────────────────────────────────────────
 
   listMessages(sessionId: string, limit?: number, offset?: number): Observable<AiMessage[]> {
@@ -84,6 +183,37 @@ export class JohnnyApiService {
       .pipe(map((data) => data.sendRelayChatMessage));
   }
 
+  sendAiChatMessage(input: { sessionId: string; content: string }): Observable<AiChatRunResult> {
+    return this.gql
+      .mutate<{ sendAiChatMessage: AiChatRunResult }>(
+        `mutation SendAiChatMessage($input: SendAiChatMessageInput!) {
+          sendAiChatMessage(input: $input) {
+            userMessage {
+              id sessionId role content toolCalls
+              finishReason inputTokens outputTokens costCents createdAt
+            }
+            assistantMessage {
+              id sessionId role content toolCalls
+              finishReason inputTokens outputTokens costCents createdAt
+            }
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.sendAiChatMessage));
+  }
+
+  stopAiGeneration(sessionId: string): Observable<boolean> {
+    return this.gql
+      .mutate<{ stopAiGeneration: boolean }>(
+        `mutation StopAiGeneration($sessionId: ID!) {
+          stopAiGeneration(sessionId: $sessionId)
+        }`,
+        { sessionId }
+      )
+      .pipe(map((data) => data.stopAiGeneration));
+  }
+
   // ── Message Subscriptions ─────────────────────────────────────────────
 
   onMessageDelta(sessionId: string): Observable<AiMessageDelta> {
@@ -111,6 +241,46 @@ export class JohnnyApiService {
         { sessionId }
       )
       .pipe(map((data) => data.aiMessageCreated));
+  }
+
+  onAiChatDelta(sessionId: string): Observable<AiMessageDelta> {
+    return this.gql
+      .subscribe<{ onAiChatDelta: AiMessageDelta & { chunkType: string; isFinal: boolean } }>(
+        `subscription OnAiChatDelta($sessionId: String!) {
+          onAiChatDelta(sessionId: $sessionId) {
+            sessionId
+            messageId
+            delta
+            chunkType
+            isFinal
+          }
+        }`,
+        { sessionId }
+      )
+      .pipe(
+        map((data) => ({
+          sessionId: data.onAiChatDelta.sessionId,
+          messageId: data.onAiChatDelta.messageId,
+          delta: data.onAiChatDelta.delta,
+          chunkType: data.onAiChatDelta.chunkType,
+          isFinal: data.onAiChatDelta.isFinal,
+          finishReason: data.onAiChatDelta.isFinal ? 'stop' : undefined,
+        }))
+      );
+  }
+
+  onAiChatComplete(sessionId: string): Observable<AiChatComplete> {
+    return this.gql
+      .subscribe<{ onAiChatComplete: AiChatComplete }>(
+        `subscription OnAiChatComplete($sessionId: String!) {
+          onAiChatComplete(sessionId: $sessionId) {
+            sessionId
+            messageId
+          }
+        }`,
+        { sessionId }
+      )
+      .pipe(map((data) => data.onAiChatComplete));
   }
 
   // ── Tools ─────────────────────────────────────────────────────────────
@@ -173,9 +343,9 @@ export class JohnnyApiService {
   upsertProviderConfig(input: Partial<ProviderConfig>): Observable<ProviderConfig> {
     return this.gql
       .mutate<{ upsertProviderConfig: ProviderConfig }>(
-        `mutation UpsertProviderConfig($input: ProviderConfigInput!) {
+        `mutation UpsertProviderConfig($input: UpsertProviderConfigInput!) {
           upsertProviderConfig(input: $input) {
-            id provider model apiKeyRef baseUrl isDefault settings
+            id provider cliPath apiKey defaultModel settings isAvailable updatedAt
           }
         }`,
         { input }
@@ -183,13 +353,13 @@ export class JohnnyApiService {
       .pipe(map((data) => data.upsertProviderConfig));
   }
 
-  deleteProviderConfig(id: string): Observable<boolean> {
+  deleteProviderConfig(provider: string): Observable<boolean> {
     return this.gql
       .mutate<{ deleteProviderConfig: boolean }>(
-        `mutation DeleteProviderConfig($id: ID!) {
-          deleteProviderConfig(id: $id)
+        `mutation DeleteProviderConfig($provider: String!) {
+          deleteProviderConfig(provider: $provider)
         }`,
-        { id }
+        { provider }
       )
       .pipe(map((data) => data.deleteProviderConfig));
   }
@@ -207,6 +377,52 @@ export class JohnnyApiService {
         }`
       )
       .pipe(map((data) => data.listDesktopNodes));
+  }
+
+  listProviderConfigs(): Observable<ProviderConfig[]> {
+    return this.gql
+      .query<{ listProviderConfigs: ProviderConfig[] }>(
+        `query ListProviderConfigs {
+          listProviderConfigs {
+            id provider cliPath apiKey defaultModel settings isAvailable updatedAt
+          }
+        }`
+      )
+      .pipe(map((data) => data.listProviderConfigs));
+  }
+
+  detectCliTools(): Observable<DetectedCliTool[]> {
+    return this.gql
+      .mutate<{ detectCliTools: DetectedCliTool[] }>(
+        `mutation DetectCliTools {
+          detectCliTools {
+            provider command found path
+          }
+        }`
+      )
+      .pipe(map((data) => data.detectCliTools));
+  }
+
+  getSetting(key: string): Observable<string> {
+    return this.gql
+      .query<{ getSetting: string }>(
+        `query GetSetting($key: String!) {
+          getSetting(key: $key)
+        }`,
+        { key }
+      )
+      .pipe(map((data) => data.getSetting));
+  }
+
+  setSetting(key: string, value: string): Observable<boolean> {
+    return this.gql
+      .mutate<{ setSetting: boolean }>(
+        `mutation SetSetting($key: String!, $value: String!) {
+          setSetting(key: $key, value: $value)
+        }`,
+        { key, value }
+      )
+      .pipe(map((data) => data.setSetting));
   }
 
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {

@@ -77,10 +77,7 @@ pub async fn get_pending_approvals(
 
 /// Approve a pending tool execution.
 #[tauri::command]
-pub async fn approve_tool(
-    call_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn approve_tool(call_id: String, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!(call_id = %call_id, "Approving tool execution");
 
     let mut executions = state.tool_executions.lock().await;
@@ -99,10 +96,7 @@ pub async fn approve_tool(
 
 /// Deny a pending tool execution.
 #[tauri::command]
-pub async fn deny_tool(
-    call_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn deny_tool(call_id: String, state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!(call_id = %call_id, "Denying tool execution");
 
     let mut executions = state.tool_executions.lock().await;

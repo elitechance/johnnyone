@@ -72,14 +72,19 @@
                 Session #{{ sessionNumber() }}
               </span>
               <ion-button
-                fill="clear"
+                fill="outline"
                 size="small"
                 class="copy-session-id-button"
                 (click)="copyCurrentSessionId()"
                 [title]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
                 [attr.aria-label]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
               >
-                <ion-icon [name]="sessionIdCopied() ? 'checkmark-outline' : 'copy-outline'"></ion-icon>
+                <ion-icon
+                  slot="start"
+                  class="copy-session-id-icon"
+                  [name]="sessionIdCopied() ? 'checkmark-outline' : 'copy-outline'"
+                ></ion-icon>
+                {{ sessionIdCopied() ? 'Copied' : 'Copy' }}
               </ion-button>
             </div>
           }

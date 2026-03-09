@@ -76,7 +76,10 @@ impl BrowserTool {
                     "status": "not_implemented",
                 }))
             }
-            BrowserInput::Screenshot { selector, full_page } => {
+            BrowserInput::Screenshot {
+                selector,
+                full_page,
+            } => {
                 tracing::info!(
                     selector = ?selector,
                     full_page = full_page,

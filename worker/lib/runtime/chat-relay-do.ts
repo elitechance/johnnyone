@@ -22,11 +22,12 @@ interface RelayEnvelope {
 }
 
 type ClientType = 'mobile' | 'desktop';
+type PendingRpcResult = { success?: boolean; data?: unknown; error?: string; timedOut?: boolean };
 
 export class ChatRelayDO implements DurableObject {
   private state: DurableObjectState;
   private pendingRpc: Map<string, {
-    resolve: (value: unknown) => void;
+    resolve: (value: PendingRpcResult) => void;
     timer: ReturnType<typeof setTimeout>;
   }> = new Map();
 
@@ -103,7 +104,7 @@ export class ChatRelayDO implements DurableObject {
     const requestId = crypto.randomUUID();
 
     // Create a promise that will be resolved when the desktop responds
-    const result = await new Promise<{ data?: unknown; error?: string; timedOut?: boolean }>((resolve) => {
+    const result = await new Promise<PendingRpcResult>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingRpc.delete(requestId);
         resolve({ timedOut: true });

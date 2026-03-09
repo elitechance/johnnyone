@@ -21,7 +21,8 @@ import {
   IonRefresherContent,
 } from '@ionic/angular/standalone';
 import { Router } from '@angular/router';
-import { TauriBridgeService, Session } from '../../services/tauri-bridge.service';
+import { JohnnyApiService, AiSession } from '@johnnyone/ui';
+import { firstValueFrom } from 'rxjs';
 
 @Component({
   selector: 'app-sessions',
@@ -52,9 +53,9 @@ import { TauriBridgeService, Session } from '../../services/tauri-bridge.service
 })
 export class SessionsPage implements OnInit {
   private readonly router = inject(Router);
-  private readonly tauriBridge = inject(TauriBridgeService);
+  private readonly api = inject(JohnnyApiService);
 
-  sessions: Session[] = [];
+  sessions: AiSession[] = [];
   loading = false;
 
   ngOnInit(): void {
@@ -64,7 +65,7 @@ export class SessionsPage implements OnInit {
   async loadSessions(): Promise<void> {
     this.loading = true;
     try {
-      this.sessions = await this.tauriBridge.listSessions();
+      this.sessions = await firstValueFrom(this.api.listSessions());
     } catch (err) {
       console.error('Failed to load sessions:', err);
     } finally {
@@ -79,7 +80,7 @@ export class SessionsPage implements OnInit {
 
   async createSession(): Promise<void> {
     try {
-      const session = await this.tauriBridge.createSession({});
+      const session = await firstValueFrom(this.api.createSession({}));
       this.sessions.unshift(session);
       this.openSession(session);
     } catch (err) {
@@ -87,13 +88,13 @@ export class SessionsPage implements OnInit {
     }
   }
 
-  openSession(session: Session): void {
+  openSession(session: AiSession): void {
     this.router.navigate(['/chat'], { queryParams: { sessionId: session.id } });
   }
 
-  async archiveSession(session: Session): Promise<void> {
+  async archiveSession(session: AiSession): Promise<void> {
     try {
-      const updated = await this.tauriBridge.archiveSession(session.id);
+      const updated = await firstValueFrom(this.api.archiveSession(session.id));
       const idx = this.sessions.findIndex((s) => s.id === session.id);
       if (idx >= 0) {
         this.sessions[idx] = updated;
@@ -103,9 +104,9 @@ export class SessionsPage implements OnInit {
     }
   }
 
-  async deleteSession(session: Session): Promise<void> {
+  async deleteSession(session: AiSession): Promise<void> {
     try {
-      await this.tauriBridge.deleteSession(session.id);
+      await firstValueFrom(this.api.deleteSession(session.id));
       this.sessions = this.sessions.filter((s) => s.id !== session.id);
     } catch (err) {
       console.error('Failed to delete session:', err);

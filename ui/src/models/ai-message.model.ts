@@ -15,6 +15,8 @@ export interface AiMessageDelta {
   sessionId: string;
   messageId: string;
   delta: string;
+  chunkType?: string;
+  isFinal?: boolean;
   finishReason?: string;
 }
 

@@ -72,14 +72,8 @@ where
         .spawn()
         .map_err(|e| format!("Failed to spawn '{}': {}", config.command, e))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Failed to capture stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("Failed to capture stderr")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
 
     let (tx, rx) = mpsc::channel::<StreamChunk>(256);
 
@@ -121,10 +115,7 @@ where
         }
     });
 
-    let process = CliProcess {
-        child,
-        session_id,
-    };
+    let process = CliProcess { child, session_id };
 
     Ok((process, rx))
 }

@@ -1,6 +1,10 @@
 pub mod agent;
 pub mod commands;
 pub mod db;
+pub mod events;
+pub mod host;
+pub mod paths;
 pub mod providers;
+pub mod services;
 pub mod state;
 pub mod tools;

@@ -2,6 +2,7 @@
   <div
     #messagesContainer
     class="messages-container"
+    data-testid="messages-container"
     (scroll)="onMessagesScroll()">
     @if (showEmpty && messages.length === 0 && !isStreaming) {
       <div class="empty-state">

@@ -44,7 +44,10 @@ impl Database {
     where
         F: FnOnce(&Connection) -> Result<T, String>,
     {
-        let conn = self.conn.lock().map_err(|e| format!("Database lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("Database lock poisoned: {}", e))?;
         f(&conn)
     }
 }

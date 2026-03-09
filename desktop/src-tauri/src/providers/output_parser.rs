@@ -15,7 +15,10 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
     match msg_type {
         "system" => {
             // Init event — carries the CLI's session_id
-            let session_id = v.get("session_id").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
             Some(StreamChunk {
                 chunk_type: ChunkType::System,
@@ -32,7 +35,10 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
         }
         "assistant" => {
             let content = extract_assistant_text(&v)?;
-            let session_id = v.get("session_id").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             Some(StreamChunk {
                 chunk_type: ChunkType::Text,
                 content,
@@ -90,12 +96,15 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
             // Check for error results (e.g. failed --resume with invalid session ID)
             let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
             if is_error {
-                let errors = v.get("errors")
+                let errors = v
+                    .get("errors")
                     .and_then(|e| e.as_array())
-                    .map(|arr| arr.iter()
-                        .filter_map(|e| e.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; "))
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
                     .unwrap_or_else(|| "Unknown error".to_string());
                 return Some(StreamChunk {
                     chunk_type: ChunkType::Error,
@@ -120,7 +129,10 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
             let output_tokens = usage
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(|t| t.as_i64());
-            let session_id = v.get("session_id").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             let result_text = v
                 .get("result")
                 .and_then(|r| r.as_str())
@@ -312,7 +324,11 @@ pub fn parse_ollama_line(line: &str) -> Option<StreamChunk> {
     let output_tokens = v.get("eval_count").and_then(|t| t.as_i64());
 
     Some(StreamChunk {
-        chunk_type: if done { ChunkType::Result } else { ChunkType::Text },
+        chunk_type: if done {
+            ChunkType::Result
+        } else {
+            ChunkType::Text
+        },
         content,
         tool_name: None,
         tool_input: None,
@@ -355,7 +371,11 @@ pub fn parse_cline_line(line: &str) -> Option<StreamChunk> {
             })
         }
         "tool_use" => {
-            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             let input = v.get("input").cloned();
             Some(StreamChunk {
                 chunk_type: ChunkType::ToolUse,
@@ -371,7 +391,11 @@ pub fn parse_cline_line(line: &str) -> Option<StreamChunk> {
             })
         }
         "result" => {
-            let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let content = v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             Some(StreamChunk {
                 chunk_type: ChunkType::Result,
                 content,

@@ -1,5 +1,5 @@
-use super::{CliSpawnConfig, StreamChunk};
 use super::output_parser::parse_cline_line;
+use super::{CliSpawnConfig, StreamChunk};
 
 /// Build a CLI spawn config for Cline.
 pub fn build_config(

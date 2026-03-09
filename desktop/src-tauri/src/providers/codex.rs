@@ -1,5 +1,5 @@
-use super::{CliSpawnConfig, StreamChunk};
 use super::output_parser::parse_codex_line;
+use super::{CliSpawnConfig, StreamChunk};
 
 /// Build a CLI spawn config for OpenAI Codex CLI.
 pub fn build_config(

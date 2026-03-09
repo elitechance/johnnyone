@@ -1,7 +1,8 @@
 use crate::db::models::Message;
 use crate::providers::{
-    cli_runner, claude_code, codex, cline, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
+use crate::services::{chat_host as chat_host_service, sessions as session_service};
 use crate::state::app_state::AppState;
 use rusqlite::params;
 use serde::Serialize;
@@ -26,8 +27,9 @@ pub async fn send_chat_message(
     state: State<'_, AppState>,
 ) -> Result<Message, String> {
     // 1. Look up session to get provider + working_directory + cli_session_id
-    let (provider_str, model, working_dir, cli_session_id) = state.db.with_conn(|conn| {
-        conn.query_row(
+    let (provider_str, model, working_dir, cli_session_id) =
+        state.db.with_conn(|conn| {
+            conn.query_row(
             "SELECT provider, model, working_directory, cli_session_id FROM sessions WHERE id = ?1",
             params![session_id],
             |row| Ok((
@@ -38,7 +40,7 @@ pub async fn send_chat_message(
             )),
         )
         .map_err(|e| format!("Session not found: {}", e))
-    })?;
+        })?;
 
     // 2. Save user message to SQLite
     let user_msg_id = Uuid::new_v4().to_string();
@@ -75,10 +77,16 @@ pub async fn send_chat_message(
     let cli_path_ref = cli_path.as_deref();
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
-        CliProvider::ClaudeCode => claude_code::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref),
-        CliProvider::Codex => codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref),
+        CliProvider::ClaudeCode => {
+            claude_code::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
+        }
+        CliProvider::Codex => {
+            codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
+        }
         CliProvider::Cline => cline::build_config(&content, &working_dir, &model, cli_path_ref),
-        CliProvider::Ollama => ollama_cli::build_config(&content, &working_dir, &model, cli_path_ref),
+        CliProvider::Ollama => {
+            ollama_cli::build_config(&content, &working_dir, &model, cli_path_ref)
+        }
     };
 
     // 5. Select the parser for this provider
@@ -90,8 +98,7 @@ pub async fn send_chat_message(
     };
 
     // 6. Spawn CLI subprocess
-    let (process, mut rx) =
-        cli_runner::spawn_cli(config, session_id.clone(), parse_fn).await?;
+    let (process, mut rx) = cli_runner::spawn_cli(config, session_id.clone(), parse_fn).await?;
 
     // Store the process handle so it can be killed
     {
@@ -141,7 +148,8 @@ pub async fn send_chat_message(
                     finish_reason = "timeout".to_string();
                     should_kill_process = true;
 
-                    let message = "Response timed out waiting for model output. Please retry.".to_string();
+                    let message =
+                        "Response timed out waiting for model output. Please retry.".to_string();
                     fallback_error = Some(message.clone());
 
                     let _ = db.with_conn(|conn| {
@@ -333,10 +341,13 @@ pub async fn send_chat_message(
         });
 
         // Emit completion event
-        let _ = app_handle.emit("chat:complete", &serde_json::json!({
-            "session_id": sid,
-            "message_id": amid,
-        }));
+        let _ = app_handle.emit(
+            "chat:complete",
+            &serde_json::json!({
+                "session_id": sid,
+                "message_id": amid,
+            }),
+        );
     });
 
     Ok(user_message)
@@ -344,18 +355,8 @@ pub async fn send_chat_message(
 
 /// Stop the currently streaming response for a session.
 #[tauri::command]
-pub async fn stop_generation(
-    session_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let mut processes = state.active_processes.lock().await;
-    if let Some(mut proc) = processes.remove(&session_id) {
-        proc.kill().await?;
-        tracing::info!(session_id = %session_id, "Stopped generation");
-        Ok(())
-    } else {
-        Err("No active generation for this session".to_string())
-    }
+pub async fn stop_generation(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    chat_host_service::stop_generation(state.inner(), session_id).await
 }
 
 /// List messages for a session.
@@ -366,40 +367,7 @@ pub async fn list_messages(
     offset: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Message>, String> {
-    let limit = limit.unwrap_or(100);
-    let offset = offset.unwrap_or(0);
-
-    state.db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, finish_reason, input_tokens, output_tokens, cost_cents, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let mut messages: Vec<Message> = stmt
-            .query_map(params![session_id, limit, offset], |row| {
-                Ok(Message {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    role: row.get(2)?,
-                    content: row.get(3)?,
-                    tool_calls: row.get(4)?,
-                    tool_call_id: row.get(5)?,
-                    finish_reason: row.get(6)?,
-                    input_tokens: row.get(7)?,
-                    output_tokens: row.get(8)?,
-                    cost_cents: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        messages.reverse();
-
-        Ok(messages)
-    })
+    session_service::list_messages(state.inner(), session_id, limit, offset)
 }
 
 /// Helper to query a single message by ID.

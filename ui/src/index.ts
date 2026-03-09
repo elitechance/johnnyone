@@ -23,7 +23,15 @@ export {
   GRAPHQL_WS_URL,
   GRAPHQL_EXTRA_HEADERS,
 } from './services/graphql-client';
-export { JohnnyApiService } from './services/johnny-api.service';
+export {
+  JohnnyApiService,
+} from './services/johnny-api.service';
+export type {
+  CreateAiSessionInput as JohnnyCreateAiSessionInput,
+  AiChatRunResult,
+  AiChatComplete,
+  DetectedCliTool,
+} from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
 export type {
   ChatBackend,
