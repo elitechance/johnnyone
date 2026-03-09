@@ -6,6 +6,7 @@ use crate::state::app_state::AppState;
 use rusqlite::params;
 use serde::Serialize;
 use tauri::{Emitter, State};
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 /// Delta event emitted to the frontend during streaming.
@@ -110,20 +111,81 @@ pub async fn send_chat_message(
 
     // 8. Stream chunks to frontend via Tauri events
     let db = state.db.clone();
+    let active_processes = state.active_processes.clone();
     let sid = session_id.clone();
     let amid = assistant_msg_id.clone();
 
     tokio::spawn(async move {
+        let stream_idle_timeout = Duration::from_secs(120);
         let mut full_content = String::new();
         let mut total_input_tokens: i64 = 0;
         let mut total_output_tokens: i64 = 0;
         let mut total_cost_cents: i64 = 0;
         let mut captured_cli_session_id: Option<String> = None;
+        let mut fallback_error: Option<String> = None;
+        let mut stderr_lines: Vec<String> = Vec::new();
+        let mut finish_reason = "stop".to_string();
+        let mut saw_final_chunk = false;
+        let mut should_kill_process = false;
 
-        while let Some(chunk) = rx.recv().await {
+        loop {
+            let chunk = match timeout(stream_idle_timeout, rx.recv()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
+                    if !saw_final_chunk {
+                        finish_reason = "stream_closed".to_string();
+                    }
+                    break;
+                }
+                Err(_) => {
+                    finish_reason = "timeout".to_string();
+                    should_kill_process = true;
+
+                    let message = "Response timed out waiting for model output. Please retry.".to_string();
+                    fallback_error = Some(message.clone());
+
+                    let _ = db.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE sessions SET cli_session_id = NULL WHERE id = ?1",
+                            params![&sid],
+                        )
+                        .map_err(|e| format!("Failed to clear cli_session_id: {}", e))
+                    });
+
+                    let timeout_delta = ChatDelta {
+                        session_id: sid.clone(),
+                        message_id: amid.clone(),
+                        chunk: StreamChunk {
+                            chunk_type: ChunkType::Error,
+                            content: message,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                            cost_usd: None,
+                            input_tokens: None,
+                            output_tokens: None,
+                            is_final: true,
+                            session_id: None,
+                        },
+                    };
+                    let _ = app_handle.emit("chat:delta", &timeout_delta);
+                    break;
+                }
+            };
+
             // Accumulate text content
             if chunk.chunk_type == ChunkType::Text {
                 full_content.push_str(&chunk.content);
+            }
+
+            if chunk.chunk_type == ChunkType::Stderr {
+                let line = chunk.content.trim();
+                if !line.is_empty() {
+                    stderr_lines.push(line.to_string());
+                    if stderr_lines.len() > 6 {
+                        stderr_lines.remove(0);
+                    }
+                }
             }
 
             // Capture cli_session_id from System (init) or Result events
@@ -135,10 +197,13 @@ pub async fn send_chat_message(
 
             // On error, clear cli_session_id so next attempt starts fresh
             if chunk.chunk_type == ChunkType::Error {
+                fallback_error = Some(chunk.content.clone());
+                finish_reason = "error".to_string();
+
                 let _ = db.with_conn(|conn| {
                     conn.execute(
                         "UPDATE sessions SET cli_session_id = NULL WHERE id = ?1",
-                        params![sid],
+                        params![&sid],
                     )
                     .map_err(|e| format!("Failed to clear cli_session_id: {}", e))
                 });
@@ -168,25 +233,88 @@ pub async fn send_chat_message(
             let _ = app_handle.emit("chat:delta", &delta);
 
             if is_final {
+                saw_final_chunk = true;
                 break;
             }
+        }
+
+        {
+            let mut processes = active_processes.lock().await;
+            if let Some(mut proc) = processes.remove(&sid) {
+                if should_kill_process && proc.is_running() {
+                    let _ = proc.kill().await;
+                }
+            }
+        }
+
+        let mut used_fallback_content = false;
+        if full_content.trim().is_empty() {
+            used_fallback_content = true;
+
+            if let Some(error) = fallback_error {
+                full_content = error;
+                if finish_reason == "stop" {
+                    finish_reason = "error".to_string();
+                }
+            } else if !stderr_lines.is_empty() {
+                full_content = format!(
+                    "Generation ended without assistant text. Recent stderr:\n{}",
+                    stderr_lines.join("\n")
+                );
+                if finish_reason == "stop" {
+                    finish_reason = "stderr".to_string();
+                }
+            } else {
+                full_content = "Generation ended without assistant text. Please retry.".to_string();
+                if finish_reason == "stop" {
+                    finish_reason = "empty".to_string();
+                }
+            }
+        }
+
+        if used_fallback_content {
+            let fallback_delta = ChatDelta {
+                session_id: sid.clone(),
+                message_id: amid.clone(),
+                chunk: StreamChunk {
+                    chunk_type: ChunkType::Text,
+                    content: full_content.clone(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    cost_usd: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    is_final: false,
+                    session_id: None,
+                },
+            };
+            let _ = app_handle.emit("chat:delta", &fallback_delta);
         }
 
         // 9. Update assistant message in SQLite with final content
         let _ = db.with_conn(|conn| {
             conn.execute(
-                "UPDATE messages SET content = ?1, input_tokens = ?2, output_tokens = ?3, cost_cents = ?4, finish_reason = 'stop' WHERE id = ?5",
-                params![full_content, total_input_tokens, total_output_tokens, total_cost_cents, amid],
+                "UPDATE messages SET content = ?1, input_tokens = ?2, output_tokens = ?3, cost_cents = ?4, finish_reason = ?5 WHERE id = ?6",
+                params![full_content, total_input_tokens, total_output_tokens, total_cost_cents, finish_reason, amid],
             )
             .map_err(|e| format!("Failed to update assistant message: {}", e))?;
 
             // Store cli_session_id from the CLI tool (for --resume on subsequent messages)
-            if let Some(ref cli_sid) = captured_cli_session_id {
+            if saw_final_chunk {
+                if let Some(ref cli_sid) = captured_cli_session_id {
+                    conn.execute(
+                        "UPDATE sessions SET cli_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        params![cli_sid, &sid],
+                    )
+                    .map_err(|e| format!("Failed to store cli_session_id: {}", e))?;
+                }
+            } else {
                 conn.execute(
-                    "UPDATE sessions SET cli_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    params![cli_sid, sid],
+                    "UPDATE sessions SET cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+                    params![&sid],
                 )
-                .map_err(|e| format!("Failed to store cli_session_id: {}", e))?;
+                .map_err(|e| format!("Failed to clear cli_session_id after incomplete stream: {}", e))?;
             }
 
             // Update session token totals
@@ -244,11 +372,11 @@ pub async fn list_messages(
     state.db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, finish_reason, input_tokens, output_tokens, cost_cents, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3",
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, finish_reason, input_tokens, output_tokens, cost_cents, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| e.to_string())?;
 
-        let messages = stmt
+        let mut messages: Vec<Message> = stmt
             .query_map(params![session_id, limit, offset], |row| {
                 Ok(Message {
                     id: row.get(0)?,
@@ -267,6 +395,8 @@ pub async fn list_messages(
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
+
+        messages.reverse();
 
         Ok(messages)
     })

@@ -64,7 +64,26 @@
             <ion-icon name="menu-outline"></ion-icon>
           </ion-button>
         }
-        <h2 class="chat-title">{{ currentSession()?.title || 'JohnnyOne' }}</h2>
+        <div class="chat-title-wrap">
+          <h2 class="chat-title">{{ currentSession()?.title || 'JohnnyOne' }}</h2>
+          @if (currentSession()) {
+            <div class="chat-session-meta">
+              <span class="chat-session-number" [title]="currentSession()?.id || ''">
+                Session #{{ sessionNumber() }}
+              </span>
+              <ion-button
+                fill="clear"
+                size="small"
+                class="copy-session-id-button"
+                (click)="copyCurrentSessionId()"
+                [title]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
+                [attr.aria-label]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
+              >
+                <ion-icon [name]="sessionIdCopied() ? 'checkmark-outline' : 'copy-outline'"></ion-icon>
+              </ion-button>
+            </div>
+          }
+        </div>
       </div>
 
       <div class="header-center">

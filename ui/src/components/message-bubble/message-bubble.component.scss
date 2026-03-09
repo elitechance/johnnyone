@@ -120,6 +120,46 @@
         background: none;
         padding: 0;
         border-radius: 0;
+        display: block;
+        white-space: pre;
+      }
+    }
+
+    .code-block {
+      margin: 8px 0;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+
+      .code-header {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        padding: 5px 10px;
+        background: rgba(0, 0, 0, 0.2);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .code-lang {
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-family: 'Fira Code', 'Consolas', 'Monaco', monospace;
+        color: var(--app-text-muted, #9fb0cd);
+        font-weight: 600;
+      }
+
+      pre {
+        margin: 0;
+        padding: 12px;
+        border-radius: 0;
+        border: 0;
+        background: transparent;
+      }
+
+      pre code {
+        min-width: max-content;
       }
     }
 
@@ -162,6 +202,16 @@
     a {
       color: var(--ion-color-primary);
       text-decoration: underline;
+    }
+
+    img {
+      display: block;
+      max-width: 100%;
+      max-height: 320px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      margin: 8px 0;
+      object-fit: contain;
     }
 
     table {

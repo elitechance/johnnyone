@@ -151,6 +151,14 @@
   align-items: center;
   gap: 8px;
 
+  .chat-title-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+  }
+
   .chat-title {
     font-size: 1.15rem;
     font-weight: 500;
@@ -159,6 +167,32 @@
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 300px;
+  }
+
+  .chat-session-number {
+    font-size: 0.72rem;
+    line-height: 1;
+    font-family: monospace;
+    color: var(--app-text-muted, var(--ion-color-step-500, #64748b));
+    white-space: nowrap;
+  }
+
+  .chat-session-meta {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .copy-session-id-button {
+    --padding-start: 2px;
+    --padding-end: 2px;
+    --color: var(--app-text-muted, var(--ion-color-step-500, #64748b));
+    margin: 0;
+    min-height: 18px;
+
+    ion-icon {
+      font-size: 0.86rem;
+    }
   }
 }
 

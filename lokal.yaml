@@ -20,6 +20,7 @@ apps:
       dir: desktop
       framework: angular
       dist: dist/desktop
+      pre_build: nx build mobile
       build: nx build desktop
     d1:
       name: johnnyone-db

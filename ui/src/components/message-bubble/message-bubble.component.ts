@@ -3,7 +3,96 @@ import { CommonModule } from '@angular/common';
 import { IonicModule } from '@ionic/angular';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { AiMessage } from '../../models/ai-message.model';
-import { marked } from 'marked';
+import { Marked, marked } from 'marked';
+import hljs from 'highlight.js/lib/common';
+
+function escapeHtml(raw: string): string {
+  return raw
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function normalizeLanguage(lang?: string): string | undefined {
+  if (!lang) return undefined;
+
+  const base = lang
+    .trim()
+    .toLowerCase()
+    .replace(/^language-/, '')
+    .replace(/^\{/, '')
+    .replace(/\}$/, '')
+    .split(/\s+/)[0];
+  if (!base) return undefined;
+
+  const safe = base.match(/^[a-z0-9#+.-]+$/i)?.[0];
+  return safe ? safe.toLowerCase() : undefined;
+}
+
+function highlightCode(text: string, lang?: string): { html: string; label: string; className: string } {
+  const language = normalizeLanguage(lang);
+
+  if (language && hljs.getLanguage(language)) {
+    const highlighted = hljs.highlight(text, {
+      language,
+      ignoreIllegals: true,
+    });
+
+    return {
+      html: highlighted.value,
+      label: language,
+      className: `language-${language}`,
+    };
+  }
+
+  if (language) {
+    return {
+      html: escapeHtml(text),
+      label: language,
+      className: 'language-plaintext',
+    };
+  }
+
+  const auto = hljs.highlightAuto(text);
+  const autoLanguage = normalizeLanguage(auto.language);
+
+  if (autoLanguage) {
+    return {
+      html: auto.value,
+      label: autoLanguage,
+      className: `language-${autoLanguage}`,
+    };
+  }
+
+  return {
+    html: escapeHtml(text),
+    label: 'text',
+    className: 'language-plaintext',
+  };
+}
+
+function createMarkdownParser(): Marked {
+  const renderer = new marked.Renderer();
+
+  renderer.code = ({ text, lang }) => {
+    const highlighted = highlightCode(text, lang);
+
+    return (
+      `<div class="code-block">` +
+      `<div class="code-header"><span class="code-lang">${escapeHtml(highlighted.label)}</span></div>` +
+      `<pre><code class="hljs ${highlighted.className}">${highlighted.html}</code></pre>` +
+      `</div>`
+    );
+  };
+
+  return new Marked({
+    gfm: true,
+    breaks: true,
+    renderer,
+  });
+}
 
 @Component({
   selector: 'johnny-message-bubble',
@@ -16,14 +105,9 @@ import { marked } from 'marked';
 export class MessageBubbleComponent {
   @Input({ required: true }) message!: AiMessage;
   @Input() isStreamingMessage = false;
+  private readonly markdownParser = createMarkdownParser();
 
-  constructor(private sanitizer: DomSanitizer) {
-    // Configure marked for safe rendering
-    marked.setOptions({
-      gfm: true,
-      breaks: true,
-    });
-  }
+  constructor(private sanitizer: DomSanitizer) {}
 
   get isUser(): boolean {
     return this.message.role === 'user';
@@ -90,15 +174,14 @@ export class MessageBubbleComponent {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  /** Render message content as markdown (for assistant) or plain text (for user). */
+  /** Render message content as markdown (for assistant/user) or plain text (for others). */
   get renderedContent(): SafeHtml {
     if (!this.message.content) {
       return '';
     }
 
-    // Only render markdown for assistant messages
-    if (this.isAssistant) {
-      const html = marked.parse(this.message.content) as string;
+    if (this.isAssistant || this.isUser) {
+      const html = this.markdownParser.parse(this.message.content) as string;
       return this.sanitizer.bypassSecurityTrustHtml(html);
     }
 
@@ -106,7 +189,7 @@ export class MessageBubbleComponent {
   }
 
   get useHtml(): boolean {
-    return this.isAssistant;
+    return this.isAssistant || this.isUser;
   }
 
   formatToolCallInput(toolCall: { id: string; name: string; input: unknown }): string {

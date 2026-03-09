@@ -15,8 +15,21 @@
           <ion-icon name="add-outline" slot="icon-only"></ion-icon>
         </ion-button>
       </ion-buttons>
-      <ion-title>{{ activeSession()?.title ?? 'New Chat' }}</ion-title>
+      <ion-title>
+        {{ activeSession()?.title ?? 'New Chat' }}{{ activeSessionNumber() ? ' · #' + activeSessionNumber() : '' }}
+      </ion-title>
       <ion-buttons slot="end">
+        @if (activeSession()) {
+          <ion-button
+            class="copy-session-id-button"
+            fill="clear"
+            (click)="copyActiveSessionId()"
+            [title]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
+            [attr.aria-label]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
+          >
+            <ion-icon [name]="sessionIdCopied() ? 'checkmark-outline' : 'copy-outline'" slot="icon-only"></ion-icon>
+          </ion-button>
+        }
         <ion-chip [color]="desktopOnline() ? 'success' : 'danger'" outline>
           <ion-label>{{ desktopOnline() ? 'Online' : 'Offline' }}</ion-label>
         </ion-chip>

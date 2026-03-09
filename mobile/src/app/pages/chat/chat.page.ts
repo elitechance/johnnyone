@@ -79,6 +79,7 @@ export class ChatPage implements OnInit, OnDestroy {
   private relayWs: WebSocket | null = null;
   private onlineNodeId: string | null = null;
   private streamingTimeout: ReturnType<typeof setTimeout> | null = null;
+  private sessionIdCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
   private preferNewSession = false;
   private initializedSessionView = false;
 
@@ -94,6 +95,7 @@ export class ChatPage implements OnInit, OnDestroy {
   desktopOnline = signal(false);
   currentRelayId = signal<string | null>(null);
   loading = signal(false);
+  sessionIdCopied = signal(false);
 
   aiMessages = computed<AiMessage[]>(() => {
     const msgs = this.messages().map(m => this.mapRelayMessage(m));
@@ -107,11 +109,19 @@ export class ChatPage implements OnInit, OnDestroy {
     return msgs;
   });
 
+  activeSessionNumber = computed(() => {
+    const session = this.activeSession();
+    if (!session) return null;
+    const [prefix] = session.id.split('-');
+    return prefix || session.id;
+  });
+
   ngOnInit(): void {
     this.checkDesktopStatus();
   }
 
   ngOnDestroy(): void {
+    this.clearSessionIdCopiedTimeout();
     this.clearStreamingTimeout();
     this.disconnectRelayWs();
   }
@@ -527,5 +537,55 @@ export class ChatPage implements OnInit, OnDestroy {
       localStorage.setItem(key, sessionId);
     }
     return sessionId;
+  }
+
+  async copyActiveSessionId(): Promise<void> {
+    const sessionId = this.activeSession()?.id;
+    if (!sessionId) return;
+
+    const copied = await this.copyTextToClipboard(sessionId);
+    if (!copied) {
+      console.error('Failed to copy session ID to clipboard');
+      return;
+    }
+
+    this.sessionIdCopied.set(true);
+    this.clearSessionIdCopiedTimeout();
+    this.sessionIdCopiedTimeout = setTimeout(() => {
+      this.sessionIdCopied.set(false);
+      this.sessionIdCopiedTimeout = null;
+    }, 1600);
+  }
+
+  private async copyTextToClipboard(value: string): Promise<boolean> {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+      // Fall back to legacy copy path.
+    }
+
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'absolute';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return copied;
+    } catch {
+      return false;
+    }
+  }
+
+  private clearSessionIdCopiedTimeout(): void {
+    if (!this.sessionIdCopiedTimeout) return;
+    clearTimeout(this.sessionIdCopiedTimeout);
+    this.sessionIdCopiedTimeout = null;
   }
 }

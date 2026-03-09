@@ -11,9 +11,11 @@
 @import '@ionic/angular/css/text-alignment.css';
 @import '@ionic/angular/css/text-transformation.css';
 @import '@ionic/angular/css/flex-utils.css';
+@import 'highlight.js/styles/a11y-dark.css';
 
 /* Dark theme variables */
 :root {
+  color-scheme: dark;
   --app-bg: #0b1220;
   --app-surface-1: #111d34;
   --app-surface-2: #16243f;
@@ -167,4 +169,88 @@ ion-content {
     margin-left: auto;
     margin-right: auto;
   }
+}
+
+.markdown-content .code-block {
+  margin: 8px 0;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  background: #0f172a;
+  overflow: hidden;
+}
+
+.markdown-content .code-block .code-header {
+  padding: 5px 10px;
+  background: #111827;
+  border-bottom: 1px solid #334155;
+}
+
+.markdown-content .code-block .code-lang {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-family: 'Fira Code', 'Consolas', 'Monaco', monospace;
+  color: #cbd5e1;
+  font-weight: 600;
+}
+
+.markdown-content .code-block pre {
+  margin: 0;
+}
+
+.markdown-content .code-block code.hljs {
+  display: block;
+  white-space: pre;
+  min-width: max-content;
+  color: #f8fafc;
+  background: transparent;
+}
+
+.markdown-content .code-block .hljs {
+  color: #f8fafc !important;
+  background: transparent !important;
+}
+
+.markdown-content .code-block .hljs-comment,
+.markdown-content .code-block .hljs-quote {
+  color: #94a3b8 !important;
+  font-style: italic;
+}
+
+.markdown-content .code-block .hljs-keyword,
+.markdown-content .code-block .hljs-selector-tag,
+.markdown-content .code-block .hljs-built_in,
+.markdown-content .code-block .hljs-literal {
+  color: #ff7ab2 !important;
+}
+
+.markdown-content .code-block .hljs-title,
+.markdown-content .code-block .hljs-section,
+.markdown-content .code-block .hljs-type,
+.markdown-content .code-block .hljs-function .hljs-title {
+  color: #7aa2f7 !important;
+}
+
+.markdown-content .code-block .hljs-string,
+.markdown-content .code-block .hljs-attr,
+.markdown-content .code-block .hljs-template-tag,
+.markdown-content .code-block .hljs-template-variable,
+.markdown-content .code-block .hljs-regexp {
+  color: #7dd3fc !important;
+}
+
+.markdown-content .code-block .hljs-number,
+.markdown-content .code-block .hljs-symbol,
+.markdown-content .code-block .hljs-variable,
+.markdown-content .code-block .hljs-bullet,
+.markdown-content .code-block .hljs-link,
+.markdown-content .code-block .hljs-meta,
+.markdown-content .code-block .hljs-name {
+  color: #e0af68 !important;
+}
+
+.markdown-content :not(pre) > code {
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #334155;
 }

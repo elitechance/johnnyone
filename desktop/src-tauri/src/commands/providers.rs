@@ -3,6 +3,10 @@ use crate::providers::CliProvider;
 use crate::state::app_state::AppState;
 use rusqlite::params;
 use serde::Serialize;
+#[cfg(target_os = "windows")]
+use std::env;
+#[cfg(target_os = "windows")]
+use std::path::{Path, PathBuf};
 use tauri::State;
 use uuid::Uuid;
 
@@ -173,6 +177,19 @@ pub async fn detect_cli_tools(
 
 /// Check if a command exists on the system PATH.
 async fn detect_command(command: &str) -> (bool, Option<String>) {
+    #[cfg(target_os = "windows")]
+    {
+        return detect_command_windows(command).await;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        return detect_command_unix(command).await;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn detect_command_unix(command: &str) -> (bool, Option<String>) {
     match tokio::process::Command::new("which")
         .arg(command)
         .output()
@@ -184,4 +201,109 @@ async fn detect_command(command: &str) -> (bool, Option<String>) {
         }
         _ => (false, None),
     }
+}
+
+#[cfg(target_os = "windows")]
+async fn detect_command_windows(command: &str) -> (bool, Option<String>) {
+    if let Some(path) = detect_with_where(command).await {
+        return (true, Some(path));
+    }
+
+    if let Some(path) = find_windows_command_path(command) {
+        return (true, Some(path));
+    }
+
+    (false, None)
+}
+
+#[cfg(target_os = "windows")]
+async fn detect_with_where(command: &str) -> Option<String> {
+    let output = tokio::process::Command::new("where")
+        .arg(command)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_command_output(&output.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn find_windows_command_path(command: &str) -> Option<String> {
+    if let Some(found) = resolve_windows_path(PathBuf::from(command)) {
+        return Some(found);
+    }
+
+    let executable_names = windows_executable_names(command);
+
+    for directory in windows_search_directories() {
+        for name in &executable_names {
+            let candidate = directory.join(name);
+            if let Some(found) = resolve_windows_path(candidate) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_executable_names(command: &str) -> Vec<String> {
+    let mut names = vec![command.to_string()];
+
+    if !has_windows_extension(command) {
+        names.push(format!("{command}.exe"));
+        names.push(format!("{command}.cmd"));
+        names.push(format!("{command}.bat"));
+    }
+
+    names
+}
+
+#[cfg(target_os = "windows")]
+fn has_windows_extension(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.ends_with(".exe") || lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_search_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+
+    if let Some(path_var) = env::var_os("PATH") {
+        directories.extend(env::split_paths(&path_var));
+    }
+
+    if let Some(app_data) = env::var_os("APPDATA") {
+        directories.push(PathBuf::from(app_data).join("npm"));
+    }
+
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        directories.push(PathBuf::from(local_app_data).join("npm"));
+    }
+
+    directories
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_path(path: PathBuf) -> Option<String> {
+    let normalized = Path::new(&path);
+    if normalized.is_file() {
+        return Some(normalized.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn parse_command_output(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }

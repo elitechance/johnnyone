@@ -1,23 +1,52 @@
 <div class="composer">
-  <ion-item lines="none" class="input-wrapper">
-    <ion-textarea
-      #messageInput
-      [(ngModel)]="messageText"
-      [placeholder]="placeholder"
-      [disabled]="disabled"
-      [autoGrow]="true"
-      [rows]="1"
-      [maxlength]="10000"
-      (keydown)="onKeyDown($event)"
-      class="message-input">
-    </ion-textarea>
-  </ion-item>
+  <div
+    class="composer-main"
+    [class.drag-over]="isDragOver"
+    (dragenter)="onDragEnter($event)"
+    (dragover)="onDragOver($event)"
+    (dragleave)="onDragLeave($event)"
+    (drop)="onDrop($event)">
+    <ion-item lines="none" class="input-wrapper">
+      <ion-textarea
+        #messageInput
+        [(ngModel)]="messageText"
+        [placeholder]="placeholder"
+        [disabled]="disabled"
+        [autoGrow]="true"
+        [rows]="1"
+        [maxlength]="10000"
+        (keydown)="onKeyDown($event)"
+        class="message-input">
+      </ion-textarea>
+    </ion-item>
+
+    @if (pastedImages.length > 0) {
+      <div class="pasted-images">
+        @for (img of pastedImages; track img.id) {
+          <div class="pasted-image-item">
+            <img [src]="img.dataUrl" [alt]="img.name" />
+            <button type="button" class="remove-image" (click)="removePastedImage(img.id)">
+              <ion-icon name="close"></ion-icon>
+            </button>
+          </div>
+        }
+      </div>
+    }
+
+    @if (isDragOver) {
+      <div class="drop-notice">Drop image to attach</div>
+    }
+
+    @if (pasteNotice) {
+      <div class="paste-notice">{{ pasteNotice }}</div>
+    }
+  </div>
 
   <ion-button
     fill="solid"
     shape="round"
     size="default"
-    [disabled]="disabled || !messageText.trim()"
+    [disabled]="!canSend"
     (click)="send()"
     class="send-button">
     <ion-icon slot="icon-only" name="send"></ion-icon>

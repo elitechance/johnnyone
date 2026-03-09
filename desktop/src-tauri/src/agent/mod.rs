@@ -465,11 +465,11 @@ impl AgentService {
         state.db.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, session_id, role, content, tool_calls, finish_reason, input_tokens, output_tokens, cost_cents, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3",
+                    "SELECT id, session_id, role, content, tool_calls, finish_reason, input_tokens, output_tokens, cost_cents, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
                 )
                 .map_err(|e| e.to_string())?;
 
-            let messages: Vec<RpcMessageView> = stmt
+            let mut messages: Vec<RpcMessageView> = stmt
                 .query_map(rusqlite::params![session_id, limit, offset], |row| {
                     Ok(RpcMessageView {
                         id: row.get(0)?,
@@ -487,6 +487,8 @@ impl AgentService {
                 .map_err(|e| e.to_string())?
                 .filter_map(|r| r.ok())
                 .collect();
+
+            messages.reverse();
 
             serde_json::to_value(&messages).map_err(|e| e.to_string())
         })

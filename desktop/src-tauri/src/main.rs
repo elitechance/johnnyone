@@ -51,6 +51,8 @@ fn main() {
             commands::chat::send_chat_message,
             commands::chat::stop_generation,
             commands::chat::list_messages,
+            // Clipboard
+            commands::clipboard::read_clipboard_image_data_url,
             // Providers
             commands::providers::list_provider_configs,
             commands::providers::upsert_provider_config,

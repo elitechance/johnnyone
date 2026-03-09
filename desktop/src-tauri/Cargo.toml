@@ -33,6 +33,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 gethostname = "0.5"
 dirs = "5"
 tauri-plugin-dialog = "2"
+arboard = "3"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

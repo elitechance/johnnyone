@@ -33,11 +33,12 @@ pub async fn start_agent(
 ) -> Result<(), String> {
     tracing::info!("Starting agent connection");
 
-    // Check if already connected
+    // Check if already started (connected or currently retrying)
     {
         let status = state.connection_status.lock().await;
-        if status.connected {
-            return Err("Agent is already connected. Disconnect first.".to_string());
+        if status.session_id.is_some() {
+            tracing::info!("Agent connection already active; skipping duplicate start");
+            return Ok(());
         }
     }
 
@@ -80,10 +81,9 @@ pub async fn stop_agent(state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("Stopping agent connection");
 
     // Signal the agent to stop
-    state
-        .shutdown_tx
-        .send(())
-        .map_err(|_| "Failed to send shutdown signal".to_string())?;
+    if state.shutdown_tx.send(()).is_err() {
+        tracing::debug!("No active agent listeners for shutdown signal");
+    }
 
     // Update connection status
     {

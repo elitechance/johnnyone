@@ -70,7 +70,6 @@ johnnyone/
 
 - Node.js 20+
 - Rust / Cargo (for Tauri desktop builds)
-- Nx CLI (`npm install -g nx`)
 - Wrangler CLI (bundled via devDependencies)
 - Lokal CLI (for worker simulation and D1 migrations)
 
@@ -83,26 +82,27 @@ npm install
 ### Development
 
 ```bash
-# Start the desktop Angular dev server (port 4200)
-nx serve desktop
+# Start the desktop Tauri app (includes frontend dev server)
+npm run start:desktop
 
-# Start the Tauri desktop app (in a separate terminal)
-cd desktop/src-tauri && cargo tauri dev
+# (Optional) Start desktop frontend only (port 4200)
+npm run start:desktop:web
 
 # Start the worker API (port 7714)
-lokal cf worker sim
+npm run start:worker
 
 # Apply D1 database migrations (local)
-lokal cf db migrate --local
+npm run migrate:worker
 
 # Start the mobile Angular dev server (port 4201)
-nx serve mobile
+npm run start:mobile
 ```
 
 ### Build
 
 ```bash
-npm run build:desktop    # Build desktop Angular app
+npm run build:desktop    # Build desktop Angular frontend
+npm run build:desktop:tauri  # Build native desktop app (Tauri)
 npm run build:mobile     # Build mobile Angular app
 npm run build:worker     # Build Cloudflare Worker
 ```

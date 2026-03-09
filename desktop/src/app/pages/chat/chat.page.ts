@@ -44,6 +44,8 @@ import { Subscription } from 'rxjs';
 })
 export class ChatPage implements OnInit, OnDestroy {
   private static readonly SIDEBAR_WIDTH_KEY = 'johnnyone_desktop_sidebar_width';
+  private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
+  private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
   private readonly tauriBridge = inject(TauriBridgeService);
   private readonly router = inject(Router);
   private readonly minSidebarWidth = 260;
@@ -53,6 +55,8 @@ export class ChatPage implements OnInit, OnDestroy {
   private completeSubscription: Subscription | null = null;
   private resizeMoveHandler: ((event: MouseEvent) => void) | null = null;
   private resizeUpHandler: (() => void) | null = null;
+  private streamingStatusInterval: ReturnType<typeof setInterval> | null = null;
+  private sessionIdCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // State
   sessions = signal<Session[]>([]);
@@ -61,6 +65,9 @@ export class ChatPage implements OnInit, OnDestroy {
   isStreaming = signal(false);
   streamingContent = signal('');
   streamingMessageId = signal<string | null>(null);
+  private streamStartedAt = signal<number | null>(null);
+  private lastStreamActivityAt = signal<number | null>(null);
+  private streamingStatusTick = signal(0);
   currentMessage = '';
   searchQuery = '';
   detectedTools = signal<DetectedTool[]>([]);
@@ -69,6 +76,7 @@ export class ChatPage implements OnInit, OnDestroy {
   sidebarOpen = signal(true);
   sidebarWidth = signal(this.defaultSidebarWidth);
   isResizingSidebar = signal(false);
+  sessionIdCopied = signal(false);
 
   // Computed
   filteredSessions = computed(() => {
@@ -100,6 +108,56 @@ export class ChatPage implements OnInit, OnDestroy {
     };
   });
 
+  sessionNumber = computed(() => {
+    const session = this.currentSession();
+    if (!session) return null;
+    return this.toSessionNumber(session.id);
+  });
+
+  streamingStatusWarning = computed(() => {
+    if (!this.isStreaming()) return false;
+
+    this.streamingStatusTick();
+
+    const startedAt = this.streamStartedAt();
+    if (!startedAt) return false;
+
+    const lastActivityAt = this.lastStreamActivityAt();
+    const idleMs = Date.now() - (lastActivityAt ?? startedAt);
+
+    if (!lastActivityAt) {
+      return idleMs >= ChatPage.STREAM_FIRST_TOKEN_NOTICE_MS;
+    }
+
+    return idleMs >= ChatPage.STREAM_IDLE_NOTICE_MS;
+  });
+
+  streamingStatusText = computed(() => {
+    if (!this.isStreaming()) return '';
+
+    this.streamingStatusTick();
+
+    const startedAt = this.streamStartedAt();
+    if (!startedAt) return 'Waiting for CLI response…';
+
+    const lastActivityAt = this.lastStreamActivityAt();
+    const idleMs = Date.now() - (lastActivityAt ?? startedAt);
+    const idleSeconds = Math.max(0, Math.floor(idleMs / 1000));
+
+    if (!lastActivityAt) {
+      if (idleMs >= ChatPage.STREAM_FIRST_TOKEN_NOTICE_MS) {
+        return `Still waiting for first token… ${idleSeconds}s`;
+      }
+      return 'Waiting for CLI response…';
+    }
+
+    if (idleMs >= ChatPage.STREAM_IDLE_NOTICE_MS) {
+      return `No new tokens yet… ${idleSeconds}s`;
+    }
+
+    return 'Streaming response…';
+  });
+
   ngOnInit(): void {
     this.loadSidebarWidth();
     this.loadSessions();
@@ -111,6 +169,8 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.clearSessionIdCopiedTimeout();
+    this.resetStreamingStatus();
     this.stopSidebarResize();
     this.deltaSubscription?.unsubscribe();
     this.completeSubscription?.unsubscribe();
@@ -204,6 +264,7 @@ export class ChatPage implements OnInit, OnDestroy {
       this.isStreaming.set(false);
       this.streamingContent.set('');
       this.streamingMessageId.set(null);
+      this.resetStreamingStatus();
     } catch (err) {
       console.error('Failed to select session:', err);
     }
@@ -306,6 +367,8 @@ export class ChatPage implements OnInit, OnDestroy {
     this.currentMessage = '';
     this.isStreaming.set(true);
     this.streamingContent.set('');
+    this.streamingMessageId.set(null);
+    this.beginStreamingStatus();
 
     try {
       const userMessage = await this.tauriBridge.sendChatMessage(session.id, text);
@@ -313,6 +376,7 @@ export class ChatPage implements OnInit, OnDestroy {
     } catch (err) {
       console.error('Failed to send message:', err);
       this.isStreaming.set(false);
+      this.resetStreamingStatus();
       this.currentMessage = text;
     }
   }
@@ -323,6 +387,8 @@ export class ChatPage implements OnInit, OnDestroy {
     try {
       await this.tauriBridge.stopGeneration(session.id);
       this.isStreaming.set(false);
+      this.streamingMessageId.set(null);
+      this.resetStreamingStatus();
     } catch (err) {
       console.error('Failed to stop generation:', err);
     }
@@ -354,6 +420,7 @@ export class ChatPage implements OnInit, OnDestroy {
       next: (complete) => {
         this.isStreaming.set(false);
         this.streamingMessageId.set(null);
+        this.resetStreamingStatus();
 
         const content = this.streamingContent();
         if (content && complete.message_id) {
@@ -383,6 +450,7 @@ export class ChatPage implements OnInit, OnDestroy {
     const session = this.currentSession();
     if (!session || delta.session_id !== session.id) return;
 
+    this.markStreamingActivity();
     this.streamingMessageId.set(delta.message_id);
 
     if (delta.chunk.chunk_type === 'text') {
@@ -576,12 +644,97 @@ export class ChatPage implements OnInit, OnDestroy {
     return Math.min(this.maxSidebarWidth, Math.max(this.minSidebarWidth, width));
   }
 
+  private beginStreamingStatus(): void {
+    this.streamStartedAt.set(Date.now());
+    this.lastStreamActivityAt.set(null);
+    this.startStreamingStatusTicker();
+  }
+
+  private markStreamingActivity(): void {
+    if (!this.isStreaming()) return;
+    this.lastStreamActivityAt.set(Date.now());
+  }
+
+  private resetStreamingStatus(): void {
+    this.streamStartedAt.set(null);
+    this.lastStreamActivityAt.set(null);
+    this.stopStreamingStatusTicker();
+  }
+
+  private startStreamingStatusTicker(): void {
+    if (this.streamingStatusInterval) return;
+    this.streamingStatusInterval = setInterval(() => {
+      this.streamingStatusTick.update((n) => n + 1);
+    }, 1000);
+  }
+
+  private stopStreamingStatusTicker(): void {
+    if (!this.streamingStatusInterval) return;
+    clearInterval(this.streamingStatusInterval);
+    this.streamingStatusInterval = null;
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────
 
   formatTokens(n: number): string {
     if (n < 1000) return String(n);
     if (n < 1000000) return `${(n / 1000).toFixed(1)}k`;
     return `${(n / 1000000).toFixed(1)}M`;
+  }
+
+  async copyCurrentSessionId(): Promise<void> {
+    const sessionId = this.currentSession()?.id;
+    if (!sessionId) return;
+
+    const copied = await this.copyTextToClipboard(sessionId);
+    if (!copied) {
+      console.error('Failed to copy session ID to clipboard');
+      return;
+    }
+
+    this.sessionIdCopied.set(true);
+    this.clearSessionIdCopiedTimeout();
+    this.sessionIdCopiedTimeout = setTimeout(() => {
+      this.sessionIdCopied.set(false);
+      this.sessionIdCopiedTimeout = null;
+    }, 1600);
+  }
+
+  toSessionNumber(sessionId: string): string {
+    const [prefix] = sessionId.split('-');
+    return prefix || sessionId;
+  }
+
+  private async copyTextToClipboard(value: string): Promise<boolean> {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+      // Fall back to legacy copy path.
+    }
+
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'absolute';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return copied;
+    } catch {
+      return false;
+    }
+  }
+
+  private clearSessionIdCopiedTimeout(): void {
+    if (!this.sessionIdCopiedTimeout) return;
+    clearTimeout(this.sessionIdCopiedTimeout);
+    this.sessionIdCopiedTimeout = null;
   }
 
   providerIcon(provider: string): string {
