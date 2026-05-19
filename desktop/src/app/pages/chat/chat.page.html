@@ -1,165 +1,114 @@
-<div class="chat-layout" [class.resizing-sidebar]="isResizingSidebar()" (keydown)="onGlobalKeyDown($event)">
-  <!-- Sidebar: Session List -->
-  <aside
-    class="sidebar"
-    [class.collapsed]="!sidebarOpen()"
-    [style.width.px]="sidebarOpen() ? sidebarWidth() : 0"
-    [style.minWidth.px]="sidebarOpen() ? sidebarWidth() : 0"
-  >
-    <div class="sidebar-header">
-      <span class="sidebar-title">Sessions</span>
-      <ion-button fill="clear" size="small" (click)="createNewSession()">
-        <ion-icon name="add-outline"></ion-icon>
-      </ion-button>
-      <ion-button fill="clear" size="small" (click)="sidebarOpen.set(false)">
-        <ion-icon name="chevron-back-outline"></ion-icon>
-      </ion-button>
+<div class="workspace-shell">
+  <header class="workspace-topbar">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">JohnnyOne</span>
     </div>
 
-    <div class="sidebar-search">
-      <input
-        type="text"
-        class="search-input"
-        [(ngModel)]="searchQuery"
-        placeholder="Search sessions..."
-      />
-    </div>
-
-    <johnny-session-list
-      [sessions]="aiSessions()"
-      [activeSessionId]="currentSession()?.id ?? null"
-      [allowRename]="true"
-      (sessionSelected)="onSessionSelected($event)"
-      (sessionArchived)="onSessionArchived($event)"
-      (sessionDeleted)="onSessionDeleted($event)"
-      (sessionRenamed)="onSessionRenamed($event)"
-    />
-  </aside>
-
-  @if (sidebarOpen()) {
-    <div
-      class="sidebar-resizer"
-      role="separator"
-      aria-orientation="vertical"
-      tabindex="0"
-      (mousedown)="startSidebarResize($event)"
-      (dblclick)="resetSidebarWidth()"
-    ></div>
-  }
-
-  <!-- Sidebar toggle when collapsed -->
-  @if (!sidebarOpen()) {
-    <button class="sidebar-toggle" (click)="sidebarOpen.set(true)">
-      <ion-icon name="menu-outline"></ion-icon>
-    </button>
-  }
-
-  <!-- Main Chat Area -->
-  <main class="chat-main">
-    <!-- Chat Header -->
-    <header class="chat-header">
-      <div class="header-left">
-        @if (!sidebarOpen()) {
-          <ion-button fill="clear" size="small" (click)="sidebarOpen.set(true)">
-            <ion-icon name="menu-outline"></ion-icon>
-          </ion-button>
-        }
-        <div class="chat-title-wrap">
-          <h2 class="chat-title">{{ currentSession()?.title || 'JohnnyOne' }}</h2>
-          @if (currentSession()) {
-            <div class="chat-session-meta">
-              <span class="chat-session-number" [title]="currentSession()?.id || ''">
-                Session #{{ sessionNumber() }}
-              </span>
-              <ion-button
-                fill="outline"
-                size="small"
-                class="copy-session-id-button"
-                (click)="copyCurrentSessionId()"
-                [title]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
-                [attr.aria-label]="sessionIdCopied() ? 'Session ID copied' : 'Copy full session ID'"
-              >
-                <ion-icon
-                  slot="start"
-                  class="copy-session-id-icon"
-                  [name]="sessionIdCopied() ? 'checkmark-outline' : 'copy-outline'"
-                ></ion-icon>
-                {{ sessionIdCopied() ? 'Copied' : 'Copy' }}
-              </ion-button>
-            </div>
-          }
-        </div>
-      </div>
-
-      <div class="header-center">
-        <!-- Working Directory Indicator -->
-        @if (currentSession()) {
-          <div class="working-dir" (click)="pickWorkingDirectory()">
-            <ion-icon name="folder-outline" size="small"></ion-icon>
-            <span class="dir-path">{{ workingDirectory() || '~ (click to set)' }}</span>
-          </div>
-        }
-      </div>
-
-      <div class="header-right">
-        <ion-button size="small" class="new-session-top" (click)="createNewSession()">
-          New Session
-        </ion-button>
-
-        <!-- Provider Selector -->
-        <div class="provider-select">
-          <ion-icon [name]="providerIcon(selectedProvider())" size="small"></ion-icon>
-          <select
-            [value]="selectedProvider()"
-            (change)="onProviderChange($any($event.target).value)"
-            class="provider-dropdown"
-          >
-            @for (tool of detectedTools(); track tool.provider) {
-              <option [value]="tool.provider" [disabled]="!tool.found">
-                {{ providerLabel(tool.provider) }}{{ !tool.found ? ' (not found)' : '' }}
-              </option>
-            }
-          </select>
-        </div>
-
-        <ion-button fill="clear" size="small" (click)="navigateTo('/settings')">
-          <ion-icon name="settings-outline"></ion-icon>
-        </ion-button>
-      </div>
-    </header>
-
-    <!-- Shared Chat Thread -->
-    <johnny-chat-window
-      class="chat-thread"
-      [messages]="aiMessages()"
-      [isStreaming]="isStreaming()"
-      [streamingMessageId]="streamingMessageId()"
-      [disabled]="isStreaming()"
-      placeholder="Type a message... (Enter to send)"
-      emptyTitle="Welcome to JohnnyOne"
-      emptyDescription="Create a new session or select one from the sidebar to start chatting."
-      [showEmpty]="!currentSession()"
-      (messageSent)="onMessageSent($event)"
-    >
-      @if (messages().length === 0 && !currentSession()) {
-        <ion-button chat-empty-actions (click)="createNewSession()">New Session</ion-button>
+    <nav class="workspace-tabs" aria-label="Terminal sessions">
+      @for (session of aiSessions(); track session.id) {
+        <button
+          class="workspace-tab"
+          [class.active]="session.id === currentSession()?.id"
+          (click)="onSessionSelected(session.id)"
+          [title]="session.id"
+        >
+          <span class="tab-status" aria-hidden="true"></span>
+          <span>{{ providerLabel(session.provider) }}</span>
+          <span class="tab-number">#{{ toSessionNumber(session.id) }}</span>
+        </button>
       }
+    </nav>
+
+    <div class="workspace-actions">
+      <select
+        [value]="selectedProvider()"
+        (change)="onProviderChange($any($event.target).value)"
+        class="provider-dropdown"
+        aria-label="Provider"
+      >
+        @for (tool of detectedTools(); track tool.provider) {
+          <option [value]="tool.provider" [disabled]="!tool.found">
+            {{ providerLabel(tool.provider) }}{{ !tool.found ? ' (not found)' : '' }}
+          </option>
+        }
+      </select>
+      <button class="primary-action" (click)="createNewSession()">New Terminal</button>
       @if (currentSession()) {
-        <div chat-meta class="usage-bar">
-          <span>{{ formatTokens(sessionTokens().input) }} in</span>
-          <span>{{ formatTokens(sessionTokens().output) }} out</span>
-          @if (sessionTokens().cost > 0) {
-            <span>${{ sessionTokens().cost.toFixed(2) }}</span>
-          }
-        </div>
+        <button class="icon-action" title="Copy session ID" (click)="copyCurrentSessionId()">
+          {{ sessionIdCopied() ? '✓' : '#' }}
+        </button>
       }
-      @if (isStreaming()) {
-        <ion-button chat-actions color="danger" size="small" class="stop-button" (click)="stopGeneration()">
-          <ion-icon name="stop-outline" slot="start"></ion-icon>
-          Stop
-        </ion-button>
-      }
-    </johnny-chat-window>
+      <button class="icon-action" title="Settings" (click)="navigateTo('/settings')">⚙</button>
+    </div>
+  </header>
 
+  <main class="terminal-workspace">
+    @if (visiblePaneSessions().length > 0) {
+      @for (session of visiblePaneSessions(); track session.id; let index = $index) {
+      @let layout = paneLayout(session.id, index);
+      @let screen = terminalScreens()[session.id] || null;
+      <section
+        class="terminal-pane"
+        [class.active]="session.id === currentSession()?.id"
+        [class.dragging]="isDraggingPane()"
+        [class.resizing]="isResizingPane()"
+        [style.left.px]="layout.x"
+        [style.top.px]="layout.y"
+        [style.width.px]="layout.width"
+        [style.height.px]="layout.height"
+        (pointerdown)="onSessionSelected(session.id)"
+      >
+        <header class="pane-header" (pointerdown)="startPaneDrag($event, session.id)">
+          <div class="pane-title">
+            <span class="provider-badge">{{ providerLabel(session.provider) }}</span>
+            <span class="pane-name">{{ session.title || 'Terminal' }}</span>
+            <span class="pane-id">#{{ toSessionNumber(session.id) }}</span>
+          </div>
+          <div class="pane-meta">
+            <button class="pane-tool" title="Working directory" (click)="pickWorkingDirectoryForSession(session.id); $event.stopPropagation()">
+              {{ session.workingDirectory || '~' }}
+            </button>
+            <button class="pane-tool danger" title="Kill terminal" (click)="killTerminal(session.id); $event.stopPropagation()">
+              kill
+            </button>
+            <button class="pane-icon" title="Close terminal widget" (click)="closeTerminalPane(session.id); $event.stopPropagation()">
+              ×
+            </button>
+            <span class="pane-status" [class.offline]="screen?.status !== 'attached'">
+              {{ screen?.status || (session.id === currentSession()?.id ? 'attaching' : 'detached') }}
+            </span>
+          </div>
+        </header>
+
+        <johnny-terminal-screen
+          class="terminal-surface"
+          [screen]="screen"
+          [title]="session.title || 'Terminal'"
+          [disabled]="session.id !== currentSession()?.id"
+          (rawInput)="onTerminalRawInput($event, session.id)"
+          (terminalResize)="onTerminalResize($event, session.id)"
+        />
+
+        <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>
+
+        @if (terminalError() && session.id === currentSession()?.id) {
+          <div class="terminal-error">{{ terminalError() }}</div>
+        }
+      </section>
+      }
+    } @else {
+      <section class="workspace-empty">
+        <div class="empty-title">No terminal attached</div>
+        <div class="empty-copy">Start a tmux-backed terminal using the selected provider.</div>
+        <button class="primary-action" (click)="createNewSession()">New Terminal</button>
+      </section>
+    }
   </main>
+
+  <footer class="workspace-statusbar">
+    <span>relay <strong>connected</strong></span>
+    <span>raw input batched at <strong>200ms</strong></span>
+    <span>drag header · resize corner</span>
+  </footer>
 </div>

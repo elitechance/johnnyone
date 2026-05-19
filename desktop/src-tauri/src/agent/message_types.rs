@@ -55,6 +55,26 @@ pub enum AgentMessage {
     /// Desktop → mobile: a session was deleted on the desktop.
     #[serde(rename = "session_deleted")]
     SessionDeleted(SessionDeleted),
+
+    /// Desktop → remote clients: current tmux-visible terminal screen.
+    #[serde(rename = "terminal_screen")]
+    TerminalScreen(TerminalScreen),
+
+    /// Remote clients → desktop: raw terminal input for a tmux pane.
+    #[serde(rename = "terminal_command")]
+    TerminalCommand(TerminalCommand),
+
+    /// Remote clients → desktop: resize a tmux pane to match the UI terminal.
+    #[serde(rename = "terminal_resize")]
+    TerminalResize(TerminalResize),
+
+    /// Remote clients → desktop: kill a tmux terminal session.
+    #[serde(rename = "terminal_kill")]
+    TerminalKill(TerminalKill),
+
+    /// Desktop → remote clients: terminal command acknowledgement.
+    #[serde(rename = "terminal_command_ack")]
+    TerminalCommandAck(TerminalCommandAck),
 }
 
 // ── Existing Types ───────────────────────────────────────────────────────────
@@ -216,6 +236,60 @@ pub struct RpcResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionDeleted {
     pub session_id: String,
+}
+
+/// Current terminal screen replicated from tmux.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalScreen {
+    pub session_id: String,
+    pub pane_id: String,
+    pub cursor: i64,
+    pub content: String,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub history_lines: u16,
+    pub rows: u16,
+    pub cols: u16,
+    pub status: String,
+}
+
+/// Raw terminal input request from a remote UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCommand {
+    pub request_id: String,
+    pub session_id: String,
+    pub data: String,
+}
+
+/// Resize request from a remote UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResize {
+    pub request_id: String,
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Kill request from a remote UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalKill {
+    pub request_id: String,
+    pub session_id: String,
+}
+
+/// Acknowledgement for a raw terminal input request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCommandAck {
+    pub request_id: String,
+    pub session_id: String,
+    pub accepted: bool,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Session view for RPC responses (camelCase for GraphQL compatibility).

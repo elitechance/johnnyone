@@ -93,19 +93,20 @@
     </div>
   }
 
-  <!-- Chat View -->
+  <!-- Terminal View -->
   @if (view() === 'chat') {
-    <johnny-chat-window
-      class="chat-thread"
-      [messages]="aiMessages()"
-      [isStreaming]="isStreaming()"
-      [disabled]="!desktopOnline() || isStreaming()"
-      placeholder="Type a message..."
-      emptyTitle="New Chat"
-      emptyDescription="Send a message to your desktop agent."
-      [emptyHint]="desktopOnline() ? '' : 'Start the desktop app to connect.'"
-      [showEmpty]="!loading()"
-      (messageSent)="onMessageSent($event)"
-    />
+    <section class="terminal-view">
+      <johnny-terminal-screen
+        class="terminal-surface"
+        [screen]="terminalScreen()"
+        [title]="activeSession()?.title || 'Terminal'"
+        [disabled]="!desktopOnline()"
+        (rawInput)="onTerminalRawInput($event)"
+        (terminalResize)="onTerminalResize($event)"
+      />
+      @if (terminalError()) {
+        <div class="terminal-error">{{ terminalError() }}</div>
+      }
+    </section>
   }
 </ion-content>

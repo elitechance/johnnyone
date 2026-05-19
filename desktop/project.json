@@ -22,6 +22,9 @@
     "e2e-web": {
       "command": "node desktop/e2e/desktop-web.e2e.cjs"
     },
+    "e2e-terminal-workspace": {
+      "command": "node desktop/e2e/terminal-workspace.e2e.cjs"
+    },
     "tauri-dev": {
       "command": "cd desktop/src-tauri && cargo tauri dev"
     },

@@ -1,12 +1,13 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
+import { desktopRpc } from '../../lib/runtime/desktop-rpc';
 
 interface ResolverContext {
+  db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
 }
 
 interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
+  CHAT_RELAY_DO: DurableObjectNamespace;
   [key: string]: unknown;
 }
 
@@ -15,28 +16,9 @@ export default async function listAiMessages(
   args: { sessionId: string; limit?: number; offset?: number },
   ctx: ResolverContext,
 ) {
-  const result = await hostGraphqlRequest<{ listAiMessages: unknown[] }>(
-    ctx.env,
-    `query ListAiMessages($sessionId: String!, $limit: Int, $offset: Int) {
-      listAiMessages(sessionId: $sessionId, limit: $limit, offset: $offset) {
-        id
-        sessionId
-        role
-        content
-        toolCalls
-        finishReason
-        inputTokens
-        outputTokens
-        costCents
-        createdAt
-      }
-    }`,
-    {
-      sessionId: args.sessionId,
-      limit: args.limit ?? 100,
-      offset: args.offset ?? 0,
-    },
-  );
-
-  return result.listAiMessages;
+  return desktopRpc<unknown[]>(ctx, 'list_messages', {
+    sessionId: args.sessionId,
+    limit: args.limit ?? 100,
+    offset: args.offset ?? 0,
+  });
 }

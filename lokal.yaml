@@ -73,6 +73,9 @@ local:
       command: cargo run --bin johnnyone-host
       env:
         JOHNNYONE_HOST_ADDR: 127.0.0.1:7788
+        JOHNNYONE_WORKER_URL: http://127.0.0.1:7714
+        JOHNNYONE_TENANT_ID: 00000000-0000-0000-0000-000000000001
+        JOHNNYONE_USER_ID: 00000000-0000-0000-0000-000000000002
       ready:
         type: graphql
         url: http://127.0.0.1:7788/graphql

@@ -34,7 +34,16 @@ function getStoredSetting(key: string, fallback: string): string {
 }
 
 function getWorkerBaseUrl(): string {
-  return getStoredSetting('johnnyone_worker_url', 'http://127.0.0.1:7714');
+  const localFallback = 'http://127.0.0.1:7714';
+  let fallback = localFallback;
+
+  if (typeof window !== 'undefined' && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+    fallback = window.location.hostname.endsWith('.pages.dev')
+      ? 'https://johnnyone-dev-johnnyone-hub.cf-static-5f5.workers.dev'
+      : window.location.origin;
+  }
+
+  return getStoredSetting('johnnyone_worker_url', fallback);
 }
 
 function getWorkerGraphqlUrl(): string {

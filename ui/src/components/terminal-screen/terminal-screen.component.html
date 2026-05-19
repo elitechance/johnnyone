@@ -1,0 +1,14 @@
+<section class="terminal-shell">
+  <header class="terminal-toolbar">
+    <div class="terminal-title">{{ title }}</div>
+    <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
+      {{ screen?.status || 'detached' }}
+    </div>
+  </header>
+  <div #terminalHost class="terminal-host" [class.disabled]="disabled"></div>
+  <div class="terminal-local-input" [class.visible]="showLocalPrompt" aria-live="polite">
+    <span class="terminal-local-prompt">&gt;</span>
+    <span class="terminal-local-buffer">{{ localInputBuffer }}</span>
+    <span class="terminal-local-cursor" aria-hidden="true"></span>
+  </div>
+</section>

@@ -51,6 +51,10 @@ fn main() {
             commands::chat::send_chat_message,
             commands::chat::stop_generation,
             commands::chat::list_messages,
+            // Terminal
+            commands::terminal::attach_terminal_session,
+            commands::terminal::send_terminal_input,
+            commands::terminal::resize_terminal,
             // Clipboard
             commands::clipboard::read_clipboard_image_data_url,
             // Providers

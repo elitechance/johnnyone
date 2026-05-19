@@ -8,23 +8,17 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import {
-  IonButton,
-  IonIcon,
-} from '@ionic/angular/standalone';
 import { ActivatedRoute, Router } from '@angular/router';
-import {
-  TauriBridgeService,
-} from '../../services/tauri-bridge.service';
+import { RelayTerminalService } from '../../services/relay-terminal.service';
 import {
   JohnnyApiService,
-  SessionListComponent,
-  ChatWindowComponent,
+  TerminalScreenComponent,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
   AiChatComplete,
   DetectedCliTool,
+  TerminalScreen,
 } from '@johnnyone/ui';
 import { firstValueFrom, Subscription } from 'rxjs';
 
@@ -57,16 +51,20 @@ interface Message {
 
 interface DetectedTool extends DetectedCliTool {}
 
+interface PaneLayout {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 @Component({
   selector: 'app-chat',
   standalone: true,
   imports: [
     CommonModule,
     FormsModule,
-    IonButton,
-    IonIcon,
-    SessionListComponent,
-    ChatWindowComponent,
+    TerminalScreenComponent,
   ],
   templateUrl: './chat.page.html',
   styleUrls: ['./chat.page.scss'],
@@ -77,17 +75,22 @@ export class ChatPage implements OnInit, OnDestroy {
   private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
   private readonly api = inject(JohnnyApiService);
   private readonly route = inject(ActivatedRoute);
-  private readonly tauriBridge = inject(TauriBridgeService);
+  private readonly relayTerminal = inject(RelayTerminalService);
   private readonly router = inject(Router);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
   private readonly defaultSidebarWidth = 360;
   private resizeMoveHandler: ((event: MouseEvent) => void) | null = null;
   private resizeUpHandler: (() => void) | null = null;
+  private paneMoveHandler: ((event: PointerEvent) => void) | null = null;
+  private paneUpHandler: (() => void) | null = null;
+  private paneInteractionStart = { x: 0, y: 0, left: 0, top: 0, width: 0, height: 0 };
   private streamingStatusInterval: ReturnType<typeof setInterval> | null = null;
   private sessionIdCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
+  private terminalSubscription: Subscription | null = null;
+  private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // State
   sessions = signal<Session[]>([]);
@@ -102,12 +105,23 @@ export class ChatPage implements OnInit, OnDestroy {
   currentMessage = '';
   searchQuery = '';
   detectedTools = signal<DetectedTool[]>([]);
-  selectedProvider = signal('claude_code');
+  selectedProvider = signal('ollama');
   workingDirectory = signal('');
   sidebarOpen = signal(true);
   sidebarWidth = signal(this.defaultSidebarWidth);
   isResizingSidebar = signal(false);
   sessionIdCopied = signal(false);
+  terminalScreen = signal<TerminalScreen | null>(null);
+  terminalScreens = signal<Record<string, TerminalScreen>>({});
+  terminalError = signal<string | null>(null);
+  paneLayouts = signal<Record<string, PaneLayout>>({});
+  closedPaneIds = signal<Set<string>>(new Set());
+  paneX = signal(44);
+  paneY = signal(34);
+  paneWidth = signal(860);
+  paneHeight = signal(560);
+  isDraggingPane = signal(false);
+  isResizingPane = signal(false);
 
   // Computed
   filteredSessions = computed(() => {
@@ -118,7 +132,13 @@ export class ChatPage implements OnInit, OnDestroy {
   });
 
   aiSessions = computed<SharedAiSession[]>(() =>
-    this.filteredSessions().map(s => this.mapSession(s))
+    this.filteredSessions()
+      .filter((session) => !this.closedPaneIds().has(session.id))
+      .map(s => this.mapSession(s))
+  );
+
+  visiblePaneSessions = computed<SharedAiSession[]>(() =>
+    this.aiSessions()
   );
 
   aiMessages = computed<SharedAiMessage[]>(() => {
@@ -198,9 +218,11 @@ export class ChatPage implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.teardownChatSubscriptions();
+    this.teardownTerminalSubscription();
     this.clearSessionIdCopiedTimeout();
     this.resetStreamingStatus();
     this.stopSidebarResize();
+    this.stopPaneInteraction();
   }
 
   // ── Type Mappers ───────────────────────────────────────────────────
@@ -271,9 +293,12 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async loadSessions(targetSessionId?: string): Promise<void> {
     try {
-      const sessions = (await firstValueFrom(this.api.listSessions('active')))
-        .map((session) => this.mapApiSessionToState(session));
-      this.sessions.set(this.sortSessions(sessions));
+      const sessions = (await firstValueFrom(this.api.listSessions('active'))).map((session) =>
+        this.mapApiSessionToState(session)
+      );
+      const sortedSessions = this.sortSessions(sessions);
+      this.sessions.set(sortedSessions);
+      this.ensurePaneLayouts(sortedSessions);
 
       const current = this.currentSession();
       if (targetSessionId) {
@@ -307,6 +332,7 @@ export class ChatPage implements OnInit, OnDestroy {
     try {
       const session = this.mapApiSessionToState(await firstValueFrom(this.api.createSession({
         provider: this.selectedProvider(),
+        model: this.selectedProvider() === 'ollama' ? 'qwen3.5:2b' : undefined,
         workingDirectory: this.workingDirectory(),
       })));
       this.upsertSession(session);
@@ -318,18 +344,20 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async selectSession(id: string): Promise<void> {
     try {
-      const [session, messages] = await Promise.all([
+      const [apiSession, apiMessages] = await Promise.all([
         firstValueFrom(this.api.getSession(id)),
         firstValueFrom(this.api.listMessages(id)),
       ]);
+      const session = this.mapApiSessionToState(apiSession);
+      const messages = apiMessages.map((message) => this.mapApiMessageToState(message));
 
-      const mappedSession = this.mapApiSessionToState(session);
-      this.upsertSession(mappedSession);
-      this.currentSession.set(mappedSession);
-      this.selectedProvider.set(mappedSession.provider);
-      this.workingDirectory.set(mappedSession.working_directory);
-      this.messages.set(messages.map((message) => this.mapApiMessageToState(message)));
-      this.subscribeToSessionEvents(id);
+      this.upsertSession(session);
+      this.currentSession.set(session);
+      this.selectedProvider.set(session.provider);
+      this.workingDirectory.set(session.working_directory);
+      this.messages.set(messages);
+      this.subscribeToTerminalEvents();
+      await this.attachTerminal(id);
 
       this.isStreaming.set(false);
       this.streamingContent.set('');
@@ -346,8 +374,12 @@ export class ChatPage implements OnInit, OnDestroy {
       this.sessions.update(s => s.filter(sess => sess.id !== id));
       if (this.currentSession()?.id === id) {
         this.teardownChatSubscriptions();
+        this.teardownTerminalSubscription();
         this.currentSession.set(null);
         this.messages.set([]);
+        this.terminalScreen.set(null);
+        this.terminalScreens.update((screens) => this.omitRecordKey(screens, id));
+        this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, id));
       }
     } catch (err) {
       console.error('Failed to archive session:', err);
@@ -370,8 +402,12 @@ export class ChatPage implements OnInit, OnDestroy {
       this.sessions.update(s => s.filter(sess => sess.id !== id));
       if (this.currentSession()?.id === id) {
         this.teardownChatSubscriptions();
+        this.teardownTerminalSubscription();
         this.currentSession.set(null);
         this.messages.set([]);
+        this.terminalScreen.set(null);
+        this.terminalScreens.update((screens) => this.omitRecordKey(screens, id));
+        this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, id));
       }
     } catch (err) {
       console.error('Failed to delete session:', err);
@@ -444,17 +480,7 @@ export class ChatPage implements OnInit, OnDestroy {
     this.messages.update((msgs) => [...msgs, optimisticUserMessage]);
 
     try {
-      const result = await firstValueFrom(this.api.sendAiChatMessage({
-        sessionId: session.id,
-        content: text,
-      }));
-      const userMessage = this.mapApiMessageToState(result.userMessage);
-      const assistantMessage = this.mapApiMessageToState(result.assistantMessage);
-
-      this.messages.update((msgs) => {
-        const withoutOptimistic = msgs.filter((msg) => msg.id !== optimisticUserMessage.id);
-        return this.upsertMessage(this.upsertMessage(withoutOptimistic, userMessage), assistantMessage);
-      });
+      await this.relayTerminal.sendInput(session.id, `${text}\r`);
       this.finishStreamingState();
       await this.refreshSession(session.id);
       await this.autoTitleIfNeeded();
@@ -470,7 +496,7 @@ export class ChatPage implements OnInit, OnDestroy {
     const session = this.currentSession();
     if (!session) return;
     try {
-      await firstValueFrom(this.api.stopAiGeneration(session.id));
+      await this.relayTerminal.sendInput(session.id, '\u0003');
       this.isStreaming.set(false);
       this.streamingMessageId.set(null);
       this.resetStreamingStatus();
@@ -504,6 +530,142 @@ export class ChatPage implements OnInit, OnDestroy {
       },
       error: (err) => console.error('Failed to subscribe to ai chat completion:', err),
     });
+  }
+
+  private subscribeToTerminalEvents(): void {
+    if (this.terminalSubscription) return;
+    this.terminalSubscription = this.relayTerminal.screens().subscribe({
+      next: (screen) => {
+        this.terminalScreens.update((screens) => ({ ...screens, [screen.sessionId]: screen }));
+        if (screen.sessionId === this.currentSession()?.id) {
+          this.terminalScreen.set(screen);
+          this.terminalError.set(null);
+        }
+      },
+      error: (err) => {
+        console.error('Failed to subscribe to terminal screen:', err);
+        this.terminalError.set(String(err));
+      },
+    });
+  }
+
+  private teardownTerminalSubscription(): void {
+    this.terminalSubscription?.unsubscribe();
+    this.terminalSubscription = null;
+    if (this.resizeTerminalTimeout) {
+      clearTimeout(this.resizeTerminalTimeout);
+      this.resizeTerminalTimeout = null;
+    }
+  }
+
+  async attachTerminal(sessionId: string): Promise<void> {
+    try {
+      await this.relayTerminal.attach(sessionId);
+      this.terminalError.set(null);
+    } catch (err) {
+      console.error('Failed to attach terminal:', err);
+      this.terminalError.set(String(err));
+    }
+  }
+
+  async onTerminalRawInput(data: string, sessionId = this.currentSession()?.id): Promise<void> {
+    const session = this.sessions().find((item) => item.id === sessionId);
+    if (!session) return;
+    try {
+      if (this.currentSession()?.id !== session.id) {
+        await this.selectSession(session.id);
+      }
+      await this.relayTerminal.sendInput(session.id, data);
+    } catch (err) {
+      console.error('Failed to send terminal input:', err);
+      this.terminalError.set(String(err));
+    }
+  }
+
+  onTerminalResize(size: { cols: number; rows: number }, sessionId = this.currentSession()?.id): void {
+    const session = this.sessions().find((item) => item.id === sessionId);
+    if (!session) return;
+    if (this.resizeTerminalTimeout) clearTimeout(this.resizeTerminalTimeout);
+    this.resizeTerminalTimeout = setTimeout(() => {
+      this.relayTerminal.resize(session.id, size.cols, size.rows).catch((err) => {
+        console.error('Failed to resize terminal:', err);
+      });
+    }, 180);
+  }
+
+  startPaneDrag(event: PointerEvent, sessionId = this.currentSession()?.id): void {
+    const layout = sessionId ? this.paneLayout(sessionId) : null;
+    if (!sessionId || !layout) return;
+    if ((event.target as HTMLElement).closest('button, select, input')) return;
+
+    event.preventDefault();
+    this.stopPaneInteraction();
+    this.paneInteractionStart = {
+      x: event.clientX,
+      y: event.clientY,
+      left: layout.x,
+      top: layout.y,
+      width: layout.width,
+      height: layout.height,
+    };
+    this.isDraggingPane.set(true);
+
+    this.paneMoveHandler = (moveEvent) => {
+      const maxLeft = Math.max(12, window.innerWidth - 180);
+      const maxTop = Math.max(12, window.innerHeight - 120);
+      this.updatePaneLayout(sessionId, {
+        x: this.clamp(this.paneInteractionStart.left + moveEvent.clientX - this.paneInteractionStart.x, 12, maxLeft),
+        y: this.clamp(this.paneInteractionStart.top + moveEvent.clientY - this.paneInteractionStart.y, 12, maxTop),
+      });
+    };
+    this.paneUpHandler = () => this.stopPaneInteraction();
+
+    window.addEventListener('pointermove', this.paneMoveHandler);
+    window.addEventListener('pointerup', this.paneUpHandler, { once: true });
+  }
+
+  startPaneResize(event: PointerEvent, sessionId = this.currentSession()?.id): void {
+    const layout = sessionId ? this.paneLayout(sessionId) : null;
+    if (!sessionId || !layout) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.stopPaneInteraction();
+    this.paneInteractionStart = {
+      x: event.clientX,
+      y: event.clientY,
+      left: layout.x,
+      top: layout.y,
+      width: layout.width,
+      height: layout.height,
+    };
+    this.isResizingPane.set(true);
+
+    this.paneMoveHandler = (moveEvent) => {
+      const currentLayout = this.paneLayout(sessionId);
+      const maxWidth = Math.max(420, window.innerWidth - currentLayout.x - 18);
+      const maxHeight = Math.max(260, window.innerHeight - currentLayout.y - 78);
+      this.updatePaneLayout(sessionId, {
+        width: this.clamp(this.paneInteractionStart.width + moveEvent.clientX - this.paneInteractionStart.x, 420, maxWidth),
+        height: this.clamp(this.paneInteractionStart.height + moveEvent.clientY - this.paneInteractionStart.y, 260, maxHeight),
+      });
+    };
+    this.paneUpHandler = () => this.stopPaneInteraction();
+
+    window.addEventListener('pointermove', this.paneMoveHandler);
+    window.addEventListener('pointerup', this.paneUpHandler, { once: true });
+  }
+
+  private stopPaneInteraction(): void {
+    if (this.paneMoveHandler) {
+      window.removeEventListener('pointermove', this.paneMoveHandler);
+      this.paneMoveHandler = null;
+    }
+    if (this.paneUpHandler) {
+      window.removeEventListener('pointerup', this.paneUpHandler);
+      this.paneUpHandler = null;
+    }
+    this.isDraggingPane.set(false);
+    this.isResizingPane.set(false);
   }
 
   private teardownChatSubscriptions(): void {
@@ -607,6 +769,11 @@ export class ChatPage implements OnInit, OnDestroy {
     try {
       const tools = await firstValueFrom(this.api.detectCliTools());
       this.detectedTools.set(tools);
+      if (!tools.some((tool) => tool.provider === this.selectedProvider() && tool.found)) {
+        const preferred = tools.find((tool) => tool.provider === 'ollama' && tool.found)
+          ?? tools.find((tool) => tool.found);
+        if (preferred) this.selectedProvider.set(preferred.provider);
+      }
     } catch (err) {
       console.error('Failed to detect tools:', err);
     }
@@ -642,8 +809,6 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async onWorkingDirectoryChange(dir: string): Promise<void> {
     this.workingDirectory.set(dir);
-    await firstValueFrom(this.api.setSetting('last_working_directory', dir));
-
     const session = this.currentSession();
     if (session) {
       const updated = this.mapApiSessionToState(
@@ -655,9 +820,61 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   async pickWorkingDirectory(): Promise<void> {
-    const dir = await this.tauriBridge.pickDirectory();
+    const dir = window.prompt('Working directory', this.workingDirectory());
     if (dir) {
       await this.onWorkingDirectoryChange(dir);
+    }
+  }
+
+  async pickWorkingDirectoryForSession(sessionId: string): Promise<void> {
+    if (this.currentSession()?.id !== sessionId) {
+      await this.selectSession(sessionId);
+    }
+    await this.pickWorkingDirectory();
+  }
+
+  async killTerminal(sessionId: string): Promise<void> {
+    await this.closeTerminalPane(sessionId, true);
+  }
+
+  async closeTerminalPane(sessionId: string, killTerminal = true): Promise<void> {
+    const wasCurrentSession = this.currentSession()?.id === sessionId;
+
+    try {
+      if (killTerminal) {
+        await this.relayTerminal.kill(sessionId);
+      }
+    } catch (err) {
+      console.error('Failed to kill terminal:', err);
+      this.terminalError.set(`Failed to kill terminal: ${String(err)}`);
+    }
+
+    try {
+      await firstValueFrom(this.api.archiveSession(sessionId));
+    } catch (err) {
+      console.error('Failed to archive closed terminal session:', err);
+      this.terminalError.set(`Failed to close terminal: ${String(err)}`);
+      return;
+    }
+
+    const nextClosed = new Set(this.closedPaneIds());
+    nextClosed.add(sessionId);
+    this.closedPaneIds.set(nextClosed);
+    this.sessions.update((sessions) => sessions.filter((session) => session.id !== sessionId));
+    this.terminalScreens.update((screens) => this.omitRecordKey(screens, sessionId));
+    this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, sessionId));
+
+    if (!wasCurrentSession) return;
+
+    this.terminalScreen.set(null);
+    const nextSession = this.sessions().find((session) => !nextClosed.has(session.id));
+    if (nextSession) {
+      await this.selectSession(nextSession.id);
+    } else {
+      this.teardownChatSubscriptions();
+      this.teardownTerminalSubscription();
+      this.currentSession.set(null);
+      this.messages.set([]);
     }
   }
 
@@ -735,6 +952,52 @@ export class ChatPage implements OnInit, OnDestroy {
     return Math.min(this.maxSidebarWidth, Math.max(this.minSidebarWidth, width));
   }
 
+  private clamp(value: number, min: number, max: number): number {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  paneLayout(sessionId: string, index = 0): PaneLayout {
+    return this.paneLayouts()[sessionId] ?? this.defaultPaneLayout(index);
+  }
+
+  private ensurePaneLayouts(sessions: Session[]): void {
+    this.paneLayouts.update((layouts) => {
+      let changed = false;
+      const next = { ...layouts };
+      sessions.forEach((session, index) => {
+        if (!next[session.id]) {
+          next[session.id] = this.defaultPaneLayout(index);
+          changed = true;
+        }
+      });
+      return changed ? next : layouts;
+    });
+  }
+
+  private updatePaneLayout(sessionId: string, patch: Partial<PaneLayout>): void {
+    this.paneLayouts.update((layouts) => {
+      const current = layouts[sessionId] ?? this.defaultPaneLayout(0);
+      return {
+        ...layouts,
+        [sessionId]: { ...current, ...patch },
+      };
+    });
+  }
+
+  private defaultPaneLayout(index: number): PaneLayout {
+    return {
+      x: 44 + index * 36,
+      y: 34 + index * 30,
+      width: 860,
+      height: 560,
+    };
+  }
+
+  private omitRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+    const { [key]: _ignored, ...rest } = record;
+    return rest;
+  }
+
   private beginStreamingStatus(): void {
     this.streamStartedAt.set(Date.now());
     this.lastStreamActivityAt.set(null);
@@ -776,6 +1039,7 @@ export class ChatPage implements OnInit, OnDestroy {
         ...sessions.filter((existing) => existing.id !== session.id),
       ])
     );
+    this.ensurePaneLayouts([session]);
   }
 
   private upsertMessage(messages: Message[], message: Message): Message[] {

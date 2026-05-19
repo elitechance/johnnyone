@@ -5,6 +5,7 @@ pub mod events;
 pub mod host;
 pub mod paths;
 pub mod providers;
+pub mod terminal;
 pub mod services;
 pub mod simulator;
 pub mod state;

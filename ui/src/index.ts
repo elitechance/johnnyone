@@ -49,3 +49,5 @@ export { SessionListComponent } from './components/session-list/session-list.com
 export { ProviderSelectorComponent } from './components/provider-selector/provider-selector.component';
 export { NodeStatusComponent } from './components/node-status/node-status.component';
 export { StreamingTextComponent } from './components/streaming-text/streaming-text.component';
+export { TerminalScreenComponent } from './components/terminal-screen/terminal-screen.component';
+export type { TerminalScreen } from './models/terminal.model';

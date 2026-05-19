@@ -25,8 +25,9 @@ import {
   JohnnyApiService,
   AiSession,
   AiMessage,
-  ChatWindowComponent,
   SessionListComponent,
+  TerminalScreenComponent,
+  TerminalScreen,
 } from '@johnnyone/ui';
 
 interface RelayMessage {
@@ -47,6 +48,14 @@ interface RelayEnvelope {
     role?: string;
     content?: string;
     messageId?: string;
+    paneId?: string;
+    cursor?: number;
+    rows?: number;
+    cols?: number;
+    status?: string;
+    requestId?: string;
+    accepted?: boolean;
+    error?: string;
   };
 }
 
@@ -67,7 +76,7 @@ interface RelayEnvelope {
     IonLabel,
     IonRefresher,
     IonRefresherContent,
-    ChatWindowComponent,
+    TerminalScreenComponent,
     SessionListComponent,
   ],
   templateUrl: './chat.page.html',
@@ -88,6 +97,7 @@ export class ChatPage implements OnInit, OnDestroy {
 
   sessions = signal<AiSession[]>([]);
   activeSession = signal<AiSession | null>(null);
+  activeTerminalSessionId = signal<string | null>(null);
   messages = signal<RelayMessage[]>([]);
   isStreaming = signal(false);
   streamingContent = signal('');
@@ -96,6 +106,8 @@ export class ChatPage implements OnInit, OnDestroy {
   currentRelayId = signal<string | null>(null);
   loading = signal(false);
   sessionIdCopied = signal(false);
+  terminalScreen = signal<TerminalScreen | null>(null);
+  terminalError = signal<string | null>(null);
 
   aiMessages = computed<AiMessage[]>(() => {
     const msgs = this.messages().map(m => this.mapRelayMessage(m));
@@ -293,6 +305,28 @@ export class ChatPage implements OnInit, OnDestroy {
         }
         break;
       }
+
+      case 'terminal_screen': {
+        if (!data.sessionId || data.sessionId !== this.activeTerminalSessionId()) return;
+        this.terminalScreen.set({
+          sessionId: data.sessionId,
+          paneId: data.paneId || '',
+          cursor: data.cursor || 0,
+          content: data.content || '',
+          rows: data.rows || 30,
+          cols: data.cols || 100,
+          status: data.status || 'attached',
+        });
+        this.terminalError.set(null);
+        break;
+      }
+
+      case 'terminal_command_ack': {
+        if (data.accepted === false) {
+          this.terminalError.set(data.error || 'Terminal input was rejected.');
+        }
+        break;
+      }
     }
   }
 
@@ -344,10 +378,12 @@ export class ChatPage implements OnInit, OnDestroy {
 
   selectSession(session: AiSession): void {
     this.activeSession.set(session);
+    this.activeTerminalSessionId.set(session.id);
     this.setStoredActiveSessionId(session.id);
     this.preferNewSession = false;
     this.view.set('chat');
     this.messages.set([]);
+    this.terminalScreen.set(null);
     this.loading.set(true);
 
     this.api.listMessages(session.id).subscribe({
@@ -373,7 +409,9 @@ export class ChatPage implements OnInit, OnDestroy {
   backToSessions(): void {
     this.view.set('sessions');
     this.activeSession.set(null);
+    this.activeTerminalSessionId.set(null);
     this.messages.set([]);
+    this.terminalScreen.set(null);
     this.loadSessions();
   }
 
@@ -381,10 +419,39 @@ export class ChatPage implements OnInit, OnDestroy {
     const sessionId = crypto.randomUUID();
     localStorage.setItem('johnnyone_mobile_session', sessionId);
     this.activeSession.set(null);
+    this.activeTerminalSessionId.set(sessionId);
     this.setStoredActiveSessionId(null);
     this.preferNewSession = true;
     this.messages.set([]);
+    this.terminalScreen.set(null);
     this.view.set('chat');
+  }
+
+  onTerminalRawInput(data: string): void {
+    let sessionId = this.activeSession()?.id;
+    if (!sessionId) {
+      sessionId = this.getOrCreateSessionId();
+    }
+    this.activeTerminalSessionId.set(sessionId);
+
+    if (!this.relayWs || this.relayWs.readyState !== WebSocket.OPEN) {
+      this.terminalError.set('Desktop relay is not connected.');
+      return;
+    }
+
+    this.relayWs.send(JSON.stringify({
+      type: 'terminal_command',
+      data: {
+        requestId: crypto.randomUUID(),
+        sessionId,
+        data,
+      },
+    }));
+  }
+
+  onTerminalResize(_size: { cols: number; rows: number }): void {
+    // The desktop host owns pane sizing today. The shared component emits this
+    // for desktop/web parity; remote resize can be wired when needed.
   }
 
   onRefresh(event: CustomEvent): void {

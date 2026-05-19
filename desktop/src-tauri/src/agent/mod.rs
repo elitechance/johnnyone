@@ -7,12 +7,14 @@ pub mod ws_client;
 use crate::providers::{
     claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
+use crate::services::{providers as provider_service, sessions as session_service};
 use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use message_types::{
     AgentEnvelope, AgentMessage, RelayChatComplete, RelayChatDelta, RelayChatRequest,
-    RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted,
+    RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted, TerminalCommandAck,
+    TerminalScreen,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -167,6 +169,7 @@ impl AgentService {
     ) -> Result<(), String> {
         let mut shutdown_rx = state.shutdown_tx.subscribe();
         let mut session_deleted_rx = state.session_deleted_tx.subscribe();
+        let mut terminal_screen_rx = state.terminal_screen_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -212,6 +215,28 @@ impl AgentService {
                             tokio_tungstenite::tungstenite::Message::Text(json.into())
                         ).await;
                         tracing::info!(session_id = %session_id, "Broadcast session_deleted to relay");
+                    }
+                }
+                Ok(screen) = terminal_screen_rx.recv() => {
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::TerminalScreen(TerminalScreen {
+                            session_id: screen.session_id,
+                            pane_id: screen.pane_id,
+                            cursor: screen.cursor,
+                            content: screen.content,
+                            cursor_x: screen.cursor_x,
+                            cursor_y: screen.cursor_y,
+                            history_lines: screen.history_lines,
+                            rows: screen.rows,
+                            cols: screen.cols,
+                            status: screen.status,
+                        }),
+                    };
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        let mut writer = ws_write.lock().await;
+                        let _ = writer.send(
+                            tokio_tungstenite::tungstenite::Message::Text(json.into())
+                        ).await;
                     }
                 }
                 _ = shutdown_rx.recv() => {
@@ -323,6 +348,86 @@ impl AgentService {
                     }
                 });
             }
+            AgentMessage::TerminalCommand(command) => {
+                let ws = Arc::clone(ws_write);
+                let st = Arc::clone(state);
+                tokio::spawn(async move {
+                    let result = crate::terminal::send_terminal_input(
+                        &st,
+                        command.session_id.clone(),
+                        command.data,
+                    )
+                    .await;
+
+                    let ack = TerminalCommandAck {
+                        request_id: command.request_id,
+                        session_id: command.session_id,
+                        accepted: result.is_ok(),
+                        error: result.err(),
+                    };
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::TerminalCommandAck(ack),
+                    };
+                    if let Ok(msg) = serde_json::to_string(&envelope) {
+                        let mut writer = ws.lock().await;
+                        let _ = writer
+                            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                            .await;
+                    }
+                });
+            }
+            AgentMessage::TerminalResize(resize) => {
+                let ws = Arc::clone(ws_write);
+                let st = Arc::clone(state);
+                tokio::spawn(async move {
+                    let result = crate::terminal::resize_terminal(
+                        &st,
+                        resize.session_id.clone(),
+                        resize.cols,
+                        resize.rows,
+                    )
+                    .await;
+
+                    let ack = TerminalCommandAck {
+                        request_id: resize.request_id,
+                        session_id: resize.session_id,
+                        accepted: result.is_ok(),
+                        error: result.err(),
+                    };
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::TerminalCommandAck(ack),
+                    };
+                    if let Ok(msg) = serde_json::to_string(&envelope) {
+                        let mut writer = ws.lock().await;
+                        let _ = writer
+                            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                            .await;
+                    }
+                });
+            }
+            AgentMessage::TerminalKill(kill) => {
+                let ws = Arc::clone(ws_write);
+                let st = Arc::clone(state);
+                tokio::spawn(async move {
+                    let result = crate::terminal::kill_terminal_session(&st, &kill.session_id).await;
+
+                    let ack = TerminalCommandAck {
+                        request_id: kill.request_id,
+                        session_id: kill.session_id,
+                        accepted: result.is_ok(),
+                        error: result.err(),
+                    };
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::TerminalCommandAck(ack),
+                    };
+                    if let Ok(msg) = serde_json::to_string(&envelope) {
+                        let mut writer = ws.lock().await;
+                        let _ = writer
+                            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                            .await;
+                    }
+                });
+            }
             AgentMessage::Heartbeat(hb) => {
                 tracing::debug!(ts = %hb.timestamp, "Received heartbeat ack");
                 let mut status = state.connection_status.lock().await;
@@ -349,9 +454,17 @@ impl AgentService {
     async fn handle_rpc(req: &RpcRequest, state: &Arc<AppState>) -> RpcResponse {
         let result = match req.method.as_str() {
             "list_sessions" => Self::rpc_list_sessions(&req.params, state),
+            "create_session" => Self::rpc_create_session(&req.params, state),
             "get_session" => Self::rpc_get_session(&req.params, state),
+            "update_session_title" => Self::rpc_update_session_title(&req.params, state),
+            "update_session_provider" => Self::rpc_update_session_provider(&req.params, state),
+            "update_session_working_directory" => {
+                Self::rpc_update_session_working_directory(&req.params, state)
+            }
+            "archive_session" => Self::rpc_archive_session(&req.params, state).await,
             "list_messages" => Self::rpc_list_messages(&req.params, state),
             "delete_session" => Self::rpc_delete_session(&req.params, state).await,
+            "detect_cli_tools" => Self::rpc_detect_cli_tools(state).await,
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };
 
@@ -375,44 +488,31 @@ impl AgentService {
         params: &serde_json::Value,
         state: &Arc<AppState>,
     ) -> Result<serde_json::Value, String> {
-        let status = params.get("status").and_then(|v| v.as_str());
+        let status = params
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let sessions = session_service::list_sessions(state, status)?
+            .into_iter()
+            .map(Self::session_view)
+            .collect::<Vec<_>>();
 
-        state.db.with_conn(|conn| {
-            let (sql, param_value);
-            let query_params: Vec<&dyn rusqlite::ToSql>;
+        serde_json::to_value(&sessions).map_err(|e| e.to_string())
+    }
 
-            if let Some(s) = status {
-                sql = "SELECT id, title, provider, model, working_directory, status, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions WHERE status = ?1 ORDER BY updated_at DESC";
-                param_value = s.to_string();
-                query_params = vec![&param_value as &dyn rusqlite::ToSql];
-            } else {
-                sql = "SELECT id, title, provider, model, working_directory, status, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions ORDER BY updated_at DESC";
-                query_params = vec![];
-            }
+    fn rpc_create_session(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let input_value = params
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let input: crate::db::models::CreateSessionInput =
+            serde_json::from_value(input_value).map_err(|e| e.to_string())?;
+        let session = session_service::create_session(state, input)?;
 
-            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-            let sessions: Vec<RpcSessionView> = stmt
-                .query_map(query_params.as_slice(), |row| {
-                    Ok(RpcSessionView {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        provider: row.get(2)?,
-                        model: row.get(3)?,
-                        working_directory: row.get(4)?,
-                        status: row.get(5)?,
-                        total_input_tokens: row.get(6)?,
-                        total_output_tokens: row.get(7)?,
-                        total_cost_cents: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                    })
-                })
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            serde_json::to_value(&sessions).map_err(|e| e.to_string())
-        })
+        serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
     }
 
     fn rpc_get_session(
@@ -424,31 +524,77 @@ impl AgentService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
 
-        state.db.with_conn(|conn| {
-            let session = conn
-                .query_row(
-                    "SELECT id, title, provider, model, working_directory, status, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| {
-                        Ok(RpcSessionView {
-                            id: row.get(0)?,
-                            title: row.get(1)?,
-                            provider: row.get(2)?,
-                            model: row.get(3)?,
-                            working_directory: row.get(4)?,
-                            status: row.get(5)?,
-                            total_input_tokens: row.get(6)?,
-                            total_output_tokens: row.get(7)?,
-                            total_cost_cents: row.get(8)?,
-                            created_at: row.get(9)?,
-                            updated_at: row.get(10)?,
-                        })
-                    },
-                )
-                .map_err(|e| format!("Session not found: {}", e))?;
+        let session = session_service::get_session(state, id.to_string())?;
+        serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
+    }
 
-            serde_json::to_value(&session).map_err(|e| e.to_string())
-        })
+    fn rpc_update_session_title(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'title' parameter".to_string())?;
+        let session = session_service::update_session_title(state, id.to_string(), title.to_string())?;
+
+        serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_session_provider(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let provider = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'provider' parameter".to_string())?;
+        let session =
+            session_service::update_session_provider(state, id.to_string(), provider.to_string())?;
+
+        serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_session_working_directory(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let working_directory = params
+            .get("workingDirectory")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'workingDirectory' parameter".to_string())?;
+        let session = session_service::update_session_working_directory(
+            state,
+            id.to_string(),
+            working_directory.to_string(),
+        )?;
+
+        serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_archive_session(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let session = session_service::archive_session(state, id.to_string()).await?;
+
+        serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
     }
 
     fn rpc_list_messages(
@@ -503,20 +649,30 @@ impl AgentService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
 
-        // Kill any active CLI process for this session
-        {
-            let mut processes = state.active_processes.lock().await;
-            if let Some(mut proc) = processes.remove(id) {
-                let _ = proc.kill().await;
-                tracing::info!(session_id = %id, "Killed active process before deleting session");
-            }
-        }
+        session_service::delete_session(state, id.to_string()).await?;
 
-        state.db.with_conn(|conn| {
-            conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])
-                .map_err(|e| e.to_string())?;
-            serde_json::to_value(serde_json::json!({ "deleted": true })).map_err(|e| e.to_string())
-        })
+        serde_json::to_value(serde_json::json!({ "deleted": true })).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_detect_cli_tools(state: &Arc<AppState>) -> Result<serde_json::Value, String> {
+        let tools = provider_service::detect_cli_tools(state).await?;
+        serde_json::to_value(&tools).map_err(|e| e.to_string())
+    }
+
+    fn session_view(session: crate::db::models::Session) -> RpcSessionView {
+        RpcSessionView {
+            id: session.id,
+            title: session.title,
+            provider: session.provider,
+            model: session.model,
+            working_directory: session.working_directory,
+            status: session.status,
+            total_input_tokens: session.total_input_tokens,
+            total_output_tokens: session.total_output_tokens,
+            total_cost_cents: session.total_cost_cents,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        }
     }
 
     /// Handle a relayed chat request from mobile.

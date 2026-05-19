@@ -1,0 +1,120 @@
+@import '@xterm/xterm/css/xterm.css';
+
+:host {
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.terminal-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: #05070b;
+  color: #d7e1ee;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 34px;
+  padding: 0 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+  background: #0b1018;
+  font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.terminal-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-status {
+  flex: 0 0 auto;
+  color: #86efac;
+  text-transform: uppercase;
+  font-size: 11px;
+
+  &.offline {
+    color: #fca5a5;
+  }
+}
+
+.terminal-host {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+
+  &.disabled {
+    opacity: 0.72;
+  }
+}
+
+.terminal-local-input {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  overflow: hidden;
+  background: rgba(5, 7, 11, 0.94);
+  color: #f8fafc;
+  font: 14px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  opacity: 0;
+  pointer-events: none;
+  white-space: pre;
+
+  &.visible {
+    opacity: 1;
+  }
+}
+
+.terminal-local-prompt {
+  flex: 0 0 auto;
+  margin-right: 8px;
+  color: #7dd3fc;
+}
+
+.terminal-local-buffer {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+.terminal-local-cursor {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 16px;
+  margin-left: 1px;
+  background: #7dd3fc;
+  animation: terminal-cursor-blink 1s steps(2, start) infinite;
+}
+
+@keyframes terminal-cursor-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+::ng-deep .terminal-host .xterm {
+  height: 100%;
+}
+
+::ng-deep .terminal-host .xterm-helper-textarea {
+  opacity: 0 !important;
+  color: transparent !important;
+  background: transparent !important;
+  border: 0 !important;
+  outline: 0 !important;
+  resize: none !important;
+  overflow: hidden;
+}

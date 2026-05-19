@@ -39,3 +39,4 @@ Thumbs.db
 # Nx
 .nx/cache
 .nx/workspace-data
+desktop/e2e/artifacts/terminal-workspace/

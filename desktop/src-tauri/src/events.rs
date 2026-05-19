@@ -12,3 +12,18 @@ pub struct ChatCompleteEvent {
     pub session_id: String,
     pub message_id: String,
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalScreenEvent {
+    pub session_id: String,
+    pub pane_id: String,
+    pub cursor: i64,
+    pub content: String,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub history_lines: u16,
+    pub rows: u16,
+    pub cols: u16,
+    pub status: String,
+}

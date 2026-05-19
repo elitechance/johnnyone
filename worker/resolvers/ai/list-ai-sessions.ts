@@ -1,12 +1,13 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
+import { desktopRpc } from '../../lib/runtime/desktop-rpc';
 
 interface ResolverContext {
+  db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
 }
 
 interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
+  CHAT_RELAY_DO: DurableObjectNamespace;
   [key: string]: unknown;
 }
 
@@ -15,25 +16,5 @@ export default async function listAiSessions(
   args: { status?: string },
   ctx: ResolverContext,
 ) {
-  const result = await hostGraphqlRequest<{ listAiSessions: unknown[] }>(
-    ctx.env,
-    `query ListAiSessions($status: String) {
-      listAiSessions(status: $status) {
-        id
-        title
-        provider
-        model
-        workingDirectory
-        status
-        totalInputTokens
-        totalOutputTokens
-        totalCostCents
-        createdAt
-        updatedAt
-      }
-    }`,
-    { status: args.status ?? null },
-  );
-
-  return result.listAiSessions;
+  return desktopRpc<unknown[]>(ctx, 'list_sessions', { status: args.status ?? null });
 }

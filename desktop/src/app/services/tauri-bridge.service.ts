@@ -30,7 +30,7 @@ export interface Session {
 export interface CreateSessionInput {
   provider?: string;
   model?: string;
-  working_directory?: string;
+  workingDirectory?: string;
   title?: string;
 }
 
@@ -73,6 +73,19 @@ export interface ChatDelta {
 export interface ChatComplete {
   session_id: string;
   message_id: string;
+}
+
+export interface TerminalScreen {
+  sessionId: string;
+  paneId: string;
+  cursor: number;
+  content: string;
+  cursorX: number;
+  cursorY: number;
+  historyLines: number;
+  rows: number;
+  cols: number;
+  status: string;
 }
 
 // ── Provider Config ──────────────────────────────────────────────────────────
@@ -226,6 +239,42 @@ export class TauriBridgeService {
       let unlisten: UnlistenFn | undefined;
 
       listen<ChatComplete>('chat:complete', (event) => {
+        subscriber.next(event.payload);
+      }).then((fn) => {
+        unlisten = fn;
+      });
+
+      return () => {
+        unlisten?.();
+      };
+    });
+  }
+
+  // ── Terminal ───────────────────────────────────────────────────────
+
+  async attachTerminalSession(sessionId: string, cols: number, rows: number): Promise<TerminalScreen> {
+    return await invoke<TerminalScreen>('attach_terminal_session', {
+      input: { sessionId, cols, rows },
+    });
+  }
+
+  async sendTerminalInput(sessionId: string, data: string): Promise<void> {
+    await invoke('send_terminal_input', {
+      input: { sessionId, data },
+    });
+  }
+
+  async resizeTerminal(sessionId: string, cols: number, rows: number): Promise<void> {
+    await invoke('resize_terminal', {
+      input: { sessionId, cols, rows },
+    });
+  }
+
+  onTerminalScreen(): Observable<TerminalScreen> {
+    return new Observable<TerminalScreen>((subscriber) => {
+      let unlisten: UnlistenFn | undefined;
+
+      listen<TerminalScreen>('terminal:screen', (event) => {
         subscriber.next(event.payload);
       }).then((fn) => {
         unlisten = fn;

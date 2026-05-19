@@ -1,12 +1,13 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
+import { desktopRpc } from '../../lib/runtime/desktop-rpc';
 
 interface ResolverContext {
+  db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
 }
 
 interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
+  CHAT_RELAY_DO: DurableObjectNamespace;
   [key: string]: unknown;
 }
 
@@ -15,17 +16,5 @@ export default async function listDetectedCliTools(
   _args: Record<string, never>,
   ctx: ResolverContext,
 ) {
-  const result = await hostGraphqlRequest<{ detectCliTools: unknown[] }>(
-    ctx.env,
-    `mutation DetectCliTools {
-      detectCliTools {
-        provider
-        command
-        found
-        path
-      }
-    }`,
-  );
-
-  return result.detectCliTools;
+  return desktopRpc<unknown[]>(ctx, 'detect_cli_tools');
 }

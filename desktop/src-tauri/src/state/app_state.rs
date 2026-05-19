@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
+use crate::events::{ChatCompleteEvent, ChatDeltaEvent, TerminalScreenEvent};
 use crate::providers::cli_runner::CliProcess;
 use crate::tools::tool_schema::ToolExecutionRecord;
 use chrono::{DateTime, Utc};
@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Connection status information for the agent WebSocket.
@@ -56,6 +57,10 @@ pub struct AppState {
     pub chat_delta_tx: broadcast::Sender<ChatDeltaEvent>,
     /// Broadcast channel for host chat completion notifications.
     pub chat_complete_tx: broadcast::Sender<ChatCompleteEvent>,
+    /// Broadcast channel for terminal screen updates.
+    pub terminal_screen_tx: broadcast::Sender<TerminalScreenEvent>,
+    /// Active tmux capture loops, keyed by session_id.
+    pub terminal_capture_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
 
 impl AppState {
@@ -67,6 +72,7 @@ impl AppState {
         let (session_deleted_tx, _) = broadcast::channel(16);
         let (chat_delta_tx, _) = broadcast::channel(256);
         let (chat_complete_tx, _) = broadcast::channel(64);
+        let (terminal_screen_tx, _) = broadcast::channel(256);
 
         tracing::info!(
             node_id = %node_id,
@@ -85,6 +91,8 @@ impl AppState {
             session_deleted_tx,
             chat_delta_tx,
             chat_complete_tx,
+            terminal_screen_tx,
+            terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -94,6 +102,7 @@ impl AppState {
         let (session_deleted_tx, _) = broadcast::channel(16);
         let (chat_delta_tx, _) = broadcast::channel(256);
         let (chat_complete_tx, _) = broadcast::channel(64);
+        let (terminal_screen_tx, _) = broadcast::channel(256);
 
         Self {
             db,
@@ -106,6 +115,8 @@ impl AppState {
             session_deleted_tx,
             chat_delta_tx,
             chat_complete_tx,
+            terminal_screen_tx,
+            terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

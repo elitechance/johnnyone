@@ -20,6 +20,7 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSessionInput {
     pub provider: Option<String>,
     pub model: Option<String>,

@@ -117,7 +117,6 @@ pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, Str
     let providers = [
         CliProvider::ClaudeCode,
         CliProvider::Codex,
-        CliProvider::Cline,
         CliProvider::Ollama,
     ];
 

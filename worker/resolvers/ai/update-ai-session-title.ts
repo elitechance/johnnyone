@@ -1,12 +1,13 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
+import { desktopRpc } from '../../lib/runtime/desktop-rpc';
 
 interface ResolverContext {
+  db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
 }
 
 interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
+  CHAT_RELAY_DO: DurableObjectNamespace;
   [key: string]: unknown;
 }
 
@@ -15,25 +16,5 @@ export default async function updateAiSessionTitle(
   args: { id: string; title: string },
   ctx: ResolverContext,
 ) {
-  const result = await hostGraphqlRequest<{ updateAiSessionTitle: unknown }>(
-    ctx.env,
-    `mutation UpdateAiSessionTitle($id: String!, $title: String!) {
-      updateAiSessionTitle(id: $id, title: $title) {
-        id
-        title
-        provider
-        model
-        workingDirectory
-        status
-        totalInputTokens
-        totalOutputTokens
-        totalCostCents
-        createdAt
-        updatedAt
-      }
-    }`,
-    { id: args.id, title: args.title },
-  );
-
-  return result.updateAiSessionTitle;
+  return desktopRpc<unknown>(ctx, 'update_session_title', { id: args.id, title: args.title });
 }
