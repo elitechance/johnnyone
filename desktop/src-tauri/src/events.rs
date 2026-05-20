@@ -27,3 +27,12 @@ pub struct TerminalScreenEvent {
     pub cols: u16,
     pub status: String,
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanRunEvent {
+    pub plan_id: String,
+    pub deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<serde_json::Value>,
+}

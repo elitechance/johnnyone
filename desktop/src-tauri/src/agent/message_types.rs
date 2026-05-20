@@ -75,6 +75,10 @@ pub enum AgentMessage {
     /// Desktop → remote clients: terminal command acknowledgement.
     #[serde(rename = "terminal_command_ack")]
     TerminalCommandAck(TerminalCommandAck),
+
+    /// Desktop → remote clients: planner run state update.
+    #[serde(rename = "agent_plan_run_updated")]
+    AgentPlanRunUpdated(AgentPlanRunUpdated),
 }
 
 // ── Existing Types ───────────────────────────────────────────────────────────
@@ -236,6 +240,15 @@ pub struct RpcResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionDeleted {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanRunUpdated {
+    pub plan_id: String,
+    pub deleted: bool,
+    #[serde(default)]
+    pub run: Option<serde_json::Value>,
 }
 
 /// Current terminal screen replicated from tmux.

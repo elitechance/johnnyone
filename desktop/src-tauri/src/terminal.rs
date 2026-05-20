@@ -58,6 +58,7 @@ pub async fn attach_terminal(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
+    publish_snapshot(state, &snapshot, Some(&app_handle));
     start_capture_loop(state, Some(app_handle), terminal).await;
     Ok(snapshot)
 }
@@ -70,6 +71,7 @@ pub async fn attach_terminal_headless(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
+    publish_snapshot(state, &snapshot, None);
     start_capture_loop(state, None, terminal).await;
     Ok(snapshot)
 }
@@ -125,6 +127,38 @@ pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result
     })?;
 
     Ok(())
+}
+
+pub async fn capture_terminal_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<TerminalSnapshot, String> {
+    let terminal = ensure_terminal_session_for_input(state, session_id).await?;
+    capture_snapshot(state, &terminal).await
+}
+
+fn publish_snapshot(
+    state: &AppState,
+    snapshot: &TerminalSnapshot,
+    app_handle: Option<&tauri::AppHandle>,
+) {
+    let event = TerminalScreenEvent {
+        session_id: snapshot.session_id.clone(),
+        pane_id: snapshot.pane_id.clone(),
+        cursor: snapshot.cursor,
+        content: snapshot.content.clone(),
+        cursor_x: snapshot.cursor_x,
+        cursor_y: snapshot.cursor_y,
+        history_lines: snapshot.history_lines,
+        rows: snapshot.rows,
+        cols: snapshot.cols,
+        status: snapshot.status.clone(),
+    };
+
+    let _ = state.terminal_screen_tx.send(event.clone());
+    if let Some(handle) = app_handle {
+        let _ = handle.emit("terminal:screen", event);
+    }
 }
 
 async fn start_capture_loop(

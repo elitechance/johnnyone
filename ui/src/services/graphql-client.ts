@@ -56,11 +56,12 @@ export class GraphQLClient {
         ws = new WebSocket(this.wsUrl, 'graphql-transport-ws');
 
         ws.onopen = () => {
+          const headers = this.buildHeaders(false);
           ws!.send(
             JSON.stringify({
               type: 'connection_init',
               payload: {
-                headers: this.extraHeaders,
+                headers,
               },
             })
           );
@@ -133,11 +134,7 @@ export class GraphQLClient {
     return from(
       fetch(this.apiUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          ...this.extraHeaders,
-        },
+        headers: this.buildHeaders(true),
         body,
         credentials: 'same-origin',
       })
@@ -155,6 +152,41 @@ export class GraphQLClient {
         return result.data;
       })
     );
+  }
+
+  private buildHeaders(includeContentHeaders: boolean): Record<string, string> {
+    const headers: Record<string, string> = {
+      ...this.extraHeaders,
+    };
+
+    if (includeContentHeaders) {
+      headers['Content-Type'] = 'application/json';
+      headers.Accept = 'application/json';
+    }
+
+    const token = this.getStoredValue('johnnyone_access_token');
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    const tenantId = this.getStoredValue('johnnyone_tenant_id');
+    if (tenantId) {
+      headers['x-tenant-id'] = tenantId;
+    }
+
+    const userId = this.getStoredValue('johnnyone_user_id');
+    if (userId) {
+      headers['x-user-id'] = userId;
+    }
+
+    return headers;
+  }
+
+  private getStoredValue(key: string): string | null {
+    if (typeof window === 'undefined') return null;
+
+    const value = window.localStorage.getItem(key)?.trim();
+    return value || null;
   }
 }
 

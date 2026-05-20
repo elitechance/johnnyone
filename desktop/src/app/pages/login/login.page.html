@@ -1,0 +1,56 @@
+<main class="login-shell">
+  <section class="login-panel">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>JohnnyOne</span>
+    </div>
+
+    <form class="login-form" (submit)="$event.preventDefault(); login()">
+      <header>
+        <h1>Sign in</h1>
+        <p>Use your Lokal account to access terminals and planners.</p>
+      </header>
+
+      <label>
+        <span>Email</span>
+        <input
+          type="email"
+          name="email"
+          autocomplete="email"
+          [(ngModel)]="email"
+          required
+        />
+      </label>
+
+      <label>
+        <span>Password</span>
+        <input
+          type="password"
+          name="password"
+          autocomplete="current-password"
+          [(ngModel)]="password"
+          required
+        />
+      </label>
+
+      <label>
+        <span>Tenant</span>
+        <input
+          type="text"
+          name="tenantId"
+          autocomplete="organization"
+          [(ngModel)]="tenantId"
+          required
+        />
+      </label>
+
+      @if (error) {
+        <div class="login-error">{{ error }}</div>
+      }
+
+      <button type="submit" [disabled]="loading">
+        {{ loading ? 'Signing in...' : 'Sign in' }}
+      </button>
+    </form>
+  </section>
+</main>

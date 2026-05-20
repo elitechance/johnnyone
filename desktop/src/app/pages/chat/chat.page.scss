@@ -13,7 +13,7 @@
 
 .workspace-topbar {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto auto 1fr auto;
   align-items: center;
   gap: 12px;
   padding: 0 14px;
@@ -23,6 +23,7 @@
 
 .brand-lockup,
 .workspace-actions,
+.mode-switch,
 .pane-title,
 .pane-meta {
   display: flex;
@@ -89,6 +90,25 @@
   gap: 8px;
 }
 
+.mode-switch {
+  border: 1px solid #263241;
+}
+
+.mode-switch button {
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: #8fa0b3;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.mode-switch button.active {
+  color: #dbe7f3;
+  background: #10243a;
+  box-shadow: inset 0 -2px 0 #64b5ff;
+}
+
 .provider-dropdown,
 .primary-action,
 .icon-action,
@@ -110,6 +130,11 @@
   background: #19314a;
   border-color: #315b82;
   cursor: pointer;
+
+  &.secondary {
+    background: #122033;
+    border-color: #2e4763;
+  }
 }
 
 .icon-action {
@@ -121,6 +146,8 @@
 
 .terminal-workspace {
   position: relative;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background:
     linear-gradient(rgba(96, 120, 145, 0.08) 1px, transparent 1px),
@@ -322,28 +349,141 @@
 }
 
 @media (max-width: 900px) {
+  :host {
+    min-width: 0;
+  }
+
+  .workspace-shell {
+    height: 100dvh;
+    min-width: 0;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
   .workspace-topbar {
     grid-template-columns: 1fr;
     height: auto;
-    min-height: 96px;
+    min-height: 0;
     padding: 8px;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .brand-lockup {
+    min-width: 0;
+  }
+
+  .brand-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workspace-tabs {
+    width: 100%;
+    padding-bottom: 2px;
   }
 
   .workspace-actions {
-    justify-content: flex-start;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    justify-content: stretch;
+    overflow: visible;
+    padding-bottom: 0;
+  }
+
+  .provider-dropdown {
+    grid-column: 1 / -1;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .primary-action {
+    grid-column: span 2;
+    min-width: 0;
+    width: 100%;
+    padding: 0 8px;
+  }
+
+  .icon-action {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .terminal-workspace {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+    overflow: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
   .terminal-pane {
-    left: 10px !important;
-    top: 10px !important;
-    width: calc(100vw - 20px) !important;
-    height: calc(100vh - 150px) !important;
+    position: relative;
+    left: auto !important;
+    top: auto !important;
+    width: 100% !important;
+    min-width: 0;
+    min-height: 360px;
+    max-height: calc(100dvh - 220px);
+    flex: 0 0 auto;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
   }
 
   .pane-header {
     grid-template-columns: 1fr;
-    min-height: 52px;
+    min-height: 68px;
     align-content: center;
+    gap: 6px;
+    cursor: default;
+    touch-action: auto;
+  }
+
+  .pane-title,
+  .pane-meta {
+    width: 100%;
+  }
+
+  .pane-meta {
+    gap: 6px;
+    overflow: auto hidden;
+    scrollbar-width: none;
+  }
+
+  .pane-tool {
+    max-width: 48vw;
+    flex: 0 0 auto;
+  }
+
+  .pane-status {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .pane-resize-handle {
+    left: 0;
+    right: 0;
+    bottom: 104px;
+    width: auto;
+    height: 28px;
+    cursor: ns-resize;
+    touch-action: none;
+    background:
+      linear-gradient(90deg, transparent calc(50% - 28px), rgba(143, 160, 179, 0.65) calc(50% - 28px), rgba(143, 160, 179, 0.65) calc(50% + 28px), transparent calc(50% + 28px)),
+      linear-gradient(90deg, transparent calc(50% - 18px), rgba(143, 160, 179, 0.55) calc(50% - 18px), rgba(143, 160, 179, 0.55) calc(50% + 18px), transparent calc(50% + 18px));
+    background-size: 100% 1px, 100% 1px;
+    background-position: 0 9px, 0 16px;
+    background-repeat: no-repeat;
+  }
+
+  .workspace-empty {
+    position: static;
+    transform: none;
+    min-height: 100%;
+    place-content: center;
+    text-align: center;
+    padding: 24px;
   }
 
   .workspace-statusbar {

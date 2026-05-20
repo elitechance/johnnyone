@@ -77,6 +77,86 @@ pub struct UpsertProviderConfigInput {
     pub settings: Option<String>,
 }
 
+// ── Agent Planner ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlan {
+    pub id: String,
+    pub title: String,
+    pub workspace_path: String,
+    pub plan_path: String,
+    pub status: String,
+    pub worker_session_id: Option<String>,
+    pub reviewer_session_id: Option<String>,
+    pub worker_provider: String,
+    pub reviewer_provider: String,
+    pub current_phase_id: Option<String>,
+    pub current_phase_index: i64,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanPhase {
+    pub id: String,
+    pub plan_id: String,
+    pub phase_id: String,
+    pub phase_title: String,
+    pub phase_index: i64,
+    pub status: String,
+    pub worker_started_at: Option<String>,
+    pub worker_idle_at: Option<String>,
+    pub reviewer_started_at: Option<String>,
+    pub reviewer_idle_at: Option<String>,
+    pub gate_verdict: String,
+    pub clarification_attempts: i64,
+    pub summary: Option<String>,
+    pub findings_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanTask {
+    pub id: String,
+    pub plan_id: String,
+    pub phase_id: String,
+    pub task_id: String,
+    pub task_title: String,
+    pub task_index: i64,
+    pub prompt_path: String,
+    pub status_path: Option<String>,
+    pub decisions_path: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlanEvent {
+    pub id: String,
+    pub plan_id: String,
+    pub phase_id: Option<String>,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAgentPlanInput {
+    pub title: Option<String>,
+    pub workspace_path: String,
+    pub plan_path: String,
+    pub worker_provider: String,
+    pub reviewer_provider: String,
+}
+
 // ── Usage Log ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

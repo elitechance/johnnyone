@@ -25,6 +25,12 @@
     "e2e-terminal-workspace": {
       "command": "node desktop/e2e/terminal-workspace.e2e.cjs"
     },
+    "e2e-session-sync": {
+      "command": "node desktop/e2e/session-sync.e2e.cjs"
+    },
+    "e2e-planner-smoke": {
+      "command": "node desktop/e2e/planner-smoke.e2e.cjs"
+    },
     "tauri-dev": {
       "command": "cd desktop/src-tauri && cargo tauri dev"
     },

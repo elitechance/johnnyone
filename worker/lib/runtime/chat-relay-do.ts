@@ -14,7 +14,7 @@
  */
 
 interface RelayEnvelope {
-  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'session_deleted' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response' | 'terminal_screen' | 'terminal_command' | 'terminal_resize' | 'terminal_kill' | 'terminal_command_ack';
+  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'session_deleted' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response' | 'terminal_screen' | 'terminal_command' | 'terminal_resize' | 'terminal_kill' | 'terminal_command_ack' | 'agent_plan_run_updated';
   relayId?: string;
   sessionId?: string;
   requestId?: string;
@@ -167,6 +167,7 @@ export class ChatRelayDO implements DurableObject {
         case 'session_deleted':
         case 'terminal_screen':
         case 'terminal_command_ack':
+        case 'agent_plan_run_updated':
           // Desktop → mobile: broadcast response data
           if (clientType === 'desktop') {
             this.broadcastTo('mobile', envelope);

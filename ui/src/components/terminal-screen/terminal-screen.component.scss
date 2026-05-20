@@ -19,6 +19,12 @@
   background: #05070b;
   color: #d7e1ee;
   border: 1px solid rgba(148, 163, 184, 0.3);
+
+  &.mobile-input-mode {
+    .terminal-host.disabled {
+      opacity: 1;
+    }
+  }
 }
 
 .terminal-toolbar {
@@ -97,6 +103,81 @@
   margin-left: 1px;
   background: #7dd3fc;
   animation: terminal-cursor-blink 1s steps(2, start) infinite;
+}
+
+.terminal-mobile-input {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 8px;
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  border-top: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(10, 13, 18, 0.98);
+}
+
+.terminal-mobile-keys,
+.terminal-mobile-submit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.terminal-mobile-keys {
+  overflow: auto hidden;
+  scrollbar-width: none;
+}
+
+.terminal-mobile-keys button,
+.terminal-mobile-submit button {
+  flex: 0 0 auto;
+  height: 32px;
+  border: 1px solid #263241;
+  background: #121821;
+  color: #dbe7f3;
+  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.terminal-mobile-keys button {
+  min-width: 48px;
+  padding: 0 10px;
+}
+
+.terminal-mobile-submit {
+  align-items: end;
+}
+
+.terminal-mobile-submit textarea {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  max-height: 112px;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid #315b82;
+  border-radius: 0;
+  outline: 0;
+  background: #0a1018;
+  color: #dbe7f3;
+  font: 16px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  &:focus {
+    border-color: #64b5ff;
+    box-shadow: 0 0 0 1px rgba(100, 181, 255, 0.45);
+  }
+}
+
+.terminal-mobile-submit button {
+  width: 72px;
+  height: 44px;
+  background: #1d4f7a;
+  border-color: #4d8fd1;
+  font-weight: 650;
+}
+
+.terminal-mobile-keys button:disabled,
+.terminal-mobile-submit button:disabled,
+.terminal-mobile-submit textarea:disabled {
+  opacity: 0.5;
 }
 
 @keyframes terminal-cursor-blink {

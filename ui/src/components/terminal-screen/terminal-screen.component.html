@@ -1,4 +1,4 @@
-<section class="terminal-shell">
+<section class="terminal-shell" [class.mobile-input-mode]="mobileInputMode">
   <header class="terminal-toolbar">
     <div class="terminal-title">{{ title }}</div>
     <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
@@ -11,4 +11,38 @@
     <span class="terminal-local-buffer">{{ localInputBuffer }}</span>
     <span class="terminal-local-cursor" aria-hidden="true"></span>
   </div>
+
+  @if (mobileInputMode) {
+    <form
+      class="terminal-mobile-input"
+      (pointerdown)="$event.stopPropagation()"
+      (click)="$event.stopPropagation()"
+      (submit)="$event.preventDefault(); submitMobileInput()"
+    >
+      <div class="terminal-mobile-keys" aria-label="Terminal controls">
+        <button type="button" (click)="sendControlInput('\t')" [disabled]="disabled">Tab</button>
+        <button type="button" (click)="sendControlInput('\u001b')" [disabled]="disabled">Esc</button>
+        <button type="button" (click)="sendControlInput('\u0003')" [disabled]="disabled">Ctrl-C</button>
+        <button type="button" (click)="sendControlInput('\u001b[A')" [disabled]="disabled">↑</button>
+        <button type="button" (click)="sendControlInput('\u001b[B')" [disabled]="disabled">↓</button>
+        <button type="button" (click)="sendControlInput('\r')" [disabled]="disabled">Enter</button>
+      </div>
+
+      <div class="terminal-mobile-submit">
+        <textarea
+          name="mobileTerminalInput"
+          rows="1"
+          placeholder="Type command or message"
+          [(ngModel)]="mobileInputBuffer"
+          (keydown)="onMobileInputKeydown($event)"
+          [disabled]="disabled"
+          autocapitalize="none"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+        ></textarea>
+        <button type="submit" [disabled]="disabled">Send</button>
+      </div>
+    </form>
+  }
 </section>

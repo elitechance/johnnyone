@@ -18,6 +18,8 @@
     "build:desktop:tauri": "nx run desktop:tauri-build",
     "e2e:desktop:web": "npm run build:desktop:web && nx run desktop:e2e-web",
     "e2e:terminal-workspace": "npm run build:desktop:web && nx run desktop:e2e-terminal-workspace",
+    "e2e:session-sync": "npm run build:desktop:web && nx run desktop:e2e-session-sync",
+    "e2e:planner-smoke": "npm run build:desktop:web && nx run desktop:e2e-planner-smoke",
     "build:mobile": "nx build mobile",
     "build:worker": "nx build worker",
     "lint": "nx run-many -t lint",

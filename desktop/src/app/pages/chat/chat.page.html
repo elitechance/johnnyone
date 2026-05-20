@@ -5,6 +5,11 @@
       <span class="brand-name">JohnnyOne</span>
     </div>
 
+    <div class="mode-switch">
+      <button type="button" class="active">Terminal</button>
+      <button type="button" (click)="navigateTo('/planner')">Planner</button>
+    </div>
+
     <nav class="workspace-tabs" aria-label="Terminal sessions">
       @for (session of aiSessions(); track session.id) {
         <button
@@ -40,6 +45,7 @@
         </button>
       }
       <button class="icon-action" title="Settings" (click)="navigateTo('/settings')">⚙</button>
+      <button class="icon-action" title="Sign out" (click)="logout()">⎋</button>
     </div>
   </header>
 
@@ -86,6 +92,7 @@
           [screen]="screen"
           [title]="session.title || 'Terminal'"
           [disabled]="session.id !== currentSession()?.id"
+          [mobileInputMode]="isCompactWorkspace()"
           (rawInput)="onTerminalRawInput($event, session.id)"
           (terminalResize)="onTerminalResize($event, session.id)"
         />

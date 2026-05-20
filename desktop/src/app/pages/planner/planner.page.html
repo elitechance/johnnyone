@@ -1,0 +1,266 @@
+<div class="planner-shell">
+  <header class="planner-topbar">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">JohnnyOne</span>
+    </div>
+
+    <div class="mode-switch">
+      <button type="button" (click)="navigateTo('/chat')">Terminal</button>
+      <button type="button" class="active">Planner</button>
+    </div>
+
+    <nav class="planner-tabs" aria-label="Planner runs">
+      @for (plan of plans(); track plan.id) {
+        <div
+          class="planner-tab"
+          [class.active]="currentPlan()?.id === plan.id"
+        >
+          <button class="planner-tab-main" type="button" (click)="selectPlan(plan.id)">
+            <span class="dot" [class.warn]="plan.status.includes('running')" [class.bad]="plan.status === 'blocked' || plan.status === 'needs_attention'"></span>
+            <span>{{ plan.title }}</span>
+          </button>
+          <button class="tab-close" type="button" title="Delete planner run" (click)="deletePlan(plan.id, $event)">×</button>
+        </div>
+      }
+    </nav>
+
+    <div class="planner-actions">
+      <button class="primary-action" type="button" (click)="openSetup()">New Planner</button>
+      <button class="icon-action" title="Settings" (click)="navigateTo('/settings')">⚙</button>
+      <button class="icon-action" title="Sign out" (click)="logout()">⎋</button>
+    </div>
+  </header>
+
+  <main class="planner-workspace">
+    @if (error()) {
+      <div class="error-banner">{{ error() }}</div>
+    }
+
+    @if (currentRun(); as run) {
+      <section class="agent-grid">
+        <article class="terminal-card">
+          <header>
+            <span class="badge">T1</span>
+            <strong>Worker</strong>
+            <span class="state">{{ run.plan.status }}</span>
+          </header>
+          <johnny-terminal-screen
+            class="terminal-fill"
+            [screen]="workerScreen()"
+            [mobileInputMode]="false"
+          ></johnny-terminal-screen>
+        </article>
+
+        <article class="terminal-card">
+          <header>
+            <span class="badge">T2</span>
+            <strong>Reviewer</strong>
+            <span class="state">{{ currentPhase()?.gateVerdict || 'unknown' }}</span>
+          </header>
+          <johnny-terminal-screen
+            class="terminal-fill"
+            [screen]="reviewerScreen()"
+            [mobileInputMode]="false"
+          ></johnny-terminal-screen>
+        </article>
+      </section>
+
+      <section class="coordinator-panel">
+        <header>
+          <div>
+            <span class="badge coordinator">Coordinator</span>
+            <strong>{{ run.plan.title }}</strong>
+          </div>
+          <div class="coordinator-actions">
+            <button class="secondary-action" type="button" (click)="openFiles('changed')">Files</button>
+            <button class="secondary-action" type="button" (click)="startPlan()">Start</button>
+            <button class="secondary-action" type="button" (click)="sendBackToWorker()">Send back</button>
+            <button class="secondary-action" type="button" (click)="rerunReviewer()">Rerun T2</button>
+            <button class="secondary-action" type="button" [disabled]="!canManualPass()" (click)="manualPass()">Manual pass</button>
+            <button class="danger-action" type="button" (click)="blockPlan()">Block</button>
+            <button class="danger-action" type="button" (click)="stopPlan()">Stop</button>
+          </div>
+        </header>
+
+        <div class="coordinator-body">
+          <section class="phase-list">
+            <div class="section-title">Phases</div>
+            @for (phase of run.phases; track phase.id) {
+              <div class="phase-row" [class.active]="phase.phaseId === run.plan.currentPhaseId" [class.locked]="phase.status === 'locked'">
+                <span>
+                  <strong>{{ phase.phaseId }}</strong>
+                  {{ phase.phaseTitle }}
+                </span>
+                <em>{{ phase.status }} · {{ phase.gateVerdict }}</em>
+              </div>
+            }
+          </section>
+
+          <section class="event-log">
+            <div class="section-title">Events</div>
+            @for (event of run.events; track event.id) {
+              <div class="event-row">
+                <strong>{{ event.eventType }}</strong>
+                <span>{{ event.createdAt }}</span>
+                <pre>{{ eventPayload(event) }}</pre>
+              </div>
+            }
+          </section>
+
+          <section class="run-settings">
+            <div class="section-title">Run Settings</div>
+            <label>Workspace</label>
+            <code>{{ run.plan.workspacePath }}</code>
+            <label>Plan path</label>
+            <code>{{ run.plan.planPath }}</code>
+            <label>Providers</label>
+            <code>T1: {{ run.plan.workerProvider }} · T2: {{ run.plan.reviewerProvider }}</code>
+            @if (run.plan.error) {
+              <label>Error</label>
+              <code>{{ run.plan.error }}</code>
+            }
+          </section>
+        </div>
+      </section>
+    } @else {
+      <section class="empty-state">
+        <h1>No planner run selected</h1>
+        <p>Start a host-backed T1/T2 planner run.</p>
+        <button class="primary-action" type="button" (click)="openSetup()">New Planner</button>
+      </section>
+    }
+  </main>
+</div>
+
+@if (setupOpen()) {
+  <div class="modal-backdrop">
+    <section class="setup-modal">
+      <header>
+        <strong>New Planner</strong>
+        <button class="icon-action" type="button" (click)="closeSetup()">×</button>
+      </header>
+      <div class="setup-body">
+        <label>
+          <span>Title</span>
+          <input [(ngModel)]="setupTitle" placeholder="Optional plan run title" />
+        </label>
+        <label>
+          <span>Workspace directory on backend host</span>
+          <div class="field-control">
+            <input [(ngModel)]="workspacePath" (ngModelChange)="scheduleValidation()" />
+            <button class="secondary-action" type="button" (click)="openPathBrowser('workspace')">Browse</button>
+          </div>
+        </label>
+        <label>
+          <span>Plan path</span>
+          <div class="field-control">
+            <input [(ngModel)]="planPath" (ngModelChange)="scheduleValidation()" />
+            <button class="secondary-action" type="button" (click)="openPathBrowser('plan')">Browse</button>
+          </div>
+        </label>
+        <div class="provider-grid">
+          <label>
+            <span>T1 Worker</span>
+            <select [(ngModel)]="workerProvider">
+              <option value="codex">Codex CLI</option>
+              <option value="claude_code">Claude Code</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </label>
+          <label>
+            <span>T2 Reviewer</span>
+            <select [(ngModel)]="reviewerProvider">
+              <option value="codex">Codex CLI</option>
+              <option value="claude_code">Claude Code</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="validation-box" [class.invalid]="validation() && !validation()?.valid">
+          @if (validation(); as result) {
+            @if (result.valid) {
+              Valid plan: {{ result.title }} · {{ result.phaseCount }} phases · {{ result.taskCount }} tasks
+            } @else {
+              {{ result.error }}
+            }
+          } @else {
+            Enter a workspace and plan path.
+          }
+        </div>
+      </div>
+      <footer>
+        <button class="secondary-action" type="button" (click)="closeSetup()">Cancel</button>
+        <button class="primary-action" type="button" [disabled]="!validation()?.valid || isBusy()" (click)="createPlanner()">Start Planner</button>
+      </footer>
+    </section>
+  </div>
+}
+
+@if (browserOpen()) {
+  <div class="modal-backdrop">
+    <section class="browser-modal">
+      <header>
+        <div>
+          <strong>{{ browserMode() === 'workspace' ? 'Choose Workspace Directory' : 'Choose Plan Directory' }}</strong>
+          <code>{{ browsePath }}</code>
+        </div>
+        <button class="icon-action" type="button" (click)="closePathBrowser()">×</button>
+      </header>
+      <div class="browser-toolbar">
+        <button class="secondary-action" type="button" (click)="browseParent()">Up</button>
+        <button class="primary-action" type="button" (click)="useBrowsePath()">Use This Directory</button>
+      </div>
+      <div class="browser-list">
+        @if (browserError()) {
+          <div class="file-empty">{{ browserError() }}</div>
+        } @else if (browserEntries().length === 0) {
+          <div class="file-empty">No entries in this directory.</div>
+        }
+        @for (entry of browserEntries(); track entry.path) {
+          <div class="browser-row" [class.file]="entry.kind !== 'directory'">
+            <button type="button" [disabled]="entry.kind !== 'directory'" (click)="browseInto(entry)">
+              <span class="file-status">{{ entry.kind }}</span>
+              <span>{{ entry.name }}</span>
+            </button>
+            @if (entry.kind === 'directory') {
+              <button class="secondary-action" type="button" (click)="useBrowsePath(entry.path)">Use</button>
+            }
+          </div>
+        }
+      </div>
+    </section>
+  </div>
+}
+
+@if (filesOpen()) {
+  <div class="modal-backdrop">
+    <section class="files-modal">
+      <header>
+        <strong>Workspace Files</strong>
+        <div class="file-actions">
+          <button type="button" [class.active]="fileMode() === 'changed'" (click)="openFiles('changed')">Changed</button>
+          <button type="button" [class.active]="fileMode() === 'all'" (click)="openFiles('all')">All</button>
+          <button class="icon-action" type="button" (click)="closeFiles()">×</button>
+        </div>
+      </header>
+      <div class="file-list">
+        @if (filesError()) {
+          <div class="file-empty">{{ filesError() }}</div>
+        } @else if (workspaceFiles().length === 0) {
+          <div class="file-empty">No files to show.</div>
+        }
+        @for (file of workspaceFiles(); track file.path) {
+          <div class="file-row">
+            <span class="file-status">{{ file.status || file.kind }}</span>
+            <span>{{ file.path }}</span>
+            @if (file.size !== undefined) {
+              <em>{{ file.size }} bytes</em>
+            }
+          </div>
+        }
+      </div>
+    </section>
+  </div>
+}

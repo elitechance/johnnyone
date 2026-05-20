@@ -110,6 +110,91 @@ type RelayChatMessage {
   content: String!
 }
 
+type AgentPlan {
+  id: ID!
+  title: String!
+  workspacePath: String!
+  planPath: String!
+  status: String!
+  workerSessionId: String
+  reviewerSessionId: String
+  workerProvider: String!
+  reviewerProvider: String!
+  currentPhaseId: String
+  currentPhaseIndex: Int!
+  error: String
+  createdAt: String!
+  updatedAt: String!
+}
+
+type AgentPlanPhase {
+  id: ID!
+  planId: String!
+  phaseId: String!
+  phaseTitle: String!
+  phaseIndex: Int!
+  status: String!
+  workerStartedAt: String
+  workerIdleAt: String
+  reviewerStartedAt: String
+  reviewerIdleAt: String
+  gateVerdict: String!
+  clarificationAttempts: Int!
+  summary: String
+  findingsJson: String!
+  createdAt: String!
+  updatedAt: String!
+}
+
+type AgentPlanTask {
+  id: ID!
+  planId: String!
+  phaseId: String!
+  taskId: String!
+  taskTitle: String!
+  taskIndex: Int!
+  promptPath: String!
+  statusPath: String
+  decisionsPath: String
+  status: String!
+  createdAt: String!
+  updatedAt: String!
+}
+
+type AgentPlanEvent {
+  id: ID!
+  planId: String!
+  phaseId: String
+  eventType: String!
+  payloadJson: String!
+  createdAt: String!
+}
+
+type AgentPlanRun {
+  plan: AgentPlan!
+  phases: [AgentPlanPhase!]!
+  tasks: [AgentPlanTask!]!
+  events: [AgentPlanEvent!]!
+}
+
+type HostFileEntry {
+  path: String!
+  name: String!
+  kind: String!
+  status: String
+  size: Int
+}
+
+type WorkspaceValidation {
+  valid: Boolean!
+  workspacePath: String!
+  planPath: String!
+  title: String
+  phaseCount: Int!
+  taskCount: Int!
+  error: String
+}
+
 # --- Inputs ---
 
 input RegisterDesktopNodeInput {
@@ -148,6 +233,14 @@ input UpsertProviderConfigInput {
   settings: String
 }
 
+input CreateAgentPlanInput {
+  title: String
+  workspacePath: String!
+  planPath: String!
+  workerProvider: String!
+  reviewerProvider: String!
+}
+
 # --- Queries ---
 
 type Query {
@@ -158,6 +251,11 @@ type Query {
   listProviderConfigs: [ProviderConfig!]!
   listDetectedCliTools: [DetectedTool!]!
   getSetting(key: String!): String!
+  listAgentPlans(status: String): [AgentPlan!]!
+  getAgentPlan(id: ID!): AgentPlanRun!
+  browseHostDirectory(path: String!): [HostFileEntry!]!
+  validateWorkspacePlan(workspacePath: String!, planPath: String!): WorkspaceValidation!
+  listWorkspaceFiles(planId: ID!, mode: String!): [HostFileEntry!]!
 }
 
 # --- Mutations ---
@@ -177,6 +275,14 @@ type Mutation {
   upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
   deleteProviderConfig(provider: String!): Boolean!
   updateSetting(key: String!, value: String!): Boolean!
+  createAgentPlan(input: CreateAgentPlanInput!): AgentPlanRun!
+  startAgentPlan(id: ID!): AgentPlanRun!
+  updateAgentPlanStopped(id: ID!): AgentPlanRun!
+  deleteAgentPlan(id: ID!): Boolean!
+  updateAgentPlanBlocked(id: ID!, reason: String!): AgentPlanRun!
+  updateAgentPhaseManualPass(id: ID!, phaseId: String!): AgentPlanRun!
+  sendAgentFeedbackToWorker(id: ID!): AgentPlanRun!
+  retryAgentReviewer(id: ID!): AgentPlanRun!
 }
 
 # --- Subscriptions ---

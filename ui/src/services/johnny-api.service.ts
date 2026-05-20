@@ -32,9 +32,121 @@ export interface DetectedCliTool {
   path?: string;
 }
 
+export interface CreateAgentPlanInput {
+  title?: string;
+  workspacePath: string;
+  planPath: string;
+  workerProvider: string;
+  reviewerProvider: string;
+}
+
+export interface AgentPlan {
+  id: string;
+  title: string;
+  workspacePath: string;
+  planPath: string;
+  status: string;
+  workerSessionId?: string;
+  reviewerSessionId?: string;
+  workerProvider: string;
+  reviewerProvider: string;
+  currentPhaseId?: string;
+  currentPhaseIndex: number;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentPlanPhase {
+  id: string;
+  planId: string;
+  phaseId: string;
+  phaseTitle: string;
+  phaseIndex: number;
+  status: string;
+  workerStartedAt?: string;
+  workerIdleAt?: string;
+  reviewerStartedAt?: string;
+  reviewerIdleAt?: string;
+  gateVerdict: string;
+  clarificationAttempts: number;
+  summary?: string;
+  findingsJson: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentPlanTask {
+  id: string;
+  planId: string;
+  phaseId: string;
+  taskId: string;
+  taskTitle: string;
+  taskIndex: number;
+  promptPath: string;
+  statusPath?: string;
+  decisionsPath?: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentPlanEvent {
+  id: string;
+  planId: string;
+  phaseId?: string;
+  eventType: string;
+  payloadJson: string;
+  createdAt: string;
+}
+
+export interface AgentPlanRun {
+  plan: AgentPlan;
+  phases: AgentPlanPhase[];
+  tasks: AgentPlanTask[];
+  events: AgentPlanEvent[];
+}
+
+export interface HostFileEntry {
+  path: string;
+  name: string;
+  kind: string;
+  status?: string;
+  size?: number;
+}
+
+export interface WorkspaceValidation {
+  valid: boolean;
+  workspacePath: string;
+  planPath: string;
+  title?: string;
+  phaseCount: number;
+  taskCount: number;
+  error?: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class JohnnyApiService {
   private readonly gql = inject(GraphQLClient);
+  private readonly agentPlanRunFields = `
+    plan {
+      id title workspacePath planPath status workerSessionId reviewerSessionId
+      workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
+      createdAt updatedAt
+    }
+    phases {
+      id planId phaseId phaseTitle phaseIndex status workerStartedAt workerIdleAt
+      reviewerStartedAt reviewerIdleAt gateVerdict clarificationAttempts summary
+      findingsJson createdAt updatedAt
+    }
+    tasks {
+      id planId phaseId taskId taskTitle taskIndex promptPath statusPath
+      decisionsPath status createdAt updatedAt
+    }
+    events {
+      id planId phaseId eventType payloadJson createdAt
+    }
+  `;
 
   // ── Sessions ──────────────────────────────────────────────────────────
 
@@ -425,6 +537,141 @@ export class JohnnyApiService {
       .pipe(map((data) => data.updateSetting));
   }
 
+  // ── Agent Planner ────────────────────────────────────────────────────
+
+  listAgentPlans(status?: string): Observable<AgentPlan[]> {
+    return this.gql
+      .query<{ listAgentPlans: AgentPlan[] }>(
+        `query ListAgentPlans($status: String) {
+          listAgentPlans(status: $status) {
+            id title workspacePath planPath status workerSessionId reviewerSessionId
+            workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
+            createdAt updatedAt
+          }
+        }`,
+        { status }
+      )
+      .pipe(map((data) => data.listAgentPlans));
+  }
+
+  getAgentPlan(id: string): Observable<AgentPlanRun> {
+    return this.gql
+      .query<{ getAgentPlan: AgentPlanRun }>(
+        `query GetAgentPlan($id: ID!) {
+          getAgentPlan(id: $id) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id }
+      )
+      .pipe(map((data) => data.getAgentPlan));
+  }
+
+  createAgentPlan(input: CreateAgentPlanInput): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ createAgentPlan: AgentPlanRun }>(
+        `mutation CreateAgentPlan($input: CreateAgentPlanInput!) {
+          createAgentPlan(input: $input) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.createAgentPlan));
+  }
+
+  startAgentPlan(id: string): Observable<AgentPlanRun> {
+    return this.agentPlanMutation('startAgentPlan', { id });
+  }
+
+  stopAgentPlan(id: string): Observable<AgentPlanRun> {
+    return this.agentPlanMutation('updateAgentPlanStopped', { id });
+  }
+
+  deleteAgentPlan(id: string): Observable<boolean> {
+    return this.gql
+      .mutate<{ deleteAgentPlan: boolean }>(
+        `mutation DeleteAgentPlan($id: ID!) {
+          deleteAgentPlan(id: $id)
+        }`,
+        { id }
+      )
+      .pipe(map((data) => data.deleteAgentPlan));
+  }
+
+  blockAgentPlan(id: string, reason: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanBlocked: AgentPlanRun }>(
+        `mutation BlockAgentPlan($id: ID!, $reason: String!) {
+          updateAgentPlanBlocked(id: $id, reason: $reason) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, reason }
+      )
+      .pipe(map((data) => data.updateAgentPlanBlocked));
+  }
+
+  manualPassAgentPhase(id: string, phaseId: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPhaseManualPass: AgentPlanRun }>(
+        `mutation ManualPassAgentPhase($id: ID!, $phaseId: String!) {
+          updateAgentPhaseManualPass(id: $id, phaseId: $phaseId) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, phaseId }
+      )
+      .pipe(map((data) => data.updateAgentPhaseManualPass));
+  }
+
+  sendAgentFeedbackToWorker(id: string): Observable<AgentPlanRun> {
+    return this.agentPlanMutation('sendAgentFeedbackToWorker', { id });
+  }
+
+  rerunAgentReviewer(id: string): Observable<AgentPlanRun> {
+    return this.agentPlanMutation('retryAgentReviewer', { id });
+  }
+
+  browseHostDirectory(path: string): Observable<HostFileEntry[]> {
+    return this.gql
+      .query<{ browseHostDirectory: HostFileEntry[] }>(
+        `query BrowseHostDirectory($path: String!) {
+          browseHostDirectory(path: $path) {
+            path name kind status size
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.browseHostDirectory));
+  }
+
+  validateWorkspacePlan(workspacePath: string, planPath: string): Observable<WorkspaceValidation> {
+    return this.gql
+      .query<{ validateWorkspacePlan: WorkspaceValidation }>(
+        `query ValidateWorkspacePlan($workspacePath: String!, $planPath: String!) {
+          validateWorkspacePlan(workspacePath: $workspacePath, planPath: $planPath) {
+            valid workspacePath planPath title phaseCount taskCount error
+          }
+        }`,
+        { workspacePath, planPath }
+      )
+      .pipe(map((data) => data.validateWorkspacePlan));
+  }
+
+  listWorkspaceFiles(planId: string, mode: 'changed' | 'all'): Observable<HostFileEntry[]> {
+    return this.gql
+      .query<{ listWorkspaceFiles: HostFileEntry[] }>(
+        `query ListWorkspaceFiles($planId: ID!, $mode: String!) {
+          listWorkspaceFiles(planId: $planId, mode: $mode) {
+            path name kind status size
+          }
+        }`,
+        { planId, mode }
+      )
+      .pipe(map((data) => data.listWorkspaceFiles));
+  }
+
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {
     return this.gql
       .mutate<{ registerDesktopNode: DesktopNode }>(
@@ -466,5 +713,21 @@ export class JohnnyApiService {
         { from, to }
       )
       .pipe(map((data) => data.aiUsageSummary));
+  }
+
+  private agentPlanMutation(
+    field: 'startAgentPlan' | 'updateAgentPlanStopped' | 'sendAgentFeedbackToWorker' | 'retryAgentReviewer',
+    variables: { id: string }
+  ): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<Record<typeof field, AgentPlanRun>>(
+        `mutation AgentPlanMutation($id: ID!) {
+          ${field}(id: $id) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        variables
+      )
+      .pipe(map((data) => data[field]));
   }
 }

@@ -1,5 +1,5 @@
 use crate::db::Database;
-use crate::events::{ChatCompleteEvent, ChatDeltaEvent, TerminalScreenEvent};
+use crate::events::{AgentPlanRunEvent, ChatCompleteEvent, ChatDeltaEvent, TerminalScreenEvent};
 use crate::providers::cli_runner::CliProcess;
 use crate::tools::tool_schema::ToolExecutionRecord;
 use chrono::{DateTime, Utc};
@@ -59,6 +59,8 @@ pub struct AppState {
     pub chat_complete_tx: broadcast::Sender<ChatCompleteEvent>,
     /// Broadcast channel for terminal screen updates.
     pub terminal_screen_tx: broadcast::Sender<TerminalScreenEvent>,
+    /// Broadcast channel for planner run state updates.
+    pub agent_plan_run_tx: broadcast::Sender<AgentPlanRunEvent>,
     /// Active tmux capture loops, keyed by session_id.
     pub terminal_capture_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
@@ -73,6 +75,7 @@ impl AppState {
         let (chat_delta_tx, _) = broadcast::channel(256);
         let (chat_complete_tx, _) = broadcast::channel(64);
         let (terminal_screen_tx, _) = broadcast::channel(256);
+        let (agent_plan_run_tx, _) = broadcast::channel(256);
 
         tracing::info!(
             node_id = %node_id,
@@ -92,6 +95,7 @@ impl AppState {
             chat_delta_tx,
             chat_complete_tx,
             terminal_screen_tx,
+            agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -103,6 +107,7 @@ impl AppState {
         let (chat_delta_tx, _) = broadcast::channel(256);
         let (chat_complete_tx, _) = broadcast::channel(64);
         let (terminal_screen_tx, _) = broadcast::channel(256);
+        let (agent_plan_run_tx, _) = broadcast::channel(256);
 
         Self {
             db,
@@ -116,6 +121,7 @@ impl AppState {
             chat_delta_tx,
             chat_complete_tx,
             terminal_screen_tx,
+            agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }

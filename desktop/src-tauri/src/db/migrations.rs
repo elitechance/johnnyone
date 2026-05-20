@@ -4,6 +4,7 @@ const MIGRATION_001: &str = include_str!("../../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../../migrations/002_add_cli_session_id.sql");
 const MIGRATION_003: &str = include_str!("../../migrations/003_add_worker_settings.sql");
 const MIGRATION_004: &str = include_str!("../../migrations/004_add_tmux_terminal.sql");
+const MIGRATION_005: &str = include_str!("../../migrations/005_add_agent_plans.sql");
 
 /// Run all pending migrations. Uses a simple version table to track applied migrations.
 pub fn run_migrations(conn: &Connection) -> Result<(), String> {
@@ -34,6 +35,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (2, "002_add_cli_session_id", MIGRATION_002),
         (3, "003_add_worker_settings", MIGRATION_003),
         (4, "004_add_tmux_terminal", MIGRATION_004),
+        (5, "005_add_agent_plans", MIGRATION_005),
     ];
 
     for (version, name, sql) in migrations {

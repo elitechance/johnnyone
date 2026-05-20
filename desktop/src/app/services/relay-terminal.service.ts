@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import { Observable, Subject, firstValueFrom } from 'rxjs';
-import { DesktopNode, JohnnyApiService, TerminalScreen } from '@johnnyone/ui';
+import { AgentPlanRun, DesktopNode, JohnnyApiService, TerminalScreen } from '@johnnyone/ui';
 
 interface RelayEnvelope {
   type: string;
@@ -14,11 +14,18 @@ interface TerminalCommandAck {
   error?: string;
 }
 
+export interface AgentPlanRunUpdate {
+  planId: string;
+  deleted: boolean;
+  run?: AgentPlanRun;
+}
+
 @Injectable({ providedIn: 'root' })
 export class RelayTerminalService {
   private static readonly INPUT_FLUSH_MS = 200;
   private readonly api = inject(JohnnyApiService);
   private readonly screenSubject = new Subject<TerminalScreen>();
+  private readonly agentPlanRunSubject = new Subject<AgentPlanRunUpdate>();
   private socket: WebSocket | null = null;
   private connectedNodeId: string | null = null;
   private pendingInput = new Map<string, string>();
@@ -26,6 +33,14 @@ export class RelayTerminalService {
 
   screens(): Observable<TerminalScreen> {
     return this.screenSubject.asObservable();
+  }
+
+  agentPlanRuns(): Observable<AgentPlanRunUpdate> {
+    return this.agentPlanRunSubject.asObservable();
+  }
+
+  async connect(): Promise<void> {
+    await this.ensureConnected();
   }
 
   async attach(sessionId: string): Promise<void> {
@@ -192,6 +207,10 @@ export class RelayTerminalService {
       if (!ack.accepted) {
         console.error('Terminal command was rejected:', ack.error);
       }
+    }
+
+    if (envelope.type === 'agent_plan_run_updated') {
+      this.agentPlanRunSubject.next(envelope.data as AgentPlanRunUpdate);
     }
   }
 

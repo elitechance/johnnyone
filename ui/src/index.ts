@@ -31,6 +31,14 @@ export type {
   AiChatRunResult,
   AiChatComplete,
   DetectedCliTool,
+  AgentPlan,
+  AgentPlanPhase,
+  AgentPlanTask,
+  AgentPlanEvent,
+  AgentPlanRun,
+  CreateAgentPlanInput,
+  HostFileEntry,
+  WorkspaceValidation,
 } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
 export type {

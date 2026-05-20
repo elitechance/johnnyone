@@ -9,6 +9,7 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
+import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
 import {
   JohnnyApiService,
@@ -74,6 +75,7 @@ export class ChatPage implements OnInit, OnDestroy {
   private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
   private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
   private readonly api = inject(JohnnyApiService);
+  private readonly auth = inject(AuthService);
   private readonly route = inject(ActivatedRoute);
   private readonly relayTerminal = inject(RelayTerminalService);
   private readonly router = inject(Router);
@@ -90,7 +92,11 @@ export class ChatPage implements OnInit, OnDestroy {
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
   private terminalSubscription: Subscription | null = null;
+  private sessionRefreshInterval: ReturnType<typeof setInterval> | null = null;
+  private sessionRefreshInFlight = false;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
+  private compactWorkspaceMediaQuery: MediaQueryList | null = null;
+  private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
 
   // State
   sessions = signal<Session[]>([]);
@@ -122,6 +128,7 @@ export class ChatPage implements OnInit, OnDestroy {
   paneHeight = signal(560);
   isDraggingPane = signal(false);
   isResizingPane = signal(false);
+  isCompactWorkspace = signal(false);
 
   // Computed
   filteredSessions = computed(() => {
@@ -210,19 +217,23 @@ export class ChatPage implements OnInit, OnDestroy {
   });
 
   ngOnInit(): void {
+    this.setupCompactWorkspaceMode();
     this.loadSidebarWidth();
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
     void this.detectTools();
     void this.loadLastWorkingDirectory();
+    this.startSessionRefresh();
   }
 
   ngOnDestroy(): void {
+    this.stopSessionRefresh();
     this.teardownChatSubscriptions();
     this.teardownTerminalSubscription();
     this.clearSessionIdCopiedTimeout();
     this.resetStreamingStatus();
     this.stopSidebarResize();
     this.stopPaneInteraction();
+    this.teardownCompactWorkspaceMode();
   }
 
   // ── Type Mappers ───────────────────────────────────────────────────
@@ -326,6 +337,105 @@ export class ChatPage implements OnInit, OnDestroy {
     } catch (err) {
       console.error('Failed to load sessions:', err);
     }
+  }
+
+  private startSessionRefresh(): void {
+    if (this.sessionRefreshInterval) return;
+    this.sessionRefreshInterval = setInterval(() => {
+      void this.reconcileSessions();
+    }, 2_000);
+  }
+
+  private stopSessionRefresh(): void {
+    if (!this.sessionRefreshInterval) return;
+    clearInterval(this.sessionRefreshInterval);
+    this.sessionRefreshInterval = null;
+  }
+
+  private async reconcileSessions(): Promise<void> {
+    if (this.sessionRefreshInFlight) return;
+    this.sessionRefreshInFlight = true;
+
+    try {
+      const sessions = (await firstValueFrom(this.api.listSessions('active'))).map((session) =>
+        this.mapApiSessionToState(session)
+      );
+      const sortedSessions = this.sortSessions(sessions);
+      const activeIds = new Set(sortedSessions.map((session) => session.id));
+      const current = this.currentSession();
+
+      this.sessions.set(sortedSessions);
+      this.ensurePaneLayouts(sortedSessions);
+      this.removeInactivePaneState(activeIds);
+
+      if (current && activeIds.has(current.id)) {
+        const refreshed = sortedSessions.find((session) => session.id === current.id);
+        if (refreshed) {
+          this.currentSession.set(refreshed);
+          this.selectedProvider.set(refreshed.provider);
+          this.workingDirectory.set(refreshed.working_directory);
+        }
+        return;
+      }
+
+      if (current) {
+        this.terminalScreen.set(null);
+        this.teardownChatSubscriptions();
+        this.teardownTerminalSubscription();
+        this.currentSession.set(null);
+        this.messages.set([]);
+      }
+
+      const nextSession = sortedSessions[0];
+      if (nextSession) {
+        await this.selectSession(nextSession.id);
+      }
+    } catch (err) {
+      console.error('Failed to reconcile sessions:', err);
+    } finally {
+      this.sessionRefreshInFlight = false;
+    }
+  }
+
+  private removeInactivePaneState(activeIds: Set<string>): void {
+    this.terminalScreens.update((screens) => {
+      let changed = false;
+      const next: Record<string, TerminalScreen> = {};
+      for (const [sessionId, screen] of Object.entries(screens)) {
+        if (activeIds.has(sessionId)) {
+          next[sessionId] = screen;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : screens;
+    });
+
+    this.paneLayouts.update((layouts) => {
+      let changed = false;
+      const next: Record<string, PaneLayout> = {};
+      for (const [sessionId, layout] of Object.entries(layouts)) {
+        if (activeIds.has(sessionId)) {
+          next[sessionId] = layout;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : layouts;
+    });
+
+    this.closedPaneIds.update((closedIds) => {
+      const next = new Set<string>();
+      let changed = false;
+      for (const sessionId of closedIds) {
+        if (activeIds.has(sessionId)) {
+          next.add(sessionId);
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : closedIds;
+    });
   }
 
   async createNewSession(): Promise<void> {
@@ -594,6 +704,7 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   startPaneDrag(event: PointerEvent, sessionId = this.currentSession()?.id): void {
+    if (this.isCompactWorkspace()) return;
     const layout = sessionId ? this.paneLayout(sessionId) : null;
     if (!sessionId || !layout) return;
     if ((event.target as HTMLElement).closest('button, select, input')) return;
@@ -642,6 +753,14 @@ export class ChatPage implements OnInit, OnDestroy {
 
     this.paneMoveHandler = (moveEvent) => {
       const currentLayout = this.paneLayout(sessionId);
+      if (this.isCompactWorkspace()) {
+        const maxHeight = Math.max(420, Math.floor(window.innerHeight * 1.5));
+        this.updatePaneLayout(sessionId, {
+          height: this.clamp(this.paneInteractionStart.height + moveEvent.clientY - this.paneInteractionStart.y, 360, maxHeight),
+        });
+        return;
+      }
+
       const maxWidth = Math.max(420, window.innerWidth - currentLayout.x - 18);
       const maxHeight = Math.max(260, window.innerHeight - currentLayout.y - 78);
       this.updatePaneLayout(sessionId, {
@@ -666,6 +785,26 @@ export class ChatPage implements OnInit, OnDestroy {
     }
     this.isDraggingPane.set(false);
     this.isResizingPane.set(false);
+  }
+
+  private setupCompactWorkspaceMode(): void {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+
+    this.compactWorkspaceMediaQuery = window.matchMedia('(max-width: 900px)');
+    this.isCompactWorkspace.set(this.compactWorkspaceMediaQuery.matches);
+    this.compactWorkspaceListener = (event) => {
+      this.stopPaneInteraction();
+      this.isCompactWorkspace.set(event.matches);
+    };
+    this.compactWorkspaceMediaQuery.addEventListener('change', this.compactWorkspaceListener);
+  }
+
+  private teardownCompactWorkspaceMode(): void {
+    if (this.compactWorkspaceMediaQuery && this.compactWorkspaceListener) {
+      this.compactWorkspaceMediaQuery.removeEventListener('change', this.compactWorkspaceListener);
+    }
+    this.compactWorkspaceMediaQuery = null;
+    this.compactWorkspaceListener = null;
   }
 
   private teardownChatSubscriptions(): void {
@@ -985,12 +1124,30 @@ export class ChatPage implements OnInit, OnDestroy {
   }
 
   private defaultPaneLayout(index: number): PaneLayout {
+    if (this.isCompactWorkspace() && typeof window !== 'undefined') {
+      return {
+        x: 0,
+        y: 0,
+        width: Math.max(320, window.innerWidth - 20),
+        height: this.defaultCompactPaneHeight(),
+      };
+    }
+
     return {
       x: 44 + index * 36,
       y: 34 + index * 30,
       width: 860,
       height: 560,
     };
+  }
+
+  private defaultCompactPaneHeight(): number {
+    const workspaceHeight = document.querySelector('.terminal-workspace')?.clientHeight;
+    const availableHeight = workspaceHeight && workspaceHeight > 0
+      ? workspaceHeight - 20
+      : window.innerHeight - 220;
+
+    return this.clamp(Math.floor(availableHeight), 360, 680);
   }
 
   private omitRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -1167,6 +1324,10 @@ export class ChatPage implements OnInit, OnDestroy {
 
   navigateTo(path: string): void {
     this.router.navigate([path]);
+  }
+
+  logout(): void {
+    this.auth.logout();
   }
 
   // Keyboard shortcuts (handled at document level)
