@@ -53,12 +53,16 @@ async function login() {
 
 async function primeAuth(page, auth) {
   await page.evaluateOnNewDocument((workerUrl, loginResult) => {
-    window.localStorage.setItem('johnnyone_worker_url', workerUrl);
-    window.localStorage.setItem('johnnyone_access_token', loginResult.accessToken);
-    window.localStorage.setItem('johnnyone_refresh_token', loginResult.refreshToken);
-    window.localStorage.setItem('johnnyone_tenant_id', loginResult.user.tenantId);
-    window.localStorage.setItem('johnnyone_user_id', loginResult.user.id);
-    window.localStorage.setItem('johnnyone_auth_user', JSON.stringify(loginResult.user));
+    try {
+      window.localStorage.setItem('johnnyone_worker_url', workerUrl);
+      window.localStorage.setItem('johnnyone_access_token', loginResult.accessToken);
+      window.localStorage.setItem('johnnyone_refresh_token', loginResult.refreshToken);
+      window.localStorage.setItem('johnnyone_tenant_id', loginResult.user.tenantId);
+      window.localStorage.setItem('johnnyone_user_id', loginResult.user.id);
+      window.localStorage.setItem('johnnyone_auth_user', JSON.stringify(loginResult.user));
+    } catch {
+      // Some browser bootstrap documents do not expose localStorage.
+    }
   }, WORKER_URL, auth);
 }
 
@@ -154,9 +158,37 @@ async function run() {
       { timeout: 30000 },
       testTitle,
     );
+
+    const rowsBeforeResize = await page.$eval('.planner-workspace', (node) => getComputedStyle(node).gridTemplateRows);
+    const resizerBox = await page.$eval('.coordinator-resizer', (node) => {
+      const rect = node.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    });
+    await page.mouse.move(resizerBox.x, resizerBox.y);
+    await page.mouse.down();
+    await page.mouse.move(resizerBox.x, resizerBox.y - 70);
+    await page.mouse.up();
+    const rowsAfterResize = await page.$eval('.planner-workspace', (node) => getComputedStyle(node).gridTemplateRows);
+    assert(rowsBeforeResize !== rowsAfterResize, 'Coordinator divider should resize the coordinator panel');
+    await screenshot(page, '04-coordinator-resized');
+
+    await page.click('.phase-row');
+    await page.waitForSelector('.phase-tasks-modal', { timeout: 15000 });
+    await screenshot(page, '05-phase-tasks-modal');
+    const phaseModalHasTasks = await page.evaluate(() => {
+      const modal = document.querySelector('.phase-tasks-modal');
+      return Boolean(
+        modal?.textContent?.includes('Tasks:')
+        && modal.querySelector('.phase-task-row')
+        && modal.textContent.includes('Status'),
+      );
+    });
+    assert(phaseModalHasTasks, 'Clicking a phase card should show task statuses from the plan run');
+    await page.click('.phase-tasks-modal .icon-action');
+
     await page.click('.coordinator-actions .secondary-action');
     await page.waitForSelector('.files-modal', { timeout: 15000 });
-    await screenshot(page, '04-files-modal');
+    await screenshot(page, '06-files-modal');
 
     const hasGlobalError = await page.evaluate(() => document.querySelector('.error-banner') !== null);
     assert(!hasGlobalError, 'Files modal should not create a global error banner');

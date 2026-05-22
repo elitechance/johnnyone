@@ -28,12 +28,15 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   @Input() screen: TerminalScreen | null = null;
   @Input() disabled = false;
   @Input() mobileInputMode = false;
+  @Input() showInput = true;
   @Input() title = 'Terminal';
 
   @Output() rawInput = new EventEmitter<string>();
   @Output() terminalResize = new EventEmitter<{ cols: number; rows: number }>();
 
+  @ViewChild('terminalShell', { static: true }) private terminalShell!: ElementRef<HTMLElement>;
   @ViewChild('terminalHost', { static: true }) private terminalHost!: ElementRef<HTMLDivElement>;
+  @ViewChild('mobileInput') private mobileInput?: ElementRef<HTMLTextAreaElement>;
 
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
@@ -44,15 +47,13 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private writing = false;
   private wheelHandler: ((event: WheelEvent) => void) | null = null;
   private idlePromptTimer: ReturnType<typeof setTimeout> | null = null;
-  protected localInputBuffer = '';
   protected mobileInputBuffer = '';
-  protected showLocalPrompt = false;
 
   ngAfterViewInit(): void {
     this.terminal = new Terminal({
       cursorBlink: true,
       convertEol: true,
-      disableStdin: this.disabled || this.mobileInputMode,
+      disableStdin: true,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
       fontSize: 14,
       lineHeight: 1.2,
@@ -67,7 +68,6 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.terminalHost.nativeElement);
-    this.terminalHost.nativeElement.addEventListener('pointerdown', () => this.terminal?.focus());
     this.wheelHandler = (event) => {
       if (!this.terminal) return;
       const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
@@ -75,13 +75,9 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       event.preventDefault();
     };
     this.terminalHost.nativeElement.addEventListener('wheel', this.wheelHandler, { passive: false });
-    this.terminal.onData((data) => {
-      if (!this.disabled && !this.mobileInputMode) {
-        this.echoRawInput(data);
-      }
-    });
 
     this.resizeObserver = new ResizeObserver(() => this.fit());
+    this.resizeObserver.observe(this.terminalShell.nativeElement);
     this.resizeObserver.observe(this.terminalHost.nativeElement);
     this.fit();
     this.renderScreen(true);
@@ -89,15 +85,15 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   ngOnChanges(changes: SimpleChanges): void {
     if (changes['disabled'] && this.terminal) {
-      this.terminal.options.disableStdin = this.disabled || this.mobileInputMode;
+      this.terminal.options.disableStdin = true;
     }
 
     if (changes['mobileInputMode'] && this.terminal) {
-      this.terminal.options.disableStdin = this.disabled || this.mobileInputMode;
-      if (this.mobileInputMode) {
-        this.localInputBuffer = '';
-        this.showLocalPrompt = false;
-      }
+      this.terminal.options.disableStdin = true;
+    }
+
+    if (changes['showInput']) {
+      queueMicrotask(() => this.fit());
     }
 
     if (changes['screen']) {
@@ -124,28 +120,56 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   @HostListener('pointerdown')
   focus(): void {
-    if (this.mobileInputMode) return;
-    this.terminal?.focus();
+    this.terminalHost.nativeElement
+      .closest('johnny-terminal-screen')
+      ?.querySelector<HTMLTextAreaElement>('textarea[name="terminalInput"]')
+      ?.focus();
   }
 
-  protected submitMobileInput(): void {
+  protected submitTerminalInput(): void {
     if (this.disabled) return;
 
     const input = this.mobileInputBuffer;
     this.mobileInputBuffer = '';
     this.rawInput.emit(`${input}\r`);
+    this.refocusMobileInput();
   }
 
   protected sendControlInput(input: string): void {
     if (this.disabled) return;
     this.rawInput.emit(input);
+    this.refocusMobileInput();
   }
 
   protected onMobileInputKeydown(event: KeyboardEvent): void {
     if (event.key !== 'Enter' || event.shiftKey) return;
 
     event.preventDefault();
-    this.submitMobileInput();
+    this.submitTerminalInput();
+  }
+
+  protected onTerminalInputPaste(event: ClipboardEvent): void {
+    if (this.disabled) return;
+
+    const text = event.clipboardData?.getData('text/plain');
+    if (!text) return;
+
+    event.preventDefault();
+    const textarea = event.target as HTMLTextAreaElement;
+    const start = textarea.selectionStart ?? this.mobileInputBuffer.length;
+    const end = textarea.selectionEnd ?? start;
+    this.mobileInputBuffer = `${this.mobileInputBuffer.slice(0, start)}${text}${this.mobileInputBuffer.slice(end)}`;
+
+    queueMicrotask(() => {
+      const cursor = start + text.length;
+      textarea.selectionStart = cursor;
+      textarea.selectionEnd = cursor;
+    });
+  }
+
+  private refocusMobileInput(): void {
+    if (!this.mobileInputMode) return;
+    queueMicrotask(() => this.mobileInput?.nativeElement.focus());
   }
 
   fit(): void {
@@ -189,6 +213,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.terminal.write(`\x1b[?25l\x1b[3J\x1b[H\x1b[2J${content}\x1b[?25h`, () => {
       this.writing = false;
       if (!this.terminal || !this.screen) return;
+      this.terminal.scrollToBottom();
 
       const latest = this.normalizeSnapshot(this.compactSnapshot(this.screen.content || ''));
       if (latest !== this.lastContent) {
@@ -213,53 +238,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     return lines.join('\n');
   }
 
-  private echoRawInput(data: string): void {
-    if (!this.terminal) return;
-
-    for (const char of Array.from(data)) {
-      this.echoRawInputChar(char);
-    }
-  }
-
-  private echoRawInputChar(char: string): void {
-    const code = char.charCodeAt(0);
-    this.showLocalPrompt = true;
-
-    if (code === 3) {
-      this.localInputBuffer = '';
-      this.rawInput.emit(char);
-      return;
-    }
-
-    if (char === '\r' || char === '\n') {
-      const input = this.localInputBuffer;
-      this.localInputBuffer = '';
-      this.showLocalPrompt = false;
-      this.rawInput.emit(`${input}\r`);
-      return;
-    }
-
-    if (code === 21) {
-      this.localInputBuffer = '';
-      return;
-    }
-
-    if (code === 8 || code === 127) {
-      this.localInputBuffer = this.localInputBuffer.slice(0, -1);
-      return;
-    }
-
-    if (code >= 32 && code !== 127) {
-      this.localInputBuffer += char;
-      return;
-    }
-
-    this.rawInput.emit(char);
-  }
-
   private resetIdlePromptTimer(): void {
-    if (this.disabled || this.mobileInputMode) return;
     if (this.idlePromptTimer) clearTimeout(this.idlePromptTimer);
-    this.showLocalPrompt = this.localInputBuffer.length > 0;
   }
 }

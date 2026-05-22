@@ -15,6 +15,13 @@
         "browser": "desktop/src/main.ts",
         "tsConfig": "desktop/tsconfig.app.json",
         "polyfills": ["zone.js"],
+        "assets": [
+          {
+            "glob": "_redirects",
+            "input": "desktop/src",
+            "output": "."
+          }
+        ],
         "styles": ["desktop/src/styles.scss"],
         "scripts": []
       }
@@ -30,6 +37,18 @@
     },
     "e2e-planner-smoke": {
       "command": "node desktop/e2e/planner-smoke.e2e.cjs"
+    },
+    "e2e-mobile-shell": {
+      "command": "node desktop/e2e/mobile-shell.e2e.cjs"
+    },
+    "e2e-mobile-terminal": {
+      "command": "node desktop/e2e/mobile-terminal.e2e.cjs"
+    },
+    "e2e-mobile-planner-panels": {
+      "command": "node desktop/e2e/mobile-planner-panels.e2e.cjs"
+    },
+    "e2e-mobile-cross-client": {
+      "command": "node desktop/e2e/mobile-cross-client.e2e.cjs"
     },
     "tauri-dev": {
       "command": "cd desktop/src-tauri && cargo tauri dev"

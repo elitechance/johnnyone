@@ -4,6 +4,7 @@ use crate::db::models::{
 use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::services::{
     chat_host,
+    planner_prompts::{self as planner_prompt_service, PlannerPromptSettings},
     providers::{self as provider_service, DetectedTool},
     sessions as session_service, settings as settings_service,
 };
@@ -112,6 +113,10 @@ impl QueryRoot {
     async fn get_setting(&self, ctx: &Context<'_>, key: String) -> async_graphql::Result<String> {
         let state = ctx.data_unchecked::<AppState>();
         Ok(settings_service::get_setting(state, key)?)
+    }
+
+    async fn get_planner_prompt_settings(&self) -> async_graphql::Result<GqlPlannerPromptSettings> {
+        Ok(planner_prompt_service::load_prompt_settings()?.into())
     }
 }
 
@@ -240,6 +245,13 @@ impl MutationRoot {
         let state = ctx.data_unchecked::<AppState>();
         settings_service::set_setting(state, key, value)?;
         Ok(true)
+    }
+
+    async fn set_planner_prompt_settings(
+        &self,
+        input: PlannerPromptSettingsInput,
+    ) -> async_graphql::Result<GqlPlannerPromptSettings> {
+        Ok(planner_prompt_service::save_prompt_settings(input.into())?.into())
     }
 }
 
@@ -397,6 +409,44 @@ impl From<DetectedTool> for GqlDetectedTool {
 }
 
 #[derive(SimpleObject, Clone)]
+#[graphql(name = "PlannerPromptSettings", rename_fields = "camelCase")]
+struct GqlPlannerPromptSettings {
+    schema: String,
+    development: GqlPlannerDevelopmentPrompts,
+    planning: GqlPlannerPlanningPrompts,
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "PlannerDevelopmentPrompts", rename_fields = "camelCase")]
+struct GqlPlannerDevelopmentPrompts {
+    worker: String,
+    reviewer: String,
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "PlannerPlanningPrompts", rename_fields = "camelCase")]
+struct GqlPlannerPlanningPrompts {
+    planner: String,
+    reviewer: String,
+}
+
+impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
+    fn from(value: PlannerPromptSettings) -> Self {
+        Self {
+            schema: value.schema,
+            development: GqlPlannerDevelopmentPrompts {
+                worker: value.development.worker,
+                reviewer: value.development.reviewer,
+            },
+            planning: GqlPlannerPlanningPrompts {
+                planner: value.planning.planner,
+                reviewer: value.planning.reviewer,
+            },
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
 #[graphql(name = "AiChatRunResult", rename_fields = "camelCase")]
 struct AiChatRunResult {
     user_message: AiMessage,
@@ -495,6 +545,43 @@ impl From<UpsertProviderConfigInputGql> for UpsertProviderConfigInput {
             api_key: value.api_key,
             default_model: value.default_model,
             settings: value.settings,
+        }
+    }
+}
+
+#[derive(InputObject)]
+#[graphql(name = "PlannerPromptSettingsInput", rename_fields = "camelCase")]
+struct PlannerPromptSettingsInput {
+    development: PlannerDevelopmentPromptsInput,
+    planning: PlannerPlanningPromptsInput,
+}
+
+#[derive(InputObject)]
+#[graphql(name = "PlannerDevelopmentPromptsInput", rename_fields = "camelCase")]
+struct PlannerDevelopmentPromptsInput {
+    worker: String,
+    reviewer: String,
+}
+
+#[derive(InputObject)]
+#[graphql(name = "PlannerPlanningPromptsInput", rename_fields = "camelCase")]
+struct PlannerPlanningPromptsInput {
+    planner: String,
+    reviewer: String,
+}
+
+impl From<PlannerPromptSettingsInput> for PlannerPromptSettings {
+    fn from(value: PlannerPromptSettingsInput) -> Self {
+        Self {
+            schema: String::new(),
+            development: planner_prompt_service::PlannerDevelopmentPrompts {
+                worker: value.development.worker,
+                reviewer: value.development.reviewer,
+            },
+            planning: planner_prompt_service::PlannerPlanningPrompts {
+                planner: value.planning.planner,
+                reviewer: value.planning.reviewer,
+            },
         }
     }
 }

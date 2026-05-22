@@ -83,6 +83,7 @@ pub struct UpsertProviderConfigInput {
 #[serde(rename_all = "camelCase")]
 pub struct AgentPlan {
     pub id: String,
+    pub run_type: String,
     pub title: String,
     pub workspace_path: String,
     pub plan_path: String,
@@ -94,6 +95,10 @@ pub struct AgentPlan {
     pub current_phase_id: Option<String>,
     pub current_phase_index: i64,
     pub error: Option<String>,
+    pub brief: Option<String>,
+    pub app_scope: Option<String>,
+    pub docs_scope: Option<String>,
+    pub reference_paths: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -150,11 +155,16 @@ pub struct AgentPlanEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateAgentPlanInput {
+    pub run_type: Option<String>,
     pub title: Option<String>,
     pub workspace_path: String,
     pub plan_path: String,
     pub worker_provider: String,
     pub reviewer_provider: String,
+    pub brief: Option<String>,
+    pub app_scope: Option<String>,
+    pub docs_scope: Option<String>,
+    pub reference_paths: Option<String>,
 }
 
 // ── Usage Log ────────────────────────────────────────────────────────────────

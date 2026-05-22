@@ -1,5 +1,6 @@
 export interface TerminalScreen {
   sessionId: string;
+  tmuxSessionName?: string;
   paneId: string;
   cursor: number;
   content: string;

@@ -50,7 +50,7 @@ app:
         dev: nx build desktop
         prod: nx build desktop
       outputs:
-        - dist/desktop
+        - dist/desktop/browser
 
     mobile-web:
       kind: mobile

@@ -22,6 +22,7 @@ import {
   TerminalScreen,
 } from '@johnnyone/ui';
 import { firstValueFrom, Subscription } from 'rxjs';
+import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 
 interface Session {
   id: string;
@@ -92,11 +93,19 @@ export class ChatPage implements OnInit, OnDestroy {
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
   private terminalSubscription: Subscription | null = null;
-  private sessionRefreshInterval: ReturnType<typeof setInterval> | null = null;
-  private sessionRefreshInFlight = false;
+  private sessionUpdateSubscription: Subscription | null = null;
+  private sessionDeleteSubscription: Subscription | null = null;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
   private compactWorkspaceMediaQuery: MediaQueryList | null = null;
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
+  private terminalVisualSubscriptions = new Set<string>();
+  private readonly visibilityChangeHandler = () => {
+    if (document.hidden) {
+      void this.unsubscribeAllTerminalVisuals();
+    } else {
+      void this.syncTerminalVisualSubscriptions();
+    }
+  };
 
   // State
   sessions = signal<Session[]>([]);
@@ -145,7 +154,9 @@ export class ChatPage implements OnInit, OnDestroy {
   );
 
   visiblePaneSessions = computed<SharedAiSession[]>(() =>
-    this.aiSessions()
+    this.isCompactWorkspace()
+      ? this.aiSessions().filter((session) => session.id === this.currentSession()?.id)
+      : this.aiSessions()
   );
 
   aiMessages = computed<SharedAiMessage[]>(() => {
@@ -219,16 +230,21 @@ export class ChatPage implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.setupCompactWorkspaceMode();
     this.loadSidebarWidth();
+    this.subscribeToTerminalEvents();
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
     void this.detectTools();
     void this.loadLastWorkingDirectory();
-    this.startSessionRefresh();
+    this.subscribeToRelaySessionEvents();
+    document.addEventListener('visibilitychange', this.visibilityChangeHandler);
+    void this.relayTerminal.connect();
   }
 
   ngOnDestroy(): void {
-    this.stopSessionRefresh();
+    document.removeEventListener('visibilitychange', this.visibilityChangeHandler);
+    void this.unsubscribeAllTerminalVisuals();
     this.teardownChatSubscriptions();
     this.teardownTerminalSubscription();
+    this.teardownRelaySessionEvents();
     this.clearSessionIdCopiedTimeout();
     this.resetStreamingStatus();
     this.stopSidebarResize();
@@ -310,6 +326,7 @@ export class ChatPage implements OnInit, OnDestroy {
       const sortedSessions = this.sortSessions(sessions);
       this.sessions.set(sortedSessions);
       this.ensurePaneLayouts(sortedSessions);
+      await this.syncTerminalVisualSubscriptions();
 
       const current = this.currentSession();
       if (targetSessionId) {
@@ -336,64 +353,6 @@ export class ChatPage implements OnInit, OnDestroy {
       }
     } catch (err) {
       console.error('Failed to load sessions:', err);
-    }
-  }
-
-  private startSessionRefresh(): void {
-    if (this.sessionRefreshInterval) return;
-    this.sessionRefreshInterval = setInterval(() => {
-      void this.reconcileSessions();
-    }, 2_000);
-  }
-
-  private stopSessionRefresh(): void {
-    if (!this.sessionRefreshInterval) return;
-    clearInterval(this.sessionRefreshInterval);
-    this.sessionRefreshInterval = null;
-  }
-
-  private async reconcileSessions(): Promise<void> {
-    if (this.sessionRefreshInFlight) return;
-    this.sessionRefreshInFlight = true;
-
-    try {
-      const sessions = (await firstValueFrom(this.api.listSessions('active'))).map((session) =>
-        this.mapApiSessionToState(session)
-      );
-      const sortedSessions = this.sortSessions(sessions);
-      const activeIds = new Set(sortedSessions.map((session) => session.id));
-      const current = this.currentSession();
-
-      this.sessions.set(sortedSessions);
-      this.ensurePaneLayouts(sortedSessions);
-      this.removeInactivePaneState(activeIds);
-
-      if (current && activeIds.has(current.id)) {
-        const refreshed = sortedSessions.find((session) => session.id === current.id);
-        if (refreshed) {
-          this.currentSession.set(refreshed);
-          this.selectedProvider.set(refreshed.provider);
-          this.workingDirectory.set(refreshed.working_directory);
-        }
-        return;
-      }
-
-      if (current) {
-        this.terminalScreen.set(null);
-        this.teardownChatSubscriptions();
-        this.teardownTerminalSubscription();
-        this.currentSession.set(null);
-        this.messages.set([]);
-      }
-
-      const nextSession = sortedSessions[0];
-      if (nextSession) {
-        await this.selectSession(nextSession.id);
-      }
-    } catch (err) {
-      console.error('Failed to reconcile sessions:', err);
-    } finally {
-      this.sessionRefreshInFlight = false;
     }
   }
 
@@ -438,6 +397,66 @@ export class ChatPage implements OnInit, OnDestroy {
     });
   }
 
+  private subscribeToRelaySessionEvents(): void {
+    if (!this.sessionUpdateSubscription) {
+      this.sessionUpdateSubscription = this.relayTerminal.sessionUpdates().subscribe(({ session }) => {
+        const mapped = this.mapApiSessionToState(session);
+        if (mapped.status === 'active') {
+          this.upsertSession(mapped);
+          this.ensurePaneLayouts(this.sessions());
+          void this.syncTerminalVisualSubscriptions();
+        } else {
+          void this.unsubscribeTerminalVisual(mapped.id);
+          this.removeSessionLocally(mapped.id);
+        }
+        if (this.currentSession()?.id === mapped.id) {
+          if (mapped.status === 'active') {
+            this.currentSession.set(mapped);
+            this.selectedProvider.set(mapped.provider);
+            this.workingDirectory.set(mapped.working_directory);
+          } else {
+            this.clearCurrentSession(mapped.id);
+          }
+        }
+      });
+    }
+
+    if (!this.sessionDeleteSubscription) {
+      this.sessionDeleteSubscription = this.relayTerminal.sessionDeletes().subscribe((sessionId) => {
+        void this.unsubscribeTerminalVisual(sessionId);
+        this.removeSessionLocally(sessionId);
+        this.clearCurrentSession(sessionId);
+      });
+    }
+  }
+
+  private teardownRelaySessionEvents(): void {
+    this.sessionUpdateSubscription?.unsubscribe();
+    this.sessionUpdateSubscription = null;
+    this.sessionDeleteSubscription?.unsubscribe();
+    this.sessionDeleteSubscription = null;
+  }
+
+  private removeSessionLocally(id: string): void {
+    this.sessions.update((sessions) => sessions.filter((session) => session.id !== id));
+    this.terminalScreens.update((screens) => this.omitRecordKey(screens, id));
+    this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, id));
+    this.closedPaneIds.update((closedIds) => {
+      if (!closedIds.has(id)) return closedIds;
+      const next = new Set(closedIds);
+      next.delete(id);
+      return next;
+    });
+  }
+
+  private clearCurrentSession(id: string): void {
+    if (this.currentSession()?.id !== id) return;
+    this.teardownChatSubscriptions();
+    this.currentSession.set(null);
+    this.messages.set([]);
+    this.terminalScreen.set(null);
+  }
+
   async createNewSession(): Promise<void> {
     try {
       const session = this.mapApiSessionToState(await firstValueFrom(this.api.createSession({
@@ -466,7 +485,6 @@ export class ChatPage implements OnInit, OnDestroy {
       this.selectedProvider.set(session.provider);
       this.workingDirectory.set(session.working_directory);
       this.messages.set(messages);
-      this.subscribeToTerminalEvents();
       await this.attachTerminal(id);
 
       this.isStreaming.set(false);
@@ -670,11 +688,44 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async attachTerminal(sessionId: string): Promise<void> {
     try {
-      await this.relayTerminal.attach(sessionId);
+      await this.relayTerminal.refreshVisual(sessionId);
+      this.terminalVisualSubscriptions.add(sessionId);
       this.terminalError.set(null);
     } catch (err) {
       console.error('Failed to attach terminal:', err);
       this.terminalError.set(String(err));
+    }
+  }
+
+  private async syncTerminalVisualSubscriptions(): Promise<void> {
+    if (document.hidden) return;
+    const visibleIds = new Set(this.visiblePaneSessions().map((session) => session.id));
+
+    for (const sessionId of Array.from(this.terminalVisualSubscriptions)) {
+      if (!visibleIds.has(sessionId)) {
+        await this.unsubscribeTerminalVisual(sessionId);
+      }
+    }
+
+    for (const sessionId of visibleIds) {
+      await this.subscribeTerminalVisual(sessionId);
+    }
+  }
+
+  private async subscribeTerminalVisual(sessionId: string): Promise<void> {
+    if (this.terminalVisualSubscriptions.has(sessionId)) return;
+    await this.relayTerminal.subscribeVisual(sessionId);
+    this.terminalVisualSubscriptions.add(sessionId);
+  }
+
+  private async unsubscribeTerminalVisual(sessionId: string): Promise<void> {
+    if (!this.terminalVisualSubscriptions.delete(sessionId)) return;
+    await this.relayTerminal.unsubscribeVisual(sessionId);
+  }
+
+  private async unsubscribeAllTerminalVisuals(): Promise<void> {
+    for (const sessionId of Array.from(this.terminalVisualSubscriptions)) {
+      await this.unsubscribeTerminalVisual(sessionId);
     }
   }
 
@@ -790,11 +841,12 @@ export class ChatPage implements OnInit, OnDestroy {
   private setupCompactWorkspaceMode(): void {
     if (typeof window === 'undefined' || !window.matchMedia) return;
 
-    this.compactWorkspaceMediaQuery = window.matchMedia('(max-width: 900px)');
+    this.compactWorkspaceMediaQuery = window.matchMedia(WORKSPACE_MOBILE_MEDIA_QUERY);
     this.isCompactWorkspace.set(this.compactWorkspaceMediaQuery.matches);
     this.compactWorkspaceListener = (event) => {
       this.stopPaneInteraction();
       this.isCompactWorkspace.set(event.matches);
+      void this.syncTerminalVisualSubscriptions();
     };
     this.compactWorkspaceMediaQuery.addEventListener('change', this.compactWorkspaceListener);
   }
@@ -978,6 +1030,7 @@ export class ChatPage implements OnInit, OnDestroy {
 
   async closeTerminalPane(sessionId: string, killTerminal = true): Promise<void> {
     const wasCurrentSession = this.currentSession()?.id === sessionId;
+    await this.unsubscribeTerminalVisual(sessionId);
 
     try {
       if (killTerminal) {

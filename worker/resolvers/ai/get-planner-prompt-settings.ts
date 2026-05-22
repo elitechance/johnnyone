@@ -11,13 +11,10 @@ interface WorkerEnv {
   [key: string]: unknown;
 }
 
-export default async function listAgentPlans(
+export default async function getPlannerPromptSettings(
   _parent: unknown,
-  args: { status?: string; runType?: string },
+  _args: Record<string, never>,
   ctx: ResolverContext,
 ) {
-  return desktopRpc<unknown[]>(ctx, 'list_agent_plans', {
-    status: args.status ?? null,
-    runType: args.runType ?? null,
-  });
+  return desktopRpc<unknown>(ctx, 'get_planner_prompt_settings');
 }

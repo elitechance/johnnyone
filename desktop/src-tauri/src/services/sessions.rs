@@ -1,4 +1,5 @@
 use crate::db::models::{CreateSessionInput, Message, Session};
+use crate::events::SessionUpdatedEvent;
 use crate::providers::CliProvider;
 use crate::state::app_state::AppState;
 use rusqlite::params;
@@ -22,7 +23,7 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
         })?,
     };
 
-    state.db.with_conn(|conn| {
+    let session = state.db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO sessions (id, title, provider, model, working_directory) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, title, provider, model, working_directory],
@@ -30,7 +31,9 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
         .map_err(|e| format!("Failed to create session: {}", e))?;
 
         query_session(conn, &id)
-    })
+    })?;
+    publish_session_update(state, &session);
+    Ok(session)
 }
 
 pub fn list_sessions(state: &AppState, status: Option<String>) -> Result<Vec<Session>, String> {
@@ -82,7 +85,7 @@ pub fn update_session_title(
     id: String,
     title: String,
 ) -> Result<Session, String> {
-    state.db.with_conn(|conn| {
+    let session = state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE sessions SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![title, id],
@@ -90,7 +93,9 @@ pub fn update_session_title(
         .map_err(|e| format!("Failed to update title: {}", e))?;
 
         query_session(conn, &id)
-    })
+    })?;
+    publish_session_update(state, &session);
+    Ok(session)
 }
 
 pub fn update_session_working_directory(
@@ -98,7 +103,7 @@ pub fn update_session_working_directory(
     id: String,
     working_directory: String,
 ) -> Result<Session, String> {
-    state.db.with_conn(|conn| {
+    let session = state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE sessions SET working_directory = ?1, cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?2",
             params![working_directory, id],
@@ -106,7 +111,9 @@ pub fn update_session_working_directory(
         .map_err(|e| format!("Failed to update working directory: {}", e))?;
 
         query_session(conn, &id)
-    })
+    })?;
+    publish_session_update(state, &session);
+    Ok(session)
 }
 
 pub fn update_session_provider(
@@ -118,7 +125,7 @@ pub fn update_session_provider(
     let parsed = CliProvider::from_str(&normalized)
         .ok_or_else(|| format!("Unsupported provider: {}", provider))?;
 
-    state.db.with_conn(|conn| {
+    let session = state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE sessions SET provider = ?1, cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?2",
             params![parsed.as_str(), id],
@@ -126,7 +133,9 @@ pub fn update_session_provider(
         .map_err(|e| format!("Failed to update provider: {}", e))?;
 
         query_session(conn, &id)
-    })
+    })?;
+    publish_session_update(state, &session);
+    Ok(session)
 }
 
 pub async fn archive_session(state: &AppState, id: String) -> Result<Session, String> {
@@ -137,7 +146,7 @@ pub async fn archive_session(state: &AppState, id: String) -> Result<Session, St
         }
     }
 
-    state.db.with_conn(|conn| {
+    let session = state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE sessions SET status = 'archived', updated_at = datetime('now') WHERE id = ?1",
             params![id],
@@ -145,7 +154,9 @@ pub async fn archive_session(state: &AppState, id: String) -> Result<Session, St
         .map_err(|e| format!("Failed to archive session: {}", e))?;
 
         query_session(conn, &id)
-    })
+    })?;
+    publish_session_update(state, &session);
+    Ok(session)
 }
 
 pub async fn delete_session(state: &AppState, id: String) -> Result<bool, String> {
@@ -231,4 +242,14 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
         },
     )
     .map_err(|e| format!("Session not found: {}", e))
+}
+
+fn publish_session_update(state: &AppState, session: &Session) {
+    let Ok(value) = serde_json::to_value(session) else {
+        return;
+    };
+    let _ = state.session_updated_tx.send(SessionUpdatedEvent {
+        session_id: session.id.clone(),
+        session: value,
+    });
 }

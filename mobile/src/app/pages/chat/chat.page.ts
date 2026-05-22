@@ -50,6 +50,9 @@ interface RelayEnvelope {
     messageId?: string;
     paneId?: string;
     cursor?: number;
+    cursorX?: number;
+    cursorY?: number;
+    historyLines?: number;
     rows?: number;
     cols?: number;
     status?: string;
@@ -313,6 +316,9 @@ export class ChatPage implements OnInit, OnDestroy {
           paneId: data.paneId || '',
           cursor: data.cursor || 0,
           content: data.content || '',
+          cursorX: data.cursorX || 0,
+          cursorY: data.cursorY || 0,
+          historyLines: data.historyLines || 0,
           rows: data.rows || 30,
           cols: data.cols || 100,
           status: data.status || 'attached',

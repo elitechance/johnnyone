@@ -4,6 +4,11 @@ import { authGuard } from './services/auth.guard';
 export const routes: Routes = [
   {
     path: '',
+    redirectTo: 'terminal',
+    pathMatch: 'full',
+  },
+  {
+    path: 'terminal',
     redirectTo: 'chat',
     pathMatch: 'full',
   },
@@ -32,7 +37,20 @@ export const routes: Routes = [
   },
   {
     path: 'planner',
+    redirectTo: 'development',
+    pathMatch: 'full',
+  },
+  {
+    path: 'planning',
     canActivate: [authGuard],
+    data: { mode: 'planning' },
+    loadComponent: () =>
+      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
+  },
+  {
+    path: 'development',
+    canActivate: [authGuard],
+    data: { mode: 'development' },
     loadComponent: () =>
       import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
@@ -44,6 +62,6 @@ export const routes: Routes = [
   },
   {
     path: '**',
-    redirectTo: 'chat',
+    redirectTo: 'terminal',
   },
 ];

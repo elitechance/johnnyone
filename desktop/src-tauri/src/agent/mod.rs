@@ -12,9 +12,9 @@ use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use message_types::{
-    AgentEnvelope, AgentMessage, RelayChatComplete, RelayChatDelta, RelayChatRequest,
-    RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted, AgentPlanRunUpdated,
-    TerminalCommandAck, TerminalScreen,
+    AgentEnvelope, AgentMessage, AgentPlanRunUpdated, RelayChatComplete, RelayChatDelta,
+    RelayChatRequest, RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted,
+    SessionUpdated, TerminalCommandAck, TerminalScreen,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -169,6 +169,7 @@ impl AgentService {
     ) -> Result<(), String> {
         let mut shutdown_rx = state.shutdown_tx.subscribe();
         let mut session_deleted_rx = state.session_deleted_tx.subscribe();
+        let mut session_updated_rx = state.session_updated_tx.subscribe();
         let mut terminal_screen_rx = state.terminal_screen_tx.subscribe();
         let mut agent_plan_run_rx = state.agent_plan_run_tx.subscribe();
 
@@ -218,10 +219,25 @@ impl AgentService {
                         tracing::info!(session_id = %session_id, "Broadcast session_deleted to relay");
                     }
                 }
+                Ok(event) = session_updated_rx.recv() => {
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::SessionUpdated(SessionUpdated {
+                            session_id: event.session_id,
+                            session: event.session,
+                        }),
+                    };
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        let mut writer = ws_write.lock().await;
+                        let _ = writer.send(
+                            tokio_tungstenite::tungstenite::Message::Text(json.into())
+                        ).await;
+                    }
+                }
                 Ok(screen) = terminal_screen_rx.recv() => {
                     let envelope = AgentEnvelope {
                         message: AgentMessage::TerminalScreen(TerminalScreen {
                             session_id: screen.session_id,
+                            tmux_session_name: screen.tmux_session_name,
                             pane_id: screen.pane_id,
                             cursor: screen.cursor,
                             content: screen.content,
@@ -369,8 +385,8 @@ impl AgentService {
                 let ws = Arc::clone(ws_write);
                 let st = Arc::clone(state);
                 tokio::spawn(async move {
-                    let result = if command.data.is_empty() {
-                        crate::terminal::attach_terminal_headless(
+                    let result = if command.control.as_deref() == Some("visual_subscribe") {
+                        crate::terminal::subscribe_terminal_visual(
                             &st,
                             command.session_id.clone(),
                             120,
@@ -378,6 +394,19 @@ impl AgentService {
                         )
                         .await
                         .map(|_| ())
+                    } else if command.control.as_deref() == Some("visual_refresh") {
+                        crate::terminal::refresh_terminal_visual(
+                            &st,
+                            command.session_id.clone(),
+                            120,
+                            36,
+                        )
+                        .await
+                        .map(|_| ())
+                    } else if command.control.as_deref() == Some("visual_unsubscribe") {
+                        crate::terminal::unsubscribe_terminal_visual(&st, &command.session_id).await
+                    } else if command.data.is_empty() {
+                        Ok(())
                     } else {
                         crate::terminal::send_terminal_input(
                             &st,
@@ -390,6 +419,61 @@ impl AgentService {
                     let ack = TerminalCommandAck {
                         request_id: command.request_id,
                         session_id: command.session_id,
+                        accepted: result.is_ok(),
+                        error: result.err(),
+                    };
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::TerminalCommandAck(ack),
+                    };
+                    if let Ok(msg) = serde_json::to_string(&envelope) {
+                        let mut writer = ws.lock().await;
+                        let _ = writer
+                            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                            .await;
+                    }
+                });
+            }
+            AgentMessage::TerminalVisualSubscribe(subscription) => {
+                let ws = Arc::clone(ws_write);
+                let st = Arc::clone(state);
+                tokio::spawn(async move {
+                    let result = crate::terminal::subscribe_terminal_visual(
+                        &st,
+                        subscription.session_id.clone(),
+                        120,
+                        36,
+                    )
+                    .await
+                    .map(|_| ());
+
+                    let ack = TerminalCommandAck {
+                        request_id: subscription.request_id,
+                        session_id: subscription.session_id,
+                        accepted: result.is_ok(),
+                        error: result.err(),
+                    };
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::TerminalCommandAck(ack),
+                    };
+                    if let Ok(msg) = serde_json::to_string(&envelope) {
+                        let mut writer = ws.lock().await;
+                        let _ = writer
+                            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                            .await;
+                    }
+                });
+            }
+            AgentMessage::TerminalVisualUnsubscribe(subscription) => {
+                let ws = Arc::clone(ws_write);
+                let st = Arc::clone(state);
+                tokio::spawn(async move {
+                    let result =
+                        crate::terminal::unsubscribe_terminal_visual(&st, &subscription.session_id)
+                            .await;
+
+                    let ack = TerminalCommandAck {
+                        request_id: subscription.request_id,
+                        session_id: subscription.session_id,
                         accepted: result.is_ok(),
                         error: result.err(),
                     };
@@ -437,7 +521,8 @@ impl AgentService {
                 let ws = Arc::clone(ws_write);
                 let st = Arc::clone(state);
                 tokio::spawn(async move {
-                    let result = crate::terminal::kill_terminal_session(&st, &kill.session_id).await;
+                    let result =
+                        crate::terminal::kill_terminal_session(&st, &kill.session_id).await;
 
                     let ack = TerminalCommandAck {
                         request_id: kill.request_id,
@@ -500,7 +585,9 @@ impl AgentService {
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
             "block_agent_plan" => Self::rpc_block_agent_plan(&req.params, state).await,
-            "manual_pass_agent_phase" => Self::rpc_manual_pass_agent_phase(&req.params, state).await,
+            "manual_pass_agent_phase" => {
+                Self::rpc_manual_pass_agent_phase(&req.params, state).await
+            }
             "send_agent_feedback_to_worker" => {
                 Self::rpc_send_agent_feedback_to_worker(&req.params, state).await
             }
@@ -508,6 +595,12 @@ impl AgentService {
             "browse_host_directory" => Self::rpc_browse_host_directory(&req.params),
             "validate_workspace_plan" => Self::rpc_validate_workspace_plan(&req.params),
             "list_workspace_files" => Self::rpc_list_workspace_files(&req.params, state),
+            "read_host_file" => Self::rpc_read_host_file(&req.params, state),
+            "get_workspace_file_diff" => Self::rpc_get_workspace_file_diff(&req.params, state),
+            "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
+            "update_planner_prompt_settings" => {
+                Self::rpc_update_planner_prompt_settings(&req.params)
+            }
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };
 
@@ -583,7 +676,8 @@ impl AgentService {
             .get("title")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'title' parameter".to_string())?;
-        let session = session_service::update_session_title(state, id.to_string(), title.to_string())?;
+        let session =
+            session_service::update_session_title(state, id.to_string(), title.to_string())?;
 
         serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
     }
@@ -724,7 +818,11 @@ impl AgentService {
             .get("status")
             .and_then(|value| value.as_str())
             .map(str::to_string);
-        let plans = crate::services::agent_plans::list_plans(state, status)?;
+        let run_type = params
+            .get("runType")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let plans = crate::services::agent_plans::list_plans(state, status, run_type)?;
         serde_json::to_value(plans).map_err(|e| e.to_string())
     }
 
@@ -748,7 +846,14 @@ impl AgentService {
             .get("id")
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
-        let run = crate::services::agent_plans::start_plan((**state).clone(), id.to_string()).await?;
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let run =
+            crate::services::agent_plans::start_plan((**state).clone(), id.to_string(), phase_id)
+                .await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -822,9 +927,11 @@ impl AgentService {
             .get("id")
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
-        let run =
-            crate::services::agent_plans::send_feedback_to_worker((**state).clone(), id.to_string())
-                .await?;
+        let run = crate::services::agent_plans::send_feedback_to_worker(
+            (**state).clone(),
+            id.to_string(),
+        )
+        .await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -850,7 +957,9 @@ impl AgentService {
         serde_json::to_value(entries).map_err(|e| e.to_string())
     }
 
-    fn rpc_validate_workspace_plan(params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn rpc_validate_workspace_plan(
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let workspace_path = params
             .get("workspacePath")
             .and_then(|value| value.as_str())
@@ -878,9 +987,67 @@ impl AgentService {
             .get("mode")
             .and_then(|value| value.as_str())
             .unwrap_or("changed");
-        let entries =
-            crate::services::agent_plans::list_workspace_files(state, id.to_string(), mode.to_string())?;
+        let entries = crate::services::agent_plans::list_workspace_files(
+            state,
+            id.to_string(),
+            mode.to_string(),
+        )?;
         serde_json::to_value(entries).map_err(|e| e.to_string())
+    }
+
+    fn rpc_read_host_file(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let path = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'path' parameter".to_string())?;
+        let content =
+            crate::services::agent_plans::read_host_file(state, id.to_string(), path.to_string())?;
+        serde_json::to_value(content).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_workspace_file_diff(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let path = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'path' parameter".to_string())?;
+        let diff = crate::services::agent_plans::get_workspace_file_diff(
+            state,
+            id.to_string(),
+            path.to_string(),
+        )?;
+        serde_json::to_value(diff).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_planner_prompt_settings() -> Result<serde_json::Value, String> {
+        let settings = crate::services::planner_prompts::load_prompt_settings()?;
+        serde_json::to_value(settings).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_planner_prompt_settings(
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let input = params
+            .get("input")
+            .cloned()
+            .ok_or_else(|| "Missing 'input' parameter".to_string())?;
+        let settings: crate::services::planner_prompts::PlannerPromptSettings =
+            serde_json::from_value(input).map_err(|e| e.to_string())?;
+        let saved = crate::services::planner_prompts::save_prompt_settings(settings)?;
+        serde_json::to_value(saved).map_err(|e| e.to_string())
     }
 
     fn session_view(session: crate::db::models::Session) -> RpcSessionView {

@@ -56,6 +56,10 @@ pub enum AgentMessage {
     #[serde(rename = "session_deleted")]
     SessionDeleted(SessionDeleted),
 
+    /// Desktop → remote clients: a session was created or updated.
+    #[serde(rename = "session_updated")]
+    SessionUpdated(SessionUpdated),
+
     /// Desktop → remote clients: current tmux-visible terminal screen.
     #[serde(rename = "terminal_screen")]
     TerminalScreen(TerminalScreen),
@@ -63,6 +67,14 @@ pub enum AgentMessage {
     /// Remote clients → desktop: raw terminal input for a tmux pane.
     #[serde(rename = "terminal_command")]
     TerminalCommand(TerminalCommand),
+
+    /// Remote clients → desktop: visible UI started watching a tmux pane.
+    #[serde(rename = "terminal_visual_subscribe")]
+    TerminalVisualSubscribe(TerminalVisualSubscription),
+
+    /// Remote clients → desktop: visible UI stopped watching a tmux pane.
+    #[serde(rename = "terminal_visual_unsubscribe")]
+    TerminalVisualUnsubscribe(TerminalVisualSubscription),
 
     /// Remote clients → desktop: resize a tmux pane to match the UI terminal.
     #[serde(rename = "terminal_resize")]
@@ -244,6 +256,13 @@ pub struct SessionDeleted {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionUpdated {
+    pub session_id: String,
+    pub session: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentPlanRunUpdated {
     pub plan_id: String,
     pub deleted: bool,
@@ -256,6 +275,7 @@ pub struct AgentPlanRunUpdated {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalScreen {
     pub session_id: String,
+    pub tmux_session_name: String,
     pub pane_id: String,
     pub cursor: i64,
     pub content: String,
@@ -274,6 +294,16 @@ pub struct TerminalCommand {
     pub request_id: String,
     pub session_id: String,
     pub data: String,
+    #[serde(default)]
+    pub control: Option<String>,
+}
+
+/// Visual subscription request from a remote UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalVisualSubscription {
+    pub request_id: String,
+    pub session_id: String,
 }
 
 /// Resize request from a remote UI.

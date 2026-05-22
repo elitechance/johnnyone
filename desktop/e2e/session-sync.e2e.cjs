@@ -129,7 +129,9 @@ async function run() {
     console.log(`session-sync.e2e: before desktop=${desktopTabsBefore} mobile=${mobileTabsBefore}`);
 
     console.log('session-sync.e2e: create terminal in desktop client');
-    await desktop.click('.workspace-actions .primary-action');
+    await desktop.evaluate(() => {
+      document.querySelector('.workspace-actions .primary-action')?.click();
+    });
     console.log('session-sync.e2e: wait for desktop attach');
     await waitForAttachedPane(desktop);
     console.log('session-sync.e2e: wait for desktop tab count');
@@ -151,7 +153,9 @@ async function run() {
     const mobileTabsAfterCreate = await count(mobile, '.workspace-tab');
 
     console.log('session-sync.e2e: close terminal in desktop client');
-    await desktop.click('.terminal-pane.active .pane-icon');
+    await desktop.evaluate(() => {
+      document.querySelector('.terminal-pane.active .pane-icon')?.click();
+    });
     console.log('session-sync.e2e: wait for desktop close');
     await desktop.waitForFunction(
       (previousCount) => document.querySelectorAll('.workspace-tab').length === previousCount - 1,

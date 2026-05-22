@@ -17,6 +17,7 @@ pub struct ChatCompleteEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalScreenEvent {
     pub session_id: String,
+    pub tmux_session_name: String,
     pub pane_id: String,
     pub cursor: i64,
     pub content: String,
@@ -35,4 +36,11 @@ pub struct AgentPlanRunEvent {
     pub deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUpdatedEvent {
+    pub session_id: String,
+    pub session: serde_json::Value,
 }

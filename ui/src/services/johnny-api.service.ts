@@ -33,15 +33,21 @@ export interface DetectedCliTool {
 }
 
 export interface CreateAgentPlanInput {
+  runType?: 'planning' | 'development';
   title?: string;
   workspacePath: string;
   planPath: string;
   workerProvider: string;
   reviewerProvider: string;
+  brief?: string;
+  appScope?: string;
+  docsScope?: string;
+  referencePaths?: string;
 }
 
 export interface AgentPlan {
   id: string;
+  runType: 'planning' | 'development' | string;
   title: string;
   workspacePath: string;
   planPath: string;
@@ -53,6 +59,10 @@ export interface AgentPlan {
   currentPhaseId?: string;
   currentPhaseIndex: number;
   error?: string;
+  brief?: string;
+  appScope?: string;
+  docsScope?: string;
+  referencePaths?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -115,6 +125,21 @@ export interface HostFileEntry {
   size?: number;
 }
 
+export interface HostFileContent {
+  path: string;
+  name: string;
+  kind: string;
+  contentType: string;
+  encoding: string;
+  content: string;
+  size: number;
+}
+
+export interface WorkspaceFileDiff {
+  path: string;
+  diff: string;
+}
+
 export interface WorkspaceValidation {
   valid: boolean;
   workspacePath: string;
@@ -125,13 +150,26 @@ export interface WorkspaceValidation {
   error?: string;
 }
 
+export interface PlannerPromptSettings {
+  schema?: string;
+  development: {
+    worker: string;
+    reviewer: string;
+  };
+  planning: {
+    planner: string;
+    reviewer: string;
+  };
+}
+
 @Injectable({ providedIn: 'root' })
 export class JohnnyApiService {
   private readonly gql = inject(GraphQLClient);
   private readonly agentPlanRunFields = `
     plan {
-      id title workspacePath planPath status workerSessionId reviewerSessionId
+      id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
+      brief appScope docsScope referencePaths
       createdAt updatedAt
     }
     phases {
@@ -537,19 +575,53 @@ export class JohnnyApiService {
       .pipe(map((data) => data.updateSetting));
   }
 
+  getPlannerPromptSettings(): Observable<PlannerPromptSettings> {
+    return this.gql
+      .query<{ getPlannerPromptSettings: PlannerPromptSettings }>(
+        `query GetPlannerPromptSettings {
+          getPlannerPromptSettings {
+            schema
+            development { worker reviewer }
+            planning { planner reviewer }
+          }
+        }`
+      )
+      .pipe(map((data) => data.getPlannerPromptSettings));
+  }
+
+  updatePlannerPromptSettings(input: PlannerPromptSettings): Observable<PlannerPromptSettings> {
+    const payload = {
+      development: input.development,
+      planning: input.planning,
+    };
+    return this.gql
+      .mutate<{ updatePlannerPromptSettings: PlannerPromptSettings }>(
+        `mutation UpdatePlannerPromptSettings($input: PlannerPromptSettingsInput!) {
+          updatePlannerPromptSettings(input: $input) {
+            schema
+            development { worker reviewer }
+            planning { planner reviewer }
+          }
+        }`,
+        { input: payload }
+      )
+      .pipe(map((data) => data.updatePlannerPromptSettings));
+  }
+
   // ── Agent Planner ────────────────────────────────────────────────────
 
-  listAgentPlans(status?: string): Observable<AgentPlan[]> {
+  listAgentPlans(status?: string, runType?: 'planning' | 'development'): Observable<AgentPlan[]> {
     return this.gql
       .query<{ listAgentPlans: AgentPlan[] }>(
-        `query ListAgentPlans($status: String) {
-          listAgentPlans(status: $status) {
-            id title workspacePath planPath status workerSessionId reviewerSessionId
+        `query ListAgentPlans($status: String, $runType: String) {
+          listAgentPlans(status: $status, runType: $runType) {
+            id runType title workspacePath planPath status workerSessionId reviewerSessionId
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
+            brief appScope docsScope referencePaths
             createdAt updatedAt
           }
         }`,
-        { status }
+        { status, runType }
       )
       .pipe(map((data) => data.listAgentPlans));
   }
@@ -580,8 +652,17 @@ export class JohnnyApiService {
       .pipe(map((data) => data.createAgentPlan));
   }
 
-  startAgentPlan(id: string): Observable<AgentPlanRun> {
-    return this.agentPlanMutation('startAgentPlan', { id });
+  startAgentPlan(id: string, phaseId?: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ startAgentPlan: AgentPlanRun }>(
+        `mutation StartAgentPlan($id: ID!, $phaseId: String) {
+          startAgentPlan(id: $id, phaseId: $phaseId) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, phaseId: phaseId || null }
+      )
+      .pipe(map((data) => data.startAgentPlan));
   }
 
   stopAgentPlan(id: string): Observable<AgentPlanRun> {
@@ -670,6 +751,32 @@ export class JohnnyApiService {
         { planId, mode }
       )
       .pipe(map((data) => data.listWorkspaceFiles));
+  }
+
+  readHostFile(planId: string, path: string): Observable<HostFileContent> {
+    return this.gql
+      .query<{ readHostFile: HostFileContent }>(
+        `query ReadHostFile($planId: ID!, $path: String!) {
+          readHostFile(planId: $planId, path: $path) {
+            path name kind contentType encoding content size
+          }
+        }`,
+        { planId, path }
+      )
+      .pipe(map((data) => data.readHostFile));
+  }
+
+  getWorkspaceFileDiff(planId: string, path: string): Observable<WorkspaceFileDiff> {
+    return this.gql
+      .query<{ getWorkspaceFileDiff: WorkspaceFileDiff }>(
+        `query GetWorkspaceFileDiff($planId: ID!, $path: String!) {
+          getWorkspaceFileDiff(planId: $planId, path: $path) {
+            path diff
+          }
+        }`,
+        { planId, path }
+      )
+      .pipe(map((data) => data.getWorkspaceFileDiff));
   }
 
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {

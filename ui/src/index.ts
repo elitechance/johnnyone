@@ -37,7 +37,10 @@ export type {
   AgentPlanEvent,
   AgentPlanRun,
   CreateAgentPlanInput,
+  HostFileContent,
   HostFileEntry,
+  PlannerPromptSettings,
+  WorkspaceFileDiff,
   WorkspaceValidation,
 } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';

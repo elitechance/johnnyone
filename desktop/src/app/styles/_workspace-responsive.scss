@@ -1,0 +1,65 @@
+$mobile-breakpoint: 900px;
+$control-height: 32px;
+$safe-bottom: env(safe-area-inset-bottom);
+
+@mixin shell-vars {
+  --workspace-mobile-breakpoint: #{$mobile-breakpoint};
+  --workspace-control-height: #{$control-height};
+  --workspace-mobile-gap: 8px;
+  --workspace-mobile-padding: 8px;
+  --workspace-composer-reserved-height: calc(112px + #{$safe-bottom});
+}
+
+@mixin control-height {
+  height: var(--workspace-control-height, #{$control-height});
+  min-height: var(--workspace-control-height, #{$control-height});
+}
+
+@mixin mobile-topbar {
+  height: auto;
+  min-height: 0;
+  align-items: stretch;
+  gap: var(--workspace-mobile-gap, 8px);
+  padding: var(--workspace-mobile-padding, 8px);
+}
+
+@mixin mobile-mode-switch {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+
+  button {
+    min-width: 0;
+    width: 100%;
+    padding-inline: 6px;
+  }
+}
+
+@mixin mobile-actions-grid($columns: 5) {
+  display: grid;
+  grid-template-columns: repeat($columns, minmax(0, 1fr));
+  justify-content: stretch;
+  gap: var(--workspace-mobile-gap, 8px);
+}
+
+@mixin mobile-tab-strip {
+  width: 100%;
+  min-width: 0;
+  padding-bottom: 2px;
+  overflow: auto hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+@mixin mobile-panel-shell {
+  min-width: 0;
+  min-height: 0;
+  padding-bottom: $safe-bottom;
+  overflow: hidden;
+}
+
+@mixin reserved-composer-grid {
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+}

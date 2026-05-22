@@ -1,4 +1,4 @@
-<section class="terminal-shell" [class.mobile-input-mode]="mobileInputMode">
+<section #terminalShell class="terminal-shell" [class.mobile-input-mode]="mobileInputMode">
   <header class="terminal-toolbar">
     <div class="terminal-title">{{ title }}</div>
     <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
@@ -6,18 +6,13 @@
     </div>
   </header>
   <div #terminalHost class="terminal-host" [class.disabled]="disabled"></div>
-  <div class="terminal-local-input" [class.visible]="showLocalPrompt" aria-live="polite">
-    <span class="terminal-local-prompt">&gt;</span>
-    <span class="terminal-local-buffer">{{ localInputBuffer }}</span>
-    <span class="terminal-local-cursor" aria-hidden="true"></span>
-  </div>
 
-  @if (mobileInputMode) {
+  @if (showInput) {
     <form
       class="terminal-mobile-input"
       (pointerdown)="$event.stopPropagation()"
       (click)="$event.stopPropagation()"
-      (submit)="$event.preventDefault(); submitMobileInput()"
+      (submit)="$event.preventDefault(); submitTerminalInput()"
     >
       <div class="terminal-mobile-keys" aria-label="Terminal controls">
         <button type="button" (click)="sendControlInput('\t')" [disabled]="disabled">Tab</button>
@@ -30,11 +25,13 @@
 
       <div class="terminal-mobile-submit">
         <textarea
-          name="mobileTerminalInput"
+          #mobileInput
+          name="terminalInput"
           rows="1"
-          placeholder="Type command or message"
+          placeholder="Type or paste command/message"
           [(ngModel)]="mobileInputBuffer"
           (keydown)="onMobileInputKeydown($event)"
+          (paste)="onTerminalInputPaste($event)"
           [disabled]="disabled"
           autocapitalize="none"
           autocomplete="off"

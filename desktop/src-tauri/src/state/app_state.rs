@@ -1,5 +1,7 @@
 use crate::db::Database;
-use crate::events::{AgentPlanRunEvent, ChatCompleteEvent, ChatDeltaEvent, TerminalScreenEvent};
+use crate::events::{
+    AgentPlanRunEvent, ChatCompleteEvent, ChatDeltaEvent, SessionUpdatedEvent, TerminalScreenEvent,
+};
 use crate::providers::cli_runner::CliProcess;
 use crate::tools::tool_schema::ToolExecutionRecord;
 use chrono::{DateTime, Utc};
@@ -53,6 +55,8 @@ pub struct AppState {
     pub shutdown_tx: broadcast::Sender<()>,
     /// Broadcast channel for session deletion events (sends session ID).
     pub session_deleted_tx: broadcast::Sender<String>,
+    /// Broadcast channel for session create/update/archive events.
+    pub session_updated_tx: broadcast::Sender<SessionUpdatedEvent>,
     /// Broadcast channel for host chat deltas.
     pub chat_delta_tx: broadcast::Sender<ChatDeltaEvent>,
     /// Broadcast channel for host chat completion notifications.
@@ -63,6 +67,8 @@ pub struct AppState {
     pub agent_plan_run_tx: broadcast::Sender<AgentPlanRunEvent>,
     /// Active tmux capture loops, keyed by session_id.
     pub terminal_capture_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    /// Visible UI subscribers for tmux screen mirroring, keyed by session_id.
+    pub terminal_visual_subscribers: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl AppState {
@@ -72,6 +78,7 @@ impl AppState {
         let node_name = format!("desktop-{}", &node_id[..8]);
         let (shutdown_tx, _) = broadcast::channel(16);
         let (session_deleted_tx, _) = broadcast::channel(16);
+        let (session_updated_tx, _) = broadcast::channel(256);
         let (chat_delta_tx, _) = broadcast::channel(256);
         let (chat_complete_tx, _) = broadcast::channel(64);
         let (terminal_screen_tx, _) = broadcast::channel(256);
@@ -92,11 +99,13 @@ impl AppState {
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
             session_deleted_tx,
+            session_updated_tx,
             chat_delta_tx,
             chat_complete_tx,
             terminal_screen_tx,
             agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
+            terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -104,6 +113,7 @@ impl AppState {
     pub fn with_node_info(db: Database, node_id: String, node_name: String) -> Self {
         let (shutdown_tx, _) = broadcast::channel(16);
         let (session_deleted_tx, _) = broadcast::channel(16);
+        let (session_updated_tx, _) = broadcast::channel(256);
         let (chat_delta_tx, _) = broadcast::channel(256);
         let (chat_complete_tx, _) = broadcast::channel(64);
         let (terminal_screen_tx, _) = broadcast::channel(256);
@@ -118,11 +128,13 @@ impl AppState {
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
             session_deleted_tx,
+            session_updated_tx,
             chat_delta_tx,
             chat_complete_tx,
             terminal_screen_tx,
             agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
+            terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

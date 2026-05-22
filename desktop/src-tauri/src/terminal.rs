@@ -9,10 +9,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
+const CAPTURE_INTERVAL_MS: u64 = 1_000;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSnapshot {
     pub session_id: String,
+    pub tmux_session_name: String,
     pub pane_id: String,
     pub cursor: i64,
     pub content: String,
@@ -27,6 +30,7 @@ pub struct TerminalSnapshot {
 #[derive(Debug, Clone)]
 struct TerminalSession {
     session_id: String,
+    tmux_session_name: String,
     pane_id: String,
     rows: u16,
     cols: u16,
@@ -69,6 +73,21 @@ pub async fn attach_terminal_headless(
     cols: u16,
     rows: u16,
 ) -> Result<TerminalSnapshot, String> {
+    subscribe_terminal_visual(state, session_id, cols, rows).await
+}
+
+pub async fn subscribe_terminal_visual(
+    state: &AppState,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<TerminalSnapshot, String> {
+    {
+        let mut subscribers = state.terminal_visual_subscribers.lock().await;
+        let count = subscribers.entry(session_id.clone()).or_insert(0);
+        *count += 1;
+    }
+
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
     publish_snapshot(state, &snapshot, None);
@@ -76,13 +95,63 @@ pub async fn attach_terminal_headless(
     Ok(snapshot)
 }
 
+pub async fn refresh_terminal_visual(
+    state: &AppState,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<TerminalSnapshot, String> {
+    let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
+    let snapshot = capture_snapshot(state, &terminal).await?;
+    publish_snapshot(state, &snapshot, None);
+    if has_terminal_visual_subscribers(state, &session_id).await {
+        start_capture_loop(state, None, terminal).await;
+    }
+    Ok(snapshot)
+}
+
+pub async fn unsubscribe_terminal_visual(state: &AppState, session_id: &str) -> Result<(), String> {
+    let should_stop = {
+        let mut subscribers = state.terminal_visual_subscribers.lock().await;
+        match subscribers.get_mut(session_id) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                subscribers.remove(session_id);
+                true
+            }
+            None => false,
+        }
+    };
+
+    if should_stop {
+        stop_terminal_capture(state, session_id).await;
+    }
+
+    Ok(())
+}
+
+async fn has_terminal_visual_subscribers(state: &AppState, session_id: &str) -> bool {
+    state
+        .terminal_visual_subscribers
+        .lock()
+        .await
+        .get(session_id)
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
 pub async fn send_terminal_input(
     state: &AppState,
     session_id: String,
     input: String,
 ) -> Result<(), String> {
+    let config = load_session_config(state, &session_id)?;
     let terminal = ensure_terminal_session_for_input(state, &session_id).await?;
-    send_raw_input(&terminal.pane_id, &input).await
+    send_raw_input(&terminal.pane_id, &input, config.provider).await
 }
 
 pub async fn resize_terminal(
@@ -93,7 +162,9 @@ pub async fn resize_terminal(
 ) -> Result<(), String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     resize_pane(&terminal.pane_id, cols, rows).await?;
-    start_capture_loop(state, None, terminal).await;
+    if has_terminal_visual_subscribers(state, &session_id).await {
+        start_capture_loop(state, None, terminal).await;
+    }
     Ok(())
 }
 
@@ -106,6 +177,11 @@ pub async fn stop_terminal_capture(state: &AppState, session_id: &str) {
 
 pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result<(), String> {
     stop_terminal_capture(state, session_id).await;
+    state
+        .terminal_visual_subscribers
+        .lock()
+        .await
+        .remove(session_id);
 
     let tmux_session_name = tmux_session_name(session_id);
     if tmux_has_session(&tmux_session_name).await {
@@ -137,6 +213,14 @@ pub async fn capture_terminal_session(
     capture_snapshot(state, &terminal).await
 }
 
+pub async fn capture_terminal_session_with_history(
+    state: &AppState,
+    session_id: &str,
+) -> Result<TerminalSnapshot, String> {
+    let terminal = ensure_terminal_session_for_input(state, session_id).await?;
+    capture_snapshot_with_history(state, &terminal).await
+}
+
 fn publish_snapshot(
     state: &AppState,
     snapshot: &TerminalSnapshot,
@@ -144,6 +228,7 @@ fn publish_snapshot(
 ) {
     let event = TerminalScreenEvent {
         session_id: snapshot.session_id.clone(),
+        tmux_session_name: snapshot.tmux_session_name.clone(),
         pane_id: snapshot.pane_id.clone(),
         cursor: snapshot.cursor,
         content: snapshot.content.clone(),
@@ -174,6 +259,7 @@ async fn start_capture_loop(
     }
 
     let db = state.db.clone();
+    let visual_subscribers = state.terminal_visual_subscribers.clone();
     let terminal_screen_tx = state.terminal_screen_tx.clone();
     let session_id = terminal.session_id.clone();
     let handle = tokio::spawn(async move {
@@ -181,11 +267,25 @@ async fn start_capture_loop(
         let mut cursor: i64 = 0;
 
         loop {
+            let subscriber_count = visual_subscribers
+                .lock()
+                .await
+                .get(&terminal.session_id)
+                .copied()
+                .unwrap_or(0);
+            if subscriber_count == 0 {
+                tracing::debug!(
+                    session_id = %terminal.session_id,
+                    "stopping terminal capture loop without visual subscribers"
+                );
+                break;
+            }
+
             match capture_terminal(&terminal.pane_id).await {
                 Ok(capture) => {
                     let capture_key = format!(
-                        "{}\n{}:{}:{}",
-                        capture.content, capture.cursor_x, capture.cursor_y, capture.history_lines
+                        "{}\n{}:{}",
+                        capture.content, capture.cursor_x, capture.cursor_y
                     );
                     if capture_key != last_capture_key {
                         cursor += 1;
@@ -193,6 +293,7 @@ async fn start_capture_loop(
 
                         let event = TerminalScreenEvent {
                             session_id: terminal.session_id.clone(),
+                            tmux_session_name: terminal.tmux_session_name.clone(),
                             pane_id: terminal.pane_id.clone(),
                             cursor,
                             content: capture.content,
@@ -236,7 +337,7 @@ async fn start_capture_loop(
                 }
             }
 
-            sleep(Duration::from_millis(350)).await;
+            sleep(Duration::from_millis(CAPTURE_INTERVAL_MS)).await;
         }
     });
 
@@ -266,7 +367,7 @@ async fn ensure_terminal_session(
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE sessions SET tmux_session_name = ?1, tmux_pane_id = ?2, terminal_status = 'attached', updated_at = datetime('now') WHERE id = ?3",
+            "UPDATE sessions SET tmux_session_name = ?1, tmux_pane_id = ?2, terminal_status = 'attached', status = 'active', updated_at = datetime('now') WHERE id = ?3",
             params![&tmux_session_name, &pane_id, session_id],
         )
         .map_err(|e| e.to_string())
@@ -274,6 +375,7 @@ async fn ensure_terminal_session(
 
     Ok(TerminalSession {
         session_id: config.session_id,
+        tmux_session_name,
         pane_id,
         rows,
         cols,
@@ -300,7 +402,7 @@ async fn ensure_terminal_session_for_input(
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE sessions SET tmux_session_name = ?1, tmux_pane_id = ?2, terminal_status = 'attached', updated_at = datetime('now') WHERE id = ?3",
+            "UPDATE sessions SET tmux_session_name = ?1, tmux_pane_id = ?2, terminal_status = 'attached', status = 'active', updated_at = datetime('now') WHERE id = ?3",
             params![&tmux_session_name, &pane_id, session_id],
         )
         .map_err(|e| e.to_string())
@@ -308,6 +410,7 @@ async fn ensure_terminal_session_for_input(
 
     Ok(TerminalSession {
         session_id: config.session_id,
+        tmux_session_name,
         pane_id,
         rows,
         cols,
@@ -392,6 +495,18 @@ fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
         .unwrap_or_else(|| config.provider.default_command().to_string());
 
     match config.provider {
+        CliProvider::ClaudeCode => (
+            command,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ],
+        ),
+        CliProvider::Codex => (
+            command,
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()],
+        ),
         CliProvider::Ollama if !config.model.trim().is_empty() => {
             (command, vec!["run".to_string(), config.model.clone()])
         }
@@ -471,6 +586,22 @@ async fn capture_snapshot(
     terminal: &TerminalSession,
 ) -> Result<TerminalSnapshot, String> {
     let capture = capture_terminal(&terminal.pane_id).await?;
+    snapshot_from_capture(state, terminal, capture).await
+}
+
+async fn capture_snapshot_with_history(
+    state: &AppState,
+    terminal: &TerminalSession,
+) -> Result<TerminalSnapshot, String> {
+    let capture = capture_terminal_with_history(&terminal.pane_id).await?;
+    snapshot_from_capture(state, terminal, capture).await
+}
+
+async fn snapshot_from_capture(
+    state: &AppState,
+    terminal: &TerminalSession,
+    capture: TerminalCapture,
+) -> Result<TerminalSnapshot, String> {
     let cursor = state.db.with_conn(|conn| {
         conn.query_row(
             "SELECT tmux_screen_cursor FROM sessions WHERE id = ?1",
@@ -482,6 +613,7 @@ async fn capture_snapshot(
 
     Ok(TerminalSnapshot {
         session_id: terminal.session_id.clone(),
+        tmux_session_name: terminal.tmux_session_name.clone(),
         pane_id: terminal.pane_id.clone(),
         cursor,
         content: capture.content,
@@ -500,8 +632,28 @@ async fn capture_terminal(pane_id: &str) -> Result<TerminalCapture, String> {
         "-p".to_string(),
         "-e".to_string(),
         "-N".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+    ])
+    .await?;
+    let (cursor_x, cursor_y, history_size) = pane_cursor_meta(pane_id).await?;
+    Ok(TerminalCapture {
+        content,
+        cursor_x,
+        cursor_y,
+        history_lines: history_size.min(2000),
+    })
+}
+
+async fn capture_terminal_with_history(pane_id: &str) -> Result<TerminalCapture, String> {
+    let content = run_tmux(vec![
+        "capture-pane".to_string(),
+        "-p".to_string(),
+        "-e".to_string(),
+        "-N".to_string(),
+        "-J".to_string(),
         "-S".to_string(),
-        "-2000".to_string(),
+        "-200".to_string(),
         "-t".to_string(),
         pane_id.to_string(),
     ])
@@ -544,7 +696,7 @@ async fn pane_cursor_meta(pane_id: &str) -> Result<(u16, u16, u16), String> {
     Ok((cursor_x, cursor_y, history_size))
 }
 
-async fn send_raw_input(pane_id: &str, input: &str) -> Result<(), String> {
+async fn send_raw_input(pane_id: &str, input: &str, provider: CliProvider) -> Result<(), String> {
     if input == "\u{3}" {
         return run_tmux(vec![
             "send-keys".to_string(),
@@ -557,7 +709,36 @@ async fn send_raw_input(pane_id: &str, input: &str) -> Result<(), String> {
     }
 
     if input.contains('\n') || input.len() > 512 {
-        return paste_buffer(pane_id, input).await;
+        if provider == CliProvider::Codex {
+            return send_codex_literal_input(pane_id, input).await;
+        }
+
+        let submit = input.ends_with('\r') || input.ends_with('\n');
+        let text = input.trim_end_matches(['\r', '\n']);
+        if !text.is_empty() {
+            paste_buffer(pane_id, text).await?;
+        }
+        if submit {
+            sleep(Duration::from_millis(250)).await;
+            if provider == CliProvider::Codex {
+                run_tmux(vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    pane_id.to_string(),
+                    "Escape".to_string(),
+                ])
+                .await?;
+                sleep(Duration::from_millis(100)).await;
+            }
+            run_tmux(vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                pane_id.to_string(),
+                "C-m".to_string(),
+            ])
+            .await?;
+        }
+        return Ok(());
     }
 
     for segment in input.split_inclusive('\r') {
@@ -568,22 +749,66 @@ async fn send_raw_input(pane_id: &str, input: &str) -> Result<(), String> {
                 "-t".to_string(),
                 pane_id.to_string(),
                 "-l".to_string(),
+                "--".to_string(),
                 text.to_string(),
             ])
             .await?;
         }
         if segment.ends_with('\r') {
-            run_tmux(vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                pane_id.to_string(),
-                "Enter".to_string(),
-            ])
-            .await?;
+            if provider == CliProvider::Codex {
+                send_submit_key(pane_id).await?;
+                sleep(Duration::from_millis(200)).await;
+                send_submit_key(pane_id).await?;
+            } else {
+                send_submit_key(pane_id).await?;
+            }
         }
     }
 
     Ok(())
+}
+
+async fn send_codex_literal_input(pane_id: &str, input: &str) -> Result<(), String> {
+    let submit = input.ends_with('\r') || input.ends_with('\n');
+    let text = input
+        .trim_end_matches(['\r', '\n'])
+        .replace("\r\n", "\\n")
+        .replace('\r', "\\n")
+        .replace('\n', "\\n");
+
+    let chars = text.chars().collect::<Vec<_>>();
+    for chunk in chars.chunks(180) {
+        let chunk = chunk.iter().collect::<String>();
+        run_tmux(vec![
+            "send-keys".to_string(),
+            "-t".to_string(),
+            pane_id.to_string(),
+            "-l".to_string(),
+            "--".to_string(),
+            chunk,
+        ])
+        .await?;
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    if submit {
+        send_submit_key(pane_id).await?;
+        sleep(Duration::from_millis(200)).await;
+        send_submit_key(pane_id).await?;
+    }
+
+    Ok(())
+}
+
+async fn send_submit_key(pane_id: &str) -> Result<(), String> {
+    run_tmux(vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "C-m".to_string(),
+    ])
+    .await
+    .map(|_| ())
 }
 
 async fn paste_buffer(pane_id: &str, input: &str) -> Result<(), String> {

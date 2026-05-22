@@ -112,6 +112,7 @@ type RelayChatMessage {
 
 type AgentPlan {
   id: ID!
+  runType: String!
   title: String!
   workspacePath: String!
   planPath: String!
@@ -123,6 +124,10 @@ type AgentPlan {
   currentPhaseId: String
   currentPhaseIndex: Int!
   error: String
+  brief: String
+  appScope: String
+  docsScope: String
+  referencePaths: String
   createdAt: String!
   updatedAt: String!
 }
@@ -185,6 +190,21 @@ type HostFileEntry {
   size: Int
 }
 
+type HostFileContent {
+  path: String!
+  name: String!
+  kind: String!
+  contentType: String!
+  encoding: String!
+  content: String!
+  size: Int!
+}
+
+type WorkspaceFileDiff {
+  path: String!
+  diff: String!
+}
+
 type WorkspaceValidation {
   valid: Boolean!
   workspacePath: String!
@@ -193,6 +213,22 @@ type WorkspaceValidation {
   phaseCount: Int!
   taskCount: Int!
   error: String
+}
+
+type PlannerPromptSettings {
+  schema: String!
+  development: PlannerDevelopmentPrompts!
+  planning: PlannerPlanningPrompts!
+}
+
+type PlannerDevelopmentPrompts {
+  worker: String!
+  reviewer: String!
+}
+
+type PlannerPlanningPrompts {
+  planner: String!
+  reviewer: String!
 }
 
 # --- Inputs ---
@@ -234,11 +270,31 @@ input UpsertProviderConfigInput {
 }
 
 input CreateAgentPlanInput {
+  runType: String
   title: String
   workspacePath: String!
   planPath: String!
   workerProvider: String!
   reviewerProvider: String!
+  brief: String
+  appScope: String
+  docsScope: String
+  referencePaths: String
+}
+
+input PlannerPromptSettingsInput {
+  development: PlannerDevelopmentPromptsInput!
+  planning: PlannerPlanningPromptsInput!
+}
+
+input PlannerDevelopmentPromptsInput {
+  worker: String!
+  reviewer: String!
+}
+
+input PlannerPlanningPromptsInput {
+  planner: String!
+  reviewer: String!
 }
 
 # --- Queries ---
@@ -251,11 +307,14 @@ type Query {
   listProviderConfigs: [ProviderConfig!]!
   listDetectedCliTools: [DetectedTool!]!
   getSetting(key: String!): String!
-  listAgentPlans(status: String): [AgentPlan!]!
+  getPlannerPromptSettings: PlannerPromptSettings!
+  listAgentPlans(status: String, runType: String): [AgentPlan!]!
   getAgentPlan(id: ID!): AgentPlanRun!
   browseHostDirectory(path: String!): [HostFileEntry!]!
   validateWorkspacePlan(workspacePath: String!, planPath: String!): WorkspaceValidation!
   listWorkspaceFiles(planId: ID!, mode: String!): [HostFileEntry!]!
+  readHostFile(planId: ID!, path: String!): HostFileContent!
+  getWorkspaceFileDiff(planId: ID!, path: String!): WorkspaceFileDiff!
 }
 
 # --- Mutations ---
@@ -275,8 +334,9 @@ type Mutation {
   upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
   deleteProviderConfig(provider: String!): Boolean!
   updateSetting(key: String!, value: String!): Boolean!
+  updatePlannerPromptSettings(input: PlannerPromptSettingsInput!): PlannerPromptSettings!
   createAgentPlan(input: CreateAgentPlanInput!): AgentPlanRun!
-  startAgentPlan(id: ID!): AgentPlanRun!
+  startAgentPlan(id: ID!, phaseId: String): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
   updateAgentPlanBlocked(id: ID!, reason: String!): AgentPlanRun!

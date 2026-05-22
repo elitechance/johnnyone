@@ -14,7 +14,7 @@
  */
 
 interface RelayEnvelope {
-  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'session_deleted' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response' | 'terminal_screen' | 'terminal_command' | 'terminal_resize' | 'terminal_kill' | 'terminal_command_ack' | 'agent_plan_run_updated';
+  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'session_deleted' | 'session_updated' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response' | 'terminal_screen' | 'terminal_command' | 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_resize' | 'terminal_kill' | 'terminal_command_ack' | 'agent_plan_run_updated';
   relayId?: string;
   sessionId?: string;
   requestId?: string;
@@ -153,6 +153,8 @@ export class ChatRelayDO implements DurableObject {
 
         case 'chat_request':
         case 'terminal_command':
+        case 'terminal_visual_subscribe':
+        case 'terminal_visual_unsubscribe':
         case 'terminal_resize':
         case 'terminal_kill':
           // Mobile → desktop: forward the chat request
@@ -165,6 +167,7 @@ export class ChatRelayDO implements DurableObject {
         case 'chat_complete':
         case 'chat_message':
         case 'session_deleted':
+        case 'session_updated':
         case 'terminal_screen':
         case 'terminal_command_ack':
         case 'agent_plan_run_updated':

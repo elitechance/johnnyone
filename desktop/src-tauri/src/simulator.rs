@@ -1,6 +1,11 @@
 pub fn host_simulator_enabled() -> bool {
     std::env::var("JOHNNYONE_HOST_SIMULATOR")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -19,7 +24,11 @@ pub fn simulated_chat_response(provider: &str, model: &str, content: &str) -> St
     format!(
         "Simulated {} response via {}.\n\n{}",
         provider,
-        if model.is_empty() { "default-model" } else { model },
+        if model.is_empty() {
+            "default-model"
+        } else {
+            model
+        },
         reply_body
     )
 }

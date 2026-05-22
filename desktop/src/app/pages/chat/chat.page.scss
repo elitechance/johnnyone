@@ -1,9 +1,12 @@
+@use '../../styles/workspace-responsive' as workspace;
+
 :host {
   display: block;
   height: 100%;
 }
 
 .workspace-shell {
+  @include workspace.shell-vars;
   height: 100vh;
   display: grid;
   grid-template-rows: 48px 1fr 28px;
@@ -33,6 +36,11 @@
 .brand-lockup {
   gap: 10px;
   font-weight: 650;
+}
+
+.brand-name {
+  font-size: 20px;
+  line-height: 1;
 }
 
 .brand-mark {
@@ -95,12 +103,14 @@
 }
 
 .mode-switch button {
-  height: 32px;
+  @include workspace.control-height;
+  min-width: 96px;
   border: 0;
   background: transparent;
   color: #8fa0b3;
   padding: 0 10px;
   cursor: pointer;
+  font: 14px/1.2 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 .mode-switch button.active {
@@ -114,18 +124,19 @@
 .icon-action,
 .pane-tool,
 .pane-icon {
-  height: 32px;
+  @include workspace.control-height;
   border: 1px solid #263241;
   background: #121821;
   color: #dbe7f3;
 }
 
 .provider-dropdown {
-  min-width: 118px;
+  min-width: 150px;
   padding: 0 9px;
 }
 
 .primary-action {
+  min-width: 150px;
   padding: 0 12px;
   background: #19314a;
   border-color: #315b82;
@@ -348,7 +359,7 @@
   border: 0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: workspace.$mobile-breakpoint) {
   :host {
     min-width: 0;
   }
@@ -361,11 +372,7 @@
 
   .workspace-topbar {
     grid-template-columns: 1fr;
-    height: auto;
-    min-height: 0;
-    padding: 8px;
-    align-items: stretch;
-    gap: 8px;
+    @include workspace.mobile-topbar;
   }
 
   .brand-lockup {
@@ -379,44 +386,42 @@
   }
 
   .workspace-tabs {
-    width: 100%;
-    padding-bottom: 2px;
+    @include workspace.mobile-tab-strip;
+  }
+
+  .mode-switch {
+    @include workspace.mobile-mode-switch;
   }
 
   .workspace-actions {
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    justify-content: stretch;
-    overflow: visible;
+    @include workspace.mobile-actions-grid(5);
     padding-bottom: 0;
   }
 
-  .provider-dropdown {
+  .workspace-actions .provider-dropdown {
     grid-column: 1 / -1;
     min-width: 0;
     width: 100%;
   }
 
-  .primary-action {
+  .workspace-actions .primary-action {
     grid-column: span 2;
     min-width: 0;
     width: 100%;
     padding: 0 8px;
   }
 
-  .icon-action {
+  .workspace-actions .icon-action {
     width: 100%;
     min-width: 0;
   }
 
   .terminal-workspace {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
+    @include workspace.mobile-panel-shell;
+    display: grid;
+    grid-template-rows: minmax(0, 1fr);
     padding: 10px;
-    overflow: auto;
-    overscroll-behavior: contain;
-    -webkit-overflow-scrolling: touch;
+    overflow: hidden;
   }
 
   .terminal-pane {
@@ -424,10 +429,10 @@
     left: auto !important;
     top: auto !important;
     width: 100% !important;
+    height: auto !important;
     min-width: 0;
-    min-height: 360px;
-    max-height: calc(100dvh - 220px);
-    flex: 0 0 auto;
+    min-height: 0;
+    max-height: none;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
   }
 
@@ -462,19 +467,7 @@
   }
 
   .pane-resize-handle {
-    left: 0;
-    right: 0;
-    bottom: 104px;
-    width: auto;
-    height: 28px;
-    cursor: ns-resize;
-    touch-action: none;
-    background:
-      linear-gradient(90deg, transparent calc(50% - 28px), rgba(143, 160, 179, 0.65) calc(50% - 28px), rgba(143, 160, 179, 0.65) calc(50% + 28px), transparent calc(50% + 28px)),
-      linear-gradient(90deg, transparent calc(50% - 18px), rgba(143, 160, 179, 0.55) calc(50% - 18px), rgba(143, 160, 179, 0.55) calc(50% + 18px), transparent calc(50% + 18px));
-    background-size: 100% 1px, 100% 1px;
-    background-position: 0 9px, 0 16px;
-    background-repeat: no-repeat;
+    display: none;
   }
 
   .workspace-empty {

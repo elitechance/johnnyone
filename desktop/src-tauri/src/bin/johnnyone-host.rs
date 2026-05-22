@@ -1,7 +1,8 @@
+use johnnyone_desktop_lib::agent::{AgentConfig, AgentService};
 use johnnyone_desktop_lib::db::Database;
 use johnnyone_desktop_lib::host;
 use johnnyone_desktop_lib::paths::default_db_path;
-use johnnyone_desktop_lib::agent::{AgentConfig, AgentService};
+use johnnyone_desktop_lib::services::agent_plans;
 use johnnyone_desktop_lib::state::app_state::AppState;
 use tracing_subscriber::EnvFilter;
 
@@ -20,6 +21,11 @@ async fn main() {
     let db_path = default_db_path();
     let db = Database::open(&db_path).expect("Failed to initialize database");
     let state = AppState::new(db);
+    match agent_plans::resume_active_plan_loops(state.clone()).await {
+        Ok(count) if count > 0 => tracing::info!(count, "Resumed active planner coordinator loops"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "Failed to resume active planner coordinator loops"),
+    }
 
     if let Ok(worker_url) = std::env::var("JOHNNYONE_WORKER_URL") {
         let user_id = std::env::var("JOHNNYONE_USER_ID")
