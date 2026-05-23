@@ -1646,6 +1646,7 @@ fn phase_template_values(
     phase_path: &Path,
     tasks_path: &Path,
 ) -> Vec<(&'static str, String)> {
+    let conventions_path = Path::new(&run.plan.workspace_path).join("common/conventions");
     vec![
         ("run_id", run.plan.id.clone()),
         ("phase_id", phase.phase_id.clone()),
@@ -1653,11 +1654,16 @@ fn phase_template_values(
         ("plan_path", run.plan.plan_path.clone()),
         ("phase_path", phase_path.to_string_lossy().to_string()),
         ("tasks_path", tasks_path.to_string_lossy().to_string()),
+        (
+            "conventions_path",
+            conventions_path.to_string_lossy().to_string(),
+        ),
     ]
 }
 
 fn planning_template_values(run: &AgentPlanRun) -> Vec<(&'static str, String)> {
     let methodology_path = Path::new(&run.plan.workspace_path).join("common/methodology.md");
+    let conventions_path = Path::new(&run.plan.workspace_path).join("common/conventions");
     vec![
         ("run_id", run.plan.id.clone()),
         ("workspace_path", run.plan.workspace_path.clone()),
@@ -1665,6 +1671,10 @@ fn planning_template_values(run: &AgentPlanRun) -> Vec<(&'static str, String)> {
         (
             "methodology_path",
             methodology_path.to_string_lossy().to_string(),
+        ),
+        (
+            "conventions_path",
+            conventions_path.to_string_lossy().to_string(),
         ),
         (
             "app_scope",

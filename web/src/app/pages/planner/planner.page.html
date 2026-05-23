@@ -1,10 +1,7 @@
 <div class="planner-shell">
   <header class="planner-topbar">
+    <!-- Brand removed — the side menu carries that. -->
     <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
-    <div class="brand-lockup">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">JohnnyOne</span>
-    </div>
 
     <nav class="planner-tabs" [attr.aria-label]="modeTitle() + ' runs'">
       @for (plan of plans(); track plan.id) {

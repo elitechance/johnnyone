@@ -76,6 +76,15 @@ pub async fn send_chat_message_blocking(
     let provider = CliProvider::from_str(&provider_str)
         .ok_or_else(|| format!("Unknown provider: {}", provider_str))?;
 
+    // Shell sessions are terminal-mode only — they don't accept chat messages.
+    // The user interacts with the tmux pane directly. Reject explicitly so the
+    // caller (web client / API) sees a clear error rather than a silent no-op.
+    if matches!(provider, CliProvider::Shell) {
+        return Err(
+            "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
+        );
+    }
+
     let cli_path_ref = cli_path.as_deref();
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
@@ -89,6 +98,9 @@ pub async fn send_chat_message_blocking(
         CliProvider::Ollama => {
             ollama_cli::build_config(&content, &working_dir, &model, cli_path_ref)
         }
+        // Shell is filtered out above; unreachable here but the compiler needs
+        // the arm so the match stays exhaustive.
+        CliProvider::Shell => unreachable!("shell provider already rejected"),
     };
 
     let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -96,6 +108,7 @@ pub async fn send_chat_message_blocking(
         CliProvider::Codex => codex::parse_line,
         CliProvider::Cline => cline::parse_line,
         CliProvider::Ollama => ollama_cli::parse_line,
+        CliProvider::Shell => unreachable!("shell provider already rejected"),
     };
 
     let (process, mut rx) = cli_runner::spawn_cli(config, session_id.clone(), parse_fn).await?;

@@ -489,10 +489,21 @@ async fn create_tmux_session(
 }
 
 fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
-    let command = config
-        .cli_path
-        .clone()
-        .unwrap_or_else(|| config.provider.default_command().to_string());
+    // For Shell, prefer the user's $SHELL over the static default ("bash"),
+    // so people on zsh/fish get their actual login shell.
+    let command = if matches!(config.provider, CliProvider::Shell) {
+        config
+            .cli_path
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| config.provider.default_command().to_string())
+    } else {
+        config
+            .cli_path
+            .clone()
+            .unwrap_or_else(|| config.provider.default_command().to_string())
+    };
 
     match config.provider {
         CliProvider::ClaudeCode => (
@@ -510,6 +521,9 @@ fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
         CliProvider::Ollama if !config.model.trim().is_empty() => {
             (command, vec!["run".to_string(), config.model.clone()])
         }
+        // Plain shell — no args. tmux will run it as the pane's command and
+        // the user types whatever they want.
+        CliProvider::Shell => (command, Vec::new()),
         _ => (command, Vec::new()),
     }
 }

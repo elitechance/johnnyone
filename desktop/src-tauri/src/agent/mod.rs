@@ -1460,6 +1460,14 @@ impl AgentService {
         } else {
             None
         };
+        // Shell sessions are terminal-mode only; they don't go through the
+        // chat-message dispatch. Reject explicitly before the match.
+        if matches!(provider, CliProvider::Shell) {
+            return Err(
+                "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
+            );
+        }
+
         let config = match provider {
             CliProvider::ClaudeCode => claude_code::build_config(
                 &req.content,
@@ -1481,6 +1489,7 @@ impl AgentService {
             CliProvider::Ollama => {
                 ollama_cli::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }
+            CliProvider::Shell => unreachable!("shell provider already rejected"),
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -1488,6 +1497,7 @@ impl AgentService {
             CliProvider::Codex => codex::parse_line,
             CliProvider::Cline => cline::parse_line,
             CliProvider::Ollama => ollama_cli::parse_line,
+            CliProvider::Shell => unreachable!("shell provider already rejected"),
         };
 
         let (_process, mut rx) =

@@ -9,7 +9,31 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
-import { IonMenuButton } from '@ionic/angular/standalone';
+import {
+  IonMenuButton,
+  IonModal,
+  IonHeader,
+  IonToolbar,
+  IonTitle,
+  IonButtons,
+  IonButton,
+  IonContent,
+  IonList,
+  IonItem,
+  IonLabel,
+  IonIcon,
+  IonText,
+  IonFooter,
+  IonSegment,
+  IonSegmentButton,
+} from '@ionic/angular/standalone';
+import { addIcons } from 'ionicons';
+import {
+  arrowUpOutline,
+  closeOutline,
+  folderOutline,
+  documentOutline,
+} from 'ionicons/icons';
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
 import {
@@ -69,6 +93,14 @@ interface PendingImageAttachment {
   previewUrl: string;
 }
 
+// Register Ionicons used by the workspace-picker modal once at module load.
+addIcons({
+  'arrow-up-outline': arrowUpOutline,
+  'close-outline': closeOutline,
+  'folder-outline': folderOutline,
+  'document-outline': documentOutline,
+});
+
 @Component({
   selector: 'app-terminal',
   standalone: true,
@@ -77,6 +109,21 @@ interface PendingImageAttachment {
     FormsModule,
     TerminalScreenComponent,
     IonMenuButton,
+    IonModal,
+    IonHeader,
+    IonToolbar,
+    IonTitle,
+    IonButtons,
+    IonButton,
+    IonContent,
+    IonList,
+    IonItem,
+    IonLabel,
+    IonIcon,
+    IonText,
+    IonFooter,
+    IonSegment,
+    IonSegmentButton,
   ],
   templateUrl: './terminal.page.html',
   styleUrls: ['./terminal.page.scss'],
@@ -1554,6 +1601,7 @@ export class TerminalPage implements OnInit, OnDestroy {
       case 'codex': return 'terminal-outline';
       case 'cline': return 'git-branch-outline';
       case 'ollama': return 'hardware-chip-outline';
+      case 'shell': return 'terminal-outline';
       default: return 'chatbubble-outline';
     }
   }
@@ -1564,6 +1612,7 @@ export class TerminalPage implements OnInit, OnDestroy {
       case 'codex': return 'Codex';
       case 'cline': return 'Cline';
       case 'ollama': return 'Ollama';
+      case 'shell': return 'Shell';
       default: return provider;
     }
   }

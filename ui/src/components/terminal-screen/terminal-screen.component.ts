@@ -68,6 +68,25 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.terminalHost.nativeElement);
+
+    // Forward every keystroke that xterm.js captures (Tab, arrow keys, regular
+    // characters, Ctrl-*, etc.) up to the host. Without this, the xterm view
+    // shows output but typed keys go nowhere — Tab autocomplete, arrow-key
+    // history, Ctrl-R etc. all silently fail.
+    //
+    // xterm.js intercepts Tab when its container has focus, so the browser's
+    // default "Tab moves focus" behavior is bypassed automatically.
+    this.terminal.onData((data) => {
+      if (this.disabled) return;
+      this.rawInput.emit(data);
+    });
+
+    // Same for paste / structured key events that bubble up via onBinary.
+    this.terminal.onBinary((data) => {
+      if (this.disabled) return;
+      this.rawInput.emit(data);
+    });
+
     this.wheelHandler = (event) => {
       if (!this.terminal) return;
       const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40));
@@ -142,6 +161,19 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   protected onMobileInputKeydown(event: KeyboardEvent): void {
+    // Tab: don't let the browser move focus. Flush whatever's in the textarea
+    // to the shell + a literal Tab so readline triggers completion. Then
+    // clear the textarea — those bytes now live on the shell's line, the
+    // completion (if any) will appear in the xterm pane.
+    if (event.key === 'Tab' && !event.shiftKey) {
+      event.preventDefault();
+      if (this.disabled) return;
+      const buffered = this.mobileInputBuffer ?? '';
+      this.rawInput.emit(`${buffered}\t`);
+      this.mobileInputBuffer = '';
+      return;
+    }
+
     if (event.key !== 'Enter' || event.shiftKey) return;
 
     event.preventDefault();
@@ -176,7 +208,20 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (!this.terminal || !this.fitAddon) return;
 
     try {
-      this.fitAddon.fit();
+      // FitAddon occasionally rounds up by one row when the host's height is
+      // fractionally larger than `cols * cellHeight`. Use `proposeDimensions`
+      // and apply the proposal manually so we can clamp instead of trusting
+      // its built-in `fit()` rounding.
+      const proposed = this.fitAddon.proposeDimensions();
+      if (proposed && proposed.cols > 0 && proposed.rows > 0) {
+        const safeRows = Math.max(1, proposed.rows);
+        const safeCols = Math.max(1, proposed.cols);
+        if (this.terminal.cols !== safeCols || this.terminal.rows !== safeRows) {
+          this.terminal.resize(safeCols, safeRows);
+        }
+      } else {
+        this.fitAddon.fit();
+      }
       this.terminalResize.emit({
         cols: this.terminal.cols,
         rows: this.terminal.rows,

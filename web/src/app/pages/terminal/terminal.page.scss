@@ -626,3 +626,23 @@
 @media (max-width: 767px) {
   .mobile-menu-btn { display: inline-flex; }
 }
+
+/* === Workspace picker modal === */
+ion-modal.workspace-picker {
+  --width: min(640px, 92vw);
+  --height: min(720px, 84vh);
+  --border-radius: 12px;
+}
+ion-modal.workspace-picker .picker-path {
+  margin: 0;
+  padding: 6px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  white-space: normal;
+  line-height: 1.4;
+}
+ion-modal.workspace-picker .picker-empty {
+  padding: 32px 16px;
+  text-align: center;
+}

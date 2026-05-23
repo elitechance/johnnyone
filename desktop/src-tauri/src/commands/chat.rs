@@ -74,6 +74,13 @@ pub async fn send_chat_message(
     let provider = CliProvider::from_str(&provider_str)
         .ok_or_else(|| format!("Unknown provider: {}", provider_str))?;
 
+    // Shell sessions are terminal-mode only — reject chat-mode invocation.
+    if matches!(provider, CliProvider::Shell) {
+        return Err(
+            "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
+        );
+    }
+
     let cli_path_ref = cli_path.as_deref();
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
@@ -87,6 +94,7 @@ pub async fn send_chat_message(
         CliProvider::Ollama => {
             ollama_cli::build_config(&content, &working_dir, &model, cli_path_ref)
         }
+        CliProvider::Shell => unreachable!("shell provider already rejected"),
     };
 
     // 5. Select the parser for this provider
@@ -95,6 +103,7 @@ pub async fn send_chat_message(
         CliProvider::Codex => codex::parse_line,
         CliProvider::Cline => cline::parse_line,
         CliProvider::Ollama => ollama_cli::parse_line,
+        CliProvider::Shell => unreachable!("shell provider already rejected"),
     };
 
     // 6. Spawn CLI subprocess

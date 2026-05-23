@@ -107,8 +107,9 @@ Plan: {{plan_path}}
 Current phase: {{phase_id}}
 Phase path: {{phase_path}}
 Tasks path: {{tasks_path}}
+Conventions: {{conventions_path}}
 
-Read methodology, plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. When the whole phase is ready for review, say READY_FOR_T2_VALIDATION."#;
+Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. When the whole phase is ready for review, say READY_FOR_T2_VALIDATION."#;
 
 const DEFAULT_DEVELOPMENT_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
 JOHNNYONE_PHASE_ID: {{phase_id}}
@@ -119,8 +120,9 @@ Plan: {{plan_path}}
 Current phase: {{phase_id}}
 Phase path: {{phase_path}}
 Tasks path: {{tasks_path}}
+Conventions: {{conventions_path}}
 
-Read methodology, plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only. Focus on status files, decisions, tests, E2E artifacts, screenshots, and acceptance criteria.
+Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only. Focus on status files, decisions, tests, E2E artifacts, screenshots, acceptance criteria, and convention compliance.
 
 Before returning, append your phase validation result to {{phase_path}}/status.md under `## Phase Validation`. Include verdict, summary, findings, next steps, and any screenshot/test read-back notes. If {{phase_path}}/status.yml exists, update its validation fields consistently with your verdict. Do not edit application source files.
 
@@ -147,6 +149,7 @@ App/source scope: {{app_scope}}
 Docs scope: {{docs_scope}}
 Plan output path: {{plan_output_path}}
 Methodology: {{methodology_path}}
+Conventions: {{conventions_path}}
 
 User brief:
 {{user_brief}}
@@ -154,7 +157,7 @@ User brief:
 Reference paths:
 {{reference_paths}}
 
-Create or update a methodology-compliant plan at the plan output path. Read the methodology first. Inspect the app/source scope and docs scope enough to ground the plan in the real codebase. Use Mermaid for diagrams and HTML+JS mocks when UI/layout is unclear. Include local and live validation strategy when the feature must be testable by the user. Do not implement application code. Only create/update plan files.
+Create or update a methodology-compliant plan at the plan output path. Read the methodology first, then read every file under the conventions path so the plan honors project conventions (UI, backend, testing, tooling, plan-validation, etc.). Inspect the app/source scope and docs scope enough to ground the plan in the real codebase. Use Mermaid for diagrams and HTML+JS mocks when UI/layout is unclear. Include local and live validation strategy when the feature must be testable by the user. Do not implement application code. Only create/update plan files.
 
 When the plan is ready for review, say exactly:
 
@@ -168,10 +171,11 @@ App/source scope: {{app_scope}}
 Docs scope: {{docs_scope}}
 Plan path: {{plan_output_path}}
 Methodology: {{methodology_path}}
+Conventions: {{conventions_path}}
 
-Validate the plan only. Do not implement application code. Read methodology, the created plan, relevant docs, source scope, artifacts, mocks, and diagrams.
+Validate the plan only. Do not implement application code. Read methodology, every convention file under the conventions path, the created plan, relevant docs, source scope, artifacts, mocks, and diagrams.
 
-Review for methodology compliance, clear phase boundaries, actionable task prompts, explicit acceptance criteria, local/live testing strategy, UI mocks/diagrams where needed, risky assumptions, and whether the plan can produce something the user can test.
+Review for methodology + convention compliance, clear phase boundaries, actionable task prompts, explicit acceptance criteria, local/live testing strategy, UI mocks/diagrams where needed, risky assumptions, and whether the plan can produce something the user can test.
 
 Return this footer exactly:
 

@@ -57,7 +57,11 @@
   flex: 1 1 0;
   min-height: 0;
   overflow: hidden;
-  padding: 4px 8px;
+  // Vertical padding removed: xterm FitAddon reads this host's computed
+  // height as the available area but only subtracts padding from the inner
+  // .xterm element (which has none). The result was a row of overdraw that
+  // got clipped at the bottom. Keep horizontal padding for breathing room.
+  padding: 0 8px;
   box-sizing: border-box;
 
   &.disabled {

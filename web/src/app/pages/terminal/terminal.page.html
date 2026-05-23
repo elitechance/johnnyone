@@ -4,15 +4,11 @@
   (dragover)="onWorkspaceDragOver($event)"
   (drop)="onWorkspaceDrop($event)"
 >
+  <!-- Page-level brand/header removed — the side menu carries that. -->
   <header class="workspace-topbar">
-    <!-- Hamburger to pop the side drawer on phone-narrow viewports (md and up
-         the split-pane shows the menu permanently, so this button hides). -->
+    <!-- Hamburger to pop the side drawer on phone-narrow viewports only;
+         hidden by CSS at md+ where the split-pane shows the menu permanently. -->
     <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
-
-    <div class="brand-lockup">
-      <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-name">JohnnyOne</span>
-    </div>
 
     <nav class="workspace-tabs" aria-label="Terminal sessions">
       @for (session of aiSessions(); track session.id) {
@@ -151,39 +147,107 @@
   </footer>
 </div>
 
-@if (newSessionBrowserOpen()) {
-  <div class="modal-backdrop">
-    <section class="directory-browser">
-      <header>
-        <div>
-          <strong>Choose workspace directory</strong>
-          <code>{{ newSessionBrowsePath() }}</code>
+<ion-modal
+  [isOpen]="newSessionBrowserOpen()"
+  (didDismiss)="closeNewSessionBrowser()"
+  class="workspace-picker"
+>
+  <ng-template>
+    <ion-header>
+      <ion-toolbar>
+        <ion-buttons slot="start">
+          <ion-button
+            (click)="browseNewSessionParent()"
+            [disabled]="!canBrowseNewSessionUp()"
+            aria-label="Up one directory"
+          >
+            <ion-icon slot="icon-only" name="arrow-up-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+        <ion-title>New Terminal</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="closeNewSessionBrowser()" aria-label="Cancel">
+            <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+      <ion-toolbar>
+        <ion-segment
+          [value]="selectedProvider()"
+          (ionChange)="selectedProvider.set($any($event.detail.value))"
+          scrollable
+        >
+          <ion-segment-button value="shell">
+            <ion-label>Shell</ion-label>
+          </ion-segment-button>
+          <ion-segment-button value="claude_code">
+            <ion-label>Claude Code</ion-label>
+          </ion-segment-button>
+          <ion-segment-button value="codex">
+            <ion-label>Codex</ion-label>
+          </ion-segment-button>
+          <ion-segment-button value="cline">
+            <ion-label>Cline</ion-label>
+          </ion-segment-button>
+          <ion-segment-button value="ollama">
+            <ion-label>Ollama</ion-label>
+          </ion-segment-button>
+        </ion-segment>
+      </ion-toolbar>
+      <ion-toolbar>
+        <ion-text color="medium">
+          <p class="picker-path">{{ newSessionBrowsePath() }}</p>
+        </ion-text>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content>
+      @if (newSessionBrowserError()) {
+        <div class="picker-empty">
+          <ion-text color="danger">{{ newSessionBrowserError() }}</ion-text>
         </div>
-        <button class="icon-action" type="button" (click)="closeNewSessionBrowser()" aria-label="Cancel">×</button>
-      </header>
-      <div class="browser-toolbar">
-        <button class="secondary-action" type="button" [disabled]="!canBrowseNewSessionUp()" (click)="browseNewSessionParent()">Up</button>
-        <button class="primary-action" type="button" (click)="confirmNewSessionPath()">Use This Directory</button>
-      </div>
-      <div class="browser-list">
-        @if (newSessionBrowserError()) {
-          <div class="file-empty">{{ newSessionBrowserError() }}</div>
-        } @else if (newSessionEntries().length === 0) {
-          <div class="file-empty">No entries in this directory.</div>
-        }
-        @for (entry of newSessionEntries(); track entry.path) {
-          <div class="browser-row" [class.file]="entry.kind !== 'directory'">
-            <button type="button" [disabled]="entry.kind !== 'directory'" (click)="browseNewSessionTo(entry)">
-              <span class="file-status">{{ entry.kind }}</span>
-              <span>{{ entry.name }}</span>
-            </button>
-            @if (entry.kind === 'directory') {
-              <button class="secondary-action" type="button" (click)="confirmNewSessionPath(entry.path)">Use</button>
-            }
-          </div>
-        }
-      </div>
-    </section>
-  </div>
-}
+      } @else if (newSessionEntries().length === 0) {
+        <div class="picker-empty">
+          <ion-text color="medium">Empty directory.</ion-text>
+        </div>
+      } @else {
+        <ion-list>
+          @for (entry of newSessionEntries(); track entry.path) {
+            <ion-item
+              [button]="entry.kind === 'directory'"
+              [detail]="false"
+              (click)="entry.kind === 'directory' ? browseNewSessionTo(entry) : null"
+            >
+              <ion-icon
+                slot="start"
+                [name]="entry.kind === 'directory' ? 'folder-outline' : 'document-outline'"
+                [color]="entry.kind === 'directory' ? 'primary' : 'medium'"
+              ></ion-icon>
+              <ion-label>{{ entry.name }}</ion-label>
+              @if (entry.kind === 'directory') {
+                <ion-button
+                  slot="end"
+                  size="small"
+                  fill="clear"
+                  (click)="confirmNewSessionPath(entry.path); $event.stopPropagation()"
+                >
+                  Use
+                </ion-button>
+              }
+            </ion-item>
+          }
+        </ion-list>
+      }
+    </ion-content>
+    <ion-footer>
+      <ion-toolbar>
+        <ion-buttons slot="end">
+          <ion-button fill="clear" (click)="closeNewSessionBrowser()">Cancel</ion-button>
+          <ion-button color="primary" fill="solid" (click)="confirmNewSessionPath()">
+            Use This Directory
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-footer>
+  </ng-template>
+</ion-modal>
 

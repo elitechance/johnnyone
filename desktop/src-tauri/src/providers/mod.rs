@@ -15,6 +15,10 @@ pub enum CliProvider {
     Codex,
     Cline,
     Ollama,
+    /// Plain interactive shell session (no AI provider). Spawned as the user's
+    /// `$SHELL` (or bash) in a tmux pane; the user types commands themselves.
+    /// Doesn't participate in chat-mode message exchange — terminal-mode only.
+    Shell,
 }
 
 impl CliProvider {
@@ -24,6 +28,7 @@ impl CliProvider {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Ollama => "ollama",
+            Self::Shell => "shell",
         }
     }
 
@@ -33,6 +38,7 @@ impl CliProvider {
             "codex" => Some(Self::Codex),
             "cline" => Some(Self::Cline),
             "ollama" => Some(Self::Ollama),
+            "shell" | "bash" | "sh" => Some(Self::Shell),
             _ => None,
         }
     }
@@ -43,6 +49,9 @@ impl CliProvider {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Ollama => "ollama",
+            // Honor the user's $SHELL at runtime; this static default is the
+            // fallback if $SHELL isn't set. Resolved in terminal.rs::provider_command.
+            Self::Shell => "bash",
         }
     }
 }
