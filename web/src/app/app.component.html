@@ -1,0 +1,63 @@
+<ion-app>
+  <ion-split-pane contentId="main-content" when="md">
+    <ion-menu contentId="main-content" type="overlay" *ngIf="auth.isAuthenticated()">
+      <ion-content>
+        <ion-list lines="none">
+          <ion-list-header>JohnnyOne</ion-list-header>
+
+          <ion-menu-toggle auto-hide="false">
+            <ion-item routerLink="/terminal" routerLinkActive="ion-color-primary" lines="none" detail="false">
+              <ion-icon slot="start" name="terminal-outline"></ion-icon>
+              <ion-label>Terminal</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+
+          <ion-menu-toggle auto-hide="false">
+            <ion-item routerLink="/planning" routerLinkActive="ion-color-primary" lines="none" detail="false">
+              <ion-icon slot="start" name="document-text-outline"></ion-icon>
+              <ion-label>Planning</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+
+          <ion-menu-toggle auto-hide="false">
+            <ion-item routerLink="/development" routerLinkActive="ion-color-primary" lines="none" detail="false">
+              <ion-icon slot="start" name="hammer-outline"></ion-icon>
+              <ion-label>Development</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+
+          <ion-menu-toggle auto-hide="false">
+            <ion-item routerLink="/settings" routerLinkActive="ion-color-primary" lines="none" detail="false">
+              <ion-icon slot="start" name="settings-outline"></ion-icon>
+              <ion-label>Settings</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+        </ion-list>
+
+        <ion-list lines="none" class="ion-margin-top">
+          <ion-menu-toggle auto-hide="false">
+            <ion-item button (click)="logout()" lines="none" detail="false">
+              <ion-icon slot="start" name="log-out-outline"></ion-icon>
+              <ion-label>Sign out</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+        </ion-list>
+      </ion-content>
+    </ion-menu>
+
+    <ion-router-outlet id="main-content"></ion-router-outlet>
+  </ion-split-pane>
+
+  <!-- Draggable resizer pinned to the right edge of the side menu (md+ only). -->
+  <div
+    *ngIf="auth.isAuthenticated()"
+    class="side-resizer"
+    [class.dragging]="isResizing()"
+    (mousedown)="startResize($event)"
+    role="separator"
+    aria-orientation="vertical"
+    aria-label="Resize side menu"
+  >
+    <div class="side-resizer-handle"></div>
+  </div>
+</ion-app>

@@ -162,6 +162,17 @@ export interface PlannerPromptSettings {
   };
 }
 
+export interface ChatAttachment {
+  id: string;
+  sessionId?: string;
+  originalName: string;
+  contentType: string;
+  size: number;
+  status: string;
+  uploadedAt: string;
+  localPath?: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class JohnnyApiService {
   private readonly gql = inject(GraphQLClient);
@@ -333,25 +344,22 @@ export class JohnnyApiService {
       .pipe(map((data) => data.sendRelayChatMessage));
   }
 
-  sendAiChatMessage(input: { sessionId: string; content: string }): Observable<AiChatRunResult> {
+  createChatAttachment(input: { sessionId?: string; originalName: string; contentType: string; dataBase64: string }): Observable<ChatAttachment> {
     return this.gql
-      .mutate<{ sendAiChatMessage: AiChatRunResult }>(
-        `mutation SendAiChatMessage($input: SendAiChatMessageInput!) {
-          sendAiChatMessage(input: $input) {
-            userMessage {
-              id sessionId role content toolCalls
-              finishReason inputTokens outputTokens costCents createdAt
-            }
-            assistantMessage {
-              id sessionId role content toolCalls
-              finishReason inputTokens outputTokens costCents createdAt
-            }
+      .mutate<{ createChatAttachment: ChatAttachment }>(
+        `mutation CreateChatAttachment($input: ChatAttachmentInput!) {
+          createChatAttachment(input: $input) {
+            id sessionId originalName contentType size status uploadedAt localPath
           }
         }`,
         { input }
       )
-      .pipe(map((data) => data.sendAiChatMessage));
+      .pipe(map((data) => data.createChatAttachment));
   }
+
+  // sendAiChatMessage (forward path) removed by Phase 2 task 05 of multi-user-saas plan.
+  // Use sendRelayChatMessage (above) — it routes through ChatRelayDO to the user's
+  // registered host, which is multi-tenant safe.
 
   stopAiGeneration(sessionId: string): Observable<boolean> {
     return this.gql
@@ -393,45 +401,9 @@ export class JohnnyApiService {
       .pipe(map((data) => data.aiMessageCreated));
   }
 
-  onAiChatDelta(sessionId: string): Observable<AiMessageDelta> {
-    return this.gql
-      .subscribe<{ onAiChatDelta: AiMessageDelta & { chunkType: string; isFinal: boolean } }>(
-        `subscription OnAiChatDelta($sessionId: String!) {
-          onAiChatDelta(sessionId: $sessionId) {
-            sessionId
-            messageId
-            delta
-            chunkType
-            isFinal
-          }
-        }`,
-        { sessionId }
-      )
-      .pipe(
-        map((data) => ({
-          sessionId: data.onAiChatDelta.sessionId,
-          messageId: data.onAiChatDelta.messageId,
-          delta: data.onAiChatDelta.delta,
-          chunkType: data.onAiChatDelta.chunkType,
-          isFinal: data.onAiChatDelta.isFinal,
-          finishReason: data.onAiChatDelta.isFinal ? 'stop' : undefined,
-        }))
-      );
-  }
-
-  onAiChatComplete(sessionId: string): Observable<AiChatComplete> {
-    return this.gql
-      .subscribe<{ onAiChatComplete: AiChatComplete }>(
-        `subscription OnAiChatComplete($sessionId: String!) {
-          onAiChatComplete(sessionId: $sessionId) {
-            sessionId
-            messageId
-          }
-        }`,
-        { sessionId }
-      )
-      .pipe(map((data) => data.onAiChatComplete));
-  }
+  // onAiChatDelta / onAiChatComplete (forward subscriptions) removed by Phase 2 task 05.
+  // Use onRelayChatDelta + onRelayChatMessage (relay-WS via ChatRelayDO) for
+  // streaming + completion.
 
   // ── Tools ─────────────────────────────────────────────────────────────
 

@@ -13,6 +13,7 @@ import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
 import {
   JohnnyApiService,
+  ChatAttachment,
   TerminalScreenComponent,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
@@ -58,6 +59,12 @@ interface PaneLayout {
   y: number;
   width: number;
   height: number;
+}
+
+interface PendingImageAttachment {
+  id: string;
+  file: File;
+  previewUrl: string;
 }
 
 @Component({
@@ -138,6 +145,9 @@ export class ChatPage implements OnInit, OnDestroy {
   isDraggingPane = signal(false);
   isResizingPane = signal(false);
   isCompactWorkspace = signal(false);
+  pendingAttachments = signal<PendingImageAttachment[]>([]);
+  attachmentMessage = '';
+  isSendingAttachments = signal(false);
 
   // Computed
   filteredSessions = computed(() => {
@@ -250,6 +260,7 @@ export class ChatPage implements OnInit, OnDestroy {
     this.stopSidebarResize();
     this.stopPaneInteraction();
     this.teardownCompactWorkspaceMode();
+    this.clearPendingAttachments();
   }
 
   // ── Type Mappers ───────────────────────────────────────────────────
@@ -618,6 +629,112 @@ export class ChatPage implements OnInit, OnDestroy {
       this.finishStreamingState();
       this.currentMessage = text;
     }
+  }
+
+  onWorkspacePaste(event: ClipboardEvent): void {
+    const files = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+      file.type.startsWith('image/')
+    );
+    if (files.length === 0) return;
+    event.preventDefault();
+    this.addPendingImageFiles(files);
+  }
+
+  onWorkspaceDragOver(event: DragEvent): void {
+    if (this.dragEventHasImage(event)) {
+      event.preventDefault();
+    }
+  }
+
+  onWorkspaceDrop(event: DragEvent): void {
+    const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
+      file.type.startsWith('image/')
+    );
+    if (files.length === 0) return;
+    event.preventDefault();
+    this.addPendingImageFiles(files);
+  }
+
+  removePendingAttachment(id: string): void {
+    this.pendingAttachments.update((items) => {
+      const target = items.find((item) => item.id === id);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return items.filter((item) => item.id !== id);
+    });
+  }
+
+  async sendAttachmentMessage(): Promise<void> {
+    const session = this.currentSession();
+    const attachments = this.pendingAttachments();
+    const text = this.attachmentMessage.trim();
+    if (!session || this.isSendingAttachments() || attachments.length === 0) return;
+
+    this.isSendingAttachments.set(true);
+    try {
+      const uploaded: ChatAttachment[] = [];
+      for (const item of attachments) {
+        uploaded.push(
+          await firstValueFrom(this.api.createChatAttachment({
+            sessionId: session.id,
+            originalName: item.file.name || 'clipboard-image.png',
+            contentType: item.file.type || 'image/png',
+            dataBase64: await this.fileToBase64(item.file),
+          }))
+        );
+      }
+
+      await this.relayTerminal.sendInputWithAttachments(
+        session.id,
+        `${text || 'Please review the attached image.'}\r`,
+        uploaded.map((attachment) => ({
+          id: attachment.id,
+          originalName: attachment.originalName,
+          contentType: attachment.contentType,
+          size: attachment.size,
+        })),
+      );
+
+      this.attachmentMessage = '';
+      this.clearPendingAttachments();
+    } catch (err) {
+      console.error('Failed to send image attachment:', err);
+    } finally {
+      this.isSendingAttachments.set(false);
+    }
+  }
+
+  private addPendingImageFiles(files: File[]): void {
+    const items = files.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }));
+    this.pendingAttachments.update((current) => [...current, ...items]);
+  }
+
+  private clearPendingAttachments(): void {
+    for (const item of this.pendingAttachments()) {
+      URL.revokeObjectURL(item.previewUrl);
+    }
+    this.pendingAttachments.set([]);
+  }
+
+  private fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error ?? new Error('Failed to read image'));
+      reader.onload = () => {
+        const value = String(reader.result ?? '');
+        resolve(value.includes(',') ? value.split(',').pop() ?? '' : value);
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  private dragEventHasImage(event: DragEvent): boolean {
+    return Array.from(event.dataTransfer?.items ?? []).some((item) =>
+      item.kind === 'file' && item.type.startsWith('image/')
+    );
   }
 
   async stopGeneration(): Promise<void> {

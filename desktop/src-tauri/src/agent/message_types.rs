@@ -296,6 +296,17 @@ pub struct TerminalCommand {
     pub data: String,
     #[serde(default)]
     pub control: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<TerminalCommandAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCommandAttachment {
+    pub id: String,
+    pub original_name: String,
+    pub content_type: String,
+    pub size: i64,
 }
 
 /// Visual subscription request from a remote UI.

@@ -1,0 +1,189 @@
+<div
+  class="workspace-shell"
+  (paste)="onWorkspacePaste($event)"
+  (dragover)="onWorkspaceDragOver($event)"
+  (drop)="onWorkspaceDrop($event)"
+>
+  <header class="workspace-topbar">
+    <!-- Hamburger to pop the side drawer on phone-narrow viewports (md and up
+         the split-pane shows the menu permanently, so this button hides). -->
+    <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
+
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">JohnnyOne</span>
+    </div>
+
+    <nav class="workspace-tabs" aria-label="Terminal sessions">
+      @for (session of aiSessions(); track session.id) {
+        <button
+          class="workspace-tab"
+          [class.active]="session.id === currentSession()?.id"
+          (click)="onSessionSelected(session.id)"
+          [title]="session.id"
+        >
+          <span class="tab-status" aria-hidden="true"></span>
+          <span>{{ providerLabel(session.provider) }}</span>
+          <span class="tab-number">#{{ toSessionNumber(session.id) }}</span>
+        </button>
+      }
+    </nav>
+
+    <div class="workspace-actions">
+      <select
+        [value]="selectedProvider()"
+        (change)="onProviderChange($any($event.target).value)"
+        class="provider-dropdown"
+        aria-label="Provider"
+      >
+        @for (tool of detectedTools(); track tool.provider) {
+          <option [value]="tool.provider" [disabled]="!tool.found">
+            {{ providerLabel(tool.provider) }}{{ !tool.found ? ' (not found)' : '' }}
+          </option>
+        }
+      </select>
+      <button class="primary-action" (click)="createNewSession()">New Terminal</button>
+      @if (currentSession()) {
+        <button class="icon-action" title="Copy session ID" (click)="copyCurrentSessionId()">
+          {{ sessionIdCopied() ? '✓' : '#' }}
+        </button>
+      }
+      <button class="icon-action" title="Settings" (click)="navigateTo('/settings')">⚙</button>
+      <button class="icon-action" title="Sign out" (click)="logout()">⎋</button>
+    </div>
+  </header>
+
+  <main class="terminal-workspace">
+    @if (visiblePaneSessions().length > 0) {
+      @for (session of visiblePaneSessions(); track session.id; let index = $index) {
+      @let layout = paneLayout(session.id, index);
+      @let screen = terminalScreens()[session.id] || null;
+      <section
+        class="terminal-pane"
+        [class.active]="session.id === currentSession()?.id"
+        [class.dragging]="isDraggingPane()"
+        [class.resizing]="isResizingPane()"
+        [style.left.px]="layout.x"
+        [style.top.px]="layout.y"
+        [style.width.px]="layout.width"
+        [style.height.px]="layout.height"
+        (pointerdown)="onSessionSelected(session.id)"
+      >
+        <header class="pane-header" (pointerdown)="startPaneDrag($event, session.id)">
+          <div class="pane-title">
+            <span class="provider-badge">{{ providerLabel(session.provider) }}</span>
+            <span class="pane-name">{{ session.title || 'Terminal' }}</span>
+            <span class="pane-id">#{{ toSessionNumber(session.id) }}</span>
+          </div>
+          <div class="pane-meta">
+            <button class="pane-tool" title="Working directory" (click)="pickWorkingDirectoryForSession(session.id); $event.stopPropagation()">
+              {{ session.workingDirectory || '~' }}
+            </button>
+            <button class="pane-tool danger" title="Kill terminal" (click)="killTerminal(session.id); $event.stopPropagation()">
+              kill
+            </button>
+            <button class="pane-icon" title="Close terminal widget" (click)="closeTerminalPane(session.id); $event.stopPropagation()">
+              ×
+            </button>
+            <span class="pane-status" [class.offline]="screen?.status !== 'attached'">
+              {{ screen?.status || (session.id === currentSession()?.id ? 'attaching' : 'detached') }}
+            </span>
+          </div>
+        </header>
+
+        <johnny-terminal-screen
+          class="terminal-surface"
+          [screen]="screen"
+          [title]="session.title || 'Terminal'"
+          [disabled]="session.id !== currentSession()?.id"
+          [mobileInputMode]="isCompactWorkspace()"
+          (rawInput)="onTerminalRawInput($event, session.id)"
+          (terminalResize)="onTerminalResize($event, session.id)"
+        />
+
+        <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>
+
+        @if (terminalError() && session.id === currentSession()?.id) {
+          <div class="terminal-error">{{ terminalError() }}</div>
+        }
+      </section>
+      }
+    } @else {
+      <section class="workspace-empty">
+        <div class="empty-title">No terminal attached</div>
+        <div class="empty-copy">Start a tmux-backed terminal using the selected provider.</div>
+        <button class="primary-action" (click)="createNewSession()">New Terminal</button>
+      </section>
+    }
+  </main>
+
+  <footer class="workspace-statusbar">
+    @if (pendingAttachments().length > 0) {
+      <div class="attachment-composer">
+        <div class="attachment-previews" aria-label="Pending image attachments">
+          @for (attachment of pendingAttachments(); track attachment.id) {
+            <div class="attachment-preview">
+              <img [src]="attachment.previewUrl" [alt]="attachment.file.name || 'Pasted image'" />
+              <button type="button" title="Remove image" (click)="removePendingAttachment(attachment.id)">×</button>
+            </div>
+          }
+        </div>
+        <textarea
+          [(ngModel)]="attachmentMessage"
+          rows="2"
+          placeholder="Message with image"
+          [disabled]="isSendingAttachments()"
+        ></textarea>
+        <button
+          type="button"
+          class="primary-action"
+          [disabled]="isSendingAttachments() || !currentSession()"
+          (click)="sendAttachmentMessage()"
+        >
+          {{ isSendingAttachments() ? 'Sending…' : 'Send image' }}
+        </button>
+      </div>
+    } @else {
+      <span>relay <strong>connected</strong></span>
+      <span>paste or drop images to attach</span>
+      <span>raw input batched at <strong>200ms</strong></span>
+    }
+  </footer>
+</div>
+
+@if (newSessionBrowserOpen()) {
+  <div class="modal-backdrop">
+    <section class="directory-browser">
+      <header>
+        <div>
+          <strong>Choose workspace directory</strong>
+          <code>{{ newSessionBrowsePath() }}</code>
+        </div>
+        <button class="icon-action" type="button" (click)="closeNewSessionBrowser()" aria-label="Cancel">×</button>
+      </header>
+      <div class="browser-toolbar">
+        <button class="secondary-action" type="button" [disabled]="!canBrowseNewSessionUp()" (click)="browseNewSessionParent()">Up</button>
+        <button class="primary-action" type="button" (click)="confirmNewSessionPath()">Use This Directory</button>
+      </div>
+      <div class="browser-list">
+        @if (newSessionBrowserError()) {
+          <div class="file-empty">{{ newSessionBrowserError() }}</div>
+        } @else if (newSessionEntries().length === 0) {
+          <div class="file-empty">No entries in this directory.</div>
+        }
+        @for (entry of newSessionEntries(); track entry.path) {
+          <div class="browser-row" [class.file]="entry.kind !== 'directory'">
+            <button type="button" [disabled]="entry.kind !== 'directory'" (click)="browseNewSessionTo(entry)">
+              <span class="file-status">{{ entry.kind }}</span>
+              <span>{{ entry.name }}</span>
+            </button>
+            @if (entry.kind === 'directory') {
+              <button class="secondary-action" type="button" (click)="confirmNewSessionPath(entry.path)">Use</button>
+            }
+          </div>
+        }
+      </div>
+    </section>
+  </div>
+}
+

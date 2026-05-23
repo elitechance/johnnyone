@@ -1,0 +1,72 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Sign in to JohnnyOne</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content class="ion-padding login-content">
+  <ion-card class="login-card">
+    <form #loginForm="ngForm" (ngSubmit)="login()" autocomplete="on">
+      <ion-list lines="full">
+        <ion-item>
+          <ion-input
+            label="Email"
+            labelPlacement="floating"
+            type="email"
+            name="email"
+            autocomplete="username"
+            inputmode="email"
+            autocapitalize="none"
+            spellcheck="false"
+            required
+            [value]="email()"
+            (ionInput)="email.set($any($event.target).value)"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-input
+            label="Password"
+            labelPlacement="floating"
+            type="password"
+            name="password"
+            autocomplete="current-password"
+            required
+            [value]="password()"
+            (ionInput)="password.set($any($event.target).value)"
+          ></ion-input>
+        </ion-item>
+
+        <ion-item>
+          <ion-input
+            label="Tenant"
+            labelPlacement="floating"
+            type="text"
+            name="tenantId"
+            autocomplete="organization"
+            autocapitalize="none"
+            spellcheck="false"
+            required
+            [value]="tenantId()"
+            (ionInput)="tenantId.set($any($event.target).value)"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+
+      @if (error()) {
+        <ion-text color="danger" class="login-error">
+          <p>{{ error() }}</p>
+        </ion-text>
+      }
+
+      <ion-button
+        type="submit"
+        expand="block"
+        class="login-submit"
+        [disabled]="loading()"
+      >
+        {{ loading() ? 'Signing in…' : 'Sign in' }}
+      </ion-button>
+    </form>
+  </ion-card>
+</ion-content>

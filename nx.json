@@ -16,6 +16,19 @@
     },
     "test": {
       "cache": true
+    },
+    "@angular-devkit/build-angular:application": {
+      "cache": true,
+      "dependsOn": ["^build"],
+      "inputs": ["production", "^production"]
+    }
+  },
+  "generators": {
+    "@nx/angular:application": {
+      "e2eTestRunner": "none",
+      "linter": "none",
+      "style": "scss",
+      "unitTestRunner": "none"
     }
   }
 }

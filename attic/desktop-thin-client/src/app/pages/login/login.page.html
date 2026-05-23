@@ -5,26 +5,31 @@
       <span>JohnnyOne</span>
     </div>
 
-    <form class="login-form" (submit)="$event.preventDefault(); login()">
+    <form class="login-form" autocomplete="on" (ngSubmit)="login()">
       <header>
         <h1>Sign in</h1>
         <p>Use your Lokal account to access terminals and planners.</p>
       </header>
 
-      <label>
+      <label for="johnnyone-login-username">
         <span>Email</span>
         <input
+          id="johnnyone-login-username"
           type="email"
-          name="email"
-          autocomplete="email"
+          name="username"
+          autocomplete="username"
+          inputmode="email"
+          autocapitalize="none"
+          spellcheck="false"
           [(ngModel)]="email"
           required
         />
       </label>
 
-      <label>
+      <label for="johnnyone-login-password">
         <span>Password</span>
         <input
+          id="johnnyone-login-password"
           type="password"
           name="password"
           autocomplete="current-password"
@@ -33,12 +38,15 @@
         />
       </label>
 
-      <label>
+      <label for="johnnyone-login-tenant">
         <span>Tenant</span>
         <input
+          id="johnnyone-login-tenant"
           type="text"
           name="tenantId"
           autocomplete="organization"
+          autocapitalize="none"
+          spellcheck="false"
           [(ngModel)]="tenantId"
           required
         />

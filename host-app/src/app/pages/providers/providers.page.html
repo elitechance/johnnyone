@@ -1,0 +1,47 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Provider CLIs</ion-title>
+  </ion-toolbar>
+</ion-header>
+<ion-content class="ion-padding">
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Detected on this machine</ion-card-title>
+    </ion-card-header>
+    <ion-card-content>
+      @if (loading()) {
+        <ion-text color="medium"><p>Checking…</p></ion-text>
+      } @else if (tools().length === 0) {
+        <ion-text color="medium">
+          <p>
+            No provider CLIs detected. Install at least one of Claude Code, Codex, Cline, or
+            Ollama to start using JohnnyOne.
+          </p>
+        </ion-text>
+      } @else {
+        <ion-list lines="full">
+          @for (tool of tools(); track tool.provider) {
+            <ion-item>
+              <ion-icon name="terminal" slot="start"></ion-icon>
+              <ion-label>
+                <h3>{{ tool.provider }}</h3>
+                <p>{{ tool.path ?? tool.command }}</p>
+              </ion-label>
+              @if (tool.found) {
+                <ion-chip color="success" slot="end">
+                  <ion-icon name="checkmark-circle"></ion-icon>
+                  <ion-label>Found</ion-label>
+                </ion-chip>
+              } @else {
+                <ion-chip color="medium" slot="end">
+                  <ion-icon name="close-circle"></ion-icon>
+                  <ion-label>Missing</ion-label>
+                </ion-chip>
+              }
+            </ion-item>
+          }
+        </ion-list>
+      }
+    </ion-card-content>
+  </ion-card>
+</ion-content>

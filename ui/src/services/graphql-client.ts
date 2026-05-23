@@ -161,12 +161,12 @@ export class GraphQLClient {
 
     if (includeContentHeaders) {
       headers['Content-Type'] = 'application/json';
-      headers.Accept = 'application/json';
+      headers['Accept'] = 'application/json';
     }
 
     const token = this.getStoredValue('johnnyone_access_token');
     if (token) {
-      headers.Authorization = `Bearer ${token}`;
+      headers['Authorization'] = `Bearer ${token}`;
     }
 
     const tenantId = this.getStoredValue('johnnyone_tenant_id');

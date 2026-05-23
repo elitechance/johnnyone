@@ -7,7 +7,10 @@ pub mod ws_client;
 use crate::providers::{
     claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
-use crate::services::{providers as provider_service, sessions as session_service};
+use crate::services::{
+    chat_host, providers as provider_service, sessions as session_service,
+    settings as settings_service,
+};
 use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
@@ -405,15 +408,23 @@ impl AgentService {
                         .map(|_| ())
                     } else if command.control.as_deref() == Some("visual_unsubscribe") {
                         crate::terminal::unsubscribe_terminal_visual(&st, &command.session_id).await
-                    } else if command.data.is_empty() {
+                    } else if command.data.is_empty() && command.attachments.is_empty() {
                         Ok(())
                     } else {
-                        crate::terminal::send_terminal_input(
-                            &st,
-                            command.session_id.clone(),
-                            command.data,
-                        )
-                        .await
+                        match Self::prepare_terminal_command_data(&st, &command).await {
+                            Ok(data) => {
+                                crate::terminal::send_terminal_input(
+                                    &st,
+                                    command.session_id.clone(),
+                                    data,
+                                )
+                                .await
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, session_id = %command.session_id, "Failed to prepare terminal attachments");
+                                Err(error)
+                            }
+                        }
                     };
 
                     let ack = TerminalCommandAck {
@@ -563,6 +574,209 @@ impl AgentService {
         Ok(())
     }
 
+    async fn prepare_terminal_command_data(
+        state: &Arc<AppState>,
+        command: &message_types::TerminalCommand,
+    ) -> Result<String, String> {
+        if command.attachments.is_empty() {
+            return Ok(command.data.clone());
+        }
+
+        let saved = Self::save_command_attachments(state, command).await?;
+        let mut data = command.data.trim_end_matches(['\r', '\n']).to_string();
+        if !data.is_empty() {
+            data.push_str("\n\n");
+        }
+        data.push_str("Attached image files saved in this workspace:\n");
+        for path in saved {
+            data.push_str("- ");
+            data.push_str(&path);
+            data.push('\n');
+        }
+        data.push('\r');
+        Ok(data)
+    }
+
+    async fn save_command_attachments(
+        state: &Arc<AppState>,
+        command: &message_types::TerminalCommand,
+    ) -> Result<Vec<String>, String> {
+        use base64::{engine::general_purpose, Engine as _};
+        use serde::Deserialize;
+        use std::path::PathBuf;
+
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AttachmentContent {
+            id: String,
+            original_name: String,
+            content_type: String,
+            size: i64,
+            data_base64: String,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AttachmentData {
+            get_chat_attachment: AttachmentContent,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct GraphqlResponse<T> {
+            data: Option<T>,
+            errors: Option<Vec<GraphqlError>>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct GraphqlError {
+            message: String,
+        }
+
+        let worker_config = state
+            .worker_relay_config
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "Worker relay config is not available".to_string())?;
+
+        let working_dir = state.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT working_directory FROM sessions WHERE id = ?1",
+                rusqlite::params![command.session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())
+        })?;
+        let workspace_path = if working_dir.trim().is_empty() {
+            std::env::current_dir().map_err(|e| e.to_string())?
+        } else {
+            PathBuf::from(working_dir)
+        };
+        let attachment_dir = workspace_path.join(".johnnyone").join("attachments");
+        tokio::fs::create_dir_all(&attachment_dir)
+            .await
+            .map_err(|e| format!("Failed to create attachment directory: {}", e))?;
+
+        let client = reqwest::Client::new();
+        let graphql_url = format!("{}/graphql", worker_config.worker_url.trim_end_matches('/'));
+        let mut saved_paths = Vec::new();
+
+        for attachment in &command.attachments {
+            let response = client
+                .post(&graphql_url)
+                .header("Content-Type", "application/json")
+                .header("x-tenant-id", &worker_config.tenant_id)
+                .header("x-user-id", &worker_config.user_id)
+                .json(&serde_json::json!({
+                    "query": "query GetChatAttachment($id: ID!) { getChatAttachment(id: $id) { id originalName contentType size dataBase64 } }",
+                    "variables": { "id": attachment.id }
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Attachment download request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Attachment download failed with status {}: {}",
+                    status, body
+                ));
+            }
+
+            let gql: GraphqlResponse<AttachmentData> = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse attachment response: {}", e))?;
+            if let Some(errors) = gql.errors {
+                let messages = errors.into_iter().map(|e| e.message).collect::<Vec<_>>();
+                return Err(format!(
+                    "Attachment download failed: {}",
+                    messages.join("; ")
+                ));
+            }
+            let content = gql
+                .data
+                .ok_or_else(|| "Attachment response had no data".to_string())?
+                .get_chat_attachment;
+            if !content.content_type.starts_with("image/") {
+                return Err(format!(
+                    "Attachment {} is not an image: {}",
+                    content.id, content.content_type
+                ));
+            }
+            let bytes = general_purpose::STANDARD
+                .decode(content.data_base64)
+                .map_err(|e| format!("Invalid attachment encoding: {}", e))?;
+            if content.size >= 0 && bytes.len() as i64 != content.size {
+                return Err(format!("Attachment {} size mismatch", content.id));
+            }
+            let file_name = Self::local_attachment_file_name(&content.original_name, &content.id);
+            let local_path = attachment_dir.join(file_name);
+            tokio::fs::write(&local_path, bytes)
+                .await
+                .map_err(|e| format!("Failed to save attachment: {}", e))?;
+
+            let display_path = Self::display_workspace_path(&workspace_path, &local_path);
+            saved_paths.push(display_path.clone());
+
+            let _ = client
+                .post(&graphql_url)
+                .header("Content-Type", "application/json")
+                .header("x-tenant-id", &worker_config.tenant_id)
+                .header("x-user-id", &worker_config.user_id)
+                .json(&serde_json::json!({
+                    "query": "mutation DeleteChatAttachment($input: MarkChatAttachmentDeliveredInput!) { deleteChatAttachment(input: $input) { id status localPath } }",
+                    "variables": { "input": { "id": content.id, "localPath": display_path } }
+                }))
+                .send()
+                .await;
+        }
+
+        Ok(saved_paths)
+    }
+
+    fn local_attachment_file_name(original_name: &str, id: &str) -> String {
+        let fallback = "image";
+        let safe = original_name
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(fallback)
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let safe = safe.trim_matches('-');
+        let path = std::path::Path::new(if safe.is_empty() { fallback } else { safe });
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(fallback);
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("png");
+        let short_id = id.get(0..8).unwrap_or(id);
+        format!("{}-{}.{}", stem, short_id, ext)
+    }
+
+    fn display_workspace_path(
+        workspace_path: &std::path::Path,
+        local_path: &std::path::Path,
+    ) -> String {
+        local_path
+            .strip_prefix(workspace_path)
+            .ok()
+            .map(|path| format!("./{}", path.to_string_lossy()))
+            .unwrap_or_else(|| local_path.to_string_lossy().to_string())
+    }
+
     /// Handle an RPC request by dispatching to the appropriate query method.
     async fn handle_rpc(req: &RpcRequest, state: &Arc<AppState>) -> RpcResponse {
         let result = match req.method.as_str() {
@@ -601,6 +815,15 @@ impl AgentService {
             "update_planner_prompt_settings" => {
                 Self::rpc_update_planner_prompt_settings(&req.params)
             }
+            // Forward-path replacements (Phase 2 of multi-user-saas plan).
+            // These mirror the host's GraphQL mutations so the worker can reach them
+            // via relay-RPC after host-graphql.ts is deleted.
+            "get_setting" => Self::rpc_get_setting(&req.params, state),
+            "set_setting" => Self::rpc_set_setting(&req.params, state),
+            "list_provider_configs" => Self::rpc_list_provider_configs(state),
+            "upsert_provider_config" => Self::rpc_upsert_provider_config(&req.params, state),
+            "delete_provider_config" => Self::rpc_delete_provider_config(&req.params, state),
+            "stop_ai_generation" => Self::rpc_stop_ai_generation(&req.params, state).await,
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };
 
@@ -1048,6 +1271,84 @@ impl AgentService {
             serde_json::from_value(input).map_err(|e| e.to_string())?;
         let saved = crate::services::planner_prompts::save_prompt_settings(settings)?;
         serde_json::to_value(saved).map_err(|e| e.to_string())
+    }
+
+    // ── Phase 2 forward-path replacements ────────────────────────────────────
+    // Each method below mirrors a corresponding host GraphQL mutation/query.
+    // The worker reaches these via ChatRelayDO `/relay-rpc` once Phase 2 deletes
+    // host-graphql.ts. Until then, both the GraphQL handlers in host/mod.rs and
+    // these RPC handlers coexist (they delegate to the same service functions).
+
+    fn rpc_get_setting(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let key = params
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'key' parameter".to_string())?;
+        let value = settings_service::get_setting(state, key.to_string())?;
+        serde_json::to_value(value).map_err(|e| e.to_string())
+    }
+
+    fn rpc_set_setting(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let key = params
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'key' parameter".to_string())?;
+        let value = params
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'value' parameter".to_string())?;
+        settings_service::set_setting(state, key.to_string(), value.to_string())?;
+        Ok(serde_json::json!(true))
+    }
+
+    fn rpc_list_provider_configs(state: &Arc<AppState>) -> Result<serde_json::Value, String> {
+        let configs = provider_service::list_provider_configs(state)?;
+        serde_json::to_value(configs).map_err(|e| e.to_string())
+    }
+
+    fn rpc_upsert_provider_config(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let input_value = params
+            .get("input")
+            .cloned()
+            .ok_or_else(|| "Missing 'input' parameter".to_string())?;
+        let input: crate::db::models::UpsertProviderConfigInput =
+            serde_json::from_value(input_value).map_err(|e| e.to_string())?;
+        let config = provider_service::upsert_provider_config(state, input)?;
+        serde_json::to_value(config).map_err(|e| e.to_string())
+    }
+
+    fn rpc_delete_provider_config(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let provider = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'provider' parameter".to_string())?;
+        provider_service::delete_provider_config(state, provider.to_string())?;
+        Ok(serde_json::json!(true))
+    }
+
+    async fn rpc_stop_ai_generation(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("session_id").and_then(|v| v.as_str()))
+            .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
+        chat_host::stop_generation(state, session_id.to_string()).await?;
+        Ok(serde_json::json!(true))
     }
 
     fn session_view(session: crate::db::models::Session) -> RpcSessionView {

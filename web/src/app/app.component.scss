@@ -1,0 +1,49 @@
+// Side menu width is bound to a CSS variable so the drag-handle component can
+// update it. Min/max prevent the user from shrinking the menu to invisibility
+// or growing it past half the viewport.
+:host {
+  --jo-side-menu-width: 240px;
+}
+
+ion-split-pane {
+  --side-width: var(--jo-side-menu-width);
+  --side-min-width: var(--jo-side-menu-width);
+  --side-max-width: var(--jo-side-menu-width);
+}
+
+// Thin, draggable bar pinned to the right edge of the side menu (md+ only;
+// on mobile the menu is an overlay drawer with no need for resizing).
+.side-resizer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  left: calc(var(--jo-side-menu-width) - 3px);
+  cursor: col-resize;
+  z-index: 1000;
+  background: transparent;
+  user-select: none;
+
+  &:hover,
+  &.dragging {
+    background: var(--ion-color-step-200, rgba(0, 0, 0, 0.08));
+  }
+
+  // Hide on phone-narrow widths — split-pane collapses there anyway.
+  @media (max-width: 767px) {
+    display: none;
+  }
+}
+
+.side-resizer-handle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 32px;
+  margin-top: -16px;
+  margin-left: -1px;
+  background: var(--ion-color-step-400, rgba(0, 0, 0, 0.15));
+  border-radius: 1px;
+  pointer-events: none;
+}

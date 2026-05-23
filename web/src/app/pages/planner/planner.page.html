@@ -1,0 +1,619 @@
+<div class="planner-shell">
+  <header class="planner-topbar">
+    <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">JohnnyOne</span>
+    </div>
+
+    <nav class="planner-tabs" [attr.aria-label]="modeTitle() + ' runs'">
+      @for (plan of plans(); track plan.id) {
+        <div
+          class="planner-tab"
+          [class.active]="currentPlan()?.id === plan.id"
+        >
+          <button class="planner-tab-main" type="button" (click)="selectPlan(plan.id)">
+            <span class="dot" [class.warn]="plan.status.includes('running')" [class.bad]="plan.status === 'blocked' || plan.status === 'needs_attention'"></span>
+            <span>{{ plan.title }}</span>
+          </button>
+          <button class="tab-close" type="button" title="Delete planner run" (click)="deletePlan(plan.id, $event)">×</button>
+        </div>
+      }
+    </nav>
+
+    <div class="planner-actions">
+      <button class="primary-action" type="button" (click)="openSetup()">{{ primaryActionLabel() }}</button>
+      <button class="icon-action" title="Settings" (click)="navigateTo('/settings')">⚙</button>
+      <button class="icon-action" title="Sign out" (click)="logout()">⎋</button>
+    </div>
+  </header>
+
+  <main class="planner-workspace" [style.grid-template-rows]="coordinatorRows()">
+    @if (error()) {
+      <div class="error-banner">{{ error() }}</div>
+    }
+
+    @if (currentRun(); as run) {
+      <nav class="mobile-panel-switcher" aria-label="Planner mobile panels">
+        <button
+          type="button"
+          [class.active]="activeMobilePanel() === 'worker'"
+          (click)="selectMobilePanel('worker')"
+        >
+          T1
+        </button>
+        <button
+          type="button"
+          [class.active]="activeMobilePanel() === 'reviewer'"
+          (click)="selectMobilePanel('reviewer')"
+        >
+          T2
+        </button>
+        <button
+          type="button"
+          [class.active]="activeMobilePanel() === 'coordinator'"
+          (click)="selectMobilePanel('coordinator')"
+        >
+          Coordinator
+        </button>
+      </nav>
+
+      <section class="agent-grid" [class.active-mobile-panel]="activeMobilePanel() === 'worker' || activeMobilePanel() === 'reviewer'">
+        <article class="terminal-card" [class.active-mobile-panel]="activeMobilePanel() === 'worker'">
+          <header>
+            <span class="badge">T1</span>
+            <strong>{{ t1Label() }}</strong>
+            @if (workerScreen(); as screen) {
+              <code class="tmux-ref" [title]="screen.tmuxSessionName || screen.sessionId">
+                {{ screen.tmuxSessionName || screen.sessionId }}
+              </code>
+              <code class="tmux-ref pane" [title]="screen.paneId">{{ screen.paneId }}</code>
+            }
+            <span class="state">{{ run.plan.status }}</span>
+          </header>
+          <johnny-terminal-screen
+            class="terminal-fill"
+            [screen]="workerScreen()"
+            [mobileInputMode]="isCompactWorkspace()"
+            [showInput]="isCompactWorkspace()"
+            (rawInput)="sendPlannerRawInput('worker', $event)"
+            (terminalResize)="resizePlannerTerminal('worker', $event)"
+          ></johnny-terminal-screen>
+          <form class="agent-message-bar" (submit)="$event.preventDefault(); sendWorkerMessage()">
+            <textarea
+              name="workerMessage"
+              rows="1"
+              placeholder="Message T1"
+              [ngModel]="workerMessage()"
+              (ngModelChange)="workerMessage.set($event)"
+            ></textarea>
+            <button type="submit" [disabled]="!workerMessage().trim()">Send T1</button>
+          </form>
+        </article>
+
+        <article class="terminal-card" [class.active-mobile-panel]="activeMobilePanel() === 'reviewer'">
+          <header>
+            <span class="badge">T2</span>
+            <strong>{{ t2Label() }}</strong>
+            @if (reviewerScreen(); as screen) {
+              <code class="tmux-ref" [title]="screen.tmuxSessionName || screen.sessionId">
+                {{ screen.tmuxSessionName || screen.sessionId }}
+              </code>
+              <code class="tmux-ref pane" [title]="screen.paneId">{{ screen.paneId }}</code>
+            }
+            <span class="state">{{ currentPhase()?.gateVerdict || 'unknown' }}</span>
+          </header>
+          <johnny-terminal-screen
+            class="terminal-fill"
+            [screen]="reviewerScreen()"
+            [mobileInputMode]="isCompactWorkspace()"
+            [showInput]="isCompactWorkspace()"
+            (rawInput)="sendPlannerRawInput('reviewer', $event)"
+            (terminalResize)="resizePlannerTerminal('reviewer', $event)"
+          ></johnny-terminal-screen>
+          <form class="agent-message-bar" (submit)="$event.preventDefault(); sendReviewerMessage()">
+            <textarea
+              name="reviewerMessage"
+              rows="1"
+              placeholder="Message T2"
+              [ngModel]="reviewerMessage()"
+              (ngModelChange)="reviewerMessage.set($event)"
+            ></textarea>
+            <button type="submit" [disabled]="!reviewerMessage().trim()">Send T2</button>
+          </form>
+        </article>
+      </section>
+
+      <div
+        class="coordinator-resizer"
+        role="separator"
+        aria-label="Resize coordinator panel"
+        title="Resize coordinator panel"
+        (pointerdown)="startCoordinatorResize($event)"
+      ></div>
+
+      <section class="coordinator-panel" [class.active-mobile-panel]="activeMobilePanel() === 'coordinator'">
+        <header>
+          <div>
+            <span class="badge coordinator">Coordinator</span>
+            <strong>{{ run.plan.title }}</strong>
+          </div>
+          <div class="coordinator-actions">
+            <button class="secondary-action" type="button" (click)="openFiles('all')">Files</button>
+            @if (mode() === 'development') {
+              <select
+                class="phase-start-select"
+                aria-label="Start phase"
+                [ngModel]="selectedStartPhaseId()"
+                (ngModelChange)="selectedStartPhaseId.set($event)"
+              >
+                <option value="">Current phase</option>
+                @for (phase of run.phases; track phase.id) {
+                  <option [value]="phase.phaseId">{{ phase.phaseId }}</option>
+                }
+              </select>
+            }
+            <button class="secondary-action" type="button" (click)="startPlan()">Start</button>
+            <button class="secondary-action" type="button" (click)="sendBackToWorker()">Send back</button>
+            <button class="secondary-action" type="button" (click)="rerunReviewer()">Rerun T2</button>
+            @if (mode() === 'development') {
+              <button class="secondary-action" type="button" [disabled]="!canManualPass()" (click)="manualPass()">Manual pass</button>
+            }
+            <button class="danger-action" type="button" (click)="blockPlan()">Block</button>
+            <button class="danger-action" type="button" (click)="stopPlan()">Stop</button>
+          </div>
+        </header>
+
+        <div class="coordinator-body">
+          <section class="phase-list">
+            <div class="section-title">Phases</div>
+            @for (phase of run.phases; track phase.id) {
+              <button
+                class="phase-row"
+                type="button"
+                [class.active]="phase.phaseId === run.plan.currentPhaseId"
+                [class.locked]="phase.status === 'locked'"
+                (click)="openPhaseTasks(phase)"
+              >
+                <span>
+                  <strong>{{ phase.phaseId }}</strong>
+                  {{ phase.phaseTitle }}
+                </span>
+                <em>{{ phase.status }} · {{ phase.gateVerdict }} · {{ phaseTaskCount(phase.phaseId) }} tasks</em>
+              </button>
+            }
+          </section>
+
+          <section class="event-log">
+            <div class="section-title">Events</div>
+            @for (event of run.events; track event.id) {
+              <div class="event-row">
+                <strong>{{ event.eventType }}</strong>
+                <span>{{ event.createdAt }}</span>
+                <pre>{{ eventPayload(event) }}</pre>
+              </div>
+            }
+          </section>
+
+          <section class="run-settings">
+            <div class="section-title">Run Settings</div>
+            <label>Workspace</label>
+            <code>{{ run.plan.workspacePath }}</code>
+            <label>Plan path</label>
+            <code>{{ run.plan.planPath }}</code>
+            <label>Providers</label>
+            <code>T1: {{ run.plan.workerProvider }} · T2: {{ run.plan.reviewerProvider }}</code>
+            @if (run.plan.error) {
+              <label>Error</label>
+              <code>{{ run.plan.error }}</code>
+            }
+          </section>
+        </div>
+      </section>
+    } @else {
+      <section class="empty-state">
+        <h1>{{ emptyTitle() }}</h1>
+        <p>{{ emptyText() }}</p>
+        <button class="primary-action" type="button" (click)="openSetup()">{{ primaryActionLabel() }}</button>
+      </section>
+    }
+  </main>
+</div>
+
+@if (setupOpen()) {
+  <div class="modal-backdrop">
+    <section class="setup-modal">
+      <header>
+        <strong>{{ primaryActionLabel() }}</strong>
+        <button class="icon-action" type="button" (click)="closeSetup()">×</button>
+      </header>
+      <div class="setup-body">
+        <label>
+          <span>Title</span>
+          <input [(ngModel)]="setupTitle" placeholder="Optional plan run title" />
+        </label>
+        <label>
+          <span>Workspace directory on backend host</span>
+          <div class="field-control">
+            <input [(ngModel)]="workspacePath" (ngModelChange)="scheduleValidation()" />
+            <button class="secondary-action" type="button" (click)="openPathBrowser('workspace')">Browse</button>
+          </div>
+        </label>
+        <label>
+          <span>{{ mode() === 'planning' ? 'Output plan path or slug' : 'Plan path' }}</span>
+          <div class="field-control">
+            <input [(ngModel)]="planPath" (ngModelChange)="scheduleValidation()" />
+            <button class="secondary-action" type="button" (click)="openPathBrowser('plan')">Browse</button>
+          </div>
+        </label>
+        @if (mode() === 'planning') {
+          <label>
+            <span>User brief</span>
+            <textarea class="brief-input" [(ngModel)]="userBrief" rows="5" placeholder="Describe the plan you want T1 to create."></textarea>
+          </label>
+          <div class="provider-grid">
+            <label>
+              <span>App/source scope</span>
+              <div class="field-control">
+                <input [(ngModel)]="appScope" />
+                <button class="secondary-action" type="button" (click)="openPathBrowser('appScope')">Browse</button>
+              </div>
+            </label>
+            <label>
+              <span>Docs scope</span>
+              <div class="field-control">
+                <input [(ngModel)]="docsScope" />
+                <button class="secondary-action" type="button" (click)="openPathBrowser('docsScope')">Browse</button>
+              </div>
+            </label>
+          </div>
+          <label>
+            <span>Reference host paths</span>
+            <textarea class="brief-input compact" [(ngModel)]="referencePaths" rows="3" placeholder="Optional docs, existing plans, screenshots, or source paths. One backend-host path per line."></textarea>
+            <em class="field-help">These are extra files or directories T1/T2 should read while creating and reviewing the plan.</em>
+            <button class="secondary-action browse-inline" type="button" (click)="openPathBrowser('reference')">Add Reference Path</button>
+          </label>
+        }
+        <div class="provider-grid">
+          <label>
+            <span>T1 {{ t1Label() }}</span>
+            <select [(ngModel)]="workerProvider">
+              <option value="codex">Codex CLI</option>
+              <option value="claude_code">Claude Code</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </label>
+          <label>
+            <span>T2 {{ t2Label() }}</span>
+            <select [(ngModel)]="reviewerProvider">
+              <option value="codex">Codex CLI</option>
+              <option value="claude_code">Claude Code</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </label>
+        </div>
+
+        <section class="prompt-settings-panel">
+          <button class="secondary-action prompt-toggle" type="button" (click)="promptSettingsOpen = !promptSettingsOpen">
+            {{ promptSettingsOpen ? 'Hide' : 'Show' }} Prompt Settings
+          </button>
+          <code>{{ promptSettingsPath }}</code>
+          @if (promptSettingsOpen) {
+            <div class="prompt-grid">
+              <label>
+                <span>Development T1 Worker prompt</span>
+                <textarea [(ngModel)]="developmentWorkerPrompt" spellcheck="false"></textarea>
+              </label>
+              <label>
+                <span>Development T2 Reviewer prompt</span>
+                <textarea [(ngModel)]="developmentReviewerPrompt" spellcheck="false"></textarea>
+              </label>
+              <label>
+                <span>Planning T1 Planner prompt</span>
+                <textarea [(ngModel)]="planningPlannerPrompt" spellcheck="false"></textarea>
+              </label>
+              <label>
+                <span>Planning T2 Plan Reviewer prompt</span>
+                <textarea [(ngModel)]="planningReviewerPrompt" spellcheck="false"></textarea>
+              </label>
+            </div>
+            <div class="prompt-actions">
+              <span>Variables use <code>{{'{{run_id}}'}}</code>, <code>{{'{{phase_id}}'}}</code>, <code>{{'{{workspace_path}}'}}</code>, <code>{{'{{plan_path}}'}}</code>, <code>{{'{{phase_path}}'}}</code>, and <code>{{'{{tasks_path}}'}}</code>.</span>
+              <button class="secondary-action" type="button" [disabled]="isBusy()" (click)="savePromptSettingsFromSetup()">Save Prompts</button>
+            </div>
+          }
+        </section>
+
+        <div class="validation-box" [class.invalid]="validation() && !validation()?.valid">
+          @if (validation(); as result) {
+            @if (result.valid) {
+              @if (mode() === 'planning') {
+                Ready to create plan: {{ result.title }}
+              } @else {
+                Valid plan: {{ result.title }} · {{ result.phaseCount }} phases · {{ result.taskCount }} tasks
+              }
+            } @else {
+              {{ result.error }}
+            }
+          } @else {
+            Enter a workspace and plan path.
+          }
+        </div>
+      </div>
+      <footer>
+        <button class="secondary-action" type="button" (click)="closeSetup()">Cancel</button>
+        <button class="primary-action" type="button" [disabled]="!validation()?.valid || isBusy()" (click)="createPlanner()">{{ mode() === 'planning' ? 'Start Planner' : 'Start Development' }}</button>
+      </footer>
+    </section>
+  </div>
+}
+
+@if (browserOpen()) {
+  <div class="modal-backdrop">
+    <section class="browser-modal">
+      <header>
+        <div>
+          <strong>{{ browserTitle() }}</strong>
+          <code>{{ browsePath }}</code>
+        </div>
+        <button class="icon-action" type="button" (click)="closePathBrowser()">×</button>
+      </header>
+      <div class="browser-toolbar">
+        @if (browserMode() !== 'workspace') {
+          <span class="browser-root-note">Limited to {{ workspacePath }}</span>
+        }
+        <button class="secondary-action" type="button" [disabled]="!canBrowseUp()" (click)="browseParent()">Up</button>
+        <button class="primary-action" type="button" (click)="useBrowsePath()">{{ browserMode() === 'reference' ? 'Add This Path' : 'Use This Directory' }}</button>
+      </div>
+      <div class="browser-list">
+        @if (browserError()) {
+          <div class="file-empty">{{ browserError() }}</div>
+        } @else if (browserEntries().length === 0) {
+          <div class="file-empty">No entries in this directory.</div>
+        }
+        @for (entry of browserEntries(); track entry.path) {
+          <div class="browser-row" [class.file]="entry.kind !== 'directory'">
+            <button type="button" [disabled]="entry.kind !== 'directory'" (click)="browseInto(entry)">
+              <span class="file-status">{{ entry.kind }}</span>
+              <span>{{ entry.name }}</span>
+            </button>
+            @if (entry.kind === 'directory') {
+              <button class="secondary-action" type="button" (click)="useBrowsePath(entry.path)">Use</button>
+            } @else if (browserMode() === 'reference') {
+              <button class="secondary-action" type="button" (click)="useBrowsePath(entry.path)">Add</button>
+            }
+          </div>
+        }
+      </div>
+    </section>
+  </div>
+}
+
+@if (phaseTasksOpen() && selectedPhase(); as phase) {
+  <div class="modal-backdrop">
+    <section class="phase-tasks-modal">
+      <header>
+        <div>
+          <strong>{{ phase.phaseId }}</strong>
+          <span>{{ phase.phaseTitle }}</span>
+        </div>
+        <button class="icon-action" type="button" (click)="closePhaseTasks()">×</button>
+      </header>
+      <div class="phase-task-summary">
+        <span>Status: {{ phase.status }}</span>
+        <span>Verdict: {{ phase.gateVerdict }}</span>
+        <span>Tasks: {{ selectedPhaseTasks().length }}</span>
+      </div>
+      <div class="phase-task-list">
+        @if (selectedPhaseTasks().length === 0) {
+          <div class="file-empty">No tasks found for this phase.</div>
+        }
+        @for (task of selectedPhaseTasks(); track task.id) {
+          <article class="phase-task-row">
+            <div>
+              <span class="task-status" [ngClass]="statusClass(task.status)">{{ task.status }}</span>
+              <strong>{{ task.taskId }}</strong>
+            </div>
+            <h3>{{ task.taskTitle }}</h3>
+            <dl>
+              <dt>Prompt</dt>
+              <dd>{{ task.promptPath }}</dd>
+              <dt>Status</dt>
+              <dd>{{ task.statusPath || 'Missing status file' }}</dd>
+              <dt>Decisions</dt>
+              <dd>{{ task.decisionsPath || 'Missing decisions file' }}</dd>
+            </dl>
+            @if (taskStatusDetail(task); as detail) {
+              <section class="task-status-detail">
+                <header>
+                  <span>Status Details</span>
+                  @if (detail.path) {
+                    <code>{{ detail.path }}</code>
+                  }
+                </header>
+                @if (detail.loading) {
+                  <div class="file-empty">Loading task status...</div>
+                } @else if (detail.error) {
+                  <div class="file-empty">{{ detail.error }}</div>
+                } @else if (detail.kind === 'markdown') {
+                  <article class="plan-markdown-preview markdown-content compact" [innerHTML]="detail.renderedHtml"></article>
+                } @else if (detail.fields?.length) {
+                  <dl class="task-status-fields">
+                    @for (field of detail.fields; track field.label) {
+                      <dt>{{ field.label }}</dt>
+                      <dd>{{ field.value }}</dd>
+                    }
+                  </dl>
+                  <pre class="raw-preview compact">{{ detail.rawText }}</pre>
+                } @else {
+                  <pre class="raw-preview compact">{{ detail.rawText }}</pre>
+                }
+              </section>
+            }
+          </article>
+        }
+      </div>
+    </section>
+  </div>
+}
+
+@if (filesOpen()) {
+  <div class="modal-backdrop">
+    <section class="files-modal">
+      <header>
+        <div>
+          <strong>Files</strong>
+          <code>{{ currentRun()?.plan?.workspacePath }}</code>
+        </div>
+        <button class="icon-action" type="button" (click)="closeFiles()">×</button>
+      </header>
+
+      <nav class="files-tabs" aria-label="Files tabs">
+        <button type="button" [class.active]="filesTab() === 'changes'" (click)="setFilesTab('changes')">File Changes</button>
+        <button type="button" [class.active]="filesTab() === 'plan'" (click)="setFilesTab('plan')">Plan Files</button>
+      </nav>
+
+      @if (filesTab() === 'changes') {
+        <section class="files-tab-panel">
+          <div class="file-toolbar">
+            <div class="crumbs">
+              <button type="button" (click)="loadWorkspaceFiles('all', workspaceRootPath())">workspace root</button>
+              <span>/</span>
+              <button type="button" (click)="browseWorkspaceParent()">up</button>
+              <code>{{ fileMode() === 'all' ? workspaceRelativePath(workspaceBrowsePath()) : 'git status / working tree' }}</code>
+            </div>
+            <button type="button" [class.active]="fileMode() === 'changed'" (click)="loadWorkspaceFiles('changed')">Changed</button>
+            <button type="button" [class.active]="fileMode() === 'all'" (click)="loadWorkspaceFiles('all', workspaceBrowsePath() || workspaceRootPath())">All</button>
+          </div>
+
+          <div class="changes-viewer" [style.grid-template-columns]="fileViewerColumns()">
+            <aside class="change-list">
+              @if (filesError()) {
+                <div class="file-empty">{{ filesError() }}</div>
+              } @else if (workspaceFiles().length === 0) {
+                <div class="file-empty">{{ fileMode() === 'changed' ? 'No changed files.' : 'No entries in this directory.' }}</div>
+              }
+              @for (file of workspaceFiles(); track file.path) {
+                <button
+                  class="git-file"
+                  type="button"
+                  [class.active]="selectedWorkspaceFile()?.path === file.path"
+                  [class.directory]="file.kind === 'directory'"
+                  (click)="selectWorkspaceEntry(file)"
+                >
+                  <span class="change-kind" [ngClass]="fileStatusClass(file)">{{ fileStatusLabel(file) }}</span>
+                  <span class="name">{{ workspaceEntryLabel(file) }}</span>
+                  @if (file.size !== undefined) {
+                    <span class="diff-stat">{{ file.size }}b</span>
+                  }
+                </button>
+              }
+            </aside>
+
+            <div
+              class="file-resizer"
+              role="separator"
+              aria-label="Resize file list"
+              title="Resize file list"
+              (pointerdown)="startFileResize($event)"
+            ></div>
+
+            <section class="diff-pane">
+              <div class="preview-meta">
+                <span class="badge">Diff</span>
+                <code>{{ selectedWorkspaceFile()?.path || (fileMode() === 'all' ? 'Select a file to view its git diff' : 'Select a changed file') }}</code>
+              </div>
+              <div class="diff-scroll">
+                @if (!selectedWorkspaceFile()) {
+                  <div class="file-empty">Select a file to view its git diff.</div>
+                } @else {
+                  <table class="diff-table">
+                    <tbody>
+                      @for (line of diffLines(); track line.index) {
+                        <tr [class.add]="line.kind === 'add'" [class.remove]="line.kind === 'remove'" [class.hunk]="line.kind === 'hunk'">
+                          <td class="line-number">{{ line.index }}</td>
+                          <td class="line-text">{{ line.text || ' ' }}</td>
+                        </tr>
+                      }
+                    </tbody>
+                  </table>
+                }
+              </div>
+            </section>
+          </div>
+        </section>
+      }
+
+      @if (filesTab() === 'plan') {
+        <section class="files-tab-panel">
+          <div class="file-toolbar">
+            <div class="crumbs">
+              <button type="button" (click)="loadPlanFiles(planRootPath())">plan root</button>
+              <span>/</span>
+              <button type="button" (click)="browsePlanParent()">up</button>
+              <code>{{ planRelativePath(planBrowsePath()) }}</code>
+            </div>
+            <button type="button" (click)="loadPlanFiles(planBrowsePath() || planRootPath())">Refresh</button>
+          </div>
+
+          <div class="plan-file-viewer" [style.grid-template-columns]="fileViewerColumns()">
+            <aside class="tree">
+              @if (planFilesError()) {
+                <div class="file-empty">{{ planFilesError() }}</div>
+              } @else if (planFiles().length === 0) {
+                <div class="file-empty">No plan files.</div>
+              }
+              @for (entry of planFiles(); track entry.path) {
+                <button
+                  class="plan-file-row"
+                  type="button"
+                  [class.active]="selectedPlanFile()?.path === entry.path"
+                  [class.directory]="entry.kind === 'directory'"
+                  (click)="selectPlanEntry(entry)"
+                >
+                  <span class="file-kind">{{ fileKind(entry) }}</span>
+                  <span class="name">{{ entry.name }}</span>
+                  @if (entry.size !== undefined) {
+                    <span class="diff-stat">{{ entry.size }}b</span>
+                  }
+                </button>
+              }
+            </aside>
+
+            <div
+              class="file-resizer"
+              role="separator"
+              aria-label="Resize plan file list"
+              title="Resize plan file list"
+              (pointerdown)="startFileResize($event)"
+            ></div>
+
+            <section class="preview">
+              <div class="preview-meta">
+                <span class="badge">{{ selectedPlanPreviewKind() }}</span>
+                <code>{{ selectedPlanContent()?.path || 'Select a plan file' }}</code>
+              </div>
+              <div class="preview-scroll" [class.html-preview-scroll]="selectedPlanPreviewKind() === 'html'">
+                @if (planFilesError()) {
+                  <div class="file-empty">{{ planFilesError() }}</div>
+                } @else if (!selectedPlanContent()) {
+                  <div class="file-empty">Select a markdown, image, HTML, or raw file from the plan directory.</div>
+                } @else if (selectedPlanPreviewKind() === 'markdown') {
+                  <article class="plan-markdown-preview markdown-content" [innerHTML]="renderedPlanHtml()"></article>
+                } @else if (selectedPlanPreviewKind() === 'image') {
+                  <div class="image-preview">
+                    <img [src]="selectedPlanImageSrc()" [alt]="selectedPlanContent()?.name" />
+                  </div>
+                } @else if (selectedPlanPreviewKind() === 'html') {
+                  <iframe class="html-preview-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups" [src]="selectedPlanHtmlUrl()"></iframe>
+                } @else {
+                  <pre class="raw-preview">{{ selectedPlanRawText() }}</pre>
+                }
+              </div>
+            </section>
+          </div>
+        </section>
+      }
+    </section>
+  </div>
+}

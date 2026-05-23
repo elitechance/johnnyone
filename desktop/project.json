@@ -1,66 +1,18 @@
 {
   "name": "desktop",
   "projectType": "application",
-  "sourceRoot": "desktop/src",
   "targets": {
-    "serve": {
-      "executor": "@angular-devkit/build-angular:dev-server",
-      "options": { "buildTarget": "desktop:build", "port": 4200 }
+    "desktop-dev": {
+      "command": "cd desktop/src-tauri && cargo run --bin johnnyone-desktop"
     },
-    "build": {
-      "executor": "@angular-devkit/build-angular:application",
-      "options": {
-        "outputPath": "dist/desktop",
-        "index": "desktop/src/index.html",
-        "browser": "desktop/src/main.ts",
-        "tsConfig": "desktop/tsconfig.app.json",
-        "polyfills": ["zone.js"],
-        "assets": [
-          {
-            "glob": "_redirects",
-            "input": "desktop/src",
-            "output": "."
-          }
-        ],
-        "styles": ["desktop/src/styles.scss"],
-        "scripts": []
-      }
+    "desktop-check": {
+      "command": "cd desktop/src-tauri && cargo check --bin johnnyone-desktop"
     },
-    "e2e-web": {
-      "command": "node desktop/e2e/desktop-web.e2e.cjs"
-    },
-    "e2e-terminal-workspace": {
-      "command": "node desktop/e2e/terminal-workspace.e2e.cjs"
-    },
-    "e2e-session-sync": {
-      "command": "node desktop/e2e/session-sync.e2e.cjs"
-    },
-    "e2e-planner-smoke": {
-      "command": "node desktop/e2e/planner-smoke.e2e.cjs"
-    },
-    "e2e-mobile-shell": {
-      "command": "node desktop/e2e/mobile-shell.e2e.cjs"
-    },
-    "e2e-mobile-terminal": {
-      "command": "node desktop/e2e/mobile-terminal.e2e.cjs"
-    },
-    "e2e-mobile-planner-panels": {
-      "command": "node desktop/e2e/mobile-planner-panels.e2e.cjs"
-    },
-    "e2e-mobile-cross-client": {
-      "command": "node desktop/e2e/mobile-cross-client.e2e.cjs"
+    "desktop-build": {
+      "command": "cd desktop/src-tauri && cargo build --release --bin johnnyone-desktop"
     },
     "tauri-dev": {
       "command": "cd desktop/src-tauri && cargo tauri dev"
-    },
-    "host-dev": {
-      "command": "cd desktop/src-tauri && cargo run --bin johnnyone-host"
-    },
-    "host-check": {
-      "command": "cd desktop/src-tauri && cargo check --bin johnnyone-host"
-    },
-    "host-build": {
-      "command": "cd desktop/src-tauri && cargo build --bin johnnyone-host"
     },
     "tauri-build": {
       "command": "cd desktop/src-tauri && cargo tauri build"

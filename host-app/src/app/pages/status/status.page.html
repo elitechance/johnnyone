@@ -1,0 +1,93 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>JohnnyOne Host</ion-title>
+  </ion-toolbar>
+</ion-header>
+<ion-content class="ion-padding">
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Status</ion-card-title>
+      <ion-card-subtitle>This machine's backend</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="none">
+        <ion-item>
+          <ion-label>
+            <h3>Host process</h3>
+            <p>Listening on 127.0.0.1:7788 (GraphQL)</p>
+          </ion-label>
+          @if (status.hostUp()) {
+            <ion-chip color="success" slot="end">
+              <ion-icon name="checkmark-circle"></ion-icon>
+              <ion-label>Up</ion-label>
+            </ion-chip>
+          } @else {
+            <ion-chip color="medium" slot="end">
+              <ion-icon name="close-circle"></ion-icon>
+              <ion-label>Down</ion-label>
+            </ion-chip>
+          }
+        </ion-item>
+        <ion-item>
+          <ion-label>
+            <h3>Worker reachable</h3>
+            <p>Cloud relay endpoint</p>
+          </ion-label>
+          @if (status.workerUp()) {
+            <ion-chip color="success" slot="end">
+              <ion-icon name="checkmark-circle"></ion-icon>
+              <ion-label>Reachable</ion-label>
+            </ion-chip>
+          } @else {
+            <ion-chip color="warning" slot="end">
+              <ion-icon name="close-circle"></ion-icon>
+              <ion-label>Offline</ion-label>
+            </ion-chip>
+          }
+        </ion-item>
+        <ion-item>
+          <ion-label>
+            <h3>Node registered</h3>
+            <p>{{ user()?.email ?? 'Not signed in' }}</p>
+          </ion-label>
+          @if (status.nodeRegistered()) {
+            <ion-chip color="success" slot="end">
+              <ion-icon name="checkmark-circle"></ion-icon>
+              <ion-label>Registered</ion-label>
+            </ion-chip>
+          } @else {
+            <ion-chip color="warning" slot="end">
+              <ion-icon name="close-circle"></ion-icon>
+              <ion-label>Not registered</ion-label>
+            </ion-chip>
+          }
+        </ion-item>
+      </ion-list>
+      @if (status.lastError()) {
+        <ion-text color="danger"><p>{{ status.lastError() }}</p></ion-text>
+      }
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Use it</ion-card-title>
+    </ion-card-header>
+    <ion-card-content>
+      <p>Open the web app to start chatting. This host stays running in the background.</p>
+      <ion-button expand="block" (click)="openWeb()">
+        <ion-icon name="open-outline" slot="start"></ion-icon>
+        Open web client
+      </ion-button>
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Account</ion-card-title>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-button expand="block" color="medium" (click)="signOut()">Sign out</ion-button>
+    </ion-card-content>
+  </ion-card>
+</ion-content>

@@ -23,6 +23,13 @@ pub struct ConnectionStatus {
     pub last_heartbeat: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WorkerRelayConfig {
+    pub worker_url: String,
+    pub user_id: String,
+    pub tenant_id: String,
+}
+
 impl Default for ConnectionStatus {
     fn default() -> Self {
         Self {
@@ -69,6 +76,8 @@ pub struct AppState {
     pub terminal_capture_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     /// Visible UI subscribers for tmux screen mirroring, keyed by session_id.
     pub terminal_visual_subscribers: Arc<Mutex<HashMap<String, usize>>>,
+    /// Worker connection context used by host-side relay follow-up calls.
+    pub worker_relay_config: Arc<Mutex<Option<WorkerRelayConfig>>>,
 }
 
 impl AppState {
@@ -106,6 +115,7 @@ impl AppState {
             agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
             terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            worker_relay_config: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -135,7 +145,13 @@ impl AppState {
             agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
             terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            worker_relay_config: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub async fn set_worker_relay_config(&self, config: WorkerRelayConfig) {
+        let mut worker_config = self.worker_relay_config.lock().await;
+        *worker_config = Some(config);
     }
 
     /// Clear old tool execution records, keeping only the most recent `max_records`.

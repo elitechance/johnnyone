@@ -139,11 +139,19 @@ pub fn update_session_provider(
 }
 
 pub async fn archive_session(state: &AppState, id: String) -> Result<Session, String> {
+    // Chat-mode subprocess (`chat_host::send_message` spawn) → kill if present.
     {
         let mut processes = state.active_processes.lock().await;
         if let Some(mut proc) = processes.remove(&id) {
             let _ = proc.kill().await;
         }
+    }
+
+    // Terminal-mode tmux session (separate lifecycle from active_processes) →
+    // tear it down too, otherwise archiving from the UI leaves the tmux pane
+    // running and the next list_sessions still has data for it.
+    if let Err(error) = crate::terminal::kill_terminal_session(state, &id).await {
+        tracing::warn!(%error, session_id = %id, "kill_terminal_session failed during archive");
     }
 
     let session = state.db.with_conn(|conn| {
@@ -160,11 +168,16 @@ pub async fn archive_session(state: &AppState, id: String) -> Result<Session, St
 }
 
 pub async fn delete_session(state: &AppState, id: String) -> Result<bool, String> {
+    // Same two-cleanup pattern as archive — see archive_session for rationale.
     {
         let mut processes = state.active_processes.lock().await;
         if let Some(mut proc) = processes.remove(&id) {
             let _ = proc.kill().await;
         }
+    }
+
+    if let Err(error) = crate::terminal::kill_terminal_session(state, &id).await {
+        tracing::warn!(%error, session_id = %id, "kill_terminal_session failed during delete");
     }
 
     state.db.with_conn(|conn| {

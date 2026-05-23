@@ -19,8 +19,8 @@
     "noImplicitOverride": true,
     "noImplicitReturns": true,
     "paths": {
-      "@johnnyone/ui": ["ui/src/index.ts"],
-      "@johnnyone/shared": ["shared/src/index.ts"]
+      "@johnnyone/shared": ["shared/src/index.ts"],
+      "@johnnyone/ui": ["ui/src/index.ts"]
     }
   },
   "exclude": ["node_modules", "tmp"]

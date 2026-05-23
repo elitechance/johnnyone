@@ -4,23 +4,23 @@
   "version": "0.1.0",
   "identifier": "app.johnnyone.desktop",
   "build": {
-    "frontendDist": "../../dist/desktop/browser",
-    "devUrl": "http://localhost:4200",
-    "beforeDevCommand": "npx nx serve desktop",
-    "beforeBuildCommand": ""
+    "frontendDist": "../../dist/host-app/browser",
+    "devUrl": "http://localhost:4201",
+    "beforeDevCommand": "npx nx serve host-app --port 4201",
+    "beforeBuildCommand": "npx nx build host-app"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
         "title": "JohnnyOne",
-        "width": 1400,
-        "height": 900,
+        "width": 720,
+        "height": 560,
         "resizable": true,
         "fullscreen": false,
         "center": true,
-        "minWidth": 800,
-        "minHeight": 600
+        "minWidth": 480,
+        "minHeight": 480
       }
     ],
     "security": {

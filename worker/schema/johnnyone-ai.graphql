@@ -71,24 +71,6 @@ type DetectedTool {
   path: String
 }
 
-type AiChatRunResult {
-  userMessage: AiMessage!
-  assistantMessage: AiMessage!
-}
-
-type AiChatDelta {
-  sessionId: String!
-  messageId: String!
-  delta: String!
-  chunkType: String!
-  isFinal: Boolean!
-}
-
-type AiChatComplete {
-  sessionId: String!
-  messageId: String!
-}
-
 type RelayChatResponse {
   success: Boolean!
   relayId: String!
@@ -108,6 +90,25 @@ type RelayChatMessage {
   sessionId: String!
   role: String!
   content: String!
+}
+
+type ChatAttachment {
+  id: ID!
+  sessionId: String
+  originalName: String!
+  contentType: String!
+  size: Int!
+  status: String!
+  uploadedAt: String!
+  localPath: String
+}
+
+type ChatAttachmentContent {
+  id: ID!
+  originalName: String!
+  contentType: String!
+  size: Int!
+  dataBase64: String!
 }
 
 type AgentPlan {
@@ -249,16 +250,23 @@ input RelayChatMessageInput {
   workingDirectory: String
 }
 
+input ChatAttachmentInput {
+  sessionId: String
+  originalName: String!
+  contentType: String!
+  dataBase64: String!
+}
+
+input MarkChatAttachmentDeliveredInput {
+  id: ID!
+  localPath: String!
+}
+
 input CreateAiSessionInput {
   title: String
   provider: String
   model: String
   workingDirectory: String
-}
-
-input SendAiChatMessageInput {
-  sessionId: String!
-  content: String!
 }
 
 input UpsertProviderConfigInput {
@@ -315,6 +323,7 @@ type Query {
   listWorkspaceFiles(planId: ID!, mode: String!): [HostFileEntry!]!
   readHostFile(planId: ID!, path: String!): HostFileContent!
   getWorkspaceFileDiff(planId: ID!, path: String!): WorkspaceFileDiff!
+  getChatAttachment(id: ID!): ChatAttachmentContent!
 }
 
 # --- Mutations ---
@@ -328,7 +337,6 @@ type Mutation {
   registerDesktopNode(input: RegisterDesktopNodeInput!): DesktopNode!
   updateDesktopNodeStatus(id: ID!, status: DesktopNodeStatus!): DesktopNode!
   sendRelayChatMessage(input: RelayChatMessageInput!): RelayChatResponse!
-  sendAiChatMessage(input: SendAiChatMessageInput!): AiChatRunResult!
   cancelAiGeneration(sessionId: ID!): Boolean!
   deleteAiSession(id: ID!): Boolean!
   upsertProviderConfig(input: UpsertProviderConfigInput!): ProviderConfig!
@@ -343,14 +351,14 @@ type Mutation {
   updateAgentPhaseManualPass(id: ID!, phaseId: String!): AgentPlanRun!
   sendAgentFeedbackToWorker(id: ID!): AgentPlanRun!
   retryAgentReviewer(id: ID!): AgentPlanRun!
+  createChatAttachment(input: ChatAttachmentInput!): ChatAttachment!
+  deleteChatAttachment(input: MarkChatAttachmentDeliveredInput!): ChatAttachment!
 }
 
 # --- Subscriptions ---
 
 type Subscription {
   onDesktopNodeStatus: DesktopNode!
-  onAiChatDelta(sessionId: String!): AiChatDelta!
-  onAiChatComplete(sessionId: String!): AiChatComplete!
   onRelayChatDelta(relayId: String!): RelayChatDelta!
   onRelayChatMessage(sessionId: String!): RelayChatMessage!
 }

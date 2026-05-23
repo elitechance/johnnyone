@@ -1,0 +1,6 @@
+# Patterns Nx should NOT scan for project.json / package.json.
+# Same syntax as .gitignore.
+
+# Archived projects — preserved on disk for history, NOT in the active project graph.
+# See: attic/README.md and the multi-user-saas plan.
+attic/

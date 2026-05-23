@@ -1,0 +1,114 @@
+/* JohnnyOne web client — global styles */
+
+/* Ionic core CSS — required */
+@import '@ionic/angular/css/core.css';
+
+/* Ionic structure / typography utility layers */
+@import '@ionic/angular/css/normalize.css';
+@import '@ionic/angular/css/structure.css';
+@import '@ionic/angular/css/typography.css';
+@import '@ionic/angular/css/display.css';
+
+/* Optional but useful: utility classes for padding, flex helpers, etc. */
+@import '@ionic/angular/css/padding.css';
+@import '@ionic/angular/css/float-elements.css';
+@import '@ionic/angular/css/text-alignment.css';
+@import '@ionic/angular/css/text-transformation.css';
+@import '@ionic/angular/css/flex-utils.css';
+
+/* Force dark mode globally (Ionic ships a "dark.always" palette). The classed
+   variant (`dark.class.css`) is for runtime-toggleable themes; we want it on
+   unconditionally for every visitor. */
+@import '@ionic/angular/css/palettes/dark.always.css';
+
+/* App-wide neutral tokens layered on top of Ionic's dark palette. These cover
+   the non-Ionic primitives in the legacy pages (custom topbar, modal-backdrop,
+   directory-browser) so the whole theme stays consistent. */
+:root {
+  /* Background scale (darkest → lightest) */
+  --jo-bg-base:     #0d0f12;
+  --jo-bg-elevated: #14171c;
+  --jo-bg-raised:   #1a1d23;
+  --jo-bg-hover:    #232830;
+
+  /* Foreground scale */
+  --jo-fg-strong:   #e7eaee;
+  --jo-fg:          #c5cbd3;
+  --jo-fg-muted:    #8a92a0;
+  --jo-fg-faint:    #5a6271;
+
+  /* Borders / dividers */
+  --jo-border:      #262b33;
+  --jo-border-strong: #353c47;
+
+  /* Accent (matches Ionic primary in dark) */
+  --jo-accent:      #5096ff;
+  --jo-accent-hover:#73abff;
+
+  /* Status */
+  --jo-warn:        #ffb454;
+  --jo-bad:         #ff6868;
+  --jo-good:        #5fd78f;
+}
+
+html, body {
+  background: var(--jo-bg-base);
+  color: var(--jo-fg);
+  color-scheme: dark;
+}
+
+/* Reusable primitives the legacy attic pages depend on. Override any
+   hardcoded light backgrounds globally so the whole modal/toolbar tree is
+   consistent regardless of which page imports it. */
+.modal-backdrop {
+  background: rgba(0, 0, 0, 0.66) !important;
+}
+.directory-browser,
+.phase-tasks-modal,
+.browser-list,
+.workspace-topbar,
+.planner-topbar {
+  background: var(--jo-bg-elevated) !important;
+  color: var(--jo-fg) !important;
+  border-color: var(--jo-border) !important;
+}
+.browser-row,
+.browser-toolbar {
+  background: var(--jo-bg-elevated);
+  color: var(--jo-fg);
+  border-color: var(--jo-border);
+}
+.browser-row button,
+.browser-toolbar button {
+  background: transparent;
+  color: var(--jo-fg);
+}
+.browser-row:hover {
+  background: var(--jo-bg-hover);
+}
+.file-empty {
+  color: var(--jo-fg-muted);
+}
+.primary-action {
+  background: var(--jo-accent) !important;
+  color: #0d0f12 !important;
+  border: none !important;
+}
+.primary-action:hover { background: var(--jo-accent-hover) !important; }
+.primary-action:disabled { opacity: 0.5; cursor: not-allowed; }
+.secondary-action,
+.icon-action {
+  background: var(--jo-bg-raised) !important;
+  color: var(--jo-fg) !important;
+  border: 1px solid var(--jo-border) !important;
+}
+.secondary-action:hover,
+.icon-action:hover {
+  background: var(--jo-bg-hover) !important;
+}
+code {
+  background: var(--jo-bg-raised);
+  color: var(--jo-fg-strong);
+  padding: 0.05em 0.35em;
+  border-radius: 3px;
+}

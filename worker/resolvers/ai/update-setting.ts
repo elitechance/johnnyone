@@ -1,27 +1,9 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
-
-interface ResolverContext {
-  env: WorkerEnv;
-  auth: { userId: string; tenantId: string };
-}
-
-interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
-  [key: string]: unknown;
-}
+import { relayRpc, type RelayRpcContext } from '../../lib/runtime/relay-rpc';
 
 export default async function updateSetting(
   _parent: unknown,
   args: { key: string; value: string },
-  ctx: ResolverContext,
+  ctx: RelayRpcContext,
 ) {
-  const result = await hostGraphqlRequest<{ setSetting: boolean }>(
-    ctx.env,
-    `mutation SetSetting($key: String!, $value: String!) {
-      setSetting(key: $key, value: $value)
-    }`,
-    args,
-  );
-
-  return result.setSetting;
+  return relayRpc<boolean>(ctx, 'set_setting', { key: args.key, value: args.value });
 }

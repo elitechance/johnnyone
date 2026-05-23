@@ -1,0 +1,56 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>JohnnyOne — Sign in</ion-title>
+  </ion-toolbar>
+</ion-header>
+<ion-content class="ion-padding">
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Connect this host to your cloud account</ion-card-title>
+    </ion-card-header>
+    <ion-card-content>
+      <form (ngSubmit)="login()" autocomplete="on">
+        <ion-list lines="full">
+          <ion-item>
+            <ion-input
+              label="Email"
+              labelPlacement="floating"
+              type="email"
+              autocomplete="username"
+              required
+              [value]="email()"
+              (ionInput)="email.set($any($event.target).value)"
+            ></ion-input>
+          </ion-item>
+          <ion-item>
+            <ion-input
+              label="Password"
+              labelPlacement="floating"
+              type="password"
+              autocomplete="current-password"
+              required
+              [value]="password()"
+              (ionInput)="password.set($any($event.target).value)"
+            ></ion-input>
+          </ion-item>
+          <ion-item>
+            <ion-input
+              label="Tenant ID"
+              labelPlacement="floating"
+              type="text"
+              required
+              [value]="tenantId()"
+              (ionInput)="tenantId.set($any($event.target).value)"
+            ></ion-input>
+          </ion-item>
+        </ion-list>
+        @if (error()) {
+          <ion-text color="danger"><p>{{ error() }}</p></ion-text>
+        }
+        <ion-button type="submit" expand="block" [disabled]="loading()">
+          {{ loading() ? 'Signing in…' : 'Sign in' }}
+        </ion-button>
+      </form>
+    </ion-card-content>
+  </ion-card>
+</ion-content>

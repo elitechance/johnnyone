@@ -1,184 +1,326 @@
 # JohnnyOne
 
-> "Number 5 is alive!" -- Short Circuit (1986)
+> "Number 5 is alive!" — Short Circuit (1986)
 
-Personal AI agent platform. Your desktop is the always-on compute node (Tauri + Ionic/Angular), your phone is the remote control (Ionic/Angular + Capacitor), and a Cloudflare Worker acts as a thin relay in between. Multi-provider CLI support with Claude Code, Codex, Cline, and Ollama for fully offline operation.
+A personal-AI agent platform shaped as a small multi-user SaaS. Each user
+installs a single **desktop binary** on their own machine; everyone uses the
+same hosted **web client** from anywhere. The desktop binary owns all data
+locally — sessions, messages, planner state, agent CLI subprocesses — and the
+Cloudflare Worker is a thin relay between the web browser and that binary.
+
+| Surface | URL |
+|---|---|
+| Web client | https://johnnyone-dev.pages.dev |
+| Worker GraphQL | https://johnnyone-dev-hub.ethan-353.workers.dev/graphql |
+| Worker relay WebSocket | wss://johnnyone-dev-hub.ethan-353.workers.dev/api/relay/ws |
+| Desktop binary (Linux) | `desktop/src-tauri/target/release/johnnyone-desktop` (built locally) |
+| Mac binary | not yet — needs a Mac to build |
 
 ## Architecture
 
-All AI processing happens on the desktop. The worker is a thin relay layer.
+One Tauri desktop binary per user, one Worker for everyone, one Pages site for everyone:
 
-```
-  +----------+           +-------------------+           +-----------------+
-  |  Mobile  | <-------> |   CF Worker       | <-------> | Desktop Agent   |
-  |  App     |  GraphQL  |   (Relay Hub)     |    WSS    | (Tauri)         |
-  |          |  + WS     |                   |           |                 |
-  +----------+           | +---------------+ |           | +-------------+ |
-                         | | D1 (nodes)    | |           | | SQLite DB   | |
-  +----------+           | | ChatRelayDO   | |           | | CLI Runner  | |
-  |  Desktop | <-------> | | (WebSocket    | |           | | Claude Code | |
-  |  Web UI  |  Angular  | |  relay)       | |           | | Codex       | |
-  +----------+           | +---------------+ |           | | Cline       | |
-                         +-------------------+           | | Ollama      | |
-                                                         | +-------------+ |
-                                                         +-----------------+
+```mermaid
+flowchart TB
+  subgraph hosted["Hosted on Cloudflare"]
+    web["Web client (Pages)<br/>Ionic 8 / Angular 19"]
+    worker["Worker (johnnyone-dev-hub)<br/>GraphQL + relay-RPC"]
+    do["ChatRelayDO<br/>per-user WebSocket relay"]
+    d1[("D1 registry<br/>tenants, users,<br/>desktop_nodes, channels")]
+  end
+
+  subgraph user["User's machine"]
+    bin["johnnyone-desktop (Tauri)<br/>30 MB Linux binary"]
+    embed["Embedded host (axum)<br/>127.0.0.1:7788"]
+    sqlite[("SQLite<br/>sessions, messages,<br/>plans, settings")]
+    tmux["tmux runtime<br/>+ provider CLIs:<br/>Claude Code, Codex,<br/>Cline, Ollama"]
+  end
+
+  web -- "GraphQL HTTPS<br/>(JWT in Authorization header)" --> worker
+  worker --- d1
+  worker -. "relay-RPC over WebSocket<br/>(scoped by tenant + user)" .-> do
+  do <-. "outbound WS from user's machine<br/>kept alive by desktop binary" .-> bin
+
+  bin --- embed
+  embed --- sqlite
+  bin --- tmux
+
+  classDef hostedNode fill:#eef,stroke:#229
+  classDef userNode fill:#fee,stroke:#922
+  class hosted,web,worker,do,d1 hostedNode
+  class user,bin,embed,sqlite,tmux userNode
 ```
 
-## Project Structure
+### The big picture
+
+1. User installs the desktop binary on their machine. The binary registers
+   the machine as their `desktop_node` (one row in D1) and keeps an outbound
+   WebSocket open to `ChatRelayDO`.
+2. User opens the hosted web client in any browser, logs in, gets a JWT.
+3. Every action in the web client (open a session, send a message, browse the
+   filesystem) is a GraphQL request to the worker. The worker resolves the
+   user's online `desktop_node` from D1 and forwards the call via
+   relay-RPC over the open WebSocket to that user's binary.
+4. The desktop binary handles the call locally (writes to its SQLite, spawns
+   provider CLIs in tmux panes, etc.) and streams responses back the same way.
+
+The web client holds **no user data**. Everything lives in the user's local
+SQLite. If two users have a binary running, each only ever sees their own
+data — the worker scopes every relay-RPC by `WHERE tenant_id = ? AND user_id = ?`.
+
+### Why a single binary
+
+Originally split into two: `johnnyone-host` (headless daemon) + `johnnyone-desktop`
+(Tauri shell). Today both are folded into a single `johnnyone-desktop` Tauri
+binary that opens a window AND runs the embedded host listener. One binary to
+install, one process to supervise. See `personal/docs/johnnyone/decisions/`
+for the rationale.
+
+## Project structure
 
 ```
 johnnyone/
-  desktop/              Ionic/Angular desktop frontend + Tauri backend
-    src/                  Angular app (chat, sessions, tools, settings pages)
-    src-tauri/            Rust backend (WS agent, CLI runners, RPC handlers, SQLite)
-  mobile/               Ionic/Angular + Capacitor mobile app (Android)
-    src/                  Angular app (chat, sessions, settings pages)
-  worker/               Cloudflare Worker -- GraphQL API + WebSocket relay
-    d1/                   D1 migrations and seed data
-    resolvers/            GraphQL resolvers (ai/, channels/)
-    schema/               GraphQL schema definitions
-  ui/                   Shared UI component library
-    src/components/       Reusable Angular components (8 components)
-    src/services/         GraphQL client, JohnnyAPI, AI chat state
-    src/models/           TypeScript models and interfaces
-  shared/               Cross-platform shared code
-    src/types/            WebSocket protocol types, tool definitions
-    src/utils/            ID generation, date formatting, helpers
-  package.json          Root monorepo config (Nx 20, Angular 19)
-  nx.json               Nx workspace configuration
-  lokal.yaml            Lokal deployment configuration
-  tsconfig.base.json    Shared TypeScript config
+  web/                      Web client — Ionic 8 / Angular 19 (the hosted Pages app)
+    src/app/pages/            login, terminal, planning, development, settings, install
+    src/app/services/         auth, auth.guard, relay-terminal (WS for terminal stream)
+  host-app/                 Tauri-window control panel — login / status / providers
+    src/app/                  Embedded inside the desktop binary's webview
+  ui/                       Shared Angular component library
+    src/components/           chat-window, terminal-screen, message-bubble, ...
+    src/services/             JohnnyApiService — single GraphQL client used by web + host-app
+  desktop/
+    src-tauri/              Rust — single Tauri binary (johnnyone-desktop)
+      src/main.rs             Tauri entrypoint: opens window + spawns embedded host
+      src/host/               axum-based GraphQL listener on :7788
+      src/providers/          CLI runners: claude_code, codex, cline, ollama_cli
+      src/terminal.rs         tmux runtime (create/capture/send-keys, screen mirror)
+      src/services/           agent_plans, chat_host, providers, sessions, ...
+      src/agent/              outbound WS client + RPC dispatch
+      src/db/                 SQLite + migrations
+    project.json              Nx targets: desktop-dev / desktop-build / tauri-dev / tauri-build
+  worker/                   Cloudflare Worker — GraphQL gateway
+    resolvers/ai/             AI resolvers (all routed to host via relay-RPC)
+    resolvers/channels/       Channel adapters (Telegram/Discord/WhatsApp stubs)
+    lib/runtime/              relay-rpc.ts, desktop-rpc.ts, chat-relay-do.ts
+    d1/migrations/            D1 registry schema
+    schema/                   GraphQL schema (johnnyone-ai.graphql, johnnyone-channels.graphql)
+    worker.yaml               name: hub → deployed as johnnyone-dev-hub
+  attic/                    Frozen old code (excluded from Nx via .nxignore)
+    desktop-thin-client/      Original combined desktop UI — superseded by web + host-app
+    mobile-thin-client/       Original mobile Capacitor wrap — deferred
+  scripts/dev-tmux.sh       Optional local-dev tmux launcher
+  lokal.yaml                Local processes, builds, deploy config
 ```
 
-## Tech Stack
+## Tech stack
 
-| Layer         | Technology                              |
-|---------------|-----------------------------------------|
-| Frontend      | Ionic 8 / Angular 19                    |
-| Desktop       | Tauri 2 (Rust)                          |
-| Mobile        | Capacitor 6 (Android)                   |
-| Backend       | Cloudflare Workers                      |
-| Database      | D1 (SQLite at the edge)                 |
-| Real-time     | Durable Objects + WebSockets            |
-| LLM Providers | Claude Code, Codex, Cline, Ollama (CLI)  |
-| Monorepo      | Nx 20                                   |
-| GraphQL       | Custom resolver layer + graphql-ws      |
+| Layer | Tech |
+|---|---|
+| Web client | Ionic 8 / Angular 19, standalone components |
+| Tauri window UI | Same stack, separate Nx project (`host-app/`) |
+| Shared components | `ui/` library — `JohnnyApiService`, terminal-screen, chat-window, etc. |
+| Desktop binary | Tauri 2 + Rust (`async-graphql`, `axum`, `rusqlite`, `tokio-tungstenite`) |
+| Agent runtime | tmux + provider CLIs (Claude Code, Codex, Cline, Ollama) |
+| Worker / gateway | Cloudflare Workers (TS) |
+| Edge data | D1 (registry) + Durable Objects (`ChatRelayDO`) |
+| GraphQL | Schema-first, `graphql-yoga` on web, custom resolver wiring in the worker |
+| Monorepo | Nx 20 |
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
 - Node.js 20+
-- Rust / Cargo (for Tauri desktop builds)
-- Wrangler CLI (bundled via devDependencies)
-- Lokal CLI (for worker simulation and D1 migrations)
+- Rust / Cargo (the Tauri binary compiles native code)
+- tmux 3+ (provider CLIs run inside it)
+- Display server for the Tauri window (WSLg, X11, or macOS native)
+- For Tauri builds on Linux: `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`
 
 ### Install
 
 ```bash
+cd personal/apps/johnnyone
 npm install
 ```
 
-### Development
+## Running locally
+
+There are two reasonable local-dev setups depending on what you're changing:
+
+### A. Web-only against the deployed worker — fastest
+
+You change web code; everything else (worker, host) is the live deployment.
 
 ```bash
-# Start the desktop Tauri app (includes frontend dev server)
+npx nx serve web                    # http://localhost:4200
+```
+
+Then open `http://localhost:4200` and log in with the seeded admin
+(`admin@johnnyone.local` / `johnnyone-dev`, tenant `default`). The web app
+detects the hostname is `localhost` and falls back to `http://127.0.0.1:7714`
+for the worker — if you don't have a local worker, set the worker URL
+explicitly in your browser's localStorage:
+
+```js
+localStorage.setItem('johnnyone_worker_url', 'https://johnnyone-dev-hub.ethan-353.workers.dev');
+```
+
+For this to work, your **desktop binary must be running on your machine** and
+the seeded admin user's `JOHNNYONE_USER_ID` env var must match the JWT subject
+(see the [live-test runbook](../../docs/johnnyone/runbooks/live-test.md)).
+
+### B. Full stack local (host + worker simulator + web)
+
+You change worker or host code; everything runs against local processes.
+
+```bash
+./scripts/dev-tmux.sh
+```
+
+Opens a tmux session with three processes:
+
+| Process | Port | What it is |
+|---|---|---|
+| desktop | 7788 (embedded), display window | `cargo run --bin johnnyone-desktop` |
+| edge    | 7714 | `lokal cf worker sim` (local Cloudflare Worker simulator) |
+| web     | 4200 | `nx serve web` |
+
+Or run them by hand in three terminals:
+
+```bash
+# 1
 npm run start:desktop
 
-# (Optional) Start desktop frontend only (port 4200)
-npm run start:desktop:web
-
-# Start the worker API (port 7714)
+# 2
 npm run start:worker
 
-# Apply D1 database migrations (local)
-npm run migrate:worker
-
-# Start the mobile Angular dev server (port 4201)
-npm run start:mobile
+# 3
+npm run start:web
 ```
 
-### Build
+See [the local-dev runbook](../../docs/johnnyone/runbooks/local-dev.md) for full
+details, env vars, ports, and troubleshooting.
+
+## Running the JohnnyOne desktop binary
+
+End-users only need to run the desktop binary on their own machine and use the
+hosted web client from any browser. No other local setup.
+
+### Build the Linux binary
 
 ```bash
-npm run build:desktop    # Build desktop Angular frontend
-npm run build:desktop:tauri  # Build native desktop app (Tauri)
-npm run build:mobile     # Build mobile Angular app
-npm run build:worker     # Build Cloudflare Worker
+cd personal/apps/johnnyone
+nx build host-app                 # build the Angular UI the Tauri window loads
+cd desktop/src-tauri
+cargo build --release --bin johnnyone-desktop
+ls -lh target/release/johnnyone-desktop          # ~30 MB
 ```
 
-## Key Features
+### Launch
 
-- **Relay architecture** -- Worker is a thin relay; all AI processing, sessions, and messages live on the desktop
-- **Multi-provider CLI** -- Claude Code, Codex, Cline, and Ollama CLI runners with streaming output
-- **RPC-over-relay** -- Mobile queries desktop SQLite (sessions, messages) via Worker → ChatRelayDO → WebSocket → Desktop RPC
-- **Real-time streaming** -- Token-by-token response streaming through ChatRelayDO WebSocket relay
-- **Offline mode** -- Ollama CLI integration means the agent works without internet
-- **Mobile remote control** -- List sessions, view messages, send chat, and delete sessions from your phone via swipe-to-delete
-- **Desktop-local storage** -- Sessions and messages stored in local SQLite with `ON DELETE CASCADE` for clean session removal
-- **Channel adapters** -- Telegram, Discord, WhatsApp adapter stubs (channel resolvers)
+```bash
+JOHNNYONE_WORKER_URL=https://johnnyone-dev-hub.ethan-353.workers.dev \
+JOHNNYONE_USER_ID=<your-user-id-uuid> \
+JOHNNYONE_TENANT_ID=<your-tenant-id-uuid> \
+./desktop/src-tauri/target/release/johnnyone-desktop
+```
 
-## Data Flow
+(Later, once the host-app login flow writes credentials to a config file,
+those three env vars stop being needed — see Phase 3 of the
+[multi-user-saas plan](../../docs/johnnyone/plans/multi-user-saas/).)
 
-### Chat (relay)
+The binary will:
 
-1. Mobile sends a message via GraphQL `sendRelayChatMessage` mutation
-2. Worker finds an online desktop node in D1 and forwards the request to `ChatRelayDO`
-3. ChatRelayDO relays the message over WebSocket to the desktop agent
-4. Desktop spawns the configured CLI provider (Claude Code, Codex, Cline, or Ollama) as a subprocess
-5. CLI output is streamed line-by-line, parsed into chunks, and sent back through the WebSocket as `chat_delta` frames
-6. Worker relays deltas to the mobile client's WebSocket connection in real time
-7. On completion, desktop saves user + assistant messages to local SQLite
+1. Apply DB migrations under `~/.local/share/johnnyone/johnnyone.db`
+2. Open a Tauri window pointing at the bundled host-app UI
+3. Register your machine with the deployed worker as a `desktop_node`
+4. Keep an outbound WebSocket open for relay-RPC
+5. Listen on `127.0.0.1:7788` for the embedded UI's local GraphQL calls
 
-### RPC queries (read/delete)
+See [the install runbook](../../docs/johnnyone/runbooks/installing.md) for the
+end-user install flow.
 
-1. Mobile calls a GraphQL query or mutation (e.g. `listAiSessions`, `deleteAiSession`)
-2. Worker resolver finds an online node and POSTs to `ChatRelayDO` at `/relay-rpc`
-3. ChatRelayDO forwards the RPC request over WebSocket to the desktop agent
-4. Desktop executes the query against local SQLite and returns the result
-5. Worker resolver returns the data to the mobile client via GraphQL
+## Live deployments
 
-## Ports
+Only the **worker** and **web client** deploy to Cloudflare. The desktop binary
+runs on each user's machine.
 
-| Service           | Port |
-|-------------------|------|
-| Worker API        | 7714 |
-| Desktop frontend  | 4200 |
-| Mobile frontend   | 4201 |
+```bash
+lokal cf deploy --env dev               # worker + Pages, both
+lokal cf worker deploy --env dev        # worker only
+lokal cf db migrate --env dev           # apply D1 migrations
+```
+
+### Account + URLs
+
+- CF account: `elitechance` (configured in `~/.lokal/cf.yaml`)
+- Worker name pattern: `johnnyone-<env>-hub` (worker.yaml `name: hub` is the suffix)
+  → dev = `johnnyone-dev-hub.ethan-353.workers.dev`
+- Pages project: `johnnyone-dev`
+  → `https://johnnyone-dev.pages.dev`
+
+### Worker secrets
+
+Only one secret is required:
+
+```bash
+echo -n "<rand-base64-48>" | npx wrangler secret put JWT_SECRET --name johnnyone-dev-hub
+```
+
+If you rename the worker (change `worker.yaml: name`), CF treats it as a new
+script and you'll need to re-set this secret on the new name.
+
+See [the live-test runbook](../../docs/johnnyone/runbooks/live-test.md) for
+verification scripts (login, relay-RPC smoke, etc.).
 
 ## GraphQL API
 
-The worker exposes a GraphQL API with:
+The worker exposes ~75 auto-wired resolvers grouped by capability. Every
+mutation/query that needs host data is routed via `relayRpc` /
+`desktopRpc` to the user's online desktop binary.
 
-- **4 queries** -- `listDesktopNodes`, `listAiSessions`, `getAiSession`, `listAiMessages` (sessions/messages resolve via RPC to desktop SQLite)
-- **4 mutations** -- `registerDesktopNode`, `updateDesktopNodeStatus`, `sendRelayChatMessage`, `deleteAiSession`
-- **3 subscriptions** -- `onDesktopNodeStatus`, `onRelayChatDelta` (streaming), `onRelayChatMessage`
+- **Auth** (lokal builtin) — `login`, `loginWithOauth`, `myCompleteFirstLogin`, `adminCreate{User,Tenant}`, `refreshToken`
+- **Sessions** — `listAiSessions`, `getAiSession`, `createAiSession`, `updateAiSession{Title,Provider,WorkingDirectory,Archived}`, `deleteAiSession`
+- **Chat** — `sendRelayChatMessage`, `cancelAiGeneration`, `listAiMessages`
+- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
+- **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
+- **Providers / settings** — `listDetectedCliTools`, `listProviderConfigs`, `upsertProviderConfig`, `deleteProviderConfig`, `getSetting`, `setSetting`, `getPlannerPromptSettings`, `updatePlannerPromptSettings`
+- **Nodes** — `listDesktopNodes`, `registerDesktopNode`, `updateDesktopNodeStatus`
+- **Channels / attachments** — `listChannelBindings`, `link/unlinkChannel`, `createChannelWebhook`, `get/create/deleteChatAttachment`
+- **Subscriptions** — `onRelayChatDelta`, `onRelayChatMessage`, `onDesktopNodeStatus`
 
-Schema: [`worker/schema/johnnyone-ai.graphql`](worker/schema/johnnyone-ai.graphql)
+Schema files:
+- [`worker/schema/johnnyone-ai.graphql`](worker/schema/johnnyone-ai.graphql)
+- [`worker/schema/johnnyone-channels.graphql`](worker/schema/johnnyone-channels.graphql)
 
-### Desktop RPC Methods
+## Documentation map
 
-The desktop agent handles these RPC methods over the WebSocket relay:
-
-| Method | Params | Description |
-|--------|--------|-------------|
-| `list_sessions` | `status?` | List all sessions from local SQLite |
-| `get_session` | `id` | Get a single session by ID |
-| `list_messages` | `sessionId`, `limit?`, `offset?` | List messages for a session |
-| `delete_session` | `id` | Kill active process + delete session (cascades to messages) |
+| Doc | What it covers |
+|---|---|
+| [README.md](README.md) | This file — overview, structure, run + deploy commands |
+| [docs/.../runbooks/local-dev.md](../../docs/johnnyone/runbooks/local-dev.md) | Local development workflow |
+| [docs/.../runbooks/installing.md](../../docs/johnnyone/runbooks/installing.md) | End-user install of the desktop binary |
+| [docs/.../runbooks/live-test.md](../../docs/johnnyone/runbooks/live-test.md) | Smoke-test the deployed worker + Pages |
+| [docs/.../decisions/](../../docs/johnnyone/decisions/) | ADRs for the multi-user-saas pivot |
+| [docs/.../plans/multi-user-saas/](../../docs/johnnyone/plans/multi-user-saas/) | The active multi-phase plan |
 
 ## Roadmap
 
-| Phase  | Description                                         | Status      |
-|--------|-----------------------------------------------------|-------------|
-| 0      | Nx monorepo scaffold, project structure             | Done        |
-| 1A     | Foundation + basic AI chat                          | Done        |
-| 1B     | Relay architecture + ChatRelayDO streaming          | Done        |
-| 1C     | Multi-provider CLI runners (Claude Code, Codex, Cline, Ollama) | Done |
-| 1D     | Desktop node registration + heartbeat               | Done        |
-| 1E     | Mobile RPC (list/view/delete sessions & messages)   | Done        |
-| 2      | Channel adapters (Telegram, Discord, WhatsApp)      | Planned     |
-| 3      | Browser automation, cron scheduling, voice input    | Planned     |
+Phase status lives in
+[`personal/docs/johnnyone/plans/multi-user-saas/status.md`](../../docs/johnnyone/plans/multi-user-saas/status.md).
+
+| Area | Status |
+|---|---|
+| Multi-user SaaS — foundation cleanup (Phase 0) | Done |
+| Multi-user SaaS — `web/` scaffold + nav (Phase 1) | Done |
+| Multi-user SaaS — pairing + relay-RPC end-to-end (Phase 2) | Done |
+| Multi-user SaaS — Tauri control panel (Phase 3) | Done — host folded into one binary |
+| Multi-user SaaS — Mac binary + R2 hosting (Phase 4) | Pending (needs Mac) |
+| Multi-user SaaS — ADRs (Phase 5) | Done |
+| Terminal page restored from attic + workspace browser | Done (2026-05-23) |
+| Planner / Development modes restored from attic | Done (2026-05-23) |
+| Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
+| Browser automation, cron scheduling, voice input | Planned |
 
 ## License
 

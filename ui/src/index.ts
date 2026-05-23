@@ -40,6 +40,7 @@ export type {
   HostFileContent,
   HostFileEntry,
   PlannerPromptSettings,
+  ChatAttachment,
   WorkspaceFileDiff,
   WorkspaceValidation,
 } from './services/johnny-api.service';

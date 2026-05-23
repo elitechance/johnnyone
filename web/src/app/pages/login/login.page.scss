@@ -1,0 +1,25 @@
+.login-content {
+  --background: var(--ion-color-step-50, #f8f8fa);
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+}
+
+.login-card {
+  max-width: 440px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.login-error {
+  display: block;
+  margin: 12px 0;
+  font-size: 0.875rem;
+}
+
+.login-submit {
+  margin-top: 16px;
+}

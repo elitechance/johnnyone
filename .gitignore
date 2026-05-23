@@ -41,3 +41,7 @@ Thumbs.db
 .nx/workspace-data
 desktop/e2e/artifacts/*
 
+
+.angular
+attic/desktop-thin-client/e2e/artifacts/*
+web/e2e/__screenshots__/*

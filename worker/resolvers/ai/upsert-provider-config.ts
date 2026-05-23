@@ -1,14 +1,4 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
-
-interface ResolverContext {
-  env: WorkerEnv;
-  auth: { userId: string; tenantId: string };
-}
-
-interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
-  [key: string]: unknown;
-}
+import { relayRpc, type RelayRpcContext } from '../../lib/runtime/relay-rpc';
 
 interface UpsertProviderConfigInput {
   provider: string;
@@ -18,27 +8,41 @@ interface UpsertProviderConfigInput {
   settings?: string;
 }
 
+interface RustProviderConfig {
+  id: string;
+  provider: string;
+  cli_path: string;
+  api_key: string;
+  default_model: string;
+  settings: string;
+  is_available: boolean;
+  updated_at: string;
+}
+
 export default async function upsertProviderConfig(
   _parent: unknown,
   args: { input: UpsertProviderConfigInput },
-  ctx: ResolverContext,
+  ctx: RelayRpcContext,
 ) {
-  const result = await hostGraphqlRequest<{ upsertProviderConfig: unknown }>(
-    ctx.env,
-    `mutation UpsertProviderConfig($input: UpsertProviderConfigInput!) {
-      upsertProviderConfig(input: $input) {
-        id
-        provider
-        cliPath
-        apiKey
-        defaultModel
-        settings
-        isAvailable
-        updatedAt
-      }
-    }`,
-    { input: args.input },
-  );
+  // camelCase → snake_case for the host's serde-deserialized input
+  const input = {
+    provider: args.input.provider,
+    cli_path: args.input.cliPath ?? null,
+    api_key: args.input.apiKey ?? null,
+    default_model: args.input.defaultModel ?? null,
+    settings: args.input.settings ?? null,
+  };
 
-  return result.upsertProviderConfig;
+  // Host returns snake_case; GraphQL schema expects camelCase — flip back.
+  const r = await relayRpc<RustProviderConfig>(ctx, 'upsert_provider_config', { input });
+  return {
+    id: r.id,
+    provider: r.provider,
+    cliPath: r.cli_path,
+    apiKey: r.api_key,
+    defaultModel: r.default_model,
+    settings: r.settings,
+    isAvailable: r.is_available,
+    updatedAt: r.updated_at,
+  };
 }

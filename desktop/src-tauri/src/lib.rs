@@ -3,6 +3,7 @@ pub mod commands;
 pub mod db;
 pub mod events;
 pub mod host;
+pub mod host_supervisor;
 pub mod paths;
 pub mod providers;
 pub mod services;

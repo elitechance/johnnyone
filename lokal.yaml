@@ -4,7 +4,7 @@ project:
   tenant_id: johnnyone-default
 
 cloudflare:
-  account: static
+  account: elitechance
 
 app:
   worker:
@@ -32,45 +32,39 @@ app:
       outputs:
         - dist/worker
 
-    host:
+    desktop:
       kind: binary
       cwd: desktop/src-tauri
       command:
-        local: cargo build --bin johnnyone-host
-        dev: cargo build --bin johnnyone-host
-        prod: cargo build --release --bin johnnyone-host
+        local: cargo build --bin johnnyone-desktop
+        dev: cargo build --bin johnnyone-desktop
+        prod: cargo build --release --bin johnnyone-desktop
       outputs:
-        - target/debug/johnnyone-host
+        - target/release/johnnyone-desktop
 
-    desktop-web:
+    web:
       kind: web
       cwd: .
       command:
-        local: nx build desktop
-        dev: nx build desktop
-        prod: nx build desktop
+        local: nx build web
+        dev: nx build web
+        prod: nx build web
       outputs:
-        - dist/desktop/browser
-
-    mobile-web:
-      kind: mobile
-      cwd: .
-      command:
-        local: nx build mobile
-        dev: nx build mobile
-        prod: nx build mobile
-      outputs:
-        - dist/mobile
+        - dist/web/browser
 
 local:
   hooks:
     pre_sim:
-      - nx build desktop
+      - nx build web
   processes:
-    host:
+    desktop:
+      # The single consolidated Tauri binary — embeds the host's :7788
+      # GraphQL listener AND opens the JohnnyOne window.
+      # If you don't have a display (headless dev), comment this out and connect
+      # the local web client directly at the deployed worker URL.
       kind: service
       cwd: desktop/src-tauri
-      command: cargo run --bin johnnyone-host
+      command: cargo run --bin johnnyone-desktop
       env:
         JOHNNYONE_HOST_ADDR: 127.0.0.1:7788
         JOHNNYONE_WORKER_URL: http://127.0.0.1:7714
@@ -84,63 +78,34 @@ local:
       kind: worker
       cwd: .
       command: npx lokal cf worker sim --project johnnyone --worker-dir worker --port 7714
-      env:
-        HOST_GRAPHQL_URL: http://127.0.0.1:7788/graphql
+      # HOST_GRAPHQL_URL removed in Phase 2 of multi-user-saas plan — forward
+      # path replaced by relay-RPC via ChatRelayDO (worker/lib/runtime/relay-rpc.ts).
       depends_on:
-        - host
+        - desktop
       ready:
         type: graphql
         url: http://127.0.0.1:7714/graphql
         query: "query { __typename }"
-    desktop:
+    web:
       kind: frontend
-      cwd: desktop
+      cwd: web
       command: npx ng serve --port 4200
       depends_on:
         - edge
       ready:
         type: http
         url: http://127.0.0.1:4200
-    mobile:
-      kind: mobile
-      cwd: mobile
-      command: npx ng serve --port 4201
-      depends_on:
-        - edge
-      ready:
-        type: http
-        url: http://127.0.0.1:4201
   profiles:
-    desktop:
+    default:
       build:
-        - host
-        - edge
-        - desktop-web
-      run:
-        - host
-        - edge
         - desktop
-    mobile:
-      build:
-        - host
         - edge
-        - mobile-web
+        - web
       run:
-        - host
-        - edge
-        - mobile
-    full:
-      build:
-        - host
-        - edge
-        - desktop-web
-        - mobile-web
-      run:
-        - host
-        - edge
         - desktop
-        - mobile
-  default_profile: desktop
+        - edge
+        - web
+  default_profile: default
 
 environments:
   local:
@@ -149,9 +114,11 @@ environments:
     domain: localhost:4200
     worker_domain: localhost:7714
   dev:
-    worker_domain: dev-johnnyone.lokalbase.app
+    # No custom worker_domain on elitechance for now — deploy uses CF's auto-assigned
+    # *.workers.dev URL. To wire a custom domain, add a zone to ~/.lokal/cf.yaml's
+    # elitechance entry (e.g. videokestar.com subdomain) and set worker_domain here.
   prod:
-    worker_domain: johnnyone.lokalbase.app
+    # Same — no custom domain on elitechance yet.
 
 secrets:
   - JWT_SECRET

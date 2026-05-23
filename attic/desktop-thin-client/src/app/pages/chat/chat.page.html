@@ -1,4 +1,9 @@
-<div class="workspace-shell">
+<div
+  class="workspace-shell"
+  (paste)="onWorkspacePaste($event)"
+  (dragover)="onWorkspaceDragOver($event)"
+  (drop)="onWorkspaceDrop($event)"
+>
   <header class="workspace-topbar">
     <div class="brand-lockup">
       <span class="brand-mark" aria-hidden="true"></span>
@@ -115,8 +120,35 @@
   </main>
 
   <footer class="workspace-statusbar">
-    <span>relay <strong>connected</strong></span>
-    <span>raw input batched at <strong>200ms</strong></span>
-    <span>drag header · resize corner</span>
+    @if (pendingAttachments().length > 0) {
+      <div class="attachment-composer">
+        <div class="attachment-previews" aria-label="Pending image attachments">
+          @for (attachment of pendingAttachments(); track attachment.id) {
+            <div class="attachment-preview">
+              <img [src]="attachment.previewUrl" [alt]="attachment.file.name || 'Pasted image'" />
+              <button type="button" title="Remove image" (click)="removePendingAttachment(attachment.id)">×</button>
+            </div>
+          }
+        </div>
+        <textarea
+          [(ngModel)]="attachmentMessage"
+          rows="2"
+          placeholder="Message with image"
+          [disabled]="isSendingAttachments()"
+        ></textarea>
+        <button
+          type="button"
+          class="primary-action"
+          [disabled]="isSendingAttachments() || !currentSession()"
+          (click)="sendAttachmentMessage()"
+        >
+          {{ isSendingAttachments() ? 'Sending…' : 'Send image' }}
+        </button>
+      </div>
+    } @else {
+      <span>relay <strong>connected</strong></span>
+      <span>paste or drop images to attach</span>
+      <span>raw input batched at <strong>200ms</strong></span>
+    }
   </footer>
 </div>

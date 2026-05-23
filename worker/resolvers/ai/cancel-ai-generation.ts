@@ -1,27 +1,9 @@
-import { hostGraphqlRequest } from '../../lib/runtime/host-graphql';
-
-interface ResolverContext {
-  env: WorkerEnv;
-  auth: { userId: string; tenantId: string };
-}
-
-interface WorkerEnv {
-  HOST_GRAPHQL_URL?: string;
-  [key: string]: unknown;
-}
+import { relayRpc, type RelayRpcContext } from '../../lib/runtime/relay-rpc';
 
 export default async function cancelAiGeneration(
   _parent: unknown,
   args: { sessionId: string },
-  ctx: ResolverContext,
+  ctx: RelayRpcContext,
 ) {
-  const result = await hostGraphqlRequest<{ stopAiGeneration: boolean }>(
-    ctx.env,
-    `mutation StopAiGeneration($sessionId: String!) {
-      stopAiGeneration(sessionId: $sessionId)
-    }`,
-    { sessionId: args.sessionId },
-  );
-
-  return result.stopAiGeneration;
+  return relayRpc<boolean>(ctx, 'stop_ai_generation', { sessionId: args.sessionId });
 }

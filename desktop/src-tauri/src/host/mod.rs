@@ -20,6 +20,7 @@ use axum::{
     Router,
 };
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::cors::{Any, CorsLayer};
 
 type JohnnyHostSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
@@ -28,9 +29,19 @@ pub fn router(state: AppState) -> Router {
         .data(state)
         .finish();
 
+    // CORS: the host's GraphQL is reached from the Tauri webview (any origin)
+    // and from local dev tools (e.g. host-app at :4201). Permissive by design —
+    // the host listens on localhost only, so external origins can't reach it
+    // anyway. Methods/headers must include everything async-graphql sends.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
         .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone()))
+        .layer(cors)
         .with_state(schema)
 }
 

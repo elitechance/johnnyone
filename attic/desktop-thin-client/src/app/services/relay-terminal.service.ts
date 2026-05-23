@@ -14,6 +14,13 @@ interface TerminalCommandAck {
   error?: string;
 }
 
+export interface TerminalInputAttachment {
+  id: string;
+  originalName: string;
+  contentType: string;
+  size: number;
+}
+
 export interface AgentPlanRunUpdate {
   planId: string;
   deleted: boolean;
@@ -113,6 +120,15 @@ export class RelayTerminalService {
     this.pendingTimers.set(sessionId, timer);
   }
 
+  async sendInputWithAttachments(
+    sessionId: string,
+    data: string,
+    attachments: TerminalInputAttachment[],
+  ): Promise<void> {
+    await this.flushInput(sessionId);
+    await this.sendInputNow(sessionId, data, attachments);
+  }
+
   async flushInput(sessionId: string): Promise<void> {
     const data = this.pendingInput.get(sessionId);
     if (!data) return;
@@ -124,7 +140,11 @@ export class RelayTerminalService {
     await this.sendInputNow(sessionId, data);
   }
 
-  private async sendInputNow(sessionId: string, data: string): Promise<void> {
+  private async sendInputNow(
+    sessionId: string,
+    data: string,
+    attachments: TerminalInputAttachment[] = [],
+  ): Promise<void> {
     await this.ensureConnected();
 
     const socket = this.socket;
@@ -138,6 +158,7 @@ export class RelayTerminalService {
         requestId: crypto.randomUUID(),
         sessionId,
         data,
+        attachments,
       },
     }));
   }
