@@ -166,8 +166,7 @@ localStorage.setItem('johnnyone_worker_url', 'https://johnnyone-dev-hub.ethan-35
 ```
 
 For this to work, your **desktop binary must be running on your machine** and
-the seeded admin user's `JOHNNYONE_USER_ID` env var must match the JWT subject
-(see the [live-test runbook](../../docs/johnnyone/runbooks/live-test.md)).
+the seeded admin user's `JOHNNYONE_USER_ID` env var must match the JWT subject.
 
 ### B. Full stack local (host + worker simulator + web)
 
@@ -198,9 +197,6 @@ npm run start:worker
 npm run start:web
 ```
 
-See [the local-dev runbook](../../docs/johnnyone/runbooks/local-dev.md) for full
-details, env vars, ports, and troubleshooting.
-
 ## Running the JohnnyOne desktop binary
 
 End-users only need to run the desktop binary on their own machine and use the
@@ -226,8 +222,7 @@ JOHNNYONE_TENANT_ID=<your-tenant-id-uuid> \
 ```
 
 (Later, once the host-app login flow writes credentials to a config file,
-those three env vars stop being needed — see Phase 3 of the
-[multi-user-saas plan](../../docs/johnnyone/plans/multi-user-saas/).)
+those three env vars stop being needed.)
 
 The binary will:
 
@@ -236,9 +231,6 @@ The binary will:
 3. Register your machine with the deployed worker as a `desktop_node`
 4. Keep an outbound WebSocket open for relay-RPC
 5. Listen on `127.0.0.1:7788` for the embedded UI's local GraphQL calls
-
-See [the install runbook](../../docs/johnnyone/runbooks/installing.md) for the
-end-user install flow.
 
 ## Live deployments
 
@@ -270,8 +262,41 @@ echo -n "<rand-base64-48>" | npx wrangler secret put JWT_SECRET --name johnnyone
 If you rename the worker (change `worker.yaml: name`), CF treats it as a new
 script and you'll need to re-set this secret on the new name.
 
-See [the live-test runbook](../../docs/johnnyone/runbooks/live-test.md) for
-verification scripts (login, relay-RPC smoke, etc.).
+### Deploy gotchas
+
+- **Nx caches builds aggressively.** If you've changed `web/` or `ui/` code
+  but `npx nx build web` reports "Nx read the output from the cache instead
+  of running the command," force a real rebuild:
+
+  ```bash
+  rm -rf .nx/cache dist/web dist/ui
+  npx nx build web --skip-nx-cache
+  ```
+
+  Always do this before `lokal cf deploy --env dev` if you've changed
+  components — otherwise the deploy uploads a stale bundle.
+
+- **Lokal's resolver-schema validator infers Query vs Mutation from the
+  filename prefix.** Recognized mutation prefixes:
+
+  ```
+  create-, update-, upsert-, delete-, remove-,
+  assign-, complete-, admin-, refresh-,
+  start-, send-, close-, revoke-, report-,
+  publish-, make-, request-, share-,
+  change-, link-, unlink-, register-, authenticate-, mark-
+  ```
+
+  Anything else defaults to Query. If your mutation resolver isn't
+  recognized (validator complains `Missing resolver: Mutation.fooBar
+  (expected: resolvers/foo-bar.ts)`), rename the file to use a recognized
+  prefix and align the GraphQL field. You can keep a friendly public name
+  in `JohnnyApiService` by wrapping it.
+
+- **Tauri `beforeBuildCommand` doesn't run for plain `cargo build`.** The
+  desktop binary embeds `dist/host-app/browser` at compile time. Run
+  `nx build host-app` before `cargo build --release --bin johnnyone-desktop`
+  if you've changed Angular code in `host-app/`.
 
 ## GraphQL API
 
@@ -282,7 +307,7 @@ mutation/query that needs host data is routed via `relayRpc` /
 - **Auth** (lokal builtin) — `login`, `loginWithOauth`, `myCompleteFirstLogin`, `adminCreate{User,Tenant}`, `refreshToken`
 - **Sessions** — `listAiSessions`, `getAiSession`, `createAiSession`, `updateAiSession{Title,Provider,WorkingDirectory,Archived}`, `deleteAiSession`
 - **Chat** — `sendRelayChatMessage`, `cancelAiGeneration`, `listAiMessages`
-- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
+- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
 - **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
 - **Providers / settings** — `listDetectedCliTools`, `listProviderConfigs`, `upsertProviderConfig`, `deleteProviderConfig`, `getSetting`, `setSetting`, `getPlannerPromptSettings`, `updatePlannerPromptSettings`
 - **Nodes** — `listDesktopNodes`, `registerDesktopNode`, `updateDesktopNodeStatus`
@@ -293,21 +318,56 @@ Schema files:
 - [`worker/schema/johnnyone-ai.graphql`](worker/schema/johnnyone-ai.graphql)
 - [`worker/schema/johnnyone-channels.graphql`](worker/schema/johnnyone-channels.graphql)
 
-## Documentation map
+## Documentation
 
-| Doc | What it covers |
-|---|---|
-| [README.md](README.md) | This file — overview, structure, run + deploy commands |
-| [docs/.../runbooks/local-dev.md](../../docs/johnnyone/runbooks/local-dev.md) | Local development workflow |
-| [docs/.../runbooks/installing.md](../../docs/johnnyone/runbooks/installing.md) | End-user install of the desktop binary |
-| [docs/.../runbooks/live-test.md](../../docs/johnnyone/runbooks/live-test.md) | Smoke-test the deployed worker + Pages |
-| [docs/.../decisions/](../../docs/johnnyone/decisions/) | ADRs for the multi-user-saas pivot |
-| [docs/.../plans/multi-user-saas/](../../docs/johnnyone/plans/multi-user-saas/) | The active multi-phase plan |
+Repo-local docs live alongside the code:
+
+- **`README.md`** (this file) — overview, structure, run + deploy commands,
+  feature inventory, deploy gotchas
+- **`CHANGELOG.md`** — dated log of what shipped, in Keep-a-Changelog format
+
+## Notable features shipped beyond the multi-user-saas plan
+
+The bullets below track work that happened on top of the multi-user-saas
+plan, so a fresh session can know what's already live.
+
+- **Per-plan git history (2026-05-25)** — every approved plan state lands as
+  a commit in `plan_path/.git`. Initial + amend + revalidate + phase-pass
+  commits. Helpers in `desktop/src-tauri/src/services/git_history.rs`.
+- **Plan amendments (2026-05-25)** — `updateAgentPlanAmend(id, brief)`
+  mutation re-runs T1 in edit-mode + T2 on the diff. UI: "Amend" button in
+  the planner coordinator panel. Storage: `agent_plans.amend_brief` column
+  (migration 007).
+- **Session kinds (2026-05-25)** — `sessions.kind = 'user' | 'agent'`
+  (migration 008). `/terminal` only shows user-created sessions; planner
+  T1/T2 sessions are hidden. `list_sessions` defaults to `kind='user'`.
+- **Convention paths in planner prompts (2026-05-25)** — `{{conventions_path}}`
+  pointing at `{workspace}/common/conventions/` is injected into all four
+  default planner prompt templates. T1/T2 read every file under that path
+  before producing or validating a plan.
+- **Markdown link interceptor in planner (2026-05-25)** — clicks on relative
+  links inside a rendered plan markdown (e.g. `../../common/methodology.md`)
+  are intercepted via a `document:click` HostListener, resolved against the
+  current plan file's directory, and opened in the same preview pane.
+- **Mermaid zoom modal (2026-05-25)** — global `<app-mermaid-zoom-modal>`
+  reachable via `MermaidZoomService`. Click any rendered mermaid diagram
+  (planner preview or chat message) to open full-screen. Pinch + drag +
+  wheel + double-tap-reset.
+- **All four planner modals are Ionic-native (2026-05-25)** — Files, Setup
+  (New Planner), Browser (directory picker), Phase Tasks. Use
+  `<ion-modal>` + `<ion-segment>` + `<ion-list>` + `<ion-input>` /
+  `<ion-textarea>` per `common/conventions/ui.md`. The legacy
+  `.modal-backdrop` + `.setup-modal` markup is gone.
+- **Mobile-friendly navigation (2026-05-25)** — `<ion-split-pane>` left
+  menu collapses to a swipe drawer below 768px. Hamburger menu button +
+  page title chip (TERMINAL / PLANNING / DEVELOPMENT) in each page's
+  topbar. Tab-switch state reset so terminal screens + file lists clear
+  cleanly between plans.
+- **Tab autocomplete in shell sessions (2026-05-23)** — xterm `onData`
+  wired so Tab, arrow keys, Ctrl-R etc. all reach the shell. Mobile
+  textarea Tab is intercepted and flushed to the shell as `\t`.
 
 ## Roadmap
-
-Phase status lives in
-[`personal/docs/johnnyone/plans/multi-user-saas/status.md`](../../docs/johnnyone/plans/multi-user-saas/status.md).
 
 | Area | Status |
 |---|---|
@@ -319,6 +379,8 @@ Phase status lives in
 | Multi-user SaaS — ADRs (Phase 5) | Done |
 | Terminal page restored from attic + workspace browser | Done (2026-05-23) |
 | Planner / Development modes restored from attic | Done (2026-05-23) |
+| Per-plan git history + amend workflow | Done (2026-05-25) |
+| Ionic-native modals + mobile responsive nav + mermaid zoom | Done (2026-05-25) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 

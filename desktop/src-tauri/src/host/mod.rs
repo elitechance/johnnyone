@@ -527,6 +527,11 @@ impl From<CreateAiSessionInput> for CreateSessionInput {
             model: value.model,
             working_directory: value.working_directory,
             title: value.title,
+            // All sessions created via the host's GraphQL surface are user
+            // sessions. The planner / development coordinator creates its
+            // agent sessions directly via `sessions::create_session` with
+            // `kind: Some("agent")`.
+            kind: None,
         }
     }
 }

@@ -124,6 +124,7 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
             model: default_model_for_provider(&input.worker_provider),
             working_directory: Some(parsed.workspace_path.to_string_lossy().to_string()),
             title: Some(format!("T1 Worker - {}", title)),
+            kind: Some("agent".to_string()),
         },
     )?;
     let reviewer_session = sessions::create_session(
@@ -133,6 +134,7 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
             model: default_model_for_provider(&input.reviewer_provider),
             working_directory: Some(parsed.workspace_path.to_string_lossy().to_string()),
             title: Some(format!("T2 Reviewer - {}", title)),
+            kind: Some("agent".to_string()),
         },
     )?;
 
@@ -240,6 +242,7 @@ fn create_planning_run(
             model: default_model_for_provider(&input.worker_provider),
             working_directory: Some(workspace.to_string_lossy().to_string()),
             title: Some(format!("T1 Planner - {}", title)),
+            kind: Some("agent".to_string()),
         },
     )?;
     let reviewer_session = sessions::create_session(
@@ -249,6 +252,7 @@ fn create_planning_run(
             model: default_model_for_provider(&input.reviewer_provider),
             working_directory: Some(workspace.to_string_lossy().to_string()),
             title: Some(format!("T2 Plan Reviewer - {}", title)),
+            kind: Some("agent".to_string()),
         },
     )?;
 

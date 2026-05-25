@@ -10,6 +10,12 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
     let provider = input.provider.unwrap_or_else(|| "claude_code".to_string());
     let model = input.model.unwrap_or_default();
     let title = input.title.unwrap_or_else(|| "New Session".to_string());
+    // Anything other than the known kinds normalizes to "user" — the kind
+    // column has a CHECK-like guard at the application layer.
+    let kind = match input.kind.as_deref() {
+        Some("agent") => "agent".to_string(),
+        _ => "user".to_string(),
+    };
 
     let working_directory = match input.working_directory {
         Some(wd) if !wd.is_empty() => wd,
@@ -25,8 +31,8 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
 
     let session = state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO sessions (id, title, provider, model, working_directory) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, title, provider, model, working_directory],
+            "INSERT INTO sessions (id, title, provider, model, working_directory, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, title, provider, model, working_directory, kind],
         )
         .map_err(|e| format!("Failed to create session: {}", e))?;
 
@@ -37,22 +43,45 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
 }
 
 pub fn list_sessions(state: &AppState, status: Option<String>) -> Result<Vec<Session>, String> {
+    list_sessions_filtered(state, status, Some("user".to_string()))
+}
+
+/// Lower-level variant of `list_sessions` that takes a `kind` filter too.
+/// `kind = None` returns sessions of all kinds (used internally by the
+/// planner if it ever needs to enumerate its own sessions); `Some("user")`
+/// is what /terminal calls into so planner T1/T2 sessions don't leak in.
+pub fn list_sessions_filtered(
+    state: &AppState,
+    status: Option<String>,
+    kind: Option<String>,
+) -> Result<Vec<Session>, String> {
     state.db.with_conn(|conn| {
-        let (sql, param_value);
-        let params: Vec<&dyn rusqlite::ToSql>;
-
-        if let Some(ref s) = status {
-            sql = "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions WHERE status = ?1 ORDER BY updated_at DESC";
-            param_value = s.clone();
-            params = vec![&param_value as &dyn rusqlite::ToSql];
-        } else {
-            sql = "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions ORDER BY updated_at DESC";
-            params = vec![];
+        let mut clauses: Vec<String> = Vec::new();
+        let mut bound: Vec<String> = Vec::new();
+        if let Some(s) = status {
+            clauses.push(format!("status = ?{}", bound.len() + 1));
+            bound.push(s);
         }
+        if let Some(k) = kind {
+            clauses.push(format!("kind = ?{}", bound.len() + 1));
+            bound.push(k);
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at FROM sessions{} ORDER BY updated_at DESC",
+            where_sql
+        );
 
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let params_dyn: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let sessions = stmt
-            .query_map(params.as_slice(), |row| {
+            .query_map(params_dyn.as_slice(), |row| {
                 Ok(Session {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -64,8 +93,9 @@ pub fn list_sessions(state: &AppState, status: Option<String>) -> Result<Vec<Ses
                     total_input_tokens: row.get(7)?,
                     total_output_tokens: row.get(8)?,
                     total_cost_cents: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
+                    kind: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -235,7 +265,7 @@ pub fn list_messages(
 
 fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, String> {
     conn.query_row(
-        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, created_at, updated_at FROM sessions WHERE id = ?1",
+        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at FROM sessions WHERE id = ?1",
         params![id],
         |row| {
             Ok(Session {
@@ -249,8 +279,9 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                 total_input_tokens: row.get(7)?,
                 total_output_tokens: row.get(8)?,
                 total_cost_cents: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                kind: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         },
     )

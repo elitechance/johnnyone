@@ -15,8 +15,17 @@ pub struct Session {
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_cost_cents: i64,
+    /// Where this session came from. `'user'` = created from /terminal,
+    /// `'agent'` = created by the planner/development coordinator. The
+    /// /terminal UI filters to user-only via the kind filter on list_sessions.
+    #[serde(default = "default_session_kind")]
+    pub kind: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_session_kind() -> String {
+    "user".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +35,10 @@ pub struct CreateSessionInput {
     pub model: Option<String>,
     pub working_directory: Option<String>,
     pub title: Option<String>,
+    /// Optional. Defaults to `'user'`. Planner/development internals pass
+    /// `'agent'` so those sessions don't show up in the /terminal tab strip.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 // ── Message ──────────────────────────────────────────────────────────────────
