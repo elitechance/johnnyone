@@ -796,6 +796,7 @@ impl AgentService {
             "list_agent_plans" => Self::rpc_list_agent_plans(&req.params, state),
             "get_agent_plan" => Self::rpc_get_agent_plan(&req.params, state),
             "start_agent_plan" => Self::rpc_start_agent_plan(&req.params, state).await,
+            "amend_agent_plan" => Self::rpc_amend_agent_plan(&req.params, state).await,
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
             "block_agent_plan" => Self::rpc_block_agent_plan(&req.params, state).await,
@@ -1089,6 +1090,27 @@ impl AgentService {
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
         let run = crate::services::agent_plans::stop_plan(state, id.to_string()).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_amend_agent_plan(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let brief = params
+            .get("brief")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'brief' parameter".to_string())?;
+        let run = crate::services::agent_plans::amend_plan(
+            (**state).clone(),
+            id.to_string(),
+            brief.to_string(),
+        )
+        .await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 

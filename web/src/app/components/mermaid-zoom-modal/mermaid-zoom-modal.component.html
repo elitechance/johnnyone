@@ -1,0 +1,46 @@
+<ion-modal
+  [isOpen]="zoom.isOpen()"
+  (didDismiss)="close()"
+  (didPresent)="onDidPresent()"
+  class="mermaid-zoom"
+>
+  <ng-template>
+    <ion-header>
+      <ion-toolbar>
+        <ion-title>Diagram</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="zoomOut()" aria-label="Zoom out">
+            <ion-icon slot="icon-only" name="remove-outline"></ion-icon>
+          </ion-button>
+          <ion-button (click)="reset()" aria-label="Reset zoom">
+            <ion-icon slot="icon-only" name="expand-outline"></ion-icon>
+          </ion-button>
+          <ion-button (click)="zoomIn()" aria-label="Zoom in">
+            <ion-icon slot="icon-only" name="add-outline"></ion-icon>
+          </ion-button>
+          <ion-button (click)="close()" aria-label="Close">
+            <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content>
+      <div
+        #viewport
+        class="mermaid-zoom-viewport"
+        (wheel)="onWheel($event)"
+        (pointerdown)="onPointerDown($event)"
+        (pointermove)="onPointerMove($event)"
+        (pointerup)="onPointerUp($event)"
+        (pointercancel)="onPointerUp($event)"
+      >
+        <div
+          class="mermaid-zoom-stage"
+          [style.transform]="'translate(' + panX() + 'px, ' + panY() + 'px) scale(' + scale() + ')'"
+          [innerHTML]="safeSvg()"
+        ></div>
+        <div class="mermaid-zoom-hint">pinch / scroll to zoom · drag to pan · double-tap to reset</div>
+      </div>
+    </ion-content>
+  </ng-template>
+</ion-modal>

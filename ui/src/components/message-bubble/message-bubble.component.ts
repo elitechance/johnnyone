@@ -1,10 +1,21 @@
-import { Component, Input, ChangeDetectionStrategy } from '@angular/core';
+import {
+  AfterViewChecked,
+  Component,
+  ElementRef,
+  Input,
+  ChangeDetectionStrategy,
+  inject,
+} from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { IonicModule } from '@ionic/angular';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { AiMessage } from '../../models/ai-message.model';
 import { Marked, marked } from 'marked';
 import hljs from 'highlight.js/lib/common';
+import mermaid from 'mermaid';
+
+// One-time mermaid bootstrap (idempotent — mermaid guards reinit internally).
+mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
 
 function escapeHtml(raw: string): string {
   return raw
@@ -77,6 +88,14 @@ function createMarkdownParser(): Marked {
   const renderer = new marked.Renderer();
 
   renderer.code = ({ text, lang }) => {
+    // Mermaid fences get emitted as a placeholder that AfterViewChecked
+    // hydrates with a real SVG via `mermaid.render`. Inline rendering inside
+    // marked's renderer would need to be async, which marked doesn't support.
+    if ((lang || '').trim().toLowerCase() === 'mermaid') {
+      const source = encodeURIComponent(text);
+      return `<div class="mermaid-svg" data-mermaid-src="${source}" role="img" aria-label="Mermaid diagram"><div class="mermaid-pending">Rendering diagram…</div></div>`;
+    }
+
     const highlighted = highlightCode(text, lang);
 
     return (
@@ -102,12 +121,43 @@ function createMarkdownParser(): Marked {
   styleUrls: ['./message-bubble.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class MessageBubbleComponent {
+export class MessageBubbleComponent implements AfterViewChecked {
   @Input({ required: true }) message!: AiMessage;
   @Input() isStreamingMessage = false;
   private readonly markdownParser = createMarkdownParser();
+  private readonly host: ElementRef<HTMLElement> = inject(ElementRef);
 
   constructor(private sanitizer: DomSanitizer) {}
+
+  /**
+   * Hydrate any `<div class="mermaid-svg">` placeholders the markdown parser
+   * emitted with actual rendered SVGs. mermaid.render is async, so we can't
+   * do this inside marked's synchronous renderer — we do it here after each
+   * view check, marking nodes as processed to avoid re-rendering.
+   */
+  ngAfterViewChecked(): void {
+    const pending = this.host.nativeElement.querySelectorAll<HTMLElement>(
+      '.mermaid-svg[data-mermaid-src]',
+    );
+    if (pending.length === 0) return;
+    pending.forEach((node) => {
+      const raw = node.getAttribute('data-mermaid-src');
+      if (!raw) return;
+      // Mark as processing so a follow-up tick doesn't re-render the same node.
+      node.removeAttribute('data-mermaid-src');
+      const source = decodeURIComponent(raw);
+      const id = `mb-mermaid-${Math.random().toString(36).slice(2, 10)}`;
+      mermaid
+        .render(id, source)
+        .then((rendered) => {
+          node.innerHTML = rendered.svg;
+          rendered.bindFunctions?.(node);
+        })
+        .catch((err) => {
+          node.innerHTML = `<div class="mermaid-error">Failed to render mermaid diagram: ${escapeHtml(String(err))}</div>`;
+        });
+    });
+  }
 
   get isUser(): boolean {
     return this.message.role === 'user';

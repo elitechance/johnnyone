@@ -63,6 +63,8 @@ export interface AgentPlan {
   appScope?: string;
   docsScope?: string;
   referencePaths?: string;
+  /** Non-empty when an amendment cycle is in flight; cleared when T2 PASSes. */
+  amendBrief?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -180,7 +182,7 @@ export class JohnnyApiService {
     plan {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
-      brief appScope docsScope referencePaths
+      brief appScope docsScope referencePaths amendBrief
       createdAt updatedAt
     }
     phases {
@@ -635,6 +637,28 @@ export class JohnnyApiService {
         { id, phaseId: phaseId || null }
       )
       .pipe(map((data) => data.startAgentPlan));
+  }
+
+  /**
+   * Amend an approved planning run. Stashes the brief on the plan, switches
+   * T1 into "edit mode", and re-runs the T1→T2 planning cycle. On T2 PASS
+   * the amended plan state is committed to the plan's per-plan git repo.
+   *
+   * The GraphQL name is `updateAgentPlanAmend` (uses an `update-` mutation
+   * prefix lokal's validator recognizes); we expose it as `amendAgentPlan`
+   * here so callers read naturally.
+   */
+  amendAgentPlan(id: string, brief: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanAmend: AgentPlanRun }>(
+        `mutation UpdateAgentPlanAmend($id: ID!, $brief: String!) {
+          updateAgentPlanAmend(id: $id, brief: $brief) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, brief }
+      )
+      .pipe(map((data) => data.updateAgentPlanAmend));
   }
 
   stopAgentPlan(id: string): Observable<AgentPlanRun> {

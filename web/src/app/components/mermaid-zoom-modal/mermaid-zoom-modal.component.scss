@@ -1,0 +1,86 @@
+ion-modal.mermaid-zoom {
+  --width: 100vw;
+  --height: 100vh;
+  --border-radius: 0;
+}
+
+/* Bigger tap targets on the toolbar — the default ion-button is ~32px tall
+   which is borderline on touch. 44px is the Apple HIG / Material minimum. */
+ion-modal.mermaid-zoom ion-toolbar ion-button {
+  --padding-start: 12px;
+  --padding-end: 12px;
+  height: 44px;
+  min-width: 44px;
+}
+
+.mermaid-zoom-viewport {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  cursor: grab;
+  background: var(--jo-bg-base, #0d0f12);
+  // Disable all browser-default touch gestures so pinch/pan-zoom hit our
+  // pointer handlers instead of the page scroller or the OS pinch-zoom.
+  touch-action: none;
+  // Don't show the iOS callout / selection ring while a user is panning.
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+
+  &:active {
+    cursor: grabbing;
+  }
+}
+
+.mermaid-zoom-stage {
+  // Center origin so wheel-zoom feels natural relative to viewport center.
+  transform-origin: center center;
+  // Disable transitions during zoom — they make wheel feel mushy.
+  transition: none;
+  will-change: transform;
+  pointer-events: none; // The viewport handles all input.
+}
+
+.mermaid-zoom-stage svg {
+  display: block;
+  // Don't clamp here — the fitToViewport() pass applies the right initial
+  // scale based on actual rendered dimensions, so a clamp would fight with it.
+  // The transform-origin on .mermaid-zoom-stage keeps zoom anchored at
+  // viewport center.
+  height: auto;
+  background: transparent;
+}
+
+/* Small hint badge at the bottom — shows briefly when the modal opens
+   so first-time touch users know they can pinch + double-tap. */
+.mermaid-zoom-hint {
+  position: absolute;
+  left: 50%;
+  bottom: max(16px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--jo-fg, #c5cbd3);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  animation: jo-mermaid-hint 4s ease-out forwards;
+}
+
+@keyframes jo-mermaid-hint {
+  0%   { opacity: 0; transform: translate(-50%, 8px); }
+  10%  { opacity: 1; transform: translate(-50%, 0); }
+  70%  { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, 0); }
+}
+
+/* Safe-area top so the toolbar with × close stays tappable below notch / URL bar. */
+@media (max-width: 900px) {
+  ion-modal.mermaid-zoom::part(content) {
+    padding-top: env(safe-area-inset-top);
+  }
+}

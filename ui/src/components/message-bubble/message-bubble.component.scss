@@ -341,3 +341,38 @@
     opacity: 1;
   }
 }
+
+/* Mermaid diagram rendered inline by ngAfterViewChecked. The global click
+   handler in app.component delegates clicks here to the zoom modal. */
+.mermaid-svg {
+  display: grid;
+  justify-items: center;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--jo-border, #262b33);
+  border-radius: 8px;
+  background: var(--jo-bg-elevated, #14171c);
+  cursor: zoom-in;
+  transition: border-color 120ms ease;
+
+  &:hover {
+    border-color: var(--jo-accent, #5096ff);
+  }
+
+  svg {
+    max-width: 100%;
+    height: auto;
+  }
+}
+
+.mermaid-svg .mermaid-pending {
+  color: var(--jo-fg-muted, #8a92a0);
+  font-size: 13px;
+  padding: 8px 0;
+}
+
+.mermaid-svg .mermaid-error {
+  color: var(--jo-bad, #ff6868);
+  font-size: 13px;
+  white-space: pre-wrap;
+}

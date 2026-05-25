@@ -99,6 +99,10 @@ pub struct AgentPlan {
     pub app_scope: Option<String>,
     pub docs_scope: Option<String>,
     pub reference_paths: Option<String>,
+    /// Non-null when an "amend" cycle is in flight — the brief the user gave
+    /// when they clicked Amend. Cleared back to NULL by `commit_plan_on_pass`
+    /// after T2 PASSes the amended state.
+    pub amend_brief: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -291,7 +291,7 @@ pub fn list_plans(
     run_type: Option<String>,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, created_at, updated_at FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, created_at, updated_at FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -308,7 +308,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, created_at, updated_at FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, created_at, updated_at FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -331,6 +331,12 @@ pub async fn start_plan(
     phase_id: Option<String>,
 ) -> Result<AgentPlanRun, String> {
     let run = get_plan(&state, &id)?;
+    // Initialize the per-plan git repo on first start. Idempotent — re-runs
+    // are no-ops. Failures (git not installed, permissions) are logged but
+    // don't block the plan from running.
+    if let Err(err) = super::git_history::ensure_repo(&run.plan.plan_path) {
+        tracing::warn!(plan_id = %id, %err, "git_history::ensure_repo failed; plan history disabled");
+    }
     if run.plan.run_type == "planning" {
         return start_planning_run(state, id).await;
     }
@@ -417,6 +423,48 @@ pub async fn resume_active_plan_loops(state: AppState) -> Result<usize, String> 
         spawn_coordinator_loop(state.clone(), plan_id).await;
     }
     Ok(count)
+}
+
+/// Amend an existing approved plan: set `amend_brief` on the row, kick the
+/// status back to `planning_planner_running`, and trigger a fresh planning
+/// run. T1's prompt picks up the amend brief and switches to "edit mode"
+/// (read the existing plan + apply changes in place instead of creating from
+/// scratch). T2 reviews the diff against HEAD. On T2 PASS, `amend_brief`
+/// is cleared and a new commit lands on `main` with the amendment as its
+/// message.
+pub async fn amend_plan(
+    state: AppState,
+    id: String,
+    brief: String,
+) -> Result<AgentPlanRun, String> {
+    let brief = brief.trim().to_string();
+    if brief.is_empty() {
+        return Err("Amendment brief is required".to_string());
+    }
+    let run = get_plan(&state, &id)?;
+    if run.plan.run_type != "planning" {
+        return Err("Amend is only valid for planning-mode runs".to_string());
+    }
+    // Stash the brief + flip status so the next planning run picks up where
+    // we left off.
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET amend_brief = ?1, status = 'planning_planner_running', error = NULL, updated_at = datetime('now') WHERE id = ?2",
+            params![brief, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        &state,
+        &id,
+        None,
+        "planning_amend_requested",
+        json!({ "brief": brief }),
+    )?;
+    // Reuse the existing planning pipeline — start_planning_run reads the
+    // current state (including the freshly-set amend_brief) and walks T1→T2
+    // the same way an initial run does.
+    start_planning_run(state, id).await
 }
 
 pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, String> {
@@ -1063,6 +1111,12 @@ async fn handle_planning_reviewer_output(
                 )
                 .map_err(|e| e.to_string())
             })?;
+            // Commit the approved plan state. The message format depends on
+            // whether this is the very first approval (initial commit) or a
+            // re-approval after an amendment edit. Heuristic: if there are
+            // existing commits, treat as amend; if HEAD doesn't exist yet,
+            // treat as initial.
+            commit_plan_on_pass(state, run);
             append_event(
                 state,
                 &run.plan.id,
@@ -1370,6 +1424,13 @@ async fn pass_phase(
         }
         Ok(())
     })?;
+    // Commit the phase-pass state. Message ties the commit to a phase ID so
+    // `git log` reads like a progression through the plan's phases.
+    let message = format!("phase {}: {} (validated)", phase.phase_id, phase.phase_title);
+    if let Err(err) = super::git_history::commit_all(&run.plan.plan_path, &message) {
+        tracing::warn!(plan_id = %plan_id, phase_id = %phase_id, %err, "git_history::commit_all (phase pass) failed");
+    }
+
     append_event(
         state,
         plan_id,
@@ -1695,21 +1756,57 @@ fn planning_template_values(run: &AgentPlanRun) -> Vec<(&'static str, String)> {
             "reference_paths",
             run.plan.reference_paths.clone().unwrap_or_default(),
         ),
+        // Slice 2: amend-cycle placeholders. Empty when not amending so the
+        // template renders cleanly in either mode.
+        (
+            "amendment_brief",
+            run.plan.amend_brief.clone().unwrap_or_default(),
+        ),
+        (
+            "git_diff",
+            super::git_history::diff_head(&run.plan.plan_path).unwrap_or_default(),
+        ),
     ]
 }
 
 fn planning_planner_prompt(run: &AgentPlanRun) -> Result<String, String> {
     let settings = planner_prompts::load_prompt_settings()?;
+    // Pick the template variant based on whether an amend cycle is in flight.
+    // The `amend_planner` / `amend_reviewer` templates instruct T1 to edit in
+    // place + T2 to validate the diff, rather than treating the plan as a
+    // greenfield creation.
+    let amending = run
+        .plan
+        .amend_brief
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let template = if amending {
+        &settings.planning.amend_planner
+    } else {
+        &settings.planning.planner
+    };
     Ok(planner_prompts::render_template(
-        &settings.planning.planner,
+        template,
         &planning_template_values(run),
     ))
 }
 
 fn planning_reviewer_prompt(run: &AgentPlanRun) -> Result<String, String> {
     let settings = planner_prompts::load_prompt_settings()?;
+    let amending = run
+        .plan
+        .amend_brief
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let template = if amending {
+        &settings.planning.amend_reviewer
+    } else {
+        &settings.planning.reviewer
+    };
     Ok(planner_prompts::render_template(
-        &settings.planning.reviewer,
+        template,
         &planning_template_values(run),
     ))
 }
@@ -1753,6 +1850,62 @@ fn reviewer_verdict_block(output: &str) -> String {
         .take(80)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Commit the planning-mode plan on T2 PASS. The first PASS (no prior HEAD)
+/// produces an `initial: <title>` commit. Subsequent PASSes (re-running T1
+/// after edits or amendments) produce `amend: <brief excerpt>` commits if an
+/// `amend_brief` is set on the plan row, otherwise `revalidate: <title>`.
+///
+/// Failures are logged + swallowed so a missing `git` binary never blocks the
+/// planner from approving a plan.
+fn commit_plan_on_pass(state: &AppState, run: &AgentPlanRun) {
+    let plan_path = &run.plan.plan_path;
+    let title = if run.plan.title.trim().is_empty() {
+        "plan"
+    } else {
+        run.plan.title.trim()
+    };
+
+    // Message shape — three cases:
+    //   1. First commit ever        → "initial: <title>"
+    //   2. Subsequent + amend_brief → "amend: <brief excerpt>" (the user is amending)
+    //   3. Subsequent + no amend    → "revalidate: <title>" (T1 re-ran without an amend trigger)
+    let has_prior = super::git_history::has_any_commit(plan_path);
+    let message = match (has_prior, run.plan.amend_brief.as_deref()) {
+        (false, _) => format!("initial: {}", title),
+        (true, Some(brief)) if !brief.trim().is_empty() => {
+            super::git_history::amend_commit_message(brief)
+        }
+        (true, _) => format!("revalidate: {}", title),
+    };
+
+    match super::git_history::commit_all(plan_path, &message) {
+        Ok(Some(sha)) => {
+            tracing::info!(plan_id = %run.plan.id, %sha, %message, "plan committed to git history")
+        }
+        Ok(None) => {
+            tracing::debug!(plan_id = %run.plan.id, "no changes to commit on T2 PASS")
+        }
+        Err(err) => {
+            tracing::warn!(plan_id = %run.plan.id, %err, "git_history::commit_all (planning pass) failed")
+        }
+    }
+
+    // Amend cycle complete — clear the brief so future PASSes don't keep
+    // attributing themselves to this amendment.
+    if run.plan.amend_brief.is_some() {
+        let cleared = state.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agent_plans SET amend_brief = NULL, updated_at = datetime('now') WHERE id = ?1",
+                params![run.plan.id],
+            )
+            .map_err(|e| e.to_string())
+        });
+        if let Err(err) = cleared {
+            tracing::warn!(plan_id = %run.plan.id, %err, "failed to clear amend_brief after commit");
+        }
+    }
 }
 
 fn parse_verdict(output: &str) -> Option<String> {
@@ -2367,8 +2520,9 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         app_scope: row.get(14)?,
         docs_scope: row.get(15)?,
         reference_paths: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        amend_brief: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
 }
 

@@ -25,6 +25,17 @@ pub struct PlannerDevelopmentPrompts {
 pub struct PlannerPlanningPrompts {
     pub planner: String,
     pub reviewer: String,
+    /// Variant of `planner` used when an amendment is in flight. Instead of
+    /// scaffolding a plan from scratch, T1 reads the existing plan + the
+    /// amendment brief and edits files in place. `serde(default)` so old
+    /// `~/.johnnyone/planner-prompts.yml` files (pre-amend) still parse.
+    #[serde(default = "default_amend_planning_planner")]
+    pub amend_planner: String,
+    /// Variant of `reviewer` used during amendment review. Pulls a
+    /// `{{git_diff}}` into the prompt so T2 focuses on what changed since
+    /// the last approved commit rather than re-reviewing the whole plan.
+    #[serde(default = "default_amend_planning_reviewer")]
+    pub amend_reviewer: String,
 }
 
 impl Default for PlannerPromptSettings {
@@ -38,9 +49,19 @@ impl Default for PlannerPromptSettings {
             planning: PlannerPlanningPrompts {
                 planner: DEFAULT_PLANNING_PLANNER.to_string(),
                 reviewer: DEFAULT_PLANNING_REVIEWER.to_string(),
+                amend_planner: DEFAULT_AMEND_PLANNING_PLANNER.to_string(),
+                amend_reviewer: DEFAULT_AMEND_PLANNING_REVIEWER.to_string(),
             },
         }
     }
+}
+
+fn default_amend_planning_planner() -> String {
+    DEFAULT_AMEND_PLANNING_PLANNER.to_string()
+}
+
+fn default_amend_planning_reviewer() -> String {
+    DEFAULT_AMEND_PLANNING_REVIEWER.to_string()
 }
 
 fn default_schema() -> String {
@@ -176,6 +197,74 @@ Conventions: {{conventions_path}}
 Validate the plan only. Do not implement application code. Read methodology, every convention file under the conventions path, the created plan, relevant docs, source scope, artifacts, mocks, and diagrams.
 
 Review for methodology + convention compliance, clear phase boundaries, actionable task prompts, explicit acceptance criteria, local/live testing strategy, UI mocks/diagrams where needed, risky assumptions, and whether the plan can produce something the user can test.
+
+Return this footer exactly:
+
+PLAN: {{plan_output_path}}
+VERDICT: PASS | NEEDS_CHANGES | BLOCKED
+SUMMARY: <one paragraph>
+FINDINGS:
+- <finding or none>
+NEXT_STEPS:
+- <step for T1 or none>"#;
+
+// === Amend variants (Slice 2 / 2026-05-25) ============================
+// Used when the user clicks "Amend" on an approved planning run. T1 reads
+// the existing plan + applies the amendment in place; T2 reviews the diff
+// rather than re-validating from scratch.
+
+const DEFAULT_AMEND_PLANNING_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+ROLE: T1_PLANNER (AMEND MODE)
+
+Workspace root: {{workspace_path}}
+App/source scope: {{app_scope}}
+Docs scope: {{docs_scope}}
+Existing plan at: {{plan_output_path}}
+Methodology: {{methodology_path}}
+Conventions: {{conventions_path}}
+
+User's amendment brief:
+{{amendment_brief}}
+
+Original brief (for context, do not re-implement it from scratch):
+{{user_brief}}
+
+Reference paths:
+{{reference_paths}}
+
+A plan already lives at {{plan_output_path}}. Read it first (overview.md, status.md, phases/, decisions/, artifacts/), along with the methodology and the project conventions. The plan also has a per-plan git repo at {{plan_output_path}}/.git — run `git log --oneline` and `git diff` against earlier commits if you want context on past decisions.
+
+Apply the user's amendment by editing files IN PLACE. Add new phases or tasks where the amendment requires them. Update overview.md and status.md to reflect the change. Preserve completed phase status entries unless the amendment explicitly invalidates them. Do NOT recreate the plan from scratch — that throws away all prior approval history.
+
+When the amendment is applied and the plan is ready for review, say exactly:
+
+READY_FOR_T2_PLAN_REVIEW"#;
+
+const DEFAULT_AMEND_PLANNING_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+ROLE: T2_PLAN_REVIEWER (AMEND MODE)
+
+Workspace root: {{workspace_path}}
+App/source scope: {{app_scope}}
+Docs scope: {{docs_scope}}
+Plan path: {{plan_output_path}}
+Methodology: {{methodology_path}}
+Conventions: {{conventions_path}}
+
+User's amendment brief:
+{{amendment_brief}}
+
+T1 modified files in place. The diff against the previously-approved commit (`git diff HEAD` in the plan repo) is below. Focus your review on these changes — you do not need to re-validate sections that haven't been touched.
+
+--- BEGIN DIFF ---
+{{git_diff}}
+--- END DIFF ---
+
+Validate:
+1. The diff implements the amendment brief correctly.
+2. The amendment doesn't break methodology compliance (phase structure, acceptance criteria, plan validation strategy).
+3. New phases/tasks follow the project's conventions (read every file under {{conventions_path}}).
+4. Existing approved sections that the amendment SHOULD have touched have been updated (e.g. overview.md if new phases are added, status.md if scope changed).
+5. Diagrams + mocks were updated where the amendment changes UI/architecture.
 
 Return this footer exactly:
 

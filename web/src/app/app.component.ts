@@ -23,6 +23,8 @@ import {
   terminalOutline,
 } from 'ionicons/icons';
 import { AuthService } from './services/auth.service';
+import { MermaidZoomService } from './services/mermaid-zoom.service';
+import { MermaidZoomModalComponent } from './components/mermaid-zoom-modal/mermaid-zoom-modal.component';
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;
@@ -45,6 +47,7 @@ const STORAGE_KEY = 'jo_side_menu_width';
     IonMenuToggle,
     IonRouterOutlet,
     IonSplitPane,
+    MermaidZoomModalComponent,
   ],
   selector: 'app-root',
   templateUrl: './app.component.html',
@@ -54,6 +57,7 @@ export class AppComponent {
   protected readonly auth = inject(AuthService);
   private readonly router = inject(Router);
   private readonly host = inject(ElementRef<HTMLElement>);
+  private readonly mermaidZoom = inject(MermaidZoomService);
 
   /** True while the user is dragging the side-menu resize bar. */
   protected readonly isResizing = signal(false);
@@ -67,6 +71,25 @@ export class AppComponent {
       'log-out-outline': logOutOutline,
     });
     this.applyWidth(this.loadWidth());
+  }
+
+  /**
+   * Global click delegation for mermaid diagrams. Any element on any page
+   * with class `mermaid-rendered` (planner's renderer output) or `mermaid-svg`
+   * (message-bubble's inline render — see message-bubble.component.ts) opens
+   * the zoom modal with its SVG content.
+   */
+  @HostListener('document:click', ['$event'])
+  onDocClick(event: MouseEvent): void {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const container =
+      target.closest('.mermaid-rendered') ?? target.closest('.mermaid-svg');
+    if (!container) return;
+    const svg = container.querySelector('svg');
+    if (!svg) return;
+    event.preventDefault();
+    this.mermaidZoom.open(svg.outerHTML);
   }
 
   logout(): void {

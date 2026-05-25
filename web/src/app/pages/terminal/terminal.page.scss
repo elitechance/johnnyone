@@ -646,3 +646,26 @@ ion-modal.workspace-picker .picker-empty {
   padding: 32px 16px;
   text-align: center;
 }
+
+/* Safe-area top for the workspace picker modal on mobile. */
+@media (max-width: 900px) {
+  ion-modal.workspace-picker::part(content) {
+    padding-top: env(safe-area-inset-top);
+  }
+}
+
+/* === Page title chip (Terminal) === */
+.page-title-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  margin: 0 8px;
+  border-radius: 999px;
+  background: var(--ion-color-primary, #5096ff);
+  color: var(--jo-bg-base, #0d0f12);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}

@@ -117,7 +117,15 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
     if (changes['screen']) {
       this.resetIdlePromptTimer();
-      this.renderScreen(false);
+      // When the parent swaps to a different session (e.g. user switches plan
+      // tabs), `screen` flips to null while the new screen loads. Clear xterm
+      // immediately so the previous session's content doesn't stay on screen.
+      if (!this.screen && this.terminal) {
+        this.terminal.reset();
+        this.lastContent = '';
+        this.lastCursor = -1;
+      }
+      this.renderScreen(true);
     }
   }
 

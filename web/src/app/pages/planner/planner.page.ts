@@ -1,10 +1,44 @@
 import { CommonModule } from '@angular/common';
-import { Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { Component, HostListener, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
 import { DomSanitizer, SafeHtml, SafeResourceUrl } from '@angular/platform-browser';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { ActivatedRoute } from '@angular/router';
-import { IonMenuButton } from '@ionic/angular/standalone';
+import {
+  IonMenuButton,
+  IonModal,
+  IonHeader,
+  IonFooter,
+  IonToolbar,
+  IonTitle,
+  IonButtons,
+  IonButton,
+  IonContent,
+  IonIcon,
+  IonText,
+  IonSegment,
+  IonSegmentButton,
+  IonLabel,
+  IonList,
+  IonItem,
+  IonBadge,
+  IonNote,
+  IonInput,
+  IonTextarea,
+  IonSelect,
+  IonSelectOption,
+  IonCard,
+  IonCardHeader,
+  IonCardTitle,
+  IonCardSubtitle,
+  IonCardContent,
+  IonChip,
+} from '@ionic/angular/standalone';
+import { addIcons } from 'ionicons';
+import { closeOutline } from 'ionicons/icons';
+
+// Register the close icon for the Files modal's close button.
+addIcons({ 'close-outline': closeOutline });
 import { firstValueFrom, Subscription } from 'rxjs';
 import { Marked, marked } from 'marked';
 import mermaid from 'mermaid';
@@ -40,7 +74,39 @@ interface TaskStatusDetail {
 @Component({
   selector: 'app-planner',
   standalone: true,
-  imports: [CommonModule, FormsModule, TerminalScreenComponent, IonMenuButton],
+  imports: [
+    CommonModule,
+    FormsModule,
+    TerminalScreenComponent,
+    IonMenuButton,
+    IonModal,
+    IonHeader,
+    IonFooter,
+    IonToolbar,
+    IonTitle,
+    IonButtons,
+    IonButton,
+    IonContent,
+    IonIcon,
+    IonText,
+    IonSegment,
+    IonSegmentButton,
+    IonLabel,
+    IonList,
+    IonItem,
+    IonBadge,
+    IonNote,
+    IonInput,
+    IonTextarea,
+    IonSelect,
+    IonSelectOption,
+    IonCard,
+    IonCardHeader,
+    IonCardTitle,
+    IonCardSubtitle,
+    IonCardContent,
+    IonChip,
+  ],
   templateUrl: './planner.page.html',
   styleUrls: ['./planner.page.scss'],
 })
@@ -75,6 +141,9 @@ export class PlannerPage implements OnInit, OnDestroy {
   terminalScreens = signal<Record<string, TerminalScreen>>({});
   setupOpen = signal(false);
   filesOpen = signal(false);
+  amendOpen = signal(false);
+  isAmendBusy = signal(false);
+  amendBrief = '';
   filesTab = signal<'changes' | 'plan'>('changes');
   fileMode = signal<'changed' | 'all'>('changed');
   workspaceBrowsePath = signal('');
@@ -352,12 +421,54 @@ export class PlannerPage implements OnInit, OnDestroy {
   async selectPlan(id: string): Promise<void> {
     try {
       const run = await firstValueFrom(this.api.getAgentPlan(id));
+
+      // Wipe any state tied to the previous plan BEFORE swapping currentRun
+      // so derived signals (workerScreen, planFiles, etc.) don't briefly
+      // show last plan's data against the new plan's identity.
+      this.resetPerPlanState();
+
       this.currentRun.set(run);
       this.ensureActiveMobilePanel(run);
       await this.attachPlanTerminals(run);
+
+      // If the Files modal is open, refresh its contents for the new plan.
+      if (this.filesOpen()) {
+        await Promise.all([
+          this.loadWorkspaceFiles(this.fileMode()),
+          this.loadPlanFiles(this.planRootPath()),
+        ]);
+      }
     } catch (err) {
       this.error.set(String(err));
     }
+  }
+
+  /**
+   * Clear all signals scoped to the currently-selected plan. Called when the
+   * user switches between plan tabs so the UI doesn't briefly display the old
+   * plan's terminal screens / file list / selected diff against the new
+   * plan's identity.
+   */
+  private resetPerPlanState(): void {
+    // Terminal screens are keyed by session_id and the new plan will have its
+    // own session_ids — keeping stale entries means workerScreen/reviewerScreen
+    // could resolve to a previous plan's frame if lookups accidentally hit.
+    this.terminalScreens.set({});
+
+    // Files modal state.
+    this.workspaceBrowsePath.set('');
+    this.workspaceFiles.set([]);
+    this.selectedWorkspaceFile.set(null);
+    this.workspaceDiff.set('');
+    this.filesError.set(null);
+
+    this.planBrowsePath.set('');
+    this.planFiles.set([]);
+    this.selectedPlanFile.set(null);
+    this.selectedPlanContent.set(null);
+    this.renderedPlanHtml.set('');
+    this.clearSelectedPlanHtmlUrl();
+    this.planFilesError.set(null);
   }
 
   async createPlanner(): Promise<void> {
@@ -448,6 +559,40 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.error.set(String(err));
     } finally {
       this.isBusy.set(false);
+    }
+  }
+
+  /** Open the amend modal, pre-filling the brief textarea with the in-flight
+   * amendment brief if one exists on the current plan. */
+  openAmend(): void {
+    if (this.mode() !== 'planning') return;
+    this.amendBrief = this.currentRun()?.plan.amendBrief ?? '';
+    this.amendOpen.set(true);
+  }
+
+  closeAmend(): void {
+    this.amendOpen.set(false);
+  }
+
+  /** Send the amendment brief to the worker. The host sets `amend_brief` on
+   * the plan + re-triggers T1 in edit mode; status flows through the same
+   * planning pipeline back to T2 PASS, which commits the diff. */
+  async submitAmend(): Promise<void> {
+    const id = this.currentRun()?.plan.id;
+    const brief = this.amendBrief.trim();
+    if (!id || !brief || this.isAmendBusy()) return;
+    this.isAmendBusy.set(true);
+    this.error.set(null);
+    try {
+      const run = await firstValueFrom(this.api.amendAgentPlan(id, brief));
+      this.currentRun.set(run);
+      this.amendBrief = '';
+      this.amendOpen.set(false);
+      await this.attachPlanTerminals(run);
+    } catch (err) {
+      this.error.set(String(err));
+    } finally {
+      this.isAmendBusy.set(false);
     }
   }
 
@@ -685,6 +830,103 @@ export class PlannerPage implements OnInit, OnDestroy {
       return;
     }
     await this.selectPlanFile(entry);
+  }
+
+  /**
+   * Intercept clicks on `<a>` elements inside the markdown preview. Mermaid
+   * outputs and plan markdown often contain relative paths like
+   * `../../common/methodology.md` — those don't resolve through the SPA
+   * router and would 404 if clicked. Resolve them against the currently-open
+   * plan file's directory and re-open the result inside this same preview
+   * pane.
+   */
+  // Document-level click listener — needed because `<ion-modal>` teleports
+  // its content into <body>, outside this component's host element, so
+  // bubbling through @HostListener('click') on PlannerPage misses it.
+  @HostListener('document:click', ['$event'])
+  onPreviewLinkClick(event: MouseEvent): void {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const anchor = target.closest('a');
+    if (!anchor) return;
+    // Only intercept inside our markdown previews — leaves left-nav etc. alone.
+    if (!anchor.closest('.plan-markdown-preview')) return;
+
+    const href = anchor.getAttribute('href');
+    if (!href) return;
+
+    // Let true external links + in-page anchors + protocol-handlers through.
+    if (/^https?:\/\//i.test(href) || /^(mailto|tel|sms):/i.test(href) || href.startsWith('#')) {
+      anchor.setAttribute('target', '_blank');
+      anchor.setAttribute('rel', 'noopener noreferrer');
+      return;
+    }
+
+    const currentPath = this.selectedPlanContent()?.path;
+    if (!currentPath) return;
+
+    // Resolve and dispatch.
+    const resolved = this.resolveRelativeHostPath(currentPath, href);
+    console.log('[link-handler] base=' + currentPath + ' rel=' + href + ' resolved=' + resolved);
+    if (!resolved) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    void this.openHostPath(resolved);
+  }
+
+  /** Resolve `rel` (which may start with `./`, `../`, or be a bare segment)
+   * against the directory of `basePath`. `basePath` is workspace-relative
+   * (e.g. `lokal/docs/.../overview.md`), so the result is also
+   * workspace-relative; the host joins it with the plan's workspace root
+   * in `resolve_workspace_file_path`. Returns null if the relative path
+   * walks above the workspace root. */
+  private resolveRelativeHostPath(basePath: string, rel: string): string | null {
+    // Strip any URL hash/query — host paths never carry them.
+    rel = rel.replace(/[#?].*$/, '');
+    // Strip a leading slash on `basePath` if some caller passed an absolute
+    // form — treat both consistently.
+    const base = basePath.replace(/^\/+/, '');
+    const baseAbsolute = rel.startsWith('/');
+    const combined = baseAbsolute
+      ? rel.replace(/^\/+/, '')  // absolute rel — drop the leading slash so it joins as workspace-relative
+      : `${base.replace(/\/+[^/]*$/, '')}/${rel}`;
+    const parts: string[] = [];
+    for (const seg of combined.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (parts.length === 0) return null;
+        parts.pop();
+        continue;
+      }
+      parts.push(seg);
+    }
+    return parts.join('/');
+  }
+
+  /** Open an arbitrary host file path in the plan-preview pane. Synthesizes
+   * a HostFileEntry and reuses `selectPlanFile`'s side effects (content
+   * fetch + markdown render + mermaid re-render). Does NOT try to refresh
+   * the directory listing — the linked file is usually outside the plan
+   * dir (e.g. common/methodology.md) and that listing would 404. */
+  private async openHostPath(path: string): Promise<void> {
+    const dir = path.replace(/\/+[^/]*$/, '') || '/';
+    const filename = path.slice(dir.length + 1);
+    if (!filename) return;
+    // Open the Files modal on the Plan Files tab if it's closed — that's
+    // where the preview pane lives.
+    if (!this.filesOpen()) {
+      this.filesOpen.set(true);
+      this.filesTab.set('plan');
+    } else if (this.filesTab() !== 'plan') {
+      this.filesTab.set('plan');
+    }
+    await this.selectPlanFile({
+      path,
+      name: filename,
+      kind: 'file',
+      status: 'unchanged',
+    } as HostFileEntry);
   }
 
   async selectPlanFile(file: HostFileEntry): Promise<void> {
@@ -1036,12 +1278,24 @@ export class PlannerPage implements OnInit, OnDestroy {
     for (const sessionId of Array.from(this.plannerVisualSubscriptions)) {
       if (!visibleIds.has(sessionId)) {
         await this.unsubscribePlanTerminal(sessionId);
+        // Prune the cached screen for the no-longer-visible session so it
+        // can't accidentally re-render if currentRun briefly resolves back.
+        this.terminalScreens.update((screens) => {
+          const next = { ...screens };
+          delete next[sessionId];
+          return next;
+        });
       }
     }
 
     for (const sessionId of sessionIds) {
       try {
-        await this.subscribePlanTerminal(sessionId);
+        // refreshVisual = subscribe-if-not-subscribed, otherwise send a fresh
+        // `visual_refresh` so the host re-emits the current pane state. This
+        // covers tab switches where the subscription already existed but the
+        // cached screen was wiped above.
+        await this.relayTerminal.refreshVisual(sessionId);
+        this.plannerVisualSubscriptions.add(sessionId);
       } catch {
         // The coordinator may still be starting the host/tmux session.
       }

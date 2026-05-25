@@ -1723,3 +1723,274 @@ label {
 @media (max-width: 767px) {
   .mobile-menu-btn { display: inline-flex; }
 }
+
+/* Make planner-rendered mermaid clickable to open the zoom modal
+   (handler is global in app.component). */
+.plan-markdown-preview .mermaid-rendered {
+  cursor: zoom-in;
+  transition: border-color 120ms ease;
+}
+.plan-markdown-preview .mermaid-rendered:hover {
+  border-color: var(--jo-accent, #5096ff);
+}
+
+/* === Mobile overflow cascade (2026-05-25) ===
+   Previously the files-modal grew to fit content because no ancestor had a
+   bounded height: backdrop → modal → tab-panel → viewer → preview all had
+   `overflow: visible`, so `minmax(0, 1fr)` rows expanded indefinitely and the
+   `.preview-scroll`'s `overflow: auto` never had a smaller parent to scroll
+   within. Pinning the chain to 100dvh + overflow:hidden lets the inner
+   scrollable areas finally clip + scroll. */
+@media (max-width: workspace.$mobile-breakpoint) {
+  .modal-backdrop {
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  .setup-modal,
+  .files-modal,
+  .browser-modal,
+  .phase-tasks-modal {
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+    overflow: hidden !important;
+  }
+
+  .files-modal .files-tab-panel,
+  .changes-viewer,
+  .plan-file-viewer,
+  .diff-pane,
+  .preview {
+    overflow: hidden !important;
+    min-height: 0;
+  }
+
+  /* Now that ancestors are bounded, scrollable inner areas can actually
+     scroll. Make sure they have a clear overflow:auto and a min-height:0 so
+     flex/grid doesn't force them to expand. */
+  .plan-file-list,
+  .change-list,
+  .preview-scroll,
+  .diff-scroll,
+  .tree {
+    overflow: auto !important;
+    min-height: 0;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+/* Terminal-card / coordinator-panel mobile constraint — same root cause as
+   the modal: with no fixed height, the active xterm/coordinator panel
+   expanded and pushed content past the viewport's right edge. Pin to
+   `100%` of the visible workspace so the panels stay inside the viewport. */
+@media (max-width: workspace.$mobile-breakpoint) {
+  .planner-workspace {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .agent-grid.active-mobile-panel,
+  .coordinator-panel.active-mobile-panel {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .terminal-card.active-mobile-panel {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+  }
+}
+
+/* === Files modal — Ionic-native (2026-05-25) === */
+ion-modal.files-ion-modal {
+  --width: min(1100px, 100vw);
+  --height: min(900px, 100vh);
+}
+@media (max-width: workspace.$mobile-breakpoint) {
+  ion-modal.files-ion-modal {
+    --width: 100vw;
+    --height: 100vh;
+    --border-radius: 0;
+  }
+}
+
+ion-modal.files-ion-modal .files-modal-path {
+  margin: 0;
+  padding: 4px 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  white-space: normal;
+}
+
+ion-modal.files-ion-modal .files-subtoolbar {
+  --min-height: 36px;
+}
+
+ion-modal.files-ion-modal .files-crumb {
+  display: block;
+  padding: 4px 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+ion-modal.files-ion-modal .files-list {
+  background: transparent;
+  padding: 0;
+}
+
+ion-modal.files-ion-modal .files-empty {
+  display: block;
+  padding: 24px 16px;
+  text-align: center;
+}
+
+ion-modal.files-ion-modal .diff-region {
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+  border-top: 1px solid var(--jo-border, #262b33);
+}
+
+ion-modal.files-ion-modal .diff-scroll,
+ion-modal.files-ion-modal .preview-scroll {
+  padding: 8px 16px;
+  overflow: auto;
+  /* ion-content already gives momentum + safe-area on iOS — this just makes
+     the inner viewport scroll independently if needed. */
+  -webkit-overflow-scrolling: touch;
+}
+
+ion-modal.files-ion-modal .diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+ion-modal.files-ion-modal .diff-table td.line-number {
+  width: 48px;
+  padding: 2px 8px;
+  color: var(--jo-fg-faint, #5a6271);
+  text-align: right;
+  user-select: none;
+}
+ion-modal.files-ion-modal .diff-table td.line-text {
+  padding: 2px 8px;
+  white-space: pre;
+}
+ion-modal.files-ion-modal .diff-table tr.add { background: rgba(95, 215, 143, 0.12); }
+ion-modal.files-ion-modal .diff-table tr.remove { background: rgba(255, 104, 104, 0.12); }
+ion-modal.files-ion-modal .diff-table tr.hunk { color: var(--jo-fg-muted, #8a92a0); }
+
+/* === Refactored modals (setup/browser/phase-tasks) — Ionic-native (2026-05-25) === */
+ion-modal.setup-ion-modal {
+  --width: min(820px, 100vw);
+  --height: min(900px, 100vh);
+}
+@media (max-width: workspace.$mobile-breakpoint) {
+  ion-modal.setup-ion-modal {
+    --width: 100vw;
+    --height: 100vh;
+    --border-radius: 0;
+  }
+}
+
+ion-modal.setup-ion-modal .setup-form ion-item ion-button[slot="end"] {
+  --padding-start: 8px;
+  --padding-end: 8px;
+}
+
+ion-modal.setup-ion-modal .prompt-settings-panel {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--jo-border, #262b33);
+}
+ion-modal.setup-ion-modal .prompt-settings-path {
+  display: inline-block;
+  margin-left: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--jo-fg-muted, #8a92a0);
+  word-break: break-all;
+}
+ion-modal.setup-ion-modal .prompt-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+}
+ion-modal.setup-ion-modal .validation-box {
+  margin: 12px 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--jo-bg-elevated, #14171c);
+  border: 1px solid var(--jo-border, #262b33);
+  color: var(--jo-fg-muted, #8a92a0);
+  font-size: 13px;
+}
+ion-modal.setup-ion-modal .validation-box.invalid {
+  border-color: var(--jo-bad, #ff6868);
+  color: var(--jo-bad, #ff6868);
+}
+
+ion-modal.files-ion-modal .phase-task-card {
+  margin: 12px;
+  background: var(--jo-bg-elevated, #14171c);
+}
+ion-modal.files-ion-modal .phase-task-card dl.task-paths {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+ion-modal.files-ion-modal .phase-task-card dl.task-paths dt {
+  color: var(--jo-fg-muted, #8a92a0);
+}
+ion-modal.files-ion-modal .phase-task-card dl.task-paths dd {
+  margin: 0;
+  word-break: break-all;
+}
+ion-modal.files-ion-modal .task-status-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--jo-border, #262b33);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* === Safe-area for full-screen modals on mobile (2026-05-25) ===
+   iOS Safari URL bar / notch covers the top of full-screen modals.
+   Push the header below the safe-area-inset-top so the title and close
+   button stay tappable. */
+@media (max-width: workspace.$mobile-breakpoint) {
+  ion-modal.files-ion-modal::part(content),
+  ion-modal.setup-ion-modal::part(content) {
+    padding-top: env(safe-area-inset-top);
+  }
+}
+
+/* === Page title chip (Planner / Development) === */
+.page-title-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  margin: 0 8px;
+  border-radius: 999px;
+  background: var(--ion-color-primary, #5096ff);
+  color: var(--jo-bg-base, #0d0f12);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
