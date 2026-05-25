@@ -39,8 +39,12 @@
           [style.transform]="'translate(' + panX() + 'px, ' + panY() + 'px) scale(' + scale() + ')'"
           [innerHTML]="safeSvg()"
         ></div>
-        <div class="mermaid-zoom-hint">pinch / scroll to zoom · drag to pan · double-tap to reset</div>
       </div>
     </ion-content>
+    <ion-footer>
+      <ion-toolbar>
+        <div class="mermaid-zoom-hint">pinch / scroll to zoom · drag to pan · double-tap to reset</div>
+      </ion-toolbar>
+    </ion-footer>
   </ng-template>
 </ion-modal>

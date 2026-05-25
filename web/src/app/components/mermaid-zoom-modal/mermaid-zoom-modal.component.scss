@@ -1,7 +1,23 @@
 ion-modal.mermaid-zoom {
   --width: 100vw;
-  --height: 100vh;
+  --height: 100dvh;
   --border-radius: 0;
+}
+
+ion-modal.mermaid-zoom::part(content) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+ion-modal.mermaid-zoom ion-header,
+ion-modal.mermaid-zoom ion-footer {
+  flex: 0 0 auto;
+}
+
+ion-modal.mermaid-zoom ion-content {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* Bigger tap targets on the toolbar — the default ion-button is ~32px tall
@@ -54,33 +70,31 @@ ion-modal.mermaid-zoom ion-toolbar ion-button {
   background: transparent;
 }
 
-/* Small hint badge at the bottom — shows briefly when the modal opens
-   so first-time touch users know they can pinch + double-tap. */
+/* Small hint in the Ionic footer so it stays inside the modal viewport. */
 .mermaid-zoom-hint {
-  position: absolute;
-  left: 50%;
-  bottom: max(16px, env(safe-area-inset-bottom));
-  transform: translateX(-50%);
-  padding: 6px 14px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.55);
+  padding: 8px 14px;
+  text-align: center;
   color: var(--jo-fg, #c5cbd3);
   font-size: 12px;
   letter-spacing: 0.02em;
-  pointer-events: none;
   animation: jo-mermaid-hint 4s ease-out forwards;
 }
 
 @keyframes jo-mermaid-hint {
-  0%   { opacity: 0; transform: translate(-50%, 8px); }
-  10%  { opacity: 1; transform: translate(-50%, 0); }
+  0%   { opacity: 0; }
+  10%  { opacity: 1; }
   70%  { opacity: 1; }
-  100% { opacity: 0; transform: translate(-50%, 0); }
+  100% { opacity: 0.72; }
 }
 
-/* Safe-area top so the toolbar with × close stays tappable below notch / URL bar. */
+/* Keep safe-area padding on Ionic bars, not on ::part(content), so header,
+   content, and footer remain in Ionic's measured layout on mobile browsers. */
 @media (max-width: 900px) {
-  ion-modal.mermaid-zoom::part(content) {
+  ion-modal.mermaid-zoom ion-header {
     padding-top: env(safe-area-inset-top);
+  }
+
+  ion-modal.mermaid-zoom ion-footer {
+    padding-bottom: env(safe-area-inset-bottom);
   }
 }

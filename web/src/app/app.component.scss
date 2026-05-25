@@ -3,12 +3,67 @@
 // or growing it past half the viewport.
 :host {
   --jo-side-menu-width: 240px;
+  --jo-side-menu-collapsed-width: 58px;
 }
 
 ion-split-pane {
   --side-width: var(--jo-side-menu-width);
   --side-min-width: var(--jo-side-menu-width);
   --side-max-width: var(--jo-side-menu-width);
+
+  &.side-menu-collapsed {
+    --side-width: var(--jo-side-menu-collapsed-width);
+    --side-min-width: var(--jo-side-menu-collapsed-width);
+    --side-max-width: var(--jo-side-menu-collapsed-width);
+  }
+}
+
+ion-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 48px;
+  padding-inline: 16px 8px;
+}
+
+.menu-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-collapse-button {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  --padding-start: 0;
+  --padding-end: 0;
+  --color: var(--ion-color-medium);
+}
+
+ion-menu.collapsed {
+  ion-list-header {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .menu-title,
+  ion-label {
+    display: none;
+  }
+
+  ion-item {
+    --padding-start: 0;
+    --inner-padding-end: 0;
+    --min-height: 48px;
+    justify-content: center;
+  }
+
+  ion-icon[slot='start'] {
+    margin-inline: auto;
+    font-size: 22px;
+  }
 }
 
 // Thin, draggable bar pinned to the right edge of the side menu (md+ only;
@@ -33,6 +88,10 @@ ion-split-pane {
   @media (max-width: 767px) {
     display: none;
   }
+}
+
+ion-split-pane.side-menu-collapsed ~ .side-resizer {
+  display: none;
 }
 
 .side-resizer-handle {

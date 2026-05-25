@@ -1494,7 +1494,7 @@ label {
   }
 
   .planner-actions .primary-action {
-    grid-column: span 2;
+    grid-column: 1 / -1;
     min-width: 0;
     width: 100%;
     padding-inline: 8px;
@@ -1806,12 +1806,33 @@ label {
 /* === Files modal — Ionic-native (2026-05-25) === */
 ion-modal.files-ion-modal {
   --width: min(1100px, 100vw);
-  --height: min(900px, 100vh);
+  --height: min(900px, 100dvh);
 }
+
+ion-modal.files-ion-modal::part(content),
+ion-modal.setup-ion-modal::part(content) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+ion-modal.files-ion-modal ion-header,
+ion-modal.files-ion-modal ion-footer,
+ion-modal.setup-ion-modal ion-header,
+ion-modal.setup-ion-modal ion-footer {
+  flex: 0 0 auto;
+}
+
+ion-modal.files-ion-modal ion-content,
+ion-modal.setup-ion-modal ion-content {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 @media (max-width: workspace.$mobile-breakpoint) {
   ion-modal.files-ion-modal {
     --width: 100vw;
-    --height: 100vh;
+    --height: 100dvh;
     --border-radius: 0;
   }
 }
@@ -1888,12 +1909,12 @@ ion-modal.files-ion-modal .diff-table tr.hunk { color: var(--jo-fg-muted, #8a92a
 /* === Refactored modals (setup/browser/phase-tasks) — Ionic-native (2026-05-25) === */
 ion-modal.setup-ion-modal {
   --width: min(820px, 100vw);
-  --height: min(900px, 100vh);
+  --height: min(900px, 100dvh);
 }
 @media (max-width: workspace.$mobile-breakpoint) {
   ion-modal.setup-ion-modal {
     --width: 100vw;
-    --height: 100vh;
+    --height: 100dvh;
     --border-radius: 0;
   }
 }
@@ -1968,14 +1989,19 @@ ion-modal.files-ion-modal .task-status-detail {
   gap: 6px;
 }
 
-/* === Safe-area for full-screen modals on mobile (2026-05-25) ===
-   iOS Safari URL bar / notch covers the top of full-screen modals.
-   Push the header below the safe-area-inset-top so the title and close
-   button stay tappable. */
+/* === Safe-area for full-screen Ionic modals on mobile (2026-05-25) ===
+   Keep safe-area padding on the Ionic bars, not on ::part(content). Padding
+   the content host changes Ionic's header/content/footer measurement and can
+   push modal actions outside the visible viewport on mobile browsers. */
 @media (max-width: workspace.$mobile-breakpoint) {
-  ion-modal.files-ion-modal::part(content),
-  ion-modal.setup-ion-modal::part(content) {
+  ion-modal.files-ion-modal ion-header,
+  ion-modal.setup-ion-modal ion-header {
     padding-top: env(safe-area-inset-top);
+  }
+
+  ion-modal.files-ion-modal ion-footer,
+  ion-modal.setup-ion-modal ion-footer {
+    padding-bottom: env(safe-area-inset-bottom);
   }
 }
 

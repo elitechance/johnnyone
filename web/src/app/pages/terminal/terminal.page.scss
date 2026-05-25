@@ -451,7 +451,7 @@
   }
 
   .workspace-actions {
-    @include workspace.mobile-actions-grid(5);
+    @include workspace.mobile-actions-grid(3);
     padding-bottom: 0;
   }
 
@@ -487,6 +487,7 @@
     top: auto !important;
     width: 100% !important;
     height: auto !important;
+    grid-template-rows: auto minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
     max-height: none;
@@ -495,6 +496,9 @@
 
   .pane-header {
     grid-template-columns: 1fr;
+    position: sticky;
+    top: 0;
+    z-index: 2;
     min-height: 68px;
     align-content: center;
     gap: 6px;
@@ -508,19 +512,25 @@
   }
 
   .pane-meta {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 6px;
-    overflow: auto hidden;
-    scrollbar-width: none;
+    overflow: visible;
   }
 
   .pane-tool {
-    max-width: 48vw;
-    flex: 0 0 auto;
+    min-width: 0;
+    max-width: none;
+    padding-inline: 8px;
+  }
+
+  .pane-tool.danger {
+    min-width: 56px;
+    text-align: center;
   }
 
   .pane-status {
-    flex: 0 0 auto;
-    white-space: nowrap;
+    display: none;
   }
 
   .pane-resize-handle {
@@ -633,6 +643,23 @@ ion-modal.workspace-picker {
   --height: min(720px, 84vh);
   --border-radius: 12px;
 }
+
+ion-modal.workspace-picker::part(content) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+ion-modal.workspace-picker ion-header,
+ion-modal.workspace-picker ion-footer {
+  flex: 0 0 auto;
+}
+
+ion-modal.workspace-picker ion-content {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 ion-modal.workspace-picker .picker-path {
   margin: 0;
   padding: 6px 12px;
@@ -647,10 +674,21 @@ ion-modal.workspace-picker .picker-empty {
   text-align: center;
 }
 
-/* Safe-area top for the workspace picker modal on mobile. */
+/* Full-screen Ionic modal on mobile. Keep safe-area padding on Ionic bars,
+   not on ::part(content), so header/content/footer stay in-bounds. */
 @media (max-width: 900px) {
-  ion-modal.workspace-picker::part(content) {
+  ion-modal.workspace-picker {
+    --width: 100vw;
+    --height: 100dvh;
+    --border-radius: 0;
+  }
+
+  ion-modal.workspace-picker ion-header {
     padding-top: env(safe-area-inset-top);
+  }
+
+  ion-modal.workspace-picker ion-footer {
+    padding-bottom: env(safe-area-inset-bottom);
   }
 }
 

@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { Router, RouterLink, RouterLinkActive, RouterModule } from '@angular/router';
 import {
   IonApp,
+  IonButton,
   IonContent,
   IonIcon,
   IonItem,
@@ -16,6 +17,8 @@ import {
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
 import {
+  chevronBackOutline,
+  chevronForwardOutline,
   documentTextOutline,
   hammerOutline,
   logOutOutline,
@@ -29,6 +32,7 @@ import { MermaidZoomModalComponent } from './components/mermaid-zoom-modal/merma
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;
 const STORAGE_KEY = 'jo_side_menu_width';
+const COLLAPSED_STORAGE_KEY = 'jo_side_menu_collapsed';
 
 @Component({
   imports: [
@@ -37,6 +41,7 @@ const STORAGE_KEY = 'jo_side_menu_width';
     RouterLink,
     RouterLinkActive,
     IonApp,
+    IonButton,
     IonContent,
     IonIcon,
     IonItem,
@@ -61,15 +66,19 @@ export class AppComponent {
 
   /** True while the user is dragging the side-menu resize bar. */
   protected readonly isResizing = signal(false);
+  protected readonly isMenuCollapsed = signal(false);
 
   constructor() {
     addIcons({
       'terminal-outline': terminalOutline,
+      'chevron-back-outline': chevronBackOutline,
+      'chevron-forward-outline': chevronForwardOutline,
       'document-text-outline': documentTextOutline,
       'hammer-outline': hammerOutline,
       'settings-outline': settingsOutline,
       'log-out-outline': logOutOutline,
     });
+    this.isMenuCollapsed.set(this.loadCollapsed());
     this.applyWidth(this.loadWidth());
   }
 
@@ -100,9 +109,21 @@ export class AppComponent {
   startResize(event: MouseEvent): void {
     // Only react to primary-button drags; ignore on phone-narrow viewports
     // where the menu is an overlay drawer (resizer is hidden via CSS too).
-    if (event.button !== 0 || window.matchMedia('(max-width: 767px)').matches) return;
+    if (this.isMenuCollapsed() || event.button !== 0 || window.matchMedia('(max-width: 767px)').matches) return;
     event.preventDefault();
     this.isResizing.set(true);
+  }
+
+  toggleSideMenu(): void {
+    this.isMenuCollapsed.update((collapsed) => {
+      const next = !collapsed;
+      try {
+        localStorage.setItem(COLLAPSED_STORAGE_KEY, next ? '1' : '0');
+      } catch {
+        // ignore — quota / private browsing
+      }
+      return next;
+    });
   }
 
   @HostListener('document:mousemove', ['$event'])
@@ -141,5 +162,13 @@ export class AppComponent {
       // ignore
     }
     return 240; // default — matches CSS :host fallback
+  }
+
+  private loadCollapsed(): boolean {
+    try {
+      return localStorage.getItem(COLLAPSED_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
   }
 }

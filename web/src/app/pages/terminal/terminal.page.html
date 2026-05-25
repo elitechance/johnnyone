@@ -45,8 +45,6 @@
           {{ sessionIdCopied() ? '✓' : '#' }}
         </button>
       }
-      <button class="icon-action" title="Settings" (click)="navigateTo('/settings')">⚙</button>
-      <button class="icon-action" title="Sign out" (click)="logout()">⎋</button>
     </div>
   </header>
 
@@ -76,11 +74,11 @@
             <button class="pane-tool" title="Working directory" (click)="pickWorkingDirectoryForSession(session.id); $event.stopPropagation()">
               {{ session.workingDirectory || '~' }}
             </button>
-            <button class="pane-tool danger" title="Kill terminal" (click)="killTerminal(session.id); $event.stopPropagation()">
-              kill
+            <button class="pane-tool" title="Rename session" (click)="onSessionRenamed(session.id); $event.stopPropagation()">
+              rename
             </button>
-            <button class="pane-icon" title="Close terminal widget" (click)="closeTerminalPane(session.id); $event.stopPropagation()">
-              ×
+            <button class="pane-tool danger" title="Close terminal" (click)="closeTerminalPane(session.id); $event.stopPropagation()">
+              close
             </button>
             <span class="pane-status" [class.offline]="screen?.status !== 'attached'">
               {{ screen?.status || (session.id === currentSession()?.id ? 'attaching' : 'detached') }}
@@ -251,4 +249,3 @@
     </ion-footer>
   </ng-template>
 </ion-modal>
-

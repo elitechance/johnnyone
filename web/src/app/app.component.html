@@ -1,9 +1,21 @@
 <ion-app>
-  <ion-split-pane contentId="main-content" when="md">
-    <ion-menu contentId="main-content" type="overlay" *ngIf="auth.isAuthenticated()">
+  <ion-split-pane contentId="main-content" when="md" [class.side-menu-collapsed]="isMenuCollapsed()">
+    <ion-menu contentId="main-content" type="overlay" *ngIf="auth.isAuthenticated()" [class.collapsed]="isMenuCollapsed()">
       <ion-content>
         <ion-list lines="none">
-          <ion-list-header>JohnnyOne</ion-list-header>
+          <ion-list-header>
+            <span class="menu-title">JohnnyOne</span>
+            <ion-button
+              fill="clear"
+              size="small"
+              class="menu-collapse-button"
+              [attr.aria-label]="isMenuCollapsed() ? 'Expand side menu' : 'Collapse side menu'"
+              [title]="isMenuCollapsed() ? 'Expand side menu' : 'Collapse side menu'"
+              (click)="toggleSideMenu()"
+            >
+              <ion-icon slot="icon-only" [name]="isMenuCollapsed() ? 'chevron-forward-outline' : 'chevron-back-outline'"></ion-icon>
+            </ion-button>
+          </ion-list-header>
 
           <ion-menu-toggle auto-hide="false">
             <ion-item routerLink="/terminal" routerLinkActive="ion-color-primary" lines="none" detail="false">
