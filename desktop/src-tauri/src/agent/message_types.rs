@@ -297,6 +297,8 @@ pub struct TerminalCommand {
     #[serde(default)]
     pub control: Option<String>,
     #[serde(default)]
+    pub history_rows: Option<u16>,
+    #[serde(default)]
     pub attachments: Vec<TerminalCommandAttachment>,
 }
 

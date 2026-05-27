@@ -36,6 +36,7 @@ import {
 } from 'ionicons/icons';
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
+import { MermaidZoomService } from '../../services/mermaid-zoom.service';
 import {
   JohnnyApiService,
   ChatAttachment,
@@ -136,6 +137,7 @@ export class TerminalPage implements OnInit, OnDestroy {
   private readonly auth = inject(AuthService);
   private readonly route = inject(ActivatedRoute);
   private readonly relayTerminal = inject(RelayTerminalService);
+  private readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
@@ -992,6 +994,20 @@ export class TerminalPage implements OnInit, OnDestroy {
         console.error('Failed to resize terminal:', err);
       });
     }, 180);
+  }
+
+  onTerminalHistoryRequested(rows: number, sessionId = this.currentSession()?.id): void {
+    const session = this.sessions().find((item) => item.id === sessionId);
+    if (!session) return;
+
+    this.relayTerminal.loadHistory(session.id, rows).catch((err) => {
+      console.error('Failed to load terminal history:', err);
+      this.terminalError.set(String(err));
+    });
+  }
+
+  openTerminalMermaid(svg: string): void {
+    this.mermaidZoom.open(svg);
   }
 
   startPaneDrag(event: PointerEvent, sessionId = this.currentSession()?.id): void {

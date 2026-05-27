@@ -639,6 +639,19 @@ export class JohnnyApiService {
       .pipe(map((data) => data.startAgentPlan));
   }
 
+  refreshAgentPlanPhases(id: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanPhasesRefresh: AgentPlanRun }>(
+        `mutation UpdateAgentPlanPhasesRefresh($id: ID!) {
+          updateAgentPlanPhasesRefresh(id: $id) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id }
+      )
+      .pipe(map((data) => data.updateAgentPlanPhasesRefresh));
+  }
+
   /**
    * Amend an approved planning run. Stashes the brief on the plan, switches
    * T1 into "edit mode", and re-runs the T1→T2 planning cycle. On T2 PASS

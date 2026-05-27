@@ -92,6 +92,14 @@ export class RelayTerminalService {
     await this.sendVisualControl('visual_refresh', sessionId);
   }
 
+  async loadHistory(sessionId: string, rows: number): Promise<void> {
+    await this.sendVisualControl(
+      'visual_history',
+      sessionId,
+      Math.max(1, Math.floor(rows)),
+    );
+  }
+
   async unsubscribeVisual(sessionId: string): Promise<void> {
     const current = this.visualSubscriptions.get(sessionId) ?? 0;
     if (current <= 1) {
@@ -235,7 +243,11 @@ export class RelayTerminalService {
     }));
   }
 
-  private async sendVisualControl(control: 'visual_subscribe' | 'visual_unsubscribe' | 'visual_refresh', sessionId: string): Promise<void> {
+  private async sendVisualControl(
+    control: 'visual_subscribe' | 'visual_unsubscribe' | 'visual_refresh' | 'visual_history',
+    sessionId: string,
+    historyRows?: number,
+  ): Promise<void> {
     await this.ensureConnected();
 
     const socket = this.socket;
@@ -250,6 +262,7 @@ export class RelayTerminalService {
         sessionId,
         data: '',
         control,
+        historyRows,
       },
     }));
   }

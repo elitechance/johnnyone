@@ -56,7 +56,8 @@ ion-modal.mermaid-zoom ion-toolbar ion-button {
   transform-origin: center center;
   // Disable transitions during zoom — they make wheel feel mushy.
   transition: none;
-  will-change: transform;
+  // Do not use `will-change: transform` here. On mobile browsers it can cache
+  // the whole SVG as a bitmap layer, which makes zoomed diagrams look blurry.
   pointer-events: none; // The viewport handles all input.
 }
 
@@ -68,6 +69,9 @@ ion-modal.mermaid-zoom ion-toolbar ion-button {
   // viewport center.
   height: auto;
   background: transparent;
+  image-rendering: auto;
+  shape-rendering: geometricPrecision;
+  text-rendering: geometricPrecision;
 }
 
 /* Small hint in the Ionic footer so it stays inside the modal viewport. */

@@ -16,6 +16,15 @@ import { FormsModule } from '@angular/forms';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { TerminalScreen } from '../../models/terminal.model';
+import mermaid from 'mermaid';
+
+mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
+
+interface TerminalMermaidBlock {
+  id: string;
+  label: string;
+  source: string;
+}
 
 @Component({
   selector: 'johnny-terminal-screen',
@@ -25,6 +34,8 @@ import { TerminalScreen } from '../../models/terminal.model';
   styleUrls: ['./terminal-screen.component.scss'],
 })
 export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDestroy {
+  private static readonly HISTORY_CHUNK_ROWS = 200;
+
   @Input() screen: TerminalScreen | null = null;
   @Input() disabled = false;
   @Input() mobileInputMode = false;
@@ -33,6 +44,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   @Output() rawInput = new EventEmitter<string>();
   @Output() terminalResize = new EventEmitter<{ cols: number; rows: number }>();
+  @Output() historyRequested = new EventEmitter<number>();
+  @Output() mermaidRequested = new EventEmitter<string>();
 
   @ViewChild('terminalShell', { static: true }) private terminalShell!: ElementRef<HTMLElement>;
   @ViewChild('terminalHost', { static: true }) private terminalHost!: ElementRef<HTMLDivElement>;
@@ -47,6 +60,14 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private writing = false;
   private wheelHandler: ((event: WheelEvent) => void) | null = null;
   private idlePromptTimer: ReturnType<typeof setTimeout> | null = null;
+  private requestedHistoryRows = 0;
+  private historyRequestInFlight = false;
+  private historyRequestTimer: ReturnType<typeof setTimeout> | null = null;
+  private historyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private revealHistoryOnNextRender = false;
+  private lastScreenKey = '';
+  protected mermaidBlocks: TerminalMermaidBlock[] = [];
+  protected mermaidRenderError = '';
   protected mobileInputBuffer = '';
 
   ngAfterViewInit(): void {
@@ -117,6 +138,13 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
     if (changes['screen']) {
       this.resetIdlePromptTimer();
+      const nextScreenKey = this.screen ? `${this.screen.sessionId}:${this.screen.paneId}` : '';
+      if (nextScreenKey !== this.lastScreenKey) {
+        this.lastScreenKey = nextScreenKey;
+        this.requestedHistoryRows = 0;
+        this.historyRequestInFlight = false;
+        this.revealHistoryOnNextRender = false;
+      }
       // When the parent swaps to a different session (e.g. user switches plan
       // tabs), `screen` flips to null while the new screen loads. Clear xterm
       // immediately so the previous session's content doesn't stay on screen.
@@ -124,9 +152,39 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
         this.terminal.reset();
         this.lastContent = '';
         this.lastCursor = -1;
+        this.mermaidBlocks = [];
+        this.mermaidRenderError = '';
       }
       this.renderScreen(true);
     }
+  }
+
+  protected canLoadHistory(): boolean {
+    return !!this.screen
+      && this.screen.status === 'attached'
+      && this.availableHistoryRows() > 0
+      && this.loadedHistoryRows() < this.availableHistoryRows()
+      && !this.historyRequestInFlight;
+  }
+
+  protected loadedHistoryRows(): number {
+    return Math.min(this.requestedHistoryRows, this.availableHistoryRows());
+  }
+
+  protected availableHistoryRows(): number {
+    return Math.max(0, this.screen?.historyLines ?? 0);
+  }
+
+  protected historyProgressText(): string {
+    const available = this.availableHistoryRows();
+    if (available <= 0) return 'no history';
+    return `${this.loadedHistoryRows()} / ${available}`;
+  }
+
+  protected loadPreviousHistory(event?: Event): void {
+    event?.preventDefault();
+    event?.stopPropagation();
+    this.requestHistoryRows(this.loadedHistoryRows() + TerminalScreenComponent.HISTORY_CHUNK_ROWS);
   }
 
   ngOnDestroy(): void {
@@ -143,6 +201,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       clearTimeout(this.idlePromptTimer);
       this.idlePromptTimer = null;
     }
+    this.clearHistoryRequestTimer();
+    this.clearHistoryRefreshTimer();
   }
 
   @HostListener('pointerdown')
@@ -252,11 +312,66 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       if (!this.terminal || !this.screen) return;
 
       const nextContent = this.normalizeSnapshot(this.compactSnapshot(this.screen.content || ''));
+      if (this.shouldPreserveLoadedHistory(nextContent)) {
+        this.refreshLoadedHistory();
+        return;
+      }
       if (!force && nextContent === this.lastContent) return;
 
       this.lastContent = nextContent;
+      this.updateMermaidBlocks(nextContent);
+      this.historyRequestInFlight = false;
+      this.clearHistoryRequestTimer();
       this.writeSnapshot(nextContent);
     });
+  }
+
+  private requestHistoryRows(rows: number): void {
+    if (!this.screen || this.historyRequestInFlight) return;
+
+    const nextRows = Math.min(this.availableHistoryRows(), Math.max(1, Math.floor(rows)));
+    if (nextRows <= this.loadedHistoryRows()) return;
+
+    this.requestedHistoryRows = nextRows;
+    this.historyRequestInFlight = true;
+    this.revealHistoryOnNextRender = true;
+    this.clearHistoryRequestTimer();
+    this.historyRequestTimer = setTimeout(() => {
+      this.historyRequestInFlight = false;
+      this.historyRequestTimer = null;
+    }, 4_000);
+    this.historyRequested.emit(nextRows);
+  }
+
+  private refreshLoadedHistory(): void {
+    if (!this.screen || this.historyRequestInFlight || this.historyRefreshTimer) return;
+    const rows = this.loadedHistoryRows();
+    if (rows <= 0) return;
+
+    this.historyRefreshTimer = setTimeout(() => {
+      this.historyRefreshTimer = null;
+      if (!this.screen || this.historyRequestInFlight) return;
+      this.historyRequestInFlight = true;
+      this.revealHistoryOnNextRender = false;
+      this.clearHistoryRequestTimer();
+      this.historyRequestTimer = setTimeout(() => {
+        this.historyRequestInFlight = false;
+        this.historyRequestTimer = null;
+      }, 4_000);
+      this.historyRequested.emit(rows);
+    }, 250);
+  }
+
+  private clearHistoryRequestTimer(): void {
+    if (!this.historyRequestTimer) return;
+    clearTimeout(this.historyRequestTimer);
+    this.historyRequestTimer = null;
+  }
+
+  private clearHistoryRefreshTimer(): void {
+    if (!this.historyRefreshTimer) return;
+    clearTimeout(this.historyRefreshTimer);
+    this.historyRefreshTimer = null;
   }
 
   private writeSnapshot(content: string): void {
@@ -266,14 +381,85 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.terminal.write(`\x1b[?25l\x1b[3J\x1b[H\x1b[2J${content}\x1b[?25h`, () => {
       this.writing = false;
       if (!this.terminal || !this.screen) return;
-      this.terminal.scrollToBottom();
+      if (this.revealHistoryOnNextRender) {
+        this.revealHistoryOnNextRender = false;
+        this.terminal.scrollToTop();
+      } else {
+        this.terminal.scrollToBottom();
+      }
 
       const latest = this.normalizeSnapshot(this.compactSnapshot(this.screen.content || ''));
+      if (this.shouldPreserveLoadedHistory(latest)) {
+        this.refreshLoadedHistory();
+        return;
+      }
       if (latest !== this.lastContent) {
         this.lastContent = latest;
+        this.updateMermaidBlocks(latest);
         this.writeSnapshot(latest);
       }
     });
+  }
+
+  protected async openMermaidBlock(block: TerminalMermaidBlock, event?: Event): Promise<void> {
+    event?.preventDefault();
+    event?.stopPropagation();
+    this.mermaidRenderError = '';
+    try {
+      const id = `terminal-mermaid-${block.id}-${Math.random().toString(36).slice(2, 10)}`;
+      const rendered = await mermaid.render(id, block.source);
+      this.mermaidRequested.emit(rendered.svg);
+    } catch (err) {
+      this.mermaidRenderError = `Mermaid render failed: ${String(err)}`;
+    }
+  }
+
+  private updateMermaidBlocks(content: string): void {
+    const plain = this.stripAnsi(content).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const blocks = this.extractMermaidBlocks(plain);
+    this.mermaidBlocks = blocks.map((source, index) => ({
+      id: `${index + 1}`,
+      label: blocks.length === 1 ? 'Mermaid' : `Mermaid ${index + 1}`,
+      source,
+    }));
+    if (this.mermaidBlocks.length === 0) {
+      this.mermaidRenderError = '';
+    }
+  }
+
+  private extractMermaidBlocks(content: string): string[] {
+    const blocks: string[] = [];
+    const fencePattern = /(^|\n)(`{3,}|~{3,})[ \t]*mermaid[^\n]*\n([\s\S]*?)(?:\n\2[ \t]*(?=\n|$))/gi;
+    let match: RegExpExecArray | null;
+    while ((match = fencePattern.exec(content)) !== null) {
+      const source = match[3]?.trim();
+      if (source) blocks.push(source);
+      if (blocks.length >= 8) break;
+    }
+    return blocks;
+  }
+
+  private stripAnsi(content: string): string {
+    return content
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b[@-_][0-?]*[ -/]*[@-~]/g, '');
+  }
+
+  private shouldPreserveLoadedHistory(nextContent: string): boolean {
+    if (!this.screen || this.requestedHistoryRows <= 0 || !this.lastContent) return false;
+    if (!this.isExpandedHistorySnapshot(this.lastContent)) return false;
+    return !this.isExpandedHistorySnapshot(nextContent);
+  }
+
+  private isExpandedHistorySnapshot(content: string): boolean {
+    if (!this.screen) return false;
+    return this.snapshotLineCount(content) > Math.max(this.screen.rows + 2, this.screen.rows + Math.min(5, this.loadedHistoryRows()));
+  }
+
+  private snapshotLineCount(content: string): number {
+    if (!content) return 0;
+    return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
   }
 
   private normalizeSnapshot(content: string): string {

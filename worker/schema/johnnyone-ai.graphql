@@ -346,6 +346,7 @@ type Mutation {
   updatePlannerPromptSettings(input: PlannerPromptSettingsInput!): PlannerPromptSettings!
   createAgentPlan(input: CreateAgentPlanInput!): AgentPlanRun!
   startAgentPlan(id: ID!, phaseId: String): AgentPlanRun!
+  updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!

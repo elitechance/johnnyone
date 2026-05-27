@@ -326,10 +326,6 @@ select {
   min-height: 0;
 }
 
-::ng-deep .terminal-card johnny-terminal-screen .terminal-toolbar {
-  display: none;
-}
-
 ::ng-deep .terminal-card johnny-terminal-screen .terminal-shell {
   border: 0;
 }
@@ -1844,6 +1840,9 @@ ion-modal.files-ion-modal .files-modal-path {
   font-size: 12px;
   word-break: break-all;
   white-space: normal;
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 ion-modal.files-ion-modal .files-subtoolbar {
@@ -1856,6 +1855,15 @@ ion-modal.files-ion-modal .files-crumb {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   word-break: break-all;
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+ion-modal.files-ion-modal .files-crumb code {
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 ion-modal.files-ion-modal .files-list {
@@ -1883,6 +1891,16 @@ ion-modal.files-ion-modal .preview-scroll {
   /* ion-content already gives momentum + safe-area on iOS — this just makes
      the inner viewport scroll independently if needed. */
   -webkit-overflow-scrolling: touch;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+ion-modal.files-ion-modal .preview-scroll *,
+ion-modal.files-ion-modal .plan-markdown-preview,
+ion-modal.files-ion-modal .plan-markdown-preview *,
+ion-modal.files-ion-modal .raw-preview {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 ion-modal.files-ion-modal .diff-table {
@@ -1901,6 +1919,8 @@ ion-modal.files-ion-modal .diff-table td.line-number {
 ion-modal.files-ion-modal .diff-table td.line-text {
   padding: 2px 8px;
   white-space: pre;
+  -webkit-user-select: text;
+  user-select: text;
 }
 ion-modal.files-ion-modal .diff-table tr.add { background: rgba(95, 215, 143, 0.12); }
 ion-modal.files-ion-modal .diff-table tr.remove { background: rgba(255, 104, 104, 0.12); }
@@ -1938,6 +1958,9 @@ ion-modal.setup-ion-modal .prompt-settings-path {
   font-size: 11px;
   color: var(--jo-fg-muted, #8a92a0);
   word-break: break-all;
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
 }
 ion-modal.setup-ion-modal .prompt-actions {
   display: flex;

@@ -44,6 +44,7 @@ import { Marked, marked } from 'marked';
 import mermaid from 'mermaid';
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
+import { MermaidZoomService } from '../../services/mermaid-zoom.service';
 import {
   AgentPlan,
   AgentPlanPhase,
@@ -114,6 +115,7 @@ export class PlannerPage implements OnInit, OnDestroy {
   private readonly api = inject(JohnnyApiService);
   private readonly auth = inject(AuthService);
   private readonly relayTerminal = inject(RelayTerminalService);
+  private readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
   private readonly sanitizer = inject(DomSanitizer);
@@ -143,6 +145,7 @@ export class PlannerPage implements OnInit, OnDestroy {
   filesOpen = signal(false);
   amendOpen = signal(false);
   isAmendBusy = signal(false);
+  isRefreshingPhases = signal(false);
   amendBrief = '';
   filesTab = signal<'changes' | 'plan'>('changes');
   fileMode = signal<'changed' | 'all'>('changed');
@@ -156,6 +159,9 @@ export class PlannerPage implements OnInit, OnDestroy {
   selectedPlanContent = signal<HostFileContent | null>(null);
   renderedPlanHtml = signal<SafeHtml>('');
   selectedPlanHtmlUrl = signal<SafeResourceUrl | null>(null);
+  selectedPlanLoading = signal(false);
+  selectedPlanError = signal<string | null>(null);
+  selectedPlanNotice = signal<string | null>(null);
   filesError = signal<string | null>(null);
   planFilesError = signal<string | null>(null);
   browserOpen = signal(false);
@@ -243,6 +249,11 @@ export class PlannerPage implements OnInit, OnDestroy {
   canManualPass = computed(() => {
     const phase = this.currentPhase();
     return !!phase && phase.clarificationAttempts >= 5;
+  });
+  canAmend = computed(() => {
+    const run = this.currentRun();
+    if (this.mode() !== 'planning' || !run) return false;
+    return !['blocked', 'stopped'].includes(run.plan.status);
   });
   planRootPath = computed(() => {
     const plan = this.currentRun()?.plan;
@@ -466,6 +477,9 @@ export class PlannerPage implements OnInit, OnDestroy {
     this.planFiles.set([]);
     this.selectedPlanFile.set(null);
     this.selectedPlanContent.set(null);
+    this.selectedPlanLoading.set(false);
+    this.selectedPlanError.set(null);
+    this.selectedPlanNotice.set(null);
     this.renderedPlanHtml.set('');
     this.clearSelectedPlanHtmlUrl();
     this.planFilesError.set(null);
@@ -559,6 +573,25 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.error.set(String(err));
     } finally {
       this.isBusy.set(false);
+    }
+  }
+
+  async refreshPlanPhases(): Promise<void> {
+    const id = this.currentRun()?.plan.id;
+    if (!id || this.isBusy() || this.isRefreshingPhases()) return;
+    this.isRefreshingPhases.set(true);
+    this.error.set(null);
+    try {
+      const run = await firstValueFrom(this.api.refreshAgentPlanPhases(id));
+      this.currentRun.set(run);
+      if (this.selectedStartPhaseId() && !run.phases.some((phase) => phase.phaseId === this.selectedStartPhaseId())) {
+        this.selectedStartPhaseId.set('');
+      }
+      await this.loadPlans(false);
+    } catch (err) {
+      this.error.set(String(err));
+    } finally {
+      this.isRefreshingPhases.set(false);
     }
   }
 
@@ -799,7 +832,7 @@ export class PlannerPage implements OnInit, OnDestroy {
     await this.selectWorkspaceFile(entry);
   }
 
-  async loadPlanFiles(path: string): Promise<void> {
+  async loadPlanFiles(path: string, options: { autoSelectFirst?: boolean } = {}): Promise<void> {
     if (!path) return;
     this.planBrowsePath.set(path);
     this.planFilesError.set(null);
@@ -807,7 +840,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       const entries = await firstValueFrom(this.api.browseHostDirectory(path));
       this.planFiles.set(entries);
       const firstFile = entries.find((entry) => entry.kind === 'file');
-      if (firstFile && !this.selectedPlanFile()) {
+      if (options.autoSelectFirst !== false && firstFile && !this.selectedPlanFile()) {
         await this.selectPlanFile(firstFile);
       }
     } catch (err) {
@@ -867,7 +900,6 @@ export class PlannerPage implements OnInit, OnDestroy {
 
     // Resolve and dispatch.
     const resolved = this.resolveRelativeHostPath(currentPath, href);
-    console.log('[link-handler] base=' + currentPath + ' rel=' + href + ' resolved=' + resolved);
     if (!resolved) return;
 
     event.preventDefault();
@@ -908,7 +940,9 @@ export class PlannerPage implements OnInit, OnDestroy {
    * a HostFileEntry and reuses `selectPlanFile`'s side effects (content
    * fetch + markdown render + mermaid re-render). Does NOT try to refresh
    * the directory listing — the linked file is usually outside the plan
-   * dir (e.g. common/methodology.md) and that listing would 404. */
+   * dir (e.g. common/methodology.md). If the target is actually a directory,
+   * fall back to opening it in the Plan Files browser instead of surfacing the
+   * host "path is not a file" preview error. */
   private async openHostPath(path: string): Promise<void> {
     const dir = path.replace(/\/+[^/]*$/, '') || '/';
     const filename = path.slice(dir.length + 1);
@@ -926,14 +960,19 @@ export class PlannerPage implements OnInit, OnDestroy {
       name: filename,
       kind: 'file',
       status: 'unchanged',
-    } as HostFileEntry);
+    } as HostFileEntry, { directoryFallbackPath: this.hostAbsolutePath(path) });
   }
 
-  async selectPlanFile(file: HostFileEntry): Promise<void> {
+  async selectPlanFile(file: HostFileEntry, options: { directoryFallbackPath?: string } = {}): Promise<void> {
     const planId = this.currentRun()?.plan.id;
     if (!planId) return;
     this.selectedPlanFile.set(file);
-    this.planFilesError.set(null);
+    this.selectedPlanLoading.set(true);
+    this.selectedPlanError.set(null);
+    this.selectedPlanNotice.set(null);
+    this.selectedPlanContent.set(null);
+    this.renderedPlanHtml.set('');
+    this.clearSelectedPlanHtmlUrl();
     try {
       const content = await firstValueFrom(this.api.readHostFile(planId, file.path));
       this.selectedPlanContent.set(content);
@@ -952,8 +991,45 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.selectedPlanContent.set(null);
       this.renderedPlanHtml.set('');
       this.clearSelectedPlanHtmlUrl();
-      this.planFilesError.set(String(err));
+      if (options.directoryFallbackPath && this.isNotFilePreviewError(err)) {
+        await this.openPlanDirectoryFromPreviewLink(options.directoryFallbackPath);
+        return;
+      }
+      this.selectedPlanError.set(this.formatPreviewError(err));
+    } finally {
+      this.selectedPlanLoading.set(false);
     }
+  }
+
+  private async openPlanDirectoryFromPreviewLink(path: string): Promise<void> {
+    this.selectedPlanFile.set(null);
+    this.selectedPlanContent.set(null);
+    this.renderedPlanHtml.set('');
+    this.clearSelectedPlanHtmlUrl();
+    this.selectedPlanError.set(null);
+    this.selectedPlanNotice.set(null);
+    await this.loadPlanFiles(path, { autoSelectFirst: false });
+    if (this.planFilesError()) {
+      this.selectedPlanError.set(this.planFilesError());
+      return;
+    }
+    this.selectedPlanNotice.set(`Opened directory: ${this.workspaceRelativePath(path)}`);
+  }
+
+  private hostAbsolutePath(path: string): string {
+    if (path.startsWith('/')) return path;
+    const root = this.workspaceRootPath().replace(/\/+$/, '');
+    const relative = path.replace(/^\/+/, '');
+    return root ? `${root}/${relative}` : relative;
+  }
+
+  private isNotFilePreviewError(err: unknown): boolean {
+    return /not a file|is a directory|directory/i.test(this.formatPreviewError(err));
+  }
+
+  private formatPreviewError(err: unknown): string {
+    const raw = String(err);
+    return raw.replace(/^GraphQL errors?:\s*/i, '').trim() || 'Unable to load preview.';
   }
 
   private setSelectedPlanHtmlUrl(html: string): void {
@@ -1050,6 +1126,17 @@ export class PlannerPage implements OnInit, OnDestroy {
     const sessionId = role === 'worker' ? plan?.workerSessionId : plan?.reviewerSessionId;
     if (!sessionId) return;
     await this.relayTerminal.resize(sessionId, size.cols, size.rows);
+  }
+
+  async loadPlannerTerminalHistory(role: 'worker' | 'reviewer', rows: number): Promise<void> {
+    const plan = this.currentRun()?.plan;
+    const sessionId = role === 'worker' ? plan?.workerSessionId : plan?.reviewerSessionId;
+    if (!sessionId) return;
+    await this.relayTerminal.loadHistory(sessionId, rows);
+  }
+
+  openTerminalMermaid(svg: string): void {
+    this.mermaidZoom.open(svg);
   }
 
   phaseTaskCount(phaseId: string): number {

@@ -10,6 +10,8 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 const CAPTURE_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_HISTORY_CAPTURE_LINES: u16 = 200;
+const MAX_HISTORY_CAPTURE_LINES: u16 = 2000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +109,19 @@ pub async fn refresh_terminal_visual(
     if has_terminal_visual_subscribers(state, &session_id).await {
         start_capture_loop(state, None, terminal).await;
     }
+    Ok(snapshot)
+}
+
+pub async fn refresh_terminal_visual_with_history(
+    state: &AppState,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+    history_rows: u16,
+) -> Result<TerminalSnapshot, String> {
+    let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
+    let snapshot = capture_snapshot_with_history_rows(state, &terminal, history_rows).await?;
+    publish_snapshot(state, &snapshot, None);
     Ok(snapshot)
 }
 
@@ -607,7 +622,15 @@ async fn capture_snapshot_with_history(
     state: &AppState,
     terminal: &TerminalSession,
 ) -> Result<TerminalSnapshot, String> {
-    let capture = capture_terminal_with_history(&terminal.pane_id).await?;
+    capture_snapshot_with_history_rows(state, terminal, DEFAULT_HISTORY_CAPTURE_LINES).await
+}
+
+async fn capture_snapshot_with_history_rows(
+    state: &AppState,
+    terminal: &TerminalSession,
+    history_rows: u16,
+) -> Result<TerminalSnapshot, String> {
+    let capture = capture_terminal_with_history(&terminal.pane_id, history_rows).await?;
     snapshot_from_capture(state, terminal, capture).await
 }
 
@@ -659,7 +682,14 @@ async fn capture_terminal(pane_id: &str) -> Result<TerminalCapture, String> {
     })
 }
 
-async fn capture_terminal_with_history(pane_id: &str) -> Result<TerminalCapture, String> {
+async fn capture_terminal_with_history(
+    pane_id: &str,
+    history_rows: u16,
+) -> Result<TerminalCapture, String> {
+    let start = format!(
+        "-{}",
+        history_rows.clamp(1, MAX_HISTORY_CAPTURE_LINES),
+    );
     let content = run_tmux(vec![
         "capture-pane".to_string(),
         "-p".to_string(),
@@ -667,7 +697,7 @@ async fn capture_terminal_with_history(pane_id: &str) -> Result<TerminalCapture,
         "-N".to_string(),
         "-J".to_string(),
         "-S".to_string(),
-        "-200".to_string(),
+        start,
         "-t".to_string(),
         pane_id.to_string(),
     ])

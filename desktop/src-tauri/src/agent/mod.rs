@@ -406,6 +406,16 @@ impl AgentService {
                         )
                         .await
                         .map(|_| ())
+                    } else if command.control.as_deref() == Some("visual_history") {
+                        crate::terminal::refresh_terminal_visual_with_history(
+                            &st,
+                            command.session_id.clone(),
+                            120,
+                            36,
+                            command.history_rows.unwrap_or(200),
+                        )
+                        .await
+                        .map(|_| ())
                     } else if command.control.as_deref() == Some("visual_unsubscribe") {
                         crate::terminal::unsubscribe_terminal_visual(&st, &command.session_id).await
                     } else if command.data.is_empty() && command.attachments.is_empty() {
@@ -796,6 +806,9 @@ impl AgentService {
             "list_agent_plans" => Self::rpc_list_agent_plans(&req.params, state),
             "get_agent_plan" => Self::rpc_get_agent_plan(&req.params, state),
             "start_agent_plan" => Self::rpc_start_agent_plan(&req.params, state).await,
+            "refresh_agent_plan_phases" => {
+                Self::rpc_refresh_agent_plan_phases(&req.params, state)
+            },
             "amend_agent_plan" => Self::rpc_amend_agent_plan(&req.params, state).await,
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
@@ -1090,6 +1103,18 @@ impl AgentService {
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
         let run = crate::services::agent_plans::stop_plan(state, id.to_string()).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_refresh_agent_plan_phases(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let run = crate::services::agent_plans::refresh_plan_phases(state, id.to_string())?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 

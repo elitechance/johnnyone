@@ -8,7 +8,7 @@ use crate::services::sessions;
 use crate::state::app_state::AppState;
 use crate::terminal;
 use base64::{engine::general_purpose, Engine as _};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -424,9 +424,38 @@ pub async fn resume_active_plan_loops(state: AppState) -> Result<usize, String> 
 
     let count = plan_ids.len();
     for plan_id in plan_ids {
-        spawn_coordinator_loop(state.clone(), plan_id).await;
+        if needs_amend_planner_prompt_on_resume(&state, &plan_id)? {
+            start_planning_run_inner(state.clone(), plan_id, true).await?;
+        } else {
+            spawn_coordinator_loop(state.clone(), plan_id).await;
+        }
     }
     Ok(count)
+}
+
+fn needs_amend_planner_prompt_on_resume(state: &AppState, plan_id: &str) -> Result<bool, String> {
+    state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COALESCE(amend_brief, ''), status FROM agent_plans WHERE id = ?1",
+            params![plan_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|(amend_brief, status)| {
+            if amend_brief.trim().is_empty() || status != "planning_planner_running" {
+                return Ok(false);
+            }
+            let latest_event = conn
+                .query_row(
+                    "SELECT type FROM agent_plan_events WHERE plan_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![plan_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(latest_event.as_deref() == Some("planning_amend_requested"))
+        })
+    })
 }
 
 /// Amend an existing approved plan: set `amend_brief` on the row, kick the
@@ -468,7 +497,7 @@ pub async fn amend_plan(
     // Reuse the existing planning pipeline — start_planning_run reads the
     // current state (including the freshly-set amend_brief) and walks T1→T2
     // the same way an initial run does.
-    start_planning_run(state, id).await
+    start_planning_run_inner(state, id, true).await
 }
 
 pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, String> {
@@ -648,6 +677,14 @@ pub async fn rerun_reviewer(state: AppState, id: String) -> Result<AgentPlanRun,
 }
 
 async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun, String> {
+    start_planning_run_inner(state, id, false).await
+}
+
+async fn start_planning_run_inner(
+    state: AppState,
+    id: String,
+    force_planner_prompt: bool,
+) -> Result<AgentPlanRun, String> {
     let run = get_plan(&state, &id)?;
     if matches!(run.plan.status.as_str(), "approved" | "blocked" | "stopped") {
         return Ok(run);
@@ -655,7 +692,7 @@ async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun,
     if matches!(
         run.plan.status.as_str(),
         "planning_planner_running" | "planning_review_running"
-    ) {
+    ) && !force_planner_prompt {
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
@@ -686,6 +723,118 @@ async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun,
     terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
     spawn_coordinator_loop(state.clone(), id.clone()).await;
     get_plan(&state, &id)
+}
+
+pub fn refresh_plan_phases(state: &AppState, id: String) -> Result<AgentPlanRun, String> {
+    let run = get_plan(state, &id)?;
+    let parsed = parse_plan(&run.plan.workspace_path, &run.plan.plan_path)?;
+    let mut inserted_phases = 0;
+    let mut updated_phases = 0;
+    let mut inserted_tasks = 0;
+    let mut updated_tasks = 0;
+
+    state.db.with_conn(|conn| {
+        for (phase_index, phase) in parsed.phases.iter().enumerate() {
+            let phase_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM agent_plan_phases WHERE plan_id = ?1 AND phase_id = ?2",
+                    params![id, phase.phase_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(false);
+            if phase_exists {
+                conn.execute(
+                    "UPDATE agent_plan_phases SET phase_title = ?1, phase_index = ?2, updated_at = datetime('now') WHERE plan_id = ?3 AND phase_id = ?4",
+                    params![phase.title, phase_index as i64, id, phase.phase_id],
+                )
+                .map_err(|e| format!("Failed to update phase {}: {}", phase.phase_id, e))?;
+                updated_phases += 1;
+            } else {
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'locked')",
+                    params![Uuid::new_v4().to_string(), id, phase.phase_id, phase.title, phase_index as i64],
+                )
+                .map_err(|e| format!("Failed to insert phase {}: {}", phase.phase_id, e))?;
+                inserted_phases += 1;
+            }
+
+            for (task_index, task) in phase.tasks.iter().enumerate() {
+                let task_exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM agent_plan_tasks WHERE plan_id = ?1 AND phase_id = ?2 AND task_id = ?3",
+                        params![id, phase.phase_id, task.task_id],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                if task_exists {
+                    conn.execute(
+                        "UPDATE agent_plan_tasks
+                         SET task_title = ?1, task_index = ?2, prompt_path = ?3, status_path = ?4, decisions_path = ?5, updated_at = datetime('now')
+                         WHERE plan_id = ?6 AND phase_id = ?7 AND task_id = ?8",
+                        params![
+                            task.title,
+                            task_index as i64,
+                            task.prompt_path.to_string_lossy(),
+                            task.status_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            task.decisions_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            id,
+                            phase.phase_id,
+                            task.task_id,
+                        ],
+                    )
+                    .map_err(|e| format!("Failed to update task {}/{}: {}", phase.phase_id, task.task_id, e))?;
+                    updated_tasks += 1;
+                } else {
+                    conn.execute(
+                        "INSERT INTO agent_plan_tasks (id, plan_id, phase_id, task_id, task_title, task_index, prompt_path, status_path, decisions_path, status)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            id,
+                            phase.phase_id,
+                            task.task_id,
+                            task.title,
+                            task_index as i64,
+                            task.prompt_path.to_string_lossy(),
+                            task.status_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            task.decisions_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                            task.status,
+                        ],
+                    )
+                    .map_err(|e| format!("Failed to insert task {}/{}: {}", phase.phase_id, task.task_id, e))?;
+                    inserted_tasks += 1;
+                }
+            }
+        }
+
+        if run.plan.current_phase_id.is_none() {
+            conn.execute(
+                "UPDATE agent_plans SET current_phase_id = ?1, current_phase_index = 0, updated_at = datetime('now') WHERE id = ?2",
+                params![parsed.phases.first().map(|phase| phase.phase_id.as_str()), id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })?;
+
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_plan_phases_refreshed",
+        json!({
+            "insertedPhases": inserted_phases,
+            "updatedPhases": updated_phases,
+            "insertedTasks": inserted_tasks,
+            "updatedTasks": updated_tasks,
+        }),
+    )?;
+    get_plan(state, &id)
 }
 
 pub fn validate_workspace_and_plan_path(

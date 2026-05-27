@@ -94,6 +94,8 @@
           [mobileInputMode]="isCompactWorkspace()"
           (rawInput)="onTerminalRawInput($event, session.id)"
           (terminalResize)="onTerminalResize($event, session.id)"
+          (historyRequested)="onTerminalHistoryRequested($event, session.id)"
+          (mermaidRequested)="openTerminalMermaid($event)"
         />
 
         <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>

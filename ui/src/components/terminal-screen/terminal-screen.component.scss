@@ -37,8 +37,60 @@
 }
 
 .terminal-title {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-toolbar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 72%;
+}
+
+.terminal-mermaid-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(280px, 36vw);
+  overflow: auto hidden;
+  scrollbar-width: none;
+}
+
+.terminal-mermaid-button,
+.terminal-history-button {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid #263241;
+  background: #121821;
+  color: #dbe7f3;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.terminal-mermaid-button {
+  border-color: #315b82;
+  background: #102033;
+  color: #bfdbfe;
+
+  &:disabled {
+    opacity: 0.48;
+  }
+}
+
+.terminal-history-button:disabled {
+  opacity: 0.48;
+}
+
+.terminal-history-count {
+  color: #9aa8b8;
+  font-size: 11px;
   white-space: nowrap;
 }
 
@@ -51,6 +103,15 @@
   &.offline {
     color: #fca5a5;
   }
+}
+
+.terminal-mermaid-error {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(248, 113, 113, 0.28);
+  background: rgba(127, 29, 29, 0.28);
+  color: #fecaca;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .terminal-host {
@@ -143,6 +204,26 @@
 .terminal-mobile-submit button:disabled,
 .terminal-mobile-submit textarea:disabled {
   opacity: 0.5;
+}
+
+@media (max-width: 720px) {
+  .terminal-toolbar {
+    gap: 8px;
+  }
+
+  .terminal-toolbar-actions {
+    gap: 6px;
+    max-width: 78%;
+  }
+
+  .terminal-mermaid-actions {
+    max-width: 34vw;
+  }
+
+  .terminal-history-count,
+  .terminal-status {
+    display: none;
+  }
 }
 
 ::ng-deep .terminal-host .xterm {

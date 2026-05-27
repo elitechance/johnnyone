@@ -1,10 +1,43 @@
 <section #terminalShell class="terminal-shell" [class.mobile-input-mode]="mobileInputMode">
   <header class="terminal-toolbar">
     <div class="terminal-title">{{ title }}</div>
-    <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
-      {{ screen?.status || 'detached' }}
+    <div class="terminal-toolbar-actions">
+      @if (mermaidBlocks.length > 0) {
+        <div class="terminal-mermaid-actions" aria-label="Terminal Mermaid diagrams">
+          @for (block of mermaidBlocks; track block.id) {
+            <button
+              type="button"
+              class="terminal-mermaid-button"
+              (pointerdown)="$event.stopPropagation()"
+              (click)="openMermaidBlock(block, $event)"
+              title="Open Mermaid diagram"
+            >
+              {{ block.label }}
+            </button>
+          }
+        </div>
+      }
+      <button
+        type="button"
+        class="terminal-history-button"
+        [disabled]="!canLoadHistory()"
+        (pointerdown)="$event.stopPropagation()"
+        (click)="loadPreviousHistory($event)"
+        title="Load previous terminal lines"
+      >
+        Previous 200
+      </button>
+      <span class="terminal-history-count" title="Loaded terminal history lines">
+        {{ historyProgressText() }}
+      </span>
+      <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
+        {{ screen?.status || 'detached' }}
+      </div>
     </div>
   </header>
+  @if (mermaidRenderError) {
+    <div class="terminal-mermaid-error">{{ mermaidRenderError }}</div>
+  }
   <div #terminalHost class="terminal-host" [class.disabled]="disabled"></div>
 
   @if (showInput) {

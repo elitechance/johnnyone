@@ -74,6 +74,8 @@
             [showInput]="isCompactWorkspace()"
             (rawInput)="sendPlannerRawInput('worker', $event)"
             (terminalResize)="resizePlannerTerminal('worker', $event)"
+            (historyRequested)="loadPlannerTerminalHistory('worker', $event)"
+            (mermaidRequested)="openTerminalMermaid($event)"
           ></johnny-terminal-screen>
           <form class="agent-message-bar" (submit)="$event.preventDefault(); sendWorkerMessage()">
             <textarea
@@ -106,6 +108,8 @@
             [showInput]="isCompactWorkspace()"
             (rawInput)="sendPlannerRawInput('reviewer', $event)"
             (terminalResize)="resizePlannerTerminal('reviewer', $event)"
+            (historyRequested)="loadPlannerTerminalHistory('reviewer', $event)"
+            (mermaidRequested)="openTerminalMermaid($event)"
           ></johnny-terminal-screen>
           <form class="agent-message-bar" (submit)="$event.preventDefault(); sendReviewerMessage()">
             <textarea
@@ -148,9 +152,18 @@
                   <option [value]="phase.phaseId">{{ phase.phaseId }}</option>
                 }
               </select>
+              <button
+                class="secondary-action"
+                type="button"
+                [disabled]="isRefreshingPhases()"
+                (click)="refreshPlanPhases()"
+                title="Refresh phases from plan files"
+              >
+                {{ isRefreshingPhases() ? 'Refreshing…' : 'Refresh phases' }}
+              </button>
             }
             <button class="secondary-action" type="button" (click)="startPlan()">Start</button>
-            @if (mode() === 'planning' && (run.plan.status === 'approved' || run.plan.status === 'planning_planner_running')) {
+            @if (canAmend()) {
               <button class="secondary-action" type="button" (click)="openAmend()">Amend</button>
             }
             <button class="secondary-action" type="button" (click)="sendBackToWorker()">Send back</button>
@@ -740,8 +753,12 @@
             </ion-text>
           </ion-toolbar>
           <div class="preview-scroll" [class.html-preview-scroll]="selectedPlanPreviewKind() === 'html'">
-            @if (planFilesError()) {
-              <ion-text color="danger" class="files-empty">{{ planFilesError() }}</ion-text>
+            @if (selectedPlanLoading()) {
+              <ion-text color="medium" class="files-empty">Loading preview...</ion-text>
+            } @else if (selectedPlanError()) {
+              <ion-text color="danger" class="files-empty">{{ selectedPlanError() }}</ion-text>
+            } @else if (selectedPlanNotice()) {
+              <ion-text color="medium" class="files-empty">{{ selectedPlanNotice() }}</ion-text>
             } @else if (!selectedPlanContent()) {
               <ion-text color="medium" class="files-empty">Select a markdown, image, HTML, or raw file from the plan directory.</ion-text>
             } @else if (selectedPlanPreviewKind() === 'markdown') {
