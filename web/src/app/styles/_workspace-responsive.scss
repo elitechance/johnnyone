@@ -1,5 +1,6 @@
 $mobile-breakpoint: 900px;
 $control-height: 32px;
+$safe-top: env(safe-area-inset-top);
 $safe-bottom: env(safe-area-inset-bottom);
 
 @mixin shell-vars {
@@ -8,6 +9,25 @@ $safe-bottom: env(safe-area-inset-bottom);
   --workspace-mobile-gap: 8px;
   --workspace-mobile-padding: 8px;
   --workspace-composer-reserved-height: calc(112px + #{$safe-bottom});
+  --workspace-safe-top: #{$safe-top};
+  --workspace-safe-bottom: #{$safe-bottom};
+}
+
+@mixin viewport-height {
+  height: 100vh;
+  height: 100dvh;
+}
+
+@mixin safe-bottom-padding($base: 0px) {
+  padding-bottom: calc(#{$base} + #{$safe-bottom});
+}
+
+@mixin safe-top-padding($base: 0px) {
+  padding-top: calc(#{$base} + #{$safe-top});
+}
+
+@mixin safe-scroll-bottom($base: 96px) {
+  scroll-padding-bottom: calc(#{$base} + #{$safe-bottom});
 }
 
 @mixin control-height {
@@ -55,8 +75,18 @@ $safe-bottom: env(safe-area-inset-bottom);
 @mixin mobile-panel-shell {
   min-width: 0;
   min-height: 0;
-  padding-bottom: $safe-bottom;
+  @include safe-bottom-padding(0px);
   overflow: hidden;
+}
+
+@mixin mobile-ionic-safe-bars {
+  ion-header {
+    @include safe-top-padding(0px);
+  }
+
+  ion-footer {
+    @include safe-bottom-padding(0px);
+  }
 }
 
 @mixin reserved-composer-grid {

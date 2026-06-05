@@ -5,8 +5,8 @@ interface WorkerEnv { CHAT_RELAY_DO: DurableObjectNamespace; [key: string]: unkn
 
 export default async function listWorkspaceFiles(
   _parent: unknown,
-  args: { planId: string; mode: string },
+  args: { planId: string; mode: string; path?: string | null },
   ctx: ResolverContext,
 ) {
-  return desktopRpc<unknown[]>(ctx, 'list_workspace_files', { id: args.planId, mode: args.mode });
+  return desktopRpc<unknown[]>(ctx, 'list_workspace_files', { id: args.planId, mode: args.mode, path: args.path });
 }

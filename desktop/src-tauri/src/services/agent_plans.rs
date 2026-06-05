@@ -11,7 +11,7 @@ use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::time::{sleep, Duration, Instant};
@@ -63,6 +63,23 @@ pub struct WorkspaceFileDiff {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitFilesView {
+    pub path: String,
+    pub repo_root: Option<String>,
+    pub branch: Option<String>,
+    pub clean: bool,
+    pub entries: Vec<HostFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitActionResult {
+    pub success: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceValidation {
     pub valid: bool,
     pub workspace_path: String,
@@ -71,6 +88,14 @@ pub struct WorkspaceValidation {
     pub phase_count: i64,
     pub task_count: i64,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewInsights {
+    summary: Option<String>,
+    findings: Vec<String>,
+    next_steps: Vec<String>,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,17 +318,23 @@ pub fn list_plans(
     state: &AppState,
     status: Option<String>,
     run_type: Option<String>,
+    only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, created_at, updated_at FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, created_at, updated_at FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![status, run_type], agent_plan_from_row)
+        let mut rows: Vec<AgentPlan> = stmt
+            .query_map(params![status.as_deref(), run_type.as_deref()], agent_plan_from_row)
             .map_err(|e| e.to_string())?
             .filter_map(|row| row.ok())
             .collect();
+        if only_existing {
+            rows.retain(|plan| Path::new(&plan.plan_path).exists());
+        } else if status.is_none() {
+            rows.retain(|plan| plan.status != "closed");
+        }
         Ok(rows)
     })
 }
@@ -312,7 +343,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, created_at, updated_at FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, created_at, updated_at FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -333,6 +364,7 @@ pub async fn start_plan(
     state: AppState,
     id: String,
     phase_id: Option<String>,
+    phase_run_mode: Option<String>,
 ) -> Result<AgentPlanRun, String> {
     let run = get_plan(&state, &id)?;
     // Initialize the per-plan git repo on first start. Idempotent — re-runs
@@ -363,6 +395,10 @@ pub async fn start_plan(
     } else {
         current_phase(&run)?
     };
+    let phase_run_mode = match phase_run_mode.as_deref() {
+        Some("single") => "single",
+        _ => "continue",
+    };
     let worker_session_id = run
         .plan
         .worker_session_id
@@ -380,8 +416,8 @@ pub async fn start_plan(
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE agent_plans SET status = 'phase_worker_running', current_phase_id = ?1, current_phase_index = ?2, updated_at = datetime('now') WHERE id = ?3",
-            params![phase.phase_id, phase.phase_index, id],
+            "UPDATE agent_plans SET status = 'phase_worker_running', current_phase_id = ?1, current_phase_index = ?2, phase_run_mode = ?3, updated_at = datetime('now') WHERE id = ?4",
+            params![phase.phase_id, phase.phase_index, phase_run_mode, id],
         )
         .map_err(|e| e.to_string())?;
         conn.execute(
@@ -521,39 +557,59 @@ pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, Str
     get_plan(state, &id)
 }
 
+pub fn update_plan_title(
+    state: &AppState,
+    id: String,
+    title: String,
+) -> Result<AgentPlanRun, String> {
+    let next_title = title.trim().to_string();
+    if next_title.is_empty() {
+        return Err("Plan title is required".to_string());
+    }
+    let current = get_plan(state, &id)?;
+    if current.plan.title == next_title {
+        return Ok(current);
+    }
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![next_title, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_plan_renamed",
+        json!({ "oldTitle": current.plan.title, "newTitle": title.trim() }),
+    )?;
+    get_plan(state, &id)
+}
+
 pub async fn delete_plan(state: &AppState, id: String) -> Result<bool, String> {
     let run = get_plan(state, &id)?;
 
     if let Some(session_id) = run.plan.worker_session_id {
         let _ = terminal::kill_terminal_session(state, &session_id).await;
-        let _ = sessions::delete_session(state, session_id).await;
+        let _ = sessions::archive_session(state, session_id).await;
     }
     if let Some(session_id) = run.plan.reviewer_session_id {
         let _ = terminal::kill_terminal_session(state, &session_id).await;
-        let _ = sessions::delete_session(state, session_id).await;
+        let _ = sessions::archive_session(state, session_id).await;
     }
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "DELETE FROM agent_plan_events WHERE plan_id = ?1",
+            "UPDATE agent_plans SET status = 'closed', updated_at = datetime('now') WHERE id = ?1",
             params![id],
         )
-        .map_err(|e| format!("Failed to delete plan events: {}", e))?;
-        conn.execute(
-            "DELETE FROM agent_plan_tasks WHERE plan_id = ?1",
-            params![id],
-        )
-        .map_err(|e| format!("Failed to delete plan tasks: {}", e))?;
-        conn.execute(
-            "DELETE FROM agent_plan_phases WHERE plan_id = ?1",
-            params![id],
-        )
-        .map_err(|e| format!("Failed to delete plan phases: {}", e))?;
-        conn.execute("DELETE FROM agent_plans WHERE id = ?1", params![id])
-            .map_err(|e| format!("Failed to delete plan: {}", e))?;
+        .map_err(|e| format!("Failed to close plan: {}", e))?;
         Ok(())
     })?;
 
+    append_event(state, &id, None, "agent_plan_closed", json!({}))?;
     publish_plan_deleted(state, &id);
     Ok(true)
 }
@@ -896,12 +952,90 @@ pub fn list_workspace_files(
     state: &AppState,
     id: String,
     mode: String,
+    path: Option<String>,
 ) -> Result<Vec<HostFileEntry>, String> {
     let run = get_plan(state, &id)?;
     if mode == "changed" {
-        return git_changed_files(&run.plan.workspace_path);
+        return git_changed_files(&run.plan.workspace_path, path.as_deref());
     }
     all_workspace_files(&run.plan.workspace_path)
+}
+
+pub fn git_file_view(
+    state: &AppState,
+    id: String,
+    path: Option<String>,
+) -> Result<GitFilesView, String> {
+    let run = get_plan(state, &id)?;
+    let workspace_root = normalize_path(Path::new(&run.plan.workspace_path))?;
+    let browse_path = match path.filter(|value| !value.trim().is_empty()) {
+        Some(path) => resolve_workspace_file_path(&workspace_root, &path)?,
+        None => workspace_root.clone(),
+    };
+    let browse_path = if browse_path.is_file() {
+        browse_path.parent().unwrap_or(&workspace_root).to_path_buf()
+    } else {
+        browse_path
+    };
+    let mut entries = browse_host_directory(browse_path.to_string_lossy().to_string())?;
+    let repo_root = git_root_for_path(&browse_path).ok();
+    let mut branch = None;
+    let mut clean = true;
+    if let Some(repo_root) = &repo_root {
+        branch = git_current_branch(repo_root).ok();
+        let statuses = git_status_map(repo_root)?;
+        clean = statuses.is_empty();
+        for entry in &mut entries {
+            let entry_path = normalize_path(Path::new(&entry.path))?;
+            let rel = entry_path
+                .strip_prefix(repo_root)
+                .unwrap_or(&entry_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            entry.status = git_status_for_entry(&statuses, &rel, entry.kind == "directory");
+        }
+    }
+    Ok(GitFilesView {
+        path: browse_path.to_string_lossy().to_string(),
+        repo_root: repo_root.map(|path| path.to_string_lossy().to_string()),
+        branch,
+        clean,
+        entries,
+    })
+}
+
+pub fn run_git_action(
+    state: &AppState,
+    id: String,
+    path: Option<String>,
+    action: String,
+    message: Option<String>,
+) -> Result<GitActionResult, String> {
+    let run = get_plan(state, &id)?;
+    let workspace_root = normalize_path(Path::new(&run.plan.workspace_path))?;
+    let action_path = match path.filter(|value| !value.trim().is_empty()) {
+        Some(path) => resolve_workspace_file_path(&workspace_root, &path)?,
+        None => workspace_root,
+    };
+    let repo_root = git_root_for_path(&action_path)?;
+    match action.as_str() {
+        "fetch" => run_git_command(&repo_root, &["fetch"]),
+        "pull" => run_git_command(&repo_root, &["pull"]),
+        "push" => run_git_command(&repo_root, &["push"]),
+        "commit" => {
+            let message = message
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Commit message is required".to_string())?;
+            let add = run_git_command(&repo_root, &["add", "-A"])?;
+            let commit = run_git_command(&repo_root, &["commit", "-m", &message])?;
+            Ok(GitActionResult {
+                success: add.success && commit.success,
+                output: format!("{}\n{}", add.output, commit.output).trim().to_string(),
+            })
+        }
+        _ => Err(format!("Unsupported git action: {}", action)),
+    }
 }
 
 pub fn read_host_file(
@@ -1255,6 +1389,7 @@ async fn handle_planning_reviewer_output(
     output: &str,
 ) -> Result<(), String> {
     let verdict = parse_verdict(output);
+    let review = parse_review_insights(output);
     match verdict.as_deref() {
         Some("PASS") => {
             state.db.with_conn(|conn| {
@@ -1275,7 +1410,7 @@ async fn handle_planning_reviewer_output(
                 &run.plan.id,
                 None,
                 "planning_gate_result",
-                json!({ "verdict": "PASS", "summary": summarize_output(output) }),
+                review_payload("PASS", None, &review),
             )
         }
         Some("NEEDS_CHANGES") | Some("BLOCKED") => {
@@ -1283,7 +1418,7 @@ async fn handle_planning_reviewer_output(
             state.db.with_conn(|conn| {
                 conn.execute(
                     "UPDATE agent_plans SET status = 'planning_planner_running', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    params![summarize_output(output), run.plan.id],
+                    params![review.summary.clone().unwrap_or_else(|| summarize_output(output)), run.plan.id],
                 )
                 .map_err(|e| e.to_string())
             })?;
@@ -1292,9 +1427,9 @@ async fn handle_planning_reviewer_output(
                 &run.plan.id,
                 None,
                 "planning_gate_result",
-                json!({ "verdict": verdict, "action": "sent_back_to_planner" }),
+                review_payload(&verdict, Some("sent_back_to_planner"), &review),
             )?;
-            send_planning_feedback_to_planner(state, run, output).await
+            send_planning_feedback_to_planner(state, run, output, &review).await
         }
         _ => clarify_planning_or_needs_attention(state, run).await,
     }
@@ -1304,6 +1439,7 @@ async fn send_planning_feedback_to_planner(
     state: &AppState,
     run: &AgentPlanRun,
     reviewer_output: &str,
+    review: &ReviewInsights,
 ) -> Result<(), String> {
     let planner_session_id = run
         .plan
@@ -1321,7 +1457,7 @@ async fn send_planning_feedback_to_planner(
         &run.plan.id,
         None,
         "planning_feedback_sent_to_planner",
-        json!({ "source": "auto_needs_changes" }),
+        feedback_event_payload(review),
     )
 }
 
@@ -1403,6 +1539,7 @@ async fn handle_reviewer_output(
     output: &str,
 ) -> Result<(), String> {
     let verdict = parse_verdict(output);
+    let review = parse_review_insights(output);
     match verdict.as_deref() {
         Some("PASS") => pass_phase(state, &run.plan.id, &phase.phase_id, "T2 passed phase").await,
         Some("NEEDS_CHANGES") => {
@@ -1414,7 +1551,7 @@ async fn handle_reviewer_output(
                 .map_err(|e| e.to_string())?;
                 conn.execute(
                     "UPDATE agent_plan_phases SET status = 'needs_changes', gate_verdict = 'needs_changes', reviewer_idle_at = datetime('now'), summary = ?1, updated_at = datetime('now') WHERE plan_id = ?2 AND phase_id = ?3",
-                    params![summarize_output(output), run.plan.id, phase.phase_id],
+                    params![review.summary.clone().unwrap_or_else(|| summarize_output(output)), run.plan.id, phase.phase_id],
                 )
                 .map_err(|e| e.to_string())
             })?;
@@ -1423,9 +1560,9 @@ async fn handle_reviewer_output(
                 &run.plan.id,
                 Some(&phase.phase_id),
                 "agent_phase_gate_result",
-                json!({ "verdict": "NEEDS_CHANGES" }),
+                review_payload("NEEDS_CHANGES", None, &review),
             )?;
-            send_reviewer_feedback_to_worker(state, run, phase, output).await
+            send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
         Some("BLOCKED") => {
             state.db.with_conn(|conn| {
@@ -1436,7 +1573,7 @@ async fn handle_reviewer_output(
                 .map_err(|e| e.to_string())?;
                 conn.execute(
                     "UPDATE agent_plan_phases SET status = 'needs_changes', gate_verdict = 'blocked', reviewer_idle_at = datetime('now'), summary = ?1, updated_at = datetime('now') WHERE plan_id = ?2 AND phase_id = ?3",
-                    params![summarize_output(output), run.plan.id, phase.phase_id],
+                    params![review.summary.clone().unwrap_or_else(|| summarize_output(output)), run.plan.id, phase.phase_id],
                 )
                 .map_err(|e| e.to_string())
             })?;
@@ -1445,9 +1582,9 @@ async fn handle_reviewer_output(
                 &run.plan.id,
                 Some(&phase.phase_id),
                 "agent_phase_gate_result",
-                json!({ "verdict": "BLOCKED", "action": "sent_back_to_worker" }),
+                review_payload("BLOCKED", Some("sent_back_to_worker"), &review),
             )?;
-            send_reviewer_feedback_to_worker(state, run, phase, output).await
+            send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
         _ => clarify_or_needs_attention(state, run, phase).await,
     }
@@ -1458,6 +1595,7 @@ async fn send_reviewer_feedback_to_worker(
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     reviewer_output: &str,
+    review: &ReviewInsights,
 ) -> Result<(), String> {
     let worker_session_id = run
         .plan
@@ -1483,7 +1621,7 @@ async fn send_reviewer_feedback_to_worker(
         &run.plan.id,
         Some(&phase.phase_id),
         "agent_feedback_sent_to_worker",
-        json!({ "source": "auto_needs_changes" }),
+        feedback_event_payload(review),
     )
 }
 
@@ -1551,12 +1689,14 @@ async fn pass_phase(
         .iter()
         .find(|candidate| candidate.phase_index == phase.phase_index + 1)
         .cloned();
+    let should_continue = run.plan.phase_run_mode != "single";
     state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE agent_plan_phases SET status = 'passed', gate_verdict = 'pass', reviewer_idle_at = datetime('now'), summary = ?1, updated_at = datetime('now') WHERE plan_id = ?2 AND phase_id = ?3",
             params![summary, plan_id, phase_id],
         )
         .map_err(|e| e.to_string())?;
+        if should_continue {
         if let Some(next) = &next_phase {
             conn.execute(
                 "UPDATE agent_plans SET status = 'phase_worker_running', current_phase_id = ?1, current_phase_index = ?2, updated_at = datetime('now') WHERE id = ?3",
@@ -1570,7 +1710,14 @@ async fn pass_phase(
             .map_err(|e| e.to_string())?;
         } else {
             conn.execute(
-                "UPDATE agent_plans SET status = 'approved', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET status = 'approved', phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                params![plan_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        } else {
+            conn.execute(
+                "UPDATE agent_plans SET status = 'approved', phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
@@ -1592,7 +1739,8 @@ async fn pass_phase(
         json!({ "verdict": "PASS" }),
     )?;
 
-    if let Some(next) = next_phase {
+    if should_continue {
+        if let Some(next) = next_phase {
         let refreshed = get_plan(state, plan_id)?;
         let worker_session_id = refreshed
             .plan
@@ -1608,8 +1756,17 @@ async fn pass_phase(
             "agent_phase_unlocked",
             json!({}),
         )?;
+        } else {
+            append_event(state, plan_id, None, "agent_plan_completed", json!({}))?;
+        }
     } else {
-        append_event(state, plan_id, None, "agent_plan_completed", json!({}))?;
+        append_event(
+            state,
+            plan_id,
+            Some(phase_id),
+            "agent_single_phase_completed",
+            json!({ "phaseId": phase_id }),
+        )?;
     }
     Ok(())
 }
@@ -2005,6 +2162,56 @@ fn reviewer_verdict_block(output: &str) -> String {
         .join("\n")
 }
 
+fn parse_review_insights(output: &str) -> ReviewInsights {
+    let summary = extract_summary_block(output).or_else(|| {
+        let fallback = summarize_output(output);
+        if fallback == "No summary" {
+            None
+        } else {
+            Some(fallback)
+        }
+    });
+    let findings = extract_bullet_section(output, "FINDINGS:");
+    let next_steps = extract_bullet_section(output, "NEXT_STEPS:");
+    let reason = findings
+        .iter()
+        .find(|item| !is_placeholder_bullet(item))
+        .cloned()
+        .or_else(|| summary.clone());
+
+    ReviewInsights {
+        summary,
+        findings,
+        next_steps,
+        reason,
+    }
+}
+
+fn review_payload(
+    verdict: &str,
+    action: Option<&str>,
+    review: &ReviewInsights,
+) -> serde_json::Value {
+    json!({
+        "verdict": verdict,
+        "action": action,
+        "summary": review.summary,
+        "reason": review.reason,
+        "findings": review.findings,
+        "nextSteps": review.next_steps,
+    })
+}
+
+fn feedback_event_payload(review: &ReviewInsights) -> serde_json::Value {
+    json!({
+        "source": "auto_needs_changes",
+        "summary": review.summary,
+        "reason": review.reason,
+        "findings": review.findings,
+        "nextSteps": review.next_steps,
+    })
+}
+
 /// Commit the planning-mode plan on T2 PASS. The first PASS (no prior HEAD)
 /// produces an `initial: <title>` commit. Subsequent PASSes (re-running T1
 /// after edits or amendments) produce `amend: <brief excerpt>` commits if an
@@ -2139,6 +2346,56 @@ fn extract_summary_block(output: &str) -> Option<String> {
     }
 }
 
+fn extract_bullet_section(output: &str, header: &str) -> Vec<String> {
+    let lines = output.lines().map(marker_search_text).collect::<Vec<_>>();
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| line.to_ascii_uppercase().contains(header))
+    else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    for line in lines.iter().skip(start + 1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !items.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("SUMMARY:")
+            || upper.starts_with("FINDINGS:")
+            || upper.starts_with("NEXT_STEPS:")
+            || upper.starts_with("PLAN:")
+            || upper.starts_with("PHASE:")
+            || upper.starts_with("VERDICT:")
+        {
+            break;
+        }
+        let Some(item) = trimmed.strip_prefix('-').or_else(|| trimmed.strip_prefix('*')) else {
+            if !items.is_empty() {
+                break;
+            }
+            continue;
+        };
+        let normalized = item.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !normalized.is_empty() {
+            items.push(normalized);
+        }
+    }
+
+    items
+}
+
+fn is_placeholder_bullet(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "none" | "n/a" | "na" | "nil"
+    )
+}
+
 fn is_summary_fallback_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -2254,6 +2511,26 @@ fn list_events(state: &AppState, plan_id: &str, limit: i64) -> Result<Vec<AgentP
             .map_err(|e| e.to_string())?
             .filter_map(|row| row.ok())
             .collect();
+        let mut phase_meta = HashMap::new();
+        let mut phase_stmt = conn.prepare(
+            "SELECT phase_id, phase_index, phase_title FROM agent_plan_phases WHERE plan_id = ?1",
+        ).map_err(|e| e.to_string())?;
+        let phase_rows = phase_stmt
+            .query_map(params![plan_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in phase_rows {
+            let (phase_id, phase_index, phase_title) = row.map_err(|e| e.to_string())?;
+            phase_meta.insert(phase_id, (phase_index, phase_title));
+        }
+        for event in &mut rows {
+            enrich_agent_plan_event(event, &phase_meta);
+        }
         rows.reverse();
         Ok(rows)
     })
@@ -2361,7 +2638,7 @@ fn all_workspace_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, Strin
     Ok(entries)
 }
 
-fn git_changed_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, String> {
+fn git_changed_files(workspace_path: &str, path_filter: Option<&str>) -> Result<Vec<HostFileEntry>, String> {
     let root_output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(workspace_path)
@@ -2380,6 +2657,19 @@ fn git_changed_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, String>
     let git_root = String::from_utf8_lossy(&root_output.stdout)
         .trim()
         .to_string();
+    let filter_prefix = match path_filter.filter(|path| !path.trim().is_empty()) {
+        Some(path) => {
+            let filter_path = resolve_workspace_file_path(Path::new(&git_root), path)?;
+            let rel = filter_path
+                .strip_prefix(&git_root)
+                .unwrap_or(&filter_path)
+                .to_string_lossy()
+                .trim_matches('/')
+                .to_string();
+            if rel.is_empty() { None } else { Some(format!("{}/", rel)) }
+        }
+        None => None,
+    };
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(&git_root)
@@ -2395,6 +2685,11 @@ fn git_changed_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, String>
         }
         let status = line[..2].trim().to_string();
         let path = line[3..].trim().to_string();
+        if let Some(prefix) = &filter_prefix {
+            if path != prefix.trim_end_matches('/') && !path.starts_with(prefix) {
+                continue;
+            }
+        }
         let full_path = Path::new(&git_root).join(&path);
         let meta = fs::metadata(&full_path).ok();
         entries.push(HostFileEntry {
@@ -2415,6 +2710,112 @@ fn git_changed_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, String>
         });
     }
     Ok(entries)
+}
+
+fn git_root_for_path(path: &Path) -> Result<PathBuf, String> {
+    let current_dir = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(current_dir)
+        .output()
+        .map_err(|e| format!("Failed to inspect git workspace: {}", e))?;
+    if !output.status.success() {
+        return Err("Path is not inside a git repository".to_string());
+    }
+    Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
+fn git_current_branch(repo_root: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("Failed to read git branch: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if branch.is_empty() { "detached".to_string() } else { branch })
+}
+
+fn git_status_map(repo_root: &Path) -> Result<HashMap<String, String>, String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("Failed to run git status: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let mut statuses = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let code = line[..2].to_string();
+        let raw_path = line[3..].trim();
+        let path = raw_path
+            .rsplit_once(" -> ")
+            .map(|(_, renamed)| renamed)
+            .unwrap_or(raw_path)
+            .to_string();
+        statuses.insert(path, normalize_git_status(&code));
+    }
+    Ok(statuses)
+}
+
+fn git_status_for_entry(
+    statuses: &HashMap<String, String>,
+    rel_path: &str,
+    is_directory: bool,
+) -> Option<String> {
+    if let Some(status) = statuses.get(rel_path) {
+        return Some(status.clone());
+    }
+    if is_directory {
+        let prefix = format!("{}/", rel_path.trim_end_matches('/'));
+        if statuses.keys().any(|path| path.starts_with(&prefix)) {
+            return Some("changed".to_string());
+        }
+    }
+    None
+}
+
+fn normalize_git_status(code: &str) -> String {
+    if code == "??" {
+        return "untracked".to_string();
+    }
+    if code.contains('A') {
+        return "added".to_string();
+    }
+    if code.contains('D') {
+        return "deleted".to_string();
+    }
+    if code.contains('R') {
+        return "renamed".to_string();
+    }
+    if code.contains('M') {
+        return "modified".to_string();
+    }
+    "changed".to_string()
+}
+
+fn run_git_command(repo_root: &Path, args: &[&str]) -> Result<GitActionResult, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("Failed to run git {}: {}", args.join(" "), e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(GitActionResult {
+        success: output.status.success(),
+        output: format!("{}{}", stdout, stderr).trim().to_string(),
+    })
 }
 
 fn resolve_workspace_file_path(root: &Path, path: &str) -> Result<PathBuf, String> {
@@ -2674,8 +3075,9 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         docs_scope: row.get(15)?,
         reference_paths: row.get(16)?,
         amend_brief: row.get(17)?,
-        created_at: row.get(18)?,
-        updated_at: row.get(19)?,
+        phase_run_mode: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -2722,8 +3124,254 @@ fn agent_plan_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentP
         id: row.get(0)?,
         plan_id: row.get(1)?,
         phase_id: row.get(2)?,
+        phase_index: None,
+        phase_title: None,
         event_type: row.get(3)?,
+        actor: "system".to_string(),
+        category: "run".to_string(),
+        summary: String::new(),
+        status_before: None,
+        status_after: None,
+        reason: None,
+        verdict: None,
+        task_id: None,
+        clarification_attempt: None,
         payload_json: row.get(4)?,
         created_at: row.get(5)?,
     })
+}
+
+fn enrich_agent_plan_event(
+    event: &mut AgentPlanEvent,
+    phase_meta: &HashMap<String, (i64, String)>,
+) {
+    if let Some(phase_id) = &event.phase_id {
+        if let Some((phase_index, phase_title)) = phase_meta.get(phase_id) {
+            event.phase_index = Some(*phase_index);
+            event.phase_title = Some(phase_title.clone());
+        }
+    }
+
+    let payload = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+        .unwrap_or_else(|_| json!({}));
+    event.actor = event_actor(&event.event_type).to_string();
+    event.category = event_category(&event.event_type).to_string();
+    event.reason = event_reason(&event.event_type, &payload);
+    event.verdict = payload_str(&payload, "verdict");
+    event.task_id = payload_str(&payload, "taskId");
+    event.clarification_attempt = payload_i64(&payload, "attempt");
+
+    let (status_before, status_after) = event_status_transition(&event.event_type, &payload);
+    event.status_before = status_before.map(str::to_string);
+    event.status_after = status_after.map(str::to_string);
+    event.summary = event_summary(event, &payload);
+}
+
+fn event_actor(event_type: &str) -> &'static str {
+    match event_type {
+        "planning_planner_ready" | "agent_phase_worker_idle" => "t1",
+        "planning_gate_result" | "agent_phase_gate_result" => "t2",
+        "agent_plan_created"
+        | "planning_run_created"
+        | "agent_plan_stopped"
+        | "agent_plan_closed"
+        | "agent_plan_blocked"
+        | "planning_started"
+        | "planning_amend_requested"
+        | "agent_plan_phases_refreshed" => "user",
+        _ => "coordinator",
+    }
+}
+
+fn event_category(event_type: &str) -> &'static str {
+    match event_type {
+        "planning_started"
+        | "planning_planner_ready"
+        | "planning_review_started"
+        | "planning_gate_result"
+        | "planning_feedback_sent_to_planner"
+        | "planning_verdict_clarification_requested"
+        | "planning_needs_attention" => "planning",
+        "planning_amend_requested" => "amend",
+        "agent_phase_started"
+        | "agent_phase_worker_idle"
+        | "agent_phase_review_started"
+        | "agent_phase_gate_result"
+        | "agent_feedback_sent_to_worker"
+        | "agent_phase_verdict_clarification_requested"
+        | "agent_phase_needs_attention"
+        | "agent_phase_unlocked"
+        | "agent_single_phase_completed" => "phase",
+        _ => "run",
+    }
+}
+
+fn event_status_transition(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> (Option<&'static str>, Option<&'static str>) {
+    match event_type {
+        "planning_started" => (None, Some("planning_planner_running")),
+        "planning_planner_ready" => (Some("planning_planner_running"), Some("planning_review_running")),
+        "planning_review_started" => (Some("planning_planner_running"), Some("planning_review_running")),
+        "planning_gate_result" => match payload_str(payload, "verdict").as_deref() {
+            Some("PASS") => (Some("planning_review_running"), Some("approved")),
+            Some("NEEDS_CHANGES") | Some("BLOCKED") => {
+                (Some("planning_review_running"), Some("planning_planner_running"))
+            }
+            _ => (Some("planning_review_running"), None),
+        },
+        "agent_phase_started" => (None, Some("phase_worker_running")),
+        "agent_phase_worker_idle" => (Some("phase_worker_running"), Some("phase_review_running")),
+        "agent_phase_review_started" => (Some("phase_worker_running"), Some("phase_review_running")),
+        "agent_phase_gate_result" => match payload_str(payload, "verdict").as_deref() {
+            Some("PASS") => (Some("phase_review_running"), Some("passed")),
+            Some("NEEDS_CHANGES") | Some("BLOCKED") => {
+                (Some("phase_review_running"), Some("needs_changes"))
+            }
+            _ => (Some("phase_review_running"), None),
+        },
+        "agent_feedback_sent_to_worker" => (Some("phase_review_running"), Some("phase_worker_running")),
+        "agent_plan_stopped" => (None, Some("stopped")),
+        "agent_plan_closed" => (None, Some("closed")),
+        "agent_plan_completed" | "agent_single_phase_completed" => (None, Some("approved")),
+        "agent_plan_blocked" => (None, Some("blocked")),
+        _ => (None, None),
+    }
+}
+
+fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String {
+    match event.event_type.as_str() {
+        "agent_plan_created" => "Created run".to_string(),
+        "agent_plan_renamed" => match (payload_str(payload, "oldTitle"), payload_str(payload, "newTitle")) {
+            (Some(old_title), Some(new_title)) => format!("Renamed run from '{}' to '{}'", old_title, new_title),
+            (None, Some(new_title)) => format!("Renamed run to '{}'", new_title),
+            _ => "Renamed run".to_string(),
+        },
+        "planning_run_created" => "Created planning run".to_string(),
+        "agent_plan_stopped" => "Stopped run".to_string(),
+        "agent_plan_closed" => "Closed run".to_string(),
+        "agent_plan_blocked" => match payload_str(payload, "reason") {
+            Some(reason) => format!("Blocked run: {}", reason),
+            None => "Blocked run".to_string(),
+        },
+        "planning_started" => "Started planner pass".to_string(),
+        "planning_amend_requested" => "Requested plan amendment".to_string(),
+        "planning_planner_ready" => "Planner marked the plan ready for review".to_string(),
+        "planning_review_started" => "Started planning review".to_string(),
+        "planning_feedback_sent_to_planner" => match event_reason(&event.event_type, payload) {
+            Some(reason) => format!("Sent T2 feedback back to the planner ({})", reason),
+            None => "Sent T2 feedback back to the planner".to_string(),
+        },
+        "planning_verdict_clarification_requested" => match payload_i64(payload, "attempt") {
+            Some(attempt) => format!("Requested planning verdict clarification (attempt {})", attempt),
+            None => "Requested planning verdict clarification".to_string(),
+        },
+        "planning_needs_attention" => "Planning run needs manual attention".to_string(),
+        "planning_gate_result" => match payload_str(payload, "verdict").as_deref() {
+            Some("PASS") => "Planning review passed".to_string(),
+            Some("NEEDS_CHANGES") => match event_reason(&event.event_type, payload) {
+                Some(reason) => format!("Planning review requested changes ({})", reason),
+                None => "Planning review requested changes".to_string(),
+            },
+            Some("BLOCKED") => match event_reason(&event.event_type, payload) {
+                Some(reason) => format!("Planning review is blocked ({})", reason),
+                None => "Planning review is blocked".to_string(),
+            },
+            _ => "Planning review returned a verdict".to_string(),
+        },
+        "agent_phase_started" => "Started phase work".to_string(),
+        "agent_phase_worker_idle" => "T1 finished the current pass".to_string(),
+        "agent_phase_review_started" => "Started T2 review".to_string(),
+        "agent_feedback_sent_to_worker" => match event_reason(&event.event_type, payload) {
+            Some(reason) => format!("Sent T2 feedback back to T1 ({})", reason),
+            None => "Sent T2 feedback back to T1".to_string(),
+        },
+        "agent_phase_verdict_clarification_requested" => match payload_i64(payload, "attempt") {
+            Some(attempt) => format!("Requested phase verdict clarification (attempt {})", attempt),
+            None => "Requested phase verdict clarification".to_string(),
+        },
+        "agent_phase_needs_attention" => "Phase needs manual attention".to_string(),
+        "agent_phase_gate_result" => match payload_str(payload, "verdict").as_deref() {
+            Some("PASS") => "Phase review passed".to_string(),
+            Some("NEEDS_CHANGES") => match event_reason(&event.event_type, payload) {
+                Some(reason) => format!("Phase review requested changes ({})", reason),
+                None => "Phase review requested changes".to_string(),
+            },
+            Some("BLOCKED") => match event_reason(&event.event_type, payload) {
+                Some(reason) => format!("Phase review is blocked ({})", reason),
+                None => "Phase review is blocked".to_string(),
+            },
+            _ => "Phase review returned a verdict".to_string(),
+        },
+        "agent_phase_unlocked" => "Unlocked the next phase".to_string(),
+        "agent_plan_completed" => "Completed the full run".to_string(),
+        "agent_single_phase_completed" => "Completed the selected phase only".to_string(),
+        "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
+        _ => humanize_event_type(&event.event_type),
+    }
+}
+
+fn payload_str(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn payload_i64(payload: &serde_json::Value, key: &str) -> Option<i64> {
+    payload.get(key).and_then(|value| value.as_i64())
+}
+
+fn event_reason(event_type: &str, payload: &serde_json::Value) -> Option<String> {
+    if let Some(reason) = payload_str(payload, "reason") {
+        return Some(humanize_reason_value(event_type, &reason));
+    }
+    if let Some(source) = payload_str(payload, "source") {
+        return Some(humanize_reason_value(event_type, &source));
+    }
+    None
+}
+
+fn humanize_reason_value(event_type: &str, value: &str) -> String {
+    if value.contains(' ') || value.contains('.') || value.contains(',') || value.contains(':') {
+        return value.trim().to_string();
+    }
+    humanize_reason_code(event_type, value)
+}
+
+fn humanize_reason_code(event_type: &str, code: &str) -> String {
+    match (event_type, code) {
+        ("planning_feedback_sent_to_planner", "auto_needs_changes")
+        | ("agent_feedback_sent_to_worker", "auto_needs_changes") => {
+            "automatic after T2 requested changes".to_string()
+        }
+        (_, "unknown_verdict") => "T2 did not return a parseable verdict".to_string(),
+        _ => humanize_code(code),
+    }
+}
+
+fn humanize_code(code: &str) -> String {
+    code.replace('_', " ").to_lowercase()
+}
+
+fn humanize_event_type(event_type: &str) -> String {
+    let mut out = String::with_capacity(event_type.len() + 8);
+    let mut uppercase_next = true;
+    for ch in event_type.chars() {
+        if ch == '_' {
+            out.push(' ');
+            uppercase_next = true;
+            continue;
+        }
+        if uppercase_next {
+            out.extend(ch.to_uppercase());
+            uppercase_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }

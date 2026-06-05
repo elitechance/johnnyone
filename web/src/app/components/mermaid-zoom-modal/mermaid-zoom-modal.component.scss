@@ -18,6 +18,7 @@ ion-modal.mermaid-zoom ion-footer {
 ion-modal.mermaid-zoom ion-content {
   flex: 1 1 auto;
   min-height: 0;
+  --padding-bottom: calc(12px + env(safe-area-inset-bottom));
 }
 
 /* Bigger tap targets on the toolbar — the default ion-button is ~32px tall
@@ -99,6 +100,6 @@ ion-modal.mermaid-zoom ion-toolbar ion-button {
   }
 
   ion-modal.mermaid-zoom ion-footer {
-    padding-bottom: env(safe-area-inset-bottom);
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
   }
 }

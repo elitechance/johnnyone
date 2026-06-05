@@ -806,6 +806,7 @@ impl AgentService {
             "list_agent_plans" => Self::rpc_list_agent_plans(&req.params, state),
             "get_agent_plan" => Self::rpc_get_agent_plan(&req.params, state),
             "start_agent_plan" => Self::rpc_start_agent_plan(&req.params, state).await,
+            "update_agent_plan_title" => Self::rpc_update_agent_plan_title(&req.params, state),
             "refresh_agent_plan_phases" => {
                 Self::rpc_refresh_agent_plan_phases(&req.params, state)
             },
@@ -823,6 +824,8 @@ impl AgentService {
             "browse_host_directory" => Self::rpc_browse_host_directory(&req.params),
             "validate_workspace_plan" => Self::rpc_validate_workspace_plan(&req.params),
             "list_workspace_files" => Self::rpc_list_workspace_files(&req.params, state),
+            "git_file_view" => Self::rpc_git_file_view(&req.params, state),
+            "run_git_action" => Self::rpc_run_git_action(&req.params, state),
             "read_host_file" => Self::rpc_read_host_file(&req.params, state),
             "get_workspace_file_diff" => Self::rpc_get_workspace_file_diff(&req.params, state),
             "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
@@ -1059,7 +1062,16 @@ impl AgentService {
             .get("runType")
             .and_then(|value| value.as_str())
             .map(str::to_string);
-        let plans = crate::services::agent_plans::list_plans(state, status, run_type)?;
+        let only_existing = params
+            .get("onlyExisting")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let plans = crate::services::agent_plans::list_plans(
+            state,
+            status,
+            run_type,
+            only_existing,
+        )?;
         serde_json::to_value(plans).map_err(|e| e.to_string())
     }
 
@@ -1088,9 +1100,19 @@ impl AgentService {
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string);
+        let phase_run_mode = params
+            .get("phaseRunMode")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
         let run =
-            crate::services::agent_plans::start_plan((**state).clone(), id.to_string(), phase_id)
-                .await?;
+            crate::services::agent_plans::start_plan(
+                (**state).clone(),
+                id.to_string(),
+                phase_id,
+                phase_run_mode,
+            )
+            .await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -1103,6 +1125,22 @@ impl AgentService {
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
         let run = crate::services::agent_plans::stop_plan(state, id.to_string()).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_agent_plan_title(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let title = params
+            .get("title")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'title' parameter".to_string())?;
+        let run = crate::services::agent_plans::update_plan_title(state, id.to_string(), title.to_string())?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -1257,12 +1295,63 @@ impl AgentService {
             .get("mode")
             .and_then(|value| value.as_str())
             .unwrap_or("changed");
+        let path = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
         let entries = crate::services::agent_plans::list_workspace_files(
             state,
             id.to_string(),
             mode.to_string(),
+            path,
         )?;
         serde_json::to_value(entries).map_err(|e| e.to_string())
+    }
+
+    fn rpc_git_file_view(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let path = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let view = crate::services::agent_plans::git_file_view(state, id.to_string(), path)?;
+        serde_json::to_value(view).map_err(|e| e.to_string())
+    }
+
+    fn rpc_run_git_action(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let action = params
+            .get("action")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'action' parameter".to_string())?;
+        let path = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let message = params
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let result = crate::services::agent_plans::run_git_action(
+            state,
+            id.to_string(),
+            path,
+            action.to_string(),
+            message,
+        )?;
+        serde_json::to_value(result).map_err(|e| e.to_string())
     }
 
     fn rpc_read_host_file(

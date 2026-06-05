@@ -1,0 +1,33 @@
+<form
+  class="image-attachment-composer"
+  [class.has-attachments]="attachments.length > 0"
+  (submit)="$event.preventDefault(); send.emit()"
+  (paste)="onPaste($event)"
+  (dragover)="onDragOver($event)"
+  (drop)="onDrop($event)"
+>
+  @if (attachments.length > 0) {
+  <div class="attachment-previews" aria-label="Pending image attachments">
+    @for (attachment of attachments; track attachment.id) {
+      <div class="attachment-preview">
+        <img [src]="attachment.previewUrl" [alt]="attachment.file.name || 'Pasted image'" />
+        <button type="button" title="Remove image" (click)="removeAttachment.emit(attachment.id)">×</button>
+      </div>
+    }
+  </div>
+  }
+  <textarea
+    [ngModel]="message"
+    (ngModelChange)="messageChange.emit($event)"
+    name="attachmentMessage"
+    rows="1"
+    [placeholder]="placeholder || idleLabel"
+    [disabled]="disabled || sending"
+  ></textarea>
+
+  <input #imageInput class="file-input" type="file" accept="image/*" multiple (change)="onBrowse($event)" />
+  <button type="button" class="secondary-action" [disabled]="disabled || sending" (click)="imageInput.click()">{{ browseLabel }}</button>
+  <button type="submit" class="primary-action" [disabled]="disabled || sending || (attachments.length === 0 && !message.trim())">
+    {{ sending ? sendingLabel : sendLabel }}
+  </button>
+</form>

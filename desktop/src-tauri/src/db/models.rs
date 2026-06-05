@@ -116,6 +116,7 @@ pub struct AgentPlan {
     /// when they clicked Amend. Cleared back to NULL by `commit_plan_on_pass`
     /// after T2 PASSes the amended state.
     pub amend_brief: Option<String>,
+    pub phase_run_mode: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -164,7 +165,18 @@ pub struct AgentPlanEvent {
     pub id: String,
     pub plan_id: String,
     pub phase_id: Option<String>,
+    pub phase_index: Option<i64>,
+    pub phase_title: Option<String>,
     pub event_type: String,
+    pub actor: String,
+    pub category: String,
+    pub summary: String,
+    pub status_before: Option<String>,
+    pub status_after: Option<String>,
+    pub reason: Option<String>,
+    pub verdict: Option<String>,
+    pub task_id: Option<String>,
+    pub clarification_attempt: Option<i64>,
     pub payload_json: String,
     pub created_at: String,
 }

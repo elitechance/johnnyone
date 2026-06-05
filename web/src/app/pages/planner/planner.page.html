@@ -14,12 +14,13 @@
             <span class="dot" [class.warn]="plan.status.includes('running')" [class.bad]="plan.status === 'blocked' || plan.status === 'needs_attention'"></span>
             <span>{{ plan.title }}</span>
           </button>
-          <button class="tab-close" type="button" title="Delete planner run" (click)="deletePlan(plan.id, $event)">×</button>
+          <button class="tab-close" type="button" title="Close planner run" (click)="deletePlan(plan.id, $event)">×</button>
         </div>
       }
     </nav>
 
     <div class="planner-actions">
+      <button class="secondary-action" type="button" (click)="openExistingPlans()">Existing Plans</button>
       <button class="primary-action" type="button" (click)="openSetup()">{{ primaryActionLabel() }}</button>
     </div>
   </header>
@@ -71,22 +72,16 @@
             class="terminal-fill"
             [screen]="workerScreen()"
             [mobileInputMode]="isCompactWorkspace()"
-            [showInput]="isCompactWorkspace()"
+            [imageAttachments]="workerPendingAttachments()"
+            [imageSending]="isSendingWorkerAttachments()"
             (rawInput)="sendPlannerRawInput('worker', $event)"
             (terminalResize)="resizePlannerTerminal('worker', $event)"
             (historyRequested)="loadPlannerTerminalHistory('worker', $event)"
             (mermaidRequested)="openTerminalMermaid($event)"
+            (imagePasted)="addPendingImageFiles('worker', $event)"
+            (imageRemoved)="removePendingAttachment('worker', $event)"
+            (imageMessageSubmitted)="sendPlannerAttachmentMessage('worker', $event)"
           ></johnny-terminal-screen>
-          <form class="agent-message-bar" (submit)="$event.preventDefault(); sendWorkerMessage()">
-            <textarea
-              name="workerMessage"
-              rows="1"
-              placeholder="Message T1"
-              [ngModel]="workerMessage()"
-              (ngModelChange)="workerMessage.set($event)"
-            ></textarea>
-            <button type="submit" [disabled]="!workerMessage().trim()">Send T1</button>
-          </form>
         </article>
 
         <article class="terminal-card" [class.active-mobile-panel]="activeMobilePanel() === 'reviewer'">
@@ -105,22 +100,16 @@
             class="terminal-fill"
             [screen]="reviewerScreen()"
             [mobileInputMode]="isCompactWorkspace()"
-            [showInput]="isCompactWorkspace()"
+            [imageAttachments]="reviewerPendingAttachments()"
+            [imageSending]="isSendingReviewerAttachments()"
             (rawInput)="sendPlannerRawInput('reviewer', $event)"
             (terminalResize)="resizePlannerTerminal('reviewer', $event)"
             (historyRequested)="loadPlannerTerminalHistory('reviewer', $event)"
             (mermaidRequested)="openTerminalMermaid($event)"
+            (imagePasted)="addPendingImageFiles('reviewer', $event)"
+            (imageRemoved)="removePendingAttachment('reviewer', $event)"
+            (imageMessageSubmitted)="sendPlannerAttachmentMessage('reviewer', $event)"
           ></johnny-terminal-screen>
-          <form class="agent-message-bar" (submit)="$event.preventDefault(); sendReviewerMessage()">
-            <textarea
-              name="reviewerMessage"
-              rows="1"
-              placeholder="Message T2"
-              [ngModel]="reviewerMessage()"
-              (ngModelChange)="reviewerMessage.set($event)"
-            ></textarea>
-            <button type="submit" [disabled]="!reviewerMessage().trim()">Send T2</button>
-          </form>
         </article>
       </section>
 
@@ -152,6 +141,15 @@
                   <option [value]="phase.phaseId">{{ phase.phaseId }}</option>
                 }
               </select>
+              <select
+                class="phase-start-select"
+                aria-label="Phase run mode"
+                [ngModel]="selectedPhaseRunMode()"
+                (ngModelChange)="selectedPhaseRunMode.set($event)"
+              >
+                <option value="continue">Continue after phase</option>
+                <option value="single">Only selected phase</option>
+              </select>
               <button
                 class="secondary-action"
                 type="button"
@@ -162,6 +160,7 @@
                 {{ isRefreshingPhases() ? 'Refreshing…' : 'Refresh phases' }}
               </button>
             }
+            <button class="secondary-action" type="button" (click)="openRenameCurrentPlan()">Rename</button>
             <button class="secondary-action" type="button" (click)="startPlan()">Start</button>
             @if (canAmend()) {
               <button class="secondary-action" type="button" (click)="openAmend()">Amend</button>
@@ -200,9 +199,45 @@
             <div class="section-title">Events</div>
             @for (event of run.events; track event.id) {
               <div class="event-row">
-                <strong>{{ event.eventType }}</strong>
-                <span>{{ event.createdAt }}</span>
-                <pre>{{ eventPayload(event) }}</pre>
+                <div class="event-row-top">
+                  <div class="event-badges">
+                    @if (event.phaseIndex !== undefined && event.phaseIndex !== null) {
+                      <span class="event-badge phase">P{{ event.phaseIndex + 1 }}</span>
+                    }
+                    <span class="event-badge actor">{{ event.actor }}</span>
+                    <span class="event-badge category">{{ event.category }}</span>
+                    @if (event.verdict) {
+                      <span class="event-badge verdict" [class.pass]="event.verdict === 'PASS'" [class.warn]="event.verdict === 'NEEDS_CHANGES'" [class.bad]="event.verdict === 'BLOCKED'">
+                        {{ event.verdict }}
+                      </span>
+                    }
+                  </div>
+                  <span class="event-time">{{ event.createdAt }}</span>
+                </div>
+                <strong>{{ event.summary }}</strong>
+                <span class="event-meta">{{ eventPhaseLabel(event) }} · {{ event.eventType }}</span>
+                @if (event.statusBefore || event.statusAfter || event.reason || event.taskId || event.clarificationAttempt !== undefined) {
+                  <div class="event-facts">
+                    @if (event.statusBefore || event.statusAfter) {
+                      <span>{{ event.statusBefore || 'unknown' }} → {{ event.statusAfter || 'unknown' }}</span>
+                    }
+                    @if (event.reason) {
+                      <span>reason: {{ event.reason }}</span>
+                    }
+                    @if (event.taskId) {
+                      <span>task {{ event.taskId }}</span>
+                    }
+                    @if (event.clarificationAttempt !== undefined && event.clarificationAttempt !== null) {
+                      <span>attempt {{ event.clarificationAttempt }}</span>
+                    }
+                  </div>
+                }
+                @if (eventHasDetails(event)) {
+                  <details class="event-details">
+                    <summary>Details</summary>
+                    <pre>{{ eventDetails(event) }}</pre>
+                  </details>
+                }
               </div>
             }
           </section>
@@ -226,11 +261,106 @@
       <section class="empty-state">
         <h1>{{ emptyTitle() }}</h1>
         <p>{{ emptyText() }}</p>
+        <button class="secondary-action" type="button" (click)="openExistingPlans()">Existing Plans</button>
         <button class="primary-action" type="button" (click)="openSetup()">{{ primaryActionLabel() }}</button>
       </section>
     }
   </main>
 </div>
+
+<ion-modal
+  [isOpen]="existingPlansOpen()"
+  (didDismiss)="closeExistingPlans()"
+  class="files-ion-modal existing-plans-ion-modal"
+>
+  <ng-template>
+    <ion-header>
+      <ion-toolbar>
+        <ion-title>Existing {{ modeTitle() }} Plans</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="loadExistingPlans()" [disabled]="existingPlansLoading()">Refresh</ion-button>
+          <ion-button (click)="closeExistingPlans()" aria-label="Close">
+            <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content>
+      @if (existingPlansLoading()) {
+        <ion-text color="medium" class="files-empty">Loading existing plans...</ion-text>
+      } @else if (existingPlans().length === 0) {
+        <ion-text color="medium" class="files-empty">No existing {{ modeTitle().toLowerCase() }} plans with a live plan path.</ion-text>
+      } @else {
+        <ion-list lines="full" class="files-list existing-plans-list">
+          @for (plan of existingPlans(); track plan.id) {
+            <ion-item button detail="true" (click)="openExistingPlan(plan.id)">
+              <ion-label>
+                <h2>{{ plan.title }}</h2>
+                <p>
+                  <ion-badge color="medium">{{ plan.status }}</ion-badge>
+                  <span>{{ plan.updatedAt }}</span>
+                </p>
+                <code>{{ workspaceRelativePath(plan.planPath) }}</code>
+              </ion-label>
+            </ion-item>
+          }
+        </ion-list>
+      }
+    </ion-content>
+  </ng-template>
+</ion-modal>
+
+<ion-modal
+  [isOpen]="renameOpen()"
+  (didDismiss)="closeRenameCurrentPlan()"
+  class="files-ion-modal rename-plan-ion-modal"
+>
+  <ng-template>
+    <ion-header>
+      <ion-toolbar>
+        <ion-title>Rename run</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="closeRenameCurrentPlan()" aria-label="Cancel">
+            <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+      <ion-toolbar>
+        <ion-text color="medium">
+          <p class="files-modal-path">{{ currentRun()?.plan?.title }}</p>
+        </ion-text>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content class="files-modal-body">
+      <ion-list lines="full">
+        <ion-item>
+          <ion-input
+            label="Run name"
+            labelPlacement="stacked"
+            placeholder="Enter a new run name"
+            [(ngModel)]="renameDraft"
+            (keyup.enter)="renameCurrentPlan()"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+    </ion-content>
+    <ion-footer>
+      <ion-toolbar>
+        <ion-buttons slot="end">
+          <ion-button fill="clear" (click)="closeRenameCurrentPlan()">Cancel</ion-button>
+          <ion-button
+            color="primary"
+            fill="solid"
+            [disabled]="!renameDraft.trim() || renameDraft.trim() === currentRun()?.plan?.title || isBusy()"
+            (click)="renameCurrentPlan()"
+          >
+            {{ isBusy() ? 'Saving…' : 'Save' }}
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-footer>
+  </ng-template>
+</ion-modal>
 
 <ion-modal
   [isOpen]="setupOpen()"
@@ -614,168 +744,127 @@
           <p class="files-modal-path">{{ currentRun()?.plan?.workspacePath }}</p>
         </ion-text>
       </ion-toolbar>
-      <ion-toolbar>
-        <ion-segment
-          [value]="filesTab()"
-          (ionChange)="setFilesTab($any($event.detail.value))"
-        >
-          <ion-segment-button value="changes">
-            <ion-label>File Changes</ion-label>
-          </ion-segment-button>
-          <ion-segment-button value="plan">
-            <ion-label>Plan Files</ion-label>
-          </ion-segment-button>
-        </ion-segment>
-      </ion-toolbar>
     </ion-header>
 
-    @if (filesTab() === 'changes') {
-      <ion-content class="files-modal-body">
+    <ion-content class="files-modal-body">
+      <ion-toolbar class="files-subtoolbar">
+        <ion-buttons slot="start">
+          <ion-button size="small" fill="clear" (click)="loadGitFiles(workspaceRootPath())">Workspace</ion-button>
+          <ion-button size="small" fill="clear" (click)="loadGitFiles(planRootPath())">Plan</ion-button>
+          <ion-button size="small" fill="clear" (click)="browseWorkspaceParent()">Up</ion-button>
+          <ion-button size="small" fill="clear" (click)="loadGitFiles(workspaceBrowsePath() || workspaceRootPath())">Refresh</ion-button>
+        </ion-buttons>
+        <ion-buttons slot="end">
+          <ion-button size="small" fill="clear" [disabled]="gitActionBusy()" (click)="runGitAction('fetch')">Fetch</ion-button>
+          <ion-button size="small" fill="clear" [disabled]="gitActionBusy()" (click)="runGitAction('pull')">Pull</ion-button>
+          <ion-button size="small" fill="clear" [disabled]="gitActionBusy()" (click)="runGitAction('push')">Push</ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+      <ion-toolbar class="files-subtoolbar">
+        <ion-text color="medium" class="files-crumb">
+          <code>{{ workspaceRelativePath(workspaceBrowsePath()) }}</code>
+        </ion-text>
+        <ion-buttons slot="end">
+          @if (gitFilesView()?.repoRoot) {
+            <ion-badge color="medium">{{ gitFilesView()?.branch || 'git' }}</ion-badge>
+            <ion-badge [color]="gitFilesView()?.clean ? 'success' : 'warning'">{{ gitFilesView()?.clean ? 'clean' : 'changes' }}</ion-badge>
+          } @else {
+            <ion-badge color="medium">not git</ion-badge>
+          }
+        </ion-buttons>
+      </ion-toolbar>
+      <ion-toolbar class="files-subtoolbar">
+        <ion-input
+          placeholder="Commit message"
+          [ngModel]="gitCommitMessage"
+          (ngModelChange)="gitCommitMessage = $event"
+        ></ion-input>
+        <ion-buttons slot="end">
+          <ion-button size="small" fill="solid" [disabled]="gitActionBusy() || !gitCommitMessage.trim()" (click)="runGitAction('commit')">Commit all</ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+      @if (gitActionOutput()) {
+        <ion-text [color]="gitActionOutput()?.success ? 'medium' : 'danger'" class="files-crumb">
+          <code>{{ gitActionOutput()?.output || (gitActionOutput()?.success ? 'Done.' : 'Git action failed.') }}</code>
+        </ion-text>
+      }
+
+      <ion-list lines="full" class="files-list">
+        @if (filesError()) {
+          <ion-item lines="none">
+            <ion-label color="danger">{{ filesError() }}</ion-label>
+          </ion-item>
+        } @else if (workspaceFiles().length === 0) {
+          <ion-item lines="none">
+            <ion-label color="medium">No entries in this directory.</ion-label>
+          </ion-item>
+        }
+        @for (file of workspaceFiles(); track file.path) {
+          <ion-item
+            button
+            [detail]="false"
+            [color]="selectedWorkspaceFile()?.path === file.path ? 'primary' : undefined"
+            [class.git-changed-entry]="hasGitChange(file)"
+            [class.git-changed-directory]="file.kind === 'directory' && hasGitChange(file)"
+            [title]="fileStatusTitle(file)"
+            (click)="selectWorkspaceEntry(file)"
+          >
+            <span slot="start" class="file-entry-icon" [ngClass]="fileStatusClass(file)">
+              <ion-icon [name]="fileIcon(file)" aria-hidden="true"></ion-icon>
+              @if (hasGitChange(file)) {
+                <span class="git-status-dot" aria-hidden="true"></span>
+              }
+            </span>
+            <ion-label>{{ workspaceEntryLabel(file) }}</ion-label>
+            @if (file.size !== undefined) {
+              <ion-note slot="end">{{ file.size }}b</ion-note>
+            }
+          </ion-item>
+        }
+      </ion-list>
+
+      <div class="diff-region">
         <ion-toolbar class="files-subtoolbar">
           <ion-buttons slot="start">
-            <ion-button size="small" fill="clear" (click)="loadWorkspaceFiles('all', workspaceRootPath())">root</ion-button>
-            <ion-button size="small" fill="clear" (click)="browseWorkspaceParent()">up</ion-button>
+            <ion-badge color="medium">{{ selectedWorkspacePreviewKind() === 'diff' ? 'Diff' : 'Preview' }}</ion-badge>
           </ion-buttons>
-          <ion-buttons slot="end">
-            <ion-button size="small" [fill]="fileMode() === 'changed' ? 'solid' : 'clear'" (click)="loadWorkspaceFiles('changed')">Changed</ion-button>
-            <ion-button size="small" [fill]="fileMode() === 'all' ? 'solid' : 'clear'" (click)="loadWorkspaceFiles('all', workspaceBrowsePath() || workspaceRootPath())">All</ion-button>
-          </ion-buttons>
+          <ion-text color="medium" class="files-crumb">
+            <code>{{ selectedWorkspaceFile()?.path || 'Select a file to preview or view its git diff' }}</code>
+          </ion-text>
         </ion-toolbar>
-        <ion-text color="medium" class="files-crumb">
-          <code>{{ fileMode() === 'all' ? workspaceRelativePath(workspaceBrowsePath()) : 'git status / working tree' }}</code>
-        </ion-text>
-
-        <ion-list lines="full" class="files-list">
-          @if (filesError()) {
-            <ion-item lines="none">
-              <ion-label color="danger">{{ filesError() }}</ion-label>
-            </ion-item>
-          } @else if (workspaceFiles().length === 0) {
-            <ion-item lines="none">
-              <ion-label color="medium">
-                {{ fileMode() === 'changed' ? 'No changed files.' : 'No entries in this directory.' }}
-              </ion-label>
-            </ion-item>
+        <div class="diff-scroll">
+          @if (selectedWorkspaceLoading()) {
+            <ion-text color="medium" class="files-empty">Loading preview...</ion-text>
+          } @else if (!selectedWorkspaceFile()) {
+            <ion-text color="medium" class="files-empty">Select a file to preview or view its git diff.</ion-text>
+          } @else if (selectedWorkspacePreviewKind() === 'markdown') {
+            <article class="plan-markdown-preview markdown-content" [innerHTML]="renderedWorkspaceHtml()"></article>
+          } @else if (selectedWorkspacePreviewKind() === 'html') {
+            <iframe
+              class="html-preview-frame"
+              [src]="selectedWorkspaceHtmlUrl()"
+              sandbox="allow-scripts allow-forms allow-popups allow-modals"
+              title="HTML preview"
+            ></iframe>
+          } @else if (selectedWorkspacePreviewKind() === 'image') {
+            <div class="image-preview">
+              <img [src]="selectedWorkspaceImageSrc()" [alt]="selectedWorkspaceContent()?.name" />
+            </div>
+          } @else {
+            <table class="diff-table">
+              <tbody>
+                @for (line of diffLines(); track line.index) {
+                  <tr [class.add]="line.kind === 'add'" [class.remove]="line.kind === 'remove'" [class.hunk]="line.kind === 'hunk'">
+                    <td class="line-number">{{ line.index }}</td>
+                    <td class="line-text">{{ line.text || ' ' }}</td>
+                  </tr>
+                }
+              </tbody>
+            </table>
           }
-          @for (file of workspaceFiles(); track file.path) {
-            <ion-item
-              button
-              [detail]="false"
-              [color]="selectedWorkspaceFile()?.path === file.path ? 'primary' : undefined"
-              (click)="selectWorkspaceEntry(file)"
-            >
-              <ion-badge slot="start" [ngClass]="fileStatusClass(file)">{{ fileStatusLabel(file) }}</ion-badge>
-              <ion-label>{{ workspaceEntryLabel(file) }}</ion-label>
-              @if (file.size !== undefined) {
-                <ion-note slot="end">{{ file.size }}b</ion-note>
-              }
-            </ion-item>
-          }
-        </ion-list>
-
-        <div class="diff-region">
-          <ion-toolbar class="files-subtoolbar">
-            <ion-buttons slot="start">
-              <ion-badge color="medium">Diff</ion-badge>
-            </ion-buttons>
-            <ion-text color="medium" class="files-crumb">
-              <code>{{ selectedWorkspaceFile()?.path || (fileMode() === 'all' ? 'Select a file to view its git diff' : 'Select a changed file') }}</code>
-            </ion-text>
-          </ion-toolbar>
-          <div class="diff-scroll">
-            @if (!selectedWorkspaceFile()) {
-              <ion-text color="medium" class="files-empty">Select a file to view its git diff.</ion-text>
-            } @else {
-              <table class="diff-table">
-                <tbody>
-                  @for (line of diffLines(); track line.index) {
-                    <tr [class.add]="line.kind === 'add'" [class.remove]="line.kind === 'remove'" [class.hunk]="line.kind === 'hunk'">
-                      <td class="line-number">{{ line.index }}</td>
-                      <td class="line-text">{{ line.text || ' ' }}</td>
-                    </tr>
-                  }
-                </tbody>
-              </table>
-            }
-          </div>
         </div>
-      </ion-content>
-    }
-
-    @if (filesTab() === 'plan') {
-      <ion-content class="files-modal-body">
-        <ion-toolbar class="files-subtoolbar">
-          <ion-buttons slot="start">
-            <ion-button size="small" fill="clear" (click)="loadPlanFiles(planRootPath())">root</ion-button>
-            <ion-button size="small" fill="clear" (click)="browsePlanParent()">up</ion-button>
-          </ion-buttons>
-          <ion-buttons slot="end">
-            <ion-button size="small" fill="clear" (click)="loadPlanFiles(planBrowsePath() || planRootPath())">Refresh</ion-button>
-          </ion-buttons>
-        </ion-toolbar>
-        <ion-text color="medium" class="files-crumb">
-          <code>{{ planRelativePath(planBrowsePath()) }}</code>
-        </ion-text>
-
-        <ion-list lines="full" class="files-list">
-          @if (planFilesError()) {
-            <ion-item lines="none">
-              <ion-label color="danger">{{ planFilesError() }}</ion-label>
-            </ion-item>
-          } @else if (planFiles().length === 0) {
-            <ion-item lines="none">
-              <ion-label color="medium">No plan files.</ion-label>
-            </ion-item>
-          }
-          @for (entry of planFiles(); track entry.path) {
-            <ion-item
-              button
-              [detail]="false"
-              [color]="selectedPlanFile()?.path === entry.path ? 'primary' : undefined"
-              (click)="selectPlanEntry(entry)"
-            >
-              <ion-badge slot="start" color="medium">{{ fileKind(entry) }}</ion-badge>
-              <ion-label>{{ entry.name }}</ion-label>
-              @if (entry.size !== undefined) {
-                <ion-note slot="end">{{ entry.size }}b</ion-note>
-              }
-            </ion-item>
-          }
-        </ion-list>
-
-        <div class="diff-region">
-          <ion-toolbar class="files-subtoolbar">
-            <ion-buttons slot="start">
-              <ion-badge color="medium">{{ selectedPlanPreviewKind() }}</ion-badge>
-            </ion-buttons>
-            <ion-text color="medium" class="files-crumb">
-              <code>{{ selectedPlanContent()?.path || 'Select a plan file' }}</code>
-            </ion-text>
-          </ion-toolbar>
-          <div class="preview-scroll" [class.html-preview-scroll]="selectedPlanPreviewKind() === 'html'">
-            @if (selectedPlanLoading()) {
-              <ion-text color="medium" class="files-empty">Loading preview...</ion-text>
-            } @else if (selectedPlanError()) {
-              <ion-text color="danger" class="files-empty">{{ selectedPlanError() }}</ion-text>
-            } @else if (selectedPlanNotice()) {
-              <ion-text color="medium" class="files-empty">{{ selectedPlanNotice() }}</ion-text>
-            } @else if (!selectedPlanContent()) {
-              <ion-text color="medium" class="files-empty">Select a markdown, image, HTML, or raw file from the plan directory.</ion-text>
-            } @else if (selectedPlanPreviewKind() === 'markdown') {
-              <article class="plan-markdown-preview markdown-content" [innerHTML]="renderedPlanHtml()"></article>
-            } @else if (selectedPlanPreviewKind() === 'image') {
-              <div class="image-preview">
-                <img [src]="selectedPlanImageSrc()" [alt]="selectedPlanContent()?.name" />
-              </div>
-            } @else if (selectedPlanPreviewKind() === 'html') {
-              <iframe class="html-preview-frame" sandbox="allow-scripts allow-forms allow-modals allow-popups" [src]="selectedPlanHtmlUrl()"></iframe>
-            } @else {
-              <pre class="raw-preview">{{ selectedPlanRawText() }}</pre>
-            }
-          </div>
-        </div>
-      </ion-content>
-    }
+      </div>
+    </ion-content>
   </ng-template>
 </ion-modal>
 

@@ -134,7 +134,7 @@
   flex: 0 0 auto;
   display: grid;
   gap: 8px;
-  padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  padding: 8px 10px calc(16px + env(safe-area-inset-bottom));
   border-top: 1px solid rgba(148, 163, 184, 0.22);
   background: rgba(10, 13, 18, 0.98);
   contain: layout;
@@ -148,9 +148,53 @@
   min-width: 0;
 }
 
+.terminal-image-previews {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  overflow: auto hidden;
+  padding: 2px 0;
+  scrollbar-width: none;
+}
+
+.terminal-image-preview {
+  position: relative;
+  flex: 0 0 auto;
+  width: 72px;
+  height: 54px;
+  border: 1px solid #263241;
+  background: #07090d;
+}
+
+.terminal-image-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.terminal-image-preview button {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid #3a4a5f;
+  background: #121821;
+  color: #dbe7f3;
+  line-height: 18px;
+}
+
 .terminal-mobile-keys {
   overflow: auto hidden;
   scrollbar-width: none;
+}
+
+.terminal-image-input {
+  display: none;
 }
 
 .terminal-mobile-keys button,
@@ -166,6 +210,13 @@
 .terminal-mobile-keys button {
   min-width: 48px;
   padding: 0 10px;
+}
+
+.terminal-mobile-keys .terminal-image-button {
+  min-width: 112px;
+  border-color: #315b82;
+  background: #102033;
+  color: #bfdbfe;
 }
 
 .terminal-mobile-submit {

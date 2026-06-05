@@ -41,6 +41,8 @@ export type {
   HostFileEntry,
   PlannerPromptSettings,
   ChatAttachment,
+  GitActionResult,
+  GitFilesView,
   WorkspaceFileDiff,
   WorkspaceValidation,
 } from './services/johnny-api.service';

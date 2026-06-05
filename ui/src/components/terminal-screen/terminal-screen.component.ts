@@ -26,6 +26,12 @@ interface TerminalMermaidBlock {
   source: string;
 }
 
+export interface TerminalImageAttachmentPreview {
+  id: string;
+  previewUrl: string;
+  fileName?: string;
+}
+
 @Component({
   selector: 'johnny-terminal-screen',
   standalone: true,
@@ -41,8 +47,13 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   @Input() mobileInputMode = false;
   @Input() showInput = true;
   @Input() title = 'Terminal';
+  @Input() imageAttachments: TerminalImageAttachmentPreview[] = [];
+  @Input() imageSending = false;
 
   @Output() rawInput = new EventEmitter<string>();
+  @Output() imagePasted = new EventEmitter<File[]>();
+  @Output() imageRemoved = new EventEmitter<string>();
+  @Output() imageMessageSubmitted = new EventEmitter<string>();
   @Output() terminalResize = new EventEmitter<{ cols: number; rows: number }>();
   @Output() historyRequested = new EventEmitter<number>();
   @Output() mermaidRequested = new EventEmitter<string>();
@@ -214,12 +225,27 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   protected submitTerminalInput(): void {
-    if (this.disabled) return;
+    if (this.disabled || this.imageSending) return;
 
-    const input = this.mobileInputBuffer;
+    const input = this.mobileInput?.nativeElement.value ?? this.mobileInputBuffer;
     this.mobileInputBuffer = '';
+    if (this.imageAttachments.length > 0) {
+      this.imageMessageSubmitted.emit(input);
+      this.refocusMobileInput();
+      return;
+    }
     this.rawInput.emit(`${input}\r`);
     this.refocusMobileInput();
+  }
+
+  protected sendEnterInput(): void {
+    if (this.disabled || this.imageSending) return;
+    const input = this.mobileInput?.nativeElement.value ?? this.mobileInputBuffer;
+    if (this.imageAttachments.length > 0 || input.length > 0) {
+      this.submitTerminalInput();
+      return;
+    }
+    this.sendControlInput('\r');
   }
 
   protected sendControlInput(input: string): void {
@@ -251,6 +277,15 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   protected onTerminalInputPaste(event: ClipboardEvent): void {
     if (this.disabled) return;
 
+    const files = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+      file.type.startsWith('image/')
+    );
+    if (files.length > 0) {
+      event.preventDefault();
+      this.imagePasted.emit(files);
+      return;
+    }
+
     const text = event.clipboardData?.getData('text/plain');
     if (!text) return;
 
@@ -265,6 +300,18 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       textarea.selectionStart = cursor;
       textarea.selectionEnd = cursor;
     });
+  }
+
+  protected onTerminalImageBrowse(event: Event): void {
+    if (this.disabled) return;
+
+    const input = event.target as HTMLInputElement;
+    const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'));
+    if (files.length > 0) {
+      this.imagePasted.emit(files);
+    }
+    input.value = '';
+    this.refocusMobileInput();
   }
 
   private refocusMobileInput(): void {
@@ -429,10 +476,10 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   private extractMermaidBlocks(content: string): string[] {
     const blocks: string[] = [];
-    const fencePattern = /(^|\n)(`{3,}|~{3,})[ \t]*mermaid[^\n]*\n([\s\S]*?)(?:\n\2[ \t]*(?=\n|$))/gi;
+    const fencePattern = /(?:^|\n)[ \t]*(`{3,}|~{3,})[ \t]*mermaid[^\n]*\n([\s\S]*?)(?=\n[ \t]*\1[ \t]*(?:\n|$)|$)/gi;
     let match: RegExpExecArray | null;
     while ((match = fencePattern.exec(content)) !== null) {
-      const source = match[3]?.trim();
+      const source = match[2]?.trim();
       if (source) blocks.push(source);
       if (blocks.length >= 8) break;
     }

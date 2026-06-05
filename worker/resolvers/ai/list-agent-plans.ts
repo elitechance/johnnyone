@@ -13,11 +13,12 @@ interface WorkerEnv {
 
 export default async function listAgentPlans(
   _parent: unknown,
-  args: { status?: string; runType?: string },
+  args: { status?: string; runType?: string; onlyExisting?: boolean },
   ctx: ResolverContext,
 ) {
   return desktopRpc<unknown[]>(ctx, 'list_agent_plans', {
     status: args.status ?? null,
     runType: args.runType ?? null,
+    onlyExisting: args.onlyExisting ?? false,
   });
 }

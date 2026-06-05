@@ -106,6 +106,24 @@ function createMarkdownParser(): Marked {
     );
   };
 
+  renderer.table = (token) => {
+    const renderCell = (cell: (typeof token.header)[number], tag: 'th' | 'td'): string => {
+      const align = cell.align ? ` style="text-align: ${cell.align}"` : '';
+      const content = marked.parseInline(cell.text, { gfm: true, breaks: true }) as string;
+      return `<${tag}${align}>${content}</${tag}>`;
+    };
+    const header = token.header.map((cell) => renderCell(cell, 'th')).join('');
+    const rows = token.rows
+      .map((row) => `<tr>${row.map((cell) => renderCell(cell, 'td')).join('')}</tr>`)
+      .join('');
+
+    return (
+      `<div class="markdown-table-wrap">` +
+      `<table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table>` +
+      `</div>`
+    );
+  };
+
   return new Marked({
     gfm: true,
     breaks: true,

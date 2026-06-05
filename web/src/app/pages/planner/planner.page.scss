@@ -12,7 +12,7 @@
 
 .planner-shell {
   @include workspace.shell-vars;
-  height: 100vh;
+  @include workspace.viewport-height;
   display: grid;
   grid-template-rows: 48px 1fr;
   font: 14px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -332,12 +332,53 @@ select {
 
 .agent-message-bar {
   min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
+  display: block;
   padding: 8px;
   border-top: 1px solid #263241;
   background: #0a0f16;
+}
+
+.agent-attachment-previews {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.agent-attachment-preview {
+  position: relative;
+  flex: 0 0 auto;
+  width: 72px;
+  height: 54px;
+  border: 1px solid #263241;
+  background: #07090d;
+}
+
+.agent-attachment-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.agent-attachment-preview button {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid #3a4a5f;
+  background: #121821;
+  color: #dbe7f3;
+  line-height: 18px;
+}
+
+.agent-file-input {
+  display: none;
 }
 
 .agent-message-bar textarea {
@@ -461,6 +502,86 @@ select {
   color: #8fa0b3;
   font-size: 11px;
   font-style: normal;
+}
+
+.event-row-top,
+.event-badges,
+.event-facts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.event-row-top {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.event-time,
+.event-meta,
+.event-facts span {
+  color: #8fa0b3;
+  font-size: 11px;
+}
+
+.event-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: 1px solid #263241;
+  background: #101722;
+  color: #c7d4e2;
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.event-badge.phase {
+  border-color: #315b82;
+  color: #93c5fd;
+  background: #0f2235;
+}
+
+.event-badge.actor {
+  color: #dbe7f3;
+}
+
+.event-badge.category {
+  color: #a7f3d0;
+  border-color: #255c4b;
+  background: #0c1d19;
+}
+
+.event-badge.verdict.pass {
+  color: #86efac;
+  border-color: #1f6b45;
+  background: #0d2017;
+}
+
+.event-badge.verdict.warn {
+  color: #fcd34d;
+  border-color: #7c5a16;
+  background: #221a0b;
+}
+
+.event-badge.verdict.bad {
+  color: #fca5a5;
+  border-color: #7f1d1d;
+  background: #2a1118;
+}
+
+.event-details {
+  border-top: 1px solid rgba(38, 50, 65, 0.7);
+  padding-top: 6px;
+}
+
+.event-details summary {
+  cursor: pointer;
+  color: #9fc9f3;
+  font-size: 11px;
+  user-select: none;
 }
 
 .event-row pre {
@@ -1181,15 +1302,18 @@ label {
 :host ::ng-deep .plan-markdown-preview.markdown-content .markdown-table-wrap {
   max-width: 100%;
   margin: 16px 0;
-  overflow: auto;
+  overflow-x: auto;
   border: 1px solid #263241;
+  border-radius: 10px;
   background: #070c13;
+  -webkit-overflow-scrolling: touch;
 }
 
 :host ::ng-deep .plan-markdown-preview.markdown-content table {
   width: 100%;
   min-width: 560px;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   color: #dbe7f3;
   font-size: 13px;
   line-height: 1.45;
@@ -1202,7 +1326,8 @@ label {
 :host ::ng-deep .plan-markdown-preview.markdown-content th,
 :host ::ng-deep .plan-markdown-preview.markdown-content td {
   padding: 8px 10px;
-  border: 1px solid #263241;
+  border-right: 1px solid #263241;
+  border-bottom: 1px solid #263241;
   text-align: left;
   vertical-align: top;
 }
@@ -1210,6 +1335,16 @@ label {
 :host ::ng-deep .plan-markdown-preview.markdown-content th {
   color: #f3f7fb;
   font-weight: 700;
+  white-space: nowrap;
+}
+
+:host ::ng-deep .plan-markdown-preview.markdown-content th:last-child,
+:host ::ng-deep .plan-markdown-preview.markdown-content td:last-child {
+  border-right: 0;
+}
+
+:host ::ng-deep .plan-markdown-preview.markdown-content tbody tr:last-child td {
+  border-bottom: 0;
 }
 
 :host ::ng-deep .plan-markdown-preview.markdown-content tbody tr:nth-child(even) {
@@ -1451,7 +1586,7 @@ label {
   }
 
   .planner-shell {
-    height: 100dvh;
+    @include workspace.viewport-height;
     min-width: 0;
     grid-template-rows: auto minmax(0, 1fr);
   }
@@ -1591,7 +1726,7 @@ label {
 
   .terminal-card.active-mobile-panel {
     display: grid;
-    grid-template-rows: 38px minmax(0, 1fr);
+    grid-template-rows: 38px minmax(0, 1fr) auto;
   }
 
   .coordinator-panel.active-mobile-panel {
@@ -1629,10 +1764,14 @@ label {
     display: none;
   }
 
+  .agent-message-bar.has-attachments {
+    display: block;
+  }
+
   .modal-backdrop {
     align-items: stretch;
     padding: 10px;
-    padding-bottom: calc(10px + env(safe-area-inset-bottom));
+    @include workspace.safe-bottom-padding(10px);
   }
 
   .setup-modal,
@@ -1823,6 +1962,8 @@ ion-modal.files-ion-modal ion-content,
 ion-modal.setup-ion-modal ion-content {
   flex: 1 1 auto;
   min-height: 0;
+  --padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  scroll-padding-bottom: calc(96px + env(safe-area-inset-bottom));
 }
 
 @media (max-width: workspace.$mobile-breakpoint) {
@@ -1869,6 +2010,62 @@ ion-modal.files-ion-modal .files-crumb code {
 ion-modal.files-ion-modal .files-list {
   background: transparent;
   padding: 0;
+}
+
+ion-modal.files-ion-modal .files-list ion-item {
+  --padding-start: 10px;
+  --inner-padding-end: 10px;
+  --border-color: rgba(38, 50, 65, 0.76);
+}
+
+ion-modal.files-ion-modal .files-list ion-item.git-changed-entry {
+  --background: rgba(251, 191, 36, 0.06);
+}
+
+ion-modal.files-ion-modal .files-list ion-item.git-changed-directory {
+  --border-color: rgba(251, 191, 36, 0.42);
+}
+
+ion-modal.files-ion-modal .files-list ion-item.git-changed-directory::part(native) {
+  border-left: 3px solid #fbbf24;
+}
+
+ion-modal.files-ion-modal .file-entry-icon {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  color: #8fa0b3;
+}
+
+ion-modal.files-ion-modal .file-entry-icon ion-icon {
+  width: 21px;
+  height: 21px;
+}
+
+ion-modal.files-ion-modal .file-entry-icon.modified,
+ion-modal.files-ion-modal .file-entry-icon.changed {
+  color: #fbbf24;
+}
+
+ion-modal.files-ion-modal .file-entry-icon.added {
+  color: #57d68d;
+}
+
+ion-modal.files-ion-modal .file-entry-icon.deleted {
+  color: #fb7185;
+}
+
+ion-modal.files-ion-modal .git-status-dot {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--ion-background-color, #0d1117);
+  border-radius: 999px;
+  background: currentColor;
 }
 
 ion-modal.files-ion-modal .files-empty {
@@ -2017,14 +2214,9 @@ ion-modal.files-ion-modal .task-status-detail {
    the content host changes Ionic's header/content/footer measurement and can
    push modal actions outside the visible viewport on mobile browsers. */
 @media (max-width: workspace.$mobile-breakpoint) {
-  ion-modal.files-ion-modal ion-header,
-  ion-modal.setup-ion-modal ion-header {
-    padding-top: env(safe-area-inset-top);
-  }
-
-  ion-modal.files-ion-modal ion-footer,
-  ion-modal.setup-ion-modal ion-footer {
-    padding-bottom: env(safe-area-inset-bottom);
+  ion-modal.files-ion-modal,
+  ion-modal.setup-ion-modal {
+    @include workspace.mobile-ionic-safe-bars;
   }
 }
 

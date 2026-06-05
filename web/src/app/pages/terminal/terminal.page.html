@@ -92,10 +92,15 @@
           [title]="session.title || 'Terminal'"
           [disabled]="session.id !== currentSession()?.id"
           [mobileInputMode]="isCompactWorkspace()"
+          [imageAttachments]="pendingAttachmentsForSession(session.id)"
+          [imageSending]="isSendingAttachmentsForSession(session.id)"
           (rawInput)="onTerminalRawInput($event, session.id)"
           (terminalResize)="onTerminalResize($event, session.id)"
           (historyRequested)="onTerminalHistoryRequested($event, session.id)"
           (mermaidRequested)="openTerminalMermaid($event)"
+          (imagePasted)="addPendingImageFiles(session.id, $event)"
+          (imageRemoved)="removePendingAttachment(session.id, $event)"
+          (imageMessageSubmitted)="sendAttachmentMessage(session.id, $event)"
         />
 
         <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>
@@ -115,36 +120,8 @@
   </main>
 
   <footer class="workspace-statusbar">
-    @if (pendingAttachments().length > 0) {
-      <div class="attachment-composer">
-        <div class="attachment-previews" aria-label="Pending image attachments">
-          @for (attachment of pendingAttachments(); track attachment.id) {
-            <div class="attachment-preview">
-              <img [src]="attachment.previewUrl" [alt]="attachment.file.name || 'Pasted image'" />
-              <button type="button" title="Remove image" (click)="removePendingAttachment(attachment.id)">×</button>
-            </div>
-          }
-        </div>
-        <textarea
-          [(ngModel)]="attachmentMessage"
-          rows="2"
-          placeholder="Message with image"
-          [disabled]="isSendingAttachments()"
-        ></textarea>
-        <button
-          type="button"
-          class="primary-action"
-          [disabled]="isSendingAttachments() || !currentSession()"
-          (click)="sendAttachmentMessage()"
-        >
-          {{ isSendingAttachments() ? 'Sending…' : 'Send image' }}
-        </button>
-      </div>
-    } @else {
-      <span>relay <strong>connected</strong></span>
-      <span>paste or drop images to attach</span>
-      <span>raw input batched at <strong>200ms</strong></span>
-    }
+    <span>relay <strong>connected</strong></span>
+    <span>raw input batched at <strong>200ms</strong></span>
   </footer>
 </div>
 

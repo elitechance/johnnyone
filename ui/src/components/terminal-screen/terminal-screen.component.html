@@ -47,13 +47,25 @@
       (click)="$event.stopPropagation()"
       (submit)="$event.preventDefault(); submitTerminalInput()"
     >
+      @if (imageAttachments.length > 0) {
+        <div class="terminal-image-previews" aria-label="Selected images">
+          @for (image of imageAttachments; track image.id) {
+            <div class="terminal-image-preview">
+              <img [src]="image.previewUrl" [alt]="image.fileName || 'Selected image'" />
+              <button type="button" title="Remove image" (click)="imageRemoved.emit(image.id)" [disabled]="disabled || imageSending">×</button>
+            </div>
+          }
+        </div>
+      }
       <div class="terminal-mobile-keys" aria-label="Terminal controls">
+        <input #terminalImageInput class="terminal-image-input" type="file" accept="image/*" multiple (change)="onTerminalImageBrowse($event)" />
+        <button type="button" class="terminal-image-button" (click)="terminalImageInput.click()" [disabled]="disabled || imageSending">Upload image</button>
         <button type="button" (click)="sendControlInput('\t')" [disabled]="disabled">Tab</button>
         <button type="button" (click)="sendControlInput('\u001b')" [disabled]="disabled">Esc</button>
         <button type="button" (click)="sendControlInput('\u0003')" [disabled]="disabled">Ctrl-C</button>
         <button type="button" (click)="sendControlInput('\u001b[A')" [disabled]="disabled">↑</button>
         <button type="button" (click)="sendControlInput('\u001b[B')" [disabled]="disabled">↓</button>
-        <button type="button" (click)="sendControlInput('\r')" [disabled]="disabled">Enter</button>
+        <button type="button" (click)="sendEnterInput()" [disabled]="disabled || imageSending">Enter</button>
       </div>
 
       <div class="terminal-mobile-submit">
@@ -71,7 +83,7 @@
           autocorrect="off"
           spellcheck="false"
         ></textarea>
-        <button type="submit" [disabled]="disabled">Send</button>
+        <button type="submit" [disabled]="disabled || imageSending">{{ imageSending ? 'Sending' : 'Send' }}</button>
       </div>
     </form>
   }

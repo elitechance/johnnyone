@@ -3,14 +3,10 @@ import { desktopRpc } from '../../lib/runtime/desktop-rpc';
 interface ResolverContext { db: D1Database; env: WorkerEnv; auth: { userId: string; tenantId: string } }
 interface WorkerEnv { CHAT_RELAY_DO: DurableObjectNamespace; [key: string]: unknown }
 
-export default async function startAgentPlan(
+export default async function gitFileView(
   _parent: unknown,
-  args: { id: string; phaseId?: string | null; phaseRunMode?: string | null },
+  args: { planId: string; path?: string | null },
   ctx: ResolverContext,
 ) {
-  return desktopRpc<unknown>(ctx, 'start_agent_plan', {
-    id: args.id,
-    phaseId: args.phaseId ?? null,
-    phaseRunMode: args.phaseRunMode ?? null,
-  });
+  return desktopRpc<unknown>(ctx, 'git_file_view', { id: args.planId, path: args.path ?? null });
 }

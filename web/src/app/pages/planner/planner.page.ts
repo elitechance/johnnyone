@@ -16,8 +16,6 @@ import {
   IonContent,
   IonIcon,
   IonText,
-  IonSegment,
-  IonSegmentButton,
   IonLabel,
   IonList,
   IonItem,
@@ -35,21 +33,41 @@ import {
   IonChip,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import { closeOutline } from 'ionicons/icons';
+import {
+  codeSlashOutline,
+  closeOutline,
+  documentOutline,
+  documentTextOutline,
+  folderOpenOutline,
+  folderOutline,
+  imageOutline,
+} from 'ionicons/icons';
 
 // Register the close icon for the Files modal's close button.
-addIcons({ 'close-outline': closeOutline });
+addIcons({
+  'code-slash-outline': codeSlashOutline,
+  'close-outline': closeOutline,
+  'document-outline': documentOutline,
+  'document-text-outline': documentTextOutline,
+  'folder-open-outline': folderOpenOutline,
+  'folder-outline': folderOutline,
+  'image-outline': imageOutline,
+});
 import { firstValueFrom, Subscription } from 'rxjs';
 import { Marked, marked } from 'marked';
 import mermaid from 'mermaid';
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
 import { MermaidZoomService } from '../../services/mermaid-zoom.service';
+import { PendingImageAttachment } from '../../components/image-attachment-composer/image-attachment-composer.component';
 import {
   AgentPlan,
   AgentPlanPhase,
   AgentPlanTask,
   AgentPlanRun,
+  ChatAttachment,
+  GitActionResult,
+  GitFilesView,
   HostFileContent,
   HostFileEntry,
   JohnnyApiService,
@@ -61,6 +79,7 @@ import {
 import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 
 type PlannerMobilePanel = 'worker' | 'reviewer' | 'coordinator';
+type PlannerTerminalRole = 'worker' | 'reviewer';
 
 interface TaskStatusDetail {
   loading: boolean;
@@ -90,8 +109,6 @@ interface TaskStatusDetail {
     IonContent,
     IonIcon,
     IonText,
-    IonSegment,
-    IonSegmentButton,
     IonLabel,
     IonList,
     IonItem,
@@ -127,6 +144,7 @@ export class PlannerPage implements OnInit, OnDestroy {
   private fileResizeCleanup: (() => void) | null = null;
   private compactWorkspaceMediaQuery: MediaQueryList | null = null;
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
+  private selectedWorkspaceHtmlObjectUrl: string | null = null;
   private selectedPlanHtmlObjectUrl: string | null = null;
   private plannerVisualSubscriptions = new Set<string>();
   private readonly visibilityChangeHandler = () => {
@@ -142,16 +160,28 @@ export class PlannerPage implements OnInit, OnDestroy {
   currentRun = signal<AgentPlanRun | null>(null);
   terminalScreens = signal<Record<string, TerminalScreen>>({});
   setupOpen = signal(false);
+  existingPlansOpen = signal(false);
+  existingPlansLoading = signal(false);
+  existingPlans = signal<AgentPlan[]>([]);
+  renameOpen = signal(false);
   filesOpen = signal(false);
   amendOpen = signal(false);
   isAmendBusy = signal(false);
   isRefreshingPhases = signal(false);
   amendBrief = '';
-  filesTab = signal<'changes' | 'plan'>('changes');
-  fileMode = signal<'changed' | 'all'>('changed');
+  renameDraft = '';
+  gitFilesView = signal<GitFilesView | null>(null);
+  gitActionOutput = signal<GitActionResult | null>(null);
+  gitActionBusy = signal<string | null>(null);
+  gitCommitMessage = '';
+  fileMode = signal<'changed' | 'all'>('all');
   workspaceBrowsePath = signal('');
   workspaceFiles = signal<HostFileEntry[]>([]);
   selectedWorkspaceFile = signal<HostFileEntry | null>(null);
+  selectedWorkspaceContent = signal<HostFileContent | null>(null);
+  renderedWorkspaceHtml = signal<SafeHtml>('');
+  selectedWorkspaceHtmlUrl = signal<SafeResourceUrl | null>(null);
+  selectedWorkspaceLoading = signal(false);
   workspaceDiff = signal<string>('');
   planBrowsePath = signal('');
   planFiles = signal<HostFileEntry[]>([]);
@@ -171,9 +201,14 @@ export class PlannerPage implements OnInit, OnDestroy {
   phaseTasksOpen = signal(false);
   selectedPhaseId = signal<string | null>(null);
   selectedStartPhaseId = signal<string>('');
+  selectedPhaseRunMode = signal<'continue' | 'single'>('continue');
   taskStatusDetails = signal<Record<string, TaskStatusDetail>>({});
   workerMessage = signal('');
   reviewerMessage = signal('');
+  workerPendingAttachments = signal<PendingImageAttachment[]>([]);
+  reviewerPendingAttachments = signal<PendingImageAttachment[]>([]);
+  isSendingWorkerAttachments = signal(false);
+  isSendingReviewerAttachments = signal(false);
   coordinatorHeight = signal(280);
   fileSidebarWidth = signal(330);
   isCompactWorkspace = signal(false);
@@ -275,6 +310,19 @@ export class PlannerPage implements OnInit, OnDestroy {
     if (!content || !content.contentType.startsWith('image/')) return '';
     return `data:${content.contentType};base64,${content.content}`;
   });
+  selectedWorkspacePreviewKind = computed(() => {
+    const content = this.selectedWorkspaceContent();
+    if (!content) return 'diff';
+    if (content.contentType.startsWith('image/')) return 'image';
+    if (content.contentType === 'text/html') return 'html';
+    if (content.contentType === 'text/markdown') return 'markdown';
+    return 'diff';
+  });
+  selectedWorkspaceImageSrc = computed(() => {
+    const content = this.selectedWorkspaceContent();
+    if (!content || !content.contentType.startsWith('image/')) return '';
+    return `data:${content.contentType};base64,${content.content}`;
+  });
   selectedPlanRawText = computed(() => {
     const content = this.selectedPlanContent();
     if (!content) return '';
@@ -318,6 +366,9 @@ export class PlannerPage implements OnInit, OnDestroy {
     this.teardownCompactWorkspaceMode();
     this.terminalSubscription?.unsubscribe();
     this.plannerSubscription?.unsubscribe();
+    this.clearPendingAttachments('worker');
+    this.clearPendingAttachments('reviewer');
+    this.clearSelectedWorkspaceHtmlUrl();
     this.clearSelectedPlanHtmlUrl();
   }
 
@@ -340,25 +391,78 @@ export class PlannerPage implements OnInit, OnDestroy {
     this.setupOpen.set(false);
   }
 
+  async openExistingPlans(): Promise<void> {
+    this.error.set(null);
+    this.existingPlansOpen.set(true);
+    await this.loadExistingPlans();
+  }
+
+  closeExistingPlans(): void {
+    this.existingPlansOpen.set(false);
+  }
+
+  async loadExistingPlans(): Promise<void> {
+    this.existingPlansLoading.set(true);
+    try {
+      const plans = await firstValueFrom(this.api.listAgentPlans(undefined, this.runType(), true));
+      this.existingPlans.set(plans);
+    } catch (err) {
+      this.error.set(String(err));
+      this.existingPlans.set([]);
+    } finally {
+      this.existingPlansLoading.set(false);
+    }
+  }
+
+  async openExistingPlan(id: string): Promise<void> {
+    this.closeExistingPlans();
+    await this.selectPlan(id);
+    const run = this.currentRun();
+    if (run && !this.plans().some((plan) => plan.id === run.plan.id)) {
+      this.plans.update((plans) => [run.plan, ...plans]);
+    }
+  }
+
   async openPathBrowser(mode: 'workspace' | 'plan' | 'appScope' | 'docsScope' | 'reference'): Promise<void> {
     this.browserMode.set(mode);
     this.browserOpen.set(true);
     const startPath = this.browserStartPath(mode);
-    await this.loadBrowsePath(startPath);
+    const loaded = await this.loadBrowsePath(startPath);
+    if (!loaded && mode === 'plan') {
+      await this.loadNearestBrowseParent(startPath);
+    }
   }
 
   closePathBrowser(): void {
     this.browserOpen.set(false);
   }
 
-  async loadBrowsePath(path: string): Promise<void> {
+  async loadBrowsePath(path: string): Promise<boolean> {
     this.browsePath = path || '/';
     this.browserError.set(null);
     try {
       this.browserEntries.set(await firstValueFrom(this.api.browseHostDirectory(this.browsePath)));
+      return true;
     } catch (err) {
       this.browserEntries.set([]);
       this.browserError.set(String(err));
+      return false;
+    }
+  }
+
+  private async loadNearestBrowseParent(path: string): Promise<void> {
+    let current = this.clampToWorkspace(path);
+    const workspace = this.workspacePath.replace(/\/+$/, '');
+    while (current && current !== '/') {
+      current = this.parentPath(current);
+      if (workspace && !current.startsWith(workspace)) {
+        current = workspace;
+      }
+      if (await this.loadBrowsePath(current)) return;
+      if (current === workspace) break;
+    }
+    if (workspace) {
+      await this.loadBrowsePath(workspace);
     }
   }
 
@@ -444,10 +548,7 @@ export class PlannerPage implements OnInit, OnDestroy {
 
       // If the Files modal is open, refresh its contents for the new plan.
       if (this.filesOpen()) {
-        await Promise.all([
-          this.loadWorkspaceFiles(this.fileMode()),
-          this.loadPlanFiles(this.planRootPath()),
-        ]);
+        await this.loadGitFiles(this.workspaceRootPath());
       }
     } catch (err) {
       this.error.set(String(err));
@@ -469,7 +570,15 @@ export class PlannerPage implements OnInit, OnDestroy {
     // Files modal state.
     this.workspaceBrowsePath.set('');
     this.workspaceFiles.set([]);
+    this.gitFilesView.set(null);
+    this.gitActionOutput.set(null);
+    this.gitActionBusy.set(null);
+    this.gitCommitMessage = '';
     this.selectedWorkspaceFile.set(null);
+    this.selectedWorkspaceContent.set(null);
+    this.renderedWorkspaceHtml.set('');
+    this.clearSelectedWorkspaceHtmlUrl();
+    this.selectedWorkspaceLoading.set(false);
     this.workspaceDiff.set('');
     this.filesError.set(null);
 
@@ -564,6 +673,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       const run = await firstValueFrom(this.api.startAgentPlan(
         id,
         this.mode() === 'development' ? this.selectedStartPhaseId() || undefined : undefined,
+        this.mode() === 'development' ? this.selectedPhaseRunMode() : undefined,
       ));
       this.currentRun.set(run);
       this.ensureActiveMobilePanel(run);
@@ -592,6 +702,40 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.error.set(String(err));
     } finally {
       this.isRefreshingPhases.set(false);
+    }
+  }
+
+  openRenameCurrentPlan(): void {
+    const run = this.currentRun();
+    if (!run || this.isBusy()) return;
+    this.renameDraft = run.plan.title;
+    this.renameOpen.set(true);
+  }
+
+  closeRenameCurrentPlan(): void {
+    this.renameOpen.set(false);
+    this.renameDraft = '';
+  }
+
+  async renameCurrentPlan(): Promise<void> {
+    const run = this.currentRun();
+    if (!run || this.isBusy()) return;
+
+    const trimmedTitle = this.renameDraft.trim();
+    if (!trimmedTitle || trimmedTitle === run.plan.title) return;
+
+    this.isBusy.set(true);
+    this.error.set(null);
+    try {
+      const updated = await firstValueFrom(this.api.updateAgentPlanTitle(run.plan.id, trimmedTitle));
+      this.currentRun.set(updated);
+      this.upsertPlanSummary(updated.plan);
+      this.ensureActiveMobilePanel(updated);
+      this.closeRenameCurrentPlan();
+    } catch (err) {
+      this.error.set(String(err));
+    } finally {
+      this.isBusy.set(false);
     }
   }
 
@@ -748,56 +892,40 @@ export class PlannerPage implements OnInit, OnDestroy {
     if (!planId) return;
     this.fileMode.set(mode);
     this.filesOpen.set(true);
-    this.filesTab.set('changes');
     this.filesError.set(null);
-    await Promise.all([
-      this.loadWorkspaceFiles(mode),
-      this.loadPlanFiles(this.planBrowsePath() || this.planRootPath()),
-    ]);
+    await this.loadGitFiles(this.workspaceBrowsePath() || this.workspaceRootPath());
   }
 
-  async setFilesTab(tab: 'changes' | 'plan'): Promise<void> {
-    this.filesTab.set(tab);
-    if (tab === 'changes' && this.workspaceFiles().length === 0) {
-      await this.loadWorkspaceFiles(this.fileMode());
-    }
-    if (tab === 'plan' && this.planFiles().length === 0) {
-      await this.loadPlanFiles(this.planBrowsePath() || this.planRootPath());
+  async loadGitFiles(path?: string): Promise<void> {
+    const planId = this.currentRun()?.plan.id;
+    if (!planId) return;
+    this.filesError.set(null);
+    try {
+      const browsePath = path || this.workspaceBrowsePath() || this.workspaceRootPath();
+      const view = await firstValueFrom(this.api.gitFileView(planId, browsePath));
+      this.workspaceBrowsePath.set(view.path);
+      this.gitFilesView.set(view);
+      this.workspaceFiles.set(view.entries);
+      this.selectedWorkspaceFile.set(null);
+      this.selectedWorkspaceContent.set(null);
+      this.renderedWorkspaceHtml.set('');
+      this.clearSelectedWorkspaceHtmlUrl();
+      this.workspaceDiff.set('');
+    } catch (err) {
+      this.filesError.set(String(err));
+      this.gitFilesView.set(null);
+      this.workspaceFiles.set([]);
+      this.selectedWorkspaceFile.set(null);
+      this.selectedWorkspaceContent.set(null);
+      this.renderedWorkspaceHtml.set('');
+      this.clearSelectedWorkspaceHtmlUrl();
+      this.workspaceDiff.set('');
     }
   }
 
   async loadWorkspaceFiles(mode: 'changed' | 'all' = this.fileMode(), path?: string): Promise<void> {
-    const planId = this.currentRun()?.plan.id;
-    if (!planId) return;
     this.fileMode.set(mode);
-    this.filesError.set(null);
-    try {
-      const browsePath = path || this.workspaceBrowsePath() || this.workspaceRootPath();
-      const files = mode === 'changed'
-        ? await firstValueFrom(this.api.listWorkspaceFiles(planId, mode))
-        : await firstValueFrom(this.api.browseHostDirectory(browsePath));
-      if (mode === 'all') {
-        this.workspaceBrowsePath.set(browsePath);
-      }
-      this.workspaceFiles.set(files);
-      const firstFile = files.find((entry) => entry.kind === 'file');
-      if (mode === 'changed' && firstFile) {
-        await this.selectWorkspaceFile(firstFile);
-      } else if (mode === 'all') {
-        this.selectedWorkspaceFile.set(null);
-        this.workspaceDiff.set('');
-      } else if (firstFile) {
-        await this.selectWorkspaceFile(firstFile);
-      } else {
-        this.selectedWorkspaceFile.set(null);
-        this.workspaceDiff.set('');
-      }
-    } catch (err) {
-      this.filesError.set(String(err));
-      this.workspaceFiles.set([]);
-      this.selectedWorkspaceFile.set(null);
-      this.workspaceDiff.set('');
-    }
+    await this.loadGitFiles(path);
   }
 
   closeFiles(): void {
@@ -808,28 +936,74 @@ export class PlannerPage implements OnInit, OnDestroy {
     const planId = this.currentRun()?.plan.id;
     if (!planId || file.kind !== 'file') return;
     this.selectedWorkspaceFile.set(file);
+    this.selectedWorkspaceContent.set(null);
+    this.renderedWorkspaceHtml.set('');
+    this.clearSelectedWorkspaceHtmlUrl();
+    this.selectedWorkspaceLoading.set(true);
     this.filesError.set(null);
     try {
-      const result = await firstValueFrom(this.api.getWorkspaceFileDiff(planId, file.path));
+      const [result, content] = await Promise.all([
+        firstValueFrom(this.api.getWorkspaceFileDiff(planId, file.path)),
+        firstValueFrom(this.api.readHostFile(planId, file.path)).catch(() => null),
+      ]);
       this.workspaceDiff.set(result.diff);
+      this.selectedWorkspaceContent.set(content);
+      if (content?.contentType === 'text/markdown' && content.encoding === 'utf8') {
+        this.clearSelectedWorkspaceHtmlUrl();
+        this.renderedWorkspaceHtml.set(this.sanitizer.bypassSecurityTrustHtml(this.markdownParser.parse(content.content) as string));
+        window.setTimeout(() => void this.renderMermaid(), 0);
+      } else if (content?.contentType === 'text/html' && content.encoding === 'utf8') {
+        this.renderedWorkspaceHtml.set('');
+        this.setSelectedWorkspaceHtmlUrl(content.content);
+      } else {
+        this.clearSelectedWorkspaceHtmlUrl();
+        this.renderedWorkspaceHtml.set('');
+      }
     } catch (err) {
       this.workspaceDiff.set('');
+      this.clearSelectedWorkspaceHtmlUrl();
       this.filesError.set(String(err));
+    } finally {
+      this.selectedWorkspaceLoading.set(false);
     }
   }
 
   async browseWorkspaceParent(): Promise<void> {
     const current = this.workspaceBrowsePath() || this.workspaceRootPath();
     if (!current) return;
-    await this.loadWorkspaceFiles('all', this.parentPath(current));
+    await this.loadGitFiles(this.parentPath(current));
   }
 
   async selectWorkspaceEntry(entry: HostFileEntry): Promise<void> {
-    if (this.fileMode() === 'all' && entry.kind === 'directory') {
-      await this.loadWorkspaceFiles('all', entry.path);
+    if (entry.kind === 'directory') {
+      await this.loadGitFiles(entry.path);
       return;
     }
     await this.selectWorkspaceFile(entry);
+  }
+
+  async runGitAction(action: 'fetch' | 'pull' | 'push' | 'commit'): Promise<void> {
+    const planId = this.currentRun()?.plan.id;
+    if (!planId || this.gitActionBusy()) return;
+    this.gitActionBusy.set(action);
+    this.gitActionOutput.set(null);
+    this.filesError.set(null);
+    try {
+      const result = await firstValueFrom(this.api.runGitAction(planId, {
+        path: this.workspaceBrowsePath() || this.workspaceRootPath(),
+        action,
+        message: action === 'commit' ? this.gitCommitMessage : undefined,
+      }));
+      this.gitActionOutput.set(result);
+      if (result.success && action === 'commit') {
+        this.gitCommitMessage = '';
+      }
+      await this.loadGitFiles(this.workspaceBrowsePath() || this.workspaceRootPath());
+    } catch (err) {
+      this.filesError.set(String(err));
+    } finally {
+      this.gitActionBusy.set(null);
+    }
   }
 
   async loadPlanFiles(path: string, options: { autoSelectFirst?: boolean } = {}): Promise<void> {
@@ -951,9 +1125,6 @@ export class PlannerPage implements OnInit, OnDestroy {
     // where the preview pane lives.
     if (!this.filesOpen()) {
       this.filesOpen.set(true);
-      this.filesTab.set('plan');
-    } else if (this.filesTab() !== 'plan') {
-      this.filesTab.set('plan');
     }
     await this.selectPlanFile({
       path,
@@ -1039,6 +1210,21 @@ export class PlannerPage implements OnInit, OnDestroy {
     this.selectedPlanHtmlUrl.set(this.sanitizer.bypassSecurityTrustResourceUrl(this.selectedPlanHtmlObjectUrl));
   }
 
+  private setSelectedWorkspaceHtmlUrl(html: string): void {
+    this.clearSelectedWorkspaceHtmlUrl();
+    const blob = new Blob([html], { type: 'text/html' });
+    this.selectedWorkspaceHtmlObjectUrl = URL.createObjectURL(blob);
+    this.selectedWorkspaceHtmlUrl.set(this.sanitizer.bypassSecurityTrustResourceUrl(this.selectedWorkspaceHtmlObjectUrl));
+  }
+
+  private clearSelectedWorkspaceHtmlUrl(): void {
+    if (this.selectedWorkspaceHtmlObjectUrl) {
+      URL.revokeObjectURL(this.selectedWorkspaceHtmlObjectUrl);
+      this.selectedWorkspaceHtmlObjectUrl = null;
+    }
+    this.selectedWorkspaceHtmlUrl.set(null);
+  }
+
   private clearSelectedPlanHtmlUrl(): void {
     if (this.selectedPlanHtmlObjectUrl) {
       URL.revokeObjectURL(this.selectedPlanHtmlObjectUrl);
@@ -1063,11 +1249,7 @@ export class PlannerPage implements OnInit, OnDestroy {
   }
 
   workspaceEntryLabel(file: HostFileEntry): string {
-    return this.fileMode() === 'all' ? file.name : file.path;
-  }
-
-  fileStatusLabel(file: HostFileEntry): string {
-    return file.status || file.kind;
+    return file.name;
   }
 
   fileStatusClass(file: HostFileEntry): string {
@@ -1075,13 +1257,51 @@ export class PlannerPage implements OnInit, OnDestroy {
     if (status.includes('A') || status === 'added') return 'added';
     if (status.includes('D') || status === 'deleted') return 'deleted';
     if (status.includes('M') || status === 'modified') return 'modified';
+    if (status === 'changed') return 'modified';
     return this.statusClass(status);
+  }
+
+  fileIcon(file: HostFileEntry): string {
+    if (file.kind === 'directory') {
+      return this.hasGitChange(file) ? 'folder-open-outline' : 'folder-outline';
+    }
+    if (this.isImageEntry(file.name)) return 'image-outline';
+    if (this.isMarkdownEntry(file.name)) return 'document-text-outline';
+    if (/\.(js|ts|tsx|jsx|json|rs|go|py|java|kt|swift|c|cc|cpp|h|hpp|css|scss|html|xml|yaml|yml|toml|sql|sh)$/i.test(file.name)) {
+      return 'code-slash-outline';
+    }
+    return 'document-outline';
+  }
+
+  fileStatusTitle(file: HostFileEntry): string {
+    if (!file.status) {
+      return file.kind === 'directory' ? 'Directory' : 'File';
+    }
+    if (file.kind === 'directory') {
+      return 'Directory contains git changes';
+    }
+    if (file.status.includes('A') || file.status === 'added') return 'Added file';
+    if (file.status.includes('D') || file.status === 'deleted') return 'Deleted file';
+    if (file.status.includes('M') || file.status === 'modified') return 'Modified file';
+    return `Git status: ${file.status}`;
+  }
+
+  hasGitChange(file: HostFileEntry): boolean {
+    return !!file.status && file.status !== 'clean';
   }
 
   fileKind(entry: HostFileEntry): string {
     if (entry.kind === 'directory') return 'dir';
     const ext = entry.name.includes('.') ? entry.name.split('.').pop() : 'file';
     return ext?.toLowerCase() || 'file';
+  }
+
+  private isImageEntry(name: string): boolean {
+    return /\.(avif|gif|jpe?g|png|svg|webp)$/i.test(name);
+  }
+
+  private isMarkdownEntry(name: string): boolean {
+    return /\.(markdown|md|mdown|mkd)$/i.test(name);
   }
 
   openPhaseTasks(phase: AgentPlanPhase): void {
@@ -1099,19 +1319,114 @@ export class PlannerPage implements OnInit, OnDestroy {
   }
 
   async sendWorkerMessage(): Promise<void> {
-    const sessionId = this.currentRun()?.plan.workerSessionId;
-    const message = this.workerMessage().trim();
-    if (!sessionId || !message) return;
-    this.workerMessage.set('');
-    await this.relayTerminal.sendInput(sessionId, `${message}\r`);
+    await this.sendPlannerMessage('worker');
   }
 
   async sendReviewerMessage(): Promise<void> {
-    const sessionId = this.currentRun()?.plan.reviewerSessionId;
-    const message = this.reviewerMessage().trim();
-    if (!sessionId || !message) return;
-    this.reviewerMessage.set('');
-    await this.relayTerminal.sendInput(sessionId, `${message}\r`);
+    await this.sendPlannerMessage('reviewer');
+  }
+
+  async sendPlannerAttachmentMessage(role: PlannerTerminalRole, message: string): Promise<void> {
+    await this.sendPlannerMessage(role, message);
+  }
+
+  onPlannerImagePaste(role: PlannerTerminalRole, event: ClipboardEvent): void {
+    const files = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+      file.type.startsWith('image/')
+    );
+    if (files.length === 0) return;
+    event.preventDefault();
+    this.addPendingImageFiles(role, files);
+  }
+
+  onPlannerImageDragOver(event: DragEvent): void {
+    if (!this.dragEventHasImage(event)) return;
+    event.preventDefault();
+  }
+
+  onPlannerImageDrop(role: PlannerTerminalRole, event: DragEvent): void {
+    const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
+      file.type.startsWith('image/')
+    );
+    if (files.length === 0) return;
+    event.preventDefault();
+    this.addPendingImageFiles(role, files);
+  }
+
+  onPlannerImageBrowse(role: PlannerTerminalRole, event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'));
+    if (files.length > 0) {
+      this.addPendingImageFiles(role, files);
+    }
+    input.value = '';
+  }
+
+  addPendingImageFiles(role: PlannerTerminalRole, files: File[]): void {
+    const items = files.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }));
+    this.pendingAttachmentsSignal(role).update((current) => [...current, ...items]);
+  }
+
+  removePendingAttachment(role: PlannerTerminalRole, id: string): void {
+    this.pendingAttachmentsSignal(role).update((items) => {
+      const target = items.find((item) => item.id === id);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return items.filter((item) => item.id !== id);
+    });
+  }
+
+  private async sendPlannerMessage(role: PlannerTerminalRole, messageOverride?: string): Promise<void> {
+    const sessionId = role === 'worker'
+      ? this.currentRun()?.plan.workerSessionId
+      : this.currentRun()?.plan.reviewerSessionId;
+    const messageSignal = role === 'worker' ? this.workerMessage : this.reviewerMessage;
+    const sendingSignal = role === 'worker' ? this.isSendingWorkerAttachments : this.isSendingReviewerAttachments;
+    const attachments = this.pendingAttachmentsSignal(role)();
+    const message = (messageOverride ?? messageSignal()).trim();
+    if (!sessionId || sendingSignal() || (!message && attachments.length === 0)) return;
+
+    if (attachments.length === 0) {
+      messageSignal.set('');
+      await this.relayTerminal.sendInput(sessionId, `${message}\r`);
+      return;
+    }
+
+    sendingSignal.set(true);
+    try {
+      const uploaded: ChatAttachment[] = [];
+      for (const item of attachments) {
+        uploaded.push(
+          await firstValueFrom(this.api.createChatAttachment({
+            sessionId,
+            originalName: item.file.name || 'clipboard-image.png',
+            contentType: item.file.type || 'image/png',
+            dataBase64: await this.fileToBase64(item.file),
+          }))
+        );
+      }
+
+      await this.relayTerminal.sendInputWithAttachments(
+        sessionId,
+        `${message || 'Please review the attached image.'}\r`,
+        uploaded.map((attachment) => ({
+          id: attachment.id,
+          originalName: attachment.originalName,
+          contentType: attachment.contentType,
+          size: attachment.size,
+        })),
+      );
+
+      messageSignal.set('');
+      this.clearPendingAttachments(role);
+    } catch (err) {
+      this.error.set(`Failed to send image attachment: ${String(err)}`);
+    } finally {
+      sendingSignal.set(false);
+    }
   }
 
   async sendPlannerRawInput(role: 'worker' | 'reviewer', data: string): Promise<void> {
@@ -1137,6 +1452,35 @@ export class PlannerPage implements OnInit, OnDestroy {
 
   openTerminalMermaid(svg: string): void {
     this.mermaidZoom.open(svg);
+  }
+
+  private pendingAttachmentsSignal(role: PlannerTerminalRole) {
+    return role === 'worker' ? this.workerPendingAttachments : this.reviewerPendingAttachments;
+  }
+
+  private clearPendingAttachments(role: PlannerTerminalRole): void {
+    for (const item of this.pendingAttachmentsSignal(role)()) {
+      URL.revokeObjectURL(item.previewUrl);
+    }
+    this.pendingAttachmentsSignal(role).set([]);
+  }
+
+  private fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error ?? new Error('Failed to read image'));
+      reader.onload = () => {
+        const value = String(reader.result ?? '');
+        resolve(value.includes(',') ? value.split(',').pop() ?? '' : value);
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  private dragEventHasImage(event: DragEvent): boolean {
+    return Array.from(event.dataTransfer?.items ?? []).some((item) =>
+      item.kind === 'file' && item.type.startsWith('image/')
+    );
   }
 
   phaseTaskCount(phaseId: string): number {
@@ -1195,12 +1539,25 @@ export class PlannerPage implements OnInit, OnDestroy {
     window.addEventListener('pointerup', up);
   }
 
-  eventPayload(event: { payloadJson: string }): string {
+  eventDetails(event: { payloadJson: string }): string {
     try {
       return JSON.stringify(JSON.parse(event.payloadJson), null, 2);
     } catch {
       return event.payloadJson;
     }
+  }
+
+  eventHasDetails(event: { payloadJson: string }): boolean {
+    const raw = event.payloadJson?.trim();
+    return !!raw && raw !== '{}' && raw !== 'null';
+  }
+
+  eventPhaseLabel(event: { phaseIndex?: number | null; phaseTitle?: string | null; phaseId?: string | null }): string {
+    const prefix = event.phaseIndex !== undefined && event.phaseIndex !== null
+      ? `P${event.phaseIndex + 1}`
+      : 'Run';
+    const suffix = event.phaseTitle || event.phaseId;
+    return suffix ? `${prefix} · ${suffix}` : prefix;
   }
 
   private async loadPhaseTaskStatuses(phaseId: string): Promise<void> {
@@ -1311,15 +1668,9 @@ export class PlannerPage implements OnInit, OnDestroy {
         return;
       }
       if (!update.run) return;
+      if (update.run.plan.runType !== this.runType()) return;
       this.currentRun.update((current) => current?.plan.id === update.planId ? update.run! : current);
-      this.plans.update((plans) => {
-        const plan = update.run!.plan;
-        const index = plans.findIndex((item) => item.id === plan.id);
-        if (index === -1) return [plan, ...plans];
-        const next = [...plans];
-        next[index] = plan;
-        return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      });
+      this.upsertPlanSummary(update.run.plan);
       if (this.currentRun()?.plan.id === update.planId) {
         this.ensureActiveMobilePanel(update.run);
         void this.attachPlanTerminals(update.run);
@@ -1355,6 +1706,23 @@ export class PlannerPage implements OnInit, OnDestroy {
     if (active === 'worker' && !run.plan.workerSessionId && run.plan.reviewerSessionId) {
       this.activeMobilePanel.set('reviewer');
     }
+  }
+
+  private upsertPlanSummary(plan: AgentPlan): void {
+    this.plans.update((plans) => {
+      const index = plans.findIndex((item) => item.id === plan.id);
+      if (index === -1) return [plan, ...plans].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const next = [...plans];
+      next[index] = plan;
+      return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    });
+    this.existingPlans.update((plans) => {
+      const index = plans.findIndex((item) => item.id === plan.id);
+      if (index === -1) return plans;
+      const next = [...plans];
+      next[index] = plan;
+      return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    });
   }
 
   private async attachPlanTerminals(run: AgentPlanRun): Promise<void> {
@@ -1422,7 +1790,7 @@ export class PlannerPage implements OnInit, OnDestroy {
 
   private browserStartPath(mode: 'workspace' | 'plan' | 'appScope' | 'docsScope' | 'reference'): string {
     if (mode === 'workspace') return this.workspacePath.trim() || '/';
-    if (mode === 'plan') return this.mode() === 'planning' ? this.workspacePath.trim() || '/' : this.absolutePlanPath();
+    if (mode === 'plan') return this.absolutePlanPath();
     if (mode === 'appScope') return this.absoluteWorkspacePath(this.appScope.trim()) || this.workspacePath.trim() || '/';
     if (mode === 'docsScope') return this.absoluteWorkspacePath(this.docsScope.trim()) || this.workspacePath.trim() || '/';
     return this.workspacePath.trim() || '/';

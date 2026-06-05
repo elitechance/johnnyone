@@ -37,6 +37,7 @@ import {
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
 import { MermaidZoomService } from '../../services/mermaid-zoom.service';
+import { PendingImageAttachment } from '../../components/image-attachment-composer/image-attachment-composer.component';
 import {
   JohnnyApiService,
   ChatAttachment,
@@ -86,12 +87,6 @@ interface PaneLayout {
   y: number;
   width: number;
   height: number;
-}
-
-interface PendingImageAttachment {
-  id: string;
-  file: File;
-  previewUrl: string;
 }
 
 // Register Ionicons used by the workspace-picker modal once at module load.
@@ -206,9 +201,8 @@ export class TerminalPage implements OnInit, OnDestroy {
   isDraggingPane = signal(false);
   isResizingPane = signal(false);
   isCompactWorkspace = signal(false);
-  pendingAttachments = signal<PendingImageAttachment[]>([]);
-  attachmentMessage = '';
-  isSendingAttachments = signal(false);
+  pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
+  sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 
   // Computed
   filteredSessions = computed(() => {
@@ -321,7 +315,7 @@ export class TerminalPage implements OnInit, OnDestroy {
     this.stopSidebarResize();
     this.stopPaneInteraction();
     this.teardownCompactWorkspaceMode();
-    this.clearPendingAttachments();
+    this.clearAllPendingAttachments();
   }
 
   // ── Type Mappers ───────────────────────────────────────────────────
@@ -757,12 +751,14 @@ export class TerminalPage implements OnInit, OnDestroy {
   }
 
   onWorkspacePaste(event: ClipboardEvent): void {
+    const session = this.currentSession();
+    if (!session) return;
     const files = Array.from(event.clipboardData?.files ?? []).filter((file) =>
       file.type.startsWith('image/')
     );
     if (files.length === 0) return;
     event.preventDefault();
-    this.addPendingImageFiles(files);
+    this.addPendingImageFiles(session.id, files);
   }
 
   onWorkspaceDragOver(event: DragEvent): void {
@@ -772,35 +768,51 @@ export class TerminalPage implements OnInit, OnDestroy {
   }
 
   onWorkspaceDrop(event: DragEvent): void {
+    const session = this.currentSession();
+    if (!session) return;
     const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
       file.type.startsWith('image/')
     );
     if (files.length === 0) return;
     event.preventDefault();
-    this.addPendingImageFiles(files);
+    this.addPendingImageFiles(session.id, files);
   }
 
-  removePendingAttachment(id: string): void {
-    this.pendingAttachments.update((items) => {
-      const target = items.find((item) => item.id === id);
+  pendingAttachmentsForSession(sessionId: string): PendingImageAttachment[] {
+    return this.pendingAttachmentsBySession()[sessionId] ?? [];
+  }
+
+  isSendingAttachmentsForSession(sessionId: string): boolean {
+    return !!this.sendingAttachmentsBySession()[sessionId];
+  }
+
+  removePendingAttachment(sessionId: string, id: string): void {
+    const current = this.pendingAttachmentsForSession(sessionId);
+    this.pendingAttachmentsBySession.update((bySession) => {
+      const target = current.find((item) => item.id === id);
       if (target) URL.revokeObjectURL(target.previewUrl);
-      return items.filter((item) => item.id !== id);
+      const nextItems = current.filter((item) => item.id !== id);
+      return this.setSessionAttachments(bySession, sessionId, nextItems);
     });
   }
 
-  async sendAttachmentMessage(): Promise<void> {
-    const session = this.currentSession();
-    const attachments = this.pendingAttachments();
-    const text = this.attachmentMessage.trim();
-    if (!session || this.isSendingAttachments() || attachments.length === 0) return;
+  async sendAttachmentMessage(sessionId: string, message: string): Promise<void> {
+    const attachments = this.pendingAttachmentsForSession(sessionId);
+    const text = message.trim();
+    if (this.isSendingAttachmentsForSession(sessionId) || (!text && attachments.length === 0)) return;
 
-    this.isSendingAttachments.set(true);
+    if (attachments.length === 0) {
+      await this.relayTerminal.sendInput(sessionId, `${text}\r`);
+      return;
+    }
+
+    this.setSendingAttachments(sessionId, true);
     try {
       const uploaded: ChatAttachment[] = [];
       for (const item of attachments) {
         uploaded.push(
           await firstValueFrom(this.api.createChatAttachment({
-            sessionId: session.id,
+            sessionId,
             originalName: item.file.name || 'clipboard-image.png',
             contentType: item.file.type || 'image/png',
             dataBase64: await this.fileToBase64(item.file),
@@ -809,7 +821,7 @@ export class TerminalPage implements OnInit, OnDestroy {
       }
 
       await this.relayTerminal.sendInputWithAttachments(
-        session.id,
+        sessionId,
         `${text || 'Please review the attached image.'}\r`,
         uploaded.map((attachment) => ({
           id: attachment.id,
@@ -819,29 +831,66 @@ export class TerminalPage implements OnInit, OnDestroy {
         })),
       );
 
-      this.attachmentMessage = '';
-      this.clearPendingAttachments();
+      this.clearPendingAttachments(sessionId);
     } catch (err) {
       console.error('Failed to send image attachment:', err);
     } finally {
-      this.isSendingAttachments.set(false);
+      this.setSendingAttachments(sessionId, false);
     }
   }
 
-  private addPendingImageFiles(files: File[]): void {
+  addPendingImageFiles(sessionId: string, files: File[]): void {
     const items = files.map((file) => ({
       id: crypto.randomUUID(),
       file,
       previewUrl: URL.createObjectURL(file),
     }));
-    this.pendingAttachments.update((current) => [...current, ...items]);
+    this.pendingAttachmentsBySession.update((bySession) => ({
+      ...bySession,
+      [sessionId]: [...(bySession[sessionId] ?? []), ...items],
+    }));
   }
 
-  private clearPendingAttachments(): void {
-    for (const item of this.pendingAttachments()) {
+  private clearPendingAttachments(sessionId: string): void {
+    for (const item of this.pendingAttachmentsForSession(sessionId)) {
       URL.revokeObjectURL(item.previewUrl);
     }
-    this.pendingAttachments.set([]);
+    this.pendingAttachmentsBySession.update((bySession) => this.setSessionAttachments(bySession, sessionId, []));
+  }
+
+  private clearAllPendingAttachments(): void {
+    for (const items of Object.values(this.pendingAttachmentsBySession())) {
+      for (const item of items) {
+        URL.revokeObjectURL(item.previewUrl);
+      }
+    }
+    this.pendingAttachmentsBySession.set({});
+  }
+
+  private setSessionAttachments(
+    bySession: Record<string, PendingImageAttachment[]>,
+    sessionId: string,
+    items: PendingImageAttachment[],
+  ): Record<string, PendingImageAttachment[]> {
+    const next = { ...bySession };
+    if (items.length === 0) {
+      delete next[sessionId];
+    } else {
+      next[sessionId] = items;
+    }
+    return next;
+  }
+
+  private setSendingAttachments(sessionId: string, sending: boolean): void {
+    this.sendingAttachmentsBySession.update((current) => {
+      const next = { ...current };
+      if (sending) {
+        next[sessionId] = true;
+      } else {
+        delete next[sessionId];
+      }
+      return next;
+    });
   }
 
   private fileToBase64(file: File): Promise<string> {
@@ -1311,6 +1360,8 @@ export class TerminalPage implements OnInit, OnDestroy {
     this.sessions.update((sessions) => sessions.filter((session) => session.id !== sessionId));
     this.terminalScreens.update((screens) => this.omitRecordKey(screens, sessionId));
     this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, sessionId));
+    this.clearPendingAttachments(sessionId);
+    this.setSendingAttachments(sessionId, false);
 
     if (!wasCurrentSession) return;
 

@@ -143,7 +143,9 @@ Phase path: {{phase_path}}
 Tasks path: {{tasks_path}}
 Conventions: {{conventions_path}}
 
-Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only. Focus on status files, decisions, tests, E2E artifacts, screenshots, acceptance criteria, and convention compliance.
+Read methodology, project conventions (every file under {{conventions_path}}), app-local conventions if present under {{workspace_path}}/conventions or {{workspace_path}}/plans/conventions, plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only. Focus on status files, decisions, tests, E2E artifacts, screenshots, acceptance criteria, source-code fit, and convention compliance.
+
+If the phase changes user-facing UI, verify that T1 produced or referenced the required mocks/screenshots/artifacts, that they cover the relevant responsive states, and that the result still matches the current app source. Missing UI evidence is NEEDS_CHANGES.
 
 Before returning, append your phase validation result to {{phase_path}}/status.md under `## Phase Validation`. Include verdict, summary, findings, next steps, and any screenshot/test read-back notes. If {{phase_path}}/status.yml exists, update its validation fields consistently with your verdict. Do not edit application source files.
 
@@ -151,6 +153,7 @@ Verdict rules:
 - PASS only when the phase acceptance criteria are satisfied.
 - NEEDS_CHANGES when T1 can continue work, add evidence, fix issues, document a waiver/scope decision, or explain why the current evidence satisfies acceptance. Missing or insufficient validation evidence is NEEDS_CHANGES, not BLOCKED.
 - BLOCKED only when T2 cannot perform validation because of an external access/runtime problem, such as missing workspace/plan paths, unreadable files, unavailable credentials, unavailable required tools, or a broken validation environment. If you can state what T1 must do to pass, use NEEDS_CHANGES.
+- If verdict is NEEDS_CHANGES or BLOCKED, FINDINGS must contain at least one concrete reason and NEXT_STEPS must contain at least one concrete action for T1. Use `none` only when verdict is PASS and there is truly nothing to add.
 
 Return this footer exactly:
 
@@ -178,7 +181,9 @@ User brief:
 Reference paths:
 {{reference_paths}}
 
-Create or update a methodology-compliant plan at the plan output path. Read the methodology first, then read every file under the conventions path so the plan honors project conventions (UI, backend, testing, tooling, plan-validation, etc.). Inspect the app/source scope and docs scope enough to ground the plan in the real codebase. Use Mermaid for diagrams and HTML+JS mocks when UI/layout is unclear. Include local and live validation strategy when the feature must be testable by the user. Do not implement application code. Only create/update plan files.
+Create or update a methodology-compliant plan at the plan output path. Read the methodology first, then read every file under the conventions path and any app-local conventions under the app/source scope so the plan honors project conventions (UI, backend, testing, tooling, plan-validation, etc.). Inspect the app/source scope and docs scope enough to ground the plan in the real codebase. Use Mermaid for diagrams and HTML+JS mocks when UI/layout is unclear.
+
+For UI-related work, include concrete mocks or visual references unless the UI impact is trivial and documented in a decision. The plan must name the existing routes/components/widgets/styles/tests it expects to touch so T2 can verify the plan is synced with the current source code. Include local and live validation strategy when the feature must be testable by the user. Do not implement application code. Only create/update plan files.
 
 When the plan is ready for review, say exactly:
 
@@ -194,9 +199,14 @@ Plan path: {{plan_output_path}}
 Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
-Validate the plan only. Do not implement application code. Read methodology, every convention file under the conventions path, the created plan, relevant docs, source scope, artifacts, mocks, and diagrams.
+Validate the plan only. Do not implement application code. Read methodology, every convention file under the conventions path, app-local conventions if present under the app/source scope, the created plan, relevant docs, source scope, artifacts, mocks, and diagrams.
 
 Review for methodology + convention compliance, clear phase boundaries, actionable task prompts, explicit acceptance criteria, local/live testing strategy, UI mocks/diagrams where needed, risky assumptions, and whether the plan can produce something the user can test.
+
+Before PASS, perform these gates:
+- UI mock gate: if the brief or plan changes user-facing UI, verify mocks/screenshots/wireframes or explicit existing-screen references exist and are useful enough for implementation. Missing or superficial UI mocks are NEEDS_CHANGES unless a decision explains why the visual impact is trivial.
+- Source-sync gate: inspect the current app/source scope enough to confirm the plan matches the real routes, components, shared widgets, styling conventions, backend/schema boundaries, and test setup. If the plan is not synced with the current source code, return NEEDS_CHANGES.
+- If verdict is NEEDS_CHANGES or BLOCKED, FINDINGS must contain at least one concrete reason and NEXT_STEPS must contain at least one concrete action for T1. Use `none` only when verdict is PASS and there is truly nothing to add.
 
 Return this footer exactly:
 
@@ -232,9 +242,9 @@ Original brief (for context, do not re-implement it from scratch):
 Reference paths:
 {{reference_paths}}
 
-A plan already lives at {{plan_output_path}}. Read it first (overview.md, status.md, phases/, decisions/, artifacts/), along with the methodology and the project conventions. The plan also has a per-plan git repo at {{plan_output_path}}/.git — run `git log --oneline` and `git diff` against earlier commits if you want context on past decisions.
+A plan already lives at {{plan_output_path}}. Read it first (overview.md, status.md, phases/, decisions/, artifacts/), along with the methodology, project conventions, and app-local conventions if present under the app/source scope. The plan also has a per-plan git repo at {{plan_output_path}}/.git — run `git log --oneline` and `git diff` against earlier commits if you want context on past decisions.
 
-Apply the user's amendment by editing files IN PLACE. Add new phases or tasks where the amendment requires them. Update overview.md and status.md to reflect the change. Preserve completed phase status entries unless the amendment explicitly invalidates them. Do NOT recreate the plan from scratch — that throws away all prior approval history.
+Apply the user's amendment by editing files IN PLACE. Add new phases or tasks where the amendment requires them. Update overview.md and status.md to reflect the change. Preserve completed phase status entries unless the amendment explicitly invalidates them. If the amendment changes user-facing UI, update or add mocks/visual references and name the affected source files/components. Do NOT recreate the plan from scratch — that throws away all prior approval history.
 
 When the amendment is applied and the plan is ready for review, say exactly:
 
@@ -265,6 +275,8 @@ Validate:
 3. New phases/tasks follow the project's conventions (read every file under {{conventions_path}}).
 4. Existing approved sections that the amendment SHOULD have touched have been updated (e.g. overview.md if new phases are added, status.md if scope changed).
 5. Diagrams + mocks were updated where the amendment changes UI/architecture.
+6. UI amendments still match the current app/source scope. Missing or stale UI mocks, or a plan that no longer matches the app, is NEEDS_CHANGES.
+7. If verdict is NEEDS_CHANGES or BLOCKED, FINDINGS must contain at least one concrete reason and NEXT_STEPS must contain at least one concrete action for T1. Use `none` only when verdict is PASS and there is truly nothing to add.
 
 Return this footer exactly:
 

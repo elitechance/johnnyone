@@ -65,6 +65,7 @@ export interface AgentPlan {
   referencePaths?: string;
   /** Non-empty when an amendment cycle is in flight; cleared when T2 PASSes. */
   amendBrief?: string;
+  phaseRunMode: 'continue' | 'single' | string;
   createdAt: string;
   updatedAt: string;
 }
@@ -107,7 +108,18 @@ export interface AgentPlanEvent {
   id: string;
   planId: string;
   phaseId?: string;
+  phaseIndex?: number;
+  phaseTitle?: string;
   eventType: string;
+  actor: string;
+  category: string;
+  summary: string;
+  statusBefore?: string;
+  statusAfter?: string;
+  reason?: string;
+  verdict?: string;
+  taskId?: string;
+  clarificationAttempt?: number;
   payloadJson: string;
   createdAt: string;
 }
@@ -140,6 +152,19 @@ export interface HostFileContent {
 export interface WorkspaceFileDiff {
   path: string;
   diff: string;
+}
+
+export interface GitFilesView {
+  path: string;
+  repoRoot?: string;
+  branch?: string;
+  clean: boolean;
+  entries: HostFileEntry[];
+}
+
+export interface GitActionResult {
+  success: boolean;
+  output: string;
 }
 
 export interface WorkspaceValidation {
@@ -182,7 +207,7 @@ export class JohnnyApiService {
     plan {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
-      brief appScope docsScope referencePaths amendBrief
+      brief appScope docsScope referencePaths amendBrief phaseRunMode
       createdAt updatedAt
     }
     phases {
@@ -195,7 +220,8 @@ export class JohnnyApiService {
       decisionsPath status createdAt updatedAt
     }
     events {
-      id planId phaseId eventType payloadJson createdAt
+      id planId phaseId phaseIndex phaseTitle eventType actor category summary
+      statusBefore statusAfter reason verdict taskId clarificationAttempt payloadJson createdAt
     }
   `;
 
@@ -584,18 +610,18 @@ export class JohnnyApiService {
 
   // ── Agent Planner ────────────────────────────────────────────────────
 
-  listAgentPlans(status?: string, runType?: 'planning' | 'development'): Observable<AgentPlan[]> {
+  listAgentPlans(status?: string, runType?: 'planning' | 'development', onlyExisting = false): Observable<AgentPlan[]> {
     return this.gql
       .query<{ listAgentPlans: AgentPlan[] }>(
-        `query ListAgentPlans($status: String, $runType: String) {
-          listAgentPlans(status: $status, runType: $runType) {
+        `query ListAgentPlans($status: String, $runType: String, $onlyExisting: Boolean) {
+          listAgentPlans(status: $status, runType: $runType, onlyExisting: $onlyExisting) {
             id runType title workspacePath planPath status workerSessionId reviewerSessionId
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
             brief appScope docsScope referencePaths
             createdAt updatedAt
           }
         }`,
-        { status, runType }
+        { status, runType, onlyExisting }
       )
       .pipe(map((data) => data.listAgentPlans));
   }
@@ -626,15 +652,15 @@ export class JohnnyApiService {
       .pipe(map((data) => data.createAgentPlan));
   }
 
-  startAgentPlan(id: string, phaseId?: string): Observable<AgentPlanRun> {
+  startAgentPlan(id: string, phaseId?: string, phaseRunMode?: 'continue' | 'single'): Observable<AgentPlanRun> {
     return this.gql
       .mutate<{ startAgentPlan: AgentPlanRun }>(
-        `mutation StartAgentPlan($id: ID!, $phaseId: String) {
-          startAgentPlan(id: $id, phaseId: $phaseId) {
+        `mutation StartAgentPlan($id: ID!, $phaseId: String, $phaseRunMode: String) {
+          startAgentPlan(id: $id, phaseId: $phaseId, phaseRunMode: $phaseRunMode) {
             ${this.agentPlanRunFields}
           }
         }`,
-        { id, phaseId: phaseId || null }
+        { id, phaseId: phaseId || null, phaseRunMode: phaseRunMode || null }
       )
       .pipe(map((data) => data.startAgentPlan));
   }
@@ -650,6 +676,19 @@ export class JohnnyApiService {
         { id }
       )
       .pipe(map((data) => data.updateAgentPlanPhasesRefresh));
+  }
+
+  updateAgentPlanTitle(id: string, title: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanTitle: AgentPlanRun }>(
+        `mutation UpdateAgentPlanTitle($id: ID!, $title: String!) {
+          updateAgentPlanTitle(id: $id, title: $title) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, title }
+      )
+      .pipe(map((data) => data.updateAgentPlanTitle));
   }
 
   /**
@@ -749,17 +788,44 @@ export class JohnnyApiService {
       .pipe(map((data) => data.validateWorkspacePlan));
   }
 
-  listWorkspaceFiles(planId: string, mode: 'changed' | 'all'): Observable<HostFileEntry[]> {
+  listWorkspaceFiles(planId: string, mode: 'changed' | 'all', path?: string): Observable<HostFileEntry[]> {
     return this.gql
       .query<{ listWorkspaceFiles: HostFileEntry[] }>(
-        `query ListWorkspaceFiles($planId: ID!, $mode: String!) {
-          listWorkspaceFiles(planId: $planId, mode: $mode) {
+        `query ListWorkspaceFiles($planId: ID!, $mode: String!, $path: String) {
+          listWorkspaceFiles(planId: $planId, mode: $mode, path: $path) {
             path name kind status size
           }
         }`,
-        { planId, mode }
+        { planId, mode, path }
       )
       .pipe(map((data) => data.listWorkspaceFiles));
+  }
+
+  gitFileView(planId: string, path?: string): Observable<GitFilesView> {
+    return this.gql
+      .query<{ gitFileView: GitFilesView }>(
+        `query GitFileView($planId: ID!, $path: String) {
+          gitFileView(planId: $planId, path: $path) {
+            path repoRoot branch clean
+            entries { path name kind status size }
+          }
+        }`,
+        { planId, path }
+      )
+      .pipe(map((data) => data.gitFileView));
+  }
+
+  runGitAction(planId: string, input: { path?: string; action: 'fetch' | 'pull' | 'push' | 'commit'; message?: string }): Observable<GitActionResult> {
+    return this.gql
+      .mutate<{ updateGitAction: GitActionResult }>(
+        `mutation RunGitAction($planId: ID!, $path: String, $action: String!, $message: String) {
+          updateGitAction(planId: $planId, path: $path, action: $action, message: $message) {
+            success output
+          }
+        }`,
+        { planId, path: input.path || null, action: input.action, message: input.message || null }
+      )
+      .pipe(map((data) => data.updateGitAction));
   }
 
   readHostFile(planId: string, path: string): Observable<HostFileContent> {

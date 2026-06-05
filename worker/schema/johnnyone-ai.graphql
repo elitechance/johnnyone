@@ -130,6 +130,7 @@ type AgentPlan {
   docsScope: String
   referencePaths: String
   amendBrief: String
+  phaseRunMode: String!
   createdAt: String!
   updatedAt: String!
 }
@@ -172,7 +173,18 @@ type AgentPlanEvent {
   id: ID!
   planId: String!
   phaseId: String
+  phaseIndex: Int
+  phaseTitle: String
   eventType: String!
+  actor: String!
+  category: String!
+  summary: String!
+  statusBefore: String
+  statusAfter: String
+  reason: String
+  verdict: String
+  taskId: String
+  clarificationAttempt: Int
   payloadJson: String!
   createdAt: String!
 }
@@ -205,6 +217,19 @@ type HostFileContent {
 type WorkspaceFileDiff {
   path: String!
   diff: String!
+}
+
+type GitFilesView {
+  path: String!
+  repoRoot: String
+  branch: String
+  clean: Boolean!
+  entries: [HostFileEntry!]!
+}
+
+type GitActionResult {
+  success: Boolean!
+  output: String!
 }
 
 type WorkspaceValidation {
@@ -317,11 +342,12 @@ type Query {
   listDetectedCliTools: [DetectedTool!]!
   getSetting(key: String!): String!
   getPlannerPromptSettings: PlannerPromptSettings!
-  listAgentPlans(status: String, runType: String): [AgentPlan!]!
+  listAgentPlans(status: String, runType: String, onlyExisting: Boolean): [AgentPlan!]!
   getAgentPlan(id: ID!): AgentPlanRun!
   browseHostDirectory(path: String!): [HostFileEntry!]!
   validateWorkspacePlan(workspacePath: String!, planPath: String!): WorkspaceValidation!
-  listWorkspaceFiles(planId: ID!, mode: String!): [HostFileEntry!]!
+  listWorkspaceFiles(planId: ID!, mode: String!, path: String): [HostFileEntry!]!
+  gitFileView(planId: ID!, path: String): GitFilesView!
   readHostFile(planId: ID!, path: String!): HostFileContent!
   getWorkspaceFileDiff(planId: ID!, path: String!): WorkspaceFileDiff!
   getChatAttachment(id: ID!): ChatAttachmentContent!
@@ -345,8 +371,9 @@ type Mutation {
   updateSetting(key: String!, value: String!): Boolean!
   updatePlannerPromptSettings(input: PlannerPromptSettingsInput!): PlannerPromptSettings!
   createAgentPlan(input: CreateAgentPlanInput!): AgentPlanRun!
-  startAgentPlan(id: ID!, phaseId: String): AgentPlanRun!
+  startAgentPlan(id: ID!, phaseId: String, phaseRunMode: String): AgentPlanRun!
   updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
+  updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
@@ -354,6 +381,7 @@ type Mutation {
   updateAgentPhaseManualPass(id: ID!, phaseId: String!): AgentPlanRun!
   sendAgentFeedbackToWorker(id: ID!): AgentPlanRun!
   retryAgentReviewer(id: ID!): AgentPlanRun!
+  updateGitAction(planId: ID!, path: String, action: String!, message: String): GitActionResult!
   createChatAttachment(input: ChatAttachmentInput!): ChatAttachment!
   deleteChatAttachment(input: MarkChatAttachmentDeliveredInput!): ChatAttachment!
 }

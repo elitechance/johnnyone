@@ -25,6 +25,9 @@
    the non-Ionic primitives in the legacy pages (custom topbar, modal-backdrop,
    directory-browser) so the whole theme stays consistent. */
 :root {
+  --jo-safe-top: env(safe-area-inset-top);
+  --jo-safe-bottom: env(safe-area-inset-bottom);
+
   /* Background scale (darkest → lightest) */
   --jo-bg-base:     #0d0f12;
   --jo-bg-elevated: #14171c;
@@ -52,9 +55,17 @@
 }
 
 html, body {
+  min-height: 100%;
   background: var(--jo-bg-base);
   color: var(--jo-fg);
   color-scheme: dark;
+}
+
+@supports (height: 100dvh) {
+  html,
+  body {
+    min-height: 100dvh;
+  }
 }
 
 /* Reusable primitives the legacy attic pages depend on. Override any
