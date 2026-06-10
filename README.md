@@ -112,6 +112,17 @@ johnnyone/
   lokal.yaml                Local processes, builds, deploy config
 ```
 
+## Planner and Development Notes
+
+Recent planner/runtime behavior worth knowing:
+
+- Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.
+- Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
+- Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
+- The shared terminal widget lives in `ui/src/components/terminal-screen/` and is used by the standalone Terminal page plus Planning/Development T1/T2. Terminal affordances such as upload image, mobile input helpers, mermaid detection, and history loading should be implemented there, not forked per page.
+- The planner event log is enriched by the desktop backend. Events now carry actor/category/summary/status transitions plus derived review reasons. For T2 `NEEDS_CHANGES` or `BLOCKED`, the backend parses `SUMMARY`, `FINDINGS`, and `NEXT_STEPS` from the reviewer footer and promotes the first concrete finding into the event `reason`.
+- T2 send-back events are intended to explain the pushback, not only the transport action. If the event log only says something like `sent back` without a concrete reason, that is considered drift from current behavior.
+
 ## Tech stack
 
 | Layer | Tech |
@@ -204,13 +215,42 @@ hosted web client from any browser. No other local setup.
 
 ### Build the Linux binary
 
+Two modes — pick one. **Do not mix them up.**
+
+#### Mode A — production single-binary (the way users run it)
+
 ```bash
-cd personal/apps/johnnyone
-nx build host-app                 # build the Angular UI the Tauri window loads
-cd desktop/src-tauri
-cargo build --release --bin johnnyone-desktop
-ls -lh target/release/johnnyone-desktop          # ~30 MB
+cd personal/apps/johnnyone/desktop/src-tauri
+cargo tauri build --no-bundle      # builds host-app + embeds it + builds Rust release
+ls -lh target/release/johnnyone-desktop          # ~30 MB, self-contained
 ```
+
+This is the only command that produces a runnable single binary. It:
+
+1. Runs the configured `beforeBuildCommand` (`npx nx build host-app`) so `dist/host-app/browser/` is fresh.
+2. Embeds those assets into the Rust binary via Tauri's codegen.
+3. Builds the `tauri` crate **with the production webview-runtime flag** so the webview loads the embedded assets instead of `devUrl`.
+
+After this, just exec the binary directly — see **Launch** below.
+
+#### Mode B — dev with HMR (only when iterating on the host-app UI)
+
+```bash
+cd personal/apps/johnnyone/desktop/src-tauri
+cargo tauri dev    # spawns `npx nx serve host-app --port 4201` + cargo run in debug
+```
+
+The webview loads from `http://localhost:4201` (per `tauri.conf.json` `devUrl`) so
+Angular HMR works. Requires the dev server alongside the binary.
+
+> **Gotcha — do not use `cargo build --release --bin johnnyone-desktop` to make a
+> single binary.** It compiles cleanly and the binary runs (you'll see the GraphQL
+> listener bind to `:7788` in the log) but the Tauri window stays blank with
+> `Could not connect to localhost: Connection refused`. The Rust release flag
+> alone does not switch Tauri's webview to production-mode asset loading — only
+> `cargo tauri build` does. The 31 MB binary is misleading; it's missing the
+> right codegen context. If you're seeing that error after a "release" build, you
+> ran the wrong command — rerun with `cargo tauri build --no-bundle`.
 
 ### Launch
 
@@ -293,10 +333,11 @@ script and you'll need to re-set this secret on the new name.
   prefix and align the GraphQL field. You can keep a friendly public name
   in `JohnnyApiService` by wrapping it.
 
-- **Tauri `beforeBuildCommand` doesn't run for plain `cargo build`.** The
-  desktop binary embeds `dist/host-app/browser` at compile time. Run
-  `nx build host-app` before `cargo build --release --bin johnnyone-desktop`
-  if you've changed Angular code in `host-app/`.
+- **`cargo build` is not the way to build the production binary.** The desktop
+  binary embeds `dist/host-app/browser` at compile time *and* needs the Tauri
+  runtime built in production-webview mode. `cargo build --release` does
+  neither for you. Use `cargo tauri build --no-bundle` — see "Running the
+  JohnnyOne desktop binary → Build the Linux binary" above.
 
 ## GraphQL API
 

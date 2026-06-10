@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Enriched planner/development event reasons.** The desktop planner
+  orchestrator now parses reviewer `SUMMARY`, `FINDINGS`, and
+  `NEXT_STEPS` blocks from T2 output and promotes the first concrete
+  finding into event `reason`.
+  - `planning_gate_result` / `agent_phase_gate_result` now store review
+    context instead of only verdict/action.
+  - `planning_feedback_sent_to_planner` /
+    `agent_feedback_sent_to_worker` now carry the same review reason so
+    the event row explains why the run was sent back.
+- **Planner prompt enforcement for non-pass verdicts.** Default planner
+  prompts and the live `~/.johnnyone/planner-prompts.yml` now require
+  T2 to provide at least one concrete finding and one concrete next step
+  for `NEEDS_CHANGES` or `BLOCKED`.
+
+### Changed
+- **Planner event log semantics.** Event rows are expected to represent
+  decision facts, not only routing facts. A send-back event without a
+  meaningful review reason is now considered incomplete behavior.
+- **Project docs updated for current planner behavior.** README and
+  app-local conventions now document soft-close/reopen behavior,
+  persisted run rename, single-phase execution mode, shared terminal
+  ownership, and review-reason expectations in the event log.
+
 ## [2026-05-25]
 
 ### Added

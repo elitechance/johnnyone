@@ -35,6 +35,16 @@ For UI work, T1 should identify:
 
 T2 should return `NEEDS_CHANGES` when a UI plan omits mocks or visual references for a meaningful layout/workflow change, or when the plan describes a UI that does not match these source paths.
 
+For review output quality, T2 must give the orchestrator enough structure to produce meaningful event logs. When verdict is `NEEDS_CHANGES` or `BLOCKED`, reviewer output must include:
+
+- A concrete reason in `FINDINGS`, not only a status label.
+- At least one actionable `NEXT_STEPS` item for T1.
+- Enough specificity that the backend can explain why the run or phase was sent back.
+
+Avoid vague findings like "needs more work" or "not ready yet". Prefer findings that name the missing mock, stale source assumption, failing evidence, missing test, or mismatched component/screen.
+
+The planner event log is expected to communicate decision facts, not only transport facts. "Sent back to T1" is incomplete unless the associated review reason explains what T1 must fix.
+
 ## Validation And Deploy
 
 Common commands:
@@ -42,7 +52,7 @@ Common commands:
 - Web build: `npx nx build web`
 - UI library build: `npx nx build ui`
 - Dev deploy: `lokal cf deploy --env dev`
-- Desktop backend build: `cd desktop/src-tauri && cargo build --release --bin johnnyone-desktop`
+- Desktop backend build (single self-contained binary): `cd desktop/src-tauri && cargo tauri build --no-bundle`. **Do not use `cargo build --release --bin johnnyone-desktop`** — that compiles cleanly but produces a binary whose Tauri webview can't load the embedded UI (shows `Could not connect to localhost: Connection refused` on a blank page); only `cargo tauri build` triggers the production-mode webview-runtime rebuild. For dev with HMR use `cargo tauri dev` (spawns the `host-app` Angular dev server on :4201).
 
 For deployed web changes, verify the stable dev site is serving the new bundle with:
 
