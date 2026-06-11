@@ -536,6 +536,9 @@ fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
         CliProvider::Ollama if !config.model.trim().is_empty() => {
             (command, vec!["run".to_string(), config.model.clone()])
         }
+        // grok TUI — auto-approve tool executions so the pane isn't blocked on
+        // approval prompts, matching the bypass behavior of the other TUIs.
+        CliProvider::Grok => (command, vec!["--always-approve".to_string()]),
         // Plain shell — no args. tmux will run it as the pane's command and
         // the user types whatever they want.
         CliProvider::Shell => (command, Vec::new()),

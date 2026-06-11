@@ -388,6 +388,11 @@ impl AgentService {
                 let ws = Arc::clone(ws_write);
                 let st = Arc::clone(state);
                 tokio::spawn(async move {
+                    tracing::info!(
+                        session_id = %command.session_id,
+                        control = ?command.control,
+                        "terminal_command received from relay"
+                    );
                     let result = if command.control.as_deref() == Some("visual_subscribe") {
                         crate::terminal::subscribe_terminal_visual(
                             &st,
@@ -437,6 +442,9 @@ impl AgentService {
                         }
                     };
 
+                    if let Err(error) = &result {
+                        tracing::warn!(session_id = %command.session_id, control = ?command.control, %error, "terminal_command failed");
+                    }
                     let ack = TerminalCommandAck {
                         request_id: command.request_id,
                         session_id: command.session_id,
@@ -1603,6 +1611,13 @@ impl AgentService {
                 "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
             );
         }
+        // grok is wired for terminal-mode only (interactive TUI in a tmux pane);
+        // it has no chat-mode streaming runner yet.
+        if matches!(provider, CliProvider::Grok) {
+            return Err(
+                "Grok runs in terminal mode only — open it as a terminal session and type into the pane.".to_string(),
+            );
+        }
 
         let config = match provider {
             CliProvider::ClaudeCode => claude_code::build_config(
@@ -1626,6 +1641,7 @@ impl AgentService {
                 ollama_cli::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }
             CliProvider::Shell => unreachable!("shell provider already rejected"),
+            CliProvider::Grok => unreachable!("grok provider already rejected"),
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -1634,6 +1650,7 @@ impl AgentService {
             CliProvider::Cline => cline::parse_line,
             CliProvider::Ollama => ollama_cli::parse_line,
             CliProvider::Shell => unreachable!("shell provider already rejected"),
+            CliProvider::Grok => unreachable!("grok provider already rejected"),
         };
 
         let (_process, mut rx) =

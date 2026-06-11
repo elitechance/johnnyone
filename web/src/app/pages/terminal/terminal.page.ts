@@ -533,7 +533,7 @@ export class TerminalPage implements OnInit, OnDestroy {
   }
 
   async openNewSessionBrowser(): Promise<void> {
-    const start = this.workingDirectory().trim() || '/home/creepy/documents/workspace';
+    const start = this.workingDirectory().trim() || '~';
     this.newSessionBrowsePath.set(start);
     this.newSessionBrowserError.set(null);
     this.newSessionBrowserOpen.set(true);

@@ -118,6 +118,7 @@ pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, Str
         CliProvider::ClaudeCode,
         CliProvider::Codex,
         CliProvider::Ollama,
+        CliProvider::Grok,
     ];
 
     if simulator::host_simulator_enabled() {

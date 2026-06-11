@@ -10,7 +10,7 @@ Cloudflare Worker is a thin relay between the web browser and that binary.
 
 | Surface | URL |
 |---|---|
-| Web client | https://johnnyone-dev.pages.dev |
+| Web client | https://johnnyone.pages.dev |
 | Worker GraphQL | https://johnnyone-dev-hub.ethan-353.workers.dev/graphql |
 | Worker relay WebSocket | wss://johnnyone-dev-hub.ethan-353.workers.dev/api/relay/ws |
 | Desktop binary (Linux) | `desktop/src-tauri/target/release/johnnyone-desktop` (built locally) |
@@ -221,9 +221,19 @@ Two modes — pick one. **Do not mix them up.**
 
 ```bash
 cd personal/apps/johnnyone/desktop/src-tauri
-cargo tauri build --no-bundle      # builds host-app + embeds it + builds Rust release
+npx tauri build --no-bundle        # uses the repo's @tauri-apps/cli devDep — no `cargo install` needed
+# (equivalently `cargo tauri build --no-bundle` IF you've run `cargo install tauri-cli`)
 ls -lh target/release/johnnyone-desktop          # ~30 MB, self-contained
 ```
+
+> `npx tauri build --no-bundle` and `cargo tauri build --no-bundle` are
+> equivalent — both run the Tauri build pipeline (beforeBuildCommand → embed
+> assets → production-webview Rust build). Prefer `npx` since `@tauri-apps/cli`
+> is already a devDependency; `cargo tauri` additionally requires the
+> `cargo-tauri` subcommand (`cargo install tauri-cli`). The Nx `desktop-build`
+> target and lokal's `desktop.prod` build BOTH run `cargo build --release`,
+> which is the WRONG command (see the blank-window gotcha below) — do not use
+> them to produce a runnable binary.
 
 This is the only command that produces a runnable single binary. It:
 
@@ -272,6 +282,12 @@ The binary will:
 4. Keep an outbound WebSocket open for relay-RPC
 5. Listen on `127.0.0.1:7788` for the embedded UI's local GraphQL calls
 
+## Operational notes (hard-won)
+
+Build/run/debug/deploy gotchas a fresh agent needs (toolchain, the
+directory-move build-cache trap, local-dev launch identity, the terminal attach
+path, and the real deploy story) live in **[`docs/operations.md`](docs/operations.md)**.
+
 ## Live deployments
 
 Only the **worker** and **web client** deploy to Cloudflare. The desktop binary
@@ -288,8 +304,10 @@ lokal cf db migrate --env dev           # apply D1 migrations
 - CF account: `elitechance` (configured in `~/.lokal/cf.yaml`)
 - Worker name pattern: `johnnyone-<env>-hub` (worker.yaml `name: hub` is the suffix)
   → dev = `johnnyone-dev-hub.ethan-353.workers.dev`
-- Pages project: `johnnyone-dev`
-  → `https://johnnyone-dev.pages.dev`
+- Pages project: `johnnyone` (note: no `-dev` suffix — `lokal cf pages deploy
+  --env dev` names the Pages project after `lokal.yaml`'s `project:` directly,
+  unlike the worker which gets the `-dev` env suffix)
+  → `https://johnnyone.pages.dev`
 
 ### Worker secrets
 

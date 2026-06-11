@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Grok CLI provider (terminal-mode).** xAI's `grok` TUI is now a selectable
+  provider, launched in a tmux pane as `grok --always-approve`. Available in the
+  terminal session picker and the shared provider-selector. Chat-mode/planner
+  reject it for now (no streaming runner yet). Touches `CliProvider`,
+  `detect_cli_tools`, `terminal.rs::provider_command`, and the three chat-mode
+  dispatch matches.
+- **Agent operations guide.** New [`docs/operations.md`](docs/operations.md)
+  collects build/run/debug/deploy gotchas (toolchain + apt deps, the
+  directory-move build-cache trap, `npx tauri build` vs `cargo build`, local-dev
+  launch identity, the terminal attach path, lokal CLI setup, and deploy creds).
 - **Enriched planner/development event reasons.** The desktop planner
   orchestrator now parses reviewer `SUMMARY`, `FINDINGS`, and
   `NEXT_STEPS` blocks from T2 output and promotes the first concrete
@@ -29,6 +39,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   app-local conventions now document soft-close/reopen behavior,
   persisted run rename, single-phase execution mode, shared terminal
   ownership, and review-reason expectations in the event log.
+
+### Fixed
+- **Directory picker no longer hardcodes a machine path.** `browse_host_directory`
+  now resolves empty/`~`/`~/…` against the host home directory and falls back to
+  home for any unresolved path, instead of erroring `Invalid parent path`. The
+  hardcoded `/home/creepy/documents/workspace` defaults were removed from the
+  planner and terminal pages.
 
 ## [2026-05-25]
 

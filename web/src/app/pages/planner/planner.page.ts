@@ -221,9 +221,9 @@ export class PlannerPage implements OnInit, OnDestroy {
   promptSettingsPath = '~/.johnnyone/planner-prompts.yml';
 
   setupTitle = '';
-  workspacePath = '/home/creepy/documents/workspace';
-  planPath = 'personal/docs/johnnyone/plans/agent-validation-loop';
-  browsePath = '/home/creepy/documents/workspace';
+  workspacePath = '';
+  planPath = '';
+  browsePath = '';
   workerProvider = 'codex';
   reviewerProvider = 'codex';
   userBrief = '';
@@ -1789,11 +1789,11 @@ export class PlannerPage implements OnInit, OnDestroy {
   }
 
   private browserStartPath(mode: 'workspace' | 'plan' | 'appScope' | 'docsScope' | 'reference'): string {
-    if (mode === 'workspace') return this.workspacePath.trim() || '/';
+    if (mode === 'workspace') return this.workspacePath.trim() || '~';
     if (mode === 'plan') return this.absolutePlanPath();
-    if (mode === 'appScope') return this.absoluteWorkspacePath(this.appScope.trim()) || this.workspacePath.trim() || '/';
-    if (mode === 'docsScope') return this.absoluteWorkspacePath(this.docsScope.trim()) || this.workspacePath.trim() || '/';
-    return this.workspacePath.trim() || '/';
+    if (mode === 'appScope') return this.absoluteWorkspacePath(this.appScope.trim()) || this.workspacePath.trim() || '~';
+    if (mode === 'docsScope') return this.absoluteWorkspacePath(this.docsScope.trim()) || this.workspacePath.trim() || '~';
+    return this.workspacePath.trim() || '~';
   }
 
   private absoluteWorkspacePath(path: string): string {

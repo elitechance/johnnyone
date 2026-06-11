@@ -15,6 +15,10 @@ pub enum CliProvider {
     Codex,
     Cline,
     Ollama,
+    /// xAI's `grok` CLI — an interactive build TUI. Terminal-mode only (like the
+    /// other TUIs, it runs in a tmux pane). Launched with `--always-approve` so
+    /// tool executions don't block on prompts.
+    Grok,
     /// Plain interactive shell session (no AI provider). Spawned as the user's
     /// `$SHELL` (or bash) in a tmux pane; the user types commands themselves.
     /// Doesn't participate in chat-mode message exchange — terminal-mode only.
@@ -28,6 +32,7 @@ impl CliProvider {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Ollama => "ollama",
+            Self::Grok => "grok",
             Self::Shell => "shell",
         }
     }
@@ -38,6 +43,7 @@ impl CliProvider {
             "codex" => Some(Self::Codex),
             "cline" => Some(Self::Cline),
             "ollama" => Some(Self::Ollama),
+            "grok" => Some(Self::Grok),
             "shell" | "bash" | "sh" => Some(Self::Shell),
             _ => None,
         }
@@ -49,6 +55,7 @@ impl CliProvider {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Ollama => "ollama",
+            Self::Grok => "grok",
             // Honor the user's $SHELL at runtime; this static default is the
             // fallback if $SHELL isn't set. Resolved in terminal.rs::provider_command.
             Self::Shell => "bash",

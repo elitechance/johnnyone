@@ -68,6 +68,14 @@ export class ProviderSelectorComponent implements OnInit {
         { value: 'mistral:7b', label: 'Mistral 7B' },
       ],
     },
+    {
+      value: 'grok',
+      label: 'Grok',
+      models: [
+        { value: 'grok-4', label: 'Grok 4' },
+        { value: 'grok-code-fast', label: 'Grok Code Fast' },
+      ],
+    },
   ];
 
   get availableModels(): ModelOption[] {

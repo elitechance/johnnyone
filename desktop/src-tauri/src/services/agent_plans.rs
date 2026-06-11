@@ -926,8 +926,34 @@ pub fn validate_workspace_and_plan_path(
     }
 }
 
+fn home_directory() -> Result<PathBuf, String> {
+    dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())
+}
+
+/// Resolve a user-supplied browse path into an existing directory.
+///
+/// Empty input, `~`, or `~/...` resolve against the host's home directory.
+/// Anything that does not resolve to an existing directory falls back to home,
+/// so the picker always lands somewhere navigable instead of erroring. This
+/// keeps the directory browser host-agnostic — no machine-specific defaults.
+fn resolve_browse_dir(input: &str) -> Result<PathBuf, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return home_directory();
+    }
+    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
+        home_directory()?.join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    match normalize_path(&candidate) {
+        Ok(resolved) if resolved.is_dir() => Ok(resolved),
+        _ => home_directory(),
+    }
+}
+
 pub fn browse_host_directory(path: String) -> Result<Vec<HostFileEntry>, String> {
-    let base = normalize_path(Path::new(&path))?;
+    let base = resolve_browse_dir(&path)?;
     let mut entries = Vec::new();
     for entry in fs::read_dir(&base).map_err(|e| format!("Failed to read directory: {}", e))? {
         let entry = entry.map_err(|e| e.to_string())?;
