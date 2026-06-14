@@ -1,6 +1,11 @@
 <ion-header>
   <ion-toolbar>
     <ion-title>JohnnyOne Host</ion-title>
+    <ion-buttons slot="end">
+      <ion-button (click)="openSettings()" aria-label="Host settings">
+        <ion-icon slot="icon-only" name="settings-outline"></ion-icon>
+      </ion-button>
+    </ion-buttons>
   </ion-toolbar>
 </ion-header>
 <ion-content class="ion-padding">
@@ -31,7 +36,7 @@
         <ion-item>
           <ion-label>
             <h3>Worker reachable</h3>
-            <p>Cloud relay endpoint</p>
+            <p>{{ status.workerUrl() || 'Worker URL not configured' }}</p>
           </ion-label>
           @if (status.workerUp()) {
             <ion-chip color="success" slot="end">
@@ -47,18 +52,18 @@
         </ion-item>
         <ion-item>
           <ion-label>
-            <h3>Node registered</h3>
+            <h3>Relay connected</h3>
             <p>{{ user()?.email ?? 'Not signed in' }}</p>
           </ion-label>
-          @if (status.nodeRegistered()) {
+          @if (status.relayConnected()) {
             <ion-chip color="success" slot="end">
               <ion-icon name="checkmark-circle"></ion-icon>
-              <ion-label>Registered</ion-label>
+              <ion-label>Connected</ion-label>
             </ion-chip>
           } @else {
             <ion-chip color="warning" slot="end">
               <ion-icon name="close-circle"></ion-icon>
-              <ion-label>Not registered</ion-label>
+              <ion-label>Offline</ion-label>
             </ion-chip>
           }
         </ion-item>
@@ -87,6 +92,7 @@
       <ion-card-title>Account</ion-card-title>
     </ion-card-header>
     <ion-card-content>
+      <ion-button expand="block" fill="outline" (click)="openSettings()">Host settings</ion-button>
       <ion-button expand="block" color="medium" (click)="signOut()">Sign out</ion-button>
     </ion-card-content>
   </ion-card>

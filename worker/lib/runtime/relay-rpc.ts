@@ -1,3 +1,5 @@
+import { readCachedRpc, writeCachedRpc } from './desktop-rpc-cache';
+
 /**
  * Relay-RPC helper — replaces the legacy `hostGraphqlRequest` forward path.
  *
@@ -48,6 +50,11 @@ export async function relayRpc<T>(
   method: string,
   params: Record<string, unknown> = {},
 ): Promise<T> {
+  const cached = readCachedRpc<T>(ctx.auth, method, params);
+  if (cached !== null) {
+    return cached;
+  }
+
   const node = await ctx.db
     .prepare(
       `SELECT id FROM desktop_nodes
@@ -91,5 +98,7 @@ export async function relayRpc<T>(
     throw new Error(body.error ?? 'Desktop RPC failed');
   }
 
-  return body.data as T;
+  const data = body.data as T;
+  writeCachedRpc(ctx.auth, method, params, data);
+  return data;
 }

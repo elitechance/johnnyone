@@ -2,6 +2,7 @@ pub mod claude_code;
 pub mod cli_runner;
 pub mod cline;
 pub mod codex;
+pub mod grok;
 pub mod ollama_cli;
 pub mod output_parser;
 
@@ -15,9 +16,8 @@ pub enum CliProvider {
     Codex,
     Cline,
     Ollama,
-    /// xAI's `grok` CLI — an interactive build TUI. Terminal-mode only (like the
-    /// other TUIs, it runs in a tmux pane). Launched with `--always-approve` so
-    /// tool executions don't block on prompts.
+    /// xAI's `grok` CLI. Chat/planner uses headless `--output-format streaming-json`;
+    /// terminal mode launches the interactive TUI in a tmux pane.
     Grok,
     /// Plain interactive shell session (no AI provider). Spawned as the user's
     /// `$SHELL` (or bash) in a tmux pane; the user types commands themselves.

@@ -286,11 +286,14 @@ async function run() {
 
     await page.click('.workspace-actions .primary-action');
     await waitForAttachedPane(page);
-    await page.waitForFunction(() => document.querySelectorAll('.workspace-tab').length === 2, { timeout: 15000 });
+    await page.waitForFunction(
+      () => document.querySelectorAll('ion-segment.workspace-session-segment ion-segment-button').length === 2,
+      { timeout: 15000 },
+    );
     const visiblePaneCount = await page.$$eval('.terminal-pane', (panes) => panes.length);
     assert(visiblePaneCount === 1, `mobile should render one visible pane, found ${visiblePaneCount}`);
 
-    await page.click('.workspace-tab:not(.active)');
+    await page.click('ion-segment.workspace-session-segment ion-segment-button:nth-child(2)');
     await waitForAttachedPane(page);
     assert(await page.$$eval('.terminal-pane', (panes) => panes.length) === 1, 'switching tabs should still render one mobile pane');
 

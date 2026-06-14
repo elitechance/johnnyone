@@ -118,7 +118,8 @@ environments:
     # *.workers.dev URL. To wire a custom domain, add a zone to ~/.lokal/cf.yaml's
     # elitechance entry (e.g. videokestar.com subdomain) and set worker_domain here.
   prod:
-    # Same — no custom domain on elitechance yet.
+    # Live worker: johnnyone → https://johnnyone.<account>.workers.dev
+    # Deploy: lokal cf worker deploy --env prod (see docs/operations.md)
 
 secrets:
   - JWT_SECRET

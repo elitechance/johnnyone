@@ -1,3 +1,5 @@
+import { readCachedRpc, writeCachedRpc } from './desktop-rpc-cache';
+
 interface DesktopRpcEnv {
   CHAT_RELAY_DO: DurableObjectNamespace;
   [key: string]: unknown;
@@ -21,6 +23,11 @@ export async function desktopRpc<T>(
   method: string,
   params: Record<string, unknown> = {},
 ): Promise<T> {
+  const cached = readCachedRpc<T>(ctx.auth, method, params);
+  if (cached !== null) {
+    return cached;
+  }
+
   const node = await ctx.db
     .prepare(
       `SELECT id FROM desktop_nodes
@@ -47,5 +54,7 @@ export async function desktopRpc<T>(
     throw new Error(result.error || `Backend RPC failed: ${method}`);
   }
 
-  return result.data as T;
+  const data = result.data as T;
+  writeCachedRpc(ctx.auth, method, params, data);
+  return data;
 }

@@ -3,5 +3,6 @@ pub mod chat_host;
 pub mod git_history;
 pub mod planner_prompts;
 pub mod providers;
+pub mod relay;
 pub mod sessions;
 pub mod settings;

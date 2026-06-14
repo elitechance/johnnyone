@@ -8,23 +8,41 @@
   <header class="workspace-topbar">
     <!-- Hamburger to pop the side drawer on phone-narrow viewports only;
          hidden by CSS at md+ where the split-pane shows the menu permanently. -->
-    <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
-    <div class="page-title-chip">Terminal</div>
+    <div class="workspace-topbar-brand">
+      <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
+      <div class="page-title-chip">Terminal</div>
+    </div>
 
-    <nav class="workspace-tabs" aria-label="Terminal sessions">
-      @for (session of aiSessions(); track session.id) {
-        <button
-          class="workspace-tab"
-          [class.active]="session.id === currentSession()?.id"
-          (click)="onSessionSelected(session.id)"
-          [title]="session.id"
-        >
-          <span class="tab-status" aria-hidden="true"></span>
-          <span>{{ providerLabel(session.provider) }}</span>
-          <span class="tab-number">#{{ toSessionNumber(session.id) }}</span>
-        </button>
-      }
-    </nav>
+    @if (isCompactWorkspace()) {
+      <ion-segment
+        class="workspace-session-segment"
+        [value]="currentSession()?.id ?? ''"
+        (ionChange)="onSessionSelected($any($event.detail.value))"
+        scrollable
+        aria-label="Terminal sessions"
+      >
+        @for (session of aiSessions(); track session.id) {
+          <ion-segment-button [value]="session.id" [title]="session.title || providerLabel(session.provider)">
+            <ion-label>{{ mobileSessionLabel(session) }}</ion-label>
+          </ion-segment-button>
+        }
+      </ion-segment>
+    } @else {
+      <nav class="workspace-tabs" aria-label="Terminal sessions">
+        @for (session of aiSessions(); track session.id) {
+          <button
+            class="workspace-tab"
+            [class.active]="session.id === currentSession()?.id"
+            (click)="onSessionSelected(session.id)"
+            [title]="session.id"
+          >
+            <span class="tab-status" aria-hidden="true"></span>
+            <span>{{ providerLabel(session.provider) }}</span>
+            <span class="tab-number">#{{ toSessionNumber(session.id) }}</span>
+          </button>
+        }
+      </nav>
+    }
 
     <div class="workspace-actions">
       <select
@@ -48,14 +66,16 @@
     </div>
   </header>
 
-  <main class="terminal-workspace">
+  <main #terminalWorkspace class="terminal-workspace" [class.has-fullscreen-pane]="fullscreenPaneId() !== null">
     @if (visiblePaneSessions().length > 0) {
       @for (session of visiblePaneSessions(); track session.id; let index = $index) {
-      @let layout = paneLayout(session.id, index);
+      @if (!fullscreenPaneId() || fullscreenPaneId() === session.id) {
+      @let layout = paneLayoutForDisplay(session.id, index);
       @let screen = terminalScreens()[session.id] || null;
       <section
         class="terminal-pane"
         [class.active]="session.id === currentSession()?.id"
+        [class.fullscreen]="isPaneFullscreen(session.id)"
         [class.dragging]="isDraggingPane()"
         [class.resizing]="isResizingPane()"
         [style.left.px]="layout.x"
@@ -71,11 +91,20 @@
             <span class="pane-id">#{{ toSessionNumber(session.id) }}</span>
           </div>
           <div class="pane-meta">
-            <button class="pane-tool" title="Working directory" (click)="pickWorkingDirectoryForSession(session.id); $event.stopPropagation()">
-              {{ session.workingDirectory || '~' }}
+            <button class="pane-tool pane-cwd" [title]="session.workingDirectory || '~'" (click)="pickWorkingDirectoryForSession(session.id); $event.stopPropagation()">
+              {{ isCompactWorkspace() ? mobileWorkingDirectoryLabel(session.workingDirectory) : (session.workingDirectory || '~') }}
             </button>
             <button class="pane-tool" title="Rename session" (click)="onSessionRenamed(session.id); $event.stopPropagation()">
               rename
+            </button>
+            <button
+              class="pane-tool pane-fullscreen-btn"
+              [title]="isPaneFullscreen(session.id) ? 'Exit fullscreen' : 'Fullscreen in workspace'"
+              [attr.aria-label]="isPaneFullscreen(session.id) ? 'Exit fullscreen' : 'Fullscreen in workspace'"
+              (click)="togglePaneFullscreen(session.id, $event)"
+            >
+              <ion-icon [name]="isPaneFullscreen(session.id) ? 'contract-outline' : 'expand-outline'" aria-hidden="true"></ion-icon>
+              <span class="pane-fullscreen-label">{{ isPaneFullscreen(session.id) ? 'exit' : 'full' }}</span>
             </button>
             <button class="pane-tool danger" title="Close terminal" (click)="closeTerminalPane(session.id); $event.stopPropagation()">
               close
@@ -92,6 +121,7 @@
           [title]="session.title || 'Terminal'"
           [disabled]="session.id !== currentSession()?.id"
           [mobileInputMode]="isCompactWorkspace()"
+          [showInput]="true"
           [imageAttachments]="pendingAttachmentsForSession(session.id)"
           [imageSending]="isSendingAttachmentsForSession(session.id)"
           (rawInput)="onTerminalRawInput($event, session.id)"
@@ -103,12 +133,15 @@
           (imageMessageSubmitted)="sendAttachmentMessage(session.id, $event)"
         />
 
-        <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>
+        @if (!isPaneFullscreen(session.id)) {
+          <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>
+        }
 
         @if (terminalError() && session.id === currentSession()?.id) {
           <div class="terminal-error">{{ terminalError() }}</div>
         }
       </section>
+      }
       }
     } @else {
       <section class="workspace-empty">

@@ -1,0 +1,89 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-back-button defaultHref="/status"></ion-back-button>
+    </ion-buttons>
+    <ion-title>Host Settings</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content class="ion-padding">
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Cloud relay</ion-card-title>
+      <ion-card-subtitle>Persisted in the desktop backend SQLite database</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="full">
+        <ion-item>
+          <ion-input
+            label="Worker URL"
+            labelPlacement="stacked"
+            placeholder="https://johnnyone.ethan-353.workers.dev"
+            [(ngModel)]="workerUrl"
+          ></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="Tenant ID"
+            labelPlacement="stacked"
+            [(ngModel)]="tenantId"
+          ></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="User ID"
+            labelPlacement="stacked"
+            helperText="Set automatically after sign-in. Needed for relay routing before the web client connects."
+            [(ngModel)]="userId"
+          ></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="Web client URL"
+            labelPlacement="stacked"
+            [(ngModel)]="webClientUrl"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Planner paths</ion-card-title>
+      <ion-card-subtitle>Workspace-relative defaults used by T1/T2 prompts</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="full">
+        <ion-item>
+          <ion-input
+            label="Methodology path"
+            labelPlacement="stacked"
+            placeholder="lokal/agents/common/methodology.md"
+            [(ngModel)]="plannerMethodologyPath"
+          ></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="Conventions directory"
+            labelPlacement="stacked"
+            placeholder="lokal/agents/common/conventions"
+            [(ngModel)]="plannerConventionsPath"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+    </ion-card-content>
+  </ion-card>
+
+  @if (error()) {
+    <ion-text color="danger"><p>{{ error() }}</p></ion-text>
+  }
+  @if (notice()) {
+    <ion-text color="success"><p>{{ notice() }}</p></ion-text>
+  }
+
+  <ion-button expand="block" [disabled]="loading() || saving()" (click)="save()">
+    {{ saving() ? 'Saving…' : 'Save settings' }}
+  </ion-button>
+</ion-content>

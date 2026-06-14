@@ -6,6 +6,7 @@ use crate::services::{
     chat_host,
     planner_prompts::{self as planner_prompt_service, PlannerPromptSettings},
     providers::{self as provider_service, DetectedTool},
+    relay as relay_service,
     sessions as session_service, settings as settings_service,
 };
 use crate::state::app_state::AppState;
@@ -128,6 +129,24 @@ impl QueryRoot {
 
     async fn get_planner_prompt_settings(&self) -> async_graphql::Result<GqlPlannerPromptSettings> {
         Ok(planner_prompt_service::load_prompt_settings()?.into())
+    }
+
+    async fn host_settings(&self, ctx: &Context<'_>) -> async_graphql::Result<GqlHostSettings> {
+        let state = ctx.data_unchecked::<AppState>();
+        Ok(settings_service::load_host_settings(state).into())
+    }
+
+    async fn relay_connection_status(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<GqlRelayConnectionStatus> {
+        let state = ctx.data_unchecked::<AppState>();
+        let status = state.connection_status.lock().await;
+        Ok(GqlRelayConnectionStatus {
+            connected: status.connected,
+            session_id: status.session_id.clone(),
+            last_heartbeat: status.last_heartbeat.as_ref().map(|t| t.to_rfc3339()),
+        })
     }
 }
 
@@ -263,6 +282,12 @@ impl MutationRoot {
         input: PlannerPromptSettingsInput,
     ) -> async_graphql::Result<GqlPlannerPromptSettings> {
         Ok(planner_prompt_service::save_prompt_settings(input.into())?.into())
+    }
+
+    async fn connect_relay(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>().clone();
+        relay_service::ensure_connected(state).await?;
+        Ok(true)
     }
 }
 
@@ -417,6 +442,38 @@ impl From<DetectedTool> for GqlDetectedTool {
             path: value.path,
         }
     }
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "HostSettings", rename_fields = "camelCase")]
+struct GqlHostSettings {
+    worker_url: String,
+    tenant_id: String,
+    user_id: String,
+    planner_methodology_path: String,
+    planner_conventions_path: String,
+    web_client_url: String,
+}
+
+impl From<settings_service::HostSettings> for GqlHostSettings {
+    fn from(value: settings_service::HostSettings) -> Self {
+        Self {
+            worker_url: value.worker_url,
+            tenant_id: value.tenant_id,
+            user_id: value.user_id,
+            planner_methodology_path: value.planner_methodology_path,
+            planner_conventions_path: value.planner_conventions_path,
+            web_client_url: value.web_client_url,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "RelayConnectionStatus", rename_fields = "camelCase")]
+struct GqlRelayConnectionStatus {
+    connected: bool,
+    session_id: Option<String>,
+    last_heartbeat: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]

@@ -13,6 +13,16 @@
         <ion-list lines="full">
           <ion-item>
             <ion-input
+              label="Worker URL"
+              labelPlacement="floating"
+              type="url"
+              [value]="workerUrl()"
+              (ionInput)="workerUrl.set($any($event.target).value)"
+              helperText="Saved to host settings on sign-in. Edit anytime in Host Settings."
+            ></ion-input>
+          </ion-item>
+          <ion-item>
+            <ion-input
               label="Email"
               labelPlacement="floating"
               type="email"

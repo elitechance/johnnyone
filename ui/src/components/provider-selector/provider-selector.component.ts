@@ -72,8 +72,8 @@ export class ProviderSelectorComponent implements OnInit {
       value: 'grok',
       label: 'Grok',
       models: [
-        { value: 'grok-4', label: 'Grok 4' },
-        { value: 'grok-code-fast', label: 'Grok Code Fast' },
+        { value: 'grok-composer-2.5-fast', label: 'Grok Composer 2.5 Fast' },
+        { value: 'grok-build', label: 'Grok Build' },
       ],
     },
   ];

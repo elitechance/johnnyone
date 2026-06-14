@@ -51,13 +51,13 @@ Common commands:
 
 - Web build: `npx nx build web`
 - UI library build: `npx nx build ui`
-- Dev deploy: `lokal cf deploy --env dev`
-- Desktop backend build (single self-contained binary): `cd desktop/src-tauri && cargo tauri build --no-bundle`. **Do not use `cargo build --release --bin johnnyone-desktop`** — that compiles cleanly but produces a binary whose Tauri webview can't load the embedded UI (shows `Could not connect to localhost: Connection refused` on a blank page); only `cargo tauri build` triggers the production-mode webview-runtime rebuild. For dev with HMR use `cargo tauri dev` (spawns the `host-app` Angular dev server on :4201).
+- Prod deploy: `npm run deploy:worker` / `lokal cf deploy --env prod` (see `docs/operations.md` § Deploy gotchas)
+- Desktop backend build: `npm run build:desktop` (wipes `dist/host-app` then rebuilds) or `cd desktop/src-tauri && npx tauri build --no-bundle`. **Do not use plain `cargo build --release`** without `--features tauri/custom-protocol` — blank window (`Could not connect to localhost`). See `docs/operations.md`. Dev with HMR: `cargo tauri dev` (`host-app` on :4201).
 
 For deployed web changes, verify the stable dev site is serving the new bundle with:
 
 ```bash
-curl -sL https://johnnyone-dev.pages.dev/ | grep -o "main-[A-Z0-9]*\\.js" | head -1
+curl -sL https://johnnyone.pages.dev/ | grep -o "main-[A-Z0-9]*\\.js" | head -1
 ```
 
 Planning and development validation should not claim live behavior is current unless the relevant local backend, deployed Worker, and Pages bundle were actually checked.

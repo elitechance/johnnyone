@@ -17,6 +17,7 @@ import {
   IonToolbar,
 } from '@ionic/angular/standalone';
 import { HostAuthService } from '../../services/host-auth.service';
+import { HostSettingsService } from '../../services/host-settings.service';
 
 @Component({
   selector: 'host-login-page',
@@ -42,13 +43,29 @@ import { HostAuthService } from '../../services/host-auth.service';
 })
 export class LoginPage {
   private readonly auth = inject(HostAuthService);
+  private readonly settings = inject(HostSettingsService);
   private readonly router = inject(Router);
 
   email = signal('');
   password = signal('');
   tenantId = signal('00000000-0000-0000-0000-000000000001');
+  workerUrl = signal('');
   loading = signal(false);
   error = signal('');
+
+  constructor() {
+    void this.loadDefaults();
+  }
+
+  private async loadDefaults(): Promise<void> {
+    try {
+      const hostSettings = await this.settings.load();
+      this.tenantId.set(hostSettings.tenantId);
+      this.workerUrl.set(hostSettings.workerUrl);
+    } catch {
+      // Host GraphQL may still be starting; login will surface errors if needed.
+    }
+  }
 
   async login(): Promise<void> {
     if (this.loading()) return;
@@ -59,6 +76,7 @@ export class LoginPage {
         this.email().trim(),
         this.password(),
         this.tenantId().trim(),
+        this.workerUrl().trim(),
       );
       await this.router.navigateByUrl('/status');
     } catch (err) {

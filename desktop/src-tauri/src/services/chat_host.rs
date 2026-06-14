@@ -1,7 +1,7 @@
 use crate::db::models::Message;
 use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, grok, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
 use crate::simulator;
 use crate::state::app_state::AppState;
@@ -84,14 +84,6 @@ pub async fn send_chat_message_blocking(
             "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
         );
     }
-    // grok is wired for terminal-mode only (interactive TUI in a tmux pane); it
-    // has no chat-mode streaming runner yet.
-    if matches!(provider, CliProvider::Grok) {
-        return Err(
-            "Grok runs in terminal mode only — open it as a terminal session and type into the pane.".to_string(),
-        );
-    }
-
     let cli_path_ref = cli_path.as_deref();
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
@@ -101,6 +93,9 @@ pub async fn send_chat_message_blocking(
         CliProvider::Codex => {
             codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
         }
+        CliProvider::Grok => {
+            grok::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
+        }
         CliProvider::Cline => cline::build_config(&content, &working_dir, &model, cli_path_ref),
         CliProvider::Ollama => {
             ollama_cli::build_config(&content, &working_dir, &model, cli_path_ref)
@@ -108,16 +103,15 @@ pub async fn send_chat_message_blocking(
         // Shell is filtered out above; unreachable here but the compiler needs
         // the arm so the match stays exhaustive.
         CliProvider::Shell => unreachable!("shell provider already rejected"),
-        CliProvider::Grok => unreachable!("grok provider already rejected"),
     };
 
     let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
         CliProvider::ClaudeCode => claude_code::parse_line,
         CliProvider::Codex => codex::parse_line,
+        CliProvider::Grok => grok::parse_line,
         CliProvider::Cline => cline::parse_line,
         CliProvider::Ollama => ollama_cli::parse_line,
         CliProvider::Shell => unreachable!("shell provider already rejected"),
-        CliProvider::Grok => unreachable!("grok provider already rejected"),
     };
 
     let (process, mut rx) = cli_runner::spawn_cli(config, session_id.clone(), parse_fn).await?;

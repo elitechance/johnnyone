@@ -1,7 +1,11 @@
 import {
+  AfterViewInit,
   Component,
-  OnInit,
+  ElementRef,
+  HostListener,
   OnDestroy,
+  OnInit,
+  ViewChild,
   inject,
   signal,
   computed,
@@ -31,6 +35,8 @@ import { addIcons } from 'ionicons';
 import {
   arrowUpOutline,
   closeOutline,
+  contractOutline,
+  expandOutline,
   folderOutline,
   documentOutline,
 } from 'ionicons/icons';
@@ -89,10 +95,18 @@ interface PaneLayout {
   height: number;
 }
 
+interface PersistedTerminalWorkspaceState {
+  desktopLayouts: Record<string, PaneLayout>;
+  mobileLayouts: Record<string, PaneLayout>;
+  closedPaneIds: string[];
+}
+
 // Register Ionicons used by the workspace-picker modal once at module load.
 addIcons({
   'arrow-up-outline': arrowUpOutline,
   'close-outline': closeOutline,
+  'contract-outline': contractOutline,
+  'expand-outline': expandOutline,
   'folder-outline': folderOutline,
   'document-outline': documentOutline,
 });
@@ -124,8 +138,10 @@ addIcons({
   templateUrl: './terminal.page.html',
   styleUrls: ['./terminal.page.scss'],
 })
-export class TerminalPage implements OnInit, OnDestroy {
+export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private static readonly SIDEBAR_WIDTH_KEY = 'johnnyone_desktop_sidebar_width';
+  private static readonly PANE_WORKSPACE_STATE_KEY = 'johnnyone_terminal_pane_workspace';
+  private static readonly WORKSPACE_PADDING_PX = 12;
   private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
   private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
   private readonly api = inject(JohnnyApiService);
@@ -150,6 +166,9 @@ export class TerminalPage implements OnInit, OnDestroy {
   private sessionUpdateSubscription: Subscription | null = null;
   private sessionDeleteSubscription: Subscription | null = null;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
+  private saveWorkspaceStateTimeout: ReturnType<typeof setTimeout> | null = null;
+  private workspaceResizeObserver: ResizeObserver | null = null;
+  private layoutBeforeFullscreen: Record<string, PaneLayout> = {};
   private compactWorkspaceMediaQuery: MediaQueryList | null = null;
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
   private terminalVisualSubscriptions = new Set<string>();
@@ -200,7 +219,11 @@ export class TerminalPage implements OnInit, OnDestroy {
   paneHeight = signal(560);
   isDraggingPane = signal(false);
   isResizingPane = signal(false);
+  fullscreenPaneId = signal<string | null>(null);
   isCompactWorkspace = signal(false);
+
+  @ViewChild('terminalWorkspace', { static: true })
+  private terminalWorkspace?: ElementRef<HTMLElement>;
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
   sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 
@@ -218,11 +241,11 @@ export class TerminalPage implements OnInit, OnDestroy {
       .map(s => this.mapSession(s))
   );
 
-  visiblePaneSessions = computed<SharedAiSession[]>(() =>
-    this.isCompactWorkspace()
-      ? this.aiSessions().filter((session) => session.id === this.currentSession()?.id)
-      : this.aiSessions()
-  );
+  visiblePaneSessions = computed<SharedAiSession[]>(() => {
+    const currentId = this.currentSession()?.id;
+    if (!currentId) return [];
+    return this.aiSessions().filter((session) => session.id === currentId);
+  });
 
   aiMessages = computed<SharedAiMessage[]>(() => {
     const streamingId = this.streamingMessageId();
@@ -295,6 +318,7 @@ export class TerminalPage implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.setupCompactWorkspaceMode();
     this.loadSidebarWidth();
+    this.loadPersistedWorkspaceState();
     this.subscribeToTerminalEvents();
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
     void this.detectTools();
@@ -304,7 +328,28 @@ export class TerminalPage implements OnInit, OnDestroy {
     void this.relayTerminal.connect();
   }
 
+  ngAfterViewInit(): void {
+    this.setupWorkspaceResizeObserver();
+    if (this.sessions().length > 0) {
+      this.restorePaneLayoutsFromStorage(this.sessions());
+    }
+  }
+
+  @HostListener('document:keydown.escape')
+  onEscapeKey(): void {
+    if (this.fullscreenPaneId()) {
+      this.closePaneFullscreen();
+    }
+  }
+
   ngOnDestroy(): void {
+    this.flushWorkspaceState();
+    this.workspaceResizeObserver?.disconnect();
+    this.workspaceResizeObserver = null;
+    if (this.saveWorkspaceStateTimeout) {
+      clearTimeout(this.saveWorkspaceStateTimeout);
+      this.saveWorkspaceStateTimeout = null;
+    }
     document.removeEventListener('visibilitychange', this.visibilityChangeHandler);
     void this.unsubscribeAllTerminalVisuals();
     this.teardownChatSubscriptions();
@@ -391,7 +436,7 @@ export class TerminalPage implements OnInit, OnDestroy {
       );
       const sortedSessions = this.sortSessions(sessions);
       this.sessions.set(sortedSessions);
-      this.ensurePaneLayouts(sortedSessions);
+      this.restorePaneLayoutsFromStorage(sortedSessions);
       await this.syncTerminalVisualSubscriptions();
 
       const current = this.currentSession();
@@ -469,7 +514,7 @@ export class TerminalPage implements OnInit, OnDestroy {
         const mapped = this.mapApiSessionToState(session);
         if (mapped.status === 'active') {
           this.upsertSession(mapped);
-          this.ensurePaneLayouts(this.sessions());
+          this.restorePaneLayoutsFromStorage(this.sessions());
           void this.syncTerminalVisualSubscriptions();
         } else {
           void this.unsubscribeTerminalVisual(mapped.id);
@@ -615,7 +660,7 @@ export class TerminalPage implements OnInit, OnDestroy {
       this.selectedProvider.set(session.provider);
       this.workingDirectory.set(session.working_directory);
       this.messages.set(messages);
-      await this.attachTerminal(id);
+      await this.syncTerminalVisualSubscriptions();
 
       this.isStreaming.set(false);
       this.streamingContent.set('');
@@ -1060,7 +1105,7 @@ export class TerminalPage implements OnInit, OnDestroy {
   }
 
   startPaneDrag(event: PointerEvent, sessionId = this.currentSession()?.id): void {
-    if (this.isCompactWorkspace()) return;
+    if (this.isCompactWorkspace() || this.fullscreenPaneId()) return;
     const layout = sessionId ? this.paneLayout(sessionId) : null;
     if (!sessionId || !layout) return;
     if ((event.target as HTMLElement).closest('button, select, input')) return;
@@ -1078,11 +1123,20 @@ export class TerminalPage implements OnInit, OnDestroy {
     this.isDraggingPane.set(true);
 
     this.paneMoveHandler = (moveEvent) => {
-      const maxLeft = Math.max(12, window.innerWidth - 180);
-      const maxTop = Math.max(12, window.innerHeight - 120);
+      const bounds = this.workspaceBounds();
+      const maxLeft = Math.max(bounds.minX, bounds.width - this.paneInteractionStart.width);
+      const maxTop = Math.max(bounds.minY, bounds.height - this.paneInteractionStart.height);
       this.updatePaneLayout(sessionId, {
-        x: this.clamp(this.paneInteractionStart.left + moveEvent.clientX - this.paneInteractionStart.x, 12, maxLeft),
-        y: this.clamp(this.paneInteractionStart.top + moveEvent.clientY - this.paneInteractionStart.y, 12, maxTop),
+        x: this.clamp(
+          this.paneInteractionStart.left + moveEvent.clientX - this.paneInteractionStart.x,
+          bounds.minX,
+          maxLeft,
+        ),
+        y: this.clamp(
+          this.paneInteractionStart.top + moveEvent.clientY - this.paneInteractionStart.y,
+          bounds.minY,
+          maxTop,
+        ),
       });
     };
     this.paneUpHandler = () => this.stopPaneInteraction();
@@ -1092,6 +1146,7 @@ export class TerminalPage implements OnInit, OnDestroy {
   }
 
   startPaneResize(event: PointerEvent, sessionId = this.currentSession()?.id): void {
+    if (this.fullscreenPaneId()) return;
     const layout = sessionId ? this.paneLayout(sessionId) : null;
     if (!sessionId || !layout) return;
     event.preventDefault();
@@ -1117,11 +1172,20 @@ export class TerminalPage implements OnInit, OnDestroy {
         return;
       }
 
-      const maxWidth = Math.max(420, window.innerWidth - currentLayout.x - 18);
-      const maxHeight = Math.max(260, window.innerHeight - currentLayout.y - 78);
+      const bounds = this.workspaceBounds();
+      const maxWidth = Math.max(420, bounds.width - currentLayout.x);
+      const maxHeight = Math.max(260, bounds.height - currentLayout.y);
       this.updatePaneLayout(sessionId, {
-        width: this.clamp(this.paneInteractionStart.width + moveEvent.clientX - this.paneInteractionStart.x, 420, maxWidth),
-        height: this.clamp(this.paneInteractionStart.height + moveEvent.clientY - this.paneInteractionStart.y, 260, maxHeight),
+        width: this.clamp(
+          this.paneInteractionStart.width + moveEvent.clientX - this.paneInteractionStart.x,
+          420,
+          maxWidth,
+        ),
+        height: this.clamp(
+          this.paneInteractionStart.height + moveEvent.clientY - this.paneInteractionStart.y,
+          260,
+          maxHeight,
+        ),
       });
     };
     this.paneUpHandler = () => this.stopPaneInteraction();
@@ -1141,6 +1205,53 @@ export class TerminalPage implements OnInit, OnDestroy {
     }
     this.isDraggingPane.set(false);
     this.isResizingPane.set(false);
+    this.flushWorkspaceState();
+  }
+
+  paneLayoutForDisplay(sessionId: string, index = 0): PaneLayout {
+    if (this.fullscreenPaneId() === sessionId) {
+      return this.fullscreenPaneLayout();
+    }
+    return this.paneLayout(sessionId, index);
+  }
+
+  isPaneFullscreen(sessionId: string): boolean {
+    return this.fullscreenPaneId() === sessionId;
+  }
+
+  togglePaneFullscreen(sessionId: string, event?: Event): void {
+    event?.preventDefault();
+    event?.stopPropagation();
+    if (this.fullscreenPaneId() === sessionId) {
+      this.closePaneFullscreen();
+      return;
+    }
+    this.openPaneFullscreen(sessionId);
+  }
+
+  closePaneFullscreen(): void {
+    const sessionId = this.fullscreenPaneId();
+    if (!sessionId) return;
+
+    const restored = this.layoutBeforeFullscreen[sessionId];
+    delete this.layoutBeforeFullscreen[sessionId];
+    this.fullscreenPaneId.set(null);
+    if (restored) {
+      this.updatePaneLayout(sessionId, restored);
+      return;
+    }
+    this.scheduleWorkspaceStateSave();
+  }
+
+  private openPaneFullscreen(sessionId: string): void {
+    const current = this.paneLayout(sessionId);
+    this.layoutBeforeFullscreen[sessionId] = { ...current };
+    this.fullscreenPaneId.set(sessionId);
+    void this.selectSession(sessionId);
+    this.paneLayouts.update((layouts) => ({
+      ...layouts,
+      [sessionId]: this.fullscreenPaneLayout(),
+    }));
   }
 
   private setupCompactWorkspaceMode(): void {
@@ -1150,7 +1261,10 @@ export class TerminalPage implements OnInit, OnDestroy {
     this.isCompactWorkspace.set(this.compactWorkspaceMediaQuery.matches);
     this.compactWorkspaceListener = (event) => {
       this.stopPaneInteraction();
+      this.closePaneFullscreen();
+      this.saveWorkspaceState();
       this.isCompactWorkspace.set(event.matches);
+      this.restorePaneLayoutsFromStorage(this.sessions());
       void this.syncTerminalVisualSubscriptions();
     };
     this.compactWorkspaceMediaQuery.addEventListener('change', this.compactWorkspaceListener);
@@ -1360,6 +1474,11 @@ export class TerminalPage implements OnInit, OnDestroy {
     this.sessions.update((sessions) => sessions.filter((session) => session.id !== sessionId));
     this.terminalScreens.update((screens) => this.omitRecordKey(screens, sessionId));
     this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, sessionId));
+    if (this.fullscreenPaneId() === sessionId) {
+      this.fullscreenPaneId.set(null);
+      delete this.layoutBeforeFullscreen[sessionId];
+    }
+    this.scheduleWorkspaceStateSave();
     this.clearPendingAttachments(sessionId);
     this.setSendingAttachments(sessionId, false);
 
@@ -1459,16 +1578,40 @@ export class TerminalPage implements OnInit, OnDestroy {
     return this.paneLayouts()[sessionId] ?? this.defaultPaneLayout(index);
   }
 
-  private ensurePaneLayouts(sessions: Session[]): void {
+  private restorePaneLayoutsFromStorage(sessions: Session[]): void {
+    const persisted = this.readPersistedWorkspaceState();
+    const savedLayouts = this.isCompactWorkspace()
+      ? persisted?.mobileLayouts
+      : persisted?.desktopLayouts;
+    const activeIds = new Set(sessions.map((session) => session.id));
+
     this.paneLayouts.update((layouts) => {
       let changed = false;
       const next = { ...layouts };
+
       sessions.forEach((session, index) => {
+        const saved = savedLayouts?.[session.id];
+        if (saved) {
+          const normalized = this.normalizePaneLayout(saved, index);
+          if (normalized) {
+            next[session.id] = normalized;
+            changed = true;
+          }
+          return;
+        }
         if (!next[session.id]) {
           next[session.id] = this.defaultPaneLayout(index);
           changed = true;
         }
       });
+
+      for (const sessionId of Object.keys(next)) {
+        if (!activeIds.has(sessionId)) {
+          delete next[sessionId];
+          changed = true;
+        }
+      }
+
       return changed ? next : layouts;
     });
   }
@@ -1476,29 +1619,237 @@ export class TerminalPage implements OnInit, OnDestroy {
   private updatePaneLayout(sessionId: string, patch: Partial<PaneLayout>): void {
     this.paneLayouts.update((layouts) => {
       const current = layouts[sessionId] ?? this.defaultPaneLayout(0);
+      const merged = { ...current, ...patch };
+      const normalized = this.normalizePaneLayout(merged, 0) ?? merged;
       return {
         ...layouts,
-        [sessionId]: { ...current, ...patch },
+        [sessionId]: normalized,
       };
     });
+    if (this.fullscreenPaneId() !== sessionId) {
+      this.scheduleWorkspaceStateSave();
+    }
   }
 
   private defaultPaneLayout(index: number): PaneLayout {
-    if (this.isCompactWorkspace() && typeof window !== 'undefined') {
+    if (this.isCompactWorkspace()) {
+      const bounds = this.workspaceBounds();
       return {
-        x: 0,
-        y: 0,
-        width: Math.max(320, window.innerWidth - 20),
+        x: bounds.minX,
+        y: bounds.minY,
+        width: bounds.width,
         height: this.defaultCompactPaneHeight(),
       };
     }
 
-    return {
-      x: 44 + index * 36,
-      y: 34 + index * 30,
-      width: 860,
-      height: 560,
+    const bounds = this.workspaceBounds();
+    const width = Math.min(860, bounds.width);
+    const height = Math.min(560, bounds.height);
+    return this.normalizePaneLayout({
+      x: bounds.minX + index * 36,
+      y: bounds.minY + index * 30,
+      width,
+      height,
+    }, index) ?? {
+      x: bounds.minX + index * 36,
+      y: bounds.minY + index * 30,
+      width,
+      height,
     };
+  }
+
+  private fullscreenPaneLayout(): PaneLayout {
+    const bounds = this.workspaceBounds();
+    return {
+      x: bounds.minX,
+      y: bounds.minY,
+      width: bounds.width,
+      height: bounds.height,
+    };
+  }
+
+  private workspaceBounds(): {
+    minX: number;
+    minY: number;
+    width: number;
+    height: number;
+  } {
+    const padding = TerminalPage.WORKSPACE_PADDING_PX;
+    const workspace = this.terminalWorkspace?.nativeElement;
+    const workspaceWidth = workspace?.clientWidth && workspace.clientWidth > 0
+      ? workspace.clientWidth
+      : Math.max(420, (typeof window !== 'undefined' ? window.innerWidth : 1280) - 40);
+    const workspaceHeight = workspace?.clientHeight && workspace.clientHeight > 0
+      ? workspace.clientHeight
+      : Math.max(260, (typeof window !== 'undefined' ? window.innerHeight : 800) - 180);
+    const innerWidth = Math.max(320, workspaceWidth - padding * 2);
+    const innerHeight = Math.max(260, workspaceHeight - padding * 2);
+
+    return {
+      minX: padding,
+      minY: padding,
+      width: innerWidth,
+      height: innerHeight,
+    };
+  }
+
+  private normalizePaneLayout(layout: PaneLayout, index: number): PaneLayout | null {
+    const x = Number(layout.x);
+    const y = Number(layout.y);
+    const width = Number(layout.width);
+    const height = Number(layout.height);
+    if (![x, y, width, height].every(Number.isFinite)) return null;
+
+    const bounds = this.workspaceBounds();
+    const minWidth = this.isCompactWorkspace() ? 320 : 420;
+    const minHeight = this.isCompactWorkspace() ? 360 : 260;
+    const normalizedWidth = this.clamp(width, minWidth, bounds.width);
+    const normalizedHeight = this.clamp(height, minHeight, bounds.height);
+    const maxX = bounds.minX + Math.max(0, bounds.width - normalizedWidth);
+    const maxY = bounds.minY + Math.max(0, bounds.height - normalizedHeight);
+
+    return {
+      x: this.clamp(x, bounds.minX, maxX),
+      y: this.clamp(y, bounds.minY, maxY),
+      width: normalizedWidth,
+      height: normalizedHeight,
+    };
+  }
+
+  private loadPersistedWorkspaceState(): void {
+    const persisted = this.readPersistedWorkspaceState();
+    if (!persisted) return;
+    if (persisted.closedPaneIds.length > 0) {
+      this.closedPaneIds.set(new Set(persisted.closedPaneIds));
+    }
+  }
+
+  private parsePersistedLayouts(raw: unknown): Record<string, PaneLayout> {
+    const layouts: Record<string, PaneLayout> = {};
+    if (!raw || typeof raw !== 'object') return layouts;
+
+    for (const [sessionId, layout] of Object.entries(raw)) {
+      if (!layout || typeof layout !== 'object') continue;
+      const candidate = layout as Partial<PaneLayout>;
+      if (
+        Number.isFinite(candidate.x)
+        && Number.isFinite(candidate.y)
+        && Number.isFinite(candidate.width)
+        && Number.isFinite(candidate.height)
+      ) {
+        layouts[sessionId] = {
+          x: Number(candidate.x),
+          y: Number(candidate.y),
+          width: Number(candidate.width),
+          height: Number(candidate.height),
+        };
+      }
+    }
+
+    return layouts;
+  }
+
+  private readPersistedWorkspaceState(): PersistedTerminalWorkspaceState | null {
+    try {
+      const raw = localStorage.getItem(TerminalPage.PANE_WORKSPACE_STATE_KEY);
+      if (!raw) return null;
+
+      const parsed = JSON.parse(raw) as Partial<PersistedTerminalWorkspaceState> & {
+        layouts?: Record<string, PaneLayout>;
+      };
+      const desktopFromField = this.parsePersistedLayouts(parsed.desktopLayouts);
+      const legacyLayouts = this.parsePersistedLayouts(parsed.layouts);
+      const desktopLayouts = Object.keys(desktopFromField).length > 0
+        ? desktopFromField
+        : legacyLayouts;
+      const mobileLayouts = this.parsePersistedLayouts(parsed.mobileLayouts);
+
+      const closedPaneIds = Array.isArray(parsed.closedPaneIds)
+        ? parsed.closedPaneIds.filter((id): id is string => typeof id === 'string')
+        : [];
+
+      if (
+        Object.keys(desktopLayouts).length === 0
+        && Object.keys(mobileLayouts).length === 0
+        && closedPaneIds.length === 0
+      ) {
+        return null;
+      }
+
+      return { desktopLayouts, mobileLayouts, closedPaneIds };
+    } catch {
+      return null;
+    }
+  }
+
+  private scheduleWorkspaceStateSave(): void {
+    if (this.saveWorkspaceStateTimeout) {
+      clearTimeout(this.saveWorkspaceStateTimeout);
+    }
+    this.saveWorkspaceStateTimeout = setTimeout(() => {
+      this.saveWorkspaceStateTimeout = null;
+      this.saveWorkspaceState();
+    }, 250);
+  }
+
+  private flushWorkspaceState(): void {
+    if (this.saveWorkspaceStateTimeout) {
+      clearTimeout(this.saveWorkspaceStateTimeout);
+      this.saveWorkspaceStateTimeout = null;
+    }
+    this.saveWorkspaceState();
+  }
+
+  private buildPersistableLayouts(): Record<string, PaneLayout> {
+    const activeIds = new Set(this.sessions().map((session) => session.id));
+    const layouts: Record<string, PaneLayout> = {};
+    for (const [sessionId, layout] of Object.entries(this.paneLayouts())) {
+      if (!activeIds.has(sessionId)) continue;
+      if (this.fullscreenPaneId() === sessionId) {
+        const restored = this.layoutBeforeFullscreen[sessionId];
+        if (restored) {
+          layouts[sessionId] = restored;
+        }
+        continue;
+      }
+      layouts[sessionId] = layout;
+    }
+    return layouts;
+  }
+
+  private saveWorkspaceState(): void {
+    try {
+      const persisted = this.readPersistedWorkspaceState();
+      const currentLayouts = this.buildPersistableLayouts();
+      const state: PersistedTerminalWorkspaceState = {
+        desktopLayouts: persisted?.desktopLayouts ?? {},
+        mobileLayouts: persisted?.mobileLayouts ?? {},
+        closedPaneIds: Array.from(this.closedPaneIds()),
+      };
+
+      if (this.isCompactWorkspace()) {
+        state.mobileLayouts = currentLayouts;
+      } else {
+        state.desktopLayouts = currentLayouts;
+      }
+
+      localStorage.setItem(TerminalPage.PANE_WORKSPACE_STATE_KEY, JSON.stringify(state));
+    } catch {
+      // Ignore localStorage write failures.
+    }
+  }
+
+  private setupWorkspaceResizeObserver(): void {
+    const workspace = this.terminalWorkspace?.nativeElement;
+    if (!workspace || typeof ResizeObserver === 'undefined') return;
+
+    this.workspaceResizeObserver?.disconnect();
+    this.workspaceResizeObserver = new ResizeObserver(() => {
+      const fullscreenId = this.fullscreenPaneId();
+      if (!fullscreenId) return;
+      this.updatePaneLayout(fullscreenId, this.fullscreenPaneLayout());
+    });
+    this.workspaceResizeObserver.observe(workspace);
   }
 
   private defaultCompactPaneHeight(): number {
@@ -1556,7 +1907,7 @@ export class TerminalPage implements OnInit, OnDestroy {
         ...sessions.filter((existing) => existing.id !== session.id),
       ])
     );
-    this.ensurePaneLayouts([session]);
+    this.restorePaneLayoutsFromStorage([session]);
   }
 
   private upsertMessage(messages: Message[], message: Message): Message[] {
@@ -1628,6 +1979,31 @@ export class TerminalPage implements OnInit, OnDestroy {
   toSessionNumber(sessionId: string): string {
     const [prefix] = sessionId.split('-');
     return prefix || sessionId;
+  }
+
+  mobileSessionLabel(session: SharedAiSession): string {
+    const shortId = this.toSessionNumber(session.id).slice(0, 4);
+    const title = (session.title || '').trim();
+    if (title && title !== 'New Session' && title !== 'Terminal') {
+      return title.length > 14 ? `${title.slice(0, 14)}…` : title;
+    }
+    return `${this.providerLabel(session.provider)} · ${shortId}`;
+  }
+
+  mobileWorkingDirectoryLabel(path?: string | null): string {
+    const normalized = (path || '~').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (normalized === '~') return '~';
+
+    let display = normalized;
+    const homeMatch = normalized.match(/^\/home\/[^/]+(?:\/(.*))?$/);
+    if (homeMatch) {
+      display = homeMatch[1] ? `~/${homeMatch[1]}` : '~';
+    }
+
+    if (display.length <= 22) return display;
+    const parts = display.split('/').filter(Boolean);
+    if (parts.length <= 2) return `${display.slice(0, 21)}…`;
+    return `~/${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
   }
 
   private async copyTextToClipboard(value: string): Promise<boolean> {

@@ -22,15 +22,111 @@ sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
 
 ## Building the binary
 
-- Use **`npx tauri build --no-bundle`** (from `desktop/src-tauri`). It uses the
-  repo's `@tauri-apps/cli` devDependency — no `cargo install` needed.
-- `cargo tauri build --no-bundle` is equivalent but additionally requires the
-  `cargo-tauri` subcommand (`cargo install tauri-cli`).
-- **Never** use `cargo build --release` to produce a runnable binary — it
-  compiles and the `:7788` listener binds, but the Tauri window stays blank
-  (`Could not connect to localhost`). The Nx `desktop-build` target and lokal's
-  `desktop.prod` build both use this wrong command; don't use them for a
-  runnable binary.
+### Recurring gotcha: blank Tauri window — "Could not connect to localhost"
+
+**Symptom:** JohnnyOne window is blank; webview shows
+`Could not connect to localhost: Connection refused`. The desktop log may still
+look healthy (`Embedded host GraphQL listener up addr=127.0.0.1:7788`, relay
+registering) — backend and webview are separate; a working `:7788` does **not**
+mean the UI loaded.
+
+**Root cause:** The binary was built in Tauri **dev webview mode**. The webview
+tries to load `http://localhost:4201` (Angular dev server per `devUrl` in
+`desktop/src-tauri/tauri.conf.json`) instead of embedded assets at
+`tauri://localhost`. This happens when `cargo build --release` runs **without**
+enabling the `tauri/custom-protocol` feature on the `tauri` crate.
+
+**Correct builds (pick one):**
+
+All default build paths **delete `dist/host-app` first** so orphaned hashed
+chunks and stale `index.html` references cannot linger. The cargo step also
+`touch`es `build.rs` so the binary re-embeds the fresh dist.
+
+```bash
+# Default — wipes dist, rebuilds host-app, embeds into release binary
+npm run build:desktop
+# (runs scripts/build-desktop.sh)
+
+# Full Tauri pipeline — beforeBuildCommand in tauri.conf.json also wipes dist
+cd desktop/src-tauri
+npx tauri build --no-bundle
+
+# Manual equivalent when `npx tauri build` fails (e.g. inotify limit below)
+rm -rf dist/host-app
+npx nx build host-app
+cd desktop/src-tauri
+touch build.rs
+cargo build --release --bin johnnyone-desktop --features tauri/custom-protocol
+```
+
+**Wrong — produces the blank window:**
+
+```bash
+cargo build --release --bin johnnyone-desktop          # missing tauri/custom-protocol
+touch build.rs && cargo build --release --bin ...      # same trap
+```
+
+**Run after a good build:**
+
+```bash
+./scripts/run-desktop.sh
+```
+
+`run-desktop.sh` sets `JOHNNYONE_WORKER_URL` to the live hub
+(`https://johnnyone.ethan-353.workers.dev`) and starts the binary with
+`DISPLAY=:0`.
+
+**Verify the binary before launching:**
+
+```bash
+# Production webview — should print dev=false and custom_protocol
+grep -E 'dev=|custom_protocol' desktop/src-tauri/target/release/build/tauri-*/output
+
+# Embedded UI URL (dev binary also contains the devUrl string in config metadata)
+strings desktop/src-tauri/target/release/johnnyone-desktop | grep -o 'tauri://localhost' | head -1
+```
+
+If `cargo:dev=true` appears in the active `tauri-*/output` and there is no
+`cargo:rustc-cfg=custom_protocol`, rebuild with one of the correct commands above.
+
+**Dev mode (intentional):** `cargo tauri dev` / `nx run desktop:tauri-dev` —
+spawns `nx serve host-app --port 4201`; webview loads from `:4201` with HMR.
+Requires the dev server running alongside the binary. Dev mode does **not**
+wipe `dist/host-app` (no production embed).
+
+### Stale embedded UI after a "successful" build
+
+If the window still shows old UI after `npm run build:desktop`:
+
+1. Confirm dist was wiped — `dist/host-app` should only contain files from the
+   latest build (one `main-*.js`, matching hashes in `index.html`).
+2. Force Nx to ignore cache: `rm -rf dist/host-app && npx nx build host-app --skip-nx-cache`
+   then rerun `npm run build:desktop` or the manual cargo step above.
+3. Nuclear — corrupt/moved `target/` cache (see below): `cargo clean` in
+   `desktop/src-tauri`, then `npm run build:desktop`.
+
+What each clean step removes:
+
+| Step | Removes |
+|------|---------|
+| `rm -rf dist/host-app` (default in all production builds) | Orphaned JS chunks, stale `index.html` |
+| `touch build.rs` (default in `build-desktop.sh`) | Forces Tauri codegen to re-read dist |
+| `npx nx build host-app --skip-nx-cache` | Nx-restored dist from an old cache entry |
+| `cargo clean` in `desktop/src-tauri` | Rust `target/` including old embedded assets |
+
+### `npx tauri build` blocked by inotify watch limit
+
+On Linux, `npx tauri build --no-bundle` may fail with:
+
+```
+failed to watch .../Cargo.toml: OS file watch limit reached
+```
+
+Workarounds:
+
+1. Raise the limit (needs sudo): `sudo sysctl -w fs.inotify.max_user_watches=524288`
+2. Stop other file-watching dev servers (wrangler, `ng serve`, etc.) to free watches
+3. Use the manual cargo fallback above with `--features tauri/custom-protocol`
 
 ### Moving the project directory corrupts the Tauri build cache
 
@@ -70,8 +166,9 @@ terminal.rs::provider_command`). Currently: `claude_code`, `codex`, `cline`,
 chat_host.rs`, `agent/mod.rs` (reject or implement), and the frontend dropdowns
 (`web/.../terminal.page.html`, `ui/.../provider-selector.component.ts`).
 
-- **Grok** is terminal-mode only: launched as `grok --always-approve`. It has no
-  chat-mode streaming runner yet, so chat/planner reject it explicitly.
+- **Grok** supports both modes: terminal TUI (`grok --always-approve` in a tmux
+  pane) and chat/planner headless (`grok --output-format streaming-json --single`
+  with `-r` for session resume).
 
 ## Terminal attach path (debugging "stuck attaching")
 
@@ -85,13 +182,125 @@ The desktop logs `terminal_command received from relay` and
 
 ## Deploying — use the `lokal` CLI
 
-Deploy with the **`lokal` CLI** (preferred — wraps build + Cloudflare deploy):
+Deploy with the **`lokal` CLI** (preferred — wraps build + Cloudflare deploy).
+**Live production uses `--env prod`**, not `dev`.
 
 ```bash
-lokal cf deploy --env dev          # worker + Pages, both
-lokal cf worker deploy --env dev   # worker only
-lokal cf pages deploy --env dev    # web/Pages only
-lokal cf db migrate --env dev      # apply D1 migrations
+# From personal/apps/johnnyone/
+npm run deploy:worker                   # worker only → lokal cf worker deploy --env prod
+PATH="$PWD/node_modules/.bin:$PATH" \
+  lokal cf pages deploy --env prod      # web/Pages only (nx must be on PATH)
+lokal cf deploy --env prod              # worker + Pages, both
+lokal cf db migrate --env prod          # apply D1 migrations (remote)
+lokal cf db status --env prod           # see applied vs pending migrations
+lokal cf worker secrets list --env prod # verify JWT_SECRET is set
+```
+
+### Resource names (lokal CLI convention)
+
+Lokal names Cloudflare resources from `lokal.yaml` `project.slug` + `--env`:
+
+| Env | Worker script | D1 database | Example URL |
+|---|---|---|---|
+| **prod** | `johnnyone` | `johnnyone-db` | `https://johnnyone.ethan-353.workers.dev` |
+| **dev** | `johnnyone-dev` | `johnnyone-dev-db` | `https://johnnyone-dev.ethan-353.workers.dev` |
+| **qa** | `johnnyone-qa` | `johnnyone-qa-db` | `https://johnnyone-qa.ethan-353.workers.dev` |
+
+Notes:
+
+- `worker/worker.yaml` `name: hub` is **legacy** — it is **not** part of the
+  deployed worker name anymore (old names like `johnnyone-hub` /
+  `johnnyone-dev-hub` are obsolete).
+- The middle segment in `*.workers.dev` URLs (here `ethan-353`) is assigned by
+  Cloudflare per account — not something we configure in the repo. Record the
+  full hostname from deploy output.
+- Pages project name is always `johnnyone` (slug from `lokal.yaml`), regardless
+  of worker env → `https://johnnyone.pages.dev`.
+
+### Post-deploy smoke check
+
+```bash
+curl -s https://johnnyone.ethan-353.workers.dev/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"{ __typename }"}'
+# expect: {"data":{"__typename":"Query"}}
+```
+
+If you get `error code: 1101` or a worker exception, see **JWT_SECRET** below.
+
+### Deploy gotchas
+
+**1. JWT_SECRET on a new worker name**
+
+`JWT_SECRET` is required in production. Cloudflare stores it as a **write-only**
+secret — you cannot read it back from the API.
+
+- **First deploy** to a *new* worker script name: lokal skips the pre-deploy
+  secrets check (worker did not exist yet). The upload succeeds even when
+  `JWT_SECRET` is missing.
+- **Symptom:** deploy prints `✓ Worker: johnnyone` but GraphQL returns
+  `error code: 1101`.
+- **Fix:** set the secret on the **new** script name before calling the worker
+  live:
+
+  ```bash
+  # Use the SAME value as the old worker if you want existing logins to keep working
+  lokal cf worker secrets set --env prod --name JWT_SECRET --value '<secret>'
+
+  # Or generate a fresh one (all users must log in again):
+  echo -n "$(openssl rand -base64 48)" | \
+    lokal cf worker secrets set --env prod --name JWT_SECRET
+  ```
+
+  When migrating from a legacy name (`johnnyone-hub`), list secrets on the old
+  script to confirm `JWT_SECRET` exists, then **re-set the same value** on
+  `johnnyone`. Only a human with the original value can do this — CF will not
+  export it.
+
+  ```bash
+  lokal cf worker secrets list --env prod   # target: johnnyone
+  # legacy script (manual wrangler / dashboard): johnnyone-hub
+  ```
+
+**2. D1 migrations on an existing prod database**
+
+`lokal cf worker deploy` runs pending migrations before uploading the worker.
+If the prod D1 already has tables from a legacy deploy, a migration that uses
+bare `ALTER TABLE … ADD COLUMN` can fail with `duplicate column name`.
+
+- Check state: `lokal cf db status --env prod`
+- Prefer **idempotent** migrations (`CREATE TABLE IF NOT EXISTS` with all
+  columns inline; avoid redundant `ALTER`s on re-runnable paths).
+- Do **not** assume a fresh database — `johnnyone-db` may already contain
+  tenants, `desktop_nodes`, etc.
+
+**3. Nx build cache (stale Pages bundle)**
+
+If `lokal cf pages deploy` / `nx build web` reports cache hits after you changed
+`web/` or `ui/`, force a rebuild before deploying:
+
+```bash
+rm -rf .nx/cache dist/web dist/ui
+npx nx build web --skip-nx-cache
+```
+
+**4. `lokal cf pages deploy` needs `nx` on PATH**
+
+The pages deploy runs `nx build web` in a subshell. If you see `nx: not found`,
+prefix PATH:
+
+```bash
+PATH="$PWD/node_modules/.bin:$PATH" lokal cf pages deploy --env prod
+```
+
+**5. Lokal CLI changes require a rebuild**
+
+If you change resource naming or deploy logic in `lokal/apps/lokal-infra/`,
+rebuild and relink the CLI before deploying:
+
+```bash
+cd lokal/apps/lokal-infra
+npm run -w @lokal/cli build
 ```
 
 ### Setting up the `lokal` CLI (not installed by default)
@@ -129,5 +338,6 @@ them (env vars for the session, or a populated `~/.lokal/cf.yaml`).
 
 ```bash
 rm -rf .nx/cache dist/web dist/ui && npx nx build web --skip-nx-cache
-npx wrangler pages deploy dist/web/browser --project-name johnnyone-dev   # needs `wrangler login` / CLOUDFLARE_API_TOKEN
+npx wrangler pages deploy dist/web/browser --project-name johnnyone   # needs `wrangler login` / CLOUDFLARE_API_TOKEN
+# Worker: use lokal cf worker deploy --env prod — wrangler.toml is generated under ~/.lokal/simulators/johnnyone/prod/
 ```

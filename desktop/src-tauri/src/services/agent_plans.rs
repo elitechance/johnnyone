@@ -5,6 +5,7 @@ use crate::db::models::{
 use crate::events::AgentPlanRunEvent;
 use crate::services::planner_prompts;
 use crate::services::sessions;
+use crate::services::settings as settings_service;
 use crate::state::app_state::AppState;
 use crate::terminal;
 use base64::{engine::general_purpose, Engine as _};
@@ -434,7 +435,7 @@ pub async fn start_plan(
         json!({}),
     )?;
 
-    let prompt = worker_phase_prompt(&run, &phase)?;
+    let prompt = worker_phase_prompt(&state, &run, &phase)?;
     terminal::send_terminal_input(&state, worker_session_id, format!("{}\r", prompt)).await?;
 
     spawn_coordinator_loop(state.clone(), id.clone()).await;
@@ -666,10 +667,7 @@ pub async fn send_feedback_to_worker(state: AppState, id: String) -> Result<Agen
             .worker_session_id
             .clone()
             .ok_or_else(|| "Planning run has no planner session".to_string())?;
-        let prompt = format!(
-            "Continue updating the plan at {}. When ready for T2 review, say exactly {}.",
-            run.plan.plan_path, PLANNER_READY_MARKER
-        );
+        let prompt = planning_continue_prompt(&run);
         terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
         state.db.with_conn(|conn| {
             conn.execute(
@@ -749,6 +747,32 @@ async fn start_planning_run_inner(
         run.plan.status.as_str(),
         "planning_planner_running" | "planning_review_running"
     ) && !force_planner_prompt {
+        if run.plan.status == "planning_planner_running" {
+            let planner_session_id = run
+                .plan
+                .worker_session_id
+                .clone()
+                .ok_or_else(|| "Planning run has no planner session".to_string())?;
+            let prompt = planning_continue_prompt(&run);
+            terminal::attach_terminal_headless(&state, planner_session_id.clone(), 120, 36).await?;
+            terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
+            append_event(
+                &state,
+                &id,
+                None,
+                "planning_start_nudge",
+                json!({ "source": "start" }),
+            )?;
+        } else {
+            dispatch_planning_review(&state, &run).await?;
+            append_event(
+                &state,
+                &id,
+                None,
+                "planning_review_restart",
+                json!({ "source": "start" }),
+            )?;
+        }
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
@@ -775,7 +799,7 @@ async fn start_planning_run_inner(
         .map_err(|e| e.to_string())
     })?;
     append_event(&state, &id, None, "planning_started", json!({}))?;
-    let prompt = planning_planner_prompt(&run)?;
+    let prompt = planning_planner_prompt(&state, &run)?;
     terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
     spawn_coordinator_loop(state.clone(), id.clone()).await;
     get_plan(&state, &id)
@@ -1285,104 +1309,132 @@ async fn wait_for_idle(
     state: &AppState,
     session_id: &str,
 ) -> Result<terminal::TerminalSnapshot, String> {
-    let mut last_key = String::new();
-    let mut last_changed_at = Instant::now();
-    let mut last_snapshot =
-        terminal::capture_terminal_session_with_history(state, session_id).await?;
-    loop {
-        let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
-        let key = format!(
-            "{}\n{}:{}:{}",
-            snapshot.content, snapshot.cursor_x, snapshot.cursor_y, snapshot.history_lines
-        );
-        if key != last_key {
-            last_key = key;
-            last_changed_at = Instant::now();
-            last_snapshot = snapshot;
-        }
-        if last_changed_at.elapsed() >= Duration::from_millis(IDLE_WINDOW_MS) {
-            return Ok(last_snapshot);
-        }
-        sleep(Duration::from_millis(350)).await;
-    }
+    wait_for_stable_snapshot(state, session_id, |_| true).await
 }
 
 async fn wait_for_worker_ready(
     state: &AppState,
     session_id: &str,
 ) -> Result<terminal::TerminalSnapshot, String> {
-    let mut last_key = String::new();
-    let mut last_changed_at = Instant::now();
-    let mut last_snapshot =
-        terminal::capture_terminal_session_with_history(state, session_id).await?;
-
-    loop {
-        let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
-        let key = format!(
-            "{}\n{}:{}:{}",
-            snapshot.content, snapshot.cursor_x, snapshot.cursor_y, snapshot.history_lines
-        );
-        if key != last_key {
-            last_key = key;
-            last_changed_at = Instant::now();
-            last_snapshot = snapshot;
-        }
-
-        if has_ready_marker_line(&last_snapshot.content)
-            && last_changed_at.elapsed() >= Duration::from_millis(IDLE_WINDOW_MS)
-        {
-            return Ok(last_snapshot);
-        }
-
-        sleep(Duration::from_millis(1_000)).await;
-    }
+    wait_for_stable_snapshot(state, session_id, has_worker_ready_marker).await
 }
 
-fn has_ready_marker_line(content: &str) -> bool {
-    content
-        .lines()
-        .any(|line| line_contains_marker(line, WORKER_READY_MARKER))
-}
-
-fn line_contains_marker(line: &str, marker: &str) -> bool {
-    line.chars()
-        .filter(|ch| !ch.is_control())
-        .collect::<String>()
-        .contains(marker)
+fn has_worker_ready_marker(content: &str) -> bool {
+    terminal_content_contains_marker(content, WORKER_READY_MARKER)
 }
 
 async fn wait_for_planner_ready(
     state: &AppState,
     session_id: &str,
 ) -> Result<terminal::TerminalSnapshot, String> {
+    wait_for_stable_snapshot(state, session_id, |content| {
+        terminal_content_contains_marker(content, PLANNER_READY_MARKER)
+    })
+    .await
+}
+
+async fn wait_for_stable_snapshot(
+    state: &AppState,
+    session_id: &str,
+    is_ready: impl Fn(&str) -> bool,
+) -> Result<terminal::TerminalSnapshot, String> {
     let mut last_key = String::new();
     let mut last_changed_at = Instant::now();
     let mut last_snapshot =
         terminal::capture_terminal_session_with_history(state, session_id).await?;
-
     loop {
         let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
-        let key = format!(
-            "{}\n{}:{}:{}",
-            snapshot.content, snapshot.cursor_x, snapshot.cursor_y, snapshot.history_lines
-        );
+        let key = snapshot_idle_key(&snapshot);
         if key != last_key {
             last_key = key;
             last_changed_at = Instant::now();
             last_snapshot = snapshot;
         }
 
-        if last_snapshot
-            .content
-            .lines()
-            .any(|line| line_contains_marker(line, PLANNER_READY_MARKER))
+        if is_ready(&last_snapshot.content)
             && last_changed_at.elapsed() >= Duration::from_millis(IDLE_WINDOW_MS)
         {
             return Ok(last_snapshot);
         }
 
-        sleep(Duration::from_millis(1_000)).await;
+        let poll_ms = if is_ready(&last_snapshot.content) {
+            350
+        } else {
+            1_000
+        };
+        sleep(Duration::from_millis(poll_ms)).await;
     }
+}
+
+fn snapshot_idle_key(snapshot: &terminal::TerminalSnapshot) -> String {
+    normalize_terminal_snapshot_for_idle(&snapshot.content)
+}
+
+fn terminal_content_contains_marker(content: &str, marker: &str) -> bool {
+    normalize_terminal_snapshot_for_idle(content).contains(marker)
+}
+
+fn normalize_terminal_snapshot_for_idle(content: &str) -> String {
+    strip_ansi_escapes(content)
+        .lines()
+        .filter_map(|line| {
+            let normalized = marker_search_text(line);
+            let trimmed = normalized.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if trimmed == "█" || trimmed.ends_with('█') {
+                return None;
+            }
+            if trimmed.starts_with("~/") && trimmed.contains('│') {
+                return None;
+            }
+            if trimmed.starts_with("▾ Tasks") || is_volatile_grok_task_line(trimmed) {
+                return None;
+            }
+            if trimmed.contains("Shift+Tab:")
+                || trimmed.starts_with('╭')
+                || trimmed.starts_with('╰')
+            {
+                return None;
+            }
+            if trimmed.contains("Grok Composer") && trimmed.contains("always-approve") {
+                return None;
+            }
+            if trimmed.starts_with("│ ❯") {
+                return None;
+            }
+            Some(trimmed.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_volatile_grok_task_line(trimmed: &str) -> bool {
+    trimmed.starts_with('❯')
+        || trimmed.starts_with("⸬ ")
+        || trimmed.contains("[⛶]")
+        || trimmed.contains("[✗]")
+        || (trimmed.contains("+) ") && trimmed.contains('h') && trimmed.contains("m "))
+}
+
+fn strip_ansi_escapes(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.next_if_eq(&'[').is_some() {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 async fn dispatch_planning_review(state: &AppState, run: &AgentPlanRun) -> Result<(), String> {
@@ -1391,7 +1443,7 @@ async fn dispatch_planning_review(state: &AppState, run: &AgentPlanRun) -> Resul
         .reviewer_session_id
         .clone()
         .ok_or_else(|| "Planning run has no reviewer session".to_string())?;
-    let prompt = planning_reviewer_prompt(run)?;
+    let prompt = planning_reviewer_prompt(state, run)?;
     terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
     state.db.with_conn(|conn| {
         conn.execute(
@@ -1535,7 +1587,7 @@ async fn dispatch_review(
         .reviewer_session_id
         .clone()
         .ok_or_else(|| "Plan has no reviewer session".to_string())?;
-    let prompt = reviewer_phase_prompt(run, phase)?;
+    let prompt = reviewer_phase_prompt(state, run, phase)?;
     terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
     state.db.with_conn(|conn| {
         conn.execute(
@@ -1773,7 +1825,7 @@ async fn pass_phase(
             .worker_session_id
             .clone()
             .ok_or_else(|| "Plan has no worker session".to_string())?;
-        let prompt = worker_phase_prompt(&refreshed, &next)?;
+        let prompt = worker_phase_prompt(state, &refreshed, &next)?;
         terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
         append_event(
             state,
@@ -2006,14 +2058,18 @@ fn first_markdown_heading(path: &Path) -> Option<String> {
 }
 
 fn default_model_for_provider(provider: &str) -> Option<String> {
-    if provider == "ollama" {
-        Some("qwen3.5:2b".to_string())
-    } else {
-        None
+    match provider {
+        "ollama" => Some("qwen3.5:2b".to_string()),
+        "grok" => Some("grok-composer-2.5-fast".to_string()),
+        _ => None,
     }
 }
 
-fn worker_phase_prompt(run: &AgentPlanRun, phase: &AgentPlanPhase) -> Result<String, String> {
+fn worker_phase_prompt(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+) -> Result<String, String> {
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
@@ -2021,11 +2077,15 @@ fn worker_phase_prompt(run: &AgentPlanRun, phase: &AgentPlanPhase) -> Result<Str
     let settings = planner_prompts::load_prompt_settings()?;
     Ok(planner_prompts::render_template(
         &settings.development.worker,
-        &phase_template_values(run, phase, &phase_path, &tasks_path),
+        &phase_template_values(state, run, phase, &phase_path, &tasks_path),
     ))
 }
 
-fn reviewer_phase_prompt(run: &AgentPlanRun, phase: &AgentPlanPhase) -> Result<String, String> {
+fn reviewer_phase_prompt(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+) -> Result<String, String> {
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
@@ -2033,17 +2093,33 @@ fn reviewer_phase_prompt(run: &AgentPlanRun, phase: &AgentPlanPhase) -> Result<S
     let settings = planner_prompts::load_prompt_settings()?;
     Ok(planner_prompts::render_template(
         &settings.development.reviewer,
-        &phase_template_values(run, phase, &phase_path, &tasks_path),
+        &phase_template_values(state, run, phase, &phase_path, &tasks_path),
     ))
 }
 
 fn phase_template_values(
+    state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     phase_path: &Path,
     tasks_path: &Path,
 ) -> Vec<(&'static str, String)> {
-    let conventions_path = Path::new(&run.plan.workspace_path).join("common/conventions");
+    let methodology_path =
+        settings_service::resolve_methodology_path(state, &run.plan.workspace_path)
+            .unwrap_or_else(|_| {
+                Path::new(&run.plan.workspace_path)
+                    .join(settings_service::DEFAULT_METHODOLOGY_REL)
+                    .to_string_lossy()
+                    .to_string()
+            });
+    let conventions_path =
+        settings_service::resolve_conventions_path(state, &run.plan.workspace_path)
+            .unwrap_or_else(|_| {
+                Path::new(&run.plan.workspace_path)
+                    .join(settings_service::DEFAULT_CONVENTIONS_REL)
+                    .to_string_lossy()
+                    .to_string()
+            });
     vec![
         ("run_id", run.plan.id.clone()),
         ("phase_id", phase.phase_id.clone()),
@@ -2051,28 +2127,34 @@ fn phase_template_values(
         ("plan_path", run.plan.plan_path.clone()),
         ("phase_path", phase_path.to_string_lossy().to_string()),
         ("tasks_path", tasks_path.to_string_lossy().to_string()),
-        (
-            "conventions_path",
-            conventions_path.to_string_lossy().to_string(),
-        ),
+        ("methodology_path", methodology_path),
+        ("conventions_path", conventions_path),
     ]
 }
 
-fn planning_template_values(run: &AgentPlanRun) -> Vec<(&'static str, String)> {
-    let methodology_path = Path::new(&run.plan.workspace_path).join("common/methodology.md");
-    let conventions_path = Path::new(&run.plan.workspace_path).join("common/conventions");
+fn planning_template_values(state: &AppState, run: &AgentPlanRun) -> Vec<(&'static str, String)> {
+    let methodology_path =
+        settings_service::resolve_methodology_path(state, &run.plan.workspace_path)
+            .unwrap_or_else(|_| {
+                Path::new(&run.plan.workspace_path)
+                    .join(settings_service::DEFAULT_METHODOLOGY_REL)
+                    .to_string_lossy()
+                    .to_string()
+            });
+    let conventions_path =
+        settings_service::resolve_conventions_path(state, &run.plan.workspace_path)
+            .unwrap_or_else(|_| {
+                Path::new(&run.plan.workspace_path)
+                    .join(settings_service::DEFAULT_CONVENTIONS_REL)
+                    .to_string_lossy()
+                    .to_string()
+            });
     vec![
         ("run_id", run.plan.id.clone()),
         ("workspace_path", run.plan.workspace_path.clone()),
         ("plan_output_path", run.plan.plan_path.clone()),
-        (
-            "methodology_path",
-            methodology_path.to_string_lossy().to_string(),
-        ),
-        (
-            "conventions_path",
-            conventions_path.to_string_lossy().to_string(),
-        ),
+        ("methodology_path", methodology_path),
+        ("conventions_path", conventions_path),
         (
             "app_scope",
             run.plan
@@ -2105,7 +2187,14 @@ fn planning_template_values(run: &AgentPlanRun) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn planning_planner_prompt(run: &AgentPlanRun) -> Result<String, String> {
+fn planning_continue_prompt(run: &AgentPlanRun) -> String {
+    format!(
+        "Continue updating the plan at {}. When ready for T2 review, say exactly {}.",
+        run.plan.plan_path, PLANNER_READY_MARKER
+    )
+}
+
+fn planning_planner_prompt(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
     let settings = planner_prompts::load_prompt_settings()?;
     // Pick the template variant based on whether an amend cycle is in flight.
     // The `amend_planner` / `amend_reviewer` templates instruct T1 to edit in
@@ -2124,11 +2213,11 @@ fn planning_planner_prompt(run: &AgentPlanRun) -> Result<String, String> {
     };
     Ok(planner_prompts::render_template(
         template,
-        &planning_template_values(run),
+        &planning_template_values(state, run),
     ))
 }
 
-fn planning_reviewer_prompt(run: &AgentPlanRun) -> Result<String, String> {
+fn planning_reviewer_prompt(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
     let settings = planner_prompts::load_prompt_settings()?;
     let amending = run
         .plan
@@ -2143,7 +2232,7 @@ fn planning_reviewer_prompt(run: &AgentPlanRun) -> Result<String, String> {
     };
     Ok(planner_prompts::render_template(
         template,
-        &planning_template_values(run),
+        &planning_template_values(state, run),
     ))
 }
 
@@ -2295,19 +2384,32 @@ fn commit_plan_on_pass(state: &AppState, run: &AgentPlanRun) {
 }
 
 fn parse_verdict(output: &str) -> Option<String> {
-    output.lines().rev().find_map(|line| {
-        let normalized = marker_search_text(line);
-        let value = normalized
-            .split("VERDICT:")
-            .nth(1)?
-            .trim()
-            .to_ascii_uppercase();
-        let verdict = value.split_whitespace().next().unwrap_or_default();
-        match verdict {
-            "PASS" | "NEEDS_CHANGES" | "BLOCKED" => Some(verdict.to_string()),
-            _ => None,
+    for line in output.lines().rev() {
+        if let Some(verdict) = parse_verdict_line(line) {
+            return Some(verdict);
         }
-    })
+    }
+    None
+}
+
+fn parse_verdict_line(line: &str) -> Option<String> {
+    let normalized = marker_search_text(line);
+    let upper = normalized.to_ascii_uppercase();
+    let idx = upper.find("VERDICT:")?;
+    let value = normalized[idx + "VERDICT:".len()..].trim();
+    normalize_verdict_token(value)
+}
+
+fn normalize_verdict_token(value: &str) -> Option<String> {
+    let token = value
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .to_ascii_uppercase();
+    match token.as_str() {
+        "PASS" | "NEEDS_CHANGES" | "BLOCKED" => Some(token),
+        _ => None,
+    }
 }
 
 fn marker_search_text(line: &str) -> String {
@@ -3400,4 +3502,39 @@ fn humanize_event_type(event_type: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod coordinator_terminal_tests {
+    use super::*;
+
+    #[test]
+    fn parse_verdict_accepts_grok_style_verdict_label() {
+        let output = "I reviewed the phase and updated the status files. Verdict: PASS.";
+        assert_eq!(parse_verdict(output).as_deref(), Some("PASS"));
+    }
+
+    #[test]
+    fn parse_verdict_accepts_structured_footer() {
+        let output = "PHASE: 01-or-schedule\nVERDICT: NEEDS_CHANGES\nSUMMARY: missing screenshot";
+        assert_eq!(parse_verdict(output).as_deref(), Some("NEEDS_CHANGES"));
+    }
+
+    #[test]
+    fn ready_marker_survives_grok_chrome_filtering() {
+        let output = "Both tasks are READY_FOR_T2_VALIDATION.\n╭ input box\n│ ❯\n█\nGrok Composer 2.5 Fast · always-approve";
+        assert!(has_worker_ready_marker(output));
+    }
+
+    #[test]
+    fn idle_key_ignores_grok_status_chrome() {
+        let base = "Worker finished phase 01.\nREADY_FOR_T2_VALIDATION\nTurn completed in 3.0s.";
+        let with_chrome = format!(
+            "{base}\n~/Documents/Workspace │ ⸬ 4 │ 156K / 200K │ 3 ✓\n▾ Tasks 4\n⋅ running task (183+) 2h48m [⛶][✗]\n█\n│ ❯\nGrok Composer 2.5 Fast · always-approve"
+        );
+        assert_eq!(
+            normalize_terminal_snapshot_for_idle(&base),
+            normalize_terminal_snapshot_for_idle(&with_chrome)
+        );
+    }
 }

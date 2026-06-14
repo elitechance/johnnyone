@@ -21,6 +21,12 @@ export const GRAPHQL_WS_URL = new InjectionToken<string>('GRAPHQL_WS_URL', {
   },
 });
 
+/** Optional direct desktop host GraphQL URL used for local read-only queries. */
+export const HOST_GRAPHQL_API_URL = new InjectionToken<string>('HOST_GRAPHQL_API_URL', {
+  providedIn: 'root',
+  factory: () => '',
+});
+
 export interface GraphQLResponse<T> {
   data: T;
   errors?: GraphQLError[];
@@ -36,11 +42,28 @@ export interface GraphQLError {
 @Injectable({ providedIn: 'root' })
 export class GraphQLClient {
   private readonly apiUrl = inject(GRAPHQL_API_URL);
+  private readonly hostApiUrl = inject(HOST_GRAPHQL_API_URL);
   private readonly wsUrl = inject(GRAPHQL_WS_URL);
   private readonly extraHeaders = inject(GRAPHQL_EXTRA_HEADERS);
+  private localHostHealth: Promise<boolean> | null = null;
 
   query<T>(query: string, variables?: Record<string, unknown>): Observable<T> {
     return this.request<T>(query, variables);
+  }
+
+  queryPreferLocalHost<T>(
+    workerQuery: string,
+    localHostQuery: string,
+    variables?: Record<string, unknown>,
+  ): Observable<T> {
+    return from(this.shouldUseLocalHost()).pipe(
+      switchMap((useLocalHost) => this.requestAt<T>(
+        useLocalHost ? this.hostApiUrl : this.apiUrl,
+        useLocalHost ? localHostQuery : workerQuery,
+        variables,
+        !useLocalHost,
+      )),
+    );
   }
 
   mutate<T>(mutation: string, variables?: Record<string, unknown>): Observable<T> {
@@ -129,12 +152,21 @@ export class GraphQLClient {
   }
 
   private request<T>(query: string, variables?: Record<string, unknown>): Observable<T> {
+    return this.requestAt<T>(this.apiUrl, query, variables, true);
+  }
+
+  private requestAt<T>(
+    apiUrl: string,
+    query: string,
+    variables: Record<string, unknown> | undefined,
+    includeAuthHeaders: boolean,
+  ): Observable<T> {
     const body = JSON.stringify({ query, variables });
 
     return from(
-      fetch(this.apiUrl, {
+      fetch(apiUrl, {
         method: 'POST',
-        headers: this.buildHeaders(true),
+        headers: this.buildHeaders(true, includeAuthHeaders),
         body,
         credentials: 'same-origin',
       })
@@ -154,7 +186,32 @@ export class GraphQLClient {
     );
   }
 
-  private buildHeaders(includeContentHeaders: boolean): Record<string, string> {
+  private async shouldUseLocalHost(): Promise<boolean> {
+    if (!this.hostApiUrl || typeof window === 'undefined') {
+      return false;
+    }
+
+    if (!['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+      return false;
+    }
+
+    if (!this.localHostHealth) {
+      this.localHostHealth = fetch(this.hostApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ query: '{ health }' }),
+      })
+        .then((response) => response.ok)
+        .catch(() => false);
+    }
+
+    return this.localHostHealth;
+  }
+
+  private buildHeaders(includeContentHeaders: boolean, includeAuthHeaders = true): Record<string, string> {
     const headers: Record<string, string> = {
       ...this.extraHeaders,
     };
@@ -162,6 +219,10 @@ export class GraphQLClient {
     if (includeContentHeaders) {
       headers['Content-Type'] = 'application/json';
       headers['Accept'] = 'application/json';
+    }
+
+    if (!includeAuthHeaders) {
+      return headers;
     }
 
     const token = this.getStoredValue('johnnyone_access_token');

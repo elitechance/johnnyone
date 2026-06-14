@@ -5,7 +5,7 @@ pub mod registration;
 pub mod ws_client;
 
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, grok, ollama_cli, ChunkType, CliProvider, StreamChunk,
 };
 use crate::services::{
     chat_host, providers as provider_service, sessions as session_service,
@@ -1599,7 +1599,10 @@ impl AgentService {
         })?;
 
         let cli_path_ref = cli_path.as_deref();
-        let cli_sid_ref = if provider == CliProvider::ClaudeCode || provider == CliProvider::Codex {
+        let cli_sid_ref = if matches!(
+            provider,
+            CliProvider::ClaudeCode | CliProvider::Codex | CliProvider::Grok
+        ) {
             persisted_cli_session_id.as_deref()
         } else {
             None
@@ -1609,13 +1612,6 @@ impl AgentService {
         if matches!(provider, CliProvider::Shell) {
             return Err(
                 "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
-            );
-        }
-        // grok is wired for terminal-mode only (interactive TUI in a tmux pane);
-        // it has no chat-mode streaming runner yet.
-        if matches!(provider, CliProvider::Grok) {
-            return Err(
-                "Grok runs in terminal mode only — open it as a terminal session and type into the pane.".to_string(),
             );
         }
 
@@ -1634,6 +1630,13 @@ impl AgentService {
                 cli_path_ref,
                 cli_sid_ref,
             ),
+            CliProvider::Grok => grok::build_config(
+                &req.content,
+                &working_dir,
+                &model,
+                cli_path_ref,
+                cli_sid_ref,
+            ),
             CliProvider::Cline => {
                 cline::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }
@@ -1641,16 +1644,15 @@ impl AgentService {
                 ollama_cli::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }
             CliProvider::Shell => unreachable!("shell provider already rejected"),
-            CliProvider::Grok => unreachable!("grok provider already rejected"),
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
             CliProvider::ClaudeCode => claude_code::parse_line,
             CliProvider::Codex => codex::parse_line,
+            CliProvider::Grok => grok::parse_line,
             CliProvider::Cline => cline::parse_line,
             CliProvider::Ollama => ollama_cli::parse_line,
             CliProvider::Shell => unreachable!("shell provider already rejected"),
-            CliProvider::Grok => unreachable!("grok provider already rejected"),
         };
 
         let (_process, mut rx) =
@@ -1763,7 +1765,10 @@ impl AgentService {
                 rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents],
             ).map_err(|e| e.to_string())?;
 
-            if provider == CliProvider::ClaudeCode || provider == CliProvider::Codex {
+            if matches!(
+                provider,
+                CliProvider::ClaudeCode | CliProvider::Codex | CliProvider::Grok
+            ) {
                 if clear_cli_session_id {
                     conn.execute(
                         "UPDATE sessions SET cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",

@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -76,6 +77,14 @@ pub struct AppState {
     pub terminal_capture_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     /// Visible UI subscribers for tmux screen mirroring, keyed by session_id.
     pub terminal_visual_subscribers: Arc<Mutex<HashMap<String, usize>>>,
+    /// Last keyboard/input activity per terminal session for adaptive capture pacing.
+    pub terminal_last_input_at: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Last relay/UI publish time per session — enforces min interval for DO traffic.
+    pub terminal_last_screen_publish_at: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Latest screen event coalesced while publish throttle is active.
+    pub terminal_pending_screen: Arc<Mutex<HashMap<String, TerminalScreenEvent>>>,
+    /// Sessions that already have a deferred publish flush scheduled.
+    pub terminal_screen_flush_scheduled: Arc<Mutex<HashMap<String, bool>>>,
     /// Worker connection context used by host-side relay follow-up calls.
     pub worker_relay_config: Arc<Mutex<Option<WorkerRelayConfig>>>,
 }
@@ -115,6 +124,10 @@ impl AppState {
             agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
             terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            terminal_last_input_at: Arc::new(Mutex::new(HashMap::new())),
+            terminal_last_screen_publish_at: Arc::new(Mutex::new(HashMap::new())),
+            terminal_pending_screen: Arc::new(Mutex::new(HashMap::new())),
+            terminal_screen_flush_scheduled: Arc::new(Mutex::new(HashMap::new())),
             worker_relay_config: Arc::new(Mutex::new(None)),
         }
     }
@@ -145,6 +158,10 @@ impl AppState {
             agent_plan_run_tx,
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
             terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            terminal_last_input_at: Arc::new(Mutex::new(HashMap::new())),
+            terminal_last_screen_publish_at: Arc::new(Mutex::new(HashMap::new())),
+            terminal_pending_screen: Arc::new(Mutex::new(HashMap::new())),
+            terminal_screen_flush_scheduled: Arc::new(Mutex::new(HashMap::new())),
             worker_relay_config: Arc::new(Mutex::new(None)),
         }
     }

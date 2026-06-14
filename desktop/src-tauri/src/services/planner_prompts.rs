@@ -128,6 +128,7 @@ Plan: {{plan_path}}
 Current phase: {{phase_id}}
 Phase path: {{phase_path}}
 Tasks path: {{tasks_path}}
+Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
 Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. When the whole phase is ready for review, say READY_FOR_T2_VALIDATION."#;
@@ -141,6 +142,7 @@ Plan: {{plan_path}}
 Current phase: {{phase_id}}
 Phase path: {{phase_path}}
 Tasks path: {{tasks_path}}
+Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
 Read methodology, project conventions (every file under {{conventions_path}}), app-local conventions if present under {{workspace_path}}/conventions or {{workspace_path}}/plans/conventions, plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only. Focus on status files, decisions, tests, E2E artifacts, screenshots, acceptance criteria, source-code fit, and convention compliance.

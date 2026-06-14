@@ -9,6 +9,9 @@ const MIGRATION_006: &str = include_str!("../../migrations/006_workspace_modes.s
 const MIGRATION_007: &str = include_str!("../../migrations/007_add_amend_brief.sql");
 const MIGRATION_008: &str = include_str!("../../migrations/008_session_kind.sql");
 const MIGRATION_009: &str = include_str!("../../migrations/009_agent_plan_phase_run_mode.sql");
+const MIGRATION_010: &str = include_str!("../../migrations/010_host_planner_settings.sql");
+const MIGRATION_011: &str = include_str!("../../migrations/011_worker_url_without_dev.sql");
+const MIGRATION_012: &str = include_str!("../../migrations/012_worker_url_prod_naming.sql");
 
 /// Run all pending migrations. Uses a simple version table to track applied migrations.
 pub fn run_migrations(conn: &Connection) -> Result<(), String> {
@@ -44,6 +47,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (7, "007_add_amend_brief", MIGRATION_007),
         (8, "008_session_kind", MIGRATION_008),
         (9, "009_agent_plan_phase_run_mode", MIGRATION_009),
+        (10, "010_host_planner_settings", MIGRATION_010),
+        (11, "011_worker_url_without_dev", MIGRATION_011),
+        (12, "012_worker_url_prod_naming", MIGRATION_012),
     ];
 
     for (version, name, sql) in migrations {

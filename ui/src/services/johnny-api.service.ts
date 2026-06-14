@@ -228,32 +228,32 @@ export class JohnnyApiService {
   // ── Sessions ──────────────────────────────────────────────────────────
 
   listSessions(status?: string): Observable<AiSession[]> {
+    const sessionFields = `
+      id title provider model workingDirectory status
+      totalInputTokens totalOutputTokens totalCostCents
+      createdAt updatedAt
+    `;
+    const query = `query ListSessions($status: String) {
+      listAiSessions(status: $status) { ${sessionFields} }
+    }`;
+
     return this.gql
-      .query<{ listAiSessions: AiSession[] }>(
-        `query ListSessions($status: String) {
-          listAiSessions(status: $status) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
-          }
-        }`,
-        { status }
-      )
+      .queryPreferLocalHost<{ listAiSessions: AiSession[] }>(query, query, { status })
       .pipe(map((data) => data.listAiSessions));
   }
 
   getSession(id: string): Observable<AiSession> {
+    const sessionFields = `
+      id title provider model workingDirectory status
+      totalInputTokens totalOutputTokens totalCostCents
+      createdAt updatedAt
+    `;
+    const query = `query GetSession($id: ID!) {
+      getAiSession(id: $id) { ${sessionFields} }
+    }`;
+
     return this.gql
-      .query<{ getAiSession: AiSession }>(
-        `query GetSession($id: ID!) {
-          getAiSession(id: $id) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
-          }
-        }`,
-        { id }
-      )
+      .queryPreferLocalHost<{ getAiSession: AiSession }>(query, query, { id })
       .pipe(map((data) => data.getAiSession));
   }
 
@@ -346,16 +346,15 @@ export class JohnnyApiService {
   // ── Messages ──────────────────────────────────────────────────────────
 
   listMessages(sessionId: string, limit?: number, offset?: number): Observable<AiMessage[]> {
+    const query = `query ListMessages($sessionId: ID!, $limit: Int, $offset: Int) {
+      listAiMessages(sessionId: $sessionId, limit: $limit, offset: $offset) {
+        id sessionId role content toolCalls
+        finishReason inputTokens outputTokens costCents createdAt
+      }
+    }`;
+
     return this.gql
-      .query<{ listAiMessages: AiMessage[] }>(
-        `query ListMessages($sessionId: ID!, $limit: Int, $offset: Int) {
-          listAiMessages(sessionId: $sessionId, limit: $limit, offset: $offset) {
-            id sessionId role content toolCalls
-            finishReason inputTokens outputTokens costCents createdAt
-          }
-        }`,
-        { sessionId, limit, offset }
-      )
+      .queryPreferLocalHost<{ listAiMessages: AiMessage[] }>(query, query, { sessionId, limit, offset })
       .pipe(map((data) => data.listAiMessages));
   }
 
@@ -542,25 +541,28 @@ export class JohnnyApiService {
   }
 
   detectCliTools(): Observable<DetectedCliTool[]> {
+    const workerQuery = `query ListDetectedCliTools {
+      listDetectedCliTools { provider command found path }
+    }`;
+    const hostQuery = `query DetectCliTools {
+      detectCliTools { provider command found path }
+    }`;
+
     return this.gql
-      .query<{ listDetectedCliTools: DetectedCliTool[] }>(
-        `query ListDetectedCliTools {
-          listDetectedCliTools {
-            provider command found path
-          }
-        }`
-      )
-      .pipe(map((data) => data.listDetectedCliTools));
+      .queryPreferLocalHost<{
+        listDetectedCliTools?: DetectedCliTool[];
+        detectCliTools?: DetectedCliTool[];
+      }>(workerQuery, hostQuery)
+      .pipe(map((data) => data.detectCliTools ?? data.listDetectedCliTools ?? []));
   }
 
   getSetting(key: string): Observable<string> {
+    const query = `query GetSetting($key: String!) {
+      getSetting(key: $key)
+    }`;
+
     return this.gql
-      .query<{ getSetting: string }>(
-        `query GetSetting($key: String!) {
-          getSetting(key: $key)
-        }`,
-        { key }
-      )
+      .queryPreferLocalHost<{ getSetting: string }>(query, query, { key })
       .pipe(map((data) => data.getSetting));
   }
 

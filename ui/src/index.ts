@@ -20,6 +20,7 @@ export {
   GraphQLResponse,
   GraphQLError,
   GRAPHQL_API_URL,
+  HOST_GRAPHQL_API_URL,
   GRAPHQL_WS_URL,
   GRAPHQL_EXTRA_HEADERS,
 } from './services/graphql-client';

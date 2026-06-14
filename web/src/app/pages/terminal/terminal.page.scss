@@ -2,7 +2,11 @@
 
 :host {
   display: block;
+  min-width: 0;
   height: 100%;
+  position: fixed;
+  inset: 0;
+  background: #07090d;
 }
 
 .workspace-shell {
@@ -53,15 +57,27 @@
     #101722;
 }
 
+.workspace-topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .workspace-tabs {
   display: flex;
+  flex-wrap: nowrap;
   gap: 6px;
   min-width: 0;
   overflow: auto hidden;
+  overscroll-behavior-inline: contain;
   scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
 }
 
 .workspace-tab {
+  flex: 0 0 auto;
   height: 30px;
   display: inline-flex;
   align-items: center;
@@ -165,6 +181,10 @@
     linear-gradient(90deg, rgba(96, 120, 145, 0.08) 1px, transparent 1px),
     #07090d;
   background-size: 28px 28px;
+
+  &.has-fullscreen-pane {
+    background: #07090d;
+  }
 }
 
 .terminal-pane {
@@ -189,6 +209,18 @@
   &.resizing {
     border-color: #64b5ff;
     user-select: none;
+  }
+
+  &.fullscreen {
+    min-width: 0;
+    min-height: 0;
+    z-index: 8;
+    border-color: #64b5ff;
+    box-shadow: inset 0 0 0 1px rgba(100, 181, 255, 0.18);
+
+    .pane-header {
+      cursor: default;
+    }
   }
 }
 
@@ -250,6 +282,27 @@
   }
 }
 
+.pane-fullscreen-btn {
+  min-width: 44px;
+  max-width: none;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #bfdbfe;
+  flex: 0 0 auto;
+
+  ion-icon {
+    font-size: 15px;
+    flex: 0 0 auto;
+  }
+}
+
+.pane-fullscreen-label {
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-transform: lowercase;
+}
+
 .pane-icon {
   width: 28px;
   display: inline-grid;
@@ -288,6 +341,25 @@
 .terminal-surface {
   min-width: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+::ng-deep .terminal-pane johnny-terminal-screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+::ng-deep .terminal-pane johnny-terminal-screen .terminal-shell {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 0;
 }
 
 .pane-resize-handle {
@@ -351,8 +423,33 @@
   }
 }
 
-::ng-deep .terminal-pane johnny-terminal-screen .terminal-shell {
-  border: 0;
+@media (max-width: workspace.$mobile-breakpoint) {
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-toolbar {
+    display: none;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-shell {
+    flex: 1 1 0;
+    height: auto;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-host {
+    padding-inline: 0;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-host .xterm-viewport {
+    overflow-x: hidden !important;
+  }
 }
 
 @media (max-width: workspace.$mobile-breakpoint) {
@@ -369,6 +466,49 @@
   .workspace-topbar {
     grid-template-columns: 1fr;
     @include workspace.mobile-topbar;
+    gap: 6px;
+    padding-block: 6px;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .workspace-topbar-brand {
+    width: 100%;
+  }
+
+  .page-title-chip {
+    margin-inline: 0 auto 0;
+  }
+
+  .workspace-session-segment {
+    width: 100%;
+    min-width: 0;
+    --background: transparent;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x;
+
+    ion-segment-button {
+      --padding-start: 10px;
+      --padding-end: 10px;
+      min-width: 0;
+    }
+
+    ion-label {
+      font-size: 12px;
+      letter-spacing: 0.01em;
+    }
+  }
+
+  .workspace-tabs {
+    @include workspace.mobile-tab-strip;
+    flex: none;
+    touch-action: pan-x;
+  }
+
+  .workspace-tab {
+    flex: 0 0 auto;
+    max-width: min(72vw, 300px);
   }
 
   .brand-lockup {
@@ -381,42 +521,44 @@
     white-space: nowrap;
   }
 
-  .workspace-tabs {
-    @include workspace.mobile-tab-strip;
-  }
-
   .mode-switch {
     @include workspace.mobile-mode-switch;
   }
 
   .workspace-actions {
-    @include workspace.mobile-actions-grid(3);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 6px;
+    width: 100%;
     padding-bottom: 0;
   }
 
   .workspace-actions .provider-dropdown {
-    grid-column: 1 / -1;
+    grid-column: 1;
     min-width: 0;
     width: 100%;
   }
 
   .workspace-actions .primary-action {
-    grid-column: span 2;
+    grid-column: 2;
     min-width: 0;
-    width: 100%;
-    padding: 0 8px;
+    width: auto;
+    padding: 0 10px;
+    white-space: nowrap;
   }
 
   .workspace-actions .icon-action {
-    width: 100%;
-    min-width: 0;
+    grid-column: 3;
+    width: 32px;
+    min-width: 32px;
   }
 
   .terminal-workspace {
     @include workspace.mobile-panel-shell;
-    display: grid;
-    grid-template-rows: minmax(0, 1fr);
-    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 6px;
     overflow: hidden;
   }
 
@@ -425,47 +567,77 @@
     left: auto !important;
     top: auto !important;
     width: 100% !important;
-    height: auto !important;
+    height: 100% !important;
+    flex: 1 1 auto;
     grid-template-rows: auto minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
+    max-width: 100%;
     max-height: none;
+    overflow: hidden;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
   }
 
   .pane-header {
-    grid-template-columns: 1fr;
+    grid-row: 1;
+    grid-template-columns: minmax(0, 1fr) auto;
     position: sticky;
     top: 0;
-    z-index: 2;
-    min-height: 68px;
-    align-content: center;
+    z-index: 4;
+    min-height: 36px;
+    padding-block: 4px;
+    align-items: center;
     gap: 6px;
     cursor: default;
     touch-action: auto;
+    overflow: hidden;
+    background: #101722;
+    isolation: isolate;
   }
 
-  .pane-title,
+  .pane-title {
+    display: none;
+  }
+
   .pane-meta {
+    display: flex;
     width: 100%;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
   }
 
-  .pane-meta {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    gap: 6px;
-    overflow: visible;
+  .pane-tool:not(.danger):not(.pane-cwd):not(.pane-fullscreen-btn) {
+    display: none;
   }
 
   .pane-tool {
-    min-width: 0;
     max-width: none;
-    padding-inline: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .pane-tool.pane-cwd {
+    flex: 1 1 auto;
+    max-width: calc(100% - 116px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .pane-tool.danger {
-    min-width: 56px;
-    text-align: center;
+    flex: 0 0 auto;
+    min-width: 52px;
+  }
+
+  .terminal-surface {
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .pane-status {
@@ -486,11 +658,7 @@
   }
 
   .workspace-statusbar {
-    min-height: 0;
-
-    > span {
-      display: none;
-    }
+    display: none;
   }
 }
 

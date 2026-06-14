@@ -10,9 +10,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   is_active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  updated_by TEXT
+  updated_by TEXT,
+  plan TEXT NOT NULL DEFAULT 'free',
+  settings TEXT NOT NULL DEFAULT '{}'
 );
-
--- JohnnyOne-specific extensions to tenants
-ALTER TABLE tenants ADD COLUMN plan TEXT NOT NULL DEFAULT 'free';
-ALTER TABLE tenants ADD COLUMN settings TEXT NOT NULL DEFAULT '{}';

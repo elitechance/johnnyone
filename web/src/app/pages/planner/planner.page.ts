@@ -36,8 +36,10 @@ import { addIcons } from 'ionicons';
 import {
   codeSlashOutline,
   closeOutline,
+  contractOutline,
   documentOutline,
   documentTextOutline,
+  expandOutline,
   folderOpenOutline,
   folderOutline,
   imageOutline,
@@ -47,8 +49,10 @@ import {
 addIcons({
   'code-slash-outline': codeSlashOutline,
   'close-outline': closeOutline,
+  'contract-outline': contractOutline,
   'document-outline': documentOutline,
   'document-text-outline': documentTextOutline,
+  'expand-outline': expandOutline,
   'folder-open-outline': folderOpenOutline,
   'folder-outline': folderOutline,
   'image-outline': imageOutline,
@@ -147,12 +151,14 @@ export class PlannerPage implements OnInit, OnDestroy {
   private selectedWorkspaceHtmlObjectUrl: string | null = null;
   private selectedPlanHtmlObjectUrl: string | null = null;
   private plannerVisualSubscriptions = new Set<string>();
+  private lastPlanTerminalSyncKey = '';
   private readonly visibilityChangeHandler = () => {
     if (document.hidden) {
+      this.lastPlanTerminalSyncKey = '';
       void this.unsubscribeAllPlanTerminals();
     } else {
       const run = this.currentRun();
-      if (run) void this.attachPlanTerminals(run);
+      if (run) void this.syncPlanTerminalSubscriptions(run, { refresh: true });
     }
   };
 
@@ -213,9 +219,11 @@ export class PlannerPage implements OnInit, OnDestroy {
   fileSidebarWidth = signal(330);
   isCompactWorkspace = signal(false);
   activeMobilePanel = signal<PlannerMobilePanel>('worker');
+  fullscreenTerminalRole = signal<PlannerTerminalRole | null>(null);
   validation = signal<WorkspaceValidation | null>(null);
   promptSettings = signal<PlannerPromptSettings | null>(null);
   error = signal<string | null>(null);
+  coordinatorNotice = signal<string | null>(null);
   isBusy = signal(false);
   promptSettingsOpen = false;
   promptSettingsPath = '~/.johnnyone/planner-prompts.yml';
@@ -249,6 +257,13 @@ export class PlannerPage implements OnInit, OnDestroy {
     : 'Start a T1/T2 development run from an approved plan.');
   t1Label = computed(() => this.mode() === 'planning' ? 'Planner' : 'Worker');
   t2Label = computed(() => this.mode() === 'planning' ? 'Plan Reviewer' : 'Reviewer');
+  fullscreenTerminalTitle = computed(() => {
+    const role = this.fullscreenTerminalRole();
+    if (!role) return 'Terminal';
+    const badge = role === 'worker' ? 'T1' : 'T2';
+    const label = role === 'worker' ? this.t1Label() : this.t2Label();
+    return `${badge} · ${label}`;
+  });
   currentPhase = computed(() => {
     const run = this.currentRun();
     if (!run) return null;
@@ -289,6 +304,29 @@ export class PlannerPage implements OnInit, OnDestroy {
     const run = this.currentRun();
     if (this.mode() !== 'planning' || !run) return false;
     return !['blocked', 'stopped'].includes(run.plan.status);
+  });
+  startPlanLabel = computed(() => {
+    const status = this.currentRun()?.plan.status;
+    if (!status) return 'Start';
+    if (this.mode() === 'planning') {
+      if (status === 'planning_planner_running') return 'Nudge T1';
+      if (status === 'planning_review_running') return 'Restart T2';
+      if (status === 'approved') return 'Approved';
+    }
+    if (this.mode() === 'development' && status === 'approved' && !this.selectedStartPhaseId()) {
+      return 'Pick phase';
+    }
+    return 'Start';
+  });
+  startPlanDisabled = computed(() => {
+    const run = this.currentRun();
+    if (!run || this.isBusy()) return true;
+    const status = run.plan.status;
+    if (this.mode() === 'planning' && ['approved', 'blocked', 'stopped'].includes(status)) {
+      return status === 'approved' ? false : true;
+    }
+    if (this.mode() === 'development' && ['blocked', 'stopped'].includes(status)) return true;
+    return false;
   });
   planRootPath = computed(() => {
     const plan = this.currentRun()?.plan;
@@ -544,7 +582,7 @@ export class PlannerPage implements OnInit, OnDestroy {
 
       this.currentRun.set(run);
       this.ensureActiveMobilePanel(run);
-      await this.attachPlanTerminals(run);
+      await this.syncPlanTerminalSubscriptions(run, { refresh: true });
 
       // If the Files modal is open, refresh its contents for the new plan.
       if (this.filesOpen()) {
@@ -562,6 +600,9 @@ export class PlannerPage implements OnInit, OnDestroy {
    * plan's identity.
    */
   private resetPerPlanState(): void {
+    this.lastPlanTerminalSyncKey = '';
+    this.fullscreenTerminalRole.set(null);
+
     // Terminal screens are keyed by session_id and the new plan will have its
     // own session_ids — keeping stale entries means workerScreen/reviewerScreen
     // could resolve to a previous plan's frame if lookups accidentally hit.
@@ -666,9 +707,32 @@ export class PlannerPage implements OnInit, OnDestroy {
   }
 
   async startPlan(id = this.currentRun()?.plan.id): Promise<void> {
-    if (!id || this.isBusy()) return;
+    const current = this.currentRun();
+    if (!id || !current || this.isBusy()) return;
+
+    const status = current.plan.status;
+    if (this.mode() === 'planning' && status === 'approved') {
+      this.coordinatorNotice.set('Plan is approved. Use Amend to revise it, or start a Development run from this plan.');
+      this.openAmend();
+      return;
+    }
+    if (['blocked', 'stopped'].includes(status)) {
+      this.error.set(`Run is ${status}. Stop/Block cleared the active coordinator; create a new run or unblock before starting again.`);
+      return;
+    }
+    if (
+      this.mode() === 'development'
+      && status === 'approved'
+      && !this.selectedStartPhaseId()
+    ) {
+      this.coordinatorNotice.set('Select a phase in the coordinator header, then click Start to rerun it.');
+      this.error.set('Pick a phase from the dropdown before starting an approved development run.');
+      return;
+    }
+
     this.isBusy.set(true);
     this.error.set(null);
+    this.coordinatorNotice.set(null);
     try {
       const run = await firstValueFrom(this.api.startAgentPlan(
         id,
@@ -677,7 +741,19 @@ export class PlannerPage implements OnInit, OnDestroy {
       ));
       this.currentRun.set(run);
       this.ensureActiveMobilePanel(run);
-      await this.attachPlanTerminals(run);
+      if (this.mode() === 'planning') {
+        if (status === 'planning_planner_running') {
+          this.coordinatorNotice.set('Nudged T1 — switch to the Planner tab to watch output.');
+          this.activeMobilePanel.set('worker');
+        } else if (status === 'planning_review_running') {
+          this.coordinatorNotice.set('Restarted T2 review — switch to the Plan Reviewer tab.');
+          this.activeMobilePanel.set('reviewer');
+        } else if (run.plan.status === 'planning_planner_running') {
+          this.coordinatorNotice.set('Planner started — switch to the T1 tab to watch output.');
+          this.activeMobilePanel.set('worker');
+        }
+      }
+      await this.syncPlanTerminalSubscriptions(run);
       await this.loadPlans(false);
     } catch (err) {
       this.error.set(String(err));
@@ -765,7 +841,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.currentRun.set(run);
       this.amendBrief = '';
       this.amendOpen.set(false);
-      await this.attachPlanTerminals(run);
+      await this.syncPlanTerminalSubscriptions(run);
     } catch (err) {
       this.error.set(String(err));
     } finally {
@@ -1056,29 +1132,54 @@ export class PlannerPage implements OnInit, OnDestroy {
     if (!target) return;
     const anchor = target.closest('a');
     if (!anchor) return;
+    const preview = anchor.closest('.plan-markdown-preview');
     // Only intercept inside our markdown previews — leaves left-nav etc. alone.
-    if (!anchor.closest('.plan-markdown-preview')) return;
+    if (!preview) return;
 
-    const href = anchor.getAttribute('href');
-    if (!href) return;
+    const rawHref = anchor.getAttribute('href');
+    if (!rawHref) return;
 
-    // Let true external links + in-page anchors + protocol-handlers through.
-    if (/^https?:\/\//i.test(href) || /^(mailto|tel|sms):/i.test(href) || href.startsWith('#')) {
+    if (/^(mailto|tel|sms):/i.test(rawHref) || rawHref.startsWith('#')) {
+      return;
+    }
+
+    const href = this.normalizeMarkdownHref(rawHref);
+    if (/^https?:\/\//i.test(href)) {
       anchor.setAttribute('target', '_blank');
       anchor.setAttribute('rel', 'noopener noreferrer');
       return;
     }
 
-    const currentPath = this.selectedPlanContent()?.path;
+    const currentPath = this.markdownPreviewBasePath(preview);
     if (!currentPath) return;
 
-    // Resolve and dispatch.
     const resolved = this.resolveRelativeHostPath(currentPath, href);
     if (!resolved) return;
 
     event.preventDefault();
     event.stopPropagation();
-    void this.openHostPath(resolved);
+    void this.openHostPath(resolved, rawHref.replace(/[#?].*$/, '').endsWith('/'));
+  }
+
+  /** Same-origin absolute URLs (e.g. `https://johnnyone.pages.dev/phases/...`
+   * from the browser resolving a relative plan link against the SPA origin)
+   * are plan-relative host paths, not external navigation targets. */
+  private normalizeMarkdownHref(href: string): string {
+    if (!/^https?:\/\//i.test(href)) return href;
+    try {
+      const url = new URL(href);
+      if (url.origin !== window.location.origin) return href;
+      const path = url.pathname.replace(/^\/+/, '');
+      return path ? `${path}${url.search}${url.hash}` : href;
+    } catch {
+      return href;
+    }
+  }
+
+  private markdownPreviewBasePath(preview: Element): string | null {
+    const fromAttr = preview.getAttribute('data-markdown-base')?.trim();
+    if (fromAttr) return fromAttr;
+    return this.selectedWorkspaceContent()?.path ?? this.selectedPlanContent()?.path ?? null;
   }
 
   /** Resolve `rel` (which may start with `./`, `../`, or be a bare segment)
@@ -1110,28 +1211,43 @@ export class PlannerPage implements OnInit, OnDestroy {
     return parts.join('/');
   }
 
-  /** Open an arbitrary host file path in the plan-preview pane. Synthesizes
-   * a HostFileEntry and reuses `selectPlanFile`'s side effects (content
-   * fetch + markdown render + mermaid re-render). Does NOT try to refresh
-   * the directory listing — the linked file is usually outside the plan
-   * dir (e.g. common/methodology.md). If the target is actually a directory,
-   * fall back to opening it in the Plan Files browser instead of surfacing the
-   * host "path is not a file" preview error. */
-  private async openHostPath(path: string): Promise<void> {
-    const dir = path.replace(/\/+[^/]*$/, '') || '/';
-    const filename = path.slice(dir.length + 1);
-    if (!filename) return;
-    // Open the Files modal on the Plan Files tab if it's closed — that's
-    // where the preview pane lives.
+  /** Open a workspace-relative host path in the Files modal preview pane. */
+  private async openHostPath(path: string, isDirectoryLink = false): Promise<void> {
     if (!this.filesOpen()) {
       this.filesOpen.set(true);
     }
-    await this.selectPlanFile({
-      path,
+
+    const absolutePath = this.hostAbsolutePath(path);
+    if (isDirectoryLink || !this.pathLooksLikeFile(path)) {
+      await this.openHostDirectory(absolutePath);
+      return;
+    }
+
+    const filename = path.split('/').pop() || path;
+    await this.selectWorkspaceFile({
+      path: absolutePath,
       name: filename,
       kind: 'file',
       status: 'unchanged',
-    } as HostFileEntry, { directoryFallbackPath: this.hostAbsolutePath(path) });
+    } as HostFileEntry);
+  }
+
+  private pathLooksLikeFile(path: string): boolean {
+    const leaf = path.split('/').pop() || '';
+    return leaf.includes('.') && !leaf.endsWith('.');
+  }
+
+  private async openHostDirectory(path: string): Promise<void> {
+    await this.loadGitFiles(path);
+    const preferredNames = ['prompt.md', 'overview.md', 'status.md', 'decisions.md'];
+    const pick =
+      preferredNames
+        .map((name) => this.workspaceFiles().find((entry) => entry.kind === 'file' && entry.name === name))
+        .find((entry): entry is HostFileEntry => !!entry) ??
+      this.workspaceFiles().find((entry) => entry.kind === 'file' && /\.md$/i.test(entry.name));
+    if (pick) {
+      await this.selectWorkspaceFile(pick);
+    }
   }
 
   async selectPlanFile(file: HostFileEntry, options: { directoryFallbackPath?: string } = {}): Promise<void> {
@@ -1316,6 +1432,8 @@ export class PlannerPage implements OnInit, OnDestroy {
 
   selectMobilePanel(panel: PlannerMobilePanel): void {
     this.activeMobilePanel.set(panel);
+    const run = this.currentRun();
+    if (run) void this.syncPlanTerminalSubscriptions(run);
   }
 
   async sendWorkerMessage(): Promise<void> {
@@ -1427,6 +1545,18 @@ export class PlannerPage implements OnInit, OnDestroy {
     } finally {
       sendingSignal.set(false);
     }
+  }
+
+  openTerminalFullscreen(role: PlannerTerminalRole): void {
+    this.fullscreenTerminalRole.set(role);
+    const run = this.currentRun();
+    if (run) void this.syncPlanTerminalSubscriptions(run, { refresh: true });
+  }
+
+  closeTerminalFullscreen(): void {
+    this.fullscreenTerminalRole.set(null);
+    const run = this.currentRun();
+    if (run) void this.syncPlanTerminalSubscriptions(run);
   }
 
   async sendPlannerRawInput(role: 'worker' | 'reviewer', data: string): Promise<void> {
@@ -1673,7 +1803,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.upsertPlanSummary(update.run.plan);
       if (this.currentRun()?.plan.id === update.planId) {
         this.ensureActiveMobilePanel(update.run);
-        void this.attachPlanTerminals(update.run);
+        void this.syncPlanTerminalSubscriptions(update.run);
       }
     });
   }
@@ -1688,7 +1818,10 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.fileResizeCleanup?.();
       this.isCompactWorkspace.set(event.matches);
       const run = this.currentRun();
-      if (run) this.ensureActiveMobilePanel(run);
+      if (run) {
+        this.ensureActiveMobilePanel(run);
+        void this.syncPlanTerminalSubscriptions(run);
+      }
     };
     this.compactWorkspaceMediaQuery.addEventListener('change', this.compactWorkspaceListener);
   }
@@ -1725,16 +1858,64 @@ export class PlannerPage implements OnInit, OnDestroy {
     });
   }
 
-  private async attachPlanTerminals(run: AgentPlanRun): Promise<void> {
+  private planTerminalSyncKey(run: AgentPlanRun): string {
+    const visibleIds = this.visiblePlanTerminalSessionIds(run).slice().sort().join(',');
+    return [
+      run.plan.id,
+      run.plan.status,
+      run.plan.workerSessionId ?? '',
+      run.plan.reviewerSessionId ?? '',
+      visibleIds,
+      this.activeMobilePanel(),
+      this.fullscreenTerminalRole() ?? '',
+      this.isCompactWorkspace() ? '1' : '0',
+    ].join('|');
+  }
+
+  private visiblePlanTerminalSessionIds(run: AgentPlanRun): string[] {
+    const { workerSessionId, reviewerSessionId, status } = run.plan;
+
+    const fullscreenRole = this.fullscreenTerminalRole();
+    if (fullscreenRole) {
+      const sessionId = fullscreenRole === 'worker' ? workerSessionId : reviewerSessionId;
+      return sessionId ? [sessionId] : [];
+    }
+
+    if (this.isCompactWorkspace()) {
+      const panel = this.activeMobilePanel();
+      if (panel === 'worker' && workerSessionId) return [workerSessionId];
+      if (panel === 'reviewer' && reviewerSessionId) return [reviewerSessionId];
+      return [];
+    }
+
+    const workerRunning = status === 'planning_planner_running' || status === 'phase_worker_running';
+    const reviewerRunning = status === 'planning_review_running' || status === 'phase_review_running';
+    if (workerRunning && workerSessionId) return [workerSessionId];
+    if (reviewerRunning && reviewerSessionId) return [reviewerSessionId];
+
+    const panel = this.activeMobilePanel();
+    if (panel === 'worker' && workerSessionId) return [workerSessionId];
+    if (panel === 'reviewer' && reviewerSessionId) return [reviewerSessionId];
+    if (workerSessionId) return [workerSessionId];
+    if (reviewerSessionId) return [reviewerSessionId];
+    return [];
+  }
+
+  private async syncPlanTerminalSubscriptions(
+    run: AgentPlanRun,
+    options?: { refresh?: boolean },
+  ): Promise<void> {
     if (document.hidden) return;
-    const sessionIds = [run.plan.workerSessionId, run.plan.reviewerSessionId].filter(Boolean) as string[];
-    const visibleIds = new Set(sessionIds);
+
+    const syncKey = this.planTerminalSyncKey(run);
+    if (syncKey === this.lastPlanTerminalSyncKey && !options?.refresh) return;
+    this.lastPlanTerminalSyncKey = syncKey;
+
+    const visibleIds = new Set(this.visiblePlanTerminalSessionIds(run));
 
     for (const sessionId of Array.from(this.plannerVisualSubscriptions)) {
       if (!visibleIds.has(sessionId)) {
         await this.unsubscribePlanTerminal(sessionId);
-        // Prune the cached screen for the no-longer-visible session so it
-        // can't accidentally re-render if currentRun briefly resolves back.
         this.terminalScreens.update((screens) => {
           const next = { ...screens };
           delete next[sessionId];
@@ -1743,14 +1924,14 @@ export class PlannerPage implements OnInit, OnDestroy {
       }
     }
 
-    for (const sessionId of sessionIds) {
+    for (const sessionId of visibleIds) {
       try {
-        // refreshVisual = subscribe-if-not-subscribed, otherwise send a fresh
-        // `visual_refresh` so the host re-emits the current pane state. This
-        // covers tab switches where the subscription already existed but the
-        // cached screen was wiped above.
-        await this.relayTerminal.refreshVisual(sessionId);
-        this.plannerVisualSubscriptions.add(sessionId);
+        if (options?.refresh) {
+          await this.relayTerminal.refreshVisual(sessionId);
+          this.plannerVisualSubscriptions.add(sessionId);
+        } else {
+          await this.subscribePlanTerminal(sessionId);
+        }
       } catch {
         // The coordinator may still be starting the host/tmux session.
       }

@@ -1,13 +1,13 @@
 // Prevents additional console window on Windows in release builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use johnnyone_desktop_lib::agent::{AgentConfig, AgentService};
 use johnnyone_desktop_lib::commands;
 use johnnyone_desktop_lib::db::Database;
 use johnnyone_desktop_lib::host;
 use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
-use johnnyone_desktop_lib::state::app_state::{AppState, WorkerRelayConfig};
+use johnnyone_desktop_lib::services::relay;
+use johnnyone_desktop_lib::state::app_state::AppState;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -75,9 +75,9 @@ fn main() {
             //
             // Two things start here (both on Tauri's tokio runtime):
             //   1) Resume any in-flight planner coordinator loops from SQLite.
-            //   2) If `JOHNNYONE_WORKER_URL` is set, register this machine
-            //      with the deployed worker and keep a WebSocket open for
-            //      relay-RPC (so the hosted web client can talk to this host).
+            //   2) If relay settings are configured (SQLite, with optional
+            //      JOHNNYONE_* env overrides), register this machine with the
+            //      worker and keep a WebSocket open for relay-RPC.
             //   3) Local axum GraphQL listener on 127.0.0.1:7788 — what the
             //      embedded host-app Angular UI fetches against. (Will move
             //      to Tauri `invoke()` later; this is the minimal port-over.)
@@ -94,60 +94,10 @@ fn main() {
                 }
             });
 
-            if let Ok(worker_url) = std::env::var("JOHNNYONE_WORKER_URL") {
-                let user_id = std::env::var("JOHNNYONE_USER_ID").unwrap_or_else(|_| {
-                    "00000000-0000-0000-0000-000000000002".to_string()
-                });
-                let tenant_id = std::env::var("JOHNNYONE_TENANT_ID").unwrap_or_else(|_| {
-                    "00000000-0000-0000-0000-000000000001".to_string()
-                });
-
-                let agent_state = app_state.clone();
-                tauri::async_runtime::spawn(async move {
-                    agent_state
-                        .set_worker_relay_config(WorkerRelayConfig {
-                            worker_url: worker_url.clone(),
-                            user_id: user_id.clone(),
-                            tenant_id: tenant_id.clone(),
-                        })
-                        .await;
-                    {
-                        let mut status = agent_state.connection_status.lock().await;
-                        status.session_id = Some("host-agent".to_string());
-                    }
-
-                    let config = AgentConfig {
-                        worker_url,
-                        user_id,
-                        tenant_id,
-                    };
-                    loop {
-                        match AgentService::start(
-                            AgentConfig {
-                                worker_url: config.worker_url.clone(),
-                                user_id: config.user_id.clone(),
-                                tenant_id: config.tenant_id.clone(),
-                            },
-                            agent_state.clone(),
-                        )
-                        .await
-                        {
-                            Ok(()) => break,
-                            Err(error) => {
-                                tracing::error!(
-                                    %error,
-                                    "Backend relay connection failed; retrying in 2s"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            }
-                        }
-                    }
-                });
-            } else {
-                tracing::info!(
-                    "JOHNNYONE_WORKER_URL not set — running fully offline (no relay)"
-                );
-            }
+            let agent_state = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                relay::spawn_if_configured(agent_state).await;
+            });
 
             let bind_addr = std::env::var("JOHNNYONE_HOST_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:7788".to_string());

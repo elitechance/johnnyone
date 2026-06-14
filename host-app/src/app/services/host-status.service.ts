@@ -1,15 +1,8 @@
-import { Injectable, signal } from '@angular/core';
-
-/**
- * Service that pings local host + worker and lists detected CLIs.
- *
- * The Tauri shell will eventually expose richer status via IPC (process supervisor
- * state, child PID, log tail). For Phase 3 we use HTTP polling against the
- * host's GraphQL endpoint — good enough for the structural shell.
- */
+import { Injectable, inject, signal } from '@angular/core';
+import { HostRelayService } from './host-relay.service';
+import { HostSettingsService } from './host-settings.service';
 
 const HOST_URL = 'http://127.0.0.1:7788/graphql';
-const WORKER_URL = 'https://johnnyone-dev-hub.ethan-353.workers.dev/graphql';
 
 interface DetectedTool {
   provider: string;
@@ -20,14 +13,39 @@ interface DetectedTool {
 
 @Injectable({ providedIn: 'root' })
 export class HostStatusService {
+  private readonly settings = inject(HostSettingsService);
+  private readonly relay = inject(HostRelayService);
+
   readonly hostUp = signal(false);
   readonly workerUp = signal(false);
-  readonly nodeRegistered = signal(false);
-  readonly lastError = signal<string>('');
+  readonly relayConnected = signal(false);
+  readonly workerUrl = signal('');
+  readonly webClientUrl = signal('https://johnnyone.pages.dev/');
+  readonly lastError = signal('');
 
   async refresh(): Promise<void> {
     this.lastError.set('');
-    await Promise.all([this.pingHost(), this.pingWorker()]);
+    try {
+      const hostSettings = await this.settings.load();
+      this.workerUrl.set(hostSettings.workerUrl);
+      this.webClientUrl.set(hostSettings.webClientUrl);
+      await Promise.all([
+        this.pingHost(),
+        this.pingWorker(hostSettings.workerUrl),
+        this.refreshRelayStatus(),
+      ]);
+    } catch (err) {
+      this.lastError.set(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private async refreshRelayStatus(): Promise<void> {
+    try {
+      const status = await this.relay.status();
+      this.relayConnected.set(status.connected);
+    } catch {
+      this.relayConnected.set(false);
+    }
   }
 
   private async pingHost(): Promise<void> {
@@ -43,9 +61,10 @@ export class HostStatusService {
     }
   }
 
-  private async pingWorker(): Promise<void> {
+  private async pingWorker(workerUrl: string): Promise<void> {
     try {
-      const res = await fetch(WORKER_URL, {
+      const graphqlUrl = this.settings.workerGraphqlUrl(workerUrl);
+      const res = await fetch(graphqlUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: '{ __typename }' }),
@@ -57,9 +76,6 @@ export class HostStatusService {
   }
 
   async detectCliTools(): Promise<DetectedTool[]> {
-    // `detectCliTools` is a Mutation in the host's GraphQL schema (it actively
-    // re-scans the system PATH). Use `listProviderConfigs` to read the
-    // already-detected CLIs without re-scanning; fall back to detect if empty.
     try {
       const res = await fetch(HOST_URL, {
         method: 'POST',

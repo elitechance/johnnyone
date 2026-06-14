@@ -16,6 +16,7 @@
   height: 100%;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   background: #05070b;
   color: #d7e1ee;
   border: 1px solid rgba(148, 163, 184, 0.3);
@@ -88,6 +89,24 @@
   opacity: 0.48;
 }
 
+.terminal-viewport-scroll-button {
+  height: 32px;
+  min-width: 36px;
+  padding: 0 8px;
+  border: 1px solid #263241;
+  background: #121821;
+  color: #dbe7f3;
+  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.terminal-viewport-scroll-button.live {
+  min-width: 36px;
+  border-color: #315b82;
+  background: #102033;
+  color: #bfdbfe;
+  font-weight: 650;
+}
+
 .terminal-history-count {
   color: #9aa8b8;
   font-size: 11px;
@@ -115,6 +134,7 @@
 }
 
 .terminal-host {
+  position: relative;
   flex: 1 1 0;
   min-height: 0;
   overflow: hidden;
@@ -277,9 +297,76 @@
   }
 }
 
+.terminal-shell:not(.mobile-input-mode) .terminal-mobile-input {
+  padding: 8px 10px 10px;
+}
+
+.terminal-shell:not(.mobile-input-mode) .terminal-mobile-keys .terminal-viewport-scroll-button {
+  display: none;
+}
+
+.terminal-shell.mobile-input-mode {
+  overflow: hidden;
+
+  .terminal-host {
+    flex: 1 1 0;
+    min-height: 0;
+    padding-inline: 0;
+    touch-action: none;
+    cursor: grab;
+    -webkit-overflow-scrolling: touch;
+
+    &.terminal-host-scrolling {
+      cursor: grabbing;
+    }
+  }
+
+  .terminal-mobile-input {
+    gap: 6px;
+    padding: 6px 8px calc(8px + env(safe-area-inset-bottom));
+  }
+
+  .terminal-mobile-keys .terminal-image-button {
+    display: none;
+  }
+
+  .terminal-mobile-keys button {
+    min-width: 40px;
+    height: 28px;
+    padding: 0 8px;
+    font-size: 11px;
+  }
+
+  .terminal-mobile-keys .terminal-viewport-scroll-button.live {
+    min-width: 44px;
+  }
+
+  .terminal-mobile-submit textarea {
+    min-height: 36px;
+    max-height: 72px;
+    font-size: 14px;
+    line-height: 1.25;
+  }
+
+  .terminal-mobile-submit button {
+    width: 64px;
+    height: 36px;
+  }
+}
+
 ::ng-deep .terminal-host .xterm {
   height: 100%;
   width: 100%;
+  max-width: 100%;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-screen,
+::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-rows,
+::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-row {
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 ::ng-deep .terminal-host .xterm-helper-textarea {

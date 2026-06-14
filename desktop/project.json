@@ -9,7 +9,7 @@
       "command": "cd desktop/src-tauri && cargo check --bin johnnyone-desktop"
     },
     "desktop-build": {
-      "command": "cd desktop/src-tauri && cargo build --release --bin johnnyone-desktop"
+      "command": "bash scripts/build-desktop.sh"
     },
     "tauri-dev": {
       "command": "cd desktop/src-tauri && cargo tauri dev"

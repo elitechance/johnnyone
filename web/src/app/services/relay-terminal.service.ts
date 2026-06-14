@@ -1,6 +1,7 @@
 import { Injectable, NgZone, inject } from '@angular/core';
 import { Observable, Subject, firstValueFrom } from 'rxjs';
 import { AgentPlanRun, AiSession, DesktopNode, JohnnyApiService, TerminalScreen } from '@johnnyone/ui';
+import { getWorkerBaseUrl } from '../../worker-url';
 
 interface RelayEnvelope {
   type: string;
@@ -424,17 +425,7 @@ export class RelayTerminalService {
   }
 
   private workerBaseUrl(): string {
-    // Mirror the env-detection in web/src/main.ts so the WS endpoint always
-    // matches the GraphQL endpoint that the rest of the app is talking to.
-    const stored = window.localStorage.getItem('johnnyone_worker_url')?.trim();
-    if (stored) return stored;
-
-    if (!['localhost', '127.0.0.1'].includes(window.location.hostname)) {
-      return window.location.hostname.endsWith('.pages.dev')
-        ? 'https://johnnyone-dev-hub.ethan-353.workers.dev'
-        : window.location.origin;
-    }
-
-    return 'http://127.0.0.1:7714';
+    // Keep in sync with web/src/worker-url.ts (legacy hub URLs auto-migrate).
+    return getWorkerBaseUrl();
   }
 }

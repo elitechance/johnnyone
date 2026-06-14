@@ -11,8 +11,8 @@ Cloudflare Worker is a thin relay between the web browser and that binary.
 | Surface | URL |
 |---|---|
 | Web client | https://johnnyone.pages.dev |
-| Worker GraphQL | https://johnnyone-dev-hub.ethan-353.workers.dev/graphql |
-| Worker relay WebSocket | wss://johnnyone-dev-hub.ethan-353.workers.dev/api/relay/ws |
+| Worker GraphQL | https://johnnyone.ethan-353.workers.dev/graphql |
+| Worker relay WebSocket | wss://johnnyone.ethan-353.workers.dev/api/relay/ws |
 | Desktop binary (Linux) | `desktop/src-tauri/target/release/johnnyone-desktop` (built locally) |
 | Mac binary | not yet — needs a Mac to build |
 
@@ -24,7 +24,7 @@ One Tauri desktop binary per user, one Worker for everyone, one Pages site for e
 flowchart TB
   subgraph hosted["Hosted on Cloudflare"]
     web["Web client (Pages)<br/>Ionic 8 / Angular 19"]
-    worker["Worker (johnnyone-dev-hub)<br/>GraphQL + relay-RPC"]
+    worker["Worker (johnnyone)<br/>GraphQL + relay-RPC"]
     do["ChatRelayDO<br/>per-user WebSocket relay"]
     d1[("D1 registry<br/>tenants, users,<br/>desktop_nodes, channels")]
   end
@@ -104,7 +104,7 @@ johnnyone/
     lib/runtime/              relay-rpc.ts, desktop-rpc.ts, chat-relay-do.ts
     d1/migrations/            D1 registry schema
     schema/                   GraphQL schema (johnnyone-ai.graphql, johnnyone-channels.graphql)
-    worker.yaml               name: hub → deployed as johnnyone-dev-hub
+    worker.yaml               legacy `name: hub` (ignored for deploy naming)
   attic/                    Frozen old code (excluded from Nx via .nxignore)
     desktop-thin-client/      Original combined desktop UI — superseded by web + host-app
     mobile-thin-client/       Original mobile Capacitor wrap — deferred
@@ -173,7 +173,7 @@ for the worker — if you don't have a local worker, set the worker URL
 explicitly in your browser's localStorage:
 
 ```js
-localStorage.setItem('johnnyone_worker_url', 'https://johnnyone-dev-hub.ethan-353.workers.dev');
+localStorage.setItem('johnnyone_worker_url', 'https://johnnyone.ethan-353.workers.dev');
 ```
 
 For this to work, your **desktop binary must be running on your machine** and
@@ -230,10 +230,10 @@ ls -lh target/release/johnnyone-desktop          # ~30 MB, self-contained
 > equivalent — both run the Tauri build pipeline (beforeBuildCommand → embed
 > assets → production-webview Rust build). Prefer `npx` since `@tauri-apps/cli`
 > is already a devDependency; `cargo tauri` additionally requires the
-> `cargo-tauri` subcommand (`cargo install tauri-cli`). The Nx `desktop-build`
-> target and lokal's `desktop.prod` build BOTH run `cargo build --release`,
-> which is the WRONG command (see the blank-window gotcha below) — do not use
-> them to produce a runnable binary.
+> `cargo-tauri` subcommand (`cargo install tauri-cli`). `npm run build:desktop`
+> (runs `scripts/build-desktop.sh`) is also correct — wipes `dist/host-app`,
+> rebuilds host-app, then `cargo build --release --features tauri/custom-protocol`.
+> See `docs/operations.md`.
 
 This is the only command that produces a runnable single binary. It:
 
@@ -253,19 +253,18 @@ cargo tauri dev    # spawns `npx nx serve host-app --port 4201` + cargo run in d
 The webview loads from `http://localhost:4201` (per `tauri.conf.json` `devUrl`) so
 Angular HMR works. Requires the dev server alongside the binary.
 
-> **Gotcha — do not use `cargo build --release --bin johnnyone-desktop` to make a
-> single binary.** It compiles cleanly and the binary runs (you'll see the GraphQL
-> listener bind to `:7788` in the log) but the Tauri window stays blank with
-> `Could not connect to localhost: Connection refused`. The Rust release flag
-> alone does not switch Tauri's webview to production-mode asset loading — only
-> `cargo tauri build` does. The 31 MB binary is misleading; it's missing the
-> right codegen context. If you're seeing that error after a "release" build, you
-> ran the wrong command — rerun with `cargo tauri build --no-bundle`.
+> **Gotcha — blank window / "Could not connect to localhost".** Plain
+> `cargo build --release --bin johnnyone-desktop` (without
+> `--features tauri/custom-protocol`) compiles and `:7788` binds, but the Tauri
+> webview stays in dev mode and tries `http://localhost:4201`. Fix: `npx tauri
+> build --no-bundle`, `npm run build:desktop`, or `cargo build --release --bin
+> johnnyone-desktop --features tauri/custom-protocol` after `nx build host-app`.
+> Details: `docs/operations.md`.
 
 ### Launch
 
 ```bash
-JOHNNYONE_WORKER_URL=https://johnnyone-dev-hub.ethan-353.workers.dev \
+JOHNNYONE_WORKER_URL=https://johnnyone.ethan-353.workers.dev \
 JOHNNYONE_USER_ID=<your-user-id-uuid> \
 JOHNNYONE_TENANT_ID=<your-tenant-id-uuid> \
 ./desktop/src-tauri/target/release/johnnyone-desktop
@@ -294,33 +293,40 @@ Only the **worker** and **web client** deploy to Cloudflare. The desktop binary
 runs on each user's machine.
 
 ```bash
-lokal cf deploy --env dev               # worker + Pages, both
-lokal cf worker deploy --env dev        # worker only
-lokal cf db migrate --env dev           # apply D1 migrations
+lokal cf deploy --env prod              # worker + Pages, both
+npm run deploy:worker                   # worker only (johnnyone)
+lokal cf db migrate --env prod          # apply D1 migrations
 ```
 
 ### Account + URLs
 
 - CF account: `elitechance` (configured in `~/.lokal/cf.yaml`)
-- Worker name pattern: `johnnyone-<env>-hub` (worker.yaml `name: hub` is the suffix)
-  → dev = `johnnyone-dev-hub.ethan-353.workers.dev`
-- Pages project: `johnnyone` (note: no `-dev` suffix — `lokal cf pages deploy
-  --env dev` names the Pages project after `lokal.yaml`'s `project:` directly,
-  unlike the worker which gets the `-dev` env suffix)
-  → `https://johnnyone.pages.dev`
+- Worker deploy name: `johnnyone` (`lokal cf worker deploy --env prod`; dev/qa use
+  `johnnyone-dev` / `johnnyone-qa`)
+  → `https://johnnyone.ethan-353.workers.dev`
+- Pages project: `johnnyone` → `https://johnnyone.pages.dev` (slug from
+  `lokal.yaml`; deploy with `lokal cf pages deploy --env prod`)
 
 ### Worker secrets
 
-Only one secret is required:
+Only one secret is required: `JWT_SECRET` on the prod worker script `johnnyone`.
 
 ```bash
-echo -n "<rand-base64-48>" | npx wrangler secret put JWT_SECRET --name johnnyone-dev-hub
+lokal cf worker secrets set --env prod --name JWT_SECRET --value '<secret>'
+lokal cf worker secrets list --env prod
 ```
 
-If you rename the worker (change `worker.yaml: name`), CF treats it as a new
-script and you'll need to re-set this secret on the new name.
+**Gotcha:** deploying to a *new* worker name succeeds even when `JWT_SECRET` is
+missing; the worker then returns `error code: 1101` until the secret is set.
+Secrets cannot be read back from Cloudflare — when renaming from a legacy script
+(e.g. `johnnyone-hub`), you must re-set the **same** value manually. See
+[`docs/operations.md`](docs/operations.md) § Deploy gotchas.
 
 ### Deploy gotchas
+
+Full list (JWT_SECRET trap, D1 migration idempotency, `nx` on PATH, lokal naming,
+`ethan-353` workers.dev subdomain): **[`docs/operations.md`](docs/operations.md)**
+§ Deploying.
 
 - **Nx caches builds aggressively.** If you've changed `web/` or `ui/` code
   but `npx nx build web` reports "Nx read the output from the cache instead
@@ -331,7 +337,7 @@ script and you'll need to re-set this secret on the new name.
   npx nx build web --skip-nx-cache
   ```
 
-  Always do this before `lokal cf deploy --env dev` if you've changed
+  Always do this before `lokal cf pages deploy --env prod` if you've changed
   components — otherwise the deploy uploads a stale bundle.
 
 - **Lokal's resolver-schema validator infers Query vs Mutation from the

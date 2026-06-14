@@ -3,13 +3,27 @@ use crate::providers::CliProvider;
 use crate::state::app_state::AppState;
 use rusqlite::params;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
-const CAPTURE_INTERVAL_MS: u64 = 1_000;
+const INBOX_DIR: &str = ".johnnyone/inbox";
+/// Multiline or long prompts are written to a file and a one-line handoff is
+/// typed into the TUI — avoids Codex `\n` literals and Grok paste blobs.
+const FILE_HANDOFF_MIN_LEN: usize = 200;
+
+const CAPTURE_INTERVAL_ACTIVE_MS: u64 = 2_000;
+const CAPTURE_INTERVAL_IDLE_MS: u64 = 10_000;
+const CAPTURE_ACTIVITY_WINDOW_MS: u128 = 3_000;
+const CURSOR_ONLY_MIN_INTERVAL_MS: u128 = 2_000;
+/// Minimum interval between `terminal_screen` relay events (all publish paths).
+const MIN_TERMINAL_SCREEN_PUBLISH_MS: u128 = 2_000;
 const DEFAULT_HISTORY_CAPTURE_LINES: u16 = 200;
 const MAX_HISTORY_CAPTURE_LINES: u16 = 2000;
 
@@ -64,7 +78,7 @@ pub async fn attach_terminal(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
-    publish_snapshot(state, &snapshot, Some(&app_handle));
+    publish_snapshot(state, &snapshot, Some(&app_handle), true).await;
     start_capture_loop(state, Some(app_handle), terminal).await;
     Ok(snapshot)
 }
@@ -92,7 +106,7 @@ pub async fn subscribe_terminal_visual(
 
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
-    publish_snapshot(state, &snapshot, None);
+    publish_snapshot(state, &snapshot, None, true).await;
     start_capture_loop(state, None, terminal).await;
     Ok(snapshot)
 }
@@ -105,7 +119,7 @@ pub async fn refresh_terminal_visual(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
-    publish_snapshot(state, &snapshot, None);
+    publish_snapshot(state, &snapshot, None, false).await;
     if has_terminal_visual_subscribers(state, &session_id).await {
         start_capture_loop(state, None, terminal).await;
     }
@@ -121,7 +135,7 @@ pub async fn refresh_terminal_visual_with_history(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot_with_history_rows(state, &terminal, history_rows).await?;
-    publish_snapshot(state, &snapshot, None);
+    publish_snapshot(state, &snapshot, None, false).await;
     Ok(snapshot)
 }
 
@@ -166,7 +180,19 @@ pub async fn send_terminal_input(
 ) -> Result<(), String> {
     let config = load_session_config(state, &session_id)?;
     let terminal = ensure_terminal_session_for_input(state, &session_id).await?;
-    send_raw_input(&terminal.pane_id, &input, config.provider).await
+    send_raw_input(
+        &terminal.pane_id,
+        &input,
+        config.provider,
+        &config.working_directory,
+    )
+    .await?;
+    state
+        .terminal_last_input_at
+        .lock()
+        .await
+        .insert(session_id, Instant::now());
+    Ok(())
 }
 
 pub async fn resize_terminal(
@@ -236,10 +262,11 @@ pub async fn capture_terminal_session_with_history(
     capture_snapshot_with_history(state, &terminal).await
 }
 
-fn publish_snapshot(
+async fn publish_snapshot(
     state: &AppState,
     snapshot: &TerminalSnapshot,
     app_handle: Option<&tauri::AppHandle>,
+    bypass_throttle: bool,
 ) {
     let event = TerminalScreenEvent {
         session_id: snapshot.session_id.clone(),
@@ -255,10 +282,104 @@ fn publish_snapshot(
         status: snapshot.status.clone(),
     };
 
-    let _ = state.terminal_screen_tx.send(event.clone());
+    publish_terminal_screen(state, event, app_handle.cloned(), bypass_throttle).await;
+}
+
+async fn publish_terminal_screen(
+    state: &AppState,
+    event: TerminalScreenEvent,
+    app_handle: Option<tauri::AppHandle>,
+    bypass_throttle: bool,
+) {
+    publish_terminal_screen_throttled(
+        state.terminal_last_screen_publish_at.clone(),
+        state.terminal_pending_screen.clone(),
+        state.terminal_screen_flush_scheduled.clone(),
+        state.terminal_screen_tx.clone(),
+        event,
+        app_handle,
+        bypass_throttle,
+    )
+    .await;
+}
+
+async fn publish_terminal_screen_throttled(
+    last_publish: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    pending: Arc<tokio::sync::Mutex<HashMap<String, TerminalScreenEvent>>>,
+    flush_scheduled: Arc<tokio::sync::Mutex<HashMap<String, bool>>>,
+    screen_tx: tokio::sync::broadcast::Sender<TerminalScreenEvent>,
+    event: TerminalScreenEvent,
+    app_handle: Option<tauri::AppHandle>,
+    bypass_throttle: bool,
+) {
+    let session_id = event.session_id.clone();
+    let now = Instant::now();
+
+    if !bypass_throttle {
+        let mut last = last_publish.lock().await;
+        if let Some(previous) = last.get(&session_id) {
+            let elapsed = now.duration_since(*previous).as_millis();
+            if elapsed < MIN_TERMINAL_SCREEN_PUBLISH_MS {
+                pending.lock().await.insert(session_id.clone(), event);
+                let delay = MIN_TERMINAL_SCREEN_PUBLISH_MS - elapsed;
+                drop(last);
+                schedule_terminal_screen_flush(
+                    last_publish,
+                    pending,
+                    flush_scheduled,
+                    screen_tx,
+                    session_id,
+                    delay,
+                )
+                .await;
+                return;
+            }
+        }
+        last.insert(session_id.clone(), now);
+    } else {
+        last_publish
+            .lock()
+            .await
+            .insert(session_id.clone(), now);
+        pending.lock().await.remove(&session_id);
+    }
+
+    let _ = screen_tx.send(event.clone());
     if let Some(handle) = app_handle {
         let _ = handle.emit("terminal:screen", event);
     }
+}
+
+async fn schedule_terminal_screen_flush(
+    last_publish: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    pending: Arc<tokio::sync::Mutex<HashMap<String, TerminalScreenEvent>>>,
+    flush_scheduled: Arc<tokio::sync::Mutex<HashMap<String, bool>>>,
+    screen_tx: tokio::sync::broadcast::Sender<TerminalScreenEvent>,
+    session_id: String,
+    delay_ms: u128,
+) {
+    {
+        let mut scheduled = flush_scheduled.lock().await;
+        if scheduled.get(&session_id).copied().unwrap_or(false) {
+            return;
+        }
+        scheduled.insert(session_id.clone(), true);
+    }
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms.max(1) as u64)).await;
+
+        let event = pending.lock().await.remove(&session_id);
+        flush_scheduled.lock().await.remove(&session_id);
+
+        if let Some(event) = event {
+            last_publish
+                .lock()
+                .await
+                .insert(session_id, Instant::now());
+            let _ = screen_tx.send(event);
+        }
+    });
 }
 
 async fn start_capture_loop(
@@ -275,10 +396,16 @@ async fn start_capture_loop(
 
     let db = state.db.clone();
     let visual_subscribers = state.terminal_visual_subscribers.clone();
-    let terminal_screen_tx = state.terminal_screen_tx.clone();
+    let terminal_last_input_at = state.terminal_last_input_at.clone();
+    let last_screen_publish = state.terminal_last_screen_publish_at.clone();
+    let pending_screen = state.terminal_pending_screen.clone();
+    let flush_scheduled = state.terminal_screen_flush_scheduled.clone();
+    let screen_tx = state.terminal_screen_tx.clone();
     let session_id = terminal.session_id.clone();
     let handle = tokio::spawn(async move {
-        let mut last_capture_key = String::new();
+        let mut last_content_key = String::new();
+        let mut last_published_cursor_key = String::new();
+        let mut last_publish_at = Instant::now() - Duration::from_secs(10);
         let mut cursor: i64 = 0;
 
         loop {
@@ -298,13 +425,23 @@ async fn start_capture_loop(
 
             match capture_terminal(&terminal.pane_id).await {
                 Ok(capture) => {
-                    let capture_key = format!(
-                        "{}\n{}:{}",
-                        capture.content, capture.cursor_x, capture.cursor_y
-                    );
-                    if capture_key != last_capture_key {
+                    let content_key = capture.content.clone();
+                    let cursor_key = format!("{}:{}", capture.cursor_x, capture.cursor_y);
+                    let content_changed = content_key != last_content_key;
+                    let cursor_changed = cursor_key != last_published_cursor_key;
+                    let now = Instant::now();
+                    let cursor_only_due = now.duration_since(last_publish_at).as_millis()
+                        >= CURSOR_ONLY_MIN_INTERVAL_MS;
+                    let should_publish = content_changed
+                        || (cursor_changed && cursor_only_due);
+
+                    if should_publish {
+                        if content_changed {
+                            last_content_key = content_key;
+                        }
+                        last_published_cursor_key = cursor_key;
+                        last_publish_at = now;
                         cursor += 1;
-                        last_capture_key = capture_key;
 
                         let event = TerminalScreenEvent {
                             session_id: terminal.session_id.clone(),
@@ -328,10 +465,16 @@ async fn start_capture_loop(
                             .map_err(|e| e.to_string())
                         });
 
-                        let _ = terminal_screen_tx.send(event.clone());
-                        if let Some(handle) = &app_handle {
-                            let _ = handle.emit("terminal:screen", event);
-                        }
+                        publish_terminal_screen_throttled(
+                            last_screen_publish.clone(),
+                            pending_screen.clone(),
+                            flush_scheduled.clone(),
+                            screen_tx.clone(),
+                            event,
+                            app_handle.clone(),
+                            false,
+                        )
+                        .await;
                     }
                 }
                 Err(error) => {
@@ -347,12 +490,25 @@ async fn start_capture_loop(
                             params![&terminal.session_id],
                         )
                         .map_err(|e| e.to_string())
-                    });
+                        });
                     break;
                 }
             }
 
-            sleep(Duration::from_millis(CAPTURE_INTERVAL_MS)).await;
+            let interval_ms = {
+                let last_input = terminal_last_input_at
+                    .lock()
+                    .await
+                    .get(&terminal.session_id)
+                    .copied();
+                match last_input {
+                    Some(at) if at.elapsed().as_millis() < CAPTURE_ACTIVITY_WINDOW_MS => {
+                        CAPTURE_INTERVAL_ACTIVE_MS
+                    }
+                    _ => CAPTURE_INTERVAL_IDLE_MS,
+                }
+            };
+            sleep(Duration::from_millis(interval_ms)).await;
         }
     });
 
@@ -538,7 +694,19 @@ fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
         }
         // grok TUI — auto-approve tool executions so the pane isn't blocked on
         // approval prompts, matching the bypass behavior of the other TUIs.
-        CliProvider::Grok => (command, vec!["--always-approve".to_string()]),
+        // Inline mode keeps output in tmux scrollback so relay capture + small
+        // xterm viewports can still show responses on narrow screens.
+        CliProvider::Grok => {
+            let mut args = vec![
+                "--always-approve".to_string(),
+                "--no-alt-screen".to_string(),
+            ];
+            if !config.model.trim().is_empty() {
+                args.push("-m".to_string());
+                args.push(config.model.clone());
+            }
+            (command, args)
+        }
         // Plain shell — no args. tmux will run it as the pane's command and
         // the user types whatever they want.
         CliProvider::Shell => (command, Vec::new()),
@@ -743,51 +911,62 @@ async fn pane_cursor_meta(pane_id: &str) -> Result<(u16, u16, u16), String> {
     Ok((cursor_x, cursor_y, history_size))
 }
 
-async fn send_raw_input(pane_id: &str, input: &str, provider: CliProvider) -> Result<(), String> {
-    if input == "\u{3}" {
-        return run_tmux(vec![
-            "send-keys".to_string(),
-            "-t".to_string(),
-            pane_id.to_string(),
-            "C-c".to_string(),
-        ])
-        .await
-        .map(|_| ());
+fn normalize_terminal_input(input: &str) -> String {
+    if input.contains('\n') || input.contains('\r') {
+        return input.to_string();
     }
-
-    if input.contains('\n') || input.len() > 512 {
-        if provider == CliProvider::Codex {
-            return send_codex_literal_input(pane_id, input).await;
-        }
-
-        let submit = input.ends_with('\r') || input.ends_with('\n');
-        let text = input.trim_end_matches(['\r', '\n']);
-        if !text.is_empty() {
-            paste_buffer(pane_id, text).await?;
-        }
-        if submit {
-            sleep(Duration::from_millis(250)).await;
-            if provider == CliProvider::Codex {
-                run_tmux(vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    pane_id.to_string(),
-                    "Escape".to_string(),
-                ])
-                .await?;
-                sleep(Duration::from_millis(100)).await;
-            }
-            run_tmux(vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                pane_id.to_string(),
-                "C-m".to_string(),
-            ])
-            .await?;
-        }
-        return Ok(());
+    if input.contains("\\n") || input.contains("\\t") {
+        return input
+            .replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t");
     }
+    input.to_string()
+}
 
+fn should_use_file_handoff(text: &str, provider: CliProvider) -> bool {
+    if matches!(provider, CliProvider::Shell) {
+        return false;
+    }
+    text.contains('\n') || text.len() >= FILE_HANDOFF_MIN_LEN
+}
+
+fn write_inbox_prompt(working_dir: &str, text: &str) -> Result<String, String> {
+    let workspace = Path::new(working_dir);
+    let inbox = workspace.join(INBOX_DIR);
+    std::fs::create_dir_all(&inbox)
+        .map_err(|e| format!("Failed to create {}: {}", inbox.display(), e))?;
+    let file_name = format!("{}.md", uuid::Uuid::new_v4());
+    let path = inbox.join(&file_name);
+    std::fs::write(&path, text).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    Ok(path
+        .strip_prefix(workspace)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .to_string())
+}
+
+async fn send_file_handoff_input(
+    pane_id: &str,
+    working_dir: &str,
+    input: &str,
+    provider: CliProvider,
+) -> Result<(), String> {
+    let submit = input.ends_with('\r') || input.ends_with('\n');
+    let text = input.trim_end_matches(['\r', '\n']);
+    let rel_path = write_inbox_prompt(working_dir, text)?;
+    let msg = format!(
+        "Read and follow the instructions in {rel_path}. Use your file-read tool on that path before acting."
+    );
+    send_single_line_input(pane_id, &format!("{msg}\r"), provider, submit).await
+}
+
+async fn send_single_line_input(
+    pane_id: &str,
+    input: &str,
+    provider: CliProvider,
+    submit: bool,
+) -> Result<(), String> {
     for segment in input.split_inclusive('\r') {
         let text = segment.trim_end_matches('\r');
         if !text.is_empty() {
@@ -801,7 +980,7 @@ async fn send_raw_input(pane_id: &str, input: &str, provider: CliProvider) -> Re
             ])
             .await?;
         }
-        if segment.ends_with('\r') {
+        if segment.ends_with('\r') && submit {
             if provider == CliProvider::Codex {
                 send_submit_key(pane_id).await?;
                 sleep(Duration::from_millis(200)).await;
@@ -811,40 +990,54 @@ async fn send_raw_input(pane_id: &str, input: &str, provider: CliProvider) -> Re
             }
         }
     }
-
     Ok(())
 }
 
-async fn send_codex_literal_input(pane_id: &str, input: &str) -> Result<(), String> {
-    let submit = input.ends_with('\r') || input.ends_with('\n');
-    let text = input
-        .trim_end_matches(['\r', '\n'])
-        .replace("\r\n", "\\n")
-        .replace('\r', "\\n")
-        .replace('\n', "\\n");
-
-    let chars = text.chars().collect::<Vec<_>>();
-    for chunk in chars.chunks(180) {
-        let chunk = chunk.iter().collect::<String>();
-        run_tmux(vec![
+async fn send_raw_input(
+    pane_id: &str,
+    input: &str,
+    provider: CliProvider,
+    working_directory: &str,
+) -> Result<(), String> {
+    if input == "\u{3}" {
+        return run_tmux(vec![
             "send-keys".to_string(),
             "-t".to_string(),
             pane_id.to_string(),
-            "-l".to_string(),
-            "--".to_string(),
-            chunk,
+            "C-c".to_string(),
         ])
-        .await?;
-        sleep(Duration::from_millis(20)).await;
+        .await
+        .map(|_| ());
     }
 
-    if submit {
-        send_submit_key(pane_id).await?;
-        sleep(Duration::from_millis(200)).await;
-        send_submit_key(pane_id).await?;
+    let input = normalize_terminal_input(input);
+    let submit = input.ends_with('\r') || input.ends_with('\n');
+    let body = input.trim_end_matches(['\r', '\n']);
+
+    if should_use_file_handoff(body, provider) {
+        return send_file_handoff_input(pane_id, working_directory, &input, provider).await;
     }
 
-    Ok(())
+    // Shell-only fallback: other providers use inbox file handoff above.
+    if input.contains('\n') || input.len() > 512 {
+        let text = input.trim_end_matches(['\r', '\n']);
+        if !text.is_empty() {
+            paste_buffer(pane_id, text).await?;
+        }
+        if submit {
+            sleep(Duration::from_millis(250)).await;
+            run_tmux(vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                pane_id.to_string(),
+                "C-m".to_string(),
+            ])
+            .await?;
+        }
+        return Ok(());
+    }
+
+    send_single_line_input(pane_id, &input, provider, submit).await
 }
 
 async fn send_submit_key(pane_id: &str) -> Result<(), String> {
@@ -926,4 +1119,27 @@ fn tmux_session_name(session_id: &str) -> String {
         })
         .collect::<String>();
     format!("johnnyone_{}", safe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_unescapes_json_newlines() {
+        let input = "line one\\n\\nline two";
+        assert_eq!(normalize_terminal_input(input), "line one\n\nline two");
+    }
+
+    #[test]
+    fn file_handoff_for_multiline_cli_providers() {
+        assert!(should_use_file_handoff("a\nb", CliProvider::Grok));
+        assert!(!should_use_file_handoff("a\nb", CliProvider::Shell));
+    }
+
+    #[test]
+    fn file_handoff_for_long_single_line() {
+        let long = "x".repeat(FILE_HANDOFF_MIN_LEN);
+        assert!(should_use_file_handoff(&long, CliProvider::Codex));
+    }
 }

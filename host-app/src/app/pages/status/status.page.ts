@@ -1,6 +1,8 @@
 import { Component, inject, signal } from '@angular/core';
+import { Router } from '@angular/router';
 import {
   IonButton,
+  IonButtons,
   IonCard,
   IonCardContent,
   IonCardHeader,
@@ -18,7 +20,7 @@ import {
   IonToolbar,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import { checkmarkCircle, closeCircle, openOutline } from 'ionicons/icons';
+import { checkmarkCircle, closeCircle, openOutline, settingsOutline } from 'ionicons/icons';
 import { HostAuthService } from '../../services/host-auth.service';
 import { HostStatusService } from '../../services/host-status.service';
 
@@ -28,6 +30,7 @@ import { HostStatusService } from '../../services/host-status.service';
   imports: [
     IonHeader,
     IonToolbar,
+    IonButtons,
     IonTitle,
     IonContent,
     IonCard,
@@ -48,23 +51,27 @@ import { HostStatusService } from '../../services/host-status.service';
 })
 export class StatusPage {
   private readonly auth = inject(HostAuthService);
+  private readonly router = inject(Router);
   protected readonly status = inject(HostStatusService);
 
   readonly user = this.auth.currentUser;
-  readonly webUrl = signal(
-    'https://johnnyone-dev.pages.dev/',
-  );
+  readonly webUrl = this.status.webClientUrl;
 
   constructor() {
-    addIcons({ checkmarkCircle, closeCircle, openOutline });
-    this.status.refresh();
+    addIcons({ checkmarkCircle, closeCircle, openOutline, settingsOutline });
+    void this.status.refresh();
   }
 
   openWeb(): void {
     window.open(this.webUrl(), '_blank', 'noopener,noreferrer');
   }
 
+  openSettings(): void {
+    void this.router.navigateByUrl('/settings');
+  }
+
   signOut(): void {
     this.auth.logout();
+    void this.router.navigateByUrl('/login');
   }
 }

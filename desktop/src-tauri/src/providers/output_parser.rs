@@ -305,6 +305,78 @@ pub fn parse_codex_line(line: &str) -> Option<StreamChunk> {
     }
 }
 
+/// Parse a Grok streaming-json line (`grok --output-format streaming-json --single`).
+///
+/// Observed events:
+/// - `{"type":"thought","data":"..."}` — reasoning tokens (skipped for chat UI)
+/// - `{"type":"text","data":"..."}` — assistant text
+/// - `{"type":"end","sessionId":"...","stopReason":"..."}` — turn complete
+/// - `{"type":"error","message":"..."}` — failure
+pub fn parse_grok_line(line: &str) -> Option<StreamChunk> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let msg_type = v.get("type")?.as_str()?;
+
+    match msg_type {
+        "thought" => None,
+        "text" => {
+            let content = v.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+            if content.is_empty() {
+                return None;
+            }
+            Some(StreamChunk {
+                chunk_type: ChunkType::Text,
+                content,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_final: false,
+                session_id: None,
+            })
+        }
+        "end" => {
+            let session_id = v
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            Some(StreamChunk {
+                chunk_type: ChunkType::Result,
+                content: String::new(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_final: true,
+                session_id,
+            })
+        }
+        "error" => {
+            let content = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Grok returned an error")
+                .to_string();
+            Some(StreamChunk {
+                chunk_type: ChunkType::Error,
+                content,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_final: true,
+                session_id: None,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Parse an Ollama streaming JSON line.
 pub fn parse_ollama_line(line: &str) -> Option<StreamChunk> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;

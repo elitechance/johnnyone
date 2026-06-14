@@ -29,6 +29,9 @@
     @if (error()) {
       <div class="error-banner">{{ error() }}</div>
     }
+    @if (coordinatorNotice()) {
+      <div class="coordinator-notice">{{ coordinatorNotice() }}</div>
+    }
 
     @if (currentRun(); as run) {
       <nav class="mobile-panel-switcher" aria-label="Planner mobile panels">
@@ -66,22 +69,39 @@
               </code>
               <code class="tmux-ref pane" [title]="screen.paneId">{{ screen.paneId }}</code>
             }
+            <button
+              type="button"
+              class="terminal-fullscreen-btn"
+              title="Open T1 fullscreen"
+              aria-label="Open T1 fullscreen"
+              [disabled]="!workerScreen()"
+              (click)="openTerminalFullscreen('worker')"
+            >
+              <ion-icon name="expand-outline" aria-hidden="true"></ion-icon>
+            </button>
             <span class="state">{{ run.plan.status }}</span>
           </header>
-          <johnny-terminal-screen
-            class="terminal-fill"
-            [screen]="workerScreen()"
-            [mobileInputMode]="isCompactWorkspace()"
-            [imageAttachments]="workerPendingAttachments()"
-            [imageSending]="isSendingWorkerAttachments()"
-            (rawInput)="sendPlannerRawInput('worker', $event)"
-            (terminalResize)="resizePlannerTerminal('worker', $event)"
-            (historyRequested)="loadPlannerTerminalHistory('worker', $event)"
-            (mermaidRequested)="openTerminalMermaid($event)"
-            (imagePasted)="addPendingImageFiles('worker', $event)"
-            (imageRemoved)="removePendingAttachment('worker', $event)"
-            (imageMessageSubmitted)="sendPlannerAttachmentMessage('worker', $event)"
-          ></johnny-terminal-screen>
+          @if (fullscreenTerminalRole() === 'worker') {
+            <div class="terminal-inline-placeholder" aria-hidden="true">
+              <ion-icon name="expand-outline" aria-hidden="true"></ion-icon>
+              <span>Viewing in fullscreen</span>
+            </div>
+          } @else {
+            <johnny-terminal-screen
+              class="terminal-fill"
+              [screen]="workerScreen()"
+              [mobileInputMode]="isCompactWorkspace()"
+              [imageAttachments]="workerPendingAttachments()"
+              [imageSending]="isSendingWorkerAttachments()"
+              (rawInput)="sendPlannerRawInput('worker', $event)"
+              (terminalResize)="resizePlannerTerminal('worker', $event)"
+              (historyRequested)="loadPlannerTerminalHistory('worker', $event)"
+              (mermaidRequested)="openTerminalMermaid($event)"
+              (imagePasted)="addPendingImageFiles('worker', $event)"
+              (imageRemoved)="removePendingAttachment('worker', $event)"
+              (imageMessageSubmitted)="sendPlannerAttachmentMessage('worker', $event)"
+            ></johnny-terminal-screen>
+          }
         </article>
 
         <article class="terminal-card" [class.active-mobile-panel]="activeMobilePanel() === 'reviewer'">
@@ -94,22 +114,39 @@
               </code>
               <code class="tmux-ref pane" [title]="screen.paneId">{{ screen.paneId }}</code>
             }
+            <button
+              type="button"
+              class="terminal-fullscreen-btn"
+              title="Open T2 fullscreen"
+              aria-label="Open T2 fullscreen"
+              [disabled]="!reviewerScreen()"
+              (click)="openTerminalFullscreen('reviewer')"
+            >
+              <ion-icon name="expand-outline" aria-hidden="true"></ion-icon>
+            </button>
             <span class="state">{{ currentPhase()?.gateVerdict || 'unknown' }}</span>
           </header>
-          <johnny-terminal-screen
-            class="terminal-fill"
-            [screen]="reviewerScreen()"
-            [mobileInputMode]="isCompactWorkspace()"
-            [imageAttachments]="reviewerPendingAttachments()"
-            [imageSending]="isSendingReviewerAttachments()"
-            (rawInput)="sendPlannerRawInput('reviewer', $event)"
-            (terminalResize)="resizePlannerTerminal('reviewer', $event)"
-            (historyRequested)="loadPlannerTerminalHistory('reviewer', $event)"
-            (mermaidRequested)="openTerminalMermaid($event)"
-            (imagePasted)="addPendingImageFiles('reviewer', $event)"
-            (imageRemoved)="removePendingAttachment('reviewer', $event)"
-            (imageMessageSubmitted)="sendPlannerAttachmentMessage('reviewer', $event)"
-          ></johnny-terminal-screen>
+          @if (fullscreenTerminalRole() === 'reviewer') {
+            <div class="terminal-inline-placeholder" aria-hidden="true">
+              <ion-icon name="expand-outline" aria-hidden="true"></ion-icon>
+              <span>Viewing in fullscreen</span>
+            </div>
+          } @else {
+            <johnny-terminal-screen
+              class="terminal-fill"
+              [screen]="reviewerScreen()"
+              [mobileInputMode]="isCompactWorkspace()"
+              [imageAttachments]="reviewerPendingAttachments()"
+              [imageSending]="isSendingReviewerAttachments()"
+              (rawInput)="sendPlannerRawInput('reviewer', $event)"
+              (terminalResize)="resizePlannerTerminal('reviewer', $event)"
+              (historyRequested)="loadPlannerTerminalHistory('reviewer', $event)"
+              (mermaidRequested)="openTerminalMermaid($event)"
+              (imagePasted)="addPendingImageFiles('reviewer', $event)"
+              (imageRemoved)="removePendingAttachment('reviewer', $event)"
+              (imageMessageSubmitted)="sendPlannerAttachmentMessage('reviewer', $event)"
+            ></johnny-terminal-screen>
+          }
         </article>
       </section>
 
@@ -161,7 +198,15 @@
               </button>
             }
             <button class="secondary-action" type="button" (click)="openRenameCurrentPlan()">Rename</button>
-            <button class="secondary-action" type="button" (click)="startPlan()">Start</button>
+            <button
+              class="secondary-action"
+              type="button"
+              [disabled]="startPlanDisabled()"
+              [title]="startPlanLabel()"
+              (click)="startPlan()"
+            >
+              {{ startPlanLabel() }}
+            </button>
             @if (canAmend()) {
               <button class="secondary-action" type="button" (click)="openAmend()">Amend</button>
             }
@@ -465,6 +510,7 @@
           >
             <ion-select-option value="codex">Codex CLI</ion-select-option>
             <ion-select-option value="claude_code">Claude Code</ion-select-option>
+            <ion-select-option value="grok">Grok</ion-select-option>
             <ion-select-option value="ollama">Ollama</ion-select-option>
           </ion-select>
         </ion-item>
@@ -477,6 +523,7 @@
           >
             <ion-select-option value="codex">Codex CLI</ion-select-option>
             <ion-select-option value="claude_code">Claude Code</ion-select-option>
+            <ion-select-option value="grok">Grok</ion-select-option>
             <ion-select-option value="ollama">Ollama</ion-select-option>
           </ion-select>
         </ion-item>
@@ -702,7 +749,11 @@
                   } @else if (detail.error) {
                     <ion-text color="danger" class="files-empty">{{ detail.error }}</ion-text>
                   } @else if (detail.kind === 'markdown') {
-                    <article class="plan-markdown-preview markdown-content compact" [innerHTML]="detail.renderedHtml"></article>
+                    <article
+                      class="plan-markdown-preview markdown-content compact"
+                      [attr.data-markdown-base]="detail.path"
+                      [innerHTML]="detail.renderedHtml"
+                    ></article>
                   } @else if (detail.fields?.length) {
                     <dl class="task-status-fields">
                       @for (field of detail.fields; track field.label) {
@@ -838,7 +889,11 @@
           } @else if (!selectedWorkspaceFile()) {
             <ion-text color="medium" class="files-empty">Select a file to preview or view its git diff.</ion-text>
           } @else if (selectedWorkspacePreviewKind() === 'markdown') {
-            <article class="plan-markdown-preview markdown-content" [innerHTML]="renderedWorkspaceHtml()"></article>
+            <article
+              class="plan-markdown-preview markdown-content"
+              [attr.data-markdown-base]="selectedWorkspaceContent()?.path"
+              [innerHTML]="renderedWorkspaceHtml()"
+            ></article>
           } @else if (selectedWorkspacePreviewKind() === 'html') {
             <iframe
               class="html-preview-frame"
@@ -930,5 +985,57 @@
         </ion-buttons>
       </ion-toolbar>
     </ion-footer>
+  </ng-template>
+</ion-modal>
+
+<ion-modal
+  [isOpen]="fullscreenTerminalRole() !== null"
+  (didDismiss)="closeTerminalFullscreen()"
+  class="terminal-fullscreen-ion-modal"
+>
+  <ng-template>
+    <ion-header>
+      <ion-toolbar>
+        <ion-title>{{ fullscreenTerminalTitle() }}</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="closeTerminalFullscreen()" aria-label="Exit fullscreen">
+            <ion-icon slot="icon-only" name="contract-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content [scrollY]="false" class="terminal-fullscreen-content">
+      @if (fullscreenTerminalRole() === 'worker') {
+        <johnny-terminal-screen
+          class="terminal-fullscreen-fill"
+          [screen]="workerScreen()"
+          [mobileInputMode]="isCompactWorkspace()"
+          [imageAttachments]="workerPendingAttachments()"
+          [imageSending]="isSendingWorkerAttachments()"
+          (rawInput)="sendPlannerRawInput('worker', $event)"
+          (terminalResize)="resizePlannerTerminal('worker', $event)"
+          (historyRequested)="loadPlannerTerminalHistory('worker', $event)"
+          (mermaidRequested)="openTerminalMermaid($event)"
+          (imagePasted)="addPendingImageFiles('worker', $event)"
+          (imageRemoved)="removePendingAttachment('worker', $event)"
+          (imageMessageSubmitted)="sendPlannerAttachmentMessage('worker', $event)"
+        ></johnny-terminal-screen>
+      } @else if (fullscreenTerminalRole() === 'reviewer') {
+        <johnny-terminal-screen
+          class="terminal-fullscreen-fill"
+          [screen]="reviewerScreen()"
+          [mobileInputMode]="isCompactWorkspace()"
+          [imageAttachments]="reviewerPendingAttachments()"
+          [imageSending]="isSendingReviewerAttachments()"
+          (rawInput)="sendPlannerRawInput('reviewer', $event)"
+          (terminalResize)="resizePlannerTerminal('reviewer', $event)"
+          (historyRequested)="loadPlannerTerminalHistory('reviewer', $event)"
+          (mermaidRequested)="openTerminalMermaid($event)"
+          (imagePasted)="addPendingImageFiles('reviewer', $event)"
+          (imageRemoved)="removePendingAttachment('reviewer', $event)"
+          (imageMessageSubmitted)="sendPlannerAttachmentMessage('reviewer', $event)"
+        ></johnny-terminal-screen>
+      }
+    </ion-content>
   </ng-template>
 </ion-modal>

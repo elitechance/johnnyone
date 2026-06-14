@@ -10,7 +10,7 @@
       "command": "lokal cf worker sim"
     },
     "deploy": {
-      "command": "lokal cf worker deploy"
+      "command": "lokal cf worker deploy --env prod"
     },
     "migrate": {
       "command": "lokal cf db migrate --local"

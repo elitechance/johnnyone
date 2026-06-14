@@ -7,7 +7,7 @@
     "frontendDist": "../../dist/host-app/browser",
     "devUrl": "http://localhost:4201",
     "beforeDevCommand": "npx nx serve host-app --port 4201",
-    "beforeBuildCommand": "npx nx build host-app"
+    "beforeBuildCommand": "rm -rf ../../dist/host-app && npx nx build host-app"
   },
   "app": {
     "withGlobalTauri": true,
