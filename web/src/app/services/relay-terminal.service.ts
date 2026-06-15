@@ -2,6 +2,7 @@ import { Injectable, NgZone, inject } from '@angular/core';
 import { Observable, Subject, firstValueFrom } from 'rxjs';
 import { AgentPlanRun, AiSession, DesktopNode, JohnnyApiService, TerminalScreen } from '@johnnyone/ui';
 import { getWorkerBaseUrl } from '../../worker-url';
+import { TerminalScreenCacheService } from './terminal-screen-cache.service';
 
 interface RelayEnvelope {
   type: string;
@@ -38,6 +39,7 @@ export class RelayTerminalService {
   private static readonly INPUT_FLUSH_MS = 200;
   private readonly api = inject(JohnnyApiService);
   private readonly zone = inject(NgZone);
+  private readonly terminalScreenCache = inject(TerminalScreenCacheService);
   private readonly screenSubject = new Subject<TerminalScreen>();
   private readonly agentPlanRunSubject = new Subject<AgentPlanRunUpdate>();
   private readonly sessionUpdatedSubject = new Subject<SessionUpdate>();
@@ -87,7 +89,6 @@ export class RelayTerminalService {
   async refreshVisual(sessionId: string): Promise<void> {
     if (!this.visualSubscriptions.has(sessionId)) {
       await this.subscribeVisual(sessionId);
-      return;
     }
 
     await this.sendVisualControl('visual_refresh', sessionId);
@@ -195,7 +196,16 @@ export class RelayTerminalService {
     await this.sendControl('terminal_kill', sessionId);
   }
 
+  cachedScreen(sessionId: string): TerminalScreen | null {
+    return this.terminalScreenCache.get(sessionId);
+  }
+
+  forgetCachedScreen(sessionId: string): void {
+    this.terminalScreenCache.remove(sessionId);
+  }
+
   disconnect(): void {
+    this.terminalScreenCache.flush();
     for (const timer of this.pendingTimers.values()) {
       clearTimeout(timer);
     }
@@ -364,7 +374,11 @@ export class RelayTerminalService {
     const envelope = JSON.parse(raw) as RelayEnvelope;
 
     if (envelope.type === 'terminal_screen') {
-      this.zone.run(() => this.screenSubject.next(envelope.data as TerminalScreen));
+      const incoming = envelope.data as TerminalScreen;
+      // Always render the live frame. Merging cached scrollback here hid new output
+      // because viewport snapshots are shorter than a stored history snapshot.
+      this.terminalScreenCache.remember(incoming);
+      this.zone.run(() => this.screenSubject.next(incoming));
       return;
     }
 

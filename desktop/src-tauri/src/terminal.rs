@@ -26,6 +26,9 @@ const CURSOR_ONLY_MIN_INTERVAL_MS: u128 = 2_000;
 const MIN_TERMINAL_SCREEN_PUBLISH_MS: u128 = 2_000;
 const DEFAULT_HISTORY_CAPTURE_LINES: u16 = 200;
 const MAX_HISTORY_CAPTURE_LINES: u16 = 2000;
+/// Live relay captures include recent tmux scrollback so mobile viewports still
+/// receive Grok/TUI responses that scrolled above the visible pane.
+const LIVE_CAPTURE_SCROLLBACK_LINES: u16 = 120;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,7 +122,9 @@ pub async fn refresh_terminal_visual(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot(state, &terminal).await?;
-    publish_snapshot(state, &snapshot, None, false).await;
+    // Explicit refresh is a direct user/UI request — bypass the publish throttle
+    // so the snapshot shows immediately instead of being delayed up to ~2s.
+    publish_snapshot(state, &snapshot, None, true).await;
     if has_terminal_visual_subscribers(state, &session_id).await {
         start_capture_loop(state, None, terminal).await;
     }
@@ -135,7 +140,8 @@ pub async fn refresh_terminal_visual_with_history(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
     let snapshot = capture_snapshot_with_history_rows(state, &terminal, history_rows).await?;
-    publish_snapshot(state, &snapshot, None, false).await;
+    // Explicit history fetch — bypass the throttle so it is not delayed.
+    publish_snapshot(state, &snapshot, None, true).await;
     Ok(snapshot)
 }
 
@@ -191,7 +197,13 @@ pub async fn send_terminal_input(
         .terminal_last_input_at
         .lock()
         .await
-        .insert(session_id, Instant::now());
+        .insert(session_id.clone(), Instant::now());
+    // Wake/restart the capture loop so the echoed input and its output are
+    // captured at the active cadence right away, instead of waiting out the
+    // current (possibly idle, up to ~10s) sleep before the next tick.
+    if has_terminal_visual_subscribers(state, &session_id).await {
+        start_capture_loop(state, None, terminal).await;
+    }
     Ok(())
 }
 
@@ -406,6 +418,10 @@ async fn start_capture_loop(
         let mut last_content_key = String::new();
         let mut last_published_cursor_key = String::new();
         let mut last_publish_at = Instant::now() - Duration::from_secs(10);
+        // Track when the pane content last changed so we can poll fast while the
+        // agent is actively streaming output — even when that output came from a
+        // chat message rather than direct terminal input.
+        let mut last_content_change_at = Instant::now() - Duration::from_secs(60);
         let mut cursor: i64 = 0;
 
         loop {
@@ -435,6 +451,9 @@ async fn start_capture_loop(
                     let should_publish = content_changed
                         || (cursor_changed && cursor_only_due);
 
+                    if content_changed {
+                        last_content_change_at = now;
+                    }
                     if should_publish {
                         if content_changed {
                             last_content_key = content_key;
@@ -501,11 +520,18 @@ async fn start_capture_loop(
                     .await
                     .get(&terminal.session_id)
                     .copied();
-                match last_input {
-                    Some(at) if at.elapsed().as_millis() < CAPTURE_ACTIVITY_WINDOW_MS => {
-                        CAPTURE_INTERVAL_ACTIVE_MS
-                    }
-                    _ => CAPTURE_INTERVAL_IDLE_MS,
+                let recent_input = last_input
+                    .map(|at| at.elapsed().as_millis() < CAPTURE_ACTIVITY_WINDOW_MS)
+                    .unwrap_or(false);
+                // Poll fast while the agent is actively streaming output (the pane
+                // keeps changing), not only right after direct terminal input —
+                // chat-driven output otherwise refreshed at the 10s idle cadence.
+                let recent_change =
+                    last_content_change_at.elapsed().as_millis() < CAPTURE_ACTIVITY_WINDOW_MS;
+                if recent_input || recent_change {
+                    CAPTURE_INTERVAL_ACTIVE_MS
+                } else {
+                    CAPTURE_INTERVAL_IDLE_MS
                 }
             };
             sleep(Duration::from_millis(interval_ms)).await;
@@ -835,16 +861,34 @@ async fn snapshot_from_capture(
 }
 
 async fn capture_terminal(pane_id: &str) -> Result<TerminalCapture, String> {
-    let content = run_tmux(vec![
-        "capture-pane".to_string(),
-        "-p".to_string(),
-        "-e".to_string(),
-        "-N".to_string(),
-        "-t".to_string(),
-        pane_id.to_string(),
-    ])
-    .await?;
     let (cursor_x, cursor_y, history_size) = pane_cursor_meta(pane_id).await?;
+    let content = if history_size > 0 {
+        let scrollback = history_size
+            .min(LIVE_CAPTURE_SCROLLBACK_LINES)
+            .max(1);
+        run_tmux(vec![
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-e".to_string(),
+            "-N".to_string(),
+            "-J".to_string(),
+            "-S".to_string(),
+            format!("-{}", scrollback),
+            "-t".to_string(),
+            pane_id.to_string(),
+        ])
+        .await?
+    } else {
+        run_tmux(vec![
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-e".to_string(),
+            "-N".to_string(),
+            "-t".to_string(),
+            pane_id.to_string(),
+        ])
+        .await?
+    };
     Ok(TerminalCapture {
         content,
         cursor_x,

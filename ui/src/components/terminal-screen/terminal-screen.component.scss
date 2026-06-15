@@ -89,6 +89,139 @@
   opacity: 0.48;
 }
 
+.terminal-history-button.active {
+  border-color: #315b82;
+  background: #102033;
+  color: #bfdbfe;
+}
+
+.terminal-history-viewer {
+  display: flex;
+  flex-direction: column;
+  min-height: 180px;
+  max-height: min(52vh, 520px);
+  border-bottom: 1px solid #263241;
+  background: #070b10;
+}
+
+.terminal-history-viewer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #1b2430;
+}
+
+.terminal-history-viewer-meta {
+  color: #9aa8b8;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.terminal-history-viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.terminal-history-viewer-actions .terminal-mermaid-actions {
+  max-width: min(420px, 52vw);
+}
+
+.terminal-history-viewer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  color: #d7e1ee;
+  scrollbar-width: thin;
+}
+
+.terminal-history-empty {
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: #9aa8b8;
+}
+
+.terminal-history-text {
+  margin: 0;
+  color: #d7e1ee;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-history-mermaid {
+  margin: 14px 0;
+  padding: 0;
+  border: 0;
+  cursor: zoom-in;
+
+  figcaption {
+    margin: 0 0 6px;
+    color: #9aa8b8;
+    font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+}
+
+.terminal-history-mermaid .mermaid-svg {
+  display: grid;
+  justify-items: center;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #263241;
+  border-radius: 8px;
+  background: #0b1018;
+  transition: border-color 120ms ease;
+
+  &:hover {
+    border-color: #315b82;
+  }
+
+  svg {
+    max-width: 100%;
+    height: auto;
+  }
+}
+
+.terminal-history-mermaid .mermaid-pending {
+  color: #9aa8b8;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.terminal-history-mermaid .mermaid-error {
+  color: #fecaca;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+.terminal-shell.history-viewer-open {
+  .terminal-host {
+    display: none;
+  }
+
+  .terminal-history-viewer {
+    flex: 1 1 0;
+    min-height: 0;
+    max-height: none;
+    overflow: hidden;
+    border-bottom: 0;
+  }
+}
+
+.terminal-host.with-history-viewer {
+  min-height: 180px;
+}
+
 .terminal-viewport-scroll-button {
   height: 32px;
   min-width: 36px;
@@ -107,10 +240,18 @@
   font-weight: 650;
 }
 
-.terminal-history-count {
-  color: #9aa8b8;
-  font-size: 11px;
-  white-space: nowrap;
+.terminal-viewport-scroll-button.history,
+.terminal-viewport-scroll-button.refresh {
+  min-width: 56px;
+  border-color: #315b82;
+  background: #102033;
+  color: #bfdbfe;
+  font-weight: 650;
+}
+
+.terminal-viewport-scroll-button.history.active {
+  border-color: #64b5ff;
+  background: #16324d;
 }
 
 .terminal-status {
@@ -160,12 +301,33 @@
   contain: layout;
 }
 
+.terminal-mobile-primary,
 .terminal-mobile-keys,
 .terminal-mobile-submit {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.terminal-mobile-primary {
+  flex: 0 0 auto;
+  justify-content: stretch;
+  gap: 8px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.terminal-mobile-primary .terminal-viewport-scroll-button {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 34px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.terminal-mobile-primary .terminal-viewport-scroll-button.history {
+  flex: 1.2 1 0;
 }
 
 .terminal-image-previews {
@@ -291,7 +453,6 @@
     max-width: 34vw;
   }
 
-  .terminal-history-count,
   .terminal-status {
     display: none;
   }
@@ -301,6 +462,7 @@
   padding: 8px 10px 10px;
 }
 
+.terminal-shell:not(.mobile-input-mode) .terminal-mobile-primary,
 .terminal-shell:not(.mobile-input-mode) .terminal-mobile-keys .terminal-viewport-scroll-button {
   display: none;
 }
@@ -310,20 +472,27 @@
 
   .terminal-host {
     flex: 1 1 0;
-    min-height: 0;
+    min-height: min(22vh, 180px);
+    max-height: calc(100% - 168px);
     padding-inline: 0;
+    // `none`, not `pan-y`: with pan-y the browser claims the vertical swipe and
+    // pans the page, so the gesture never reaches our pointer handler and the
+    // terminal won't scroll on a real device. We drive scrolling ourselves.
     touch-action: none;
-    cursor: grab;
-    -webkit-overflow-scrolling: touch;
-
-    &.terminal-host-scrolling {
-      cursor: grabbing;
-    }
   }
 
   .terminal-mobile-input {
+    flex: 0 0 auto;
     gap: 6px;
     padding: 6px 8px calc(8px + env(safe-area-inset-bottom));
+  }
+
+  .terminal-mobile-primary {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+    padding-bottom: 4px;
+    background: rgba(10, 13, 18, 0.98);
   }
 
   .terminal-mobile-keys .terminal-image-button {
@@ -337,8 +506,20 @@
     font-size: 11px;
   }
 
-  .terminal-mobile-keys .terminal-viewport-scroll-button.live {
-    min-width: 44px;
+  .terminal-mobile-keys {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  &.history-viewer-open .terminal-history-viewer {
+    max-height: none;
+  }
+
+  &:not(.history-viewer-open) .terminal-history-viewer {
+    max-height: min(42vh, 360px);
+    min-height: 140px;
   }
 
   .terminal-mobile-submit textarea {
@@ -362,11 +543,28 @@
   text-size-adjust: 100%;
 }
 
+::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-viewport {
+  overflow-x: hidden !important;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
 ::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-screen,
 ::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-rows,
 ::ng-deep .terminal-shell.mobile-input-mode .terminal-host .xterm-row {
   max-width: 100%;
   overflow-x: hidden;
+}
+
+::ng-deep .terminal-shell.mobile-input-mode.grok-terminal-layout .terminal-host .xterm-viewport {
+  overflow-x: auto !important;
+}
+
+::ng-deep .terminal-shell.mobile-input-mode.grok-terminal-layout .terminal-host .xterm-screen,
+::ng-deep .terminal-shell.mobile-input-mode.grok-terminal-layout .terminal-host .xterm-rows,
+::ng-deep .terminal-shell.mobile-input-mode.grok-terminal-layout .terminal-host .xterm-row {
+  max-width: none;
+  overflow-x: visible;
 }
 
 ::ng-deep .terminal-host .xterm-helper-textarea {

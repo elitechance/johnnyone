@@ -1573,17 +1573,6 @@ export class PlannerPage implements OnInit, OnDestroy {
     await this.relayTerminal.resize(sessionId, size.cols, size.rows);
   }
 
-  async loadPlannerTerminalHistory(role: 'worker' | 'reviewer', rows: number): Promise<void> {
-    const plan = this.currentRun()?.plan;
-    const sessionId = role === 'worker' ? plan?.workerSessionId : plan?.reviewerSessionId;
-    if (!sessionId) return;
-    await this.relayTerminal.loadHistory(sessionId, rows);
-  }
-
-  openTerminalMermaid(svg: string): void {
-    this.mermaidZoom.open(svg);
-  }
-
   private pendingAttachmentsSignal(role: PlannerTerminalRole) {
     return role === 'worker' ? this.workerPendingAttachments : this.reviewerPendingAttachments;
   }
@@ -1925,6 +1914,7 @@ export class PlannerPage implements OnInit, OnDestroy {
     }
 
     for (const sessionId of visibleIds) {
+      this.hydrateTerminalScreenFromCache(sessionId);
       try {
         if (options?.refresh) {
           await this.relayTerminal.refreshVisual(sessionId);
@@ -1936,6 +1926,15 @@ export class PlannerPage implements OnInit, OnDestroy {
         // The coordinator may still be starting the host/tmux session.
       }
     }
+  }
+
+  private hydrateTerminalScreenFromCache(sessionId: string): void {
+    if (this.terminalScreens()[sessionId]) return;
+
+    const cached = this.relayTerminal.cachedScreen(sessionId);
+    if (!cached) return;
+
+    this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: cached }));
   }
 
   private async subscribePlanTerminal(sessionId: string): Promise<void> {

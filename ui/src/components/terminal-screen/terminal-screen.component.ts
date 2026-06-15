@@ -1,8 +1,10 @@
 import {
   AfterViewInit,
+  ChangeDetectorRef,
   Component,
   ElementRef,
   EventEmitter,
+  inject,
   Input,
   OnChanges,
   OnDestroy,
@@ -15,15 +17,7 @@ import { FormsModule } from '@angular/forms';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { TerminalScreen } from '../../models/terminal.model';
-import mermaid from 'mermaid';
-
-mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
-
-interface TerminalMermaidBlock {
-  id: string;
-  label: string;
-  source: string;
-}
+import { normalizeTerminalPlainText } from '../../services/terminal-transcript';
 
 export interface TerminalImageAttachmentPreview {
   id: string;
@@ -39,11 +33,13 @@ export interface TerminalImageAttachmentPreview {
   styleUrls: ['./terminal-screen.component.scss'],
 })
 export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDestroy {
-  private static readonly HISTORY_CHUNK_ROWS = 200;
+  private readonly changeDetector = inject(ChangeDetectorRef);
 
   @Input() screen: TerminalScreen | null = null;
   @Input() disabled = false;
   @Input() mobileInputMode = false;
+  /** Provider id (e.g. grok, codex) — Grok TUI needs color + layout preserved on mobile. */
+  @Input() terminalProvider = '';
   @Input() showInput = true;
   @Input() title = 'Terminal';
   @Input() imageAttachments: TerminalImageAttachmentPreview[] = [];
@@ -54,8 +50,6 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   @Output() imageRemoved = new EventEmitter<string>();
   @Output() imageMessageSubmitted = new EventEmitter<string>();
   @Output() terminalResize = new EventEmitter<{ cols: number; rows: number }>();
-  @Output() historyRequested = new EventEmitter<number>();
-  @Output() mermaidRequested = new EventEmitter<string>();
 
   @ViewChild('terminalShell', { static: true }) private terminalShell!: ElementRef<HTMLElement>;
   @ViewChild('terminalHost', { static: true }) private terminalHost!: ElementRef<HTMLDivElement>;
@@ -66,31 +60,42 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private resizeObserver: ResizeObserver | null = null;
   private lastCursor: number | null = null;
   private lastContent = '';
+  private lastRenderedPlain = '';
+  private lastWrittenClipped = '';
   private pendingRender = false;
+  private renderScreenTimer: ReturnType<typeof setTimeout> | null = null;
   private writing = false;
   private wheelHandler: ((event: WheelEvent) => void) | null = null;
   private pointerScrollDownHandler: ((event: PointerEvent) => void) | null = null;
   private pointerScrollMoveHandler: ((event: PointerEvent) => void) | null = null;
   private pointerScrollUpHandler: ((event: PointerEvent) => void) | null = null;
+  private xtermViewportScrollHandler: (() => void) | null = null;
   private pointerScroll = {
     tracking: false,
     scrolling: false,
     pointerId: -1,
     lastY: 0,
+    /** Fractional lines carried between moves so 1:1 tracking stays smooth. */
+    accum: 0,
+    /** Timestamp of the last move, for flick-velocity estimation. */
+    lastT: 0,
+    /** Smoothed velocity in lines/ms (sign = drag direction) for momentum. */
+    velocity: 0,
   };
   private readonly pointerScrollThresholdPx = 6;
+  private momentumRaf: number | null = null;
+  private momentumAccum = 0;
   /** When false, mobile mode keeps the user's scroll position instead of following new output. */
   private userPinnedToLatest = true;
   private idlePromptTimer: ReturnType<typeof setTimeout> | null = null;
-  private requestedHistoryRows = 0;
-  private historyRequestInFlight = false;
-  private historyRequestTimer: ReturnType<typeof setTimeout> | null = null;
-  private historyRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  private revealHistoryOnNextRender = false;
   private lastScreenKey = '';
-  protected mermaidBlocks: TerminalMermaidBlock[] = [];
-  protected mermaidRenderError = '';
   protected mobileInputBuffer = '';
+  protected grokTerminalLayout = false;
+  /** Last ANSI-rich scrollback used for mobile live view (survives small TUI redraws). */
+  private liveAnsiSnapshot = '';
+  private lastSeenScreenLines = 0;
+  private visibilityHandler: (() => void) | null = null;
+  private pageshowHandler: ((event: PageTransitionEvent) => void) | null = null;
 
   ngAfterViewInit(): void {
     this.terminal = new Terminal({
@@ -100,13 +105,9 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       fontFamily: 'Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: this.terminalFontSize(),
       lineHeight: this.mobileInputMode ? 1.1 : 1.2,
+      minimumContrastRatio: this.mobileInputMode ? 4.5 : 1,
       scrollback: 5000,
-      theme: {
-        background: '#05070b',
-        foreground: '#d7e1ee',
-        cursor: '#7dd3fc',
-        selectionBackground: '#1e3a5f',
-      },
+      theme: this.terminalTheme(),
     });
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
@@ -132,6 +133,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
     this.wheelHandler = (event) => {
       if (!this.terminal) return;
+      this.cancelMomentum();
       const lines = this.wheelDeltaToLines(event.deltaY);
       const scrollingUp = event.deltaY < 0;
       this.terminal.scrollLines(event.deltaY > 0 ? lines : -lines);
@@ -139,13 +141,41 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       event.preventDefault();
     };
     this.terminalHost.nativeElement.addEventListener('wheel', this.wheelHandler, { passive: false });
-    this.bindPointerScrollHandlers();
+    this.bindMobileOrPointerScrollHandlers();
 
-    this.resizeObserver = new ResizeObserver(() => this.fit());
+    let resizeFitTimer: ReturnType<typeof setTimeout> | null = null;
+    this.resizeObserver = new ResizeObserver(() => {
+      if (resizeFitTimer) clearTimeout(resizeFitTimer);
+      resizeFitTimer = setTimeout(() => {
+        resizeFitTimer = null;
+        this.fit();
+      }, this.mobileInputMode ? 120 : 0);
+    });
     this.resizeObserver.observe(this.terminalShell.nativeElement);
     this.resizeObserver.observe(this.terminalHost.nativeElement);
     this.fit();
     this.renderScreen(true);
+    this.syncGrokTerminalLayout();
+
+    this.visibilityHandler = () => {
+      if (!document.hidden) {
+        this.refreshTerminalLayout();
+      }
+    };
+    document.addEventListener('visibilitychange', this.visibilityHandler);
+
+    this.pageshowHandler = (event) => {
+      if (event.persisted) {
+        this.refreshTerminalLayout();
+      }
+    };
+    window.addEventListener('pageshow', this.pageshowHandler);
+
+    // Mobile flex layout may settle after first paint; refit once dimensions exist.
+    setTimeout(() => {
+      this.fit();
+      this.renderScreen(true);
+    }, 120);
   }
 
   ngOnChanges(changes: SimpleChanges): void {
@@ -155,15 +185,17 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
     if (changes['mobileInputMode'] && this.terminal) {
       this.terminal.options.disableStdin = true;
-      this.terminal.options.fontSize = this.terminalFontSize();
-      this.terminal.options.lineHeight = this.mobileInputMode ? 1.1 : 1.2;
+      this.applyTerminalPresentation();
       if (this.mobileInputMode) {
         this.userPinnedToLatest = true;
       }
       this.lastContent = '';
+      this.lastRenderedPlain = '';
+      this.lastWrittenClipped = '';
       queueMicrotask(() => {
         this.fit();
         this.renderScreen(true);
+        this.bindMobileOrPointerScrollHandlers();
       });
     }
 
@@ -171,15 +203,24 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       queueMicrotask(() => this.fit());
     }
 
+    if (changes['screen'] || changes['terminalProvider']) {
+      this.syncGrokTerminalLayout();
+    }
+
     if (changes['screen']) {
       this.resetIdlePromptTimer();
       const nextScreenKey = this.screen ? `${this.screen.sessionId}:${this.screen.paneId}` : '';
       if (nextScreenKey !== this.lastScreenKey) {
         this.lastScreenKey = nextScreenKey;
-        this.requestedHistoryRows = 0;
-        this.historyRequestInFlight = false;
-        this.revealHistoryOnNextRender = false;
         this.userPinnedToLatest = true;
+        this.liveAnsiSnapshot = '';
+        this.lastSeenScreenLines = 0;
+        this.lastWrittenClipped = '';
+        this.lastRenderedPlain = '';
+      }
+      if (this.screen?.content) {
+        this.updateLiveAnsiSnapshot(this.screen.content);
+        this.lastSeenScreenLines = this.snapshotLineCount(this.screen.content);
       }
       // When the parent swaps to a different session (e.g. user switches plan
       // tabs), `screen` flips to null while the new screen loads. Clear xterm
@@ -187,73 +228,44 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       if (!this.screen && this.terminal) {
         this.terminal.reset();
         this.lastContent = '';
+        this.lastRenderedPlain = '';
+        this.lastWrittenClipped = '';
         this.lastCursor = -1;
-        this.mermaidBlocks = [];
-        this.mermaidRenderError = '';
-      } else if (this.userPinnedToLatest || this.revealHistoryOnNextRender) {
+      } else if (this.userPinnedToLatest) {
         // While unpinned, freeze the frame so live snapshots don't wipe scrollback.
-        this.renderScreen(true);
+        this.scheduleRenderScreen(false);
       }
     }
   }
 
-  protected isFollowingLive(): boolean {
-    return this.userPinnedToLatest;
-  }
-
-  protected canLoadHistory(): boolean {
-    return !!this.screen
-      && this.screen.status === 'attached'
-      && this.availableHistoryRows() > 0
-      && this.loadedHistoryRows() < this.availableHistoryRows()
-      && !this.historyRequestInFlight;
-  }
-
-  protected loadedHistoryRows(): number {
-    return Math.min(this.requestedHistoryRows, this.availableHistoryRows());
-  }
-
-  protected availableHistoryRows(): number {
-    return Math.max(0, this.screen?.historyLines ?? 0);
-  }
-
-  protected historyProgressText(): string {
-    const available = this.availableHistoryRows();
-    if (available <= 0) return 'no history';
-    return `${this.loadedHistoryRows()} / ${available}`;
-  }
-
-  protected loadPreviousHistory(event?: Event): void {
-    event?.preventDefault();
-    event?.stopPropagation();
-    this.userPinnedToLatest = false;
-    this.requestHistoryRows(this.loadedHistoryRows() + TerminalScreenComponent.HISTORY_CHUNK_ROWS);
-  }
-
-  protected scrollViewportUp(event?: Event): void {
-    this.userPinnedToLatest = false;
-    this.scrollViewportBy(-this.viewportScrollStep(), event);
-  }
-
-  protected scrollViewportDown(event?: Event): void {
-    this.scrollViewportBy(this.viewportScrollStep(), event);
-    this.syncPinnedToLatestAfterUserScroll(false);
-  }
-
-  protected scrollViewportToLatest(event?: Event): void {
-    event?.preventDefault();
-    event?.stopPropagation();
+  /** Re-fit + repaint after the tab becomes visible again (pageshow/visibility). */
+  private refreshTerminalLayout(): void {
+    if (!this.terminal) return;
     this.userPinnedToLatest = true;
-    this.renderScreen(true);
-    this.scrollToLatestOutput(this.compactSnapshot(this.screen?.content || ''));
+    this.lastWrittenClipped = '';
+    this.lastRenderedPlain = '';
+    queueMicrotask(() => {
+      this.fit();
+      this.renderScreen(true);
+    });
   }
 
   ngOnDestroy(): void {
+    if (this.visibilityHandler) {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
+    if (this.pageshowHandler) {
+      window.removeEventListener('pageshow', this.pageshowHandler);
+      this.pageshowHandler = null;
+    }
     this.resizeObserver?.disconnect();
     if (this.wheelHandler) {
       this.terminalHost.nativeElement.removeEventListener('wheel', this.wheelHandler);
     }
+    this.cancelMomentum();
     this.unbindPointerScrollHandlers();
+    this.unbindMobileViewportScroll();
     this.terminal?.dispose();
     this.resizeObserver = null;
     this.terminal = null;
@@ -263,8 +275,10 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       clearTimeout(this.idlePromptTimer);
       this.idlePromptTimer = null;
     }
-    this.clearHistoryRequestTimer();
-    this.clearHistoryRefreshTimer();
+    if (this.renderScreenTimer) {
+      clearTimeout(this.renderScreenTimer);
+      this.renderScreenTimer = null;
+    }
   }
 
   protected submitTerminalInput(): void {
@@ -396,7 +410,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       }
       if (this.mobileInputMode && this.userPinnedToLatest && this.screen?.content) {
         queueMicrotask(() => {
-          this.scrollToLatestOutput(this.compactSnapshot(this.screen?.content || ''));
+          this.scrollToLatestOutput(this.compactSnapshot(this.liveDisplaySnapshot()));
         });
       }
     } catch {
@@ -405,7 +419,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   private applyColumnFitIfMobile(): void {
-    if (!this.terminal || !this.mobileInputMode) return;
+    if (!this.terminal || !this.mobileInputMode || this.isGrokTerminal()) return;
     this.clampColsToViewportWidth(this.terminal.cols);
   }
 
@@ -494,13 +508,43 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   private scheduleSnapshotReflow(): void {
     if (!this.screen?.content) return;
-    this.lastContent = '';
-    queueMicrotask(() => this.renderScreen(true));
+    this.scheduleRenderScreen(true);
+  }
+
+  private scheduleRenderScreen(force: boolean): void {
+    if (!this.terminal || !this.screen) return;
+
+    const delay = this.mobileInputMode && !force ? 220 : 0;
+    if (delay === 0) {
+      this.renderScreen(force);
+      return;
+    }
+
+    if (this.renderScreenTimer) clearTimeout(this.renderScreenTimer);
+    this.renderScreenTimer = setTimeout(() => {
+      this.renderScreenTimer = null;
+      this.renderScreen(force);
+    }, delay);
   }
 
   private renderScreen(force: boolean): void {
     if (!this.terminal || !this.screen) return;
-    if (!force && this.lastCursor === this.screen.cursor) return;
+
+    const nextContent = this.normalizeSnapshot(this.compactSnapshot(this.liveDisplaySnapshot()));
+    const preparedContent = this.prepareSnapshotContent(nextContent);
+    const preparedPlain = normalizeTerminalPlainText(preparedContent);
+    // Skip redraw when tmux sends cursor-only updates, TUI chrome redraws, or duplicate frames.
+    if (preparedPlain === this.lastRenderedPlain) {
+      this.lastCursor = this.screen.cursor;
+      return;
+    }
+    if (preparedContent === this.lastContent) {
+      this.lastCursor = this.screen.cursor;
+      return;
+    }
+    if (!force && this.lastCursor === this.screen.cursor && preparedContent === this.lastContent) {
+      return;
+    }
 
     this.lastCursor = this.screen.cursor;
     if (this.pendingRender) return;
@@ -510,85 +554,56 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       this.pendingRender = false;
       if (!this.terminal || !this.screen) return;
 
-      const nextContent = this.normalizeSnapshot(this.compactSnapshot(this.screen.content || ''));
-      if (this.shouldPreserveLoadedHistory(nextContent)) {
-        this.refreshLoadedHistory();
-        return;
+      const frameContent = this.normalizeSnapshot(this.compactSnapshot(this.liveDisplaySnapshot()));
+      const framePrepared = this.prepareSnapshotContent(frameContent);
+      const framePlain = normalizeTerminalPlainText(framePrepared);
+      if (framePlain === this.lastRenderedPlain || framePrepared === this.lastContent) return;
+
+      this.lastContent = framePrepared;
+      this.lastRenderedPlain = framePlain;
+      if (framePlain.length >= normalizeTerminalPlainText(this.liveAnsiSnapshot).length) {
+        this.liveAnsiSnapshot = frameContent;
       }
-      const preparedContent = this.prepareSnapshotContent(nextContent);
-      if (!force && preparedContent === this.lastContent) return;
-
-      this.lastContent = preparedContent;
-      this.updateMermaidBlocks(nextContent);
-      this.historyRequestInFlight = false;
-      this.clearHistoryRequestTimer();
-      this.writeSnapshot(nextContent);
+      this.writeSnapshot(frameContent);
+      if (this.mobileInputMode) {
+        queueMicrotask(() => this.bindMobileViewportScroll());
+      }
     });
-  }
-
-  private requestHistoryRows(rows: number): void {
-    if (!this.screen || this.historyRequestInFlight) return;
-
-    const nextRows = Math.min(this.availableHistoryRows(), Math.max(1, Math.floor(rows)));
-    if (nextRows <= this.loadedHistoryRows()) return;
-
-    this.requestedHistoryRows = nextRows;
-    this.historyRequestInFlight = true;
-    this.revealHistoryOnNextRender = true;
-    this.clearHistoryRequestTimer();
-    this.historyRequestTimer = setTimeout(() => {
-      this.historyRequestInFlight = false;
-      this.historyRequestTimer = null;
-    }, 4_000);
-    this.historyRequested.emit(nextRows);
-  }
-
-  private refreshLoadedHistory(): void {
-    if (!this.screen || this.historyRequestInFlight || this.historyRefreshTimer) return;
-    const rows = this.loadedHistoryRows();
-    if (rows <= 0) return;
-
-    this.historyRefreshTimer = setTimeout(() => {
-      this.historyRefreshTimer = null;
-      if (!this.screen || this.historyRequestInFlight) return;
-      this.historyRequestInFlight = true;
-      this.revealHistoryOnNextRender = false;
-      this.clearHistoryRequestTimer();
-      this.historyRequestTimer = setTimeout(() => {
-        this.historyRequestInFlight = false;
-        this.historyRequestTimer = null;
-      }, 4_000);
-      this.historyRequested.emit(rows);
-    }, 250);
-  }
-
-  private clearHistoryRequestTimer(): void {
-    if (!this.historyRequestTimer) return;
-    clearTimeout(this.historyRequestTimer);
-    this.historyRequestTimer = null;
-  }
-
-  private clearHistoryRefreshTimer(): void {
-    if (!this.historyRefreshTimer) return;
-    clearTimeout(this.historyRefreshTimer);
-    this.historyRefreshTimer = null;
   }
 
   private writeSnapshot(content: string, reflowAttempt = 0): void {
     if (!this.terminal || this.writing || !this.screen) return;
     if (reflowAttempt > 5) return;
 
-    this.fit();
-    this.applyColumnFitIfMobile();
+    if (reflowAttempt === 0) {
+      this.fitIfDimensionsChanged();
+    } else {
+      this.fit();
+      this.applyColumnFitIfMobile();
+    }
     const displayContent = this.prepareSnapshotContent(content);
     const clipped = this.clipSnapshotToTerminalWidth(displayContent);
+    const bufferEmpty = this.terminal.buffer.active.length === 0;
+    const contentChanged = clipped !== this.lastWrittenClipped || bufferEmpty;
+    if (!contentChanged && reflowAttempt === 0) {
+      return;
+    }
     const preserveReadingPosition = !this.userPinnedToLatest;
     const linesFromBottom = preserveReadingPosition
       ? this.captureViewportAnchorFromBottom()
       : 0;
 
     this.writing = true;
-    this.terminal.write(`\x1b[?25l\x1b[3J\x1b[H\x1b[2J${clipped}\x1b[?25h`, () => {
+    // Repaint in place instead of clearing the whole screen first. The old
+    // `\x1b[2J` blanked every cell before the new content was parsed; on the 2s
+    // capture cadence xterm could paint that empty frame, producing a visible
+    // blink. Here we clear only the scrollback (`\x1b[3J`, which leaves the
+    // visible grid untouched), home the cursor, then overwrite each row and
+    // erase its tail (`\x1b[K`). A trailing `\x1b[J` drops any rows left over
+    // from a taller previous frame. No cell is ever blank between frames, so
+    // steady output stops flickering while taller snapshots still scroll in.
+    const repainted = clipped.split(/\r?\n/).map((line) => `${line}\x1b[K`).join('\r\n');
+    this.terminal.write(`\x1b[?25l\x1b[3J\x1b[H${repainted}\x1b[0m\x1b[J\x1b[?25h`, () => {
       this.writing = false;
       if (!this.terminal || !this.screen) return;
 
@@ -596,10 +611,10 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
         if (!this.terminal || !this.screen) return;
 
         const colsBefore = this.terminal.cols;
-        this.fit();
-        this.applyColumnFitIfMobile();
+        this.fitIfDimensionsChanged();
         if (
           this.mobileInputMode
+          && !this.isGrokTerminal()
           && !preserveReadingPosition
           && (this.terminal.cols < colsBefore || this.terminalRowsOverflowViewport())
           && reflowAttempt < 5
@@ -608,7 +623,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
           return;
         }
 
-        this.finishSnapshotWrite(clipped, preserveReadingPosition, linesFromBottom, content);
+        this.lastWrittenClipped = clipped;
+        this.finishSnapshotWrite(clipped, preserveReadingPosition, linesFromBottom, contentChanged);
       };
 
       requestAnimationFrame(() => requestAnimationFrame(finalize));
@@ -620,39 +636,163 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     clipped: string,
     preserveReadingPosition: boolean,
     linesFromBottom: number,
-    sourceContent: string,
+    contentChanged: boolean,
   ): void {
     if (!this.terminal || !this.screen) return;
 
-    if (this.revealHistoryOnNextRender) {
-
-      this.revealHistoryOnNextRender = false;
-      this.terminal.scrollToTop();
-    } else if (preserveReadingPosition) {
+    if (preserveReadingPosition) {
       this.restoreViewportAnchorFromBottom(linesFromBottom);
-    } else {
+    } else if (contentChanged) {
       this.scrollToLatestOutput(clipped);
     }
 
-    const latest = this.normalizeSnapshot(this.compactSnapshot(this.screen.content || ''));
-    if (this.shouldPreserveLoadedHistory(latest)) {
-      this.refreshLoadedHistory();
-      return;
-    }
+    const latest = this.normalizeSnapshot(this.compactSnapshot(this.liveDisplaySnapshot()));
     const preparedLatest = this.prepareSnapshotContent(latest);
     if (preparedLatest !== this.lastContent) {
-      this.lastContent = preparedLatest;
-      this.updateMermaidBlocks(latest);
-      this.writeSnapshot(sourceContent);
+      this.scheduleRenderScreen(false);
     }
   }
 
   private prepareSnapshotContent(content: string): string {
     const repaired = this.repairAnsiSequences(content);
     if (this.mobileInputMode) {
+      if (this.isGrokTerminal()) {
+        return this.sanitizeGrokMobileSnapshot(repaired);
+      }
       return this.sanitizeMobileSnapshot(repaired);
     }
     return this.sanitizeDesktopSnapshot(repaired);
+  }
+
+  private syncGrokTerminalLayout(): void {
+    const next = this.isGrokTerminal();
+    if (next !== this.grokTerminalLayout) {
+      this.grokTerminalLayout = next;
+      if (next && this.mobileInputMode && this.screen?.content) {
+        this.lastWrittenClipped = '';
+        this.scheduleRenderScreen(true);
+      }
+      return;
+    }
+    this.grokTerminalLayout = next;
+  }
+
+  /** Grok TUI uses 256-color foreground/background and box-drawing layout chrome. */
+  private isGrokTerminal(): boolean {
+    const provider = (this.terminalProvider || '').trim().toLowerCase();
+    if (provider === 'grok') return true;
+
+    const content = this.screen?.content || '';
+    if (!content) return false;
+
+    return (
+      /Grok Composer/i.test(content)
+      || /(?:\x1b\[[0-9;]*48;5;|\x1b\[[0-9;]*38;5;)/.test(content)
+      || /[╭╰│▾⸬]/.test(content)
+    );
+  }
+
+  /**
+   * Grok mobile: keep ANSI colors and unicode layout, but tame harsh reds that
+   * blow out on small screens (full-width red bars, saturated error text).
+   */
+  private sanitizeGrokMobileSnapshot(content: string): string {
+    let next = content
+      .replace(/\r(?!\n)/g, '\n')
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f]/g, '')
+      .replace(/\ufffd/g, '')
+      .replace(/█$/gm, ' ');
+
+    next = this.stripGrokMobileRedBackgrounds(next);
+    next = this.softenGrokMobileRedForeground(next);
+    next = next
+      .replace(/\x1b\[1;31m/g, '\x1b[38;5;214m')
+      .replace(/\x1b\[91m/g, '\x1b[38;5;214m')
+      .replace(/\x1b\[31m/g, '\x1b[38;5;210m');
+
+    return next
+      .split('\n')
+      .map((line) => line.replace(/[ \t]+$/g, ''))
+      .join('\n');
+  }
+
+  /** Drop Grok error-panel red backgrounds; keep neutral panel fills (236, 237, …). */
+  private stripGrokMobileRedBackgrounds(content: string): string {
+    const red256 = new Set([1, 9, 52, 53, 88, 124, 160, 196, 202, 203]);
+
+    return content.replace(/\x1b\[([0-9;]*)m/g, (_match, params: string) => {
+      const codes = params.split(';').filter((part) => part !== '');
+      const kept: string[] = [];
+
+      for (let index = 0; index < codes.length; index++) {
+        const code = Number(codes[index]);
+        if (Number.isNaN(code)) {
+          kept.push(codes[index]);
+          continue;
+        }
+
+        if (code === 0) {
+          kept.push(codes[index]);
+          continue;
+        }
+
+        if (code === 41 || code === 101) {
+          continue;
+        }
+
+        if ((code === 48 || code === 58) && codes[index + 1] === '5' && codes[index + 2] !== undefined) {
+          const palette = Number(codes[index + 2]);
+          if (red256.has(palette)) {
+            index += 2;
+            continue;
+          }
+        }
+
+        if ((code === 48 || code === 58) && codes[index + 1] === '2' && codes[index + 4] !== undefined) {
+          const red = Number(codes[index + 2]);
+          const green = Number(codes[index + 3]);
+          const blue = Number(codes[index + 4]);
+          if (red > 120 && green < 90 && blue < 90) {
+            index += 4;
+            continue;
+          }
+        }
+
+        kept.push(codes[index]);
+      }
+
+      if (kept.length === 0) return '';
+      return `\x1b[${kept.join(';')}m`;
+    });
+  }
+
+  /** Remap saturated 256-color reds to softer coral tones for mobile readability. */
+  private softenGrokMobileRedForeground(content: string): string {
+    const harshRed = new Set([1, 9, 160, 196, 202, 203]);
+    const softRed = '210';
+    const softBrightRed = '214';
+
+    return content.replace(/\x1b\[([0-9;]*)m/g, (match, params: string) => {
+      const codes = params.split(';').filter((part) => part !== '');
+      let changed = false;
+
+      for (let index = 0; index < codes.length; index++) {
+        const code = Number(codes[index]);
+        if (Number.isNaN(code)) continue;
+
+        if ((code === 38 || code === 58) && codes[index + 1] === '5' && codes[index + 2] !== undefined) {
+          const palette = Number(codes[index + 2]);
+          if (harshRed.has(palette)) {
+            codes[index + 2] = palette === 9 || palette === 203 ? softBrightRed : softRed;
+            changed = true;
+          }
+          index += 2;
+        }
+      }
+
+      if (!changed) return match;
+      return `\x1b[${codes.join(';')}m`;
+    });
   }
 
   /** Re-attach ESC when CSI color codes arrive without the leading byte. */
@@ -724,44 +864,6 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       .join('\n');
   }
 
-  protected async openMermaidBlock(block: TerminalMermaidBlock, event?: Event): Promise<void> {
-    event?.preventDefault();
-    event?.stopPropagation();
-    this.mermaidRenderError = '';
-    try {
-      const id = `terminal-mermaid-${block.id}-${Math.random().toString(36).slice(2, 10)}`;
-      const rendered = await mermaid.render(id, block.source);
-      this.mermaidRequested.emit(rendered.svg);
-    } catch (err) {
-      this.mermaidRenderError = `Mermaid render failed: ${String(err)}`;
-    }
-  }
-
-  private updateMermaidBlocks(content: string): void {
-    const plain = this.stripAnsi(content).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    const blocks = this.extractMermaidBlocks(plain);
-    this.mermaidBlocks = blocks.map((source, index) => ({
-      id: `${index + 1}`,
-      label: blocks.length === 1 ? 'Mermaid' : `Mermaid ${index + 1}`,
-      source,
-    }));
-    if (this.mermaidBlocks.length === 0) {
-      this.mermaidRenderError = '';
-    }
-  }
-
-  private extractMermaidBlocks(content: string): string[] {
-    const blocks: string[] = [];
-    const fencePattern = /(?:^|\n)[ \t]*(`{3,}|~{3,})[ \t]*mermaid[^\n]*\n([\s\S]*?)(?=\n[ \t]*\1[ \t]*(?:\n|$)|$)/gi;
-    let match: RegExpExecArray | null;
-    while ((match = fencePattern.exec(content)) !== null) {
-      const source = match[2]?.trim();
-      if (source) blocks.push(source);
-      if (blocks.length >= 8) break;
-    }
-    return blocks;
-  }
-
   private stripAnsi(content: string): string {
     return content
       .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
@@ -769,15 +871,53 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       .replace(/\x1b[@-_][0-?]*[ -/]*[@-~]/g, '');
   }
 
-  private shouldPreserveLoadedHistory(nextContent: string): boolean {
-    if (!this.screen || this.requestedHistoryRows <= 0 || !this.lastContent) return false;
-    if (!this.isExpandedHistorySnapshot(this.lastContent)) return false;
-    return !this.isExpandedHistorySnapshot(nextContent);
+  /** Keep the richest ANSI scrollback for mobile live view across small TUI redraws. */
+  private updateLiveAnsiSnapshot(content: string): void {
+    const compact = this.compactSnapshot(content);
+    if (!compact) return;
+
+    const lines = this.snapshotLineCount(compact);
+    const richCaptureThreshold = Math.max((this.screen?.rows ?? 12) + 8, 28);
+
+    // Live captures already carry recent scrollback; keep the richest one so a
+    // small in-place TUI redraw doesn't momentarily shrink the mobile view.
+    if (this.mobileInputMode && lines >= richCaptureThreshold) {
+      this.liveAnsiSnapshot = compact;
+      return;
+    }
+
+    const compactPlain = normalizeTerminalPlainText(compact);
+    if (!this.liveAnsiSnapshot) {
+      this.liveAnsiSnapshot = compact;
+      return;
+    }
+
+    const existingPlain = normalizeTerminalPlainText(this.liveAnsiSnapshot);
+    if (compactPlain.length > existingPlain.length + 8) {
+      this.liveAnsiSnapshot = compact;
+    }
   }
 
-  private isExpandedHistorySnapshot(content: string): boolean {
-    if (!this.screen) return false;
-    return this.snapshotLineCount(content) > Math.max(this.screen.rows + 2, this.screen.rows + Math.min(5, this.loadedHistoryRows()));
+  /** Refit only when the host size would change terminal dimensions. */
+  private fitIfDimensionsChanged(): void {
+    if (!this.terminal || !this.fitAddon) return;
+
+    try {
+      const proposed = this.fitAddon.proposeDimensions();
+      if (!proposed || proposed.cols <= 0 || proposed.rows <= 0) {
+        this.fit();
+        return;
+      }
+      const safeRows = Math.max(1, proposed.rows);
+      const safeCols = Math.max(1, proposed.cols);
+      if (this.terminal.cols !== safeCols || this.terminal.rows !== safeRows) {
+        this.fit();
+        return;
+      }
+      this.applyColumnFitIfMobile();
+    } catch {
+      // The terminal can be hidden during route transitions; next resize will refit.
+    }
   }
 
   private snapshotLineCount(content: string): number {
@@ -800,6 +940,40 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     return lines.join('\n');
   }
 
+  /** On mobile, prefer cached ANSI scrollback so Grok responses stay visible live. */
+  private liveDisplaySnapshot(): string {
+    const viewport = this.screen?.content || '';
+    if (!this.mobileInputMode || !this.screen || !this.userPinnedToLatest) {
+      return viewport;
+    }
+
+    const rowBudget = Math.max((this.terminal?.rows ?? 12) * 8, 120);
+    const compactViewport = this.compactSnapshot(viewport);
+    const viewportPlain = normalizeTerminalPlainText(compactViewport);
+
+    if (this.liveAnsiSnapshot) {
+      const ansiPlain = normalizeTerminalPlainText(this.liveAnsiSnapshot);
+      const preferCached = this.isGrokTerminal()
+        ? ansiPlain.length >= viewportPlain.length
+        : ansiPlain.length >= viewportPlain.length + 20;
+      if (preferCached) {
+        return this.tailSnapshotLines(this.liveAnsiSnapshot, rowBudget);
+      }
+    }
+
+    if (this.snapshotLineCount(compactViewport) > (this.screen.rows ?? 12) + 2) {
+      return this.tailSnapshotLines(compactViewport, rowBudget);
+    }
+
+    return viewport;
+  }
+
+  private tailSnapshotLines(content: string, maxLines: number): string {
+    const lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    if (lines.length <= maxLines) return lines.join('\n');
+    return lines.slice(-maxLines).join('\n');
+  }
+
   /** Reflow long tmux rows to terminal cols so xterm never soft-wraps mid-line. */
   private clipSnapshotToTerminalWidth(content: string): string {
     if (!this.terminal) return content;
@@ -820,12 +994,68 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   private splitSnapshotLineToTerminalCols(line: string, cols: number): string[] {
     if (!line) return [''];
-    // Reflowing ANSI lines drops inline SGR codes (e.g. blue "Deployed"). Keep the
-    // line intact and rely on column clamp + xterm clipping instead.
     if (/\x1b\[[0-?]*[ -/]*[@-~]/.test(line)) {
+      if (this.isGrokTerminal()) {
+        return this.splitAnsiLineToTerminalCols(line, cols);
+      }
+      // Non-Grok ANSI: keep line intact; column clamp + xterm clipping handle overflow.
       return [line];
     }
     return this.splitLineToDisplayCols(line, cols);
+  }
+
+  /** Wrap Grok colored rows to mobile cols while carrying open SGR state across wraps. */
+  private splitAnsiLineToTerminalCols(line: string, cols: number): string[] {
+    if (!line) return [''];
+    const chunks: string[] = [];
+    let current = '';
+    let width = 0;
+    let openSgr = '';
+
+    const flush = (): void => {
+      if (current.length > 0) {
+        chunks.push(current);
+      }
+      current = openSgr;
+      width = 0;
+    };
+
+    for (let index = 0; index < line.length;) {
+      if (line.charCodeAt(index) === 0x1b && line[index + 1] === '[') {
+        let end = index + 2;
+        while (end < line.length) {
+          const code = line.charCodeAt(end);
+          if (code >= 0x40 && code <= 0x7e) break;
+          end += 1;
+        }
+        if (end < line.length) {
+          const seq = line.slice(index, end + 1);
+          current += seq;
+          if (seq.endsWith('m')) {
+            if (seq === '\x1b[0m' || seq === '\x1b[m') {
+              openSgr = '';
+            } else {
+              openSgr += seq;
+            }
+          }
+          index = end + 1;
+          continue;
+        }
+      }
+
+      const codePoint = line.codePointAt(index) ?? 0;
+      const char = String.fromCodePoint(codePoint);
+      const charWidth = this.terminalDisplayWidth(char);
+      if (width + charWidth > cols && width > 0) {
+        flush();
+      }
+      current += char;
+      width += charWidth;
+      index += codePoint > 0xffff ? 2 : 1;
+    }
+
+    if (current.length > 0) chunks.push(current);
+    return chunks.length > 0 ? chunks : [''];
   }
 
   private splitLineToDisplayCols(line: string, cols: number): string[] {
@@ -884,10 +1114,87 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   private terminalFontSize(): number {
-    return this.mobileInputMode ? 9 : 14;
+    return this.mobileInputMode ? 11 : 14;
   }
 
-  private bindPointerScrollHandlers(): void {
+  private terminalTheme(): {
+    background: string;
+    foreground: string;
+    cursor: string;
+    selectionBackground: string;
+    red?: string;
+    brightRed?: string;
+  } {
+    const base = {
+      background: '#05070b',
+      foreground: '#d7e1ee',
+      cursor: '#7dd3fc',
+      selectionBackground: '#1e3a5f',
+    };
+    if (!this.mobileInputMode) return base;
+    return {
+      ...base,
+      red: '#fb7185',
+      brightRed: '#fda4af',
+    };
+  }
+
+  private applyTerminalPresentation(): void {
+    if (!this.terminal) return;
+    this.terminal.options.fontSize = this.terminalFontSize();
+    this.terminal.options.lineHeight = this.mobileInputMode ? 1.1 : 1.2;
+    this.terminal.options.minimumContrastRatio = this.mobileInputMode ? 4.5 : 1;
+    this.terminal.options.theme = this.terminalTheme();
+  }
+
+  private bindMobileOrPointerScrollHandlers(): void {
+    if (this.mobileInputMode) {
+      this.bindPointerScrollHandlers(true);
+      this.bindMobileViewportScroll();
+      return;
+    }
+    this.unbindMobileViewportScroll();
+    this.bindPointerScrollHandlers();
+  }
+
+  private bindMobileViewportScroll(): void {
+    if (!this.terminal || !this.mobileInputMode) return;
+
+    const viewport = this.terminal.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+    if (!viewport) return;
+
+    this.unbindMobileViewportScroll();
+    this.xtermViewportScrollHandler = () => {
+      if (!this.terminal) return;
+      queueMicrotask(() => {
+        if (!this.terminal) return;
+        if (this.isViewportAtBottom()) {
+          this.userPinnedToLatest = true;
+        } else {
+          this.userPinnedToLatest = false;
+        }
+      });
+    };
+    viewport.addEventListener('scroll', this.xtermViewportScrollHandler, { passive: true });
+  }
+
+  private unbindMobileViewportScroll(): void {
+    if (!this.terminal || !this.xtermViewportScrollHandler) {
+      this.xtermViewportScrollHandler = null;
+      return;
+    }
+
+    const viewport = this.terminal.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+    if (viewport) {
+      viewport.removeEventListener('scroll', this.xtermViewportScrollHandler);
+    }
+    this.xtermViewportScrollHandler = null;
+  }
+
+  private bindPointerScrollHandlers(allowMobile = false): void {
+    if (this.mobileInputMode && !allowMobile) return;
+
+    this.unbindPointerScrollHandlers();
     const host = this.terminalHost.nativeElement;
     this.pointerScrollDownHandler = (event) => this.onTerminalPointerDown(event);
     this.pointerScrollMoveHandler = (event) => this.onTerminalPointerMove(event);
@@ -920,12 +1227,16 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (!this.mobileInputMode || !this.terminal) return;
     if (event.pointerType === 'mouse' && event.button !== 0) return;
 
+    this.cancelMomentum();
     this.resetPointerScroll();
     this.pointerScroll = {
       tracking: true,
       scrolling: false,
       pointerId: event.pointerId,
       lastY: event.clientY,
+      accum: 0,
+      lastT: this.now(),
+      velocity: 0,
     };
     try {
       this.terminalHost.nativeElement.setPointerCapture(event.pointerId);
@@ -947,15 +1258,33 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       this.terminalHost.nativeElement.classList.add('terminal-host-scrolling');
     }
 
-    const lines = this.touchDeltaToLines(deltaY);
+    // Direct-manipulation: dragging the finger DOWN pulls the content down so
+    // earlier output comes into view (scroll up) — the inverse of a mouse wheel.
+    // Track 1:1 against the cell height, carrying the fractional remainder so the
+    // content follows the finger smoothly instead of snapping a whole row at a time.
+    const cell = this.cellHeightPx();
+    this.pointerScroll.accum += deltaY / cell;
+    const lines = Math.trunc(this.pointerScroll.accum);
     if (lines !== 0) {
-      // Match the wheel handler: drag down reveals earlier output; drag up reveals newer.
-      const towardNewer = deltaY < 0;
-      this.terminal.scrollLines(deltaY > 0 ? lines : -lines);
-      this.syncPinnedToLatestAfterUserScroll(towardNewer);
-      this.pointerScroll.lastY = event.clientY;
-      event.preventDefault();
+      this.pointerScroll.accum -= lines;
+      this.terminal.scrollLines(-lines);
+      // Dragging DOWN (deltaY > 0) scrolls toward older output — that's "scrolled
+      // up", which unpins follow-live. Dragging UP heads back toward the latest,
+      // which re-pins once the viewport reaches the bottom. (Was inverted, which
+      // left the view unpinned after a scroll so live output stopped refreshing.)
+      this.syncPinnedToLatestAfterUserScroll(deltaY > 0);
     }
+
+    const now = this.now();
+    const dt = now - this.pointerScroll.lastT;
+    if (dt > 0) {
+      // Exponentially smooth velocity (lines/ms) so a flick reads cleanly.
+      const instant = (deltaY / cell) / dt;
+      this.pointerScroll.velocity = this.pointerScroll.velocity * 0.7 + instant * 0.3;
+    }
+    this.pointerScroll.lastY = event.clientY;
+    this.pointerScroll.lastT = now;
+    event.preventDefault();
   }
 
   private onTerminalPointerUp(event: PointerEvent): void {
@@ -966,7 +1295,14 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     } catch {
       // Ignore release failures after implicit pointer cancel.
     }
+
+    const flung = this.pointerScroll.scrolling && event.type !== 'pointercancel';
+    const velocity = this.pointerScroll.velocity;
     this.resetPointerScroll();
+    // Carry a flick into inertial scrolling for a native feel.
+    if (flung && Math.abs(velocity) > 0.01) {
+      this.startMomentum(velocity);
+    }
   }
 
   private resetPointerScroll(): void {
@@ -976,36 +1312,88 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       scrolling: false,
       pointerId: -1,
       lastY: 0,
+      accum: 0,
+      lastT: 0,
+      velocity: 0,
     };
   }
 
-  private scrollViewportBy(lines: number, event?: Event): void {
-    event?.preventDefault();
-    event?.stopPropagation();
-    if (!this.terminal || lines === 0) return;
-    this.terminal.scrollLines(-lines);
+  /** Pixel height of one terminal row, used to map finger travel to line scroll. */
+  private cellHeightPx(): number {
+    const fontSize = this.terminal?.options.fontSize ?? 11;
+    const lineHeight = this.terminal?.options.lineHeight ?? 1.1;
+    return Math.max(10, fontSize * lineHeight);
   }
 
-  private viewportScrollStep(): number {
-    return Math.max(3, Math.floor((this.terminal?.rows ?? 12) / 2));
+  private now(): number {
+    return typeof performance !== 'undefined' ? performance.now() : Date.now();
+  }
+
+  /** Inertial scroll after a flick: decay the release velocity frame by frame. */
+  private startMomentum(velocity: number): void {
+    this.cancelMomentum();
+    if (!this.terminal) return;
+
+    let v = velocity;
+    let last = this.now();
+    this.momentumAccum = 0;
+
+    const step = (): void => {
+      this.momentumRaf = null;
+      if (!this.terminal || this.pointerScroll.tracking) return;
+
+      const now = this.now();
+      const dt = Math.min(48, now - last);
+      last = now;
+
+      this.momentumAccum += v * dt;
+      const lines = Math.trunc(this.momentumAccum);
+      if (lines !== 0) {
+        this.momentumAccum -= lines;
+        this.terminal.scrollLines(-lines);
+        // Same sign convention as the drag: v > 0 = toward older = unpin.
+        this.syncPinnedToLatestAfterUserScroll(v > 0);
+      }
+
+      // ~0.94 per 16ms frame; framerate-independent decay.
+      v *= Math.pow(0.94, dt / 16);
+      if (Math.abs(v) < 0.0006 || this.isMomentumAtEdge(v)) {
+        this.cancelMomentum();
+        return;
+      }
+      this.momentumRaf = requestAnimationFrame(step);
+    };
+    this.momentumRaf = requestAnimationFrame(step);
+  }
+
+  private isMomentumAtEdge(velocity: number): boolean {
+    if (!this.terminal) return true;
+    const buffer = this.terminal.buffer.active;
+    // velocity > 0 means dragging down → scrolling up → stop at the top.
+    if (velocity > 0) return buffer.viewportY <= 0;
+    return this.isViewportAtBottom();
+  }
+
+  private cancelMomentum(): void {
+    if (this.momentumRaf !== null) {
+      cancelAnimationFrame(this.momentumRaf);
+      this.momentumRaf = null;
+    }
+    this.momentumAccum = 0;
   }
 
   private wheelDeltaToLines(deltaY: number): number {
     return Math.max(1, Math.ceil(Math.abs(deltaY) / 40));
   }
 
-  private touchDeltaToLines(deltaY: number): number {
-    const cellHeight = Math.max(
-      12,
-      (this.terminal?.options.lineHeight ?? 1.1) * (this.terminal?.options.fontSize ?? 9),
-    );
-    return Math.max(1, Math.round(Math.abs(deltaY) / (cellHeight * 0.65)));
-  }
-
   private isViewportAtBottom(): boolean {
     if (!this.terminal) return true;
     const buffer = this.terminal.buffer.active;
-    return buffer.viewportY + buffer.baseY >= buffer.length - this.terminal.rows;
+    // Forgiving threshold: with no "Live" button to resume, scrolling back to
+    // *near* the bottom must re-pin follow-live, otherwise the view could get
+    // stuck paused a couple of rows short of the end.
+    const slackRows = 2;
+    return buffer.viewportY + buffer.baseY >= buffer.length - this.terminal.rows - slackRows;
   }
 
   private syncPinnedToLatestAfterUserScroll(scrolledUp: boolean): void {
@@ -1021,12 +1409,22 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   /** Keep the latest output in view after each snapshot refresh. */
-  private scrollToLatestOutput(_content: string): void {
+  private scrollToLatestOutput(content: string): void {
     if (!this.terminal) return;
     if (!this.userPinnedToLatest) return;
 
-    // Always follow the bottom of the snapshot. tmux cursorY is pane-local and
-    // sends the viewport back to the top when the cursor sits on an upper row.
+    if (this.mobileInputMode) {
+      this.terminal.scrollToBottom();
+      return;
+    }
+
+    const lines = this.snapshotLineCount(content);
+    const rows = Math.max(1, this.terminal.rows);
+    if (lines > rows) {
+      this.terminal.scrollToLine(Math.max(0, lines - rows));
+      return;
+    }
+
     this.terminal.scrollToBottom();
   }
 }

@@ -66,11 +66,27 @@ function startStaticServer() {
   });
 }
 
+function mockViewportChrome() {
+  return [
+    '\x1b[38;5;141mGrok Composer 2.5 Fast · always-approve\x1b[0m',
+    '\x1b[38;5;240m╭────────────────────────────────────────────╮\x1b[0m',
+    '\x1b[38;5;240m│\x1b[0m \x1b[38;5;245m▾ Tasks 3\x1b[0m',
+    '\x1b[38;5;240m│\x1b[0m \x1b[38;5;245m⋅ running task\x1b[0m',
+    '\x1b[38;5;240m│\x1b[0m',
+    '\x1b[38;5;240m│ ❯\x1b[0m ',
+    '█',
+  ].join('\n');
+}
+
 function mockTerminalContent() {
   return [
     '\x1b[38;5;141mJohnnyOne mobile UI review — mock Grok session\x1b[0m',
     '\x1b[38;5;240m────────────────────────────────────────────\x1b[0m',
-    ...Array.from({ length: 28 }, (_, i) => (
+    '\x1b[48;5;52m\x1b[38;5;196mERROR: tool call failed — should not be a red bar\x1b[0m',
+    '\x1b[38;5;196mValidation failed — fix before retry\x1b[0m',
+    '\x1b[31mstandard red message\x1b[0m',
+    '\x1b[91mbright red warning\x1b[0m',
+    ...Array.from({ length: 22 }, (_, i) => (
       `\x1b[38;5;245m  [task ${i + 1}]\x1b[0m Implement scrolling + session tabs on mobile`
     )),
     '',
@@ -119,7 +135,8 @@ function createSession(id, provider, title) {
 
 async function primeAuthAndRelay(page) {
   const mockContent = mockTerminalContent();
-  await page.evaluateOnNewDocument((tenantId, terminalContent) => {
+  const mockChrome = mockViewportChrome();
+  await page.evaluateOnNewDocument((tenantId, terminalContent, viewportChrome) => {
     const user = {
       id: 'mobile-screenshot-user',
       tenantId,
@@ -140,6 +157,7 @@ async function primeAuthAndRelay(page) {
       static CONNECTING = 0;
 
       constructor() {
+        window.WebSocket._lastInstance = this;
         this.readyState = MockRelayWebSocket.CONNECTING;
         setTimeout(() => {
           this.readyState = MockRelayWebSocket.OPEN;
@@ -156,14 +174,18 @@ async function primeAuthAndRelay(page) {
         }
         const data = envelope.data || {};
         if (envelope.type === 'terminal_command' && data.control === 'visual_subscribe' && data.sessionId) {
-          this.emitScreen(data.sessionId);
+          this.emitScreen(data.sessionId, viewportChrome, 24);
+          setTimeout(() => this.emitScreen(data.sessionId, terminalContent, 420), 350);
         }
         if (envelope.type === 'terminal_command' && data.control === 'visual_refresh' && data.sessionId) {
-          this.emitScreen(data.sessionId);
+          this.emitScreen(data.sessionId, terminalContent, 420);
+        }
+        if (envelope.type === 'terminal_command' && data.control === 'visual_history' && data.sessionId) {
+          setTimeout(() => this.emitScreen(data.sessionId, terminalContent, 420), 120);
         }
       }
 
-      emitScreen(sessionId) {
+      emitScreen(sessionId, content, historyLines) {
         this.onmessage?.({
           data: JSON.stringify({
             type: 'terminal_screen',
@@ -173,15 +195,29 @@ async function primeAuthAndRelay(page) {
               paneId: '%0',
               status: 'attached',
               cursor: Date.now(),
-              content: terminalContent,
+              content,
               cursorX: 2,
               cursorY: 22,
-              historyLines: 420,
+              historyLines,
               cols: 80,
               rows: 24,
             },
           }),
         });
+      }
+
+      startPeriodicChrome(sessionId, chrome, intervalMs = 2000) {
+        if (this._chromeTimer) clearInterval(this._chromeTimer);
+        this._chromeTimer = setInterval(() => {
+          this.emitScreen(sessionId, chrome, 24);
+        }, intervalMs);
+      }
+
+      stopPeriodicChrome() {
+        if (this._chromeTimer) {
+          clearInterval(this._chromeTimer);
+          this._chromeTimer = null;
+        }
       }
 
       close() {}
@@ -190,7 +226,7 @@ async function primeAuthAndRelay(page) {
     }
 
     window.WebSocket = MockRelayWebSocket;
-  }, TENANT_ID, mockContent);
+  }, TENANT_ID, mockContent, mockChrome);
 }
 
 async function mockGraphql(page, sessions) {
@@ -286,7 +322,14 @@ async function captureViewport(browser, viewport, sessions) {
     await page.waitForSelector('.workspace-tabs .workspace-tab', { timeout: 15000 });
   }
   await page.waitForSelector('.terminal-pane johnny-terminal-screen .xterm-rows', { timeout: 30000 });
-  await delay(800);
+  await delay(1200);
+  if (viewport.mobile) {
+    await page.waitForFunction(() => {
+      const text = document.querySelector('.terminal-pane johnny-terminal-screen .xterm-rows')?.textContent || '';
+      return /Hard-refresh should see full words/i.test(text) && /Validation failed/i.test(text);
+    }, { timeout: 15000 });
+  }
+  await delay(300);
 
   const metrics = await page.evaluate(() => {
     const host = document.querySelector('.terminal-pane johnny-terminal-screen .terminal-host');
@@ -301,6 +344,13 @@ async function captureViewport(browser, viewport, sessions) {
     const deployedSpan = Array.from(rows?.querySelectorAll('span') || [])
       .find((span) => (span.textContent || '').includes('Deployed'));
     const deployedColor = deployedSpan ? getComputedStyle(deployedSpan).color : '';
+    const errorSpan = Array.from(rows?.querySelectorAll('span') || [])
+      .find((span) => (span.textContent || '').includes('ERROR: tool call failed'));
+    const errorColor = errorSpan ? getComputedStyle(errorSpan).color : '';
+    const errorBg = errorSpan ? getComputedStyle(errorSpan).backgroundColor : '';
+    const validationSpan = Array.from(rows?.querySelectorAll('span') || [])
+      .find((span) => (span.textContent || '').includes('Validation failed'));
+    const validationColor = validationSpan ? getComputedStyle(validationSpan).color : '';
     const hasVisibleCsiJunk = /\[[0-9;]*m/.test(text);
     const taskRow = Array.from(rows?.children || []).find((row) => /\[task 1\]/i.test(row.textContent || ''));
     const taskText = taskRow?.textContent || '';
@@ -350,8 +400,15 @@ async function captureViewport(browser, viewport, sessions) {
         : null,
       windowHeight: window.innerHeight,
       deployedColor,
+      errorColor,
+      errorBg,
+      validationColor,
+      showsErrorLine: /ERROR: tool call failed/i.test(text),
+      showsValidationLine: /Validation failed/i.test(text),
       hasVisibleCsiJunk,
       showsDeployedWord: /Deployed/i.test(text),
+      showsLatestResponseLive: /Hard-refresh should see full words/i.test(text),
+      historyPanelOpen: !!document.querySelector('.terminal-pane johnny-terminal-screen .history-viewer-open'),
     };
   });
   console.log(`${viewport.label} metrics:`, JSON.stringify(metrics));
@@ -377,7 +434,12 @@ async function captureViewport(browser, viewport, sessions) {
   if (viewport.mobile && metrics.hasVisibleCsiJunk) {
     throw new Error(`${viewport.label}: visible ANSI CSI junk in terminal text`);
   }
-  if (viewport.mobile && metrics.showsDeployedWord && metrics.deployedColor === 'rgb(215, 225, 238)') {
+  if (
+    viewport.mobile
+    && metrics.showsDeployedWord
+    && metrics.deployedColor === 'rgb(215, 225, 238)'
+    && !metrics.showsLatestResponseLive
+  ) {
     throw new Error(`${viewport.label}: "Deployed" rendered without ANSI color (${metrics.deployedColor})`);
   }
   if (viewport.mobile && metrics.screenWidthUtilization < 0.82) {
@@ -395,8 +457,71 @@ async function captureViewport(browser, viewport, sessions) {
       taskRowText: metrics.taskRowText,
     })})`);
   }
+  if (viewport.mobile && (!metrics.showsErrorLine || !metrics.showsValidationLine)) {
+    throw new Error(`${viewport.label}: Grok error lines missing (${JSON.stringify({
+      showsErrorLine: metrics.showsErrorLine,
+      showsValidationLine: metrics.showsValidationLine,
+    })})`);
+  }
+  if (viewport.mobile && metrics.errorBg && metrics.errorBg !== 'rgba(0, 0, 0, 0)' && metrics.errorBg !== 'rgb(5, 7, 11)') {
+    throw new Error(`${viewport.label}: Grok error line still has red background (${metrics.errorBg})`);
+  }
+  if (viewport.mobile && metrics.errorColor === 'rgb(255, 0, 0)') {
+    throw new Error(`${viewport.label}: Grok error still pure red (${metrics.errorColor})`);
+  }
+  if (viewport.mobile && metrics.validationColor === 'rgb(255, 0, 0)') {
+    throw new Error(`${viewport.label}: Grok validation still pure red (${metrics.validationColor})`);
+  }
+  if (viewport.mobile && !metrics.showsLatestResponseLive) {
+    throw new Error(`${viewport.label}: latest Grok response missing from live terminal (${JSON.stringify({
+      showsLatestResponseLive: metrics.showsLatestResponseLive,
+      historyPanelOpen: metrics.historyPanelOpen,
+      visibleTextSample: metrics.visibleTextSample,
+    })})`);
+  }
+  if (viewport.mobile && metrics.historyPanelOpen) {
+    throw new Error(`${viewport.label}: history panel should stay closed for live-view test`);
+  }
 
   await screenshot(page, `${viewport.label}-terminal-overview`);
+
+  if (viewport.mobile) {
+    const sessionId = sessions[0].id;
+    const baselineText = await page.evaluate(() => (
+      document.querySelector('.terminal-pane johnny-terminal-screen .xterm-rows')?.textContent || ''
+    ));
+    await page.evaluate((id, chrome) => {
+      const ws = window.WebSocket;
+      const relay = ws?._lastInstance;
+      if (relay?.startPeriodicChrome) {
+        relay.startPeriodicChrome(id, chrome, 400);
+      }
+    }, sessionId, mockViewportChrome());
+    await delay(1800);
+    const afterTicksText = await page.evaluate(() => (
+      document.querySelector('.terminal-pane johnny-terminal-screen .xterm-rows')?.textContent || ''
+    ));
+    await page.evaluate(() => {
+      const ws = window.WebSocket;
+      const relay = ws?._lastInstance;
+      relay?.stopPeriodicChrome?.();
+    });
+    if (!/Hard-refresh should see full words/i.test(afterTicksText)) {
+      throw new Error(`${viewport.label}: periodic chrome updates wiped live response (${JSON.stringify({
+        baselineHasResponse: /Hard-refresh should see full words/i.test(baselineText),
+        afterTicksSample: afterTicksText.slice(0, 240),
+      })})`);
+    }
+    if (baselineText.length > 0 && afterTicksText.length < baselineText.length * 0.6) {
+      throw new Error(`${viewport.label}: periodic chrome updates collapsed terminal text (${JSON.stringify({
+        baselineLen: baselineText.length,
+        afterTicksLen: afterTicksText.length,
+      })})`);
+    }
+  }
+
+  // History panel + Refresh button were removed (reading-back is covered by
+  // finger-scroll; mermaid/transcript plumbing retired). Only Live remains.
 
   if (viewport.mobile) {
     await page.evaluate(() => {

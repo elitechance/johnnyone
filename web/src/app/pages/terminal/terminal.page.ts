@@ -172,11 +172,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private compactWorkspaceMediaQuery: MediaQueryList | null = null;
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
   private terminalVisualSubscriptions = new Set<string>();
+  private terminalVisualSync: Promise<void> = Promise.resolve();
   private readonly visibilityChangeHandler = () => {
     if (document.hidden) {
-      void this.unsubscribeAllTerminalVisuals();
+      this.enqueueTerminalVisualSync(() => this.unsubscribeAllTerminalVisuals());
     } else {
-      void this.syncTerminalVisualSubscriptions();
+      this.enqueueTerminalVisualSync(() => this.syncTerminalVisualSubscriptions({ refresh: true }));
+    }
+  };
+  private readonly pageShowHandler = (event: PageTransitionEvent) => {
+    if (event.persisted) {
+      void this.syncTerminalVisualSubscriptions({ refresh: true });
     }
   };
 
@@ -325,6 +331,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
     document.addEventListener('visibilitychange', this.visibilityChangeHandler);
+    window.addEventListener('pageshow', this.pageShowHandler);
     void this.relayTerminal.connect();
   }
 
@@ -351,6 +358,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.saveWorkspaceStateTimeout = null;
     }
     document.removeEventListener('visibilitychange', this.visibilityChangeHandler);
+    window.removeEventListener('pageshow', this.pageShowHandler);
     void this.unsubscribeAllTerminalVisuals();
     this.teardownChatSubscriptions();
     this.teardownTerminalSubscription();
@@ -549,6 +557,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private removeSessionLocally(id: string): void {
+    this.relayTerminal.forgetCachedScreen(id);
     this.sessions.update((sessions) => sessions.filter((session) => session.id !== id));
     this.terminalScreens.update((screens) => this.omitRecordKey(screens, id));
     this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, id));
@@ -660,6 +669,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.selectedProvider.set(session.provider);
       this.workingDirectory.set(session.working_directory);
       this.messages.set(messages);
+      this.hydrateTerminalScreenFromCache(id);
       await this.syncTerminalVisualSubscriptions();
 
       this.isStreaming.set(false);
@@ -996,6 +1006,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
+  private hydrateTerminalScreenFromCache(sessionId: string): void {
+    if (this.terminalScreens()[sessionId]) return;
+
+    const cached = this.relayTerminal.cachedScreen(sessionId);
+    if (!cached) return;
+
+    this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: cached }));
+    if (this.currentSession()?.id === sessionId) {
+      this.terminalScreen.set(cached);
+    }
+  }
+
   private subscribeToTerminalEvents(): void {
     if (this.terminalSubscription) return;
     this.terminalSubscription = this.relayTerminal.screens().subscribe({
@@ -1033,7 +1055,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  private async syncTerminalVisualSubscriptions(): Promise<void> {
+  private async syncTerminalVisualSubscriptions(options?: { refresh?: boolean }): Promise<void> {
     if (document.hidden) return;
     const visibleIds = new Set(this.visiblePaneSessions().map((session) => session.id));
 
@@ -1045,7 +1067,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
     for (const sessionId of visibleIds) {
       await this.subscribeTerminalVisual(sessionId);
+      if (options?.refresh) {
+        await this.relayTerminal.refreshVisual(sessionId);
+      }
     }
+  }
+
+  private enqueueTerminalVisualSync(task: () => Promise<void>): void {
+    this.terminalVisualSync = this.terminalVisualSync
+      .then(task)
+      .catch((err) => {
+        console.error('Terminal visual sync failed:', err);
+      });
   }
 
   private async subscribeTerminalVisual(sessionId: string): Promise<void> {
@@ -1073,6 +1106,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         await this.selectSession(session.id);
       }
       await this.relayTerminal.sendInput(session.id, data);
+      // No manual refresh nudge here: the desktop wakes its capture loop on
+      // input and publishes through the shared throttle (≤1 per ~2s), so the
+      // echo shows promptly without adding traffic to the relay Durable Object.
     } catch (err) {
       console.error('Failed to send terminal input:', err);
       this.terminalError.set(String(err));
@@ -1088,20 +1124,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         console.error('Failed to resize terminal:', err);
       });
     }, 180);
-  }
-
-  onTerminalHistoryRequested(rows: number, sessionId = this.currentSession()?.id): void {
-    const session = this.sessions().find((item) => item.id === sessionId);
-    if (!session) return;
-
-    this.relayTerminal.loadHistory(session.id, rows).catch((err) => {
-      console.error('Failed to load terminal history:', err);
-      this.terminalError.set(String(err));
-    });
-  }
-
-  openTerminalMermaid(svg: string): void {
-    this.mermaidZoom.open(svg);
   }
 
   startPaneDrag(event: PointerEvent, sessionId = this.currentSession()?.id): void {

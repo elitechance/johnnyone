@@ -1,74 +1,17 @@
-<section #terminalShell class="terminal-shell" [class.mobile-input-mode]="mobileInputMode">
+<section
+  #terminalShell
+  class="terminal-shell"
+  [class.mobile-input-mode]="mobileInputMode"
+  [class.grok-terminal-layout]="grokTerminalLayout"
+>
   <header class="terminal-toolbar">
     <div class="terminal-title">{{ title }}</div>
     <div class="terminal-toolbar-actions">
-      @if (mermaidBlocks.length > 0) {
-        <div class="terminal-mermaid-actions" aria-label="Terminal Mermaid diagrams">
-          @for (block of mermaidBlocks; track block.id) {
-            <button
-              type="button"
-              class="terminal-mermaid-button"
-              (pointerdown)="$event.stopPropagation()"
-              (click)="openMermaidBlock(block, $event)"
-              title="Open Mermaid diagram"
-            >
-              {{ block.label }}
-            </button>
-          }
-        </div>
-      }
-      <button
-        type="button"
-        class="terminal-history-button"
-        [disabled]="!canLoadHistory()"
-        (pointerdown)="$event.stopPropagation()"
-        (click)="loadPreviousHistory($event)"
-        title="Load previous terminal lines"
-      >
-        Previous 200
-      </button>
-      <span class="terminal-history-count" title="Loaded terminal history lines">
-        {{ historyProgressText() }}
-      </span>
-      @if (!isFollowingLive()) {
-        <button
-          type="button"
-          class="terminal-history-button live"
-          (pointerdown)="$event.stopPropagation()"
-          (click)="scrollViewportToLatest($event)"
-          title="Resume following live output"
-        >
-          Follow live
-        </button>
-      }
-      @if (!mobileInputMode) {
-        <button
-          type="button"
-          class="terminal-history-button"
-          (pointerdown)="$event.stopPropagation()"
-          (click)="scrollViewportUp($event)"
-          title="Scroll output up"
-        >
-          ▲
-        </button>
-        <button
-          type="button"
-          class="terminal-history-button"
-          (pointerdown)="$event.stopPropagation()"
-          (click)="scrollViewportDown($event)"
-          title="Scroll output down"
-        >
-          ▼
-        </button>
-      }
       <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
         {{ screen?.status || 'detached' }}
       </div>
     </div>
   </header>
-  @if (mermaidRenderError) {
-    <div class="terminal-mermaid-error">{{ mermaidRenderError }}</div>
-  }
   <div #terminalHost class="terminal-host" [class.disabled]="disabled"></div>
 
   @if (showInput) {
@@ -97,36 +40,6 @@
         <button type="button" (click)="sendControlInput('\u001b[A')" [disabled]="disabled">↑</button>
         <button type="button" (click)="sendControlInput('\u001b[B')" [disabled]="disabled">↓</button>
         <button type="button" (click)="sendEnterInput()" [disabled]="disabled || imageSending">Enter</button>
-        <button
-          type="button"
-          class="terminal-viewport-scroll-button"
-          (pointerdown)="$event.stopPropagation()"
-          (click)="scrollViewportUp($event)"
-          title="Scroll output up"
-          aria-label="Scroll output up"
-        >
-          ▲
-        </button>
-        <button
-          type="button"
-          class="terminal-viewport-scroll-button"
-          (pointerdown)="$event.stopPropagation()"
-          (click)="scrollViewportDown($event)"
-          title="Scroll output down"
-          aria-label="Scroll output down"
-        >
-          ▼
-        </button>
-        <button
-          type="button"
-          class="terminal-viewport-scroll-button live"
-          (pointerdown)="$event.stopPropagation()"
-          (click)="scrollViewportToLatest($event)"
-          title="Jump to latest output"
-          aria-label="Jump to latest output"
-        >
-          Live
-        </button>
       </div>
 
       <div class="terminal-mobile-submit">

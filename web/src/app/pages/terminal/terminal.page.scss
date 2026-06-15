@@ -428,6 +428,16 @@
     display: none;
   }
 
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-mobile-primary {
+    display: flex;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-mobile-input {
+    flex: 0 0 auto;
+    max-height: min(42vh, 320px);
+    overflow: visible;
+  }
+
   ::ng-deep .terminal-pane johnny-terminal-screen {
     display: flex;
     flex-direction: column;
@@ -449,6 +459,20 @@
 
   ::ng-deep .terminal-pane johnny-terminal-screen .terminal-host .xterm-viewport {
     overflow-x: hidden !important;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen .grok-terminal-layout .terminal-host .xterm-viewport {
+    overflow-x: auto !important;
+  }
+
+  ::ng-deep .terminal-pane johnny-terminal-screen .terminal-history-viewer-body {
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    overscroll-behavior: contain;
   }
 }
 
