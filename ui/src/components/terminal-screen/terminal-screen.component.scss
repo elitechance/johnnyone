@@ -291,6 +291,78 @@
   }
 }
 
+.terminal-copy-toast {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 6;
+  padding: 6px 12px;
+  border: 1px solid #315b82;
+  border-radius: 14px;
+  background: rgba(16, 32, 51, 0.96);
+  color: #bfdbfe;
+  font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  pointer-events: none;
+}
+
+.terminal-sent-log {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.terminal-sent-log-toggle {
+  align-self: flex-start;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid #263241;
+  background: #0b1018;
+  color: #9aa8b8;
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.terminal-sent-caret {
+  color: #6b7a8d;
+}
+
+.terminal-sent-log-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: min(28vh, 200px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+
+.terminal-sent-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: 1px solid #1b2430;
+  border-left: 2px solid #315b82;
+  background: #070b10;
+  color: #d7e1ee;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.terminal-sent-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-sent-images {
+  color: #9aa8b8;
+  font-size: 11px;
+}
+
 .terminal-mobile-input {
   flex: 0 0 auto;
   display: grid;
@@ -473,7 +545,10 @@
   .terminal-host {
     flex: 1 1 0;
     min-height: min(22vh, 180px);
-    max-height: calc(100% - 168px);
+    // No max-height reserve: `flex: 1 1 0` already makes the host fill exactly the
+    // space the input area doesn't use. The old `calc(100% - 168px)` cap was sized
+    // for the removed primary bar (Refresh/History/Live); it now over-reserves and
+    // leaves dead space below the input. Let flex size it so the terminal fills.
     padding-inline: 0;
     // `none`, not `pan-y`: with pan-y the browser claims the vertical swipe and
     // pans the page, so the gesture never reaches our pointer handler and the

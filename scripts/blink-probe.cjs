@@ -171,7 +171,14 @@ async function main() {
     const page = await browser.newPage();
     page.on('pageerror', (e) => console.log('PAGEERROR:', e.message));
     page.on('console', (m) => { if (m.type() === 'error') console.log('CONSOLE.ERR:', m.text()); });
-    await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    const desktop = process.env.JOHNNYONE_PROBE_DESKTOP === '1';
+    if (desktop) {
+      console.log('viewport: desktop 1280x800');
+      await page.setViewport({ width: 1280, height: 800, isMobile: false, hasTouch: false, deviceScaleFactor: 1 });
+    } else {
+      console.log('viewport: mobile 390x844');
+      await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+    }
     await page.evaluateOnNewDocument((frameSrc) => {
       // eslint-disable-next-line no-new-func
       window.__probeFrame = new Function('tick', `return (${frameSrc})(tick);`);
@@ -192,8 +199,12 @@ async function main() {
       window.__samples = [];
       const rows = document.querySelector('.terminal-pane johnny-terminal-screen .xterm-rows');
       const sample = (src) => {
-        const text = (rows?.textContent || '').replace(/\s+/g, '');
-        window.__samples.push({ t: performance.now(), len: text.length, src });
+        const raw = rows?.textContent || '';
+        const text = raw.replace(/\s+/g, '');
+        // The latest line ("running …") is at the very bottom of the capture.
+        // If a frame doesn't show it, the viewport is parked mid-content.
+        const bottomVisible = /running/.test(raw);
+        window.__samples.push({ t: performance.now(), len: text.length, src, bottomVisible });
       };
       window.__mo = new MutationObserver(() => sample('mutation'));
       if (rows) window.__mo.observe(rows, { childList: true, subtree: true, characterData: true });
@@ -228,16 +239,26 @@ async function main() {
         blinkThreshold,
         blinkFrameCount: blinkFrames.length,
         blinkSamples: blinkFrames.slice(0, 12).map((x) => ({ t: Math.round(x.t), len: x.len, src: x.src })),
+        // Frames after the first render where the latest line was NOT visible =
+        // "showing middle content" on refresh.
+        midContentFrames: s.filter((x, i) => i > 3 && x.len > 0 && !x.bottomVisible).length,
       };
     });
 
     console.log('blink probe result:', JSON.stringify(result, null, 2));
-    if (result.blinkFrameCount > 0) {
+    const failBlink = result.blinkFrameCount > 0;
+    const failMid = result.midContentFrames > 0;
+    if (failBlink) {
       console.log(`\n❌ BLINK DETECTED: ${result.blinkFrameCount} frame(s) collapsed below ${Math.round(result.blinkThreshold)} chars (baseline ${result.baselineLen}).`);
-      process.exitCode = 2;
     } else {
       console.log(`\n✅ No blink: min visible chars ${result.minLen} stayed at/above ${Math.round(result.blinkThreshold)} (baseline ${result.baselineLen}).`);
     }
+    if (failMid) {
+      console.log(`❌ MID-CONTENT: ${result.midContentFrames} frame(s) showed mid-content (latest line not visible) during refresh.`);
+    } else {
+      console.log(`✅ Always-latest: every refresh frame showed the bottom line.`);
+    }
+    if (failBlink || failMid) process.exitCode = 2;
     await page.close();
   } finally {
     await browser.close();

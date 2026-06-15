@@ -86,6 +86,12 @@
   box-shadow: inset 0 -2px 0 #64b5ff;
 }
 
+// Desktop: the row wrapper is transparent so tabs + actions stay direct flex
+// children of the topbar (unchanged). Mobile collapses it into one scroll row.
+.planner-tab-row {
+  display: contents;
+}
+
 .planner-tabs {
   flex: 1;
   min-width: 0;
@@ -380,6 +386,14 @@ select {
 
 ::ng-deep .terminal-card johnny-terminal-screen .terminal-shell {
   border: 0;
+}
+
+// The terminal widget's own toolbar ("Terminal … ATTACHED") is redundant inside
+// the planner — the terminal-card header (T1/T2 · label · session id · status)
+// already carries that. Hide it so the header is a single row and the terminal
+// gets the reclaimed height.
+::ng-deep .terminal-card johnny-terminal-screen .terminal-toolbar {
+  display: none;
 }
 
 .agent-message-bar {
@@ -1645,8 +1659,24 @@ label {
 
   .planner-topbar {
     @include workspace.mobile-topbar;
+    // Row 1: menu + page-title. Row 2: the single scrollable tab/action row.
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 8px;
+    row-gap: 8px;
+    align-items: center;
+  }
+
+  .mobile-menu-btn {
+    grid-row: 1;
+    grid-column: 1;
+  }
+
+  .page-title-chip {
+    grid-row: 1;
+    grid-column: 2;
+    justify-self: start;
   }
 
   .brand-lockup {
@@ -1663,29 +1693,52 @@ label {
     @include workspace.mobile-mode-switch;
   }
 
+  // One horizontally-scrollable row holding plan tabs + Existing Plans + New
+  // Planner; everything is reachable by scrolling left/right.
+  .planner-tab-row {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 8px;
+    grid-row: 2;
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .planner-tab-row::-webkit-scrollbar {
+    display: none;
+  }
+
   .planner-tabs {
-    @include workspace.mobile-tab-strip;
-    flex: none;
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+    overflow: visible;
   }
 
   .planner-tab {
-    max-width: min(72vw, 300px);
+    flex: 0 0 auto;
+    max-width: min(60vw, 240px);
   }
 
   .planner-actions {
-    @include workspace.mobile-actions-grid(3);
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
   }
 
-  .planner-actions .primary-action {
-    grid-column: 1 / -1;
-    min-width: 0;
-    width: 100%;
-    padding-inline: 8px;
-  }
-
+  .planner-actions .secondary-action,
+  .planner-actions .primary-action,
   .planner-actions .icon-action {
-    width: 100%;
+    flex: 0 0 auto;
+    width: auto;
     min-width: 0;
+    white-space: nowrap;
+    padding-inline: 12px;
   }
 
   .planner-workspace {
@@ -1779,6 +1832,34 @@ label {
   .terminal-card.active-mobile-panel {
     display: grid;
     grid-template-rows: 38px minmax(0, 1fr) auto;
+  }
+
+  // The T1/T2 header (badge · label · session-id · pane · status) is wider than a
+  // phone — make it one horizontally-scrollable line instead of clipping the
+  // session id / pane. The session refs show in full via scroll.
+  .terminal-card header {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .terminal-card header::-webkit-scrollbar {
+    display: none;
+  }
+
+  .terminal-card header .badge,
+  .terminal-card header strong,
+  .terminal-card header .state,
+  .terminal-card header .terminal-fullscreen-btn {
+    flex: 0 0 auto;
+  }
+
+  .terminal-card header .tmux-ref {
+    flex: 0 0 auto;
+    max-width: none;
+    overflow: visible;
   }
 
   .coordinator-panel.active-mobile-panel {

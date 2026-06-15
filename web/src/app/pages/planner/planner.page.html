@@ -4,24 +4,29 @@
     <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
     <div class="page-title-chip">{{ modeTitle() }}</div>
 
-    <nav class="planner-tabs" [attr.aria-label]="modeTitle() + ' runs'">
-      @for (plan of plans(); track plan.id) {
-        <div
-          class="planner-tab"
-          [class.active]="currentPlan()?.id === plan.id"
-        >
-          <button class="planner-tab-main" type="button" (click)="selectPlan(plan.id)">
-            <span class="dot" [class.warn]="plan.status.includes('running')" [class.bad]="plan.status === 'blocked' || plan.status === 'needs_attention'"></span>
-            <span>{{ plan.title }}</span>
-          </button>
-          <button class="tab-close" type="button" title="Close planner run" (click)="deletePlan(plan.id, $event)">×</button>
-        </div>
-      }
-    </nav>
+    <!-- Mobile: tabs + actions collapse into one horizontally-scrollable row
+         (.planner-tab-row is `display: contents` on desktop, so desktop layout is
+         unchanged). -->
+    <div class="planner-tab-row">
+      <nav class="planner-tabs" [attr.aria-label]="modeTitle() + ' runs'">
+        @for (plan of plans(); track plan.id) {
+          <div
+            class="planner-tab"
+            [class.active]="currentPlan()?.id === plan.id"
+          >
+            <button class="planner-tab-main" type="button" (click)="selectPlan(plan.id)">
+              <span class="dot" [class.warn]="plan.status.includes('running')" [class.bad]="plan.status === 'blocked' || plan.status === 'needs_attention'"></span>
+              <span>{{ plan.title }}</span>
+            </button>
+            <button class="tab-close" type="button" title="Close planner run" (click)="deletePlan(plan.id, $event)">×</button>
+          </div>
+        }
+      </nav>
 
-    <div class="planner-actions">
-      <button class="secondary-action" type="button" (click)="openExistingPlans()">Existing Plans</button>
-      <button class="primary-action" type="button" (click)="openSetup()">{{ primaryActionLabel() }}</button>
+      <div class="planner-actions">
+        <button class="secondary-action" type="button" (click)="openExistingPlans()">Existing Plans</button>
+        <button class="primary-action" type="button" (click)="openSetup()">{{ primaryActionLabel() }}</button>
+      </div>
     </div>
   </header>
 

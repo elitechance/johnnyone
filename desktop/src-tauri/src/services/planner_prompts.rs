@@ -131,7 +131,14 @@ Tasks path: {{tasks_path}}
 Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
-Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. When the whole phase is ready for review, say READY_FOR_T2_VALIDATION."#;
+Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work.
+
+This phase will be reviewed against the three lenses in {{conventions_path}}/review-lenses.md, so prepare the evidence each needs:
+- Product (no code): for every screen in the plan's screens-to-verify inventory, capture a final screenshot of the delivered screen so it can be matched against the agreed mock.
+- QA (behavioral): make sure each acceptance criterion is actually verifiable, every feature is really wired (not stubbed), and the phase's tests were run green with output captured.
+- Lead (structural): reuse shared widgets/services instead of forking them, follow conventions (record any deviation in decisions.md), keep tenancy/authorization scoping and input/path validation intact, and don't leak secrets or creep out of scope.
+
+When the whole phase is ready for review, say READY_FOR_T2_VALIDATION."#;
 
 const DEFAULT_DEVELOPMENT_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
 JOHNNYONE_PHASE_ID: {{phase_id}}
@@ -145,7 +152,13 @@ Tasks path: {{tasks_path}}
 Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
-Read methodology, project conventions (every file under {{conventions_path}}), app-local conventions if present under {{workspace_path}}/conventions or {{workspace_path}}/plans/conventions, plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only. Focus on status files, decisions, tests, E2E artifacts, screenshots, acceptance criteria, source-code fit, and convention compliance.
+Read methodology, project conventions (every file under {{conventions_path}}), app-local conventions if present under {{workspace_path}}/conventions or {{workspace_path}}/plans/conventions, plan overview, phase overview, discoveries, and current-phase task files/artifacts directly from those paths on the host. Validate only; do not implement app changes. You may update plan status artifacts only.
+
+Run all THREE review lenses defined in {{conventions_path}}/review-lenses.md (development-review checklists) and merge them into one verdict:
+- Product (no code): screenshot the delivered screens and match them against the agreed mocks + the plan's screens-to-verify inventory at the level of intent (layout, content, states, affordances), not pixels.
+- QA (behavioral): prove/disprove each acceptance criterion against the actual code and running app with file:line + observed behavior; confirm every mocked feature is really wired (not stubbed); validate independently — do not just rerun T1's own e2e.
+- Lead (structural): code quality, security (authorization/tenancy scoping, secrets, input/path validation, least privilege), and maintainability (reuse over forking shared widgets, convention compliance, no out-of-scope creep).
+PASS only when all three lenses pass. If any fails, return NEEDS_CHANGES with findings labeled by lens (`[Product]`/`[QA]`/`[Lead]`). A Product failure caused by a missing mock or screens-to-verify inventory is a planning gap.
 
 If the phase changes user-facing UI, verify that T1 produced or referenced the required mocks/screenshots/artifacts, that they cover the relevant responsive states, and that the result still matches the current app source. Missing UI evidence is NEEDS_CHANGES.
 
@@ -187,6 +200,11 @@ Create or update a methodology-compliant plan at the plan output path. Read the 
 
 For UI-related work, include concrete mocks or visual references unless the UI impact is trivial and documented in a decision. The plan must name the existing routes/components/widgets/styles/tests it expects to touch so T2 can verify the plan is synced with the current source code. Include local and live validation strategy when the feature must be testable by the user. Do not implement application code. Only create/update plan files.
 
+The plan will be reviewed against the three lenses in {{conventions_path}}/review-lenses.md, so make it reviewable:
+- Give every phase/task EXPLICIT, TESTABLE acceptance criteria + a definition-of-done (observable; never "works"/"looks good"). [enables the QA lens]
+- For user-facing work, include a "screens to verify" inventory: each screen/flow → its mock/visual reference → how to navigate to it → its acceptance. [enables the Product lens]
+- Prefer reusing existing shared components/widgets over new or forked ones, and note foreseeable security/maintainability concerns. [enables the Lead lens]
+
 When the plan is ready for review, say exactly:
 
 READY_FOR_T2_PLAN_REVIEW"#;
@@ -204,6 +222,12 @@ Conventions: {{conventions_path}}
 Validate the plan only. Do not implement application code. Read methodology, every convention file under the conventions path, app-local conventions if present under the app/source scope, the created plan, relevant docs, source scope, artifacts, mocks, and diagrams.
 
 Review for methodology + convention compliance, clear phase boundaries, actionable task prompts, explicit acceptance criteria, local/live testing strategy, UI mocks/diagrams where needed, risky assumptions, and whether the plan can produce something the user can test.
+
+Run all THREE review lenses defined in {{conventions_path}}/review-lenses.md (planning-review checklists) and merge them into one verdict:
+- Product: the plan has mocks/visual references for every user-facing change AND a "screens to verify" inventory (each screen → its mock → how to navigate to it → its acceptance).
+- QA: every phase/task has explicit, TESTABLE acceptance criteria + definition-of-done, and a runnable validation strategy; the plan is not narrower than the original intent.
+- Lead: the approach/architecture is technically sound and decomposed sensibly, reuses existing components rather than reinventing, and acknowledges foreseeable security/maintainability concerns.
+PASS only when all three pass; otherwise NEEDS_CHANGES with findings labeled `[Product]`/`[QA]`/`[Lead]`.
 
 Before PASS, perform these gates:
 - UI mock gate: if the brief or plan changes user-facing UI, verify mocks/screenshots/wireframes or explicit existing-screen references exist and are useful enough for implementation. Missing or superficial UI mocks are NEEDS_CHANGES unless a decision explains why the visual impact is trivial.
@@ -278,7 +302,8 @@ Validate:
 4. Existing approved sections that the amendment SHOULD have touched have been updated (e.g. overview.md if new phases are added, status.md if scope changed).
 5. Diagrams + mocks were updated where the amendment changes UI/architecture.
 6. UI amendments still match the current app/source scope. Missing or stale UI mocks, or a plan that no longer matches the app, is NEEDS_CHANGES.
-7. If verdict is NEEDS_CHANGES or BLOCKED, FINDINGS must contain at least one concrete reason and NEXT_STEPS must contain at least one concrete action for T1. Use `none` only when verdict is PASS and there is truly nothing to add.
+7. Run the three review lenses (planning-review checklists) from {{conventions_path}}/review-lenses.md against the amended plan and merge into one verdict: Product (the amendment keeps/adds the needed mocks + screens-to-verify inventory), QA (new/changed phases have explicit, testable acceptance criteria), Lead (the amended approach is sound, reuses existing components, and acknowledges security/maintainability concerns). Label findings by lens (`[Product]`/`[QA]`/`[Lead]`).
+8. If verdict is NEEDS_CHANGES or BLOCKED, FINDINGS must contain at least one concrete reason and NEXT_STEPS must contain at least one concrete action for T1. Use `none` only when verdict is PASS and there is truly nothing to add.
 
 Return this footer exactly:
 

@@ -13,6 +13,9 @@
     </div>
   </header>
   <div #terminalHost class="terminal-host" [class.disabled]="disabled"></div>
+  @if (copyToast) {
+    <div class="terminal-copy-toast" role="status">{{ copyToast }}</div>
+  }
 
   @if (showInput) {
     <form
@@ -21,6 +24,27 @@
       (click)="$event.stopPropagation()"
       (submit)="$event.preventDefault(); submitTerminalInput()"
     >
+      @if (sentMessages.length > 0) {
+        <div class="terminal-sent-log" [class.open]="sentLogOpen">
+          <button type="button" class="terminal-sent-log-toggle" (click)="toggleSentLog($event)">
+            Your messages ({{ sentMessages.length }}) <span class="terminal-sent-caret">{{ sentLogOpen ? '▾' : '▸' }}</span>
+          </button>
+          @if (sentLogOpen) {
+            <div class="terminal-sent-log-body">
+              @for (msg of sentMessages; track msg.id) {
+                <button type="button" class="terminal-sent-item" (click)="copySentMessage(msg, $event)" title="Tap to copy">
+                  @if (msg.text) {
+                    <span class="terminal-sent-text">{{ msg.text }}</span>
+                  }
+                  @if (msg.images.length > 0) {
+                    <span class="terminal-sent-images">🖼 {{ msg.images.join(', ') }}</span>
+                  }
+                </button>
+              }
+            </div>
+          }
+        </div>
+      }
       @if (imageAttachments.length > 0) {
         <div class="terminal-image-previews" aria-label="Selected images">
           @for (image of imageAttachments; track image.id) {

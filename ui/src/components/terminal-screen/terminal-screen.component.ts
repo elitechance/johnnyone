@@ -66,6 +66,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private renderScreenTimer: ReturnType<typeof setTimeout> | null = null;
   private writing = false;
   private wheelHandler: ((event: WheelEvent) => void) | null = null;
+  /** A live frame arrived while text was selected; repaint once selection clears. */
+  private pendingSelectionRender = false;
   private pointerScrollDownHandler: ((event: PointerEvent) => void) | null = null;
   private pointerScrollMoveHandler: ((event: PointerEvent) => void) | null = null;
   private pointerScrollUpHandler: ((event: PointerEvent) => void) | null = null;
@@ -91,6 +93,16 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private lastScreenKey = '';
   protected mobileInputBuffer = '';
   protected grokTerminalLayout = false;
+  /** Log of what the user actually submitted (preserved even though the relay
+   *  hands a rewritten pointer to the CLI), so the question isn't lost in the UI. */
+  protected sentMessages: { id: number; text: string; images: string[] }[] = [];
+  protected sentLogOpen = false;
+  private sentMessageSeq = 0;
+  /** Transient "Copied" confirmation after a long-press copy. */
+  protected copyToast = '';
+  private copyToastTimer: ReturnType<typeof setTimeout> | null = null;
+  private longPressTimer: ReturnType<typeof setTimeout> | null = null;
+  private longPressFired = false;
   /** Last ANSI-rich scrollback used for mobile live view (survives small TUI redraws). */
   private liveAnsiSnapshot = '';
   private lastSeenScreenLines = 0;
@@ -112,6 +124,34 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.fitAddon = new FitAddon();
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.terminalHost.nativeElement);
+
+    // Desktop copy: mouse-drag selects xterm text, but xterm's selection isn't a
+    // DOM selection, so Ctrl/Cmd-C never copies it. Intercept the key here (xterm
+    // sees it before the browser) and copy the selection ourselves. Returning
+    // false stops xterm from processing the key. (disableStdin is on, so Ctrl-C
+    // isn't an interrupt — the toolbar button handles that.)
+    this.terminal.attachCustomKeyEventHandler((event) => {
+      const isCopy = (event.ctrlKey || event.metaKey)
+        && !event.altKey
+        && (event.key === 'c' || event.key === 'C');
+      if (event.type === 'keydown' && isCopy && this.terminal?.hasSelection()) {
+        const selection = this.terminal.getSelection();
+        if (selection) {
+          void this.writeClipboard(selection, 'Copied selection');
+          return false;
+        }
+      }
+      return true;
+    });
+
+    // When the selection is cleared, catch up to the latest output we held back
+    // while it was active.
+    this.terminal.onSelectionChange(() => {
+      if (this.terminal && !this.terminal.hasSelection() && this.pendingSelectionRender) {
+        this.pendingSelectionRender = false;
+        this.scheduleRenderScreen(true);
+      }
+    });
 
     // Forward every keystroke that xterm.js captures (Tab, arrow keys, regular
     // characters, Ctrl-*, etc.) up to the host. Without this, the xterm view
@@ -141,6 +181,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       event.preventDefault();
     };
     this.terminalHost.nativeElement.addEventListener('wheel', this.wheelHandler, { passive: false });
+
     this.bindMobileOrPointerScrollHandlers();
 
     let resizeFitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -217,6 +258,9 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
         this.lastSeenScreenLines = 0;
         this.lastWrittenClipped = '';
         this.lastRenderedPlain = '';
+        // The sent-message log is per session — clear it when the pane switches.
+        this.sentMessages = [];
+        this.sentLogOpen = false;
       }
       if (this.screen?.content) {
         this.updateLiveAnsiSnapshot(this.screen.content);
@@ -275,6 +319,11 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       clearTimeout(this.idlePromptTimer);
       this.idlePromptTimer = null;
     }
+    this.clearLongPressTimer();
+    if (this.copyToastTimer) {
+      clearTimeout(this.copyToastTimer);
+      this.copyToastTimer = null;
+    }
     if (this.renderScreenTimer) {
       clearTimeout(this.renderScreenTimer);
       this.renderScreenTimer = null;
@@ -286,6 +335,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
     const input = this.mobileInput?.nativeElement.value ?? this.mobileInputBuffer;
     this.mobileInputBuffer = '';
+    const images = this.imageAttachments.map((a) => a.fileName || 'image');
+    this.recordSentMessage(input, images);
     if (this.imageAttachments.length > 0) {
       this.imageMessageSubmitted.emit(input);
       this.refocusMobileInput();
@@ -293,6 +344,89 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     }
     this.rawInput.emit(`${input}\r`);
     this.refocusMobileInput();
+  }
+
+  /** Keep the user's original submission visible in JohnnyOne (the relay sends a
+   *  rewritten file-handoff pointer to the CLI, which otherwise hides the question). */
+  private recordSentMessage(text: string, images: string[]): void {
+    const trimmed = text.trim();
+    if (!trimmed && images.length === 0) return;
+    this.sentMessages = [...this.sentMessages, { id: ++this.sentMessageSeq, text: trimmed, images }];
+    if (this.sentMessages.length > 50) {
+      this.sentMessages = this.sentMessages.slice(-50);
+    }
+  }
+
+  protected toggleSentLog(event?: Event): void {
+    event?.preventDefault();
+    event?.stopPropagation();
+    this.sentLogOpen = !this.sentLogOpen;
+  }
+
+  protected async copySentMessage(message: { text: string }, event?: Event): Promise<void> {
+    event?.preventDefault();
+    event?.stopPropagation();
+    await this.writeClipboard(message.text, 'Copied your message');
+  }
+
+  private async copyTerminalText(): Promise<void> {
+    if (!this.terminal) return;
+    const buffer = this.terminal.buffer.active;
+    const start = buffer.viewportY;
+    const lines: string[] = [];
+    for (let i = 0; i < this.terminal.rows; i += 1) {
+      lines.push(buffer.getLine(start + i)?.translateToString(true) ?? '');
+    }
+    const text = lines.join('\n').replace(/[ \t]+$/gm, '').replace(/\n+$/, '');
+    await this.writeClipboard(text, 'Copied screen text');
+  }
+
+  private async writeClipboard(text: string, toast: string): Promise<void> {
+    if (!text) return;
+    // execCommand runs synchronously so it keeps the pointerup user-activation;
+    // the async Clipboard API can lose activation by the time its promise settles
+    // on mobile Safari. Try the sync path first, fall back to the async API.
+    let ok = this.execCopyFallback(text);
+    if (!ok) {
+      try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } catch {
+        ok = false;
+      }
+    }
+    this.showCopyToast(ok ? toast : 'Copy failed');
+  }
+
+  private execCopyFallback(text: string): boolean {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '0';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  private showCopyToast(message: string): void {
+    this.copyToast = message;
+    this.changeDetector.detectChanges();
+    if (this.copyToastTimer) clearTimeout(this.copyToastTimer);
+    this.copyToastTimer = setTimeout(() => {
+      this.copyToast = '';
+      this.copyToastTimer = null;
+      this.changeDetector.detectChanges();
+    }, 1600);
   }
 
   protected sendEnterInput(): void {
@@ -410,7 +544,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       }
       if (this.mobileInputMode && this.userPinnedToLatest && this.screen?.content) {
         queueMicrotask(() => {
-          this.scrollToLatestOutput(this.compactSnapshot(this.liveDisplaySnapshot()));
+          this.scrollToLatestOutput();
         });
       }
     } catch {
@@ -530,6 +664,15 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private renderScreen(force: boolean): void {
     if (!this.terminal || !this.screen) return;
 
+    // Never repaint while the user has text selected: repainting rewrites the
+    // xterm buffer, and the selection is anchored to buffer cells, so the
+    // highlight would end up over the wrong text. Defer and catch up once the
+    // selection clears (see onSelectionChange).
+    if (this.terminal.hasSelection()) {
+      this.pendingSelectionRender = true;
+      return;
+    }
+
     const nextContent = this.normalizeSnapshot(this.compactSnapshot(this.liveDisplaySnapshot()));
     const preparedContent = this.prepareSnapshotContent(nextContent);
     const preparedPlain = normalizeTerminalPlainText(preparedContent);
@@ -553,6 +696,12 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     requestAnimationFrame(() => {
       this.pendingRender = false;
       if (!this.terminal || !this.screen) return;
+      // A selection may have started between scheduling and this frame — don't
+      // rewrite the buffer out from under it.
+      if (this.terminal.hasSelection()) {
+        this.pendingSelectionRender = true;
+        return;
+      }
 
       const frameContent = this.normalizeSnapshot(this.compactSnapshot(this.liveDisplaySnapshot()));
       const framePrepared = this.prepareSnapshotContent(frameContent);
@@ -574,6 +723,12 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private writeSnapshot(content: string, reflowAttempt = 0): void {
     if (!this.terminal || this.writing || !this.screen) return;
     if (reflowAttempt > 5) return;
+    // Don't rewrite the buffer while text is selected — it would move the
+    // selection highlight off the text. Resume when the selection clears.
+    if (this.terminal.hasSelection()) {
+      this.pendingSelectionRender = true;
+      return;
+    }
 
     if (reflowAttempt === 0) {
       this.fitIfDimensionsChanged();
@@ -606,6 +761,14 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.terminal.write(`\x1b[?25l\x1b[3J\x1b[H${repainted}\x1b[0m\x1b[J\x1b[?25h`, () => {
       this.writing = false;
       if (!this.terminal || !this.screen) return;
+
+      // Land on the latest line in the SAME frame the content was written. The
+      // scroll in finishSnapshotWrite runs two rAFs later, leaving a window where
+      // a refresh paints mid-content before snapping to the bottom — which reads
+      // as a blink. Scrolling here pins the first painted frame to the bottom.
+      if (!preserveReadingPosition) {
+        this.scrollToLatestOutput();
+      }
 
       const finalize = () => {
         if (!this.terminal || !this.screen) return;
@@ -643,7 +806,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (preserveReadingPosition) {
       this.restoreViewportAnchorFromBottom(linesFromBottom);
     } else if (contentChanged) {
-      this.scrollToLatestOutput(clipped);
+      this.scrollToLatestOutput();
     }
 
     const latest = this.normalizeSnapshot(this.compactSnapshot(this.liveDisplaySnapshot()));
@@ -1244,6 +1407,22 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       // Pointer capture can fail on some mobile browsers for touch.
     }
     this.mobileInput?.nativeElement.blur();
+
+    // Long-press = "grab the text": a finger held still (no scroll) copies the
+    // visible screen to the clipboard. A quick drag scrolls instead, so the two
+    // gestures don't collide. (Native touch selection is blocked by our scroll
+    // hijack + touch-action:none, so this is the reliable way to copy on mobile.)
+    // The timer only *flags* the long-press; the clipboard write happens on
+    // pointerup, because clipboard access requires live user activation that a
+    // setTimeout callback no longer has (esp. iOS Safari).
+    this.longPressFired = false;
+    this.clearLongPressTimer();
+    this.longPressTimer = setTimeout(() => {
+      this.longPressTimer = null;
+      if (this.pointerScroll.scrolling) return;
+      this.longPressFired = true;
+      this.showCopyToast('Release to copy');
+    }, 450);
   }
 
   private onTerminalPointerMove(event: PointerEvent): void {
@@ -1255,6 +1434,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (!this.pointerScroll.scrolling) {
       if (Math.abs(deltaY) < this.pointerScrollThresholdPx) return;
       this.pointerScroll.scrolling = true;
+      this.clearLongPressTimer(); // movement ⇒ scroll, not a long-press copy
+      this.longPressFired = false;
       this.terminalHost.nativeElement.classList.add('terminal-host-scrolling');
     }
 
@@ -1296,12 +1477,28 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       // Ignore release failures after implicit pointer cancel.
     }
 
-    const flung = this.pointerScroll.scrolling && event.type !== 'pointercancel';
+    this.clearLongPressTimer();
+    const longPress = this.longPressFired && event.type !== 'pointercancel';
+    this.longPressFired = false;
+    const flung = this.pointerScroll.scrolling && event.type !== 'pointercancel' && !longPress;
     const velocity = this.pointerScroll.velocity;
     this.resetPointerScroll();
+    // Copy here (not in the timer): pointerup still carries user activation,
+    // which the clipboard API requires.
+    if (longPress) {
+      void this.copyTerminalText();
+      return;
+    }
     // Carry a flick into inertial scrolling for a native feel.
     if (flung && Math.abs(velocity) > 0.01) {
       this.startMomentum(velocity);
+    }
+  }
+
+  private clearLongPressTimer(): void {
+    if (this.longPressTimer) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = null;
     }
   }
 
@@ -1409,22 +1606,12 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   /** Keep the latest output in view after each snapshot refresh. */
-  private scrollToLatestOutput(content: string): void {
-    if (!this.terminal) return;
-    if (!this.userPinnedToLatest) return;
-
-    if (this.mobileInputMode) {
-      this.terminal.scrollToBottom();
-      return;
-    }
-
-    const lines = this.snapshotLineCount(content);
-    const rows = Math.max(1, this.terminal.rows);
-    if (lines > rows) {
-      this.terminal.scrollToLine(Math.max(0, lines - rows));
-      return;
-    }
-
+  private scrollToLatestOutput(): void {
+    if (!this.terminal || !this.userPinnedToLatest) return;
+    // Always scrollToBottom — it lands on the true last buffer row regardless of
+    // soft-wrapping. The old desktop path computed scrollToLine(logicalLines -
+    // rows), but xterm wraps long lines into extra buffer rows, so that math
+    // undershot the bottom and parked the view mid-content on refresh.
     this.terminal.scrollToBottom();
   }
 }
