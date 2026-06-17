@@ -6,7 +6,7 @@ use crate::events::AgentPlanRunEvent;
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
-use crate::state::app_state::AppState;
+use crate::state::app_state::{AgentReport, AppState};
 use crate::terminal;
 use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{params, OptionalExtension};
@@ -18,11 +18,25 @@ use std::path::{Path, PathBuf};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
-const IDLE_WINDOW_MS: u64 = 2_000;
 const TERMINAL_STARTUP_WAIT_MS: u64 = 2_500;
-const WORKER_READY_MARKER: &str = "READY_FOR_T2_VALIDATION";
+/// Still referenced in planning prompt text that asks the planner to narrate
+/// readiness; the coordinator no longer scrapes it (completion comes via the
+/// `reportAgentResult` API).
 const PLANNER_READY_MARKER: &str = "READY_FOR_T2_PLAN_REVIEW";
 const CLARIFICATION_LIMIT: i64 = 5;
+/// How many consecutive non-PASS review rounds (T2 returns NEEDS_CHANGES/BLOCKED →
+/// back to T1 → re-review …) before the coordinator gives up and escalates to
+/// `needs_attention` instead of looping forever. Without this a review that never
+/// converges churns indefinitely (the Marketplace run hit 116 rounds over 4 days).
+const MAX_REVISION_ROUNDS: i64 = 6;
+/// How long the agent's normalized screen must sit unchanged *without* a structured
+/// report before the coordinator re-requests it. The agent has clearly stopped
+/// working (Grok's volatile chrome is filtered out of the idle key) but never ran
+/// the report command.
+const READY_NUDGE_IDLE_MS: u64 = 20_000;
+/// How many times to re-request a report before escalating to needs_attention,
+/// so a run can never hang forever waiting on a report that won't arrive.
+const MAX_READY_NUDGES: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,11 +256,25 @@ fn create_planning_run(
         return Err("Workspace path is not a directory".to_string());
     }
     let raw_plan = Path::new(&input.plan_path);
-    let plan = if raw_plan.is_absolute() {
-        normalize_path(raw_plan)?
+    // A new plan usually points at a directory that doesn't exist yet (and whose
+    // parent may not exist either), so create it before normalizing — otherwise
+    // canonicalize() on the missing parent fails with "Invalid parent path".
+    // Reject `..` and confirm absolute paths sit inside the workspace before we
+    // create anything, so mkdir can never escape the workspace.
+    if input.plan_path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err("Plan path must not contain '..'".to_string());
+    }
+    let candidate = if raw_plan.is_absolute() {
+        raw_plan.to_path_buf()
     } else {
-        normalize_path(&workspace.join(raw_plan))?
+        workspace.join(raw_plan)
     };
+    if raw_plan.is_absolute() && !candidate.starts_with(&workspace) {
+        return Err("Plan path must be inside the selected workspace".to_string());
+    }
+    std::fs::create_dir_all(&candidate)
+        .map_err(|e| format!("Failed to create plan directory {}: {}", candidate.display(), e))?;
+    let plan = normalize_path(&candidate)?;
     if !plan.starts_with(&workspace) {
         return Err("Plan path must be inside the selected workspace".to_string());
     }
@@ -1214,6 +1242,15 @@ async fn spawn_coordinator_loop(state: AppState, plan_id: String) {
                 )
                 .map_err(|e| e.to_string())
             });
+            // Emit an event so the failure shows in the feed AND fires the Discord
+            // alert (append_event is the single notification chokepoint).
+            let _ = append_event(
+                &state,
+                &plan_id,
+                None,
+                "coordinator_failed",
+                json!({ "reason": error }),
+            );
         }
     });
 }
@@ -1229,7 +1266,7 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                         .worker_session_id
                         .clone()
                         .ok_or_else(|| "Planning run has no planner session".to_string())?;
-                    wait_for_planner_ready(&state, &session_id).await?;
+                    wait_for_planner_ready(&state, &session_id, &plan_id).await?;
                     state.db.with_conn(|conn| {
                         conn.execute(
                             "UPDATE agent_plans SET status = 'planning_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'planning_planner_running'",
@@ -1242,13 +1279,7 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                     dispatch_planning_review(&state, &refreshed).await?;
                 }
                 "planning_review_running" => {
-                    let session_id = run
-                        .plan
-                        .reviewer_session_id
-                        .clone()
-                        .ok_or_else(|| "Planning run has no reviewer session".to_string())?;
-                    let snapshot = wait_for_idle(&state, &session_id).await?;
-                    handle_planning_reviewer_output(&state, &run, &snapshot.content).await?;
+                    run_planning_lens_fanout_review(&state, &run).await?;
                 }
                 "approved" | "blocked" | "stopped" | "needs_attention" => break,
                 _ => break,
@@ -1264,7 +1295,7 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                     .worker_session_id
                     .clone()
                     .ok_or_else(|| "Plan has no worker session".to_string())?;
-                wait_for_worker_ready(&state, &session_id).await?;
+                wait_for_worker_ready(&state, &session_id, &plan_id, Some(&phase.phase_id)).await?;
                 state.db.with_conn(|conn| {
                     conn.execute(
                         "UPDATE agent_plans SET status = 'phase_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'phase_worker_running'",
@@ -1288,14 +1319,10 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                 dispatch_review(&state, &refreshed, &phase).await?;
             }
             "phase_review_running" => {
+                // Development review fans out into three ephemeral lens reviewers
+                // (Product/QA/Lead) run in parallel; their verdicts are merged.
                 let phase = current_phase(&run)?;
-                let session_id = run
-                    .plan
-                    .reviewer_session_id
-                    .clone()
-                    .ok_or_else(|| "Plan has no reviewer session".to_string())?;
-                let snapshot = wait_for_idle(&state, &session_id).await?;
-                handle_reviewer_output(&state, &run, &phase, &snapshot.content).await?;
+                run_lens_fanout_review(&state, &run, &phase).await?;
             }
             "approved" | "blocked" | "stopped" | "needs_attention" => break,
             _ => break,
@@ -1305,64 +1332,972 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
     Ok(())
 }
 
-async fn wait_for_idle(
+/// Record a structured agent report received via the host GraphQL
+/// `reportAgentResult` mutation. Verifies the session belongs to a plan and the
+/// report kind matches the session's role (only the worker reports `ready`, only
+/// the reviewer reports a `verdict`) — an unknown session id is rejected, which is
+/// the spoof guard (the id is an unguessable UUID a browser/remote caller can't
+/// learn). The coordinator's wait loops drain `state.agent_reports`.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_agent_report(
     state: &AppState,
-    session_id: &str,
-) -> Result<terminal::TerminalSnapshot, String> {
-    wait_for_stable_snapshot(state, session_id, |_| true).await
+    session_id: String,
+    kind: String,
+    verdict: Option<String>,
+    findings: Option<String>,
+    summary: Option<String>,
+    severity: Option<String>,
+    reason: Option<String>,
+    evidence: Option<String>,
+) -> Result<(), String> {
+    let kind_norm = kind.trim().to_ascii_lowercase();
+    // Identity is derived from the session, never self-declared (spoof guard).
+    let role = plan_role_for_session(state, &session_id)?;
+    let verdict_norm = match kind_norm.as_str() {
+        "ready" => {
+            if role != "worker" {
+                return Err("'ready' may only be reported by the worker/planner session".to_string());
+            }
+            None
+        }
+        "verdict" => {
+            if !matches!(role.as_str(), "reviewer" | "product" | "qa" | "lead") {
+                return Err(
+                    "'verdict' may only be reported by the reviewer or a lens session".to_string(),
+                );
+            }
+            let raw = verdict.ok_or_else(|| "verdict kind requires a verdict value".to_string())?;
+            Some(
+                normalize_verdict_token(&raw)
+                    .ok_or_else(|| format!("invalid verdict value: {}", raw))?,
+            )
+        }
+        // An ephemeral agent (e.g. the docs agent) signalling its task is complete.
+        "done" => None,
+        // The agent is stuck and needs a human decision — any session may signal it.
+        "blocked" => None,
+        // Progress / status — any session may push these.
+        "update" => None,
+        other => return Err(format!("unknown report kind: {}", other)),
+    };
+    state.agent_reports.lock().await.insert(
+        session_id.clone(),
+        AgentReport {
+            kind: kind_norm.clone(),
+            verdict: verdict_norm,
+            role: Some(role.clone()),
+            findings,
+            summary,
+            severity: severity.map(|s| s.trim().to_ascii_lowercase()),
+            reason,
+            evidence,
+        },
+    );
+    tracing::info!(session_id, role, kind = %kind_norm, "recorded structured agent report");
+    Ok(())
 }
 
-async fn wait_for_worker_ready(
-    state: &AppState,
-    session_id: &str,
-) -> Result<terminal::TerminalSnapshot, String> {
-    wait_for_stable_snapshot(state, session_id, has_worker_ready_marker).await
+/// Resolve a session's role: an ephemeral review/agent session's registered role
+/// (product/qa/lead/docs/…) if present, otherwise the plan's worker/reviewer.
+/// Errors if the id belongs to no plan — this is the report spoof guard.
+fn plan_role_for_session(state: &AppState, session_id: &str) -> Result<String, String> {
+    let registered: Option<String> = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT role FROM agent_plan_review_sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })?;
+    if let Some(role) = registered {
+        return Ok(role);
+    }
+    let role: Option<String> = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT CASE WHEN worker_session_id = ?1 THEN 'worker' ELSE 'reviewer' END \
+             FROM agent_plans WHERE worker_session_id = ?1 OR reviewer_session_id = ?1 LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })?;
+    role.ok_or_else(|| "session id does not belong to any plan".to_string())
 }
 
-fn has_worker_ready_marker(content: &str) -> bool {
-    terminal_content_contains_marker(content, WORKER_READY_MARKER)
+/// Register an ephemeral agent session (lens reviewer, docs agent, …) so its
+/// reports are trusted and attributed to `role`.
+fn register_review_session(
+    state: &AppState,
+    plan_id: &str,
+    session_id: &str,
+    role: &str,
+) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_plan_review_sessions (session_id, plan_id, role) VALUES (?1, ?2, ?3)",
+            params![session_id, plan_id, role],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    Ok(())
 }
 
-async fn wait_for_planner_ready(
+fn unregister_review_session(state: &AppState, session_id: &str) {
+    let _ = state.db.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM agent_plan_review_sessions WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| e.to_string())
+    });
+}
+
+/// Take a report only if it is of the given kind, leaving other kinds (e.g. a
+/// pending `update`) in place so a ready/verdict wait doesn't swallow them.
+async fn take_agent_report_kind(
     state: &AppState,
     session_id: &str,
-) -> Result<terminal::TerminalSnapshot, String> {
-    wait_for_stable_snapshot(state, session_id, |content| {
-        terminal_content_contains_marker(content, PLANNER_READY_MARKER)
+    kind: &str,
+) -> Option<AgentReport> {
+    let mut map = state.agent_reports.lock().await;
+    match map.get(session_id) {
+        Some(report) if report.kind == kind => map.remove(session_id),
+        _ => None,
+    }
+}
+
+async fn clear_agent_report(state: &AppState, session_id: &str) {
+    state.agent_reports.lock().await.remove(session_id);
+}
+
+/// Spawn an ephemeral agent (lens reviewer, docs agent, …) registered to a plan,
+/// attach it headless, and send its task prompt. `prompt_for` receives the new
+/// session id so the prompt can bake the session-specific report `curl`. Returns
+/// the session id; dispose it with `dispose_ephemeral_agent` once its report is in.
+async fn spawn_ephemeral_agent(
+    state: &AppState,
+    plan_id: &str,
+    role: &str,
+    provider: &str,
+    model: Option<String>,
+    working_directory: Option<String>,
+    prompt_for: impl FnOnce(&str) -> String,
+) -> Result<String, String> {
+    let short = &plan_id[..plan_id.len().min(8)];
+    let session = sessions::create_session(
+        state,
+        CreateSessionInput {
+            provider: Some(provider.to_string()),
+            model,
+            working_directory,
+            title: Some(format!("{} · {}", role.to_uppercase(), short)),
+            kind: Some("agent".to_string()),
+        },
+    )?;
+    let session_id = session.id.clone();
+    register_review_session(state, plan_id, &session_id, role)?;
+    terminal::attach_terminal_headless(state, session_id.clone(), 120, 36).await?;
+    sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
+    let prompt = prompt_for(&session_id);
+    terminal::send_terminal_input(state, session_id.clone(), format!("{}\r", prompt)).await?;
+    Ok(session_id)
+}
+
+/// Tear down an ephemeral agent: unregister, drop any pending report, kill its
+/// terminal, and delete the session.
+async fn dispose_ephemeral_agent(state: &AppState, session_id: &str) {
+    unregister_review_session(state, session_id);
+    state.agent_reports.lock().await.remove(session_id);
+    let _ = terminal::kill_terminal_session(state, session_id).await;
+    let _ = sessions::delete_session(state, session_id.to_string()).await;
+}
+
+/// Discord embed color by severity.
+fn discord_color(severity: &str) -> u32 {
+    match severity {
+        "attention" => 16_478_597, // red
+        "warn" => 16_705_372,      // amber
+        "success" => 5_763_719,    // green
+        _ => 3_447_003,            // blue (info)
+    }
+}
+
+/// Post a notification to the configured Discord webhook (best-effort, no-op if
+/// unset). Used for both attention alerts and per-phase progress updates: the
+/// `headline` carries its own emoji, `severity` picks the color. Always includes a
+/// deep link to the run.
+async fn notify_discord(
+    state: &AppState,
+    plan_id: &str,
+    severity: &str,
+    headline: &str,
+    reason: &str,
+) {
+    let webhook =
+        settings_service::get_setting_or(state, settings_service::KEY_DISCORD_WEBHOOK_URL, "");
+    let webhook = webhook.trim();
+    if webhook.is_empty() {
+        return;
+    }
+    let (title, run_type) = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT title, run_type FROM agent_plans WHERE id = ?1",
+                params![plan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap_or_else(|_| ("(plan)".to_string(), "development".to_string()));
+    let mode = if run_type == "planning" {
+        "planning"
+    } else {
+        "development"
+    };
+    let base = settings_service::get_setting_or(
+        state,
+        settings_service::KEY_WEB_CLIENT_URL,
+        settings_service::DEFAULT_WEB_CLIENT_URL,
+    );
+    let link = format!("{}/{}/{}", base.trim_end_matches('/'), mode, plan_id);
+    let description = if reason.is_empty() {
+        format!("[Open the run →]({})", link)
+    } else {
+        format!("{}\n[Open the run →]({})", reason, link)
+    };
+    let payload = json!({
+        "username": "JohnnyOne",
+        "embeds": [{
+            "title": headline,
+            "description": description,
+            "color": discord_color(severity),
+            "fields": [
+                { "name": "Plan", "value": title, "inline": true },
+                { "name": "Mode", "value": mode, "inline": true },
+            ],
+        }]
+    });
+    let client = reqwest::Client::new();
+    if let Err(error) = client.post(webhook).json(&payload).send().await {
+        tracing::warn!(%error, plan_id, "failed to POST Discord notification");
+    }
+}
+
+/// Map a plan event to a Discord notification, or `None` to skip (most events stay
+/// in-app only). Returns (severity, headline-with-emoji, reason).
+fn discord_message_for(
+    event_type: &str,
+    phase_id: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<(&'static str, String, String)> {
+    let phase = phase_id.unwrap_or("");
+    let str_field = |k: &str| {
+        payload
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let verdict = str_field("verdict");
+    let reason = str_field("reason");
+    let summary = str_field("summary");
+    let or_default = |s: String, d: &str| if s.is_empty() { d.to_string() } else { s };
+    // Deliberately quiet: Discord fires ONLY on (a) a block / needs-human and
+    // (b) a phase or plan being DONE (a PASS). We do NOT alert on starts, or on
+    // every T2 result — a non-PASS review just loops back to T1 silently and is
+    // visible in the web lens panel.
+    match event_type {
+        // Phase done.
+        "agent_phase_gate_result" if verdict == "PASS" => Some((
+            "success",
+            format!("✅ Phase {} passed review", phase),
+            summary,
+        )),
+        // Plan done (all dev phases passed).
+        "agent_plan_completed" => Some((
+            "success",
+            "🎉 Plan approved — all phases passed".to_string(),
+            String::new(),
+        )),
+        // Plan done (planning approved).
+        "planning_gate_result" if verdict == "PASS" => Some((
+            "success",
+            "✅ Plan passed review".to_string(),
+            summary,
+        )),
+        // Block / needs-human / failure.
+        "agent_phase_needs_attention" => Some((
+            "attention",
+            format!("🔴 Phase {} needs attention", phase),
+            or_default(reason, "unresolved"),
+        )),
+        "agent_blocked" => Some((
+            "attention",
+            "🔴 Blocked — needs your decision".to_string(),
+            "Open the run and reply to unblock the agent.".to_string(),
+        )),
+        "planning_needs_attention" => Some((
+            "attention",
+            "🔴 Plan needs attention".to_string(),
+            or_default(reason, "unresolved"),
+        )),
+        "coordinator_failed" => Some((
+            "attention",
+            "🔴 Run needs attention".to_string(),
+            or_default(reason, "coordinator error"),
+        )),
+        _ => None,
+    }
+}
+
+/// Fire-and-forget a Discord notification for notifiable plan events.
+fn maybe_notify_discord(
+    state: &AppState,
+    plan_id: &str,
+    phase_id: Option<&str>,
+    event_type: &str,
+    payload: &serde_json::Value,
+) {
+    if let Some((severity, headline, reason)) = discord_message_for(event_type, phase_id, payload) {
+        let state = state.clone();
+        let plan_id = plan_id.to_string();
+        tokio::spawn(async move {
+            notify_discord(&state, &plan_id, severity, &headline, &reason).await;
+        });
+    }
+}
+
+/// The development-review lenses: (registration role, display name).
+const REVIEW_LENSES: [(&str, &str); 3] =
+    [("product", "Product"), ("qa", "QA"), ("lead", "Lead")];
+
+/// Self-contained prompt for one ephemeral lens reviewer. Bakes the verdict report
+/// `curl` for `session_id`; the agent runs only its lens.
+/// Per-session file the lens writes its GraphQL request body into, then POSTs with
+/// `curl -d @file` — keeps the agent's free-text out of the shell (no quoting bugs)
+/// while still going through the structured API, not the terminal.
+fn review_body_path(session_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("johnnyone-reviews")
+        .join(format!("{session_id}.json"))
+}
+
+/// Instruction telling a lens to report its verdict AND reasons through the
+/// `reportAgentResult` API (summary + findings), never by printing to the screen.
+/// Uses GraphQL variables in a body file so the agent only edits simple JSON values.
+fn lens_report_instruction(session_id: &str, lens_name: &str) -> String {
+    const TEMPLATE: &str = r#"
+
+---
+Report your verdict AND your reasons through the coordinator API — this is the ONLY channel that is read. Do NOT just print to the screen; screen output is ignored.
+1. Write this exact JSON to the file BODY_PATH (keep "query" verbatim; fill ONLY the values inside "variables"):
+{
+  "query": "mutation($v:String!,$s:String,$f:String){reportAgentResult(sessionId:\"SESSION_ID\",kind:\"verdict\",verdict:$v,summary:$s,findings:$f)}",
+  "variables": {
+    "v": "<PASS|NEEDS_CHANGES|BLOCKED>",
+    "s": "<one sentence: your LENS_NAME verdict and the core reason>",
+    "f": "<if not PASS: the specific, actionable things to fix, one per line; if PASS: none>"
+  }
+}
+2. Then run exactly this (it posts the file as the request body, so your prose needs no shell escaping):
+curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d @BODY_PATH"#;
+    TEMPLATE
+        .replace("BODY_PATH", &review_body_path(session_id).to_string_lossy())
+        .replace("SESSION_ID", session_id)
+        .replace("LENS_NAME", lens_name)
+}
+
+/// Build `ReviewInsights` from a structured lens report (API), splitting the
+/// free-text `findings` string into bullet items. No terminal scraping.
+fn insights_from_report(report: &AgentReport) -> ReviewInsights {
+    let findings = report
+        .findings
+        .as_deref()
+        .map(|f| {
+            f.lines()
+                .map(|l| {
+                    l.trim()
+                        .trim_start_matches(['-', '*', '•'])
+                        .trim()
+                        .to_string()
+                })
+                .filter(|l| !l.is_empty() && !is_placeholder_bullet(l))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let summary = report.summary.clone().filter(|s| !s.trim().is_empty());
+    let reason = report
+        .reason
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| findings.first().cloned())
+        .or_else(|| summary.clone());
+    ReviewInsights {
+        summary,
+        findings,
+        next_steps: Vec::new(),
+        reason,
+    }
+}
+
+fn lens_reviewer_prompt(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    lens_name: &str,
+    session_id: &str,
+) -> String {
+    let phase_path = Path::new(&run.plan.plan_path)
+        .join("phases")
+        .join(&phase.phase_id);
+    let tasks_path = phase_path.join("tasks");
+    let values = phase_template_values(state, run, phase, &phase_path, &tasks_path);
+    let get = |k: &str| {
+        values
+            .iter()
+            .find(|(kk, _)| *kk == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    format!(
+        "You are the {name} reviewer for phase {phase_id} of a development run. Run ONLY the {name} lens — do not run the other lenses.\n\n\
+Read first: methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
+Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{report}",
+        name = lens_name,
+        phase_id = phase.phase_id,
+        methodology = get("methodology_path"),
+        conventions = get("conventions_path"),
+        plan = get("plan_path"),
+        phase_path = get("phase_path"),
+        tasks = get("tasks_path"),
+        report = lens_report_instruction(session_id, lens_name),
+    )
+}
+
+/// Wait for one lens session to report its verdict; nudge (re-send the report
+/// command) if it goes idle without one, escalating after `MAX_READY_NUDGES`.
+/// Returns the verdict plus a captured snapshot (for SUMMARY/FINDINGS prose).
+/// Build the `agent_lens_verdict` event payload, carrying the lens's reason (summary
+/// + concrete findings) so the web T2 panel can show *why* it voted as it did — not
+/// just PASS/FAIL.
+fn lens_verdict_payload(
+    lens: &str,
+    verdict: &str,
+    insights: &ReviewInsights,
+) -> serde_json::Value {
+    let findings: Vec<&String> = insights
+        .findings
+        .iter()
+        .filter(|f| !is_placeholder_bullet(f))
+        .collect();
+    json!({
+        "lens": lens,
+        "verdict": verdict,
+        "summary": insights.summary.clone().unwrap_or_default(),
+        "findings": findings,
     })
-    .await
 }
 
-async fn wait_for_stable_snapshot(
+/// Wait for one lens session to report its verdict via the `reportAgentResult` API.
+/// Returns the full `AgentReport` (verdict + summary + findings) — the reasons come
+/// from the structured report, NOT from scraping the terminal. The tmux capture is
+/// used only as an idle detector (when to re-send the report instruction).
+async fn wait_for_lens_verdict(
     state: &AppState,
     session_id: &str,
-    is_ready: impl Fn(&str) -> bool,
-) -> Result<terminal::TerminalSnapshot, String> {
+    lens_name: &str,
+) -> Result<AgentReport, String> {
+    clear_agent_report(state, session_id).await;
     let mut last_key = String::new();
     let mut last_changed_at = Instant::now();
-    let mut last_snapshot =
-        terminal::capture_terminal_session_with_history(state, session_id).await?;
+    let mut nudges_sent: u32 = 0;
     loop {
+        if let Some(report) = take_agent_report_kind(state, session_id, "verdict").await {
+            if report.verdict.is_some() {
+                return Ok(report);
+            }
+        }
+
         let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
         let key = snapshot_idle_key(&snapshot);
         if key != last_key {
             last_key = key;
             last_changed_at = Instant::now();
-            last_snapshot = snapshot;
+        }
+        if last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
+            if nudges_sent >= MAX_READY_NUDGES {
+                return Err(format!(
+                    "{} lens went idle without reporting a verdict after {} reminders",
+                    lens_name, MAX_READY_NUDGES
+                ));
+            }
+            nudges_sent += 1;
+            tracing::warn!(
+                session_id,
+                lens = lens_name,
+                attempt = nudges_sent,
+                "re-requesting lens verdict"
+            );
+            let nudge = format!(
+                "You have not yet reported your {} verdict.{}",
+                lens_name,
+                lens_report_instruction(session_id, lens_name)
+            );
+            terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", nudge))
+                .await?;
+            last_changed_at = Instant::now();
+        }
+        sleep(Duration::from_millis(1_000)).await;
+    }
+}
+
+/// Merge the three lens outcomes into one reviewer-footer string that
+/// `handle_reviewer_output` can route on. PASS iff all pass; BLOCKED wins over
+/// NEEDS_CHANGES. Findings are concatenated and labeled by lens.
+/// Combine lens verdicts: BLOCKED wins over NEEDS_CHANGES wins over PASS; PASS only
+/// if every lens passed. An unrecognized token is treated as NEEDS_CHANGES (safe).
+fn merged_verdict<'a>(verdicts: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let mut needs_changes = false;
+    let mut count = 0;
+    for v in verdicts {
+        count += 1;
+        match v {
+            "BLOCKED" => return "BLOCKED",
+            "PASS" => {}
+            _ => needs_changes = true, // NEEDS_CHANGES or anything unexpected
+        }
+    }
+    if count == 0 || needs_changes {
+        "NEEDS_CHANGES"
+    } else {
+        "PASS"
+    }
+}
+
+/// Shared body for a merged lens review: rolls the per-lens verdicts up via
+/// `merged_verdict` and concatenates their findings. Returns
+/// `(summary, findings_block, merged_verdict)` so callers can prepend whatever
+/// header (`PHASE:` for dev, none for planning) their output handler expects.
+fn merge_lens_body(outcomes: &[(String, String, ReviewInsights)]) -> (String, String, &'static str) {
+    let merged = merged_verdict(outcomes.iter().map(|(_, v, _)| v.as_str()));
+    let summary = outcomes
+        .iter()
+        .map(|(name, verdict, _)| format!("{}: {}", name, verdict))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut findings = String::new();
+    for (name, _verdict, insights) in outcomes {
+        for finding in &insights.findings {
+            if !is_placeholder_bullet(finding) {
+                findings.push_str(&format!("- [{}] {}\n", name, finding));
+            }
+        }
+    }
+    if findings.is_empty() {
+        findings.push_str("- none\n");
+    }
+    (summary, findings, merged)
+}
+
+fn merge_lens_outcomes(
+    phase: &AgentPlanPhase,
+    outcomes: &[(String, String, ReviewInsights)],
+) -> String {
+    let (summary, findings, merged) = merge_lens_body(outcomes);
+    format!(
+        "PHASE: {}\nSUMMARY: 3-lens review — {}\nFINDINGS:\n{}NEXT_STEPS:\n- none\nVERDICT: {}",
+        phase.phase_id, summary, findings, merged
+    )
+}
+
+/// Planning variant of `merge_lens_outcomes` — no `PHASE:` line (planning is a
+/// whole-plan review); `handle_planning_reviewer_output` parses VERDICT/SUMMARY/
+/// FINDINGS and ignores any phase header.
+fn merge_planning_lens_outcomes(outcomes: &[(String, String, ReviewInsights)]) -> String {
+    let (summary, findings, merged) = merge_lens_body(outcomes);
+    format!(
+        "SUMMARY: 3-lens plan review — {}\nFINDINGS:\n{}NEXT_STEPS:\n- none\nVERDICT: {}",
+        summary, findings, merged
+    )
+}
+
+/// Development phase review via lens fan-out: spawn Product/QA/Lead ephemeral
+/// reviewers in parallel, collect verdicts, dispose, merge, and route through the
+/// existing reviewer-output handler.
+async fn run_lens_fanout_review(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+) -> Result<(), String> {
+    let provider = run.plan.reviewer_provider.clone();
+    let model = default_model_for_provider(&provider);
+    let working_dir = Some(run.plan.workspace_path.clone());
+    let plan_id = run.plan.id.clone();
+    // Lenses POST their review body from a file under here; make sure it exists.
+    let _ = std::fs::create_dir_all(std::env::temp_dir().join("johnnyone-reviews"));
+
+    // Spawn all three (they run concurrently once their prompts are sent).
+    let mut sessions: Vec<(&str, String)> = Vec::new(); // (display name, session_id)
+    for (role, name) in REVIEW_LENSES {
+        let sid = spawn_ephemeral_agent(
+            state,
+            &plan_id,
+            role,
+            &provider,
+            model.clone(),
+            working_dir.clone(),
+            |sid| lens_reviewer_prompt(state, run, phase, name, sid),
+        )
+        .await?;
+        let _ = append_event(
+            state,
+            &plan_id,
+            Some(&phase.phase_id),
+            "agent_lens_review_started",
+            json!({ "lens": name }),
+        );
+        sessions.push((name, sid));
+    }
+
+    // Collect all three verdicts concurrently.
+    let (r0, r1, r2) = tokio::join!(
+        wait_for_lens_verdict(state, &sessions[0].1, sessions[0].0),
+        wait_for_lens_verdict(state, &sessions[1].1, sessions[1].0),
+        wait_for_lens_verdict(state, &sessions[2].1, sessions[2].0),
+    );
+
+    // Tear the reviewers down regardless of outcome.
+    for (_, sid) in &sessions {
+        dispose_ephemeral_agent(state, sid).await;
+    }
+
+    let results = [
+        (sessions[0].0, r0),
+        (sessions[1].0, r1),
+        (sessions[2].0, r2),
+    ];
+    let mut outcomes: Vec<(String, String, ReviewInsights)> = Vec::new();
+    for (name, res) in results {
+        let report = res?; // any lens escalation → needs_attention
+        let verdict = report
+            .verdict
+            .clone()
+            .unwrap_or_else(|| "NEEDS_CHANGES".to_string());
+        let insights = insights_from_report(&report);
+        let _ = append_event(
+            state,
+            &plan_id,
+            Some(&phase.phase_id),
+            "agent_lens_verdict",
+            lens_verdict_payload(name, &verdict, &insights),
+        );
+        outcomes.push((name.to_string(), verdict, insights));
+    }
+
+    let merged = merge_lens_outcomes(phase, &outcomes);
+    handle_reviewer_output(state, run, phase, &merged).await
+}
+
+fn planning_lens_reviewer_prompt(
+    state: &AppState,
+    run: &AgentPlanRun,
+    lens_name: &str,
+    session_id: &str,
+) -> String {
+    let values = planning_template_values(state, run);
+    let get = |k: &str| {
+        values
+            .iter()
+            .find(|(kk, _)| *kk == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    format!(
+        "You are the {name} reviewer for a PLAN (planning run). Run ONLY the {name} lens — do not run the other lenses.\n\n\
+Read first: methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the planning-review {name} checklist); then read the plan at {plan_output}. Judge whether the PLAN itself is ready along the {name} dimension (e.g. Product: clear scope, mocks, and a screens-to-verify inventory; QA: testable acceptance criteria per phase; Lead: a sound, reuse-aware, secure approach with phases sized right).\n\n\
+Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{report}",
+        name = lens_name,
+        methodology = get("methodology_path"),
+        conventions = get("conventions_path"),
+        plan_output = get("plan_output_path"),
+        report = lens_report_instruction(session_id, lens_name),
+    )
+}
+
+/// Planning review via lens fan-out: spawn Product/QA/Lead ephemeral reviewers in
+/// parallel against the whole plan, collect verdicts, dispose, merge, and route
+/// through the planning reviewer-output handler. Mirrors `run_lens_fanout_review`
+/// but has no phase (planning is a whole-plan review).
+async fn run_planning_lens_fanout_review(
+    state: &AppState,
+    run: &AgentPlanRun,
+) -> Result<(), String> {
+    let provider = run.plan.reviewer_provider.clone();
+    let model = default_model_for_provider(&provider);
+    let working_dir = Some(run.plan.workspace_path.clone());
+    let plan_id = run.plan.id.clone();
+    let _ = std::fs::create_dir_all(std::env::temp_dir().join("johnnyone-reviews"));
+
+    let mut sessions: Vec<(&str, String)> = Vec::new(); // (display name, session_id)
+    for (role, name) in REVIEW_LENSES {
+        let sid = spawn_ephemeral_agent(
+            state,
+            &plan_id,
+            role,
+            &provider,
+            model.clone(),
+            working_dir.clone(),
+            |sid| planning_lens_reviewer_prompt(state, run, name, sid),
+        )
+        .await?;
+        let _ = append_event(
+            state,
+            &plan_id,
+            None,
+            "agent_lens_review_started",
+            json!({ "lens": name }),
+        );
+        sessions.push((name, sid));
+    }
+
+    let (r0, r1, r2) = tokio::join!(
+        wait_for_lens_verdict(state, &sessions[0].1, sessions[0].0),
+        wait_for_lens_verdict(state, &sessions[1].1, sessions[1].0),
+        wait_for_lens_verdict(state, &sessions[2].1, sessions[2].0),
+    );
+
+    for (_, sid) in &sessions {
+        dispose_ephemeral_agent(state, sid).await;
+    }
+
+    let results = [
+        (sessions[0].0, r0),
+        (sessions[1].0, r1),
+        (sessions[2].0, r2),
+    ];
+    let mut outcomes: Vec<(String, String, ReviewInsights)> = Vec::new();
+    for (name, res) in results {
+        let report = res?; // any lens escalation → needs_attention
+        let verdict = report
+            .verdict
+            .clone()
+            .unwrap_or_else(|| "NEEDS_CHANGES".to_string());
+        let insights = insights_from_report(&report);
+        let _ = append_event(
+            state,
+            &plan_id,
+            None,
+            "agent_lens_verdict",
+            lens_verdict_payload(name, &verdict, &insights),
+        );
+        outcomes.push((name.to_string(), verdict, insights));
+    }
+
+    let merged = merge_planning_lens_outcomes(&outcomes);
+    handle_planning_reviewer_output(state, run, &merged).await
+}
+
+/// A baked, copy-paste-safe `curl` that the agent runs to report via the host
+/// GraphQL endpoint. CO substitutes the session id; only the verdict token (an
+/// enum) is left for the agent to fill, so there is no shell-escaping risk.
+fn report_command(session_id: &str, kind: &str) -> String {
+    const READY: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"ready\\\")}\"}'";
+    const VERDICT: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"verdict\\\",verdict:\\\"<PASS|NEEDS_CHANGES|BLOCKED>\\\")}\"}'";
+    const BLOCKED: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"blocked\\\")}\"}'";
+    let tmpl = match kind {
+        "verdict" => VERDICT,
+        "blocked" => BLOCKED,
+        _ => READY,
+    };
+    tmpl.replace("SESSION_ID", session_id)
+}
+
+fn worker_report_instruction(session_id: &str) -> String {
+    format!(
+        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator knows you are done. When this phase is complete and ready for T2 review, run this exact command:\n{}\n\nIf you get genuinely stuck and need a human decision you cannot resolve yourself (e.g. a missing credential, or an ambiguous requirement with no safe default), FIRST clearly state your question/blocker in your output, THEN run this command and wait — the coordinator will alert a human, who replies right here to unblock you:\n{}\n",
+        report_command(session_id, "ready"),
+        report_command(session_id, "blocked"),
+    )
+}
+
+fn reviewer_report_instruction(session_id: &str) -> String {
+    format!(
+        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator receives your verdict. After you decide, run this exact command — replace <PASS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
+        report_command(session_id, "verdict")
+    )
+}
+
+/// Append the worker/planner (`ready`) report instruction if the session exists.
+fn append_worker_report(run: &AgentPlanRun, prompt: String) -> String {
+    match &run.plan.worker_session_id {
+        Some(sid) => format!("{}{}", prompt, worker_report_instruction(sid)),
+        None => prompt,
+    }
+}
+
+/// Append the reviewer (`verdict`) report instruction if the session exists.
+fn append_reviewer_report(run: &AgentPlanRun, prompt: String) -> String {
+    match &run.plan.reviewer_session_id {
+        Some(sid) => format!("{}{}", prompt, reviewer_report_instruction(sid)),
+        None => prompt,
+    }
+}
+
+/// Wait on a reviewer (T2) session. Returns `Some(snapshot)` once the reviewer has
+/// reported its verdict via the `reportAgentResult` API; returns `None` if it has
+/// gone idle for `READY_NUDGE_IDLE_MS` without reporting (caller clarifies/escalates).
+///
+/// The verdict comes solely from the structured report — no terminal scraping. The
+/// reported verdict is appended as an authoritative `VERDICT:` line to the captured
+/// snapshot so `handle_reviewer_output` reads it while SUMMARY/FINDINGS still come
+/// from the pane. The capture-based idle check only decides *when* the reviewer has
+/// stopped (so we don't clarify mid-review); it is not a signal source.
+// Superseded by the lens fan-out for both dev and planning review; retained as the
+// reference single-reviewer idle+verdict waiter.
+#[allow(dead_code)]
+async fn wait_for_reviewer_idle_or_verdict(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<terminal::TerminalSnapshot>, String> {
+    // Discard any stale report from a previous turn so it can't trigger this one.
+    clear_agent_report(state, session_id).await;
+    let mut last_key = String::new();
+    let mut last_changed_at = Instant::now();
+    loop {
+        if let Some(report) = take_agent_report_kind(state, session_id, "verdict").await {
+            if let Some(verdict) = report.verdict {
+                let mut snapshot =
+                    terminal::capture_terminal_session_with_history(state, session_id).await?;
+                snapshot.content = format!("{}\nVERDICT: {}", snapshot.content, verdict);
+                return Ok(Some(snapshot));
+            }
         }
 
-        if is_ready(&last_snapshot.content)
-            && last_changed_at.elapsed() >= Duration::from_millis(IDLE_WINDOW_MS)
-        {
-            return Ok(last_snapshot);
+        let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
+        let key = snapshot_idle_key(&snapshot);
+        if key != last_key {
+            last_key = key;
+            last_changed_at = Instant::now();
+        }
+        // Reviewer has stopped but never reported a verdict — caller clarifies.
+        if last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
+            return Ok(None);
         }
 
-        let poll_ms = if is_ready(&last_snapshot.content) {
-            350
-        } else {
-            1_000
-        };
-        sleep(Duration::from_millis(poll_ms)).await;
+        sleep(Duration::from_millis(1_000)).await;
+    }
+}
+
+async fn wait_for_worker_ready(
+    state: &AppState,
+    session_id: &str,
+    plan_id: &str,
+    phase_id: Option<&str>,
+) -> Result<(), String> {
+    wait_for_agent_ready_report(state, session_id, plan_id, phase_id).await
+}
+
+async fn wait_for_planner_ready(
+    state: &AppState,
+    session_id: &str,
+    plan_id: &str,
+) -> Result<(), String> {
+    wait_for_agent_ready_report(state, session_id, plan_id, None).await
+}
+
+/// Wait for a worker/planner (T1) session to report `ready` via the
+/// `reportAgentResult` API — the sole completion signal (no marker scraping). If
+/// the session goes idle for `READY_NUDGE_IDLE_MS` without reporting, re-send the
+/// exact report command; after `MAX_READY_NUDGES` the run escalates (the caller
+/// turns the `Err` into needs_attention). The capture-based idle check only decides
+/// when the agent has stopped, so we don't nudge mid-work.
+async fn wait_for_agent_ready_report(
+    state: &AppState,
+    session_id: &str,
+    plan_id: &str,
+    phase_id: Option<&str>,
+) -> Result<(), String> {
+    // Discard any stale report from a previous turn so it can't trigger this one.
+    clear_agent_report(state, session_id).await;
+    let mut last_key = String::new();
+    let mut last_changed_at = Instant::now();
+    let mut nudges_sent: u32 = 0;
+    // When the agent reports it's blocked on a human, we stop nudging/escalating
+    // and wait (indefinitely) for the human to reply — which resumes the agent and
+    // produces the `ready` report below.
+    let mut blocked = false;
+    loop {
+        if take_agent_report_kind(state, session_id, "ready").await.is_some() {
+            return Ok(());
+        }
+        if take_agent_report_kind(state, session_id, "blocked").await.is_some() {
+            if !blocked {
+                blocked = true;
+                tracing::warn!(session_id, plan_id, "agent reported blocked — needs a human");
+                let _ = append_event(state, plan_id, phase_id, "agent_blocked", json!({}));
+            }
+        }
+
+        let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
+        let key = snapshot_idle_key(&snapshot);
+        if key != last_key {
+            last_key = key;
+            last_changed_at = Instant::now();
+        }
+
+        // While blocked, never nudge/escalate — the agent is intentionally waiting
+        // on the human, not stuck.
+        if !blocked && last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
+            if nudges_sent >= MAX_READY_NUDGES {
+                // Record an explaining event before escalating, so the timeout shows
+                // up in the event log instead of a silent status flip (the generic
+                // coordinator catch sets `needs_attention` but writes no event).
+                let (event_type, reason) = match phase_id {
+                    Some(_) => ("agent_phase_needs_attention", "worker_no_report"),
+                    None => ("planning_needs_attention", "planner_no_report"),
+                };
+                let _ = append_event(
+                    state,
+                    plan_id,
+                    phase_id,
+                    event_type,
+                    json!({ "reason": reason, "reminders": MAX_READY_NUDGES }),
+                );
+                if let Some(pid) = phase_id {
+                    let _ = state.db.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE agent_plan_phases SET status = 'needs_attention', updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2",
+                            params![plan_id, pid],
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                }
+                return Err(format!(
+                    "Agent went idle without reporting completion after {} reminders",
+                    MAX_READY_NUDGES
+                ));
+            }
+            nudges_sent += 1;
+            tracing::warn!(
+                session_id,
+                attempt = nudges_sent,
+                "coordinator re-requesting ready report"
+            );
+            let nudge = format!(
+                "You have not reported completion to the coordinator. If this turn is complete, run exactly:\n{}\nIf you are not finished, continue the work.",
+                report_command(session_id, "ready")
+            );
+            terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", nudge))
+                .await?;
+            // Restart the idle clock so the agent has time to respond before the
+            // next re-request.
+            last_changed_at = Instant::now();
+        }
+
+        sleep(Duration::from_millis(1_000)).await;
     }
 }
 
@@ -1370,9 +2305,6 @@ fn snapshot_idle_key(snapshot: &terminal::TerminalSnapshot) -> String {
     normalize_terminal_snapshot_for_idle(&snapshot.content)
 }
 
-fn terminal_content_contains_marker(content: &str, marker: &str) -> bool {
-    normalize_terminal_snapshot_for_idle(content).contains(marker)
-}
 
 fn normalize_terminal_snapshot_for_idle(content: &str) -> String {
     strip_ansi_escapes(content)
@@ -1398,7 +2330,10 @@ fn normalize_terminal_snapshot_for_idle(content: &str) -> String {
             {
                 return None;
             }
-            if trimmed.contains("Grok Composer") && trimmed.contains("always-approve") {
+            // The persistent Grok status footer ("Grok Build · always-approve",
+            // formerly "Grok Composer …"). Match on the stable token so a version
+            // rename doesn't unfilter it.
+            if trimmed.contains("always-approve") {
                 return None;
             }
             if trimmed.starts_with("│ ❯") {
@@ -1411,11 +2346,13 @@ fn normalize_terminal_snapshot_for_idle(content: &str) -> String {
 }
 
 fn is_volatile_grok_task_line(trimmed: &str) -> bool {
-    trimmed.starts_with('❯')
-        || trimmed.starts_with("⸬ ")
-        || trimmed.contains("[⛶]")
-        || trimmed.contains("[✗]")
-        || (trimmed.contains("+) ") && trimmed.contains('h') && trimmed.contains("m "))
+    // IMPORTANT: Grok's *working* indicator — the spinner + elapsed timer + run
+    // markers ([✗]/[⛶]) — is intentionally NOT filtered. While the agent works that
+    // line changes every second, so the idle key keeps changing and the agent
+    // registers as ACTIVE. Filtering it (as we used to) made a busy agent look idle
+    // after the nudge window and fired premature ready-nudges during long
+    // tool-runs. Only collapsed-list bullets are dropped here.
+    trimmed.starts_with('❯') || trimmed.starts_with("⸬ ")
 }
 
 fn strip_ansi_escapes(content: &str) -> String {
@@ -1438,13 +2375,9 @@ fn strip_ansi_escapes(content: &str) -> String {
 }
 
 async fn dispatch_planning_review(state: &AppState, run: &AgentPlanRun) -> Result<(), String> {
-    let reviewer_session_id = run
-        .plan
-        .reviewer_session_id
-        .clone()
-        .ok_or_else(|| "Planning run has no reviewer session".to_string())?;
-    let prompt = planning_reviewer_prompt(state, run)?;
-    terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
+    // Planning review fans out into ephemeral Product/QA/Lead reviewers, spawned by
+    // `run_planning_lens_fanout_review` from the `planning_review_running` arm. Here
+    // we only transition into review; the persistent reviewer session is unused.
     state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE agent_plans SET status = 'planning_review_running', updated_at = datetime('now') WHERE id = ?1",
@@ -1458,6 +2391,106 @@ async fn dispatch_planning_review(state: &AppState, run: &AgentPlanRun) -> Resul
         None,
         "planning_review_started",
         json!({}),
+    )
+}
+
+/// Read the `verdict` field straight from an event's stored payload (independent of
+/// enrichment), used to count review rounds.
+fn event_payload_verdict(event: &AgentPlanEvent) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&event.payload_json)
+        .ok()
+        .and_then(|p| {
+            p.get("verdict")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_uppercase())
+        })
+}
+
+/// Consecutive non-PASS review rounds at the tail of the event log for a given gate
+/// event type (optionally scoped to one phase). Stops at the most recent PASS so an
+/// amend cycle / a later phase starts its count fresh.
+fn count_consecutive_non_pass(
+    events: &[AgentPlanEvent],
+    gate_event_type: &str,
+    start_event_type: &str,
+    phase_id: Option<&str>,
+) -> i64 {
+    let mut n = 0;
+    for event in events.iter().rev() {
+        // Reset boundaries: a manual stop, or a fresh (re)start of this attempt, ends
+        // the backward count. Rounds from before the user last intervened (stopped /
+        // restarted / amended) must NOT carry over — otherwise a re-run of a stuck
+        // plan re-escalates on its very first round.
+        if event.event_type == "agent_plan_stopped" {
+            break;
+        }
+        if event.event_type == start_event_type
+            && phase_id.map_or(true, |pid| event.phase_id.as_deref() == Some(pid))
+        {
+            break;
+        }
+        if event.event_type != gate_event_type {
+            continue;
+        }
+        if let Some(pid) = phase_id {
+            if event.phase_id.as_deref() != Some(pid) {
+                continue;
+            }
+        }
+        match event_payload_verdict(event).as_deref() {
+            Some("PASS") => break,
+            Some(_) => n += 1,
+            None => {}
+        }
+    }
+    n
+}
+
+fn consecutive_non_pass_planning_rounds(run: &AgentPlanRun) -> i64 {
+    count_consecutive_non_pass(
+        &run.events,
+        "planning_gate_result",
+        "planning_started",
+        None,
+    )
+}
+
+fn consecutive_non_pass_phase_rounds(run: &AgentPlanRun, phase_id: &str) -> i64 {
+    count_consecutive_non_pass(
+        &run.events,
+        "agent_phase_gate_result",
+        "agent_phase_started",
+        Some(phase_id),
+    )
+}
+
+/// Stop a development phase that won't converge: pause the run into `needs_attention`
+/// (fires the Discord attention alert) instead of looping T1↔T2 forever.
+async fn escalate_phase_no_converge(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    round: i64,
+    verdict: &str,
+    summary: &str,
+) -> Result<(), String> {
+    let reason = format!(
+        "Phase {} still not passing after {} review rounds (last: {} — {}). Coordinator paused — needs a human decision.",
+        phase.phase_id, round, verdict, summary
+    );
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![reason, run.plan.id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        state,
+        &run.plan.id,
+        Some(&phase.phase_id),
+        "agent_phase_needs_attention",
+        json!({ "reason": reason, "rounds": round }),
     )
 }
 
@@ -1493,13 +2526,9 @@ async fn handle_planning_reviewer_output(
         }
         Some("NEEDS_CHANGES") | Some("BLOCKED") => {
             let verdict = verdict.unwrap();
-            state.db.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE agent_plans SET status = 'planning_planner_running', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    params![review.summary.clone().unwrap_or_else(|| summarize_output(output)), run.plan.id],
-                )
-                .map_err(|e| e.to_string())
-            })?;
+            let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
+            let round = consecutive_non_pass_planning_rounds(run) + 1;
+            // Record this round's verdict regardless of what we do next.
             append_event(
                 state,
                 &run.plan.id,
@@ -1507,6 +2536,34 @@ async fn handle_planning_reviewer_output(
                 "planning_gate_result",
                 review_payload(&verdict, Some("sent_back_to_planner"), &review),
             )?;
+            // Loop guard: a review that never converges must not churn forever.
+            if round >= MAX_REVISION_ROUNDS {
+                let reason = format!(
+                    "Plan still not passing after {} review rounds (last: {} — {}). Coordinator paused — needs a human decision.",
+                    round, verdict, summary
+                );
+                state.db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2",
+                        params![reason, run.plan.id],
+                    )
+                    .map_err(|e| e.to_string())
+                })?;
+                return append_event(
+                    state,
+                    &run.plan.id,
+                    None,
+                    "planning_needs_attention",
+                    json!({ "reason": reason, "rounds": round }),
+                );
+            }
+            state.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET status = 'planning_planner_running', error = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    params![summary, run.plan.id],
+                )
+                .map_err(|e| e.to_string())
+            })?;
             send_planning_feedback_to_planner(state, run, output, &review).await
         }
         _ => clarify_planning_or_needs_attention(state, run).await,
@@ -1525,9 +2582,12 @@ async fn send_planning_feedback_to_planner(
         .clone()
         .ok_or_else(|| "Planning run has no planner session".to_string())?;
     let feedback = reviewer_verdict_block(reviewer_output);
-    let prompt = format!(
-        "T2 reviewed the plan and requested changes.\n\nReviewer feedback:\n{}\n\nUpdate only the plan files at {}. When the plan is ready for review again, say exactly {}.",
-        feedback, run.plan.plan_path, PLANNER_READY_MARKER
+    let prompt = append_worker_report(
+        run,
+        format!(
+            "T2 reviewed the plan and requested changes.\n\nReviewer feedback:\n{}\n\nUpdate only the plan files at {}.",
+            feedback, run.plan.plan_path
+        ),
     );
     terminal::send_terminal_input(state, planner_session_id, format!("{}\r", prompt)).await?;
     append_event(
@@ -1557,7 +2617,7 @@ async fn clarify_planning_or_needs_attention(
             &run.plan.id,
             None,
             "planning_needs_attention",
-            json!({ "reason": "unknown_verdict" }),
+            json!({ "reason": "T2 did not return a parseable planning verdict after 5 clarification attempts" }),
         );
     }
 
@@ -1566,7 +2626,10 @@ async fn clarify_planning_or_needs_attention(
         .reviewer_session_id
         .clone()
         .ok_or_else(|| "Planning run has no reviewer session".to_string())?;
-    let prompt = "Return only this footer, with no extra text:\nPLAN: <plan path>\nVERDICT: PASS | NEEDS_CHANGES | BLOCKED\nSUMMARY: <one paragraph>\nFINDINGS:\n- <finding or none>\nNEXT_STEPS:\n- <step or none>";
+    let prompt = format!(
+        "You have not reported a verdict to the coordinator. Run exactly this command — replace <PASS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
+        report_command(&reviewer_session_id, "verdict")
+    );
     terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
     append_event(
         state,
@@ -1582,13 +2645,10 @@ async fn dispatch_review(
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
 ) -> Result<(), String> {
-    let reviewer_session_id = run
-        .plan
-        .reviewer_session_id
-        .clone()
-        .ok_or_else(|| "Plan has no reviewer session".to_string())?;
-    let prompt = reviewer_phase_prompt(state, run, phase)?;
-    terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
+    // Development review fans out into ephemeral Product/QA/Lead reviewers, spawned
+    // by `run_lens_fanout_review` from the `phase_review_running` arm. Here we only
+    // transition the phase into review; the persistent reviewer session is not used
+    // for the fan-out.
     state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE agent_plans SET status = 'phase_review_running', updated_at = datetime('now') WHERE id = ?1",
@@ -1640,6 +2700,11 @@ async fn handle_reviewer_output(
                 "agent_phase_gate_result",
                 review_payload("NEEDS_CHANGES", None, &review),
             )?;
+            let round = consecutive_non_pass_phase_rounds(run, &phase.phase_id) + 1;
+            if round >= MAX_REVISION_ROUNDS {
+                let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
+                return escalate_phase_no_converge(state, run, phase, round, "NEEDS_CHANGES", &summary).await;
+            }
             send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
         Some("BLOCKED") => {
@@ -1662,6 +2727,11 @@ async fn handle_reviewer_output(
                 "agent_phase_gate_result",
                 review_payload("BLOCKED", Some("sent_back_to_worker"), &review),
             )?;
+            let round = consecutive_non_pass_phase_rounds(run, &phase.phase_id) + 1;
+            if round >= MAX_REVISION_ROUNDS {
+                let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
+                return escalate_phase_no_converge(state, run, phase, round, "BLOCKED", &summary).await;
+            }
             send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
         _ => clarify_or_needs_attention(state, run, phase).await,
@@ -1680,7 +2750,7 @@ async fn send_reviewer_feedback_to_worker(
         .worker_session_id
         .clone()
         .ok_or_else(|| "Plan has no worker session".to_string())?;
-    let prompt = reviewer_feedback_prompt(phase, reviewer_output);
+    let prompt = append_worker_report(run, reviewer_feedback_prompt(phase, reviewer_output));
     terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
     state.db.with_conn(|conn| {
         conn.execute(
@@ -1727,7 +2797,7 @@ async fn clarify_or_needs_attention(
             &run.plan.id,
             Some(&phase.phase_id),
             "agent_phase_needs_attention",
-            json!({ "reason": "unknown_verdict" }),
+            json!({ "reason": "T2 did not return a parseable verdict after 5 clarification attempts" }),
         );
     }
 
@@ -1743,7 +2813,10 @@ async fn clarify_or_needs_attention(
         .reviewer_session_id
         .clone()
         .ok_or_else(|| "Plan has no reviewer session".to_string())?;
-    let prompt = "Return only this footer, with no extra text:\nPHASE: <phase id>\nVERDICT: PASS | NEEDS_CHANGES | BLOCKED\nSUMMARY: <one sentence>\nFINDINGS:\n- <finding or none>\nNEXT_STEPS:\n- <step or none>";
+    let prompt = format!(
+        "You have not reported a verdict to the coordinator. Run exactly this command — replace <PASS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
+        report_command(&reviewer_session_id, "verdict")
+    );
     terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
     append_event(
         state,
@@ -2060,7 +3133,11 @@ fn first_markdown_heading(path: &Path) -> Option<String> {
 fn default_model_for_provider(provider: &str) -> Option<String> {
     match provider {
         "ollama" => Some("qwen3.5:2b".to_string()),
-        "grok" => Some("grok-composer-2.5-fast".to_string()),
+        // `grok-composer-2.5-fast` is the cheap/weak model — too weak for the
+        // planner and the review lenses (they make real judgments). Use Grok's own
+        // default, `grok-build`, the stronger model. Applies to worker, reviewer,
+        // and all three ephemeral lens reviewers.
+        "grok" => Some("grok-build".to_string()),
         _ => None,
     }
 }
@@ -2075,12 +3152,16 @@ fn worker_phase_prompt(
         .join(&phase.phase_id);
     let tasks_path = phase_path.join("tasks");
     let settings = planner_prompts::load_prompt_settings()?;
-    Ok(planner_prompts::render_template(
+    let base = planner_prompts::render_template(
         &settings.development.worker,
         &phase_template_values(state, run, phase, &phase_path, &tasks_path),
-    ))
+    );
+    Ok(append_worker_report(run, base))
 }
 
+// Single-reviewer (all-lenses) development prompt. Superseded by the lens fan-out
+// (`run_lens_fanout_review`); kept as a fallback if we ever want non-fanout review.
+#[allow(dead_code)]
 fn reviewer_phase_prompt(
     state: &AppState,
     run: &AgentPlanRun,
@@ -2091,10 +3172,11 @@ fn reviewer_phase_prompt(
         .join(&phase.phase_id);
     let tasks_path = phase_path.join("tasks");
     let settings = planner_prompts::load_prompt_settings()?;
-    Ok(planner_prompts::render_template(
+    let base = planner_prompts::render_template(
         &settings.development.reviewer,
         &phase_template_values(state, run, phase, &phase_path, &tasks_path),
-    ))
+    );
+    Ok(append_reviewer_report(run, base))
 }
 
 fn phase_template_values(
@@ -2211,12 +3293,13 @@ fn planning_planner_prompt(state: &AppState, run: &AgentPlanRun) -> Result<Strin
     } else {
         &settings.planning.planner
     };
-    Ok(planner_prompts::render_template(
-        template,
-        &planning_template_values(state, run),
-    ))
+    let base = planner_prompts::render_template(template, &planning_template_values(state, run));
+    Ok(append_worker_report(run, base))
 }
 
+// Superseded by `planning_lens_reviewer_prompt` (3-lens fan-out); retained as the
+// reference single-reviewer planning prompt.
+#[allow(dead_code)]
 fn planning_reviewer_prompt(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
     let settings = planner_prompts::load_prompt_settings()?;
     let amending = run
@@ -2230,10 +3313,8 @@ fn planning_reviewer_prompt(state: &AppState, run: &AgentPlanRun) -> Result<Stri
     } else {
         &settings.planning.reviewer
     };
-    Ok(planner_prompts::render_template(
-        template,
-        &planning_template_values(state, run),
-    ))
+    let base = planner_prompts::render_template(template, &planning_template_values(state, run));
+    Ok(append_reviewer_report(run, base))
 }
 
 fn planning_clarification_attempts(run: &AgentPlanRun) -> Result<i64, String> {
@@ -2397,6 +3478,17 @@ fn parse_verdict_line(line: &str) -> Option<String> {
     let upper = normalized.to_ascii_uppercase();
     let idx = upper.find("VERDICT:")?;
     let value = normalized[idx + "VERDICT:".len()..].trim();
+    // Ignore the instruction/echo line that lists every option, e.g.
+    // "VERDICT: PASS | NEEDS_CHANGES | BLOCKED" — only a single concrete verdict
+    // counts (otherwise we'd parse our own clarification prompt as a PASS).
+    let value_upper = value.to_ascii_uppercase();
+    let option_count = ["PASS", "NEEDS_CHANGES", "BLOCKED"]
+        .iter()
+        .filter(|token| value_upper.contains(*token))
+        .count();
+    if option_count > 1 {
+        return None;
+    }
     normalize_verdict_token(value)
 }
 
@@ -2412,10 +3504,63 @@ fn normalize_verdict_token(value: &str) -> Option<String> {
     }
 }
 
+/// Strip ANSI/VT escape sequences (CSI `ESC [ … final`, OSC `ESC ] … BEL/ST`). The
+/// old code only dropped the ESC byte, leaving the visible `[38;2;…m` parameter text
+/// behind — which then polluted scraped summaries with terminal color codes.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\x07' {
+                        break;
+                    }
+                    if n == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn marker_search_text(line: &str) -> String {
-    line.chars()
+    strip_ansi(line)
+        .chars()
         .filter(|ch| !ch.is_control())
         .collect::<String>()
+}
+
+/// True for an agent-TUI status/shortcut bar line (e.g. Grok's
+/// "Shift+Tab :mode │ Ctrl+c :cancel │ …") so it never gets scraped as a summary.
+fn is_terminal_chrome_line(lower: &str) -> bool {
+    lower.contains("shift+tab")
+        || lower.contains(":shortcuts")
+        || lower.contains(":interject")
+        || lower.contains(":cancel")
+        || (lower.contains("ctrl+") && lower.contains(':'))
 }
 
 fn summarize_output(output: &str) -> String {
@@ -2535,6 +3680,7 @@ fn is_summary_fallback_line(line: &str) -> bool {
         && !trimmed
             .chars()
             .all(|ch| matches!(ch, '-' | '_' | '=' | ' '))
+        && !is_terminal_chrome_line(&lower)
         && !lower.contains("bypass permissions")
         && !lower.starts_with("worked for")
         && !lower.starts_with("cogitated")
@@ -2685,6 +3831,9 @@ fn append_event(
         Ok(())
     })?;
     publish_plan_update(state, plan_id);
+    // Single chokepoint for out-of-band alerts: notifiable events (phase
+    // started/passed/changes/attention, plan completed) fire a Discord message.
+    maybe_notify_discord(state, plan_id, phase_id, event_type, &payload);
     Ok(())
 }
 
@@ -3515,26 +4664,200 @@ mod coordinator_terminal_tests {
     }
 
     #[test]
+    fn parse_verdict_reads_long_joined_footer_line() {
+        // tmux -J joins the whole footer into one long line; the verdict must
+        // still parse out of the prose that follows it.
+        let output = "PHASE: 04-validation VERDICT: PASS SUMMARY: Re-validation confirms phase 04 \
+            still meets done criteria; 9/9 E2E green, worker 185/185. FINDINGS: none NEXT_STEPS: none";
+        assert_eq!(parse_verdict(output).as_deref(), Some("PASS"));
+    }
+
+    #[test]
+    fn discord_message_maps_notifiable_events() {
+        let p = |t: &str, ph: Option<&str>, v: serde_json::Value| discord_message_for(t, ph, &v);
+        // phase pass → success
+        let (sev, head, _) = p(
+            "agent_phase_gate_result",
+            Some("02-x"),
+            serde_json::json!({ "verdict": "PASS", "summary": "all good" }),
+        )
+        .unwrap();
+        assert_eq!(sev, "success");
+        assert!(head.contains("passed"));
+        // a non-PASS T2 result is NOT alerted (it just loops back to T1)
+        assert!(p(
+            "agent_phase_gate_result",
+            Some("02-x"),
+            serde_json::json!({ "verdict": "NEEDS_CHANGES", "reason": "missing test" }),
+        )
+        .is_none());
+        assert!(p(
+            "planning_gate_result",
+            None,
+            serde_json::json!({ "verdict": "NEEDS_CHANGES" }),
+        )
+        .is_none());
+        // escalation → attention
+        assert_eq!(
+            p("agent_phase_needs_attention", Some("x"), serde_json::json!({})).unwrap().0,
+            "attention"
+        );
+        // plan completed → success
+        assert_eq!(
+            p("agent_plan_completed", None, serde_json::json!({})).unwrap().0,
+            "success"
+        );
+        // blocked → attention
+        assert_eq!(
+            p("agent_blocked", Some("x"), serde_json::json!({})).unwrap().0,
+            "attention"
+        );
+        // routine / progress events are not notified (quiet mode: block or done only)
+        assert!(p("agent_phase_worker_idle", Some("x"), serde_json::json!({})).is_none());
+        assert!(p("agent_lens_review_started", Some("x"), serde_json::json!({})).is_none());
+        assert!(p("agent_phase_started", Some("x"), serde_json::json!({})).is_none());
+        assert!(p("planning_started", None, serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn merged_verdict_combines_lens_results() {
+        assert_eq!(merged_verdict(["PASS", "PASS", "PASS"]), "PASS");
+        assert_eq!(merged_verdict(["PASS", "NEEDS_CHANGES", "PASS"]), "NEEDS_CHANGES");
+        assert_eq!(merged_verdict(["PASS", "NEEDS_CHANGES", "BLOCKED"]), "BLOCKED");
+        assert_eq!(merged_verdict(["BLOCKED", "PASS", "PASS"]), "BLOCKED");
+        // empty / unexpected tokens fail safe
+        assert_eq!(merged_verdict(std::iter::empty::<&str>()), "NEEDS_CHANGES");
+        assert_eq!(merged_verdict(["PASS", "weird", "PASS"]), "NEEDS_CHANGES");
+    }
+
+    fn gate_event(event_type: &str, phase_id: Option<&str>, verdict: &str) -> AgentPlanEvent {
+        AgentPlanEvent {
+            id: String::new(),
+            plan_id: String::new(),
+            phase_id: phase_id.map(str::to_string),
+            phase_index: None,
+            phase_title: None,
+            event_type: event_type.to_string(),
+            actor: String::new(),
+            category: String::new(),
+            summary: String::new(),
+            status_before: None,
+            status_after: None,
+            reason: None,
+            verdict: None,
+            task_id: None,
+            clarification_attempt: None,
+            payload_json: format!("{{\"verdict\":\"{}\"}}", verdict),
+            created_at: String::new(),
+        }
+    }
+
+    fn boundary_event(event_type: &str) -> AgentPlanEvent {
+        gate_event(event_type, None, "")
+    }
+
+    #[test]
+    fn count_consecutive_non_pass_stops_at_last_pass_and_scopes_phase() {
+        // Planning: three NEEDS_CHANGES in a row → 3.
+        let planning = vec![
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+        ];
+        assert_eq!(
+            count_consecutive_non_pass(&planning, "planning_gate_result", "planning_started", None),
+            3
+        );
+
+        // A PASS earlier resets the count — only rounds after it are counted.
+        let with_pass = vec![
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "PASS"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "BLOCKED"),
+        ];
+        assert_eq!(
+            count_consecutive_non_pass(&with_pass, "planning_gate_result", "planning_started", None),
+            2
+        );
+
+        // A manual stop / restart resets the count — pre-stop rounds don't carry over
+        // (regression guard for the false "9 rounds" escalation on a re-run).
+        let restarted = vec![
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            boundary_event("agent_plan_stopped"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+        ];
+        assert_eq!(
+            count_consecutive_non_pass(&restarted, "planning_gate_result", "planning_started", None),
+            1
+        );
+        let reamended = vec![
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            boundary_event("planning_started"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+            gate_event("planning_gate_result", None, "NEEDS_CHANGES"),
+        ];
+        assert_eq!(
+            count_consecutive_non_pass(&reamended, "planning_gate_result", "planning_started", None),
+            2
+        );
+
+        // Dev: only the named phase's gate results count.
+        let dev = vec![
+            gate_event("agent_phase_gate_result", Some("01-x"), "NEEDS_CHANGES"),
+            gate_event("agent_phase_gate_result", Some("02-y"), "NEEDS_CHANGES"),
+            gate_event("agent_phase_gate_result", Some("02-y"), "NEEDS_CHANGES"),
+        ];
+        assert_eq!(
+            count_consecutive_non_pass(&dev, "agent_phase_gate_result", "agent_phase_started", Some("02-y")),
+            2
+        );
+        assert_eq!(
+            count_consecutive_non_pass(&dev, "agent_phase_gate_result", "agent_phase_started", Some("01-x")),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_verdict_ignores_clarification_instruction_echo() {
+        // The clarification prompt we send lists every option; its echo must not
+        // be misread as a PASS verdict.
+        let output = "Return only this footer:\nVERDICT: PASS | NEEDS_CHANGES | BLOCKED\nSUMMARY: <one sentence>";
+        assert_eq!(parse_verdict(output), None);
+    }
+
+    #[test]
     fn parse_verdict_accepts_structured_footer() {
         let output = "PHASE: 01-or-schedule\nVERDICT: NEEDS_CHANGES\nSUMMARY: missing screenshot";
         assert_eq!(parse_verdict(output).as_deref(), Some("NEEDS_CHANGES"));
     }
 
     #[test]
-    fn ready_marker_survives_grok_chrome_filtering() {
-        let output = "Both tasks are READY_FOR_T2_VALIDATION.\n╭ input box\n│ ❯\n█\nGrok Composer 2.5 Fast · always-approve";
-        assert!(has_worker_ready_marker(output));
-    }
-
-    #[test]
-    fn idle_key_ignores_grok_status_chrome() {
-        let base = "Worker finished phase 01.\nREADY_FOR_T2_VALIDATION\nTurn completed in 3.0s.";
+    fn idle_key_ignores_grok_static_chrome() {
+        // Static idle chrome (context bar, task header, cursor, prompt, the
+        // "always-approve" footer) must not change the idle key.
+        let base = "Worker finished phase 01.\nTurn completed in 3.0s.";
         let with_chrome = format!(
-            "{base}\n~/Documents/Workspace │ ⸬ 4 │ 156K / 200K │ 3 ✓\n▾ Tasks 4\n⋅ running task (183+) 2h48m [⛶][✗]\n█\n│ ❯\nGrok Composer 2.5 Fast · always-approve"
+            "{base}\n~/Documents/Workspace │ ⸬ 4 │ 156K / 200K │ 3 ✓\n▾ Tasks 4\n█\n│ ❯\nGrok Build · always-approve"
         );
         assert_eq!(
             normalize_terminal_snapshot_for_idle(&base),
             normalize_terminal_snapshot_for_idle(&with_chrome)
+        );
+    }
+
+    #[test]
+    fn idle_key_treats_working_spinner_as_activity() {
+        // The animated working line (spinner + elapsed timer + run marker) MUST
+        // change the idle key so a busy agent is never seen as idle / nudged.
+        let base = "Reading files for the phase.";
+        let working = format!("{base}\n⠋ Thinking… 0.3s 2m39s ⇣145k [✗]");
+        assert_ne!(
+            normalize_terminal_snapshot_for_idle(&base),
+            normalize_terminal_snapshot_for_idle(&working)
         );
     }
 }

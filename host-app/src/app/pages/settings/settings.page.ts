@@ -67,6 +67,7 @@ export class SettingsPage {
   plannerMethodologyPath = DEFAULT_HOST_SETTINGS.plannerMethodologyPath;
   plannerConventionsPath = DEFAULT_HOST_SETTINGS.plannerConventionsPath;
   webClientUrl = DEFAULT_HOST_SETTINGS.webClientUrl;
+  discordWebhookUrl = DEFAULT_HOST_SETTINGS.discordWebhookUrl;
 
   constructor() {
     void this.load();
@@ -113,6 +114,7 @@ export class SettingsPage {
     this.plannerMethodologyPath = settings.plannerMethodologyPath;
     this.plannerConventionsPath = settings.plannerConventionsPath;
     this.webClientUrl = settings.webClientUrl;
+    this.discordWebhookUrl = settings.discordWebhookUrl;
   }
 
   private snapshot(): HostSettings {
@@ -123,6 +125,7 @@ export class SettingsPage {
       plannerMethodologyPath: this.plannerMethodologyPath.trim(),
       plannerConventionsPath: this.plannerConventionsPath.trim(),
       webClientUrl: this.webClientUrl.trim(),
+      discordWebhookUrl: this.discordWebhookUrl.trim(),
     };
   }
 }

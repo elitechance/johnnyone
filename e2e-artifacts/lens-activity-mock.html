@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Lens activity mock — PR / QA / LE</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #0f1722; --raised: #16202c; --border: #263241;
+    --border-bright: #33465c; --fg: #dbe7f3; --fg-strong: #f3f7fb; --fg-muted: #8fa0b3;
+    --blue: #64b5ff; --green: #57d68d; --yellow: #fbbf24; --red: #fb7185;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; padding: 24px; }
+  .panel { max-width: 760px; margin: 0 auto; border: 1px solid var(--border);
+    border-radius: 10px; background: var(--panel); overflow: hidden; }
+  .panel > header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border); background: var(--raised); }
+  .panel > header .badge { font-size: 11px; font-weight: 700; letter-spacing: .04em;
+    color: var(--blue); border: 1px solid #2c4663; border-radius: 5px; padding: 2px 7px; }
+  .panel > header strong { color: var(--fg-strong); }
+  .panel > header .phase { margin-left: auto; color: var(--fg-muted); font-size: 12px;
+    font-family: ui-monospace, Menlo, monospace; }
+
+  /* (b) lens status strip */
+  .lens-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 14px 16px;
+    border-bottom: 1px solid var(--border); }
+  .lens { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    border: 1px solid var(--border-bright); border-radius: 8px; background: #0b1119; }
+  .lens .dot { width: 10px; height: 10px; border-radius: 999px; flex: 0 0 auto; }
+  .lens .name { font-weight: 700; color: var(--fg-strong); }
+  .lens .state { margin-left: auto; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .lens.pass { border-color: #1f5132; } .lens.pass .dot { background: var(--green); }
+  .lens.pass .state { color: var(--green); }
+  .lens.run  .dot { background: var(--blue); box-shadow: 0 0 0 3px rgba(100,181,255,.18); }
+  .lens.run  .state { color: var(--blue); }
+  .lens.warn { border-color: #8a5d0a; } .lens.warn .dot { background: var(--yellow); }
+  .lens.warn .state { color: var(--yellow); }
+  .lens.block { border-color: #7f1d1d; } .lens.block .dot { background: var(--red); }
+  .lens.block .state { color: var(--red); }
+
+  /* (a) activity feed */
+  .feed { padding: 8px 0; }
+  .ev { display: grid; grid-template-columns: 56px 74px 1fr; gap: 10px; align-items: baseline;
+    padding: 7px 16px; border-left: 3px solid transparent; }
+  .ev:hover { background: rgba(255,255,255,.02); }
+  .ev .t { color: #5a6271; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .ev .tag { font-size: 11px; font-weight: 700; text-align: center; border-radius: 5px;
+    padding: 2px 0; }
+  .ev .msg { color: var(--fg); }
+  .ev .msg .ev-evidence { color: var(--fg-muted); font-family: ui-monospace, Menlo, monospace;
+    font-size: 12px; }
+  .tag.pr { color: #c9b6ff; background: rgba(160,130,255,.12); }
+  .tag.qa { color: #9fd0ff; background: rgba(100,181,255,.12); }
+  .tag.le { color: #ffd9a3; background: rgba(251,191,36,.12); }
+  .tag.co { color: var(--fg-muted); background: rgba(143,160,179,.12); }
+  /* severity stripe on the left edge */
+  .ev.info { border-left-color: #2c4663; }
+  .ev.pass { border-left-color: var(--green); }
+  .ev.warn { border-left-color: var(--yellow); }
+  .ev.attn { border-left-color: var(--red); }
+  .ev.attn .msg { color: #ffd0d6; }
+  .ev .sev { font-size: 11px; color: var(--fg-muted); }
+  .legend { display: flex; gap: 14px; padding: 10px 16px; border-top: 1px solid var(--border);
+    color: var(--fg-muted); font-size: 12px; background: var(--raised); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <header>
+      <span class="badge">T2 · LENS REVIEW</span>
+      <strong>Phase review — 3 lenses</strong>
+      <span class="phase">OC June 13 · 04-validation</span>
+    </header>
+
+    <!-- (b) at-a-glance lens status strip -->
+    <div class="lens-strip">
+      <div class="lens pass"><span class="dot"></span><span class="name">Product</span><span class="state">PASS</span></div>
+      <div class="lens warn"><span class="dot"></span><span class="name">QA</span><span class="state">NEEDS_CHANGES</span></div>
+      <div class="lens block"><span class="dot"></span><span class="name">Lead</span><span class="state">BLOCKED</span></div>
+    </div>
+
+    <!-- (a) activity feed -->
+    <div class="feed">
+      <div class="ev info"><span class="t">7:02 PM</span><span class="tag co">CO</span><span class="msg">Review started — spawning Product / QA / Lead</span></div>
+      <div class="ev info"><span class="t">7:02 PM</span><span class="tag pr">PR</span><span class="msg">Review started</span></div>
+      <div class="ev info"><span class="t">7:02 PM</span><span class="tag qa">QA</span><span class="msg">Review started</span></div>
+      <div class="ev info"><span class="t">7:02 PM</span><span class="tag le">LE</span><span class="msg">Review started</span></div>
+      <div class="ev info"><span class="t">7:03 PM</span><span class="tag qa">QA</span><span class="msg">Running e2e — 3/5 specs <span class="ev-evidence">· consult-flow.spec.ts</span></span></div>
+      <div class="ev pass"><span class="t">7:04 PM</span><span class="tag pr">PR</span><span class="msg">PASS — screens match mocks (END CONSULT placement OK)</span></div>
+      <div class="ev attn"><span class="t">7:05 PM</span><span class="tag le">LE</span><span class="msg">Blocked — needs a decision on tenant scoping for shared apps <span class="ev-evidence">· wants human</span></span></div>
+      <div class="ev warn"><span class="t">7:06 PM</span><span class="tag qa">QA</span><span class="msg">NEEDS_CHANGES — patient-search not wired to the queue <span class="ev-evidence">· patient-search.component.ts:42</span></span></div>
+      <div class="ev attn"><span class="t">7:06 PM</span><span class="tag co">CO</span><span class="msg">Merged verdict: <strong>NEEDS_CHANGES</strong> — sent back to T1 with [QA]+[Lead] findings</span></div>
+    </div>
+
+    <div class="legend">
+      <span><i style="background:#2c4663"></i>info</span>
+      <span><i style="background:#57d68d"></i>pass</span>
+      <span><i style="background:#fbbf24"></i>needs-changes</span>
+      <span><i style="background:#fb7185"></i>attention / blocked</span>
+    </div>
+  </div>
+</body>
+</html>

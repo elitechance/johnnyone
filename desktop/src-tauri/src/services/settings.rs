@@ -8,6 +8,9 @@ pub const KEY_USER_ID: &str = "user_id";
 pub const KEY_PLANNER_METHODOLOGY_PATH: &str = "planner_methodology_path";
 pub const KEY_PLANNER_CONVENTIONS_PATH: &str = "planner_conventions_path";
 pub const KEY_WEB_CLIENT_URL: &str = "web_client_url";
+/// Discord incoming-webhook URL for attention alerts (blocked / needs-human).
+/// Empty = alerts disabled. Read by the coordinator's notifier.
+pub const KEY_DISCORD_WEBHOOK_URL: &str = "discord_webhook_url";
 
 pub const DEFAULT_WORKER_URL: &str = "https://johnnyone.ethan-353.workers.dev";
 pub const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -31,6 +34,7 @@ pub struct HostSettings {
     pub planner_methodology_path: String,
     pub planner_conventions_path: String,
     pub web_client_url: String,
+    pub discord_webhook_url: String,
 }
 
 pub fn get_setting(state: &AppState, key: String) -> Result<String, String> {
@@ -79,6 +83,7 @@ pub fn load_host_settings(state: &AppState) -> HostSettings {
             DEFAULT_CONVENTIONS_REL,
         ),
         web_client_url: get_setting_or(state, KEY_WEB_CLIENT_URL, DEFAULT_WEB_CLIENT_URL),
+        discord_webhook_url: get_setting_or(state, KEY_DISCORD_WEBHOOK_URL, ""),
     }
 }
 

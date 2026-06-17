@@ -187,14 +187,21 @@ Deploy with the **`lokal` CLI** (preferred — wraps build + Cloudflare deploy).
 
 ```bash
 # From personal/apps/johnnyone/
+npm run deploy:web                      # web/Pages: fresh build + lokal cf pages deploy --env prod
 npm run deploy:worker                   # worker only → lokal cf worker deploy --env prod
-PATH="$PWD/node_modules/.bin:$PATH" \
-  lokal cf pages deploy --env prod      # web/Pages only (nx must be on PATH)
 lokal cf deploy --env prod              # worker + Pages, both
 lokal cf db migrate --env prod          # apply D1 migrations (remote)
 lokal cf db status --env prod           # see applied vs pending migrations
 lokal cf worker secrets list --env prod # verify JWT_SECRET is set
 ```
+
+`npm run deploy:web` is the convenience wrapper for the web app — it runs
+`nx build web --skip-nx-cache && lokal cf pages deploy --env prod` (the
+`--skip-nx-cache` guarantees a fresh build, never a cache-replayed stale one).
+Related build-only scripts: `npm run build:web` (fast, cached) and
+`npm run build:web:fresh` (clean, no cache). The raw
+`PATH="$PWD/node_modules/.bin:$PATH" lokal cf pages deploy --env prod` still works
+if you want to deploy an already-built `dist/web` without rebuilding.
 
 ### Resource names (lokal CLI convention)
 

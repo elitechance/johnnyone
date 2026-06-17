@@ -484,7 +484,7 @@ select {
 
 .coordinator-panel {
   display: grid;
-  grid-template-rows: 42px minmax(0, 1fr);
+  grid-template-rows: 42px auto minmax(0, 1fr);
 }
 
 .coordinator-panel header {
@@ -504,13 +504,140 @@ select {
   scrollbar-width: none;
 }
 
+// --- Run stage indicator: stepper + current-stage line (CO panel, row 2) ---
+.run-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  border-top: 1px solid #1c2838;
+  border-bottom: 1px solid #1c2838;
+  background: #0a1422;
+  border-left: 3px solid #3b5a86;
+}
+.run-stage[data-tone='done'] {
+  border-left-color: #1f6b45;
+}
+.run-stage[data-tone='attention'] {
+  border-left-color: #b4502a;
+  background: #14100d;
+}
+
+.run-stage-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.run-stage-step {
+  color: #5b6b7e;
+  font-weight: 600;
+}
+.run-stage-step.done {
+  color: #6e8aa8;
+}
+.run-stage-step.active {
+  color: #93c5fd;
+}
+.run-stage[data-tone='done'] .run-stage-step.active {
+  color: #86efac;
+}
+.run-stage[data-tone='attention'] .run-stage-step.active {
+  color: #fca5a5;
+}
+.run-stage-sep {
+  color: #34455a;
+}
+
+.run-stage-now {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+
+  strong {
+    font-size: 13px;
+    color: #d4e0ee;
+  }
+  span {
+    min-width: 0;
+    font-size: 12px;
+    color: #8fa0b3;
+  }
+}
+
+// Friendly stage badge in the T1/T2 panel headers (replaces the raw status string).
+.state.stage {
+  text-transform: none;
+  border: 1px solid #2a4a6b;
+  background: #0c1d2e;
+  color: #93c5fd;
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+.state.stage[data-tone='done'] {
+  border-color: #1f6b45;
+  background: #0d2017;
+  color: #86efac;
+}
+.state.stage[data-tone='attention'] {
+  border-color: #7f1d1d;
+  background: #2a1118;
+  color: #fca5a5;
+}
+
+// T2 panel placeholder shown when there's no lens review to display yet.
+.t2-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+
+  .t2-empty-tag {
+    align-self: flex-start;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #7fc7ff;
+    border: 1px solid #2a4a6b;
+    background: #0c1d2e;
+    border-radius: 4px;
+    padding: 3px 7px;
+  }
+  strong {
+    font-size: 14px;
+    color: #d4e0ee;
+  }
+  p {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #8fa0b3;
+  }
+}
+.t2-empty[data-tone='attention'] strong {
+  color: #fca5a5;
+}
+
 .coordinator-body {
   min-height: 0;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 330px;
+  grid-template-columns: 300px minmax(0, 1fr);
   gap: 10px;
   padding: 10px;
   overflow: hidden;
+}
+
+// Planning (and dev before phases are generated) has no phase list — run settings
+// take the full width. (The 3-lens review AND the event feed now live in the T2
+// panel, not here.)
+.coordinator-body.no-phases {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .phase-list,
@@ -522,6 +649,224 @@ select {
   border: 1px solid #263241;
   background: #08111d;
   padding: 10px;
+}
+
+.lens-panel {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid #263241;
+  border-radius: 8px;
+  background: #0a1422;
+  padding: 14px;
+}
+
+// The lens panel is the T2 panel's content (the 3 ephemeral lens reviewers replace
+// the now-idle persistent reviewer terminal). Fill the terminal-card's content row
+// and scroll inside it; the card already draws the border.
+.terminal-card .lens-panel {
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  border: 0;
+  border-radius: 0;
+}
+
+// The panel itself is the scroll container; its children must NOT flex-shrink, or
+// the activity feed gets compressed (and `.lens-activity { overflow:hidden }` then
+// clips the older rows) instead of the panel scrolling to reach them.
+.terminal-card .lens-panel > * {
+  flex: 0 0 auto;
+}
+
+.lens-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  .lens-tag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #7fc7ff;
+    border: 1px solid #2a4a6b;
+    background: #0c1d2e;
+    border-radius: 4px;
+    padding: 3px 7px;
+  }
+
+  .lens-scope {
+    font-size: 13px;
+    font-weight: 600;
+    color: #d4e0ee;
+  }
+}
+
+.lens-pills {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.lens-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid #2c3a4d;
+  border-radius: 8px;
+  background: #0c1726;
+
+  .lens-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #5b6b7e;
+    flex: 0 0 auto;
+  }
+
+  .lens-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #d4e0ee;
+  }
+
+  .lens-verdict {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #8fa0b3;
+  }
+}
+
+.lens-pill.reviewing {
+  .lens-dot { background: #60a5fa; box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18); }
+  .lens-verdict { color: #93c5fd; font-weight: 600; letter-spacing: 0; }
+}
+
+.lens-pill.pass {
+  border-color: #1f6b45;
+  .lens-dot { background: #34d399; }
+  .lens-verdict { color: #86efac; }
+}
+
+.lens-pill.warn {
+  border-color: #7c5a16;
+  .lens-dot { background: #fbbf24; }
+  .lens-verdict { color: #fcd34d; }
+}
+
+.lens-pill.bad {
+  border-color: #7f1d1d;
+  .lens-dot { background: #f87171; }
+  .lens-verdict { color: #fca5a5; }
+}
+
+.lens-activity {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #1c2838;
+  border-radius: 6px;
+  background: #070f1a;
+  overflow: hidden;
+}
+
+.lens-act-row {
+  display: grid;
+  grid-template-columns: 64px 34px 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-left: 2px solid transparent;
+  font-size: 12px;
+
+  & + & {
+    border-top: 1px solid #121d2b;
+  }
+
+  &.attention {
+    border-left-color: #b4502a;
+    background: #14100d;
+  }
+
+  .lens-act-time {
+    color: #6b7c90;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lens-act-actor {
+    text-align: center;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 4px;
+    padding: 2px 0;
+    color: #0a1422;
+    background: #5b6b7e;
+
+    &[data-actor='CO'] { background: #5eead4; }
+    &[data-actor='PR'] { background: #7dd3fc; }
+    &[data-actor='QA'] { background: #fcd34d; }
+    &[data-actor='LE'] { background: #f9a8d4; }
+  }
+
+  .lens-act-text {
+    color: #c4d2e2;
+  }
+
+  .lens-act-verdict {
+    font-weight: 700;
+    &.pass { color: #86efac; }
+    &.warn { color: #fcd34d; }
+    &.bad { color: #fca5a5; }
+  }
+
+  .lens-act-findings {
+    margin: 4px 0 0;
+    padding-left: 16px;
+    list-style: disc;
+
+    li {
+      color: #aab8c8;
+      font-size: 11px;
+      line-height: 1.45;
+      margin-bottom: 2px;
+    }
+  }
+}
+
+.lens-act-empty {
+  padding: 12px;
+  color: #6b7c90;
+  font-size: 12px;
+}
+
+.lens-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 11px;
+  color: #8fa0b3;
+
+  span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #5b6b7e;
+
+    &.info { background: #7dd3fc; }
+    &.pass { background: #34d399; }
+    &.warn { background: #fbbf24; }
+    &.bad { background: #f87171; }
+  }
 }
 
 .section-title {
@@ -1233,22 +1578,48 @@ label {
   background: rgba(100, 181, 255, 0.06);
 }
 
+// Tables are wrapped in .markdown-table-wrap by the renderer so wide tables can
+// scroll horizontally instead of squishing every column.
+// Tables are wrapped in .markdown-table-wrap by the renderer so wide tables can
+// scroll horizontally instead of squishing every column. Grid lines use a
+// lighter slate than the rest of the page so cell boundaries are actually visible
+// against the near-black background.
+.plan-markdown-preview.markdown-content .markdown-table-wrap {
+  margin: 14px 0;
+  overflow-x: auto;
+  border: 1px solid #3a4f67;
+  border-radius: 6px;
+  background: #0b1119;
+}
+
 .plan-markdown-preview.markdown-content table {
   width: 100%;
-  margin: 14px 0;
+  margin: 0;
+  border: 0;
   border-collapse: collapse;
   font-size: 13px;
 }
 
 .plan-markdown-preview.markdown-content :where(th, td) {
-  padding: 7px 9px;
-  border: 1px solid #263241;
+  padding: 8px 12px;
+  border: 1px solid #33465c;
   text-align: left;
+  vertical-align: top;
+  // Let columns breathe; if the total exceeds the container the wrap scrolls
+  // rather than collapsing cells to unreadable widths.
+  min-width: 140px;
+}
+
+.plan-markdown-preview.markdown-content tbody tr:nth-child(even) {
+  background: rgba(159, 197, 232, 0.05);
 }
 
 .plan-markdown-preview.markdown-content th {
-  background: #101722;
+  background: #16202c;
   color: #f3f7fb;
+  white-space: nowrap;
+  // Stronger underline so the header row reads as distinct from the body.
+  border-bottom: 2px solid #4a6480;
 }
 
 .plan-markdown-preview.markdown-content hr {
@@ -1369,7 +1740,7 @@ label {
   max-width: 100%;
   margin: 16px 0;
   overflow-x: auto;
-  border: 1px solid #263241;
+  border: 1px solid #3a4f67;
   border-radius: 10px;
   background: #070c13;
   -webkit-overflow-scrolling: touch;
@@ -1392,8 +1763,8 @@ label {
 :host ::ng-deep .plan-markdown-preview.markdown-content th,
 :host ::ng-deep .plan-markdown-preview.markdown-content td {
   padding: 8px 10px;
-  border-right: 1px solid #263241;
-  border-bottom: 1px solid #263241;
+  border-right: 1px solid #33465c;
+  border-bottom: 1px solid #33465c;
   text-align: left;
   vertical-align: top;
 }
@@ -1402,6 +1773,8 @@ label {
   color: #f3f7fb;
   font-weight: 700;
   white-space: nowrap;
+  // Stronger underline so the header row reads as distinct from the body.
+  border-bottom: 2px solid #4a6480;
 }
 
 :host ::ng-deep .plan-markdown-preview.markdown-content th:last-child,
@@ -1864,7 +2237,7 @@ label {
 
   .coordinator-panel.active-mobile-panel {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
   }
 
   .coordinator-panel header {
@@ -1881,16 +2254,30 @@ label {
     padding-bottom: 2px;
   }
 
-  .coordinator-body {
+  // On a phone the multi-column/area grid is useless: stack every present section
+  // vertically and let the whole body scroll. (Flex ignores the desktop
+  // grid-template-* / grid-area rules, so all sections — phase-list when present,
+  // lens panel, events, settings — show in order regardless of count.)
+  .coordinator-body,
+  .coordinator-body.no-phases {
     min-height: 0;
-    grid-template-rows: minmax(0, 0.9fr) minmax(0, 1fr) auto;
-    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow-y: auto;
   }
 
   .phase-list,
   .event-log,
   .run-settings {
+    flex: 0 0 auto;
     min-height: 160px;
+  }
+
+  // Three side-by-side pills don't fit a phone (verdict text overflows the third
+  // off-screen) — stack them full-width so each lens + verdict stays readable.
+  .lens-pills {
+    grid-template-columns: 1fr;
   }
 
   .agent-message-bar {

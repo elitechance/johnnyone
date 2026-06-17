@@ -9,6 +9,7 @@ export interface HostSettings {
   plannerMethodologyPath: string;
   plannerConventionsPath: string;
   webClientUrl: string;
+  discordWebhookUrl: string;
 }
 
 export const DEFAULT_HOST_SETTINGS: HostSettings = {
@@ -18,6 +19,7 @@ export const DEFAULT_HOST_SETTINGS: HostSettings = {
   plannerMethodologyPath: 'lokal/agents/common/methodology.md',
   plannerConventionsPath: 'lokal/agents/common/conventions',
   webClientUrl: 'https://johnnyone.pages.dev/',
+  discordWebhookUrl: '',
 };
 
 @Injectable({ providedIn: 'root' })
@@ -31,6 +33,7 @@ export class HostSettingsService {
         plannerMethodologyPath
         plannerConventionsPath
         webClientUrl
+        discordWebhookUrl
       }
     }`);
     return data.hostSettings;
@@ -44,6 +47,7 @@ export class HostSettingsService {
       this.setSetting('planner_methodology_path', settings.plannerMethodologyPath.trim()),
       this.setSetting('planner_conventions_path', settings.plannerConventionsPath.trim()),
       this.setSetting('web_client_url', settings.webClientUrl.trim()),
+      this.setSetting('discord_webhook_url', settings.discordWebhookUrl.trim()),
     ]);
   }
 

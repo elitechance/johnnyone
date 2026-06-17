@@ -123,3 +123,42 @@ code {
   padding: 0.05em 0.35em;
   border-radius: 3px;
 }
+
+/* Markdown tables in plan/file previews (.plan-markdown-preview).
+   Global on purpose: these previews render inside Ionic modals, whose content is
+   teleported out of the planner component's host — so component-scoped
+   (:host ::ng-deep) rules don't reach them. Borders use a clearly-visible slate
+   so the grid reads against the near-black background. */
+.plan-markdown-preview.markdown-content .markdown-table-wrap {
+  margin: 16px 0;
+  overflow-x: auto;
+  border: 1px solid #44597a;
+  border-radius: 8px;
+  background: #070c13;
+  -webkit-overflow-scrolling: touch;
+}
+.plan-markdown-preview.markdown-content table {
+  width: 100%;
+  min-width: 480px;
+  margin: 0;
+  border-collapse: collapse;
+  font-size: 13px;
+  color: #dbe7f3;
+}
+.plan-markdown-preview.markdown-content th,
+.plan-markdown-preview.markdown-content td {
+  padding: 8px 12px;
+  border: 1px solid #4a6480;
+  text-align: left;
+  vertical-align: top;
+}
+.plan-markdown-preview.markdown-content thead th {
+  background: #18222f;
+  color: #f3f7fb;
+  font-weight: 700;
+  white-space: nowrap;
+  border-bottom: 2px solid #5e80a8;
+}
+.plan-markdown-preview.markdown-content tbody tr:nth-child(even) {
+  background: rgba(120, 160, 210, 0.06);
+}

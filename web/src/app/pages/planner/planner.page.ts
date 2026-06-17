@@ -1,4 +1,4 @@
-import { CommonModule } from '@angular/common';
+import { CommonModule, Location } from '@angular/common';
 import { Component, HostListener, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
 import { DomSanitizer, SafeHtml, SafeResourceUrl } from '@angular/platform-browser';
 import { FormsModule } from '@angular/forms';
@@ -66,6 +66,7 @@ import { MermaidZoomService } from '../../services/mermaid-zoom.service';
 import { PendingImageAttachment } from '../../components/image-attachment-composer/image-attachment-composer.component';
 import {
   AgentPlan,
+  AgentPlanEvent,
   AgentPlanPhase,
   AgentPlanTask,
   AgentPlanRun,
@@ -84,6 +85,44 @@ import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 
 type PlannerMobilePanel = 'worker' | 'reviewer' | 'coordinator';
 type PlannerTerminalRole = 'worker' | 'reviewer';
+
+interface LensChip {
+  name: string;
+  status: 'reviewing' | 'verdict';
+  verdict?: string;
+}
+
+type LensActor = 'CO' | 'PR' | 'QA' | 'LE';
+
+interface LensActivityItem {
+  id: string;
+  time: string;
+  actor: LensActor;
+  text: string;
+  verdict?: string;
+  findings?: string[];
+  attention: boolean;
+}
+
+interface LensReviewView {
+  scopeLabel: string;
+  lenses: LensChip[];
+  activity: LensActivityItem[];
+}
+
+interface RunStageStep {
+  key: string;
+  label: string;
+}
+
+interface RunStage {
+  badge: string; // short label for headers/chips
+  title: string; // longer one-line stage
+  detail: string; // what's happening right now
+  tone: 'active' | 'done' | 'attention';
+  steps: RunStageStep[];
+  activeIndex: number;
+}
 
 interface TaskStatusDetail {
   loading: boolean;
@@ -139,6 +178,7 @@ export class PlannerPage implements OnInit, OnDestroy {
   private readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
+  private readonly location = inject(Location);
   private readonly sanitizer = inject(DomSanitizer);
   private readonly markdownParser = this.createMarkdownParser();
   private terminalSubscription: Subscription | null = null;
@@ -152,6 +192,9 @@ export class PlannerPage implements OnInit, OnDestroy {
   private selectedPlanHtmlObjectUrl: string | null = null;
   private plannerVisualSubscriptions = new Set<string>();
   private lastPlanTerminalSyncKey = '';
+  /** Plan status last used to auto-follow the mobile panel, so we only switch on a
+   *  real phase transition and don't fight a manual tab selection within a phase. */
+  private lastFollowedRunStatus = '';
   private readonly visibilityChangeHandler = () => {
     if (document.hidden) {
       this.lastPlanTerminalSyncKey = '';
@@ -244,6 +287,300 @@ export class PlannerPage implements OnInit, OnDestroy {
   planningReviewerPrompt = '';
 
   currentPlan = computed(() => this.currentRun()?.plan ?? null);
+
+  /**
+   * Derives the live 3-lens (Product/QA/Lead) review panel for the current run —
+   * chips + an activity feed — from the run's events, scoped to the most recent
+   * review round (everything at/after the last `*review_started`). Returns null
+   * when that round produced no lens events (legacy single-reviewer runs, or a run
+   * that hasn't reached review yet). Renders to match the lens-review mock.
+   */
+  lensReview = computed<LensReviewView | null>(() => {
+    const all = [...(this.currentRun()?.events ?? [])].sort((a, b) =>
+      a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0,
+    );
+    if (!all.length) return null;
+
+    // Scope to the current review round: from the last `*review_started` onward.
+    let roundStart = 0;
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (
+        all[i].eventType === 'planning_review_started' ||
+        all[i].eventType === 'agent_phase_review_started'
+      ) {
+        roundStart = i;
+        break;
+      }
+    }
+    const scope = all.slice(roundStart);
+    if (!scope.some((e) => e.eventType.startsWith('agent_lens'))) return null;
+
+    // Chips: latest event per lens wins (started → reviewing, verdict → verdict).
+    const latestByLens = new Map<string, AgentPlanEvent>();
+    let phaseId: string | undefined;
+    for (const e of scope) {
+      if (
+        e.eventType !== 'agent_lens_review_started' &&
+        e.eventType !== 'agent_lens_verdict'
+      )
+        continue;
+      const lens = this.lensName(e);
+      if (!lens) continue;
+      latestByLens.set(lens, e); // scope is sorted ascending, so last write wins
+      if (e.phaseId) phaseId = e.phaseId;
+    }
+    const order = ['Product', 'QA', 'Lead'];
+    const lenses: LensChip[] = order
+      .filter((name) => latestByLens.has(name))
+      .map((name) => {
+        const e = latestByLens.get(name)!;
+        return e.eventType === 'agent_lens_verdict'
+          ? { name, status: 'verdict', verdict: this.lensVerdict(e) }
+          : { name, status: 'reviewing', verdict: undefined };
+      });
+    if (!lenses.length) return null;
+
+    // Events feed (the "why") — built from the WHOLE run, newest-first so the latest
+    // is on top (no scrolling). This is the event log relocated from the CO panel.
+    const activity = [...all]
+      .reverse()
+      .map((e) => this.lensActivityItem(e))
+      .filter((item): item is LensActivityItem => item !== null)
+      .slice(0, 80);
+
+    const scopeLabel = phaseId ? `Phase ${phaseId} review` : 'Plan review';
+    return { scopeLabel, lenses, activity };
+  });
+
+  /** Display label for a verdict token (NEEDS_CHANGES reads as FAILED). */
+  verdictLabel(verdict: string | undefined | null): string {
+    if (!verdict) return '';
+    return verdict === 'NEEDS_CHANGES' ? 'FAILED' : verdict;
+  }
+
+  /** Maps a round event to a styled activity row, or null if not lens-relevant. */
+  private lensActivityItem(event: AgentPlanEvent): LensActivityItem | null {
+    const time = this.formatLensTime(event.createdAt);
+    switch (event.eventType) {
+      case 'planning_review_started':
+      case 'agent_phase_review_started':
+        return {
+          id: event.id,
+          time,
+          actor: 'CO',
+          text: 'Review started — spawning Product / QA / Lead',
+          attention: false,
+        };
+      case 'agent_lens_review_started': {
+        const lens = this.lensName(event);
+        if (!lens) return null;
+        return {
+          id: event.id,
+          time,
+          actor: this.lensActor(lens),
+          text: 'Review started',
+          attention: false,
+        };
+      }
+      case 'agent_lens_verdict': {
+        const lens = this.lensName(event);
+        if (!lens) return null;
+        const verdict = this.lensVerdict(event);
+        const payload = this.parseEventPayload(event);
+        const summary =
+          typeof payload['summary'] === 'string' ? (payload['summary'] as string).trim() : '';
+        const findings = Array.isArray(payload['findings'])
+          ? (payload['findings'] as unknown[]).filter(
+              (f): f is string =>
+                typeof f === 'string' && !!f.trim() && f.trim().toLowerCase() !== 'none',
+            )
+          : [];
+        return {
+          id: event.id,
+          time,
+          actor: this.lensActor(lens),
+          text: summary || 'reported its verdict',
+          verdict,
+          findings,
+          attention: !!verdict && verdict !== 'PASS',
+        };
+      }
+      case 'planning_gate_result':
+      case 'agent_phase_gate_result': {
+        const verdict = this.lensVerdict(event);
+        const tail = verdict === 'PASS' ? 'approved' : 'sent back to T1';
+        return {
+          id: event.id,
+          time,
+          actor: 'CO',
+          text: `Merged verdict — ${tail}`,
+          verdict,
+          attention: !!verdict && verdict !== 'PASS',
+        };
+      }
+      default: {
+        // Generic fallback so the rest of the run's events (planner ready, feedback
+        // sent, attention, etc.) still show in this feed — it's the CO event log,
+        // relocated here. Drop pure-noise types.
+        const NOISE = new Set([
+          'planning_start_nudge',
+          'planning_verdict_clarification_requested',
+          'agent_phase_verdict_clarification_requested',
+        ]);
+        if (NOISE.has(event.eventType)) return null;
+        const text = event.summary?.trim() || event.eventType.replace(/_/g, ' ');
+        return {
+          id: event.id,
+          time,
+          actor: 'CO',
+          text,
+          verdict: this.lensVerdict(event),
+          attention:
+            event.eventType.includes('needs_attention') ||
+            event.eventType.includes('blocked') ||
+            event.eventType.includes('coordinator_failed'),
+        };
+      }
+    }
+  }
+
+  private lensActor(lensName: string): LensActor {
+    switch (lensName) {
+      case 'Product':
+        return 'PR';
+      case 'QA':
+        return 'QA';
+      case 'Lead':
+        return 'LE';
+      default:
+        return 'CO';
+    }
+  }
+
+  private formatLensTime(createdAt: string): string {
+    // SQLite emits naive UTC ("YYYY-MM-DD HH:MM:SS"); tag it so it parses as UTC.
+    const iso = /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(createdAt)
+      ? createdAt.replace(' ', 'T') + 'Z'
+      : createdAt;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return createdAt;
+    return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+
+  private parseEventPayload(event: AgentPlanEvent): Record<string, unknown> {
+    try {
+      return event.payloadJson ? JSON.parse(event.payloadJson) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private lensName(event: AgentPlanEvent): string | null {
+    const lens = this.parseEventPayload(event)['lens'];
+    return typeof lens === 'string' ? lens : null;
+  }
+
+  private lensVerdict(event: AgentPlanEvent): string | undefined {
+    const verdict = this.parseEventPayload(event)['verdict'];
+    if (typeof verdict === 'string') return verdict;
+    return event.verdict ?? undefined;
+  }
+
+  /** One-line summary of the lens chips, e.g. "Product PASS · QA reviewing…". */
+  private lensSummaryLine(): string {
+    const lr = this.lensReview();
+    if (!lr) return '';
+    return lr.lenses
+      .map((c) => `${c.name} ${c.status === 'reviewing' ? 'reviewing…' : c.verdict || 'reported'}`)
+      .join(' · ');
+  }
+
+  /**
+   * Human-readable current stage of the run, derived from `plan.status` (+ mode,
+   * phases, lens chips). Drives the stage chips in the panel headers, the
+   * coordinator stage stepper, and the T2 placeholder — so "what stage are we in"
+   * is answerable at a glance instead of from a raw status string.
+   */
+  runStage = computed<RunStage | null>(() => {
+    const run = this.currentRun();
+    if (!run) return null;
+    const status = run.plan.status;
+    const lens = this.lensSummaryLine();
+    const err = run.plan.error?.trim();
+
+    if (this.mode() === 'planning') {
+      const steps: RunStageStep[] = [
+        { key: 'draft', label: 'Draft' },
+        { key: 'review', label: 'Review' },
+        { key: 'approved', label: 'Approved' },
+      ];
+      switch (status) {
+        case 'planning_planner_running':
+          return { badge: 'Drafting', title: 'T1 drafting the plan', detail: 'The planner is writing the plan files. The 3-lens T2 review starts when the draft is ready.', tone: 'active', steps, activeIndex: 0 };
+        case 'planning_review_running':
+          return { badge: 'Reviewing', title: 'T2 reviewing — 3 lenses', detail: lens || 'Product / QA / Lead are reviewing the plan.', tone: 'active', steps, activeIndex: 1 };
+        case 'approved':
+          return { badge: 'Approved', title: 'Plan approved', detail: 'The plan passed T2 review.', tone: 'done', steps, activeIndex: 2 };
+        case 'needs_attention':
+          return { badge: 'Attention', title: 'Needs your attention', detail: err || 'The coordinator paused — open the run to resolve and continue.', tone: 'attention', steps, activeIndex: 1 };
+        case 'blocked':
+          return { badge: 'Blocked', title: 'Blocked — needs your decision', detail: err || 'Reply in the T1 message bar to unblock.', tone: 'attention', steps, activeIndex: 0 };
+        case 'stopped':
+          return { badge: 'Stopped', title: 'Run stopped', detail: 'This planning run was stopped.', tone: 'attention', steps, activeIndex: 0 };
+        default:
+          return { badge: status, title: status, detail: '', tone: 'active', steps, activeIndex: 0 };
+      }
+    }
+
+    // development — show phase position in the title
+    const phases = run.phases ?? [];
+    const total = phases.length;
+    const idx = phases.findIndex((p) => p.phaseId === run.plan.currentPhaseId);
+    const pos = run.plan.currentPhaseId
+      ? `Phase ${run.plan.currentPhaseId}${total ? ` (${idx >= 0 ? idx + 1 : '?'}/${total})` : ''}`
+      : 'Phase';
+    const steps: RunStageStep[] = [
+      { key: 'work', label: 'Work' },
+      { key: 'review', label: 'Review' },
+      { key: 'done', label: 'Done' },
+    ];
+    switch (status) {
+      case 'phase_worker_running':
+        return { badge: 'Working', title: `${pos} · T1 working`, detail: 'The worker is implementing this phase.', tone: 'active', steps, activeIndex: 0 };
+      case 'phase_review_running':
+        return { badge: 'Reviewing', title: `${pos} · T2 reviewing`, detail: lens || 'Product / QA / Lead are reviewing this phase.', tone: 'active', steps, activeIndex: 1 };
+      case 'approved':
+        return { badge: 'Done', title: 'All phases complete', detail: 'Every phase passed review.', tone: 'done', steps, activeIndex: 2 };
+      case 'needs_attention':
+        return { badge: 'Attention', title: 'Needs your attention', detail: err || 'The coordinator paused — open the run to resolve and continue.', tone: 'attention', steps, activeIndex: 1 };
+      case 'blocked':
+        return { badge: 'Blocked', title: 'Blocked — needs your decision', detail: err || 'Reply in the T1 message bar to unblock.', tone: 'attention', steps, activeIndex: 0 };
+      case 'stopped':
+        return { badge: 'Stopped', title: 'Run stopped', detail: 'This development run was stopped.', tone: 'attention', steps, activeIndex: 0 };
+      default:
+        return { badge: status, title: status, detail: '', tone: 'active', steps, activeIndex: 0 };
+    }
+  });
+
+  /** Placeholder shown in the T2 panel when there is no lens review to display. */
+  t2Placeholder = computed(() => {
+    const status = this.currentRun()?.plan.status;
+    switch (status) {
+      case 'planning_planner_running':
+      case 'phase_worker_running':
+        return 'Review has not started — T1 is still working. The 3-lens review (Product / QA / Lead) will appear here once T2 begins.';
+      case 'planning_review_running':
+      case 'phase_review_running':
+        return 'Spawning the Product / QA / Lead reviewers…';
+      case 'approved':
+        return 'Approved — no review is pending.';
+      case 'needs_attention':
+        return this.currentRun()?.plan.error?.trim() || 'This run needs your attention.';
+      default:
+        return 'No review activity yet.';
+    }
+  });
+
   mode = computed<'planning' | 'development'>(() => {
     const mode = this.route.snapshot.data['mode'];
     return mode === 'planning' ? 'planning' : 'development';
@@ -563,8 +900,13 @@ export class PlannerPage implements OnInit, OnDestroy {
     try {
       const plans = await firstValueFrom(this.api.listAgentPlans(undefined, this.runType()));
       this.plans.set(plans);
-      if (selectFirst && !this.currentRun() && plans[0]) {
-        await this.selectPlan(plans[0].id);
+      if (selectFirst && !this.currentRun() && plans.length) {
+        // Deep link: if the URL names a plan that exists, open it; else the first.
+        const routePlanId = this.route.snapshot.paramMap.get('planId');
+        const target = routePlanId && plans.some((plan) => plan.id === routePlanId)
+          ? routePlanId
+          : plans[0].id;
+        await this.selectPlan(target);
       }
     } catch (err) {
       this.error.set(String(err));
@@ -581,7 +923,11 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.resetPerPlanState();
 
       this.currentRun.set(run);
+      // Reflect the selected run in the URL (deep-linkable, refresh-safe) without
+      // a router navigation, so the component isn't torn down/recreated.
+      this.location.replaceState(`/${this.mode()}/${id}`);
       this.ensureActiveMobilePanel(run);
+      this.syncMobilePanelToRunningPhase(run);
       await this.syncPlanTerminalSubscriptions(run, { refresh: true });
 
       // If the Files modal is open, refresh its contents for the new plan.
@@ -601,6 +947,8 @@ export class PlannerPage implements OnInit, OnDestroy {
    */
   private resetPerPlanState(): void {
     this.lastPlanTerminalSyncKey = '';
+    // Re-evaluate the mobile panel against the newly selected plan's phase.
+    this.lastFollowedRunStatus = '';
     this.fullscreenTerminalRole.set(null);
 
     // Terminal screens are keyed by session_id and the new plan will have its
@@ -741,6 +1089,9 @@ export class PlannerPage implements OnInit, OnDestroy {
       ));
       this.currentRun.set(run);
       this.ensureActiveMobilePanel(run);
+      if (this.mode() === 'development') {
+        this.syncMobilePanelToRunningPhase(run);
+      }
       if (this.mode() === 'planning') {
         if (status === 'planning_planner_running') {
           this.coordinatorNotice.set('Nudged T1 — switch to the Planner tab to watch output.');
@@ -879,6 +1230,9 @@ export class PlannerPage implements OnInit, OnDestroy {
         this.currentRun.set(null);
         if (nextPlans[0]) {
           await this.selectPlan(nextPlans[0].id);
+        } else {
+          // No runs left — drop the plan id from the URL.
+          this.location.replaceState(`/${this.mode()}`);
         }
       }
     } catch (err) {
@@ -1783,6 +2137,7 @@ export class PlannerPage implements OnInit, OnDestroy {
         if (this.currentRun()?.plan.id === update.planId) {
           void this.unsubscribeAllPlanTerminals();
           this.currentRun.set(null);
+          this.location.replaceState(`/${this.mode()}`);
         }
         return;
       }
@@ -1792,6 +2147,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.upsertPlanSummary(update.run.plan);
       if (this.currentRun()?.plan.id === update.planId) {
         this.ensureActiveMobilePanel(update.run);
+        this.syncMobilePanelToRunningPhase(update.run);
         void this.syncPlanTerminalSubscriptions(update.run);
       }
     });
@@ -1827,6 +2183,26 @@ export class PlannerPage implements OnInit, OnDestroy {
     const active = this.activeMobilePanel();
     if (active === 'worker' && !run.plan.workerSessionId && run.plan.reviewerSessionId) {
       this.activeMobilePanel.set('reviewer');
+    }
+  }
+
+  /**
+   * On mobile, only the active panel's terminal is subscribed (unlike desktop,
+   * which follows the running phase). So when the coordinator advances T1→T2 the
+   * reviewer would silently stop updating. Auto-follow the running phase, but only
+   * on an actual status transition so a manual tab switch within a phase sticks.
+   */
+  private syncMobilePanelToRunningPhase(run: AgentPlanRun): void {
+    if (!this.isCompactWorkspace() || this.fullscreenTerminalRole()) return;
+    const status = run.plan.status;
+    if (status === this.lastFollowedRunStatus) return;
+    this.lastFollowedRunStatus = status;
+    const reviewerRunning = status === 'planning_review_running' || status === 'phase_review_running';
+    const workerRunning = status === 'planning_planner_running' || status === 'phase_worker_running';
+    if (reviewerRunning && run.plan.reviewerSessionId) {
+      this.activeMobilePanel.set('reviewer');
+    } else if (workerRunning && run.plan.workerSessionId) {
+      this.activeMobilePanel.set('worker');
     }
   }
 
@@ -1905,11 +2281,9 @@ export class PlannerPage implements OnInit, OnDestroy {
     for (const sessionId of Array.from(this.plannerVisualSubscriptions)) {
       if (!visibleIds.has(sessionId)) {
         await this.unsubscribePlanTerminal(sessionId);
-        this.terminalScreens.update((screens) => {
-          const next = { ...screens };
-          delete next[sessionId];
-          return next;
-        });
+        // Keep the last frame so the now-idle panel shows its most recent screen
+        // (e.g. T2's last review) instead of going blank. Cross-plan staleness is
+        // handled by resetPerPlanState() clearing terminalScreens on plan switch.
       }
     }
 
@@ -1925,6 +2299,26 @@ export class PlannerPage implements OnInit, OnDestroy {
       } catch {
         // The coordinator may still be starting the host/tmux session.
       }
+    }
+
+    // Keep the idle (non-streaming) panel showing its last screen (from cache) so
+    // it isn't blank after a refresh, without disturbing the live subscription.
+    this.seedIdlePlanTerminals(run, visibleIds);
+  }
+
+  /**
+   * Populate the last-known screen for the plan's terminals that aren't actively
+   * streaming (the idle panel) from the persisted cache, so the idle pane shows
+   * its most recent screen instead of going blank after a refresh. Cache-only on
+   * purpose: a live subscribe/unsubscribe here would race with — and tear down —
+   * the active panel's live subscription.
+   */
+  private seedIdlePlanTerminals(run: AgentPlanRun, visibleIds: Set<string>): void {
+    const ids = [run.plan.workerSessionId, run.plan.reviewerSessionId]
+      .filter((id): id is string => !!id);
+    for (const sessionId of ids) {
+      if (visibleIds.has(sessionId)) continue; // streaming live; leave it alone
+      this.hydrateTerminalScreenFromCache(sessionId);
     }
   }
 

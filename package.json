@@ -9,8 +9,10 @@
     "check:desktop": "nx run desktop:desktop-check",
     "migrate:worker": "nx run worker:migrate",
     "deploy:worker": "nx run worker:deploy",
+    "deploy:web": "nx build web --skip-nx-cache && lokal cf pages deploy --env prod",
     "build:desktop": "nx run desktop:desktop-build",
     "build:web": "nx build web",
+    "build:web:fresh": "nx build web --skip-nx-cache",
     "build:worker": "nx build worker",
     "lint": "nx run-many -t lint",
     "test": "nx run-many -t test"

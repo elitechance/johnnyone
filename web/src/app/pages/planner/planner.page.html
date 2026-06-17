@@ -84,7 +84,7 @@
             >
               <ion-icon name="expand-outline" aria-hidden="true"></ion-icon>
             </button>
-            <span class="state">{{ run.plan.status }}</span>
+            <span class="state stage" [attr.data-tone]="runStage()?.tone">{{ runStage()?.badge || run.plan.status }}</span>
           </header>
           @if (fullscreenTerminalRole() === 'worker') {
             <div class="terminal-inline-placeholder" aria-hidden="true">
@@ -128,7 +128,7 @@
             >
               <ion-icon name="expand-outline" aria-hidden="true"></ion-icon>
             </button>
-            <span class="state">{{ currentPhase()?.gateVerdict || 'unknown' }}</span>
+            <span class="state stage" [attr.data-tone]="runStage()?.tone">{{ runStage()?.badge || (currentPhase()?.gateVerdict || 'unknown') }}</span>
           </header>
           @if (fullscreenTerminalRole() === 'reviewer') {
             <div class="terminal-inline-placeholder" aria-hidden="true">
@@ -136,19 +136,79 @@
               <span>Viewing in fullscreen</span>
             </div>
           } @else {
-            <johnny-terminal-screen
-              class="terminal-fill"
-              [screen]="reviewerScreen()"
-              [terminalProvider]="reviewerProvider"
-              [mobileInputMode]="isCompactWorkspace()"
-              [imageAttachments]="reviewerPendingAttachments()"
-              [imageSending]="isSendingReviewerAttachments()"
-              (rawInput)="sendPlannerRawInput('reviewer', $event)"
-              (terminalResize)="resizePlannerTerminal('reviewer', $event)"
-              (imagePasted)="addPendingImageFiles('reviewer', $event)"
-              (imageRemoved)="removePendingAttachment('reviewer', $event)"
-              (imageMessageSubmitted)="sendPlannerAttachmentMessage('reviewer', $event)"
-            ></johnny-terminal-screen>
+            @if (lensReview(); as lens) {
+              <section class="lens-panel">
+                <header class="lens-panel-head">
+                  <span class="lens-tag">T2 · Lens review</span>
+                  <span class="lens-scope">{{ lens.scopeLabel }} — 3 lenses</span>
+                </header>
+
+                <div class="lens-pills">
+                  @for (chip of lens.lenses; track chip.name) {
+                    <div
+                      class="lens-pill"
+                      [class.reviewing]="chip.status === 'reviewing'"
+                      [class.pass]="chip.verdict === 'PASS'"
+                      [class.warn]="chip.verdict === 'NEEDS_CHANGES'"
+                      [class.bad]="chip.verdict === 'BLOCKED'"
+                    >
+                      <span class="lens-dot"></span>
+                      <span class="lens-name">{{ chip.name }}</span>
+                      <span class="lens-verdict">
+                        @if (chip.status === 'reviewing') {
+                          reviewing…
+                        } @else {
+                          {{ verdictLabel(chip.verdict) || 'reported' }}
+                        }
+                      </span>
+                    </div>
+                  }
+                </div>
+
+                <div class="lens-activity">
+                  @for (item of lens.activity; track item.id) {
+                    <div class="lens-act-row" [class.attention]="item.attention">
+                      <span class="lens-act-time">{{ item.time }}</span>
+                      <span class="lens-act-actor" [attr.data-actor]="item.actor">{{ item.actor }}</span>
+                      <span class="lens-act-text">
+                        @if (item.verdict) {
+                          <span
+                            class="lens-act-verdict"
+                            [class.pass]="item.verdict === 'PASS'"
+                            [class.warn]="item.verdict === 'NEEDS_CHANGES'"
+                            [class.bad]="item.verdict === 'BLOCKED'"
+                            >{{ verdictLabel(item.verdict) }}</span
+                          >
+                        }
+                        {{ item.text }}
+                        @if (item.findings?.length) {
+                          <ul class="lens-act-findings">
+                            @for (f of item.findings; track f) {
+                              <li>{{ f }}</li>
+                            }
+                          </ul>
+                        }
+                      </span>
+                    </div>
+                  } @empty {
+                    <div class="lens-act-empty">Waiting for lens activity…</div>
+                  }
+                </div>
+
+                <footer class="lens-legend">
+                  <span><i class="dot info"></i> info</span>
+                  <span><i class="dot pass"></i> pass</span>
+                  <span><i class="dot warn"></i> failed</span>
+                  <span><i class="dot bad"></i> attention / blocked</span>
+                </footer>
+              </section>
+            } @else {
+              <div class="t2-empty" [attr.data-tone]="runStage()?.tone">
+                <span class="t2-empty-tag">T2 · Lens review</span>
+                <strong>{{ runStage()?.title || 'Reviewer' }}</strong>
+                <p>{{ t2Placeholder() }}</p>
+              </div>
+            }
           }
         </article>
       </section>
@@ -223,72 +283,51 @@
           </div>
         </header>
 
-        <div class="coordinator-body">
-          <section class="phase-list">
-            <div class="section-title">Phases</div>
-            @for (phase of run.phases; track phase.id) {
-              <button
-                class="phase-row"
-                type="button"
-                [class.active]="phase.phaseId === run.plan.currentPhaseId"
-                [class.locked]="phase.status === 'locked'"
-                (click)="openPhaseTasks(phase)"
-              >
-                <span>
-                  <strong>{{ phase.phaseId }}</strong>
-                  {{ phase.phaseTitle }}
-                </span>
-                <em>{{ phase.status }} · {{ phase.gateVerdict }} · {{ phaseTaskCount(phase.phaseId) }} tasks</em>
-              </button>
-            }
+        @if (runStage(); as stage) {
+          <section class="run-stage" [attr.data-tone]="stage.tone">
+            <div class="run-stage-steps">
+              @for (s of stage.steps; track s.key; let i = $index) {
+                <span
+                  class="run-stage-step"
+                  [class.active]="i === stage.activeIndex"
+                  [class.done]="i < stage.activeIndex"
+                  >{{ s.label }}</span
+                >
+                @if (!$last) {
+                  <span class="run-stage-sep">›</span>
+                }
+              }
+            </div>
+            <div class="run-stage-now">
+              <strong>{{ stage.title }}</strong>
+              @if (stage.detail) {
+                <span>{{ stage.detail }}</span>
+              }
+            </div>
           </section>
+        }
 
-          <section class="event-log">
-            <div class="section-title">Events</div>
-            @for (event of run.events; track event.id) {
-              <div class="event-row">
-                <div class="event-row-top">
-                  <div class="event-badges">
-                    @if (event.phaseIndex !== undefined && event.phaseIndex !== null) {
-                      <span class="event-badge phase">P{{ event.phaseIndex + 1 }}</span>
-                    }
-                    <span class="event-badge actor">{{ event.actor }}</span>
-                    <span class="event-badge category">{{ event.category }}</span>
-                    @if (event.verdict) {
-                      <span class="event-badge verdict" [class.pass]="event.verdict === 'PASS'" [class.warn]="event.verdict === 'NEEDS_CHANGES'" [class.bad]="event.verdict === 'BLOCKED'">
-                        {{ event.verdict }}
-                      </span>
-                    }
-                  </div>
-                  <span class="event-time">{{ event.createdAt }}</span>
-                </div>
-                <strong>{{ event.summary }}</strong>
-                <span class="event-meta">{{ eventPhaseLabel(event) }} · {{ event.eventType }}</span>
-                @if (event.statusBefore || event.statusAfter || event.reason || event.taskId || event.clarificationAttempt !== undefined) {
-                  <div class="event-facts">
-                    @if (event.statusBefore || event.statusAfter) {
-                      <span>{{ event.statusBefore || 'unknown' }} → {{ event.statusAfter || 'unknown' }}</span>
-                    }
-                    @if (event.reason) {
-                      <span>reason: {{ event.reason }}</span>
-                    }
-                    @if (event.taskId) {
-                      <span>task {{ event.taskId }}</span>
-                    }
-                    @if (event.clarificationAttempt !== undefined && event.clarificationAttempt !== null) {
-                      <span>attempt {{ event.clarificationAttempt }}</span>
-                    }
-                  </div>
-                }
-                @if (eventHasDetails(event)) {
-                  <details class="event-details">
-                    <summary>Details</summary>
-                    <pre>{{ eventDetails(event) }}</pre>
-                  </details>
-                }
-              </div>
-            }
-          </section>
+        <div class="coordinator-body" [class.no-phases]="!run.phases.length">
+          @if (run.phases.length) {
+            <section class="phase-list">
+              <div class="section-title">Phases</div>
+              @for (phase of run.phases; track phase.id) {
+                <button
+                  class="phase-row"
+                  type="button"
+                  [class.active]="phase.phaseId === run.plan.currentPhaseId"
+                  [class.locked]="phase.status === 'locked'"
+                  (click)="openPhaseTasks(phase)"
+                >
+                  <span>
+                    <strong>{{ phase.phaseId }}</strong>
+                    {{ phase.phaseTitle }}
+                  </span>
+                  <em>{{ phase.status }} · {{ phase.gateVerdict }} · {{ phaseTaskCount(phase.phaseId) }} tasks</em>
+                </button>
+              }
+            </section>
+          }
 
           <section class="run-settings">
             <div class="section-title">Run Settings</div>

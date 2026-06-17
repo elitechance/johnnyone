@@ -114,6 +114,12 @@ johnnyone/
 
 ## Planner and Development Notes
 
+> **Coordinator internals** — the T1/T2 handoff, the `reportAgentResult` API (the
+> sole completion/verdict signal; terminal scraping was removed), the
+> nudge/escalate + clarify reliability mechanisms, and why scraping was dropped
+> (Grok alt-screen scroll-off) live in
+> **[`docs/coordinator.md`](docs/coordinator.md)**.
+
 Recent planner/runtime behavior worth knowing:
 
 - Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.

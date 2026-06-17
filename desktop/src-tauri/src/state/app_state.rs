@@ -31,6 +31,29 @@ pub struct WorkerRelayConfig {
     pub tenant_id: String,
 }
 
+/// A structured signal an agent reported to CO via the host GraphQL
+/// `reportAgentResult` mutation, keyed by tmux session id. The coordinator waits
+/// drain this map, preferring it over scraping the terminal for markers/verdicts.
+#[derive(Debug, Clone)]
+pub struct AgentReport {
+    /// "ready" (worker/planner done) | "verdict" (reviewer/lens) | "done"
+    /// (ephemeral agent, e.g. docs) | "update" (progress / blocked).
+    pub kind: String,
+    /// PASS | NEEDS_CHANGES | BLOCKED — present only when `kind == "verdict"`.
+    pub verdict: Option<String>,
+    /// Sender identity, CO-stamped from the session→role/lens mapping (worker,
+    /// reviewer, product, qa, lead, docs, …) — never self-declared by the agent.
+    pub role: Option<String>,
+    /// Free-text findings (for a verdict) / progress detail (for an update).
+    pub findings: Option<String>,
+    pub summary: Option<String>,
+    /// For updates: info | warn | attention — drives human triage.
+    pub severity: Option<String>,
+    pub reason: Option<String>,
+    /// Pointer the human can use to validate (artifact path, file:line, test id).
+    pub evidence: Option<String>,
+}
+
 impl Default for ConnectionStatus {
     fn default() -> Self {
         Self {
@@ -87,6 +110,9 @@ pub struct AppState {
     pub terminal_screen_flush_scheduled: Arc<Mutex<HashMap<String, bool>>>,
     /// Worker connection context used by host-side relay follow-up calls.
     pub worker_relay_config: Arc<Mutex<Option<WorkerRelayConfig>>>,
+    /// Structured agent completion reports (from the `reportAgentResult` mutation),
+    /// keyed by tmux session id. Drained by the coordinator's wait loops.
+    pub agent_reports: Arc<Mutex<HashMap<String, AgentReport>>>,
 }
 
 impl AppState {
@@ -129,6 +155,7 @@ impl AppState {
             terminal_pending_screen: Arc::new(Mutex::new(HashMap::new())),
             terminal_screen_flush_scheduled: Arc::new(Mutex::new(HashMap::new())),
             worker_relay_config: Arc::new(Mutex::new(None)),
+            agent_reports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -163,6 +190,7 @@ impl AppState {
             terminal_pending_screen: Arc::new(Mutex::new(HashMap::new())),
             terminal_screen_flush_scheduled: Arc::new(Mutex::new(HashMap::new())),
             worker_relay_config: Arc::new(Mutex::new(None)),
+            agent_reports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

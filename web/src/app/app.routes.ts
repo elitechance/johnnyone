@@ -27,9 +27,24 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
+  // Deep link to a specific selected run, e.g. /planning/<planId>.
+  {
+    path: 'planning/:planId',
+    canActivate: [authGuard],
+    data: { mode: 'planning' },
+    loadComponent: () =>
+      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
+  },
   // Development (T1=Worker, T2=Reviewer) — executes approved plans.
   {
     path: 'development',
+    canActivate: [authGuard],
+    data: { mode: 'development' },
+    loadComponent: () =>
+      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
+  },
+  {
+    path: 'development/:planId',
     canActivate: [authGuard],
     data: { mode: 'development' },
     loadComponent: () =>

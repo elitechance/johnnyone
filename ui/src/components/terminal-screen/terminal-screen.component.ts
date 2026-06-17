@@ -468,11 +468,17 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   protected onTerminalInputPaste(event: ClipboardEvent): void {
     if (this.disabled) return;
 
-    const files = Array.from(event.clipboardData?.files ?? []).filter((file) =>
-      file.type.startsWith('image/')
+    const files = this.dedupeImageFiles(
+      Array.from(event.clipboardData?.files ?? []).filter((file) =>
+        file.type.startsWith('image/')
+      )
     );
     if (files.length > 0) {
       event.preventDefault();
+      // Stop the paste from also bubbling to a page-level paste handler
+      // (e.g. the terminal page's onWorkspacePaste), which would add the same
+      // image a second time.
+      event.stopPropagation();
       this.imagePasted.emit(files);
       return;
     }
@@ -497,12 +503,29 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (this.disabled) return;
 
     const input = event.target as HTMLInputElement;
-    const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'));
+    const files = this.dedupeImageFiles(
+      Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'))
+    );
     if (files.length > 0) {
       this.imagePasted.emit(files);
     }
     input.value = '';
     this.refocusMobileInput();
+  }
+
+  /**
+   * Drop duplicate image files within a single paste/drop/browse. Some clipboard
+   * sources place the same screenshot into the clipboard more than once, which
+   * otherwise shows up as two identical attachments the user has to remove.
+   */
+  private dedupeImageFiles(files: File[]): File[] {
+    const seen = new Set<string>();
+    return files.filter((file) => {
+      const key = `${file.name}|${file.size}|${file.type}|${file.lastModified}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   private refocusMobileInput(): void {
@@ -522,14 +545,14 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       const proposed = this.fitAddon.proposeDimensions();
       if (proposed && proposed.cols > 0 && proposed.rows > 0) {
         const safeRows = Math.max(1, proposed.rows);
-        const safeCols = Math.max(1, proposed.cols);
+        const safeCols = this.colsWithScrollbarReserve(proposed.cols);
         if (this.terminal.cols !== safeCols || this.terminal.rows !== safeRows) {
           this.terminal.resize(safeCols, safeRows);
         }
-        this.applyColumnFitIfMobile();
+        this.applyColumnFit();
       } else {
         this.fitAddon.fit();
-        this.applyColumnFitIfMobile();
+        this.applyColumnFit();
       }
       this.terminalResize.emit({
         cols: this.terminal.cols,
@@ -552,7 +575,24 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     }
   }
 
-  private applyColumnFitIfMobile(): void {
+  /**
+   * Reserve room for the vertical scrollbar in the proposed column count.
+   *
+   * FitAddon only subtracts a fixed 14px for the scrollbar, which can be ~1px short
+   * of the real scrollbar — pushing the last column under it. Mobile corrects this
+   * after the fact with `clampColsToViewportWidth` because it *reflows* the snapshot
+   * to the clamped width. Desktop has no reflow, so a post-hoc clamp would create a
+   * snapshot/cols mismatch and oscillate (cols flip C↔C-1 as Grok redraws), wrapping
+   * the last character of full-width lines. Instead, reserve one extra column up
+   * front: a stable value that matches the width we send to tmux, so Grok draws to
+   * fit and nothing wraps. (~1 char of empty space on desktop is imperceptible.)
+   */
+  private colsWithScrollbarReserve(proposedCols: number): number {
+    if (this.mobileInputMode) return Math.max(1, proposedCols);
+    return Math.max(2, proposedCols - 1);
+  }
+
+  private applyColumnFit(): void {
     if (!this.terminal || !this.mobileInputMode || this.isGrokTerminal()) return;
     this.clampColsToViewportWidth(this.terminal.cols);
   }
@@ -734,7 +774,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       this.fitIfDimensionsChanged();
     } else {
       this.fit();
-      this.applyColumnFitIfMobile();
+      this.applyColumnFit();
     }
     const displayContent = this.prepareSnapshotContent(content);
     const clipped = this.clipSnapshotToTerminalWidth(displayContent);
@@ -860,13 +900,14 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
    * blow out on small screens (full-width red bars, saturated error text).
    */
   private sanitizeGrokMobileSnapshot(content: string): string {
-    let next = content
+    let next = this.stripAnsiBackgrounds(content)
       .replace(/\r(?!\n)/g, '\n')
+      .replace(/[▀-▟█]/g, ' ')
+      .replace(/[─-╿]/g, ' ')
       .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f\u007f]/g, '')
       .replace(/\ufffd/g, '')
       .replace(/█$/gm, ' ');
 
-    next = this.stripGrokMobileRedBackgrounds(next);
     next = this.softenGrokMobileRedForeground(next);
     next = next
       .replace(/\x1b\[1;31m/g, '\x1b[38;5;214m')
@@ -875,58 +916,13 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
     return next
       .split('\n')
-      .map((line) => line.replace(/[ \t]+$/g, ''))
+      .map((line) => {
+        const trimmed = this.stripAnsi(line).trim();
+        // Drop lines that are now only border/blank remnants of Grok's boxes.
+        if (/^[-# ]+$/.test(trimmed)) return '';
+        return line.replace(/[ \t]+$/g, '');
+      })
       .join('\n');
-  }
-
-  /** Drop Grok error-panel red backgrounds; keep neutral panel fills (236, 237, …). */
-  private stripGrokMobileRedBackgrounds(content: string): string {
-    const red256 = new Set([1, 9, 52, 53, 88, 124, 160, 196, 202, 203]);
-
-    return content.replace(/\x1b\[([0-9;]*)m/g, (_match, params: string) => {
-      const codes = params.split(';').filter((part) => part !== '');
-      const kept: string[] = [];
-
-      for (let index = 0; index < codes.length; index++) {
-        const code = Number(codes[index]);
-        if (Number.isNaN(code)) {
-          kept.push(codes[index]);
-          continue;
-        }
-
-        if (code === 0) {
-          kept.push(codes[index]);
-          continue;
-        }
-
-        if (code === 41 || code === 101) {
-          continue;
-        }
-
-        if ((code === 48 || code === 58) && codes[index + 1] === '5' && codes[index + 2] !== undefined) {
-          const palette = Number(codes[index + 2]);
-          if (red256.has(palette)) {
-            index += 2;
-            continue;
-          }
-        }
-
-        if ((code === 48 || code === 58) && codes[index + 1] === '2' && codes[index + 4] !== undefined) {
-          const red = Number(codes[index + 2]);
-          const green = Number(codes[index + 3]);
-          const blue = Number(codes[index + 4]);
-          if (red > 120 && green < 90 && blue < 90) {
-            index += 4;
-            continue;
-          }
-        }
-
-        kept.push(codes[index]);
-      }
-
-      if (kept.length === 0) return '';
-      return `\x1b[${kept.join(';')}m`;
-    });
   }
 
   /** Remap saturated 256-color reds to softer coral tones for mobile readability. */
@@ -1072,12 +1068,12 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
         return;
       }
       const safeRows = Math.max(1, proposed.rows);
-      const safeCols = Math.max(1, proposed.cols);
+      const safeCols = this.colsWithScrollbarReserve(proposed.cols);
       if (this.terminal.cols !== safeCols || this.terminal.rows !== safeRows) {
         this.fit();
         return;
       }
-      this.applyColumnFitIfMobile();
+      this.applyColumnFit();
     } catch {
       // The terminal can be hidden during route transitions; next resize will refit.
     }
@@ -1174,14 +1170,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     let current = '';
     let width = 0;
     let openSgr = '';
-
-    const flush = (): void => {
-      if (current.length > 0) {
-        chunks.push(current);
-      }
-      current = openSgr;
-      width = 0;
-    };
+    let lastSpace = -1;       // string index in `current` of the last visible space
+    let widthBeforeSpace = 0; // visible width up to (not incl.) that space
 
     for (let index = 0; index < line.length;) {
       if (line.charCodeAt(index) === 0x1b && line[index + 1] === '[') {
@@ -1210,7 +1200,21 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
       const char = String.fromCodePoint(codePoint);
       const charWidth = this.terminalDisplayWidth(char);
       if (width + charWidth > cols && width > 0) {
-        flush();
+        if (lastSpace > 0) {
+          // Word wrap: break at the last space; carry SGR state onto the new line.
+          chunks.push(current.slice(0, lastSpace));
+          current = openSgr + current.slice(lastSpace + 1);
+          width = width - widthBeforeSpace - 1;
+        } else {
+          chunks.push(current);
+          current = openSgr;
+          width = 0;
+        }
+        lastSpace = -1;
+      }
+      if (char === ' ') {
+        lastSpace = current.length;
+        widthBeforeSpace = width;
       }
       current += char;
       width += charWidth;
@@ -1226,13 +1230,26 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     const chunks: string[] = [];
     let current = '';
     let width = 0;
+    let lastSpace = -1;       // index in `current` of the last breakable space
+    let widthBeforeSpace = 0; // visible width up to (not incl.) that space
     for (const char of line) {
       const charWidth = this.terminalDisplayWidth(char);
       if (width + charWidth > cols && current.length > 0) {
-        chunks.push(current);
-        current = char;
-        width = charWidth;
-        continue;
+        if (lastSpace > 0) {
+          // Word wrap: break at the last space instead of mid-word.
+          chunks.push(current.slice(0, lastSpace));
+          current = current.slice(lastSpace + 1);
+          width = width - widthBeforeSpace - 1;
+        } else {
+          chunks.push(current);
+          current = '';
+          width = 0;
+        }
+        lastSpace = -1;
+      }
+      if (char === ' ') {
+        lastSpace = current.length;
+        widthBeforeSpace = width;
       }
       current += char;
       width += charWidth;

@@ -3,6 +3,7 @@ use crate::db::models::{
 };
 use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::services::{
+    agent_plans,
     chat_host,
     planner_prompts::{self as planner_prompt_service, PlannerPromptSettings},
     providers::{self as provider_service, DetectedTool},
@@ -161,6 +162,33 @@ impl MutationRoot {
     ) -> async_graphql::Result<AiSession> {
         let state = ctx.data_unchecked::<AppState>();
         Ok(session_service::create_session(state, input.into())?.into())
+    }
+
+    /// Structured completion signal from a planner/development agent. The agent is
+    /// given a baked `curl` for this in its prompt. `sessionId` must be one CO
+    /// spawned (worker or reviewer) — unknown ids are rejected. `kind` is
+    /// "ready" (worker/planner done) or "verdict" (reviewer), with `verdict` one of
+    /// PASS / NEEDS_CHANGES / BLOCKED. Reached over unauthenticated localhost; the
+    /// unguessable session id is the verification.
+    #[allow(clippy::too_many_arguments)]
+    async fn report_agent_result(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        kind: String,
+        verdict: Option<String>,
+        findings: Option<String>,
+        summary: Option<String>,
+        severity: Option<String>,
+        reason: Option<String>,
+        evidence: Option<String>,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        agent_plans::record_agent_report(
+            state, session_id, kind, verdict, findings, summary, severity, reason, evidence,
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn update_ai_session_title(
@@ -453,6 +481,7 @@ struct GqlHostSettings {
     planner_methodology_path: String,
     planner_conventions_path: String,
     web_client_url: String,
+    discord_webhook_url: String,
 }
 
 impl From<settings_service::HostSettings> for GqlHostSettings {
@@ -464,6 +493,7 @@ impl From<settings_service::HostSettings> for GqlHostSettings {
             planner_methodology_path: value.planner_methodology_path,
             planner_conventions_path: value.planner_conventions_path,
             web_client_url: value.web_client_url,
+            discord_webhook_url: value.discord_webhook_url,
         }
     }
 }

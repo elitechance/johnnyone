@@ -1,4 +1,5 @@
-import { Component, inject } from '@angular/core';
+import { Component, OnInit, inject, signal } from '@angular/core';
+import { FormsModule } from '@angular/forms';
 import {
   IonButton,
   IonCard,
@@ -8,6 +9,7 @@ import {
   IonCardTitle,
   IonContent,
   IonHeader,
+  IonInput,
   IonItem,
   IonLabel,
   IonList,
@@ -15,13 +17,17 @@ import {
   IonTitle,
   IonToolbar,
 } from '@ionic/angular/standalone';
-import { GRAPHQL_API_URL } from '@johnnyone/ui';
+import { firstValueFrom } from 'rxjs';
+import { GRAPHQL_API_URL, JohnnyApiService } from '@johnnyone/ui';
 import { AuthService } from '../../services/auth.service';
+
+const DISCORD_WEBHOOK_SETTING = 'discord_webhook_url';
 
 @Component({
   selector: 'app-settings-page',
   standalone: true,
   imports: [
+    FormsModule,
     IonHeader,
     IonToolbar,
     IonTitle,
@@ -34,6 +40,7 @@ import { AuthService } from '../../services/auth.service';
     IonList,
     IonItem,
     IonLabel,
+    IonInput,
     IonButton,
     IonText,
   ],
@@ -77,6 +84,41 @@ import { AuthService } from '../../services/auth.service';
 
       <ion-card>
         <ion-card-header>
+          <ion-card-title>Alerts</ion-card-title>
+          <ion-card-subtitle>Ping a Discord channel when a run needs your attention</ion-card-subtitle>
+        </ion-card-header>
+        <ion-card-content>
+          <ion-list lines="none">
+            <ion-item>
+              <ion-input
+                label="Discord webhook URL"
+                labelPlacement="stacked"
+                type="url"
+                autocomplete="off"
+                placeholder="https://discord.com/api/webhooks/…"
+                [(ngModel)]="discordWebhook"
+              ></ion-input>
+            </ion-item>
+          </ion-list>
+          <ion-button expand="block" (click)="saveDiscordWebhook()" [disabled]="savingDiscord()">
+            {{ savingDiscord() ? 'Saving…' : 'Save webhook' }}
+          </ion-button>
+          @if (discordSaved()) {
+            <ion-text color="success"><p>Saved.</p></ion-text>
+          }
+          <ion-text color="medium">
+            <p>
+              <em>
+                Fires only on attention (a run is blocked / needs a human decision) — never on
+                routine review changes. Leave blank to disable. Stored on the host.
+              </em>
+            </p>
+          </ion-text>
+        </ion-card-content>
+      </ion-card>
+
+      <ion-card>
+        <ion-card-header>
           <ion-card-title>Account</ion-card-title>
         </ion-card-header>
         <ion-card-content>
@@ -101,14 +143,42 @@ import { AuthService } from '../../services/auth.service';
     </ion-content>
   `,
 })
-export class SettingsPage {
+export class SettingsPage implements OnInit {
   readonly apiUrl = inject(GRAPHQL_API_URL);
   private readonly auth = inject(AuthService);
+  private readonly api = inject(JohnnyApiService);
 
   tenantId = (() => {
     const id = this.auth.getTenantId();
     return () => id;
   })();
+
+  discordWebhook = '';
+  savingDiscord = signal(false);
+  discordSaved = signal(false);
+
+  ngOnInit(): void {
+    firstValueFrom(this.api.getSetting(DISCORD_WEBHOOK_SETTING))
+      .then((value) => {
+        this.discordWebhook = value ?? '';
+      })
+      .catch(() => {
+        /* setting not set yet / host unreachable — leave blank */
+      });
+  }
+
+  async saveDiscordWebhook(): Promise<void> {
+    this.savingDiscord.set(true);
+    this.discordSaved.set(false);
+    try {
+      await firstValueFrom(
+        this.api.setSetting(DISCORD_WEBHOOK_SETTING, this.discordWebhook.trim()),
+      );
+      this.discordSaved.set(true);
+    } finally {
+      this.savingDiscord.set(false);
+    }
+  }
 
   logout(): void {
     this.auth.logout();
