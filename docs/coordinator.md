@@ -147,7 +147,7 @@ Grok-version-specific filters (e.g. `"Grok Composer"` vs the current
 `"Grok Build · always-approve"`) used by the idle detector — re-audit when Grok's
 UI changes.
 
-## Planned — ephemeral agents, lens fan-out, update triggers, docs-commit (NOT built)
+## Next-gen coordinator — ephemeral agents, lens fan-out, update triggers, docs-commit (ALL BUILT as of 2026-06-17)
 
 Design agreed in-session (2026-06-16). All four share one foundation; build the
 foundation once, then the features plug in.
@@ -293,20 +293,25 @@ costs more than dev's per-phase fan-out — accepted by design.
 mock is now in the `web` planner page (see "Web lens status strip" above). Remaining
 nice-to-have: finer per-event severity styling in the raw event feed (cosmetic).
 
-### Docs-commit agent (development only)
-- **Trigger: full plan completion** (all phases passed) — once, not per phase.
-- **App repo:** explicit path from the dev setup (new field; `app_scope` is the
-  natural home). Commit to the app repo's **current branch, no push**. (The plan's
-  own git repo is intentional and separate; this is about the *app/code* repo.)
-- CO spawns an ephemeral **docs agent** with: the app repo path, the plan's
-  validation/decisions, and the feature's full code diff.
-- Agent prompt behavior: **read the README first**; **do not bloat the README** —
-  put content in **separate docs**, creating a `docs/` directory if the repo has no
-  doc structure; **if the README links multiple docs, open and update only the
-  relevant ones** for this feature; commit on the current branch; **never push**;
-  report done. CO verifies the commit and records completion.
-- Why an agent (not hardcoded): it adapts to each repo's existing doc conventions
-  instead of forcing a fixed path/format.
+### Docs-commit agent (development only)  ✅ BUILT (2026-06-17)
+`run_docs_commit_agent` — called from `pass_phase` right after `agent_plan_completed`
+(dev full completion only; planning has no phases so it never fires there):
+- **App repo path = the dev run's `app_scope`** (the explicit field; now persisted on
+  dev create — `create_plan` normalizes + stores `input.app_scope`, and the web dev
+  setup form has an "App repo path (docs commit on completion)" field). If `app_scope`
+  is unset → emits `agent_docs_commit_skipped` and returns (no-op). The plan's own git
+  repo is separate/intentional; this commits to the **app/code** repo.
+- Spawns an ephemeral **"docs"** agent (`spawn_ephemeral_agent`, role `docs`) in the
+  app repo, using the worker provider's model (`grok-build`). Prompt
+  (`docs_commit_prompt`): read the README first; **don't bloat it** — put detail in a
+  `docs/` dir (create if missing); update only the relevant linked docs; base content
+  on the plan (`plan_path` overview/status) + actual code; **commit ONLY the doc files
+  it changed** (`git add <doc paths>`, never `-A`); **no push**; then report via the
+  `done` curl (`report_command(.., "done")`).
+- `wait_for_done_report` waits for the `kind:done` API report (nudge/escalate like the
+  lens waiter). On success → `agent_docs_committed`; on failure → `agent_docs_commit_failed`
+  (→ Discord attention) but the plan stays **approved** (docs failure never un-approves).
+- Why an agent (not hardcoded): adapts to each repo's existing doc conventions.
 
 ## Related planner UI behaviors (web)
 

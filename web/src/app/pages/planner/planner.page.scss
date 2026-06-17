@@ -1019,6 +1019,32 @@ select {
   font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+.run-settings label .hint {
+  color: #6b7c90;
+  font-weight: 400;
+}
+
+.app-scope-edit {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 2px 0 6px;
+
+  input {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: #0b1623;
+    border: 1px solid #2c3a4d;
+    border-radius: 6px;
+    color: #d4e0ee;
+    padding: 6px 8px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  .secondary-action {
+    flex: 0 0 auto;
+  }
+}
+
 .empty-state {
   grid-row: 1 / -1;
   place-self: center;

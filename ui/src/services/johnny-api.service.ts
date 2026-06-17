@@ -693,6 +693,21 @@ export class JohnnyApiService {
       .pipe(map((data) => data.updateAgentPlanTitle));
   }
 
+  /** Set/clear the app-repo path (`app_scope`) the docs-commit agent uses. Works on
+   * an in-flight run; an empty value clears it (docs commit then skips). */
+  updateAgentPlanAppScope(id: string, appScope: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanAppScope: AgentPlanRun }>(
+        `mutation UpdateAgentPlanAppScope($id: ID!, $appScope: String) {
+          updateAgentPlanAppScope(id: $id, appScope: $appScope) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, appScope }
+      )
+      .pipe(map((data) => data.updateAgentPlanAppScope));
+  }
+
   /**
    * Amend an approved planning run. Stashes the brief on the plan, switches
    * T1 into "edit mode", and re-runs the T1→T2 planning cycle. On T2 PASS

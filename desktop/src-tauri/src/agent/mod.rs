@@ -815,6 +815,9 @@ impl AgentService {
             "get_agent_plan" => Self::rpc_get_agent_plan(&req.params, state),
             "start_agent_plan" => Self::rpc_start_agent_plan(&req.params, state).await,
             "update_agent_plan_title" => Self::rpc_update_agent_plan_title(&req.params, state),
+            "update_agent_plan_app_scope" => {
+                Self::rpc_update_agent_plan_app_scope(&req.params, state)
+            }
             "refresh_agent_plan_phases" => {
                 Self::rpc_refresh_agent_plan_phases(&req.params, state)
             },
@@ -1149,6 +1152,28 @@ impl AgentService {
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'title' parameter".to_string())?;
         let run = crate::services::agent_plans::update_plan_title(state, id.to_string(), title.to_string())?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_agent_plan_app_scope(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        // `appScope` is optional — null/empty clears it.
+        let app_scope = params
+            .get("appScope")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty());
+        let run = crate::services::agent_plans::update_plan_app_scope(
+            state,
+            id.to_string(),
+            app_scope,
+        )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 

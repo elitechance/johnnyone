@@ -156,6 +156,11 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
     let parsed = parse_plan(&input.workspace_path, &input.plan_path)?;
     let plan_id = Uuid::new_v4().to_string();
     let title = input.title.unwrap_or_else(|| parsed.title.clone());
+    // Explicit app-repo path (where the docs-commit agent commits on completion).
+    let app_scope = normalize_optional_workspace_path(
+        &parsed.workspace_path,
+        input.app_scope.as_deref(),
+    )?;
 
     let worker_session = sessions::create_session(
         state,
@@ -167,31 +172,23 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
             kind: Some("agent".to_string()),
         },
     )?;
-    let reviewer_session = sessions::create_session(
-        state,
-        CreateSessionInput {
-            provider: Some(input.reviewer_provider.clone()),
-            model: default_model_for_provider(&input.reviewer_provider),
-            working_directory: Some(parsed.workspace_path.to_string_lossy().to_string()),
-            title: Some(format!("T2 Reviewer - {}", title)),
-            kind: Some("agent".to_string()),
-        },
-    )?;
+    // No persistent T2 reviewer session: the 3-lens fan-out spawns ephemeral
+    // reviewers per round, so a standing reviewer session would just sit idle.
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index)
-             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, ?6, ?7, ?8, ?9, 0)",
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope)
+             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9)",
             params![
                 plan_id,
                 title,
                 parsed.workspace_path.to_string_lossy(),
                 parsed.plan_path.to_string_lossy(),
                 worker_session.id,
-                reviewer_session.id,
                 input.worker_provider,
                 input.reviewer_provider,
                 parsed.phases.first().map(|phase| phase.phase_id.as_str()),
+                app_scope,
             ],
         )
         .map_err(|e| format!("Failed to create agent plan: {}", e))?;
@@ -241,7 +238,7 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
         &plan_id,
         None,
         "agent_plan_created",
-        json!({ "workerSessionId": worker_session.id, "reviewerSessionId": reviewer_session.id }),
+        json!({ "workerSessionId": worker_session.id, "reviewerSessionId": serde_json::Value::Null }),
     )?;
 
     get_plan(state, &plan_id)
@@ -299,28 +296,19 @@ fn create_planning_run(
             kind: Some("agent".to_string()),
         },
     )?;
-    let reviewer_session = sessions::create_session(
-        state,
-        CreateSessionInput {
-            provider: Some(input.reviewer_provider.clone()),
-            model: default_model_for_provider(&input.reviewer_provider),
-            working_directory: Some(workspace.to_string_lossy().to_string()),
-            title: Some(format!("T2 Plan Reviewer - {}", title)),
-            kind: Some("agent".to_string()),
-        },
-    )?;
+    // No persistent T2 reviewer session — the 3-lens fan-out spawns ephemeral
+    // reviewers per round, so a standing reviewer session would just sit idle.
 
     state.db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12)",
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11)",
             params![
                 plan_id,
                 title,
                 workspace.to_string_lossy(),
                 plan.to_string_lossy(),
                 worker_session.id,
-                reviewer_session.id,
                 input.worker_provider,
                 input.reviewer_provider,
                 input.brief.unwrap_or_default(),
@@ -337,7 +325,7 @@ fn create_planning_run(
         &plan_id,
         None,
         "planning_run_created",
-        json!({ "plannerSessionId": worker_session.id, "reviewerSessionId": reviewer_session.id }),
+        json!({ "plannerSessionId": worker_session.id, "reviewerSessionId": serde_json::Value::Null }),
     )?;
 
     get_plan(state, &plan_id)
@@ -433,14 +421,13 @@ pub async fn start_plan(
         .worker_session_id
         .clone()
         .ok_or_else(|| "Plan has no worker session".to_string())?;
-    let reviewer_session_id = run
-        .plan
-        .reviewer_session_id
-        .clone()
-        .ok_or_else(|| "Plan has no reviewer session".to_string())?;
 
     terminal::attach_terminal_headless(&state, worker_session_id.clone(), 120, 36).await?;
-    terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+    // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
+    // attach if a legacy run still has one.
+    if let Some(reviewer_session_id) = run.plan.reviewer_session_id.clone() {
+        terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+    }
     sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
 
     state.db.with_conn(|conn| {
@@ -575,6 +562,8 @@ pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, Str
         let _ = terminal::kill_terminal_session(state, session_id).await;
         let _ = sessions::archive_session(state, session_id.clone()).await;
     }
+    // Tear down any in-flight ephemeral lens/docs agents too (previously leaked).
+    dispose_plan_review_sessions(state, &id).await;
     state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE agent_plans SET status = 'stopped', updated_at = datetime('now') WHERE id = ?1",
@@ -583,6 +572,36 @@ pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, Str
         .map_err(|e| e.to_string())
     })?;
     append_event(state, &id, None, "agent_plan_stopped", json!({}))?;
+    get_plan(state, &id)
+}
+
+/// Set/clear the app-repo path (`app_scope`) on an existing run — so a user can add
+/// or fix the path the docs-commit agent uses, on an in-flight run, anytime before
+/// completion. An empty value clears it (docs commit then skips).
+pub fn update_plan_app_scope(
+    state: &AppState,
+    id: String,
+    app_scope: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    let current = get_plan(state, &id)?;
+    let normalized = normalize_optional_workspace_path(
+        Path::new(&current.plan.workspace_path),
+        app_scope.as_deref(),
+    )?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET app_scope = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![normalized, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_plan_app_scope_updated",
+        json!({ "appScope": normalized }),
+    )?;
     get_plan(state, &id)
 }
 
@@ -628,6 +647,8 @@ pub async fn delete_plan(state: &AppState, id: String) -> Result<bool, String> {
         let _ = terminal::kill_terminal_session(state, &session_id).await;
         let _ = sessions::archive_session(state, session_id).await;
     }
+    // Also tear down any ephemeral lens/docs agents for this plan (previously leaked).
+    dispose_plan_review_sessions(state, &id).await;
 
     state.db.with_conn(|conn| {
         conn.execute(
@@ -809,14 +830,13 @@ async fn start_planning_run_inner(
         .worker_session_id
         .clone()
         .ok_or_else(|| "Planning run has no planner session".to_string())?;
-    let reviewer_session_id = run
-        .plan
-        .reviewer_session_id
-        .clone()
-        .ok_or_else(|| "Planning run has no reviewer session".to_string())?;
 
     terminal::attach_terminal_headless(&state, planner_session_id.clone(), 120, 36).await?;
-    terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+    // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
+    // attach if a legacy run still has one.
+    if let Some(reviewer_session_id) = run.plan.reviewer_session_id.clone() {
+        terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+    }
     sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
 
     state.db.with_conn(|conn| {
@@ -1514,6 +1534,29 @@ async fn dispose_ephemeral_agent(state: &AppState, session_id: &str) {
     let _ = sessions::delete_session(state, session_id.to_string()).await;
 }
 
+/// Dispose EVERY ephemeral review/docs agent registered for a plan (the 3 lens
+/// reviewers, the docs agent). Called on stop/delete so those transient sessions
+/// never outlive the plan — they were leaking before (only T1/T2 were killed).
+async fn dispose_plan_review_sessions(state: &AppState, plan_id: &str) {
+    let session_ids: Vec<String> = state
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT session_id FROM agent_plan_review_sessions WHERE plan_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map(params![plan_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            Ok(ids)
+        })
+        .unwrap_or_default();
+    for session_id in session_ids {
+        dispose_ephemeral_agent(state, &session_id).await;
+    }
+}
+
 /// Discord embed color by severity.
 fn discord_color(severity: &str) -> u32 {
     match severity {
@@ -1648,6 +1691,11 @@ fn discord_message_for(
             "attention",
             "🔴 Run needs attention".to_string(),
             or_default(reason, "coordinator error"),
+        )),
+        "agent_docs_commit_failed" => Some((
+            "attention",
+            "🔴 Docs commit failed".to_string(),
+            or_default(reason, "the docs-commit agent did not finish"),
         )),
         _ => None,
     }
@@ -2107,12 +2155,127 @@ fn report_command(session_id: &str, kind: &str) -> String {
     const READY: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"ready\\\")}\"}'";
     const VERDICT: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"verdict\\\",verdict:\\\"<PASS|NEEDS_CHANGES|BLOCKED>\\\")}\"}'";
     const BLOCKED: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"blocked\\\")}\"}'";
+    const DONE: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"done\\\")}\"}'";
     let tmpl = match kind {
         "verdict" => VERDICT,
         "blocked" => BLOCKED,
+        "done" => DONE,
         _ => READY,
     };
     tmpl.replace("SESSION_ID", session_id)
+}
+
+/// Feature 3 — prompt for the docs-commit agent (dev-only, on full plan completion).
+/// It updates the APP repo's docs to reflect what the plan delivered and commits ONLY
+/// the docs (commit-only, no push).
+fn docs_commit_prompt(run: &AgentPlanRun, app_repo: &str, session_id: &str) -> String {
+    format!(
+        "You are the documentation agent. A development plan has just COMPLETED — every phase passed review. Your ONE job is to bring this app's documentation up to date for what was delivered, then commit ONLY the docs.\n\n\
+APP CODE REPOSITORY (work here): {app_repo}\n\
+PLAN (read its overview.md + status.md to learn what changed/was delivered): {plan_path}\n\n\
+Steps:\n\
+1. FIRST read the README at the app repo root. Update it ONLY where needed and keep it CONCISE — do NOT bloat the README. Put any detailed documentation in a `docs/` directory (create `docs/` if it does not exist). If the README links to other docs, open and update the ones that are now out of date.\n\
+2. Write accurate docs for what this plan delivered (new/changed behavior, config/env, APIs, flows) based on the plan AND the actual code — do not invent.\n\
+3. Commit ONLY the documentation files you changed. Do NOT commit code, do NOT stage everything, and do NOT push:\n\
+   git add <only the doc files you changed>   # e.g. README.md docs/whatever.md — NEVER `git add -A` or `git add .`\n\
+   git commit -m \"docs: {title}\"\n\
+4. When the commit is done, report completion by running this exact command:\n{report}",
+        app_repo = app_repo,
+        plan_path = run.plan.plan_path,
+        title = run.plan.title.replace('"', "'"),
+        report = report_command(session_id, "done"),
+    )
+}
+
+/// Wait for an ephemeral agent to report `kind:done` via the API. Nudges (re-sends
+/// the report command) if it goes idle without reporting; escalates after
+/// `MAX_READY_NUDGES`. Mirrors `wait_for_lens_verdict` but for the `done` signal.
+async fn wait_for_done_report(
+    state: &AppState,
+    session_id: &str,
+    label: &str,
+) -> Result<(), String> {
+    clear_agent_report(state, session_id).await;
+    let mut last_key = String::new();
+    let mut last_changed_at = Instant::now();
+    let mut nudges_sent: u32 = 0;
+    loop {
+        if take_agent_report_kind(state, session_id, "done").await.is_some() {
+            return Ok(());
+        }
+        let snapshot = terminal::capture_terminal_session_with_history(state, session_id).await?;
+        let key = snapshot_idle_key(&snapshot);
+        if key != last_key {
+            last_key = key;
+            last_changed_at = Instant::now();
+        }
+        if last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
+            if nudges_sent >= MAX_READY_NUDGES {
+                return Err(format!(
+                    "{} agent went idle without reporting done after {} reminders",
+                    label, MAX_READY_NUDGES
+                ));
+            }
+            nudges_sent += 1;
+            let nudge = format!(
+                "You have not reported completion. When the docs are committed, run this exact command:\n{}",
+                report_command(session_id, "done")
+            );
+            terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", nudge))
+                .await?;
+            last_changed_at = Instant::now();
+        }
+        sleep(Duration::from_millis(1_000)).await;
+    }
+}
+
+/// Feature 3 — on full development completion, spawn an ephemeral "docs" agent that
+/// updates the APP repo's docs and commits them (commit-only, no push). Dev-only.
+/// Requires the run's `app_scope` (the app repo path); skips gracefully if unset.
+async fn run_docs_commit_agent(state: &AppState, plan_id: &str) -> Result<(), String> {
+    let run = get_plan(state, plan_id)?;
+    let app_repo = match run.plan.app_scope.clone().filter(|s| !s.trim().is_empty()) {
+        Some(p) => p,
+        None => {
+            tracing::info!(plan_id, "no app_scope set — skipping docs-commit agent");
+            return append_event(
+                state,
+                plan_id,
+                None,
+                "agent_docs_commit_skipped",
+                json!({ "reason": "No app repo path (app_scope) set on this run — set it to enable docs commits." }),
+            );
+        }
+    };
+    let provider = run.plan.worker_provider.clone();
+    let model = default_model_for_provider(&provider);
+    append_event(
+        state,
+        plan_id,
+        None,
+        "agent_docs_commit_started",
+        json!({ "appRepo": app_repo }),
+    )?;
+    let session_id = spawn_ephemeral_agent(
+        state,
+        plan_id,
+        "docs",
+        &provider,
+        model,
+        Some(app_repo.clone()),
+        |sid| docs_commit_prompt(&run, &app_repo, sid),
+    )
+    .await?;
+    let result = wait_for_done_report(state, &session_id, "docs").await;
+    dispose_ephemeral_agent(state, &session_id).await;
+    result?;
+    append_event(
+        state,
+        plan_id,
+        None,
+        "agent_docs_committed",
+        json!({ "appRepo": app_repo }),
+    )
 }
 
 fn worker_report_instruction(session_id: &str) -> String {
@@ -2909,6 +3072,19 @@ async fn pass_phase(
         )?;
         } else {
             append_event(state, plan_id, None, "agent_plan_completed", json!({}))?;
+            // Feature 3: dev-only docs-commit agent — update + commit the app repo's
+            // docs (commit only). Failures are logged + surfaced but never un-approve
+            // the plan (it is already complete).
+            if let Err(err) = run_docs_commit_agent(state, plan_id).await {
+                tracing::warn!(plan_id, %err, "docs-commit agent failed");
+                let _ = append_event(
+                    state,
+                    plan_id,
+                    None,
+                    "agent_docs_commit_failed",
+                    json!({ "reason": err }),
+                );
+            }
         }
     } else {
         append_event(
@@ -4583,6 +4759,12 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
         },
         "agent_phase_unlocked" => "Unlocked the next phase".to_string(),
         "agent_plan_completed" => "Completed the full run".to_string(),
+        "agent_docs_commit_started" => "Docs agent — updating app-repo docs".to_string(),
+        "agent_docs_committed" => "Docs committed to the app repo".to_string(),
+        "agent_docs_commit_skipped" => {
+            "Docs commit skipped (no app repo path set)".to_string()
+        }
+        "agent_docs_commit_failed" => "Docs commit failed".to_string(),
         "agent_single_phase_completed" => "Completed the selected phase only".to_string(),
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
         _ => humanize_event_type(&event.event_type),

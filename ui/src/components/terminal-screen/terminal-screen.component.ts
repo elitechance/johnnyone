@@ -89,6 +89,9 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private momentumAccum = 0;
   /** When false, mobile mode keeps the user's scroll position instead of following new output. */
   private userPinnedToLatest = true;
+  /** Last mobile viewport scrollTop, to detect a *deliberate upward* scroll (vs. a
+   * programmatic scroll or simply not being able to reach the exact bottom). */
+  private lastMobileScrollTop = 0;
   private idlePromptTimer: ReturnType<typeof setTimeout> | null = null;
   private lastScreenKey = '';
   protected mobileInputBuffer = '';
@@ -1344,13 +1347,21 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (!viewport) return;
 
     this.unbindMobileViewportScroll();
+    this.lastMobileScrollTop = viewport.scrollTop;
     this.xtermViewportScrollHandler = () => {
       if (!this.terminal) return;
       queueMicrotask(() => {
         if (!this.terminal) return;
+        const top = viewport.scrollTop;
+        // A real upward gesture (top decreased meaningfully) means the user wants to
+        // read scrollback — only then freeze follow-live. Otherwise (scrolled toward
+        // the bottom, a programmatic scroll, or simply can't reach the exact bottom on
+        // a phone) keep following live, re-pinning once near the bottom.
+        const scrolledUp = top < this.lastMobileScrollTop - 4;
+        this.lastMobileScrollTop = top;
         if (this.isViewportAtBottom()) {
           this.userPinnedToLatest = true;
-        } else {
+        } else if (scrolledUp) {
           this.userPinnedToLatest = false;
         }
       });

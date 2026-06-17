@@ -337,6 +337,24 @@
             <code>{{ run.plan.planPath }}</code>
             <label>Providers</label>
             <code>T1: {{ run.plan.workerProvider }} · T2: {{ run.plan.reviewerProvider }}</code>
+            @if (mode() === 'development') {
+              <label>App repo path <span class="hint">(docs commit on completion — blank to skip)</span></label>
+              <div class="app-scope-edit">
+                <input
+                  type="text"
+                  [(ngModel)]="appScopeEdit"
+                  placeholder="e.g. lokal/apps/marketplace"
+                />
+                <button
+                  class="secondary-action"
+                  type="button"
+                  [disabled]="savingAppScope()"
+                  (click)="saveAppScope()"
+                >
+                  {{ savingAppScope() ? 'Saving…' : 'Save' }}
+                </button>
+              </div>
+            }
             @if (run.plan.error) {
               <label>Error</label>
               <code>{{ run.plan.error }}</code>
@@ -495,6 +513,18 @@
           ></ion-input>
           <ion-button slot="end" fill="clear" size="small" (click)="openPathBrowser('plan')">Browse</ion-button>
         </ion-item>
+
+        @if (mode() === 'development') {
+          <ion-item>
+            <ion-input
+              label="App repo path (docs commit on completion)"
+              labelPlacement="stacked"
+              placeholder="e.g. lokal/apps/marketplace — blank = skip docs commit"
+              [(ngModel)]="appScope"
+            ></ion-input>
+            <ion-button slot="end" fill="clear" size="small" (click)="openPathBrowser('appScope')">Browse</ion-button>
+          </ion-item>
+        }
 
         @if (mode() === 'planning') {
           <ion-item>

@@ -1,5 +1,5 @@
 import { CommonModule, Location } from '@angular/common';
-import { Component, HostListener, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { Component, HostListener, OnDestroy, OnInit, computed, effect, inject, signal } from '@angular/core';
 import { DomSanitizer, SafeHtml, SafeResourceUrl } from '@angular/platform-browser';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
@@ -192,6 +192,15 @@ export class PlannerPage implements OnInit, OnDestroy {
   private selectedPlanHtmlObjectUrl: string | null = null;
   private plannerVisualSubscriptions = new Set<string>();
   private lastPlanTerminalSyncKey = '';
+  /** Anti-flap: a terminal leaving view is unsubscribed only after this delay, so a
+   * quick re-sync (panel flutter / plan update) doesn't tear down + re-establish the
+   * stream — which would spam the DO with re-subscribes + throttle-bypassing refreshes. */
+  private pendingUnsubscribes = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Last time we sent a `visual_refresh` per session. `visual_refresh` BYPASSES the
+   * desktop's 2s publish throttle, so we cool it down to avoid overworking the DO. */
+  private lastVisualRefreshAt = new Map<string, number>();
+  private static readonly UNSUBSCRIBE_DEBOUNCE_MS = 4000;
+  private static readonly REFRESH_COOLDOWN_MS = 5000;
   /** Plan status last used to auto-follow the mobile panel, so we only switch on a
    *  real phase transition and don't fight a manual tab selection within a phase. */
   private lastFollowedRunStatus = '';
@@ -279,6 +288,12 @@ export class PlannerPage implements OnInit, OnDestroy {
   reviewerProvider = 'codex';
   userBrief = '';
   appScope = 'personal/apps';
+  // Editable app-repo path shown in Run Settings (dev runs); synced from the
+  // selected run by `syncAppScopeEdit` (only when the plan id changes, so a live
+  // refresh doesn't clobber an in-progress edit).
+  appScopeEdit = '';
+  savingAppScope = signal(false);
+  private appScopeSyncedPlanId: string | null = null;
   docsScope = 'personal/docs';
   referencePaths = '';
   developmentWorkerPrompt = '';
@@ -549,8 +564,22 @@ export class PlannerPage implements OnInit, OnDestroy {
         return { badge: 'Working', title: `${pos} · T1 working`, detail: 'The worker is implementing this phase.', tone: 'active', steps, activeIndex: 0 };
       case 'phase_review_running':
         return { badge: 'Reviewing', title: `${pos} · T2 reviewing`, detail: lens || 'Product / QA / Lead are reviewing this phase.', tone: 'active', steps, activeIndex: 1 };
-      case 'approved':
-        return { badge: 'Done', title: 'All phases complete', detail: 'Every phase passed review.', tone: 'done', steps, activeIndex: 2 };
+      case 'approved': {
+        // The docs-commit agent runs AFTER approval — reflect its state so the user
+        // knows whether docs are still committing / done / failed.
+        switch (this.docsCommitState()) {
+          case 'committing':
+            return { badge: 'Docs…', title: 'All phases complete — committing docs', detail: 'The docs agent is updating and committing the app-repo docs.', tone: 'active', steps, activeIndex: 2 };
+          case 'committed':
+            return { badge: 'Done', title: 'All phases complete — docs committed', detail: 'Every phase passed; docs were committed to the app repo.', tone: 'done', steps, activeIndex: 2 };
+          case 'failed':
+            return { badge: 'Attention', title: 'Approved — docs commit failed', detail: 'Phases passed, but the docs commit failed (see the activity feed).', tone: 'attention', steps, activeIndex: 2 };
+          case 'skipped':
+            return { badge: 'Done', title: 'All phases complete', detail: 'Every phase passed. Docs commit skipped — no app repo path set.', tone: 'done', steps, activeIndex: 2 };
+          default:
+            return { badge: 'Done', title: 'All phases complete', detail: 'Every phase passed review.', tone: 'done', steps, activeIndex: 2 };
+        }
+      }
       case 'needs_attention':
         return { badge: 'Attention', title: 'Needs your attention', detail: err || 'The coordinator paused — open the run to resolve and continue.', tone: 'attention', steps, activeIndex: 1 };
       case 'blocked':
@@ -580,6 +609,31 @@ export class PlannerPage implements OnInit, OnDestroy {
         return 'No review activity yet.';
     }
   });
+
+  /** Latest state of the dev docs-commit agent (Feature 3), derived from its events,
+   * so the stage indicator can show committing/committed/failed/skipped after approval. */
+  private docsCommitState(): 'committing' | 'committed' | 'failed' | 'skipped' | null {
+    const events = this.currentRun()?.events ?? [];
+    let latest: AgentPlanEvent | null = null;
+    for (const e of events) {
+      if (!e.eventType.startsWith('agent_docs_commit') && e.eventType !== 'agent_docs_committed') {
+        continue;
+      }
+      if (!latest || e.createdAt >= latest.createdAt) latest = e;
+    }
+    switch (latest?.eventType) {
+      case 'agent_docs_committed':
+        return 'committed';
+      case 'agent_docs_commit_failed':
+        return 'failed';
+      case 'agent_docs_commit_skipped':
+        return 'skipped';
+      case 'agent_docs_commit_started':
+        return 'committing';
+      default:
+        return null;
+    }
+  }
 
   mode = computed<'planning' | 'development'>(() => {
     const mode = this.route.snapshot.data['mode'];
@@ -716,6 +770,47 @@ export class PlannerPage implements OnInit, OnDestroy {
           : 'context',
   })));
   fileViewerColumns = computed(() => `${this.fileSidebarWidth()}px 8px minmax(0, 1fr)`);
+
+  constructor() {
+    // Keep the editable app-repo field in sync with the selected run (id-gated so a
+    // live refresh doesn't overwrite what the user is typing).
+    effect(() => this.syncAppScopeEdit());
+  }
+
+  private syncAppScopeEdit(): void {
+    const plan = this.currentRun()?.plan;
+    if (!plan) {
+      this.appScopeSyncedPlanId = null;
+      return;
+    }
+    if (this.appScopeSyncedPlanId !== plan.id) {
+      this.appScopeSyncedPlanId = plan.id;
+      this.appScopeEdit = plan.appScope ?? '';
+    }
+  }
+
+  async saveAppScope(): Promise<void> {
+    const id = this.currentRun()?.plan.id;
+    if (!id || this.savingAppScope()) return;
+    this.savingAppScope.set(true);
+    this.error.set(null);
+    try {
+      const run = await firstValueFrom(
+        this.api.updateAgentPlanAppScope(id, this.appScopeEdit.trim()),
+      );
+      this.appScopeSyncedPlanId = null; // force re-sync from the saved value
+      this.currentRun.set(run);
+      this.coordinatorNotice.set(
+        this.appScopeEdit.trim()
+          ? 'App repo path saved — docs will be committed there on completion.'
+          : 'App repo path cleared — docs commit will be skipped.',
+      );
+    } catch (err) {
+      this.error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      this.savingAppScope.set(false);
+    }
+  }
 
   ngOnInit(): void {
     this.setupCompactWorkspaceMode();
@@ -2280,22 +2375,28 @@ export class PlannerPage implements OnInit, OnDestroy {
 
     for (const sessionId of Array.from(this.plannerVisualSubscriptions)) {
       if (!visibleIds.has(sessionId)) {
-        await this.unsubscribePlanTerminal(sessionId);
-        // Keep the last frame so the now-idle panel shows its most recent screen
-        // (e.g. T2's last review) instead of going blank. Cross-plan staleness is
-        // handled by resetPerPlanState() clearing terminalScreens on plan switch.
+        // Debounced — a brief re-sync (panel flutter, plan update) shouldn't flap the
+        // stream. If it comes back into view first, the unsubscribe is cancelled.
+        // Last frame is kept so the now-idle panel isn't blank.
+        this.scheduleDebouncedUnsubscribe(sessionId);
       }
     }
 
     for (const sessionId of visibleIds) {
+      this.cancelPendingUnsubscribe(sessionId);
       this.hydrateTerminalScreenFromCache(sessionId);
       try {
-        if (options?.refresh) {
+        const alreadyLive = this.plannerVisualSubscriptions.has(sessionId);
+        if (options?.refresh && this.refreshCooldownElapsed(sessionId)) {
+          // `visual_refresh` bypasses the desktop publish throttle — only send it on a
+          // genuine (un-cooled-down) refresh request, not on every steady re-sync.
           await this.relayTerminal.refreshVisual(sessionId);
           this.plannerVisualSubscriptions.add(sessionId);
-        } else {
+          this.lastVisualRefreshAt.set(sessionId, Date.now());
+        } else if (!alreadyLive) {
           await this.subscribePlanTerminal(sessionId);
         }
+        // else: already live and within cooldown → leave the steady stream alone.
       } catch {
         // The coordinator may still be starting the host/tmux session.
       }
@@ -2331,6 +2432,28 @@ export class PlannerPage implements OnInit, OnDestroy {
     this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: cached }));
   }
 
+  private refreshCooldownElapsed(sessionId: string): boolean {
+    const last = this.lastVisualRefreshAt.get(sessionId) ?? 0;
+    return Date.now() - last > PlannerPage.REFRESH_COOLDOWN_MS;
+  }
+
+  private scheduleDebouncedUnsubscribe(sessionId: string): void {
+    if (this.pendingUnsubscribes.has(sessionId)) return;
+    const timer = setTimeout(() => {
+      this.pendingUnsubscribes.delete(sessionId);
+      void this.unsubscribePlanTerminal(sessionId);
+    }, PlannerPage.UNSUBSCRIBE_DEBOUNCE_MS);
+    this.pendingUnsubscribes.set(sessionId, timer);
+  }
+
+  private cancelPendingUnsubscribe(sessionId: string): void {
+    const timer = this.pendingUnsubscribes.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingUnsubscribes.delete(sessionId);
+    }
+  }
+
   private async subscribePlanTerminal(sessionId: string): Promise<void> {
     if (this.plannerVisualSubscriptions.has(sessionId)) return;
     await this.relayTerminal.subscribeVisual(sessionId);
@@ -2343,6 +2466,10 @@ export class PlannerPage implements OnInit, OnDestroy {
   }
 
   private async unsubscribeAllPlanTerminals(): Promise<void> {
+    for (const timer of this.pendingUnsubscribes.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingUnsubscribes.clear();
     for (const sessionId of Array.from(this.plannerVisualSubscriptions)) {
       await this.unsubscribePlanTerminal(sessionId);
     }

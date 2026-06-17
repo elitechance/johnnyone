@@ -374,6 +374,7 @@ type Mutation {
   startAgentPlan(id: ID!, phaseId: String, phaseRunMode: String): AgentPlanRun!
   updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
   updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!
+  updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
