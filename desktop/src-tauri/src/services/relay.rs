@@ -29,6 +29,7 @@ pub async fn spawn_connection(state: AppState, config: RelayConfig) {
             worker_url: config.worker_url.clone(),
             user_id: config.user_id.clone(),
             tenant_id: config.tenant_id.clone(),
+            access_token: config.access_token.clone(),
         })
         .await;
 
@@ -41,6 +42,7 @@ pub async fn spawn_connection(state: AppState, config: RelayConfig) {
         worker_url: config.worker_url,
         user_id: config.user_id,
         tenant_id: config.tenant_id,
+        access_token: config.access_token,
     };
 
     tokio::spawn(async move {
@@ -50,6 +52,7 @@ pub async fn spawn_connection(state: AppState, config: RelayConfig) {
                     worker_url: agent_config.worker_url.clone(),
                     user_id: agent_config.user_id.clone(),
                     tenant_id: agent_config.tenant_id.clone(),
+                    access_token: agent_config.access_token.clone(),
                 },
                 state.clone(),
             )

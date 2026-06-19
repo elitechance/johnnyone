@@ -1,0 +1,23 @@
+name = "johnnyone-test"
+compatibility_date = "2026-03-02"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 for real runtime in tests
+[[d1_databases]]
+binding = "DB"
+database_name = "johnnyone-db"
+database_id = "00000000000000000000000000000000"
+
+# The DO under test (class exported from test main)
+[[durable_objects.bindings]]
+name = "CHAT_RELAY_DO"
+class_name = "ChatRelayDO"
+
+[vars]
+ENVIRONMENT = "test"
+JWT_SECRET = "test-secret-for-phase-00"
+
+# Required for Durable Object class registration in this Worker (per wrangler warning)
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRelayDO"]

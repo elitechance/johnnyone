@@ -180,11 +180,11 @@
                             >{{ verdictLabel(item.verdict) }}</span
                           >
                         }
-                        {{ item.text }}
+                        <span class="md" [innerHTML]="renderMd(item.text)"></span>
                         @if (item.findings?.length) {
                           <ul class="lens-act-findings">
                             @for (f of item.findings; track f) {
-                              <li>{{ f }}</li>
+                              <li class="md" [innerHTML]="renderMd(f)"></li>
                             }
                           </ul>
                         }

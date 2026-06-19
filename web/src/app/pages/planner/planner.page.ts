@@ -183,6 +183,7 @@ export class PlannerPage implements OnInit, OnDestroy {
   private readonly markdownParser = this.createMarkdownParser();
   private terminalSubscription: Subscription | null = null;
   private plannerSubscription: Subscription | null = null;
+  private relayErrorSubscription: Subscription | null = null;
   private validationTimer: ReturnType<typeof setTimeout> | null = null;
   private coordinatorResizeCleanup: (() => void) | null = null;
   private fileResizeCleanup: (() => void) | null = null;
@@ -371,6 +372,25 @@ export class PlannerPage implements OnInit, OnDestroy {
   verdictLabel(verdict: string | undefined | null): string {
     if (!verdict) return '';
     return verdict === 'NEEDS_CHANGES' ? 'FAILED' : verdict;
+  }
+
+  /**
+   * Lightweight markdown → HTML for lens activity text/findings (agents emit
+   * markdown-ish prose). HTML is escaped FIRST so only our own formatting tags
+   * are produced, and the result is bound via `[innerHTML]` which Angular's
+   * sanitizer runs over — so no XSS even on untrusted agent output.
+   */
+  renderMd(raw: string | undefined | null): string {
+    if (!raw) return '';
+    let s = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    s = s.replace(/```([\s\S]*?)```/g, (_m, c: string) => `<pre class="md-pre"><code>${c.replace(/^\n|\n$/g, '')}</code></pre>`);
+    s = s.replace(/`([^`\n]+)`/g, '<code class="md-code">$1</code>');
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[^_\w])_([^_\n]+)_/g, '$1<em>$2</em>');
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    s = s.replace(/\n/g, '<br>');
+    return s;
   }
 
   /** Maps a round event to a styled activity row, or null if not lens-relevant. */
@@ -820,6 +840,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       theme: 'dark',
     });
     this.subscribeToRelayEvents();
+    this.subscribeToRelayErrorEvents();
     document.addEventListener('visibilitychange', this.visibilityChangeHandler);
     void this.relayTerminal.connect();
     void this.loadPlans();
@@ -836,6 +857,8 @@ export class PlannerPage implements OnInit, OnDestroy {
     this.teardownCompactWorkspaceMode();
     this.terminalSubscription?.unsubscribe();
     this.plannerSubscription?.unsubscribe();
+    this.relayErrorSubscription?.unsubscribe();
+    this.relayErrorSubscription = null;
     this.clearPendingAttachments('worker');
     this.clearPendingAttachments('reviewer');
     this.clearSelectedWorkspaceHtmlUrl();
@@ -1199,7 +1222,7 @@ export class PlannerPage implements OnInit, OnDestroy {
           this.activeMobilePanel.set('worker');
         }
       }
-      await this.syncPlanTerminalSubscriptions(run);
+      await this.syncPlanTerminalSubscriptions(run, { refresh: true });
       await this.loadPlans(false);
     } catch (err) {
       this.error.set(String(err));
@@ -1287,7 +1310,7 @@ export class PlannerPage implements OnInit, OnDestroy {
       this.currentRun.set(run);
       this.amendBrief = '';
       this.amendOpen.set(false);
-      await this.syncPlanTerminalSubscriptions(run);
+      await this.syncPlanTerminalSubscriptions(run, { refresh: true });
     } catch (err) {
       this.error.set(String(err));
     } finally {
@@ -2248,6 +2271,16 @@ export class PlannerPage implements OnInit, OnDestroy {
     });
   }
 
+  private subscribeToRelayErrorEvents(): void {
+    if (this.relayErrorSubscription) return;
+    // Surface service-level bound failures (authFailureCount >3 etc) into planner's existing error banner/UI.
+    // Mirrors terminal.page to ensure no silent dead socket on planner surface (the other terminal host).
+    this.relayErrorSubscription = this.relayTerminal.errors().subscribe({
+      next: (err) => this.error.set(String(err)),
+      error: (e) => console.error('relay error sub (planner):', e),
+    });
+  }
+
   private setupCompactWorkspaceMode(): void {
     if (typeof window === 'undefined' || !window.matchMedia) return;
 
@@ -2458,6 +2491,19 @@ export class PlannerPage implements OnInit, OnDestroy {
     if (this.plannerVisualSubscriptions.has(sessionId)) return;
     await this.relayTerminal.subscribeVisual(sessionId);
     this.plannerVisualSubscriptions.add(sessionId);
+    // `visual_subscribe` only streams FUTURE frames, so a session that already has
+    // output (e.g. a just-started T1 planner after Start) stays blank until its next
+    // throttled publish — which is why the page needed a manual refresh to show it.
+    // Pull a single initial snapshot when we have no frame yet. Cooldown-guarded so
+    // this can't spam the DO (visual_refresh bypasses the publish throttle).
+    if (!this.terminalScreens()[sessionId] && this.refreshCooldownElapsed(sessionId)) {
+      this.lastVisualRefreshAt.set(sessionId, Date.now());
+      try {
+        await this.relayTerminal.refreshVisual(sessionId);
+      } catch {
+        // Host/tmux may still be coming up — the live stream will fill in.
+      }
+    }
   }
 
   private async unsubscribePlanTerminal(sessionId: string): Promise<void> {

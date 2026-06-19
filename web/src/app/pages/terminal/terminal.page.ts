@@ -165,6 +165,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private terminalSubscription: Subscription | null = null;
   private sessionUpdateSubscription: Subscription | null = null;
   private sessionDeleteSubscription: Subscription | null = null;
+  private relayErrorSubscription: Subscription | null = null;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
   private saveWorkspaceStateTimeout: ReturnType<typeof setTimeout> | null = null;
   private workspaceResizeObserver: ResizeObserver | null = null;
@@ -326,6 +327,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.loadSidebarWidth();
     this.loadPersistedWorkspaceState();
     this.subscribeToTerminalEvents();
+    this.subscribeToRelayErrorEvents();
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
     void this.detectTools();
     void this.loadLastWorkingDirectory();
@@ -1038,10 +1040,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private teardownTerminalSubscription(): void {
     this.terminalSubscription?.unsubscribe();
     this.terminalSubscription = null;
+    this.relayErrorSubscription?.unsubscribe();
+    this.relayErrorSubscription = null;
     if (this.resizeTerminalTimeout) {
       clearTimeout(this.resizeTerminalTimeout);
       this.resizeTerminalTimeout = null;
     }
+  }
+
+  private subscribeToRelayErrorEvents(): void {
+    if (this.relayErrorSubscription) return;
+    // Surface service-level bound failures etc into the existing terminalError UI channel
+    this.relayErrorSubscription = this.relayTerminal.errors().subscribe({
+      next: (err) => this.terminalError.set(String(err)),
+      error: (e) => console.error('relay error sub:', e),
+    });
   }
 
   async attachTerminal(sessionId: string): Promise<void> {

@@ -1,9 +1,12 @@
 import { desktopRpc } from '../../lib/runtime/desktop-rpc';
+import { authorizeForAltToken } from '../../lib/auth/api-key';
 
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
+  request?: Request;
+  [key: string]: unknown;
 }
 
 interface WorkerEnv {
@@ -16,5 +19,6 @@ export default async function getAiSession(
   args: { id: string },
   ctx: ResolverContext,
 ) {
+  await authorizeForAltToken(ctx, 'sessions:read');
   return desktopRpc<unknown | null>(ctx, 'get_session', { id: args.id });
 }

@@ -132,16 +132,16 @@
 
 <h2 id="wss">Live terminal (WebSocket)</h2>
 <p>Connect to <code>wss://johnnyone-dev.ethan-353.workers.dev/api/relay/ws</code> with your token. The server validates the token, resolves your desktop node, and routes the socket. Messages are JSON <strong>envelopes</strong>:</p>
-<pre><code>{ "type": "&lt;envelope type&gt;", "sessionId": "&lt;AiSession.id&gt;", "data": &lt;payload&gt; }</code></pre>
+<pre><code>{ "type": "terminal_command", "data": { "requestId": "&lt;uuid&gt;", "sessionId": "&lt;AiSession.id&gt;", "data": "", "control": "visual_subscribe" } }</code></pre>
 
 <h3>Client → server</h3>
 <table>
   <tr><th>type</th><th>Payload</th><th>Meaning</th></tr>
-  <tr><td><code>terminal_visual_subscribe</code></td><td><code>{ sessionId }</code></td><td>Start receiving <code>terminal_screen</code> updates for the session.</td></tr>
-  <tr><td><code>terminal_command</code></td><td><code>{ sessionId, data: "&lt;input&gt;" }</code></td><td>Send keystrokes / input to the terminal.</td></tr>
-  <tr><td><code>terminal_resize</code></td><td><code>{ sessionId, data: { cols, rows } }</code></td><td>Resize the terminal.</td></tr>
-  <tr><td><code>terminal_visual_unsubscribe</code></td><td><code>{ sessionId }</code></td><td>Stop receiving updates.</td></tr>
-  <tr><td><code>terminal_kill</code></td><td><code>{ sessionId }</code></td><td>Terminate the terminal session.</td></tr>
+  <tr><td><code>terminal_command</code> (control=visual_subscribe)</td><td><code>data: { requestId, sessionId, data: "", control: "visual_subscribe" }</code></td><td>Subscribe to future <code>terminal_screen</code> updates.</td></tr>
+  <tr><td><code>terminal_command</code> (control=visual_refresh)</td><td><code>data: { requestId, sessionId, data: "", control: "visual_refresh" }</code></td><td>Pull current screen (subscribe streams only future frames).</td></tr>
+  <tr><td><code>terminal_command</code></td><td><code>data: { requestId, sessionId, data: "&lt;input&gt;" }</code></td><td>Send keystrokes / input (data string, \r to submit).</td></tr>
+  <tr><td><code>terminal_command</code> (resize)</td><td><code>data: { requestId, sessionId, data: { cols, rows } }</code></td><td>Resize the terminal.</td></tr>
+  <tr><td><code>terminal_command</code> (kill)</td><td><code>data: { requestId, sessionId, data: "", control: "kill" }</code></td><td>Terminate the terminal session.</td></tr>
 </table>
 
 <h3>Server → client</h3>
@@ -180,8 +180,12 @@ const ws = new WebSocket(`${BASE.replace('https','wss')}/api/relay/ws`, {
   headers: { authorization: `Bearer ${token}` },   // or append ?token= in the URL
 });
 ws.on('open', () => {
-  ws.send(JSON.stringify({ type: 'terminal_visual_subscribe', sessionId: s.id }));
-  ws.send(JSON.stringify({ type: 'terminal_command', sessionId: s.id, data: 'echo hello\r' }));
+  // subscribe (streams FUTURE screens)
+  ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'sub1', sessionId: s.id, data: '', control: 'visual_subscribe' } }));
+  // pull current screen
+  ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'ref1', sessionId: s.id, data: '', control: 'visual_refresh' } }));
+  // input
+  ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'cmd1', sessionId: s.id, data: 'echo hello\r' } }));
 });
 ws.on('message', (buf) => {
   const msg = JSON.parse(buf.toString());

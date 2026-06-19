@@ -28,6 +28,7 @@ pub struct AgentConfig {
     pub worker_url: String,
     pub user_id: String,
     pub tenant_id: String,
+    pub access_token: String,
 }
 
 /// AgentService manages the lifecycle of the WebSocket connection to the
@@ -82,13 +83,22 @@ impl AgentService {
             .worker_url
             .trim_start_matches("https://")
             .trim_start_matches("http://");
-        let ws_url = format!(
+        let mut ws_url = format!(
             "{}://{}/api/relay/ws?nodeId={}&clientType=desktop&userId={}&tenantId={}",
             ws_scheme, host, node_id, config.user_id, config.tenant_id
         );
+        if !config.access_token.trim().is_empty() {
+            ws_url = format!("{}&token={}", ws_url, config.access_token);
+        }
+
+        // Never log the JWT: redact the `&token=` query param (appended last) before logging.
+        let log_url = match ws_url.split_once("&token=") {
+            Some((base, _)) => format!("{}&token=<redacted>", base),
+            None => ws_url.clone(),
+        };
 
         loop {
-            tracing::info!(url = %ws_url, "Connecting to agent session");
+            tracing::info!(url = %log_url, "Connecting to agent session");
 
             match ws_client::connect(&ws_url).await {
                 Ok((ws_write, ws_read)) => {

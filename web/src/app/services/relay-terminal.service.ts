@@ -1,13 +1,16 @@
 import { Injectable, NgZone, inject } from '@angular/core';
 import { Observable, Subject, firstValueFrom } from 'rxjs';
-import { AgentPlanRun, AiSession, DesktopNode, JohnnyApiService, TerminalScreen } from '@johnnyone/ui';
-import { getWorkerBaseUrl } from '../../worker-url';
+import { AgentPlanRun, AiSession, TerminalScreen } from '@johnnyone/ui';
+import { getWorkerBaseUrl, getWorkerGraphqlUrl } from '../../worker-url';
 import { TerminalScreenCacheService } from './terminal-screen-cache.service';
+import { AuthService } from './auth.service';
 
 interface RelayEnvelope {
   type: string;
   data?: unknown;
 }
+
+const WS_OPEN = 1;
 
 interface TerminalCommandAck {
   requestId: string;
@@ -37,19 +40,23 @@ export interface SessionUpdate {
 @Injectable({ providedIn: 'root' })
 export class RelayTerminalService {
   private static readonly INPUT_FLUSH_MS = 200;
-  private readonly api = inject(JohnnyApiService);
   private readonly zone = inject(NgZone);
   private readonly terminalScreenCache = inject(TerminalScreenCacheService);
+  private readonly auth = inject(AuthService);
   private readonly screenSubject = new Subject<TerminalScreen>();
   private readonly agentPlanRunSubject = new Subject<AgentPlanRunUpdate>();
   private readonly sessionUpdatedSubject = new Subject<SessionUpdate>();
   private readonly sessionDeletedSubject = new Subject<string>();
   private socket: WebSocket | null = null;
-  private connectedNodeId: string | null = null;
   private pendingInput = new Map<string, string>();
   private pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private visualSubscriptions = new Map<string, number>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly errorSubject = new Subject<string>();
+  private authFailureCount = 0;
+  private connectAttemptEverOpened = false;
+  private justRefreshedForReconnect = false; // to dedupe double refresh on reconnect path
+  private lastDisconnectWasAuthRejection = false; // per Task 04 decision #2: branch refresh/reconnect for auth vs transient
 
   screens(): Observable<TerminalScreen> {
     return this.screenSubject.asObservable();
@@ -158,7 +165,7 @@ export class RelayTerminalService {
     await this.ensureConnected();
 
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || socket.readyState !== WS_OPEN) {
       throw new Error('Relay terminal socket is not connected');
     }
 
@@ -177,7 +184,7 @@ export class RelayTerminalService {
     await this.ensureConnected();
 
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || socket.readyState !== WS_OPEN) {
       throw new Error('Relay terminal socket is not connected');
     }
 
@@ -221,14 +228,16 @@ export class RelayTerminalService {
     this.visualSubscriptions.clear();
     this.socket?.close();
     this.socket = null;
-    this.connectedNodeId = null;
+    this.connectAttemptEverOpened = false;
+    this.lastDisconnectWasAuthRejection = false;
+    this.justRefreshedForReconnect = false;
   }
 
   private async sendControl(type: 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_kill', sessionId: string): Promise<void> {
     await this.ensureConnected();
 
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || socket.readyState !== WS_OPEN) {
       throw new Error('Relay terminal socket is not connected');
     }
 
@@ -243,7 +252,7 @@ export class RelayTerminalService {
 
   private sendControlIfOpen(type: 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_kill', sessionId: string): void {
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!socket || socket.readyState !== WS_OPEN) return;
 
     socket.send(JSON.stringify({
       type,
@@ -262,7 +271,7 @@ export class RelayTerminalService {
     await this.ensureConnected();
 
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || socket.readyState !== WS_OPEN) {
       throw new Error('Relay terminal socket is not connected');
     }
 
@@ -280,7 +289,7 @@ export class RelayTerminalService {
 
   private sendVisualControlIfOpen(control: 'visual_subscribe' | 'visual_unsubscribe', sessionId: string): void {
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!socket || socket.readyState !== WS_OPEN) return;
 
     socket.send(JSON.stringify({
       type: 'terminal_command',
@@ -304,10 +313,39 @@ export class RelayTerminalService {
   }
 
   private async ensureConnected(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) return;
+    if (this.socket && this.socket.readyState === WS_OPEN) return;
 
-    const node = await this.findOnlineNode();
-    const url = this.relayWsUrl(node.id);
+    // Gate proactive refresh: only if no token OR near expiry (using stored expiresAt).
+    // Per Task 04 decisions: reactive-on-rejection is source of truth; proactive only for
+    // obviously expired (or absent). Avoids refresh roundtrip + token rotation on every connect.
+    // After schedule's failure refresh, token will be present so ensure will not re-refresh (collapses double).
+    const apiUrl = getWorkerGraphqlUrl();
+    const hadToken = !!this.auth.getAccessToken();
+    // Consult AuthService.expiresIn (via stored value + near-expiry helper) per Task 04 decisions.
+    // Only refresh proactively when access token missing or near expiry (not on EVERY connect whenever refreshToken exists).
+    const expiresIn = this.auth.getExpiresIn();
+    const needsRefresh = !hadToken || (expiresIn != null && this.auth.isTokenNearExpiry());
+    if (this.justRefreshedForReconnect) {
+      this.justRefreshedForReconnect = false;
+      // deduped: schedule already did the refresh for this reconnect; do not refresh again
+    } else if (needsRefresh && this.auth.getRefreshToken()) {
+      try {
+        await this.auth.refresh(apiUrl);
+      } catch (e) {
+        if (!this.auth.getAccessToken()) {
+          throw new Error('No valid authentication token. Please log in or refresh.');
+        }
+        // proceed with prior token if refresh failed but one still present
+      }
+    } else if (!hadToken) {
+      throw new Error('No valid authentication token. Please log in or refresh.');
+    }
+
+    // No listDesktopNodes / findOnlineNode in connect path (Task 03): server resolves from JWT.
+    // (api.listDesktopNodes still available for any display surfaces outside this service.)
+    const url = this.relayWsUrl();
+
+    this.connectAttemptEverOpened = false;
 
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(url);
@@ -319,7 +357,9 @@ export class RelayTerminalService {
       socket.onopen = () => {
         window.clearTimeout(timeout);
         this.socket = socket;
-        this.connectedNodeId = node.id;
+        this.connectAttemptEverOpened = true;
+        this.lastDisconnectWasAuthRejection = false;
+        this.authFailureCount = 0;
         void this.replayVisualSubscriptions();
         resolve();
       };
@@ -332,7 +372,12 @@ export class RelayTerminalService {
       socket.onclose = () => {
         if (this.socket === socket) {
           this.socket = null;
-          this.connectedNodeId = null;
+        }
+        // Implement Task 04 decisions #2: distinguish AUTH rejection (close/error BEFORE onopen)
+        // from transient network drop (after successful onopen). Branch reconnect/refresh accordingly.
+        this.lastDisconnectWasAuthRejection = !this.connectAttemptEverOpened;
+        if (this.lastDisconnectWasAuthRejection) {
+          this.authFailureCount = Math.max(this.authFailureCount, 1);
         }
         this.scheduleReconnectForVisualSubscriptions();
       };
@@ -341,33 +386,49 @@ export class RelayTerminalService {
 
   private async replayVisualSubscriptions(): Promise<void> {
     const socket = this.socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!socket || socket.readyState !== WS_OPEN) return;
 
     for (const sessionId of this.visualSubscriptions.keys()) {
       this.sendVisualControlIfOpen('visual_subscribe', sessionId);
     }
   }
 
-  private scheduleReconnectForVisualSubscriptions(): void {
-    if (this.visualSubscriptions.size === 0 || this.reconnectTimer) return;
-
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      if (this.visualSubscriptions.size === 0) return;
-      void this.ensureConnected().catch((error) => {
-        console.error('Failed to reconnect relay terminal socket:', error);
-        this.scheduleReconnectForVisualSubscriptions();
-      });
-    }, 1_000);
+  errors(): Observable<string> {
+    return this.errorSubject.asObservable();
   }
 
-  private async findOnlineNode(): Promise<DesktopNode> {
-    const nodes = await firstValueFrom(this.api.listDesktopNodes());
-    const node = nodes.find((item) => item.status === 'online') ?? nodes[0];
-    if (!node) {
-      throw new Error('No backend app is online');
-    }
-    return node;
+  private scheduleReconnectForVisualSubscriptions(): void {
+    if (this.reconnectTimer) return;
+
+    const delay = 1000 * Math.min(this.authFailureCount + 1, 10); // backoff, bound max 10s
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.visualSubscriptions.size === 0) return;
+
+      try {
+        // Branch per Task 04 #2: for AUTH rejection (pre-open), do refresh then ensure.
+        // For transient (post-open), just ensure (no forced refresh this cycle).
+        if (this.lastDisconnectWasAuthRejection || this.authFailureCount > 0) {
+          const apiUrl = getWorkerGraphqlUrl();
+          await this.auth.refresh(apiUrl);
+          this.authFailureCount = 0;
+          this.justRefreshedForReconnect = true; // signal to ensureConnected to skip (dedupe double-refresh)
+          this.lastDisconnectWasAuthRejection = false;
+        }
+        await this.ensureConnected();
+      } catch (error) {
+        console.error('Failed to reconnect relay terminal socket:', error);
+        this.authFailureCount++;
+        if (this.authFailureCount > 3) {
+          // bounded: stop and surface via existing terminal error UI (no silent dead)
+          this.zone.run(() => {
+            this.errorSubject.next('Auth failures exceeded bound; not reconnecting further. Please re-login to restore terminal.');
+          });
+          return;
+        }
+        this.scheduleReconnectForVisualSubscriptions();
+      }
+    }, delay);
   }
 
   private handleMessage(raw: string): void {
@@ -430,11 +491,15 @@ export class RelayTerminalService {
     };
   }
 
-  private relayWsUrl(nodeId: string): string {
+  private relayWsUrl(): string {
     const base = this.workerBaseUrl();
     const url = new URL('/api/relay/ws', base);
-    url.searchParams.set('nodeId', nodeId);
+    // No client-supplied nodeId: server resolves from JWT (Phase 00)
     url.searchParams.set('clientType', 'mobile');
+    const token = this.auth.getAccessToken();
+    if (token) {
+      url.searchParams.set('token', token);
+    }
     return url.toString().replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
   }
 

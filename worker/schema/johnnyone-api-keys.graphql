@@ -1,0 +1,34 @@
+# Phase 05 — M2M API keys (P2/optional)
+# JWT-only management surface. create returns secret once; reads return metadata only.
+# No secret field on ApiKey (never re-readable).
+
+type ApiKey {
+  id: ID!
+  name: String!
+  keyPrefix: String!
+  scopes: [String!]!
+  lastUsedAt: String
+  expiresAt: String
+  revokedAt: String
+  createdAt: String!
+}
+
+type CreateApiKeyResult {
+  apiKey: ApiKey!
+  secret: String!   # full jk_... returned exactly once
+}
+
+input CreateApiKeyInput {
+  name: String!
+  scopes: [String!]!
+  expiresAt: String
+}
+
+extend type Query {
+  listApiKeys: [ApiKey!]!
+}
+
+extend type Mutation {
+  createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!
+  revokeApiKey(id: ID!): ApiKey!
+}

@@ -29,6 +29,7 @@ pub struct WorkerRelayConfig {
     pub worker_url: String,
     pub user_id: String,
     pub tenant_id: String,
+    pub access_token: String,
 }
 
 /// A structured signal an agent reported to CO via the host GraphQL

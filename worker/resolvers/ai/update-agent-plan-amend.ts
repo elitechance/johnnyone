@@ -1,9 +1,12 @@
 import { desktopRpc } from '../../lib/runtime/desktop-rpc';
+import { authorizeForAltToken } from '../../lib/auth/api-key';
 
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
+  request?: Request;
+  [key: string]: unknown;
 }
 interface WorkerEnv {
   CHAT_RELAY_DO: DurableObjectNamespace;
@@ -28,6 +31,7 @@ export default async function amendAgentPlan(
   args: { id: string; brief: string },
   ctx: ResolverContext,
 ) {
+  await authorizeForAltToken(ctx, 'plans:write');
   return desktopRpc<unknown>(ctx, 'amend_agent_plan', {
     id: args.id,
     brief: args.brief,

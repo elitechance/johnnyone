@@ -3,19 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "start:desktop": "nx run desktop:desktop-dev",
-    "start:web": "nx serve web",
-    "start:worker": "nx dev worker",
-    "check:desktop": "nx run desktop:desktop-check",
-    "migrate:worker": "nx run worker:migrate",
-    "deploy:worker": "nx run worker:deploy",
-    "deploy:web": "nx build web --skip-nx-cache && lokal cf pages deploy --env prod",
-    "build:desktop": "nx run desktop:desktop-build",
-    "build:web": "nx build web",
-    "build:web:fresh": "nx build web --skip-nx-cache",
-    "build:worker": "nx build worker",
-    "lint": "nx run-many -t lint",
-    "test": "nx run-many -t test"
+    "//build:desktop": "Build ONLY the desktop BACKEND binary -> desktop/src-tauri/target/release/johnnyone-desktop. No cache: wipes dist/host-app + .angular/cache and skips the Nx cache, so NO stale Ionic/Angular assets get embedded.",
+    "build:desktop": "bash scripts/build-desktop.sh",
+    "//desktop": "Build (no cache) AND launch the desktop backend against the live worker (johnnyone.ethan-353.workers.dev). Frees :7788 first, then runs in the BACKGROUND (nohup) and returns the prompt; logs go to /tmp/johnnyone-desktop.log. Stop it with: lsof -ti:7788 | xargs kill. Override identity with JOHNNYONE_USER_ID / JOHNNYONE_TENANT_ID env vars.",
+    "desktop": "npm run build:desktop && { lsof -ti:7788 | xargs -r kill 2>/dev/null; DISPLAY=\"${DISPLAY:-:0}\" JOHNNYONE_WORKER_URL=https://johnnyone.ethan-353.workers.dev JOHNNYONE_TENANT_ID=\"${JOHNNYONE_TENANT_ID:-00000000-0000-0000-0000-000000000001}\" JOHNNYONE_USER_ID=\"${JOHNNYONE_USER_ID:-00000000-0000-0000-0000-000000000002}\" nohup ./desktop/src-tauri/target/release/johnnyone-desktop > /tmp/johnnyone-desktop.log 2>&1 & echo \"johnnyone-desktop launched in background -> log: /tmp/johnnyone-desktop.log (stop: lsof -ti:7788 | xargs kill)\"; }",
+    "//deploy:web": "Deploy BOTH hosted Cloudflare surfaces (prod): the worker (johnnyone.ethan-353.workers.dev) and the web client (johnnyone.pages.dev). Builds web fresh (no nx cache) so no stale bundle is uploaded.",
+    "deploy:web": "nx build web --skip-nx-cache && lokal cf worker deploy --env prod && lokal cf pages deploy --env prod"
   },
   "dependencies": {
     "@angular/animations": "^19.0.0",
@@ -46,12 +39,14 @@
     "zone.js": "~0.15.0"
   },
   "devDependencies": {
+    "@analogjs/vitest-angular": "^2.6.1",
     "@angular-devkit/build-angular": "^19.0.0",
     "@angular-devkit/core": "^19.0.0",
     "@angular-devkit/schematics": "^19.0.0",
     "@angular/cli": "^19.0.0",
     "@angular/compiler-cli": "^19.0.0",
     "@capacitor/cli": "^6.0.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.17",
     "@cloudflare/workers-types": "^4.20260301.1",
     "@nx/angular": "^20.0.0",
     "@nx/js": "20.8.4",
@@ -62,11 +57,13 @@
     "@swc/core": "~1.5.7",
     "@swc/helpers": "~0.5.11",
     "@tauri-apps/cli": "^2.10.0",
+    "jsdom": "^29.1.1",
     "ng-packagr": "^19.0.0",
     "nx": "^20.0.0",
     "prettier": "^2.6.2",
     "puppeteer": "^24.37.5",
     "typescript": "~5.6.0",
+    "vitest": "^4.1.9",
     "wrangler": "^4.94.0"
   }
 }

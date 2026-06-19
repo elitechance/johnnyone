@@ -1,4 +1,5 @@
 import { readCachedRpc, writeCachedRpc } from './desktop-rpc-cache';
+import { resolveOnlineNode } from '../auth/resolve-online-node';
 
 /**
  * Relay-RPC helper — replaces the legacy `hostGraphqlRequest` forward path.
@@ -55,14 +56,7 @@ export async function relayRpc<T>(
     return cached;
   }
 
-  const node = await ctx.db
-    .prepare(
-      `SELECT id FROM desktop_nodes
-       WHERE tenant_id = ? AND user_id = ? AND status = 'online' AND is_deleted = 0
-       ORDER BY last_heartbeat_at DESC LIMIT 1`,
-    )
-    .bind(ctx.auth.tenantId, ctx.auth.userId)
-    .first<{ id: string }>();
+  const node = await resolveOnlineNode(ctx.db, ctx.auth);
 
   if (!node) {
     throw new Error(

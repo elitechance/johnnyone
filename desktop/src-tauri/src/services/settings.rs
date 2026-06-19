@@ -11,6 +11,7 @@ pub const KEY_WEB_CLIENT_URL: &str = "web_client_url";
 /// Discord incoming-webhook URL for attention alerts (blocked / needs-human).
 /// Empty = alerts disabled. Read by the coordinator's notifier.
 pub const KEY_DISCORD_WEBHOOK_URL: &str = "discord_webhook_url";
+pub const KEY_ACCESS_TOKEN: &str = "access_token";
 
 pub const DEFAULT_WORKER_URL: &str = "https://johnnyone.ethan-353.workers.dev";
 pub const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -24,6 +25,7 @@ pub struct RelayConfig {
     pub worker_url: String,
     pub user_id: String,
     pub tenant_id: String,
+    pub access_token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +33,7 @@ pub struct HostSettings {
     pub worker_url: String,
     pub tenant_id: String,
     pub user_id: String,
+    pub access_token: String,
     pub planner_methodology_path: String,
     pub planner_conventions_path: String,
     pub web_client_url: String,
@@ -72,6 +75,7 @@ pub fn load_host_settings(state: &AppState) -> HostSettings {
         worker_url: get_setting_or(state, KEY_WORKER_URL, DEFAULT_WORKER_URL),
         tenant_id: get_setting_or(state, KEY_TENANT_ID, DEFAULT_TENANT_ID),
         user_id: get_setting_or(state, KEY_USER_ID, ""),
+        access_token: get_setting_or(state, KEY_ACCESS_TOKEN, ""),
         planner_methodology_path: get_setting_or(
             state,
             KEY_PLANNER_METHODOLOGY_PATH,
@@ -92,6 +96,7 @@ impl RelayConfig {
         let worker_url = resolve_worker_url(state);
         let user_id = resolve_user_id(state);
         let tenant_id = resolve_tenant_id(state);
+        let access_token = resolve_access_token(state);
 
         if worker_url.trim().is_empty() || user_id.trim().is_empty() {
             return None;
@@ -101,6 +106,7 @@ impl RelayConfig {
             worker_url,
             user_id,
             tenant_id,
+            access_token,
         })
     }
 }
@@ -124,6 +130,13 @@ fn resolve_tenant_id(state: &AppState) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| get_setting_or(state, KEY_TENANT_ID, DEFAULT_TENANT_ID))
+}
+
+fn resolve_access_token(state: &AppState) -> String {
+    std::env::var("JOHNNYONE_ACCESS_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| get_setting_or(state, KEY_ACCESS_TOKEN, ""))
 }
 
 /// Resolve a configured host path against a planner workspace root.

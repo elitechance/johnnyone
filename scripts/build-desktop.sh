@@ -11,6 +11,12 @@ export PATH="${HOME}/.cargo/bin:${PATH:-}"
 echo "Removing stale host-app dist ($DIST)..."
 rm -rf "$DIST"
 
+# Angular keeps a persistent build cache in .angular/cache that can serve stale
+# Ionic/Angular compiled assets even with --skip-nx-cache. Wipe it so the embedded
+# webview assets are always freshly compiled.
+echo "Removing stale Angular build cache ($ROOT/.angular/cache)..."
+rm -rf "$ROOT/.angular/cache"
+
 echo "Building host-app..."
 cd "$ROOT"
 # --skip-nx-cache: a cache replay restores the cache entry but does NOT re-emit

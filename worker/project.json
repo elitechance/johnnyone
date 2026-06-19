@@ -14,6 +14,9 @@
     },
     "migrate": {
       "command": "lokal cf db migrate --local"
+    },
+    "test": {
+      "command": "npx vitest run --config worker/vitest.config.mts"
     }
   }
 }

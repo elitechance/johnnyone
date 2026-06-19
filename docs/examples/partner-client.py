@@ -102,7 +102,9 @@ async def main():
         headers = {"Authorization": f"Bearer {token}"}
 
         async with websockets.connect(ws_url, additional_headers=headers) as ws:
-            await ws.send(json.dumps({"type": "terminal_visual_subscribe", "sessionId": session_id}))
+            # subscribe for future (control=visual_subscribe); then refresh to pull current (subscribe only FUTURE frames)
+            await ws.send(json.dumps({"type": "terminal_command", "data": {"requestId": "sub", "sessionId": session_id, "data": "", "control": "visual_subscribe"}}))
+            await ws.send(json.dumps({"type": "terminal_command", "data": {"requestId": "ref", "sessionId": session_id, "data": "", "control": "visual_refresh"}}))
 
             first_screen = None
             async for msg in ws:
@@ -120,7 +122,7 @@ async def main():
                         first_screen = m.get("data")
                         print("received first screen", file=sys.stderr)
                         # now send command to prove updated screen
-                        await ws.send(json.dumps({"type": "terminal_command", "sessionId": session_id, "data": "echo python-demo\r"}))
+                        await ws.send(json.dumps({"type": "terminal_command", "data": {"requestId": "cmd", "sessionId": session_id, "data": "echo python-demo\r"}}))
                     else:
                         print("received updated screen after command", file=sys.stderr)
                         if m.get("data") != first_screen:

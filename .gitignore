@@ -47,3 +47,5 @@ attic/desktop-thin-client/e2e/artifacts/*
 web/e2e/__screenshots__/*
 e2e-artifacts/mobile-terminal-review/*
 e2e-artifacts/*.png
+.johnnyone/
+**/__pycache__/

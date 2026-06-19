@@ -81,7 +81,10 @@ const gql = async (query, variables, token, tenantId) => {
 
   let firstScreen = null;
   ws.on('open', () => {
-    ws.send(JSON.stringify({ type: 'terminal_visual_subscribe', sessionId }));
+    // subscribe for future screens (use data.control)
+    ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'sub-' + Date.now(), sessionId, data: '', control: 'visual_subscribe' } }));
+    // pull current screen (subscribe streams FUTURE only)
+    ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'ref-' + Date.now(), sessionId, data: '', control: 'visual_refresh' } }));
   });
 
   ws.on('message', (buf) => {
@@ -92,7 +95,7 @@ const gql = async (query, variables, token, tenantId) => {
         firstScreen = msg.data;
         console.error('received first screen');
         // now send command to prove updated screen
-        ws.send(JSON.stringify({ type: 'terminal_command', sessionId, data: 'echo partner-demo\r' }));
+        ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'cmd-' + Date.now(), sessionId, data: 'echo partner-demo\r' } }));
       } else {
         // updated screen after command
         clearTimeout(timeout);

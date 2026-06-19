@@ -1,9 +1,12 @@
 import { desktopRpc } from '../../lib/runtime/desktop-rpc';
+import { authorizeForAltToken } from '../../lib/auth/api-key';
 
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
   auth: { userId: string; tenantId: string };
+  request?: Request;
+  [key: string]: unknown;
 }
 
 interface WorkerEnv {
@@ -16,6 +19,7 @@ export default async function deleteAiSession(
   args: { id: string },
   ctx: ResolverContext,
 ) {
+  await authorizeForAltToken(ctx, 'sessions:write');
   await desktopRpc<{ deleted: boolean }>(ctx, 'delete_session', { id: args.id });
   return true;
 }

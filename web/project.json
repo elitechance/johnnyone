@@ -74,6 +74,9 @@
         "staticFilePath": "dist/web/browser",
         "spa": true
       }
+    },
+    "test": {
+      "command": "npx vitest run --config web/vitest.config.ts"
     }
   }
 }
