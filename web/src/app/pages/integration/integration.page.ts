@@ -38,6 +38,7 @@ export class IntegrationPage {
     { id: 'auth', label: 'Authentication' },
     { id: 'graphql', label: 'GraphQL API' },
     { id: 'sessions', label: 'Terminal sessions' },
+    { id: 'providers', label: 'Providers & models' },
     { id: 'plans', label: 'Planner / development' },
     { id: 'apikeys', label: 'API keys (M2M)' },
     { id: 'wss', label: 'Live terminal (WebSocket)' },

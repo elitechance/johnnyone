@@ -100,6 +100,15 @@
   -d '{"query":"mutation($i:CreateAiSessionInput!){createAiSession(input:$i){id title provider workingDirectory}}",
        "variables":{"i":{"provider":"claude_code","workingDirectory":"/home/you/project"}}}'</code></pre>
 
+<h3 id="providers">Providers &amp; models</h3>
+<p><code>provider</code> on <code>CreateAiSessionInput</code> selects which agent CLI backs the session's terminal. <code>model</code> is optional and provider-specific. The chosen CLI must be installed &amp; authenticated on the host — call <code>listDetectedCliTools</code> to see which are available.</p>
+<table>
+  <tr><th>Provider</th><th><code>provider</code></th><th><code>model</code> (optional)</th></tr>
+  <tr><td>Claude Code</td><td><code>claude_code</code></td><td>Uses the Claude Code CLI's configured model — omit <code>model</code>.</td></tr>
+  <tr><td>Grok</td><td><code>grok</code></td><td>Defaults to <code>grok-build</code>; set <code>model</code> to override.</td></tr>
+  <tr><td>Codex</td><td><code>codex</code></td><td>Uses the Codex CLI default — omit <code>model</code>.</td></tr>
+</table>
+
 <h3 id="plans">Planner / development runs</h3>
 <table>
   <tr><th>Operation</th><th>Signature</th></tr>
