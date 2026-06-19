@@ -19,6 +19,7 @@ import { addIcons } from 'ionicons';
 import {
   chevronBackOutline,
   chevronForwardOutline,
+  codeSlashOutline,
   documentTextOutline,
   hammerOutline,
   logOutOutline,
@@ -75,6 +76,7 @@ export class AppComponent {
       'chevron-forward-outline': chevronForwardOutline,
       'document-text-outline': documentTextOutline,
       'hammer-outline': hammerOutline,
+      'code-slash-outline': codeSlashOutline,
       'settings-outline': settingsOutline,
       'log-out-outline': logOutOutline,
     });

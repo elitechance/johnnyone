@@ -32,6 +32,31 @@ export interface DetectedCliTool {
   path?: string;
 }
 
+// ── M2M API keys (partner/developer credentials) ──────────────────────────
+// Mirrors worker/schema/johnnyone-api-keys.graphql. The full secret (`jk_...`)
+// is returned exactly once on create and is never re-readable.
+export interface ApiKey {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  scopes: string[];
+  lastUsedAt?: string | null;
+  expiresAt?: string | null;
+  revokedAt?: string | null;
+  createdAt: string;
+}
+
+export interface CreateApiKeyInput {
+  name: string;
+  scopes: string[];
+  expiresAt?: string;
+}
+
+export interface CreateApiKeyResult {
+  apiKey: ApiKey;
+  secret: string;
+}
+
 export interface CreateAgentPlanInput {
   runType?: 'planning' | 'development';
   title?: string;
@@ -912,6 +937,47 @@ export class JohnnyApiService {
         { from, to }
       )
       .pipe(map((data) => data.aiUsageSummary));
+  }
+
+  // ── API keys (M2M) ────────────────────────────────────────────────────
+  // JWT-only management surface against the worker. create returns the secret
+  // exactly once; list/revoke return metadata only (no secret).
+
+  private readonly apiKeyFields = `
+    id name keyPrefix scopes lastUsedAt expiresAt revokedAt createdAt
+  `;
+
+  listApiKeys(): Observable<ApiKey[]> {
+    return this.gql
+      .query<{ listApiKeys: ApiKey[] }>(
+        `query ListApiKeys { listApiKeys { ${this.apiKeyFields} } }`
+      )
+      .pipe(map((data) => data.listApiKeys));
+  }
+
+  createApiKey(input: CreateApiKeyInput): Observable<CreateApiKeyResult> {
+    return this.gql
+      .mutate<{ createApiKey: CreateApiKeyResult }>(
+        `mutation CreateApiKey($input: CreateApiKeyInput!) {
+          createApiKey(input: $input) {
+            apiKey { ${this.apiKeyFields} }
+            secret
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.createApiKey));
+  }
+
+  revokeApiKey(id: string): Observable<ApiKey> {
+    return this.gql
+      .mutate<{ revokeApiKey: ApiKey }>(
+        `mutation RevokeApiKey($id: ID!) {
+          revokeApiKey(id: $id) { ${this.apiKeyFields} }
+        }`,
+        { id }
+      )
+      .pipe(map((data) => data.revokeApiKey));
   }
 
   private agentPlanMutation(

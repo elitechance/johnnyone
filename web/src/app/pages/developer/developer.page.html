@@ -1,0 +1,278 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Developer</ion-title>
+  </ion-toolbar>
+  <ion-toolbar>
+    <ion-segment [value]="segment()" (ionChange)="setSegment($any($event.detail).value)">
+      <ion-segment-button value="auth">
+        <ion-label>Auth &amp; Keys</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="agents">
+        <ion-label>Agents</ion-label>
+      </ion-segment-button>
+      <ion-segment-button value="wss">
+        <ion-label>Live Terminal</ion-label>
+      </ion-segment-button>
+    </ion-segment>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content class="ion-padding developer-content">
+  @if (error()) {
+    <ion-text color="danger"><p class="dev-error">{{ error() }}</p></ion-text>
+  }
+
+  <!-- ───────────── AUTH / OAUTH ───────────── -->
+  @if (segment() === 'auth') {
+    <ion-list lines="full">
+      <ion-list-header><ion-label>Account</ion-label></ion-list-header>
+      <ion-item>
+        <ion-label>
+          <h3>Tenant ID</h3>
+          <p>{{ tenantId || '—' }}</p>
+        </ion-label>
+        @if (tenantId) {
+          <ion-button slot="end" fill="clear" size="small" (click)="copy(tenantId)">
+            <ion-icon slot="icon-only" name="copy-outline"></ion-icon>
+          </ion-button>
+        }
+      </ion-item>
+      <ion-item>
+        <ion-label>
+          <h3>User</h3>
+          <p>{{ user()?.email || '—' }} · {{ user()?.id || '' }}</p>
+          <p class="muted">roles: {{ (user()?.roles || []).join(', ') || '—' }} · status: {{ user()?.status || '—' }}</p>
+        </ion-label>
+      </ion-item>
+      <ion-item>
+        <ion-label>
+          <h3>Access token (Bearer)</h3>
+          <p class="mono">{{ tokenPreview() }}</p>
+          <p class="muted">Send as <code>Authorization: Bearer &lt;token&gt;</code> on GraphQL and the WSS upgrade.</p>
+        </ion-label>
+        @if (accessToken()) {
+          <ion-button slot="end" fill="clear" size="small" (click)="copy(accessToken())">
+            <ion-icon slot="icon-only" name="copy-outline"></ion-icon>
+          </ion-button>
+        }
+      </ion-item>
+    </ion-list>
+
+    <ion-list lines="full">
+      <ion-list-header>
+        <ion-label>API keys (M2M)</ion-label>
+        <ion-button fill="clear" size="small" (click)="loadApiKeys()">
+          <ion-icon slot="icon-only" name="refresh-outline"></ion-icon>
+        </ion-button>
+      </ion-list-header>
+
+      <!-- Reveal-once secret -->
+      @if (revealedSecret(); as secret) {
+        <ion-item class="reveal" lines="none">
+          <ion-label>
+            <h3>New key secret — copy it now, it won't be shown again</h3>
+            <p class="mono secret">{{ secret }}</p>
+          </ion-label>
+          <ion-button slot="end" fill="outline" size="small" (click)="copy(secret)">
+            <ion-icon slot="start" name="copy-outline"></ion-icon> Copy
+          </ion-button>
+          <ion-button slot="end" fill="clear" size="small" (click)="dismissSecret()">Dismiss</ion-button>
+        </ion-item>
+      }
+
+      <!-- Create form -->
+      <ion-item>
+        <ion-input
+          label="Name"
+          labelPlacement="floating"
+          placeholder="e.g. partner-acme-prod"
+          [value]="keyName()"
+          (ionInput)="keyName.set($any($event.target).value)"
+        ></ion-input>
+      </ion-item>
+      <ion-item>
+        <ion-input
+          label="Expires at (optional, ISO date)"
+          labelPlacement="floating"
+          type="date"
+          [value]="keyExpiresAt()"
+          (ionInput)="keyExpiresAt.set($any($event.target).value)"
+        ></ion-input>
+      </ion-item>
+      <ion-item lines="none">
+        <ion-label>Scopes</ion-label>
+      </ion-item>
+      @for (scope of allScopes; track scope) {
+        <ion-item>
+          <ion-checkbox
+            [checked]="scopeChecked(scope)"
+            (ionChange)="toggleScope(scope, $any($event.detail).checked)"
+          >
+            <span class="mono">{{ scope }}</span>
+          </ion-checkbox>
+        </ion-item>
+      }
+      <ion-item lines="none">
+        <ion-button
+          slot="end"
+          (click)="createKey()"
+          [disabled]="creatingKey() || !keyName().trim() || selectedScopes().size === 0"
+        >
+          <ion-icon slot="start" name="key-outline"></ion-icon>
+          {{ creatingKey() ? 'Creating…' : 'Create key' }}
+        </ion-button>
+      </ion-item>
+
+      <!-- List -->
+      @if (keysLoading()) {
+        <ion-item lines="none"><ion-spinner name="dots"></ion-spinner></ion-item>
+      } @else if (apiKeys().length === 0) {
+        <ion-item lines="none"><ion-note>No API keys yet.</ion-note></ion-item>
+      } @else {
+        @for (key of apiKeys(); track key.id) {
+          <ion-item>
+            <ion-label>
+              <h3>
+                {{ key.name }}
+                @if (key.revokedAt) { <ion-badge color="medium">revoked</ion-badge> }
+              </h3>
+              <p class="mono">{{ key.keyPrefix }}…</p>
+              <p class="scopes">
+                @for (s of key.scopes; track s) { <ion-chip class="mono">{{ s }}</ion-chip> }
+              </p>
+              <p class="muted">
+                last used: {{ key.lastUsedAt || 'never' }}
+                @if (key.expiresAt) { · expires: {{ key.expiresAt }} }
+              </p>
+            </ion-label>
+            @if (!key.revokedAt) {
+              <ion-button slot="end" fill="clear" color="danger" size="small" (click)="revokeKey(key)">
+                <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+              </ion-button>
+            }
+          </ion-item>
+        }
+      }
+    </ion-list>
+  }
+
+  <!-- ───────────── AGENTS (SESSIONS) ───────────── -->
+  @if (segment() === 'agents') {
+    <ion-list lines="full">
+      <ion-list-header><ion-label>Create AI / terminal session</ion-label></ion-list-header>
+      <ion-item>
+        <ion-input
+          label="Provider"
+          labelPlacement="floating"
+          placeholder="claude_code"
+          [value]="newProvider()"
+          (ionInput)="newProvider.set($any($event.target).value)"
+        ></ion-input>
+      </ion-item>
+      <ion-item>
+        <ion-input
+          label="Working directory (optional)"
+          labelPlacement="floating"
+          placeholder="/home/you/project"
+          [value]="newWorkingDir()"
+          (ionInput)="newWorkingDir.set($any($event.target).value)"
+        ></ion-input>
+      </ion-item>
+      <ion-item>
+        <ion-input
+          label="Title (optional)"
+          labelPlacement="floating"
+          [value]="newTitle()"
+          (ionInput)="newTitle.set($any($event.target).value)"
+        ></ion-input>
+      </ion-item>
+      <ion-item lines="none">
+        <ion-button slot="end" (click)="createSession()" [disabled]="creatingSession()">
+          {{ creatingSession() ? 'Creating…' : 'Create session' }}
+        </ion-button>
+      </ion-item>
+    </ion-list>
+
+    <ion-list lines="full">
+      <ion-list-header>
+        <ion-label>Sessions</ion-label>
+        <ion-button fill="clear" size="small" (click)="loadSessions()">
+          <ion-icon slot="icon-only" name="refresh-outline"></ion-icon>
+        </ion-button>
+      </ion-list-header>
+      @if (sessionsLoading()) {
+        <ion-item lines="none"><ion-spinner name="dots"></ion-spinner></ion-item>
+      } @else if (sessions().length === 0) {
+        <ion-item lines="none"><ion-note>No sessions yet.</ion-note></ion-item>
+      } @else {
+        @for (s of sessions(); track s.id) {
+          <ion-item>
+            <ion-label>
+              <h3>{{ s.title || '(untitled)' }} <ion-badge color="medium">{{ s.status }}</ion-badge></h3>
+              <p class="mono">{{ s.id }}</p>
+              <p class="muted">{{ s.provider }}@if (s.workingDirectory) { · {{ s.workingDirectory }} }</p>
+            </ion-label>
+            <ion-button slot="end" fill="outline" size="small" (click)="useInTerminal(s)">Live terminal</ion-button>
+            @if (s.status !== 'archived') {
+              <ion-button slot="end" fill="clear" size="small" (click)="archiveSession(s)">Archive</ion-button>
+            }
+            <ion-button slot="end" fill="clear" color="danger" size="small" (click)="deleteSession(s)">
+              <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+            </ion-button>
+          </ion-item>
+        }
+      }
+    </ion-list>
+  }
+
+  <!-- ───────────── LIVE TERMINAL (WSS) ───────────── -->
+  @if (segment() === 'wss') {
+    <ion-list lines="full">
+      <ion-list-header><ion-label>Live terminal (WSS relay)</ion-label></ion-list-header>
+      <ion-item>
+        <ion-input
+          label="Session ID"
+          labelPlacement="floating"
+          placeholder="AiSession.id"
+          [value]="wssSessionId()"
+          (ionInput)="wssSessionId.set($any($event.target).value)"
+        ></ion-input>
+        @if (!wssConnected()) {
+          <ion-button slot="end" (click)="connectWss()" [disabled]="!wssSessionId().trim()">Connect</ion-button>
+        } @else {
+          <ion-button slot="end" fill="outline" (click)="refreshScreen()">Refresh</ion-button>
+          <ion-button slot="end" fill="clear" color="medium" (click)="disconnectWss()">Disconnect</ion-button>
+        }
+      </ion-item>
+    </ion-list>
+
+    @if (wssConnected()) {
+      <johnny-terminal-screen
+        [screen]="wssScreen()"
+        [showInput]="false"
+        [title]="'Session ' + wssSessionId()"
+      ></johnny-terminal-screen>
+
+      <ion-item>
+        <ion-input
+          label="Send input (⏎ appended)"
+          labelPlacement="floating"
+          placeholder="echo hello"
+          [value]="wssInput()"
+          (ionInput)="wssInput.set($any($event.target).value)"
+          (keyup.enter)="sendWssInput()"
+        ></ion-input>
+        <ion-button slot="end" (click)="sendWssInput()" [disabled]="!wssInput()">Send</ion-button>
+      </ion-item>
+    }
+
+    @if (wssLog().length) {
+      <ion-list lines="none">
+        <ion-list-header><ion-label>Envelope log</ion-label></ion-list-header>
+        @for (line of wssLog(); track $index) {
+          <ion-item lines="none"><ion-note class="mono">{{ line }}</ion-note></ion-item>
+        }
+      </ion-list>
+    }
+  }
+</ion-content>

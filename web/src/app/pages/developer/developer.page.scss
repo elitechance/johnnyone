@@ -1,0 +1,57 @@
+// Developer console. The app forces dark mode globally (styles.scss), so use
+// the --jo-* token scale (not raw --ion-* light fallbacks) — same lesson as the
+// /integration page.
+
+.developer-content {
+  --background: var(--jo-bg-base, #0d0f12);
+}
+
+.dev-error {
+  margin: 0 0 12px;
+  font-size: 0.875rem;
+}
+
+.mono {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.muted {
+  color: var(--jo-fg-muted, #8a92a0);
+  font-size: 0.8rem;
+}
+
+code {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+.secret {
+  word-break: break-all;
+  white-space: normal;
+  color: var(--jo-good, #5fd78f);
+}
+
+.reveal {
+  --background: var(--jo-bg-elevated, #14171c);
+  border-left: 3px solid var(--jo-good, #5fd78f);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+
+.scopes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0 2px;
+
+  ion-chip {
+    margin: 0;
+    height: 22px;
+    font-size: 0.72rem;
+  }
+}
+
+johnny-terminal-screen {
+  display: block;
+  margin: 12px 0;
+}

@@ -57,6 +57,15 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
+  // Developer console — authenticated UI for the partner API surface
+  // (auth/keys, agent-session CRUD, live WSS terminal). The public docs live
+  // at /integration; this is the logged-in console that drives the same API.
+  {
+    path: 'developer',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/developer/developer.page').then((m) => m.DeveloperPage),
+  },
   {
     path: 'settings',
     canActivate: [authGuard],
