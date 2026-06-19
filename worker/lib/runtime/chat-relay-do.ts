@@ -324,6 +324,22 @@ export class ChatRelayDO implements DurableObject {
         case 'heartbeat':
           // Desktop keepalive — respond with pong
           ws.send(JSON.stringify({ type: 'heartbeat', data: { timestamp: new Date().toISOString() } }));
+          // Persist liveness so listDesktopNodes.lastHeartbeatAt advances and the
+          // 'online' flag stays trustworthy, instead of freezing at registration
+          // time. Best-effort: never break the relay on a heartbeat write.
+          if (clientType === 'desktop' && authCtx?.tenantId && authCtx?.userId) {
+            try {
+              await ((this.env as any).DB as D1Database)
+                .prepare(
+                  `UPDATE desktop_nodes SET last_heartbeat_at = datetime('now'), status = 'online', updated_at = datetime('now')
+                   WHERE tenant_id = ? AND user_id = ? AND is_deleted = 0`,
+                )
+                .bind(authCtx.tenantId, authCtx.userId)
+                .run();
+            } catch {
+              // ignore — heartbeat persistence is best-effort
+            }
+          }
           break;
 
         case 'ping':

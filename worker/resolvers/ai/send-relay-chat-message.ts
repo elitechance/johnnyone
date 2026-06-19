@@ -1,3 +1,5 @@
+import { applyAltTokenToContext } from '../../lib/auth/api-key';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -29,6 +31,10 @@ export default async function sendRelayChatMessage(
   args: { input: RelayChatMessageInput },
   ctx: ResolverContext,
 ) {
+  // Apply jk_ API-key identity so key-authenticated callers resolve their own
+  // online node (the platform JWT middleware only populates ctx.auth for JWTs).
+  await applyAltTokenToContext(ctx as unknown as Record<string, unknown>);
+
   const { sessionId, content, provider, model, workingDirectory } = args.input;
 
   // Find an online desktop node for this user
