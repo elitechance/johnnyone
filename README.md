@@ -108,6 +108,7 @@ johnnyone/
   attic/                    Frozen old code (excluded from Nx via .nxignore)
     desktop-thin-client/      Original combined desktop UI — superseded by web + host-app
     mobile-thin-client/       Original mobile Capacitor wrap — deferred
+  scripts/build-desktop.sh  Build the desktop binary fresh (`npm run build:desktop`)
   scripts/dev-tmux.sh       Optional local-dev tmux launcher
   lokal.yaml                Local processes, builds, deploy config
 ```
@@ -160,132 +161,129 @@ cd personal/apps/johnnyone
 npm install
 ```
 
-## Running locally
+## Running JohnnyOne
 
-There are two reasonable local-dev setups depending on what you're changing:
+Everything goes through **npm**. There are **exactly three scripts** — if you're
+looking for any other `npm run …`, it no longer exists; use the commands below.
 
-### A. Web-only against the deployed worker — fastest
+| Command | What it does |
+|---|---|
+| `npm run desktop` | **Builds (no cache) and launches** the desktop backend against the live worker. This is the one you normally run. |
+| `npm run build:desktop` | **Builds only** — produces `desktop/src-tauri/target/release/johnnyone-desktop` without launching. Wipes `dist/host-app` + `.angular/cache` and skips the Nx cache, so **no stale Ionic/Angular assets** get embedded. |
+| `npm run deploy:web` | **Deploys both hosted Cloudflare surfaces** (prod): the **worker** (`johnnyone.ethan-353.workers.dev`) and the **web client** (`johnnyone.pages.dev`). Builds web fresh (no Nx cache) so no stale bundle is uploaded. |
 
-You change web code; everything else (worker, host) is the live deployment.
+### Normal use — run the backend, use the hosted web client
 
-```bash
-npx nx serve web                    # http://localhost:4200
-```
-
-Then open `http://localhost:4200` and log in with the seeded admin
-(`admin@johnnyone.local` / `johnnyone-dev`, tenant `default`). The web app
-detects the hostname is `localhost` and falls back to `http://127.0.0.1:7714`
-for the worker — if you don't have a local worker, set the worker URL
-explicitly in your browser's localStorage:
-
-```js
-localStorage.setItem('johnnyone_worker_url', 'https://johnnyone.ethan-353.workers.dev');
-```
-
-For this to work, your **desktop binary must be running on your machine** and
-the seeded admin user's `JOHNNYONE_USER_ID` env var must match the JWT subject.
-
-### B. Full stack local (host + worker simulator + web)
-
-You change worker or host code; everything runs against local processes.
+This is all an end-user needs. The web client is already hosted; you only run
+the backend binary on your own machine so the worker has a `desktop_node` to
+forward calls to.
 
 ```bash
-./scripts/dev-tmux.sh
+cd personal/apps/johnnyone
+npm install        # first time only
+npm run desktop    # build (no cache) + launch against the LIVE worker
 ```
 
-Opens a tmux session with three processes:
+Then open **https://johnnyone.pages.dev** in any browser and log in. Done.
 
-| Process | Port | What it is |
-|---|---|---|
-| desktop | 7788 (embedded), display window | `cargo run --bin johnnyone-desktop` |
-| edge    | 7714 | `lokal cf worker sim` (local Cloudflare Worker simulator) |
-| web     | 4200 | `nx serve web` |
-
-Or run them by hand in three terminals:
+`npm run desktop` builds the binary, frees port `:7788` (kills any previous
+instance), then launches the **release** binary in the **background** (via
+`nohup`) pointed at the **live worker** `https://johnnyone.ethan-353.workers.dev`
+and returns your prompt. Logs stream to `/tmp/johnnyone-desktop.log`. Stop it
+with:
 
 ```bash
-# 1
-npm run start:desktop
-
-# 2
-npm run start:worker
-
-# 3
-npm run start:web
+lsof -ti:7788 | xargs kill
 ```
 
-## Running the JohnnyOne desktop binary
-
-End-users only need to run the desktop binary on their own machine and use the
-hosted web client from any browser. No other local setup.
-
-### Build the Linux binary
-
-Two modes — pick one. **Do not mix them up.**
-
-#### Mode A — production single-binary (the way users run it)
+If your account isn't the seeded dev user, set identity inline:
 
 ```bash
-cd personal/apps/johnnyone/desktop/src-tauri
-npx tauri build --no-bundle        # uses the repo's @tauri-apps/cli devDep — no `cargo install` needed
-# (equivalently `cargo tauri build --no-bundle` IF you've run `cargo install tauri-cli`)
-ls -lh target/release/johnnyone-desktop          # ~30 MB, self-contained
-```
-
-> `npx tauri build --no-bundle` and `cargo tauri build --no-bundle` are
-> equivalent — both run the Tauri build pipeline (beforeBuildCommand → embed
-> assets → production-webview Rust build). Prefer `npx` since `@tauri-apps/cli`
-> is already a devDependency; `cargo tauri` additionally requires the
-> `cargo-tauri` subcommand (`cargo install tauri-cli`). `npm run build:desktop`
-> (runs `scripts/build-desktop.sh`) is also correct — wipes `dist/host-app`,
-> rebuilds host-app, then `cargo build --release --features tauri/custom-protocol`.
-> See `docs/operations.md`.
-
-This is the only command that produces a runnable single binary. It:
-
-1. Runs the configured `beforeBuildCommand` (`npx nx build host-app`) so `dist/host-app/browser/` is fresh.
-2. Embeds those assets into the Rust binary via Tauri's codegen.
-3. Builds the `tauri` crate **with the production webview-runtime flag** so the webview loads the embedded assets instead of `devUrl`.
-
-After this, just exec the binary directly — see **Launch** below.
-
-#### Mode B — dev with HMR (only when iterating on the host-app UI)
-
-```bash
-cd personal/apps/johnnyone/desktop/src-tauri
-cargo tauri dev    # spawns `npx nx serve host-app --port 4201` + cargo run in debug
-```
-
-The webview loads from `http://localhost:4201` (per `tauri.conf.json` `devUrl`) so
-Angular HMR works. Requires the dev server alongside the binary.
-
-> **Gotcha — blank window / "Could not connect to localhost".** Plain
-> `cargo build --release --bin johnnyone-desktop` (without
-> `--features tauri/custom-protocol`) compiles and `:7788` binds, but the Tauri
-> webview stays in dev mode and tries `http://localhost:4201`. Fix: `npx tauri
-> build --no-bundle`, `npm run build:desktop`, or `cargo build --release --bin
-> johnnyone-desktop --features tauri/custom-protocol` after `nx build host-app`.
-> Details: `docs/operations.md`.
-
-### Launch
-
-```bash
-JOHNNYONE_WORKER_URL=https://johnnyone.ethan-353.workers.dev \
 JOHNNYONE_USER_ID=<your-user-id-uuid> \
 JOHNNYONE_TENANT_ID=<your-tenant-id-uuid> \
-./desktop/src-tauri/target/release/johnnyone-desktop
+npm run desktop
 ```
 
-(Later, once the host-app login flow writes credentials to a config file,
-those three env vars stop being needed.)
+On launch the binary:
 
-The binary will:
+1. Applies DB migrations under `~/.local/share/johnnyone/johnnyone.db`
+2. Registers your machine with the live worker as an **online `desktop_node`**
+3. Keeps an outbound WebSocket open for relay-RPC
+4. Listens on `127.0.0.1:7788` for the embedded UI's local GraphQL calls
+5. Opens a Tauri window with the host-app control panel (needs a display server)
 
-1. Apply DB migrations under `~/.local/share/johnnyone/johnnyone.db`
-2. Open a Tauri window pointing at the bundled host-app UI
-3. Register your machine with the deployed worker as a `desktop_node`
-4. Keep an outbound WebSocket open for relay-RPC
-5. Listen on `127.0.0.1:7788` for the embedded UI's local GraphQL calls
+Confirm it came up online:
+
+```bash
+grep "Desktop node registered" /tmp/johnnyone-desktop.log
+```
+
+Use `npm run build:desktop` when you only want to compile (e.g. CI, or to check
+it builds) without starting the app.
+
+### Ship a web / worker change
+
+```bash
+npm run deploy:web          # deploys BOTH: worker + web client (prod)
+```
+
+This builds the web client fresh and deploys the worker
+(`johnnyone.ethan-353.workers.dev`) **and** the Pages site
+(`johnnyone.pages.dev`). If you need finer-grained control:
+
+```bash
+lokal cf worker deploy --env prod    # worker only
+lokal cf pages deploy --env prod     # Pages only (after a fresh nx build web)
+lokal cf db migrate --env prod       # apply D1 migrations (not part of deploy:web)
+```
+
+### Developing the code (not just using the app)
+
+When you're iterating on source rather than running the shipped app:
+
+- **Web UI only**, against the live worker — fastest feedback loop:
+
+  ```bash
+  npx nx serve web          # http://localhost:4200
+  ```
+
+  Log in with the seeded admin (`admin@johnnyone.local` / `johnnyone-dev`,
+  tenant `default`). On `localhost` the web app defaults to a local worker at
+  `http://127.0.0.1:7714`; to point it at the live worker instead, run in the
+  browser console:
+
+  ```js
+  localStorage.setItem('johnnyone_worker_url', 'https://johnnyone.ethan-353.workers.dev');
+  ```
+
+  Your desktop binary must be running (`npm run desktop`) for any host data to
+  load.
+
+- **Host-app window UI with hot reload** — only when iterating on the Tauri
+  control-panel UI:
+
+  ```bash
+  cd desktop/src-tauri && cargo tauri dev
+  ```
+
+  Serves host-app on `:4201` and runs the binary in debug, loading the webview
+  from the dev server so Angular HMR works.
+
+- **Full local stack** (desktop + local worker simulator + web):
+
+  ```bash
+  ./scripts/dev-tmux.sh
+  ```
+
+  tmux session with: desktop (`cargo run`, embedded `:7788`), edge
+  (`lokal cf worker sim`, `:7714`), web (`nx serve web`, `:4200`).
+
+> **Build gotcha — blank window / "Could not connect to localhost".** Never build
+> the production binary with a plain `cargo build --release`. Without
+> `--features tauri/custom-protocol` the webview stays in dev mode and tries
+> `http://localhost:4201`, so you get a blank window even though `:7788` binds.
+> **`npm run desktop` is the correct production build** — it sets the
+> production-webview flag and embeds fresh assets. Details: `docs/operations.md`.
 
 ## Operational notes (hard-won)
 
@@ -299,8 +297,9 @@ Only the **worker** and **web client** deploy to Cloudflare. The desktop binary
 runs on each user's machine.
 
 ```bash
+npm run deploy:web                      # web client only → johnnyone.pages.dev
+lokal cf worker deploy --env prod       # worker only → johnnyone.ethan-353.workers.dev
 lokal cf deploy --env prod              # worker + Pages, both
-npm run deploy:worker                   # worker only (johnnyone)
 lokal cf db migrate --env prod          # apply D1 migrations
 ```
 
@@ -366,14 +365,16 @@ Full list (JWT_SECRET trap, D1 migration idempotency, `nx` on PATH, lokal naming
 - **`cargo build` is not the way to build the production binary.** The desktop
   binary embeds `dist/host-app/browser` at compile time *and* needs the Tauri
   runtime built in production-webview mode. `cargo build --release` does
-  neither for you. Use `cargo tauri build --no-bundle` — see "Running the
-  JohnnyOne desktop binary → Build the Linux binary" above.
+  neither for you. Use **`npm run desktop`** (runs `scripts/build-desktop.sh`)
+  — see "Running JohnnyOne" above.
 
 ## GraphQL API
 
 The worker exposes ~75 auto-wired resolvers grouped by capability. Every
 mutation/query that needs host data is routed via `relayRpc` /
-`desktopRpc` to the user's online desktop binary.
+`desktopRpc` to the user's online desktop binary. The same surface (plus
+`/api/relay/ws`) is the public Partner API — see
+[`docs/api-partner/index.html`](docs/api-partner/index.html).
 
 - **Auth** (lokal builtin) — `login`, `loginWithOauth`, `myCompleteFirstLogin`, `adminCreate{User,Tenant}`, `refreshToken`
 - **Sessions** — `listAiSessions`, `getAiSession`, `createAiSession`, `updateAiSession{Title,Provider,WorkingDirectory,Archived}`, `deleteAiSession`
@@ -382,6 +383,7 @@ mutation/query that needs host data is routed via `relayRpc` /
 - **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
 - **Providers / settings** — `listDetectedCliTools`, `listProviderConfigs`, `upsertProviderConfig`, `deleteProviderConfig`, `getSetting`, `setSetting`, `getPlannerPromptSettings`, `updatePlannerPromptSettings`
 - **Nodes** — `listDesktopNodes`, `registerDesktopNode`, `updateDesktopNodeStatus`
+- **API keys (M2M, optional)** — `createApiKey`, `listApiKeys`, `revokeApiKey`
 - **Channels / attachments** — `listChannelBindings`, `link/unlinkChannel`, `createChannelWebhook`, `get/create/deleteChatAttachment`
 - **Subscriptions** — `onRelayChatDelta`, `onRelayChatMessage`, `onDesktopNodeStatus`
 
@@ -396,6 +398,10 @@ Repo-local docs live alongside the code:
 - **`README.md`** (this file) — overview, structure, run + deploy commands,
   feature inventory, deploy gotchas
 - **`CHANGELOG.md`** — dated log of what shipped, in Keep-a-Changelog format
+- **`docs/api-partner/index.html`** — Partner/third-party API guide (auth,
+  GraphQL, live WSS terminal envelopes, examples, errors)
+- **`docs/api-partner/runbooks/`** — API versioning and partner service-account
+  provisioning runbooks
 
 ## Notable features shipped beyond the multi-user-saas plan
 

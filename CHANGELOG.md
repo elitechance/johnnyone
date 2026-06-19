@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Partner / third-party API ("J1 API")**. Authenticated GraphQL + WSS
+  terminal access for external partners (hosted service account model). JWT
+  (and `?token=`) on `/api/relay/ws` upgrade with server-side node resolution;
+  session ownership gate (`forbidden_session` on foreign `sessionId`);
+  web client now sends JWT and drops untrusted `nodeId`. AI-session and
+  AgentPlan GraphQL CRUD scoped for tenant isolation. Optional M2M API keys
+  (`jk_*` tokens, D1 migration 0004, `createApiKey`/`listApiKeys`/`revokeApiKey`
+  + scopes; usable as alternate auth on both transports). Partner docs site
+  (`docs/api-partner/index.html`), example clients (Node + Python), runbooks.
+  Phases 00-06 complete. See `docs/api-partner/`.
 - **Grok CLI provider (terminal-mode).** xAI's `grok` TUI is now a selectable
   provider, launched in a tmux pane as `grok --always-approve`. Available in the
   terminal session picker and the shared provider-selector. Chat-mode/planner
