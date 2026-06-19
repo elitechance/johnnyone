@@ -56,6 +56,14 @@ async function shot(page, name) {
   await page.goto(`${APP_URL}/`, { waitUntil: 'networkidle2', timeout: 30000 });
   await page.waitForSelector('ion-app', { timeout: 10000 });
 
+  // Force dev worker (after load so localStorage is accessible; localhost respects it)
+  await page.evaluate(() => {
+    localStorage.setItem('johnnyone_worker_url', 'https://johnnyone-dev.ethan-353.workers.dev');
+  });
+  log('set dev worker url in localStorage, reloading');
+  await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+  await page.waitForSelector('ion-app', { timeout: 10000 });
+
   const fillIon = async (label, value) => {
     const handle = await page.evaluateHandle((label) => {
       const items = Array.from(document.querySelectorAll('ion-item'));
@@ -114,7 +122,11 @@ async function shot(page, name) {
       if (use) use.click();
     });
     await page.waitForSelector('.terminal-pane, johnny-terminal-screen', { timeout: 20000 }).catch(() => log('pane wait timed out (proceeding to capture)'));
-    await new Promise((r) => setTimeout(r, 2500)); // allow connect + first visual frames via real JWT WS
+    await page.waitForFunction(() => {
+      const el = document.querySelector('.terminal-status, [class*="terminal-status"]');
+      return el && el.textContent && /attached/i.test(el.textContent);
+    }, { timeout: 15000 }).catch(() => log('attached status not seen in time'));
+    await new Promise((r) => setTimeout(r, 5000)); // allow connect + first visual frames via real JWT WS + attach
   } else {
     await new Promise((r) => setTimeout(r, 2000));
   }
@@ -136,7 +148,7 @@ async function shot(page, name) {
     const enter = btns.find((b) => b.textContent && b.textContent.trim() === 'Enter');
     if (enter) enter.click();
   });
-  await new Promise((r) => setTimeout(r, 3000)); // allow input to relay + screen update
+  await new Promise((r) => setTimeout(r, 8000)); // allow input to relay + screen update + content render
   await shot(page, 'web-terminal-after-input');
 
   // 4) Resize viewport -> component emits resize -> relay resize (real)
