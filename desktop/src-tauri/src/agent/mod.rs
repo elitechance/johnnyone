@@ -73,7 +73,7 @@ impl AgentService {
             "Desktop node registered"
         );
 
-        // Build WebSocket URL
+        // Base URL parts (stable across reconnects)
         let ws_scheme = if config.worker_url.starts_with("https") {
             "wss"
         } else {
@@ -83,21 +83,25 @@ impl AgentService {
             .worker_url
             .trim_start_matches("https://")
             .trim_start_matches("http://");
-        let mut ws_url = format!(
+        let base_ws_url = format!(
             "{}://{}/api/relay/ws?nodeId={}&clientType=desktop&userId={}&tenantId={}",
             ws_scheme, host, node_id, config.user_id, config.tenant_id
         );
-        if !config.access_token.trim().is_empty() {
-            ws_url = format!("{}&token={}", ws_url, config.access_token);
-        }
-
-        // Never log the JWT: redact the `&token=` query param (appended last) before logging.
-        let log_url = match ws_url.split_once("&token=") {
-            Some((base, _)) => format!("{}&token=<redacted>", base),
-            None => ws_url.clone(),
-        };
 
         loop {
+            // Re-resolve credential inside reconnect loop (Task 03) so rotated jk_ key is picked
+            // up without process restart. Use public RelayConfig (which calls resolve_access_token).
+            let fresh_token = settings_service::RelayConfig::resolve(&*state)
+                .map(|c| c.access_token)
+                .unwrap_or_else(|| config.access_token.clone());
+            let mut ws_url = base_ws_url.clone();
+            if !fresh_token.trim().is_empty() {
+                ws_url = format!("{}&token={}", ws_url, fresh_token);
+            }
+
+            // Use shared redaction helper (Task 02 fix) so test covers the emitted log path.
+            let log_url = ws_client::redact_token_in_url(&ws_url);
+
             tracing::info!(url = %log_url, "Connecting to agent session");
 
             match ws_client::connect(&ws_url).await {
