@@ -148,7 +148,21 @@ async function shot(page, name) {
     const enter = btns.find((b) => b.textContent && b.textContent.trim() === 'Enter');
     if (enter) enter.click();
   });
+  await new Promise((r) => setTimeout(r, 3000));
+  // force refresh if possible (simulate visual_refresh timing)
+  await page.evaluate(() => {
+    // the relay service would send on demand; re-trigger input or assume
+    const ta = document.querySelector('textarea[name="terminalInput"], .terminal-mobile-submit textarea');
+    if (ta) {
+      ta.value = '';
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  });
   await new Promise((r) => setTimeout(r, 8000)); // allow input to relay + screen update + content render
+  await page.waitForFunction(() => {
+    const term = document.querySelector('.terminal-pane, .xterm, johnny-terminal-screen, [class*="terminal"]');
+    return term && term.textContent && term.textContent.replace(/\s/g,'').length > 30;
+  }, { timeout: 10000 }).catch(() => log('no visible term content yet'));
   await shot(page, 'web-terminal-after-input');
 
   // 4) Resize viewport -> component emits resize -> relay resize (real)
