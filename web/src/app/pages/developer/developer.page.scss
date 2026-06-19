@@ -6,6 +6,13 @@
   --background: var(--jo-bg-base, #0d0f12);
 }
 
+// Wide-screen friendly: cap the content to a readable column and centre it,
+// instead of stretching edge-to-edge on large displays.
+.dev-wrap {
+  max-width: 880px;
+  margin: 0 auto;
+}
+
 .dev-error {
   margin: 0 0 12px;
   font-size: 0.875rem;

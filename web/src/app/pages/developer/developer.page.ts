@@ -130,6 +130,8 @@ export class DeveloperPage implements OnInit, OnDestroy {
   protected readonly wssInput = signal('');
   protected readonly wssLog = signal<string[]>([]);
   private screenSub?: Subscription;
+  private sessionUpdateSub?: Subscription;
+  private sessionDeleteSub?: Subscription;
 
   protected readonly error = signal<string>('');
 
@@ -145,11 +147,43 @@ export class DeveloperPage implements OnInit, OnDestroy {
   ngOnInit(): void {
     void this.loadApiKeys();
     void this.loadSessions();
+    // Live updates: open the relay socket once and reflect session
+    // create/update/delete + terminal screens in real time — no manual refresh.
+    this.screenSub = this.relay.screens().subscribe((screen) => {
+      if (screen.sessionId === this.wssSessionId()) {
+        this.wssScreen.set(screen);
+        this.appendLog(`terminal_screen (${screen.rows}×${screen.cols}, ${screen.status})`);
+      }
+    });
+    this.sessionUpdateSub = this.relay
+      .sessionUpdates()
+      .subscribe(({ session }) => this.upsertSession(session));
+    this.sessionDeleteSub = this.relay
+      .sessionDeletes()
+      .subscribe((id) => this.removeSession(id));
+    void this.relay.connect().catch(() => { /* errors surface in the WSS tab on demand */ });
   }
 
   ngOnDestroy(): void {
     this.screenSub?.unsubscribe();
+    this.sessionUpdateSub?.unsubscribe();
+    this.sessionDeleteSub?.unsubscribe();
     this.relay.disconnect();
+  }
+
+  private upsertSession(session: AiSession): void {
+    this.sessions.update((list) => {
+      const i = list.findIndex((s) => s.id === session.id);
+      if (i === -1) return [session, ...list];
+      const next = [...list];
+      next[i] = session;
+      return next;
+    });
+  }
+
+  private removeSession(id: string): void {
+    this.sessions.update((list) => list.filter((s) => s.id !== id));
+    if (this.wssSessionId() === id) this.disconnectWss();
   }
 
   protected setSegment(value: string | number | undefined): void {
@@ -240,7 +274,8 @@ export class DeveloperPage implements OnInit, OnDestroy {
     this.sessionsLoading.set(true);
     this.error.set('');
     try {
-      this.sessions.set(await firstValueFrom(this.api.listSessions()));
+      const list = await firstValueFrom(this.api.listSessions());
+      this.sessions.set([...list].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')));
     } catch (err) {
       this.fail(err);
     } finally {
@@ -309,18 +344,11 @@ export class DeveloperPage implements OnInit, OnDestroy {
     this.error.set('');
     try {
       this.appendLog(`connecting → ${sessionId}`);
-      this.screenSub?.unsubscribe();
-      this.screenSub = this.relay.screens().subscribe((screen) => {
-        if (screen.sessionId === this.wssSessionId()) {
-          this.wssScreen.set(screen);
-          this.appendLog(`terminal_screen (${screen.rows}×${screen.cols}, ${screen.status})`);
-        }
-      });
       await this.relay.connect();
       await this.relay.subscribeVisual(sessionId);
       await this.relay.refreshVisual(sessionId);
       this.wssConnected.set(true);
-      this.appendLog('connected + visual_subscribe + visual_refresh');
+      this.appendLog('visual_subscribe + visual_refresh');
     } catch (err) {
       this.fail(err);
       this.appendLog(`error: ${err instanceof Error ? err.message : String(err)}`);
@@ -352,11 +380,12 @@ export class DeveloperPage implements OnInit, OnDestroy {
   }
 
   protected disconnectWss(): void {
-    this.screenSub?.unsubscribe();
-    this.screenSub = undefined;
-    this.relay.disconnect();
+    // Stop watching this session's terminal, but keep the relay socket open so
+    // the live session list keeps receiving updates.
+    const sid = this.wssSessionId().trim();
+    if (sid) void this.relay.unsubscribeVisual(sid).catch(() => {});
     this.wssConnected.set(false);
     this.wssScreen.set(null);
-    this.appendLog('disconnected');
+    this.appendLog('unsubscribed');
   }
 }

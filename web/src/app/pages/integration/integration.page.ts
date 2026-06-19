@@ -35,13 +35,14 @@ export class IntegrationPage {
   /** Anchor sections rendered in the on-this-page table of contents. */
   protected readonly sections = [
     { id: 'overview', label: 'Overview' },
-    { id: 'auth', label: 'Authentication' },
-    { id: 'graphql', label: 'GraphQL API' },
+    { id: 'access', label: 'Access' },
+    { id: 'auth', label: '— Authentication (JWT)' },
+    { id: 'apikeys', label: '— API keys (M2M)' },
+    { id: 'graphql', label: 'API (GraphQL)' },
     { id: 'sessions', label: 'Terminal sessions' },
     { id: 'providers', label: 'Providers & models' },
     { id: 'plans', label: 'Planner / development' },
-    { id: 'apikeys', label: 'API keys (M2M)' },
-    { id: 'wss', label: 'Live terminal (WebSocket)' },
+    { id: 'wss', label: 'Live terminal (WSS)' },
     { id: 'quickstart', label: 'Quickstart (Node.js)' },
     { id: 'errors', label: 'Errors & limits' },
     { id: 'versioning', label: 'Versioning' },

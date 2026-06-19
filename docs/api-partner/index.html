@@ -39,12 +39,14 @@
   <h1>JohnnyOne Partner API</h1>
   <div class="tag">Integration Guide</div>
   <a href="#overview">Overview</a>
-  <a href="#auth">Authentication</a>
-  <a href="#graphql">GraphQL API</a>
+  <a href="#access">Access</a>
+  <a href="#auth">— Authentication (JWT)</a>
+  <a href="#apikeys">— API keys (M2M)</a>
+  <a href="#graphql">API (GraphQL)</a>
   <a href="#sessions">Terminal sessions</a>
+  <a href="#providers">Providers &amp; models</a>
   <a href="#plans">Planner / development</a>
-  <a href="#wss">Live terminal (WebSocket)</a>
-  <a href="#apikeys">API keys (M2M, optional)</a>
+  <a href="#wss">Live terminal (WSS)</a>
   <a href="#quickstart">Quickstart (Node.js)</a>
   <a href="#errors">Errors &amp; limits</a>
   <a href="#agents">For AI agents</a>
@@ -65,7 +67,16 @@
 </table>
 <p class="muted">Your account is a dedicated service account (one tenant + user). JohnnyOne hosts the desktop runtime for you — you never install anything. The server resolves your desktop node from your token; you never supply a node id.</p>
 
-<h2 id="auth">Authentication</h2>
+<h2 id="access">Access</h2>
+<p>Every call — GraphQL <em>or</em> WSS — carries a Bearer credential. There are <strong>two kinds of credential, and either one works on both transports</strong>. The credential (JWT vs API key) and the transport (GraphQL vs WSS) are independent choices.</p>
+<table>
+  <tr><th>Credential</th><th>What it is</th><th>Lifetime</th><th>Works on</th></tr>
+  <tr><td><strong>Authentication (JWT)</strong></td><td>Your login access token — your account identity.</td><td>Short-lived; renew with <code>refreshToken</code>.</td><td>GraphQL + WSS</td></tr>
+  <tr><td><strong>API key (<code>jk_…</code>)</strong></td><td>A long-lived M2M credential you mint, with explicit scopes.</td><td>Long-lived; until revoked / optional expiry.</td><td>GraphQL + WSS</td></tr>
+</table>
+<p>Send either as <code>Authorization: Bearer &lt;value&gt;</code> on GraphQL <strong>and</strong> on the WSS upgrade — or <code>?token=&lt;value&gt;</code> on the WSS URL for browser clients. A partner needs <em>one</em> of these, not both.</p>
+
+<h3 id="auth">1 · Authentication (login → JWT)</h3>
 <p>Log in once to get a short-lived <code>accessToken</code> (JWT) and a longer-lived <code>refreshToken</code>. Send the access token on every GraphQL request and on the WebSocket upgrade.</p>
 <pre><code>curl -s https://johnnyone-dev.ethan-353.workers.dev/graphql \
   -H 'content-type: application/json' \
@@ -75,9 +86,20 @@
 <p>Use the token as a Bearer header on GraphQL:</p>
 <pre><code>Authorization: Bearer &lt;accessToken&gt;</code></pre>
 <div class="note warn"><strong>Token lifetime.</strong> Access tokens are short-lived. When one expires, call <code>refreshToken(input: RefreshTokenInput!): AuthPayload</code> to get a new pair (returns <code>{ accessToken refreshToken ... }</code>). A WebSocket authenticates <em>once</em> at upgrade — if the token expires mid-connection, reconnect with a fresh token (see <a href="#errors">Errors &amp; limits</a>).</div>
-<div class="note warn"><strong><code>?token=</code> fallback.</strong> Browser WebSocket clients can't set headers, so the token may be passed as a query param. Only over TLS, only with a short-lived access token, and don't log or persist the URL.</div>
+<div class="note warn"><strong><code>?token=</code> fallback (WSS).</strong> Browser WebSocket clients can't set headers, so the token may be passed as a query param. Only over TLS, only with a short-lived access token, and don't log or persist the URL.</div>
 
-<h2 id="graphql">GraphQL API</h2>
+<h3 id="apikeys">2 · API keys (M2M)</h3>
+<p>For programs/partners that call the API <strong>without an interactive login</strong>, mint a long-lived, scoped key. The <code>jk_…</code> secret is used exactly like a JWT — <code>Authorization: Bearer jk_…</code> (or <code>?token=jk_…</code>) — on both GraphQL and WSS.</p>
+<table>
+  <tr><th>Operation</th><th>Signature</th></tr>
+  <tr><td>Create (returns secret once)</td><td><code>createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!</code></td></tr>
+  <tr><td>List</td><td><code>listApiKeys: [ApiKey!]!</code></td></tr>
+  <tr><td>Revoke</td><td><code>revokeApiKey(id: ID!): ApiKey!</code></td></tr>
+</table>
+<p><code>CreateApiKeyInput</code>: <code>{ name: String!, scopes: [String!]!, expiresAt?: String }</code>. Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>, <code>plans:read|write</code> (grant the minimum — a key is restricted to its scopes; a JWT is unrestricted). <code>CreateApiKeyResult</code> has <code>apiKey</code> (metadata only; never the secret again) + <code>secret</code> (the <code>jk_...</code> value, shown once).</p>
+<div class="note"><strong>Bootstrapping.</strong> Creating a key is <strong>JWT-only</strong> (a key can't mint keys) — log in once to create one, then use only the key.</div>
+
+<h2 id="graphql">API (GraphQL)</h2>
 <p>Endpoint: <code>POST https://johnnyone-dev.ethan-353.workers.dev/graphql</code>. The schema is introspectable — point a GraphQL client at it to discover every type and argument. The partner-usable operations are below.</p>
 
 <h3 id="sessions">Terminal / AI sessions</h3>
@@ -127,17 +149,6 @@
 
 <h3>Discovery helpers</h3>
 <p><code>listDesktopNodes</code> (your online desktop node) · <code>listDetectedCliTools</code> (available providers/CLIs on your host).</p>
-
-<h3 id="apikeys">API keys (M2M, optional)</h3>
-<p>JWT is primary. For long-lived server tokens use M2M API keys (created with a service-account JWT):</p>
-<table>
-  <tr><th>Operation</th><th>Signature</th></tr>
-  <tr><td>Create (returns secret once)</td><td><code>createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!</code></td></tr>
-  <tr><td>List</td><td><code>listApiKeys: [ApiKey!]!</code></td></tr>
-  <tr><td>Revoke</td><td><code>revokeApiKey(id: ID!): ApiKey!</code></td></tr>
-</table>
-<p><code>CreateApiKeyInput</code>: <code>{ name: String!, scopes: [String!]!, expiresAt?: String }</code>. Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>, <code>plans:read|write</code>. <code>CreateApiKeyResult</code> has <code>apiKey</code> (metadata only; never the secret again) + <code>secret</code> (the <code>jk_...</code> value, one-time). Use the secret as Bearer token (or <code>?token=</code>) on GraphQL/WSS exactly like a JWT.</p>
-<p>Keys are optional convenience; JWT always works for the account.</p>
 
 <h2 id="wss">Live terminal (WebSocket)</h2>
 <p>Connect to <code>wss://johnnyone-dev.ethan-353.workers.dev/api/relay/ws</code> with your token. The server validates the token, resolves your desktop node, and routes the socket. Messages are JSON <strong>envelopes</strong>:</p>

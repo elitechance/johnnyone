@@ -10,8 +10,7 @@
       <h1>JohnnyOne Partner API</h1>
       <p class="lede">
         Drive JohnnyOne programmatically — no UI. Create and control AI/terminal
-        sessions and planner/development runs, and stream live terminal output,
-        over two authenticated transports.
+        sessions and planner/development runs, and stream live terminal output.
       </p>
     </header>
 
@@ -29,17 +28,16 @@
     </div>
 
     <h3>Two transports</h3>
+    <p>The API is reachable over two transports. Pick by what you're doing — both authenticate the same way (see <a (click)="scrollTo('access')">Access</a>).</p>
     <table>
-      <tr><th>Transport</th><th>Use it for</th><th>Auth</th></tr>
+      <tr><th>Transport</th><th>Use it for</th></tr>
       <tr>
         <td><span class="pill post">GraphQL</span> <code>{{ base }}/graphql</code></td>
-        <td>Login, session lifecycle CRUD, planner/development lifecycle CRUD, listing nodes &amp; tools.</td>
-        <td><code>Authorization: Bearer &lt;accessToken&gt;</code></td>
+        <td>Login, session lifecycle CRUD, planner/development lifecycle CRUD, API-key management, listing nodes &amp; tools.</td>
       </tr>
       <tr>
         <td><span class="pill ws">WebSocket</span> <code>{{ wsBase }}/api/relay/ws</code></td>
         <td>Live terminal I/O — subscribe to screen updates, send input, resize, kill.</td>
-        <td><code>Authorization: Bearer &lt;accessToken&gt;</code> on upgrade, or <code>?token=&lt;accessToken&gt;</code></td>
       </tr>
     </table>
     <p class="muted">
@@ -48,19 +46,46 @@
       resolves your desktop node from your token; you never supply a node id.
     </p>
 
-    <h2 id="auth">Authentication</h2>
+    <h2 id="access">Access</h2>
+    <p>
+      Every call — GraphQL <em>or</em> WSS — carries a Bearer credential. There are
+      <strong>two kinds of credential, and either one works on both transports</strong>.
+      The credential you use (JWT vs API key) and the transport you call (GraphQL vs WSS)
+      are independent choices:
+    </p>
+    <table>
+      <tr><th>Credential</th><th>What it is</th><th>Lifetime</th><th>Works on</th></tr>
+      <tr>
+        <td><strong>Authentication (JWT)</strong></td>
+        <td>Your login access token — your account identity.</td>
+        <td>Short-lived; renew with <code>refreshToken</code>.</td>
+        <td>GraphQL + WSS</td>
+      </tr>
+      <tr>
+        <td><strong>API key (<code>jk_…</code>)</strong></td>
+        <td>A long-lived machine (M2M) credential you mint, with explicit scopes.</td>
+        <td>Long-lived; until revoked / optional expiry.</td>
+        <td>GraphQL + WSS</td>
+      </tr>
+    </table>
+    <p>
+      Send either as <code>Authorization: Bearer &lt;value&gt;</code> on GraphQL <strong>and</strong> on the
+      WSS upgrade — or as <code>?token=&lt;value&gt;</code> on the WSS URL for browser clients that can't set
+      headers. A partner needs <em>one</em> of these, not both.
+    </p>
+
+    <h3 id="auth">1 · Authentication (login → JWT)</h3>
     <p>
       Log in once to get a short-lived <code>accessToken</code> (JWT) and a
-      longer-lived <code>refreshToken</code>. Send the access token on every
-      GraphQL request and on the WebSocket upgrade.
+      longer-lived <code>refreshToken</code>. Use this when the partner authenticates
+      with their service-account credentials.
     </p>
     <pre><code>curl -s {{ base }}/graphql \
   -H 'content-type: application/json' \
   -H 'x-tenant-id: your-tenant' \
   -d '&#123;"query":"mutation($i:LoginInput!)&#123;login(input:$i)&#123;accessToken refreshToken&#125;&#125;",
        "variables":&#123;"i":&#123;"email":"you&#64;partner.com","password":"…","tenantId":"your-tenant"&#125;&#125;&#125;'</code></pre>
-    <p>Use the token as a Bearer header on GraphQL:</p>
-    <pre><code>Authorization: Bearer &lt;accessToken&gt;</code></pre>
+    <p>Then send it on every call: <code>Authorization: Bearer &lt;accessToken&gt;</code>.</p>
     <div class="note warn">
       <strong>Token lifetime.</strong> Access tokens are short-lived. When one
       expires, call <code>refreshToken(input: RefreshTokenInput!): AuthPayload</code>
@@ -69,12 +94,37 @@
       mid-connection, reconnect with a fresh token (see Errors &amp; limits).
     </div>
     <div class="note warn">
-      <strong><code>?token=</code> fallback.</strong> Browser WebSocket clients
+      <strong><code>?token=</code> fallback (WSS).</strong> Browser WebSocket clients
       can't set headers, so the token may be passed as a query param. Only over
       TLS, only with a short-lived access token, and don't log or persist the URL.
     </div>
 
-    <h2 id="graphql">GraphQL API</h2>
+    <h3 id="apikeys">2 · API keys (M2M)</h3>
+    <p>
+      For programs/partners that should call the API <strong>without an interactive login</strong>,
+      mint a long-lived, scoped key. The <code>jk_…</code> secret is used exactly like a JWT — as
+      <code>Authorization: Bearer jk_…</code> (or <code>?token=jk_…</code>) — on both GraphQL and WSS.
+    </p>
+    <table>
+      <tr><th>Operation</th><th>Signature</th></tr>
+      <tr><td>Create (returns secret once)</td><td><code>createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!</code></td></tr>
+      <tr><td>List</td><td><code>listApiKeys: [ApiKey!]!</code></td></tr>
+      <tr><td>Revoke</td><td><code>revokeApiKey(id: ID!): ApiKey!</code></td></tr>
+    </table>
+    <p>
+      <code>CreateApiKeyInput</code>: <code>&#123; name: String!, scopes: [String!]!, expiresAt? &#125;</code>.
+      Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>, <code>plans:read|write</code>
+      (grant the minimum — a key is restricted to its scopes; a JWT is unrestricted).
+      <code>CreateApiKeyResult</code> returns <code>apiKey</code> (metadata only) + <code>secret</code>
+      (the <code>jk_…</code> value, shown <strong>once</strong>).
+    </p>
+    <div class="note">
+      <strong>Bootstrapping.</strong> Creating a key is <strong>JWT-only</strong> (a key can't mint keys).
+      So either the partner logs in once (Authentication) to create their own key, or you mint it for
+      them in the Developer console — after that they use only the key.
+    </div>
+
+    <h2 id="graphql">API (GraphQL)</h2>
     <p>
       Endpoint: <code>POST {{ base }}/graphql</code>. The schema is
       introspectable — point a GraphQL client at it to discover every type and
@@ -140,28 +190,10 @@
     <h3>Discovery helpers</h3>
     <p><code>listDesktopNodes</code> (your online desktop node) · <code>listDetectedCliTools</code> (available providers/CLIs on your host).</p>
 
-    <h3 id="apikeys">API keys (M2M, optional)</h3>
-    <p>JWT is primary. For long-lived server tokens use M2M API keys (created with a service-account JWT):</p>
-    <table>
-      <tr><th>Operation</th><th>Signature</th></tr>
-      <tr><td>Create (returns secret once)</td><td><code>createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!</code></td></tr>
-      <tr><td>List</td><td><code>listApiKeys: [ApiKey!]!</code></td></tr>
-      <tr><td>Revoke</td><td><code>revokeApiKey(id: ID!): ApiKey!</code></td></tr>
-    </table>
-    <p>
-      <code>CreateApiKeyInput</code>:
-      <code>&#123; name: String!, scopes: [String!]!, expiresAt? &#125;</code>.
-      Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>,
-      <code>plans:read|write</code>. <code>CreateApiKeyResult</code> has
-      <code>apiKey</code> (metadata only; never the secret again) +
-      <code>secret</code> (the <code>jk_...</code> value, one-time). Use the
-      secret as Bearer token (or <code>?token=</code>) on GraphQL/WSS exactly
-      like a JWT.
-    </p>
-
     <h2 id="wss">Live terminal (WebSocket)</h2>
     <p>
-      Connect to <code>{{ wsBase }}/api/relay/ws</code> with your token. The
+      Connect to <code>{{ wsBase }}/api/relay/ws</code> with your token (JWT or
+      <code>jk_…</code> key — see <a (click)="scrollTo('access')">Access</a>). The
       server validates the token, resolves your desktop node, and routes the
       socket. Messages are JSON <strong>envelopes</strong>:
     </p>
@@ -170,9 +202,9 @@
     <h3>Client → server</h3>
     <table>
       <tr><th>type</th><th>Payload</th><th>Meaning</th></tr>
-      <tr><td><code>terminal_command</code> (visual_subscribe)</td><td><code>data: &#123; requestId, sessionId, data: "", control: "visual_subscribe" &#125;</code></td><td>Subscribe to future <code>terminal_screen</code> updates.</td></tr>
+      <tr><td><code>terminal_command</code> (visual_subscribe)</td><td><code>data: &#123; requestId, sessionId, data: "", control: "visual_subscribe" &#125;</code></td><td>Subscribe to future <code>terminal_screen</code> updates. <span class="muted">(scope <code>terminal:read</code>)</span></td></tr>
       <tr><td><code>terminal_command</code> (visual_refresh)</td><td><code>data: &#123; requestId, sessionId, data: "", control: "visual_refresh" &#125;</code></td><td>Pull current screen (subscribe streams only future frames).</td></tr>
-      <tr><td><code>terminal_command</code></td><td><code>data: &#123; requestId, sessionId, data: "&lt;input&gt;" &#125;</code></td><td>Send keystrokes / input (data string, \r to submit).</td></tr>
+      <tr><td><code>terminal_command</code></td><td><code>data: &#123; requestId, sessionId, data: "&lt;input&gt;" &#125;</code></td><td>Send keystrokes / input (data string, \r to submit). <span class="muted">(scope <code>terminal:write</code>)</span></td></tr>
       <tr><td><code>terminal_command</code> (resize)</td><td><code>data: &#123; requestId, sessionId, data: &#123; cols, rows &#125; &#125;</code></td><td>Resize the terminal.</td></tr>
       <tr><td><code>terminal_command</code> (kill)</td><td><code>data: &#123; requestId, sessionId, data: "", control: "kill" &#125;</code></td><td>Terminate the terminal session.</td></tr>
     </table>
@@ -202,7 +234,7 @@ const gql = (q, variables, token) =&gt; fetch(BASE + '/graphql', &#123;
   body: JSON.stringify(&#123; query: q, variables &#125;),
 &#125;).then(r =&gt; r.json());
 
-// 1. Login
+// 1. Login (JWT) — or skip and use a jk_ API key directly as the token below
 const &#123; data: &#123; login &#125; &#125; = await gql(
   'mutation($i:LoginInput!)&#123;login(input:$i)&#123;accessToken refreshToken&#125;&#125;',
   &#123; i: &#123; email: 'you&#64;partner.com', password: process.env.PW, tenantId: 'your-tenant' &#125; &#125;);
