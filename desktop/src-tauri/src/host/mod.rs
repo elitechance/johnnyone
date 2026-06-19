@@ -301,7 +301,7 @@ impl MutationRoot {
         value: String,
     ) -> async_graphql::Result<bool> {
         let state = ctx.data_unchecked::<AppState>();
-        settings_service::set_setting(state, key, value)?;
+        crate::services::relay::apply_setting(state, key, value).await?;
         Ok(true)
     }
 

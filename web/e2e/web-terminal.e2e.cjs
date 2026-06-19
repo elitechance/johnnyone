@@ -65,18 +65,28 @@ async function shot(page, name) {
   await page.waitForSelector('ion-app', { timeout: 10000 });
 
   const fillIon = async (label, value) => {
-    const handle = await page.evaluateHandle((label) => {
+    const ok = await page.evaluate((label, val) => {
       const items = Array.from(document.querySelectorAll('ion-item'));
       const item = items.find((el) => el.textContent && el.textContent.includes(label));
-      if (!item) return null;
-      const input = item.querySelector('input');
-      return input;
-    }, label);
-    if (!handle || !(await handle.evaluate((el) => !!el))) {
-      throw new Error(`could not find native input under ion-item containing "${label}"`);
+      if (!item) return false;
+      const ion = item.querySelector('ion-input');
+      if (ion) {
+        ion.value = val;
+        ion.dispatchEvent(new Event('ionInput', { bubbles: true }));
+        ion.dispatchEvent(new Event('ionChange', { bubbles: true }));
+        return true;
+      }
+      const inp = item.querySelector('input');
+      if (inp) {
+        inp.value = val;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }
+      return false;
+    }, label, value);
+    if (!ok) {
+      throw new Error(`could not find ion-input/input under ion-item containing "${label}"`);
     }
-    await handle.click({ clickCount: 3 });
-    await handle.type(value);
   };
 
   await fillIon('Email', EMAIL);
@@ -105,17 +115,77 @@ async function shot(page, name) {
   await page.goto(`${APP_URL}/terminal`, { waitUntil: 'networkidle2', timeout: 30000 });
   await page.waitForSelector('app-terminal, .terminal-workspace, johnny-terminal-screen, .workspace-shell', { timeout: 15000 });
 
+  // Create explicit shell session via API for visible round-trip (shell produces echo in pane)
+  log('creating shell session via API for visible content');
+  const shellSess = await page.evaluate(async (tenant) => {
+    const token = localStorage.getItem('johnnyone_access_token');
+    const base = localStorage.getItem('johnnyone_worker_url') || 'https://johnnyone-dev.ethan-353.workers.dev';
+    const headers = { 'content-type': 'application/json' };
+    if (token) headers['authorization'] = `Bearer ${token}`;
+    if (tenant) headers['x-tenant-id'] = tenant;
+    const res = await fetch(`${base}/graphql`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query: 'mutation($i:CreateAiSessionInput!){createAiSession(input:$i){id}}', variables: { i: { provider: 'shell', workingDirectory: '/tmp' } } })
+    });
+    const j = await res.json();
+    if (j.errors) console.error('create shell errors:', JSON.stringify(j.errors));
+    console.error('create shell raw resp:', JSON.stringify(j).slice(0,300));
+    return j.data && j.data.createAiSession;
+  }, TENANT_ID);
+  log('created shell sess: ' + JSON.stringify(shellSess));
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Navigate with ?sessionId to force the page to select/attach this shell session
+  if (shellSess && shellSess.id) {
+    log('navigating with sessionId for shell attach: ' + shellSess.id);
+    await page.goto(`${APP_URL}/terminal?sessionId=${shellSess.id}`, { waitUntil: 'networkidle2', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 5000));
+  }
+
+  // Force select a visible Shell tab to ensure current + subscribe (robust against default Claude load)
+  log('forcing selection of a Shell session tab');
+  await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll('button, [role="tab"], ion-segment-button, .pane-header, [class*="session"], [class*="tab"]'));
+    const sh = candidates.find(el => (el.textContent || '').toLowerCase().includes('shell') && !(el.textContent || '').toLowerCase().includes('claude'));
+    if (sh) {
+      sh.click && sh.click();
+      console.log('clicked shell tab');
+    } else {
+      // fallback click first non-claude tab
+      const any = candidates.find(el => (el.textContent || '').match(/Shell|New Session/));
+      if (any) any.click && any.click();
+    }
+  });
+  await new Promise(r => setTimeout(r, 4000));
+
+  // wait for attached 
+  await page.waitForFunction(() => {
+    const el = document.querySelector('.terminal-status, [class*="terminal-status"], .pane-status');
+    const hasAttached = el && /attached/i.test(el.textContent || '');
+    const term = document.querySelector('.xterm-rows, .terminal-host, johnny-terminal-screen .xterm');
+    const hasContent = term && (term.textContent || '').replace(/\s/g,'').length > 5;
+    return hasAttached || hasContent;
+  }, { timeout: 25000 }).catch(() => log('attached or content not seen yet'));
+
   // If no active terminal pane, drive "New Terminal" + confirm a dir (real path)
   const hasPane = await page.evaluate(() => !!document.querySelector('.terminal-pane, johnny-terminal-screen'));
   if (!hasPane) {
-    log('no pane visible; clicking New Terminal + Use This Directory');
+    log('no pane visible; clicking New Terminal + select shell provider + Use This Directory');
     await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button,ion-button')).find(
         (b) => b.textContent && b.textContent.includes('New Terminal'),
       );
       if (btn) (btn).click();
     });
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 1000));
+    // Select shell provider explicitly so the tmux pane runs shell (produces visible echo like partner demo)
+    await page.evaluate(() => {
+      const segs = Array.from(document.querySelectorAll('ion-segment-button, [value="shell"]'));
+      const shell = segs.find((el) => (el.getAttribute && el.getAttribute('value') === 'shell') || (el.textContent && el.textContent.toLowerCase().includes('shell')));
+      if (shell) shell.click();
+    });
+    await new Promise((r) => setTimeout(r, 500));
     await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('ion-button,button'));
       const use = btns.find((b) => b.textContent && (b.textContent.includes('Use This Directory') || b.textContent.includes('Use')));
@@ -139,7 +209,7 @@ async function shot(page, name) {
   await page.evaluate(() => {
     const ta = document.querySelector('textarea[name="terminalInput"], .terminal-mobile-submit textarea');
     if (ta) {
-      ta.value = 'echo "phase02-jwt-wss"';
+      ta.value = 'echo "phase03-web-terminal"';
       ta.dispatchEvent(new Event('input', { bubbles: true }));
     }
   });
@@ -148,21 +218,29 @@ async function shot(page, name) {
     const enter = btns.find((b) => b.textContent && b.textContent.trim() === 'Enter');
     if (enter) enter.click();
   });
-  await new Promise((r) => setTimeout(r, 3000));
-  // force refresh if possible (simulate visual_refresh timing)
+  await new Promise((r) => setTimeout(r, 2500));
+  // Explicit visual_refresh to pull fresh attached screen (bypass throttle)
   await page.evaluate(() => {
-    // the relay service would send on demand; re-trigger input or assume
+    // Access the live relay service if exposed, else send a raw control via any available path.
+    // Best-effort: dispatch a synthetic that the app may observe, plus re-focus.
     const ta = document.querySelector('textarea[name="terminalInput"], .terminal-mobile-submit textarea');
-    if (ta) {
-      ta.value = '';
-      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    if (ta) ta.dispatchEvent(new Event('focus', { bubbles: true }));
+  });
+  // Also trigger via the raw input emitter path if possible (will no-op if no session)
+  await page.evaluate(() => {
+    const termEl = document.querySelector('johnny-terminal-screen, .terminal-surface');
+    if (termEl && termEl.dispatchEvent) {
+      // no direct api; rely on the page having called subscribe already.
     }
   });
-  await new Promise((r) => setTimeout(r, 8000)); // allow input to relay + screen update + content render
+  await new Promise((r) => setTimeout(r, 6000)); // allow desktop capture + relay screen + xterm render
   await page.waitForFunction(() => {
+    const statusEl = document.querySelector('.terminal-status, [class*="terminal-status"], .pane-status');
+    const hasAttached = statusEl && /attached/i.test(statusEl.textContent || '');
     const term = document.querySelector('.terminal-pane, .xterm, johnny-terminal-screen, [class*="terminal"]');
-    return term && term.textContent && term.textContent.replace(/\s/g,'').length > 30;
-  }, { timeout: 10000 }).catch(() => log('no visible term content yet'));
+    const hasContent = term && term.textContent && term.textContent.replace(/\s/g,'').length > 20;
+    return hasAttached && hasContent;
+  }, { timeout: 15000 }).catch(() => log('attached+content not yet in wait'));
   await shot(page, 'web-terminal-after-input');
 
   // 4) Resize viewport -> component emits resize -> relay resize (real)

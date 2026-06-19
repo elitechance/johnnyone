@@ -174,6 +174,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
   private terminalVisualSubscriptions = new Set<string>();
   private terminalVisualSync: Promise<void> = Promise.resolve();
+  private queryParamSub: Subscription | null = null;
   private readonly visibilityChangeHandler = () => {
     if (document.hidden) {
       this.enqueueTerminalVisualSync(() => this.unsubscribeAllTerminalVisuals());
@@ -332,6 +333,24 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     void this.detectTools();
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
+
+    // Support ?sessionId deep links after initial mount (e.g. e2e harness goto after create, or direct nav)
+    if (!this.queryParamSub) {
+      this.queryParamSub = this.route.queryParamMap.subscribe((map) => {
+        const sid = map.get('sessionId');
+        if (sid) {
+          const current = this.currentSession()?.id;
+          if (sid !== current) {
+            const has = this.sessions().some((s) => s.id === sid);
+            if (has) {
+              void this.selectSession(sid);
+            } else {
+              void this.loadSessions(sid);
+            }
+          }
+        }
+      });
+    }
     document.addEventListener('visibilitychange', this.visibilityChangeHandler);
     window.addEventListener('pageshow', this.pageShowHandler);
     void this.relayTerminal.connect();
@@ -361,6 +380,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
     document.removeEventListener('visibilitychange', this.visibilityChangeHandler);
     window.removeEventListener('pageshow', this.pageShowHandler);
+    this.queryParamSub?.unsubscribe();
+    this.queryParamSub = null;
     void this.unsubscribeAllTerminalVisuals();
     this.teardownChatSubscriptions();
     this.teardownTerminalSubscription();

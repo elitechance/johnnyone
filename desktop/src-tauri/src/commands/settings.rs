@@ -1,3 +1,4 @@
+use crate::services::relay;
 use crate::services::settings as settings_service;
 use crate::state::app_state::AppState;
 use tauri::State;
@@ -13,5 +14,7 @@ pub async fn set_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    settings_service::set_setting(state.inner(), key, value)
+    // Connection-relevant settings take effect immediately via reconnect-on-save
+    // (shared with the host-GraphQL and relay-RPC set-setting paths).
+    relay::apply_setting(state.inner(), key, value).await
 }

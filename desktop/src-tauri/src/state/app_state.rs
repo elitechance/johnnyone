@@ -114,6 +114,9 @@ pub struct AppState {
     /// Structured agent completion reports (from the `reportAgentResult` mutation),
     /// keyed by tmux session id. Drained by the coordinator's wait loops.
     pub agent_reports: Arc<Mutex<HashMap<String, AgentReport>>>,
+    /// Handle to the running relay connection loop. Aborted + respawned by
+    /// `relay::reconnect` when connection settings change (reconnect-on-save).
+    pub relay_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl AppState {
@@ -157,6 +160,7 @@ impl AppState {
             terminal_screen_flush_scheduled: Arc::new(Mutex::new(HashMap::new())),
             worker_relay_config: Arc::new(Mutex::new(None)),
             agent_reports: Arc::new(Mutex::new(HashMap::new())),
+            relay_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -192,6 +196,7 @@ impl AppState {
             terminal_screen_flush_scheduled: Arc::new(Mutex::new(HashMap::new())),
             worker_relay_config: Arc::new(Mutex::new(None)),
             agent_reports: Arc::new(Mutex::new(HashMap::new())),
+            relay_task: Arc::new(Mutex::new(None)),
         }
     }
 

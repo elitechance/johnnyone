@@ -444,8 +444,8 @@ export class RelayTerminalService {
     }
 
     if (envelope.type === 'terminal_command_ack') {
-      const ack = envelope.data as TerminalCommandAck;
-      if (!ack.accepted) {
+      const ack = envelope.data as TerminalCommandAck | undefined;
+      if (ack && !ack.accepted) {
         console.error('Terminal command was rejected:', ack.error);
       }
     }

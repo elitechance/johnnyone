@@ -158,6 +158,16 @@ impl AgentService {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to connect");
+                    // On an auth rejection, try to refresh a short-lived JWT
+                    // credential so the next reconnect uses a fresh token. No-op
+                    // for durable jk_ keys (which never expire).
+                    if e.contains("401") || e.contains("Unauthorized") {
+                        match crate::services::relay::refresh_access_token(&*state).await {
+                            Ok(true) => tracing::info!("Refreshed relay credential after 401; retrying"),
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(error = %err, "Relay token refresh failed"),
+                        }
+                    }
                 }
             }
 
@@ -1487,6 +1497,15 @@ impl AgentService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'value' parameter".to_string())?;
         settings_service::set_setting(state, key.to_string(), value.to_string())?;
+        // Reconnect-on-save for connection-relevant keys. This RPC runs inside
+        // the relay loop, so spawn the reconnect (which aborts + respawns that
+        // loop) rather than awaiting it inline.
+        if crate::services::relay::is_connection_key(key) {
+            let st = (**state).clone();
+            tokio::spawn(async move {
+                crate::services::relay::reconnect(st).await;
+            });
+        }
         Ok(serde_json::json!(true))
     }
 

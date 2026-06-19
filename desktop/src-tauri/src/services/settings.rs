@@ -12,6 +12,9 @@ pub const KEY_WEB_CLIENT_URL: &str = "web_client_url";
 /// Empty = alerts disabled. Read by the coordinator's notifier.
 pub const KEY_DISCORD_WEBHOOK_URL: &str = "discord_webhook_url";
 pub const KEY_ACCESS_TOKEN: &str = "access_token";
+/// Refresh token persisted at login so the relay can refresh a short-lived JWT
+/// credential without a restart. Empty for durable `jk_` API-key credentials.
+pub const KEY_REFRESH_TOKEN: &str = "refresh_token";
 
 pub const DEFAULT_WORKER_URL: &str = "https://johnnyone.ethan-353.workers.dev";
 pub const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -111,7 +114,7 @@ impl RelayConfig {
     }
 }
 
-fn resolve_worker_url(state: &AppState) -> String {
+pub fn resolve_worker_url(state: &AppState) -> String {
     std::env::var("JOHNNYONE_WORKER_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())

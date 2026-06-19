@@ -82,6 +82,11 @@ export class HostAuthService {
       tenantId: login.user.tenantId,
       userId: login.user.id,
     });
+    // Drive the relay with this login: persist the JWT + refresh token so the
+    // backend relay uses this session and can auto-refresh it on expiry. (A
+    // durable jk_ API key set out-of-band remains the alternative credential.)
+    await this.settings.setSetting('access_token', login.accessToken);
+    await this.settings.setSetting('refresh_token', login.refreshToken);
     await this.relay.connect();
   }
 
