@@ -1,10 +1,16 @@
 // Native-themed port of the partner API integration guide
 // (was the standalone johnnyone-partner-api.pages.dev site).
+//
+// The web client forces dark mode globally (styles.scss imports
+// dark.always.css and defines the --jo-* token scale). Use those tokens — not
+// raw --ion-* vars with light fallbacks — so the page is guaranteed readable
+// against the app's near-black background.
+//
 // Styles are component-scoped (Angular emulated encapsulation), so the bare
 // element selectors below won't leak to the rest of the app.
 
 .integration-content {
-  --background: var(--ion-background-color, #fff);
+  --background: var(--jo-bg-base, #0d0f12);
 }
 
 .doc {
@@ -13,17 +19,18 @@
   padding: 24px 20px 64px;
   font-size: 15px;
   line-height: 1.6;
-  color: var(--ion-text-color, #1a1a1a);
+  color: var(--jo-fg, #c5cbd3);
 }
 
 .hero {
   h1 {
     font-size: 30px;
     margin: 0 0 8px;
+    color: var(--jo-fg-strong, #e7eaee);
   }
 
   .lede {
-    color: var(--ion-color-medium, #6b7280);
+    color: var(--jo-fg-muted, #8a92a0);
     font-size: 16px;
     margin: 0;
   }
@@ -36,28 +43,28 @@
   align-items: center;
   margin: 20px 0 8px;
   padding: 12px 14px;
-  border: 1px solid var(--ion-color-step-150, #e2e4e8);
+  border: 1px solid var(--jo-border, #262b33);
   border-radius: 10px;
-  background: var(--ion-color-step-50, #f7f8fa);
+  background: var(--jo-bg-elevated, #14171c);
 
   .toc-title {
     font-size: 12px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--ion-color-medium, #6b7280);
+    color: var(--jo-fg-muted, #8a92a0);
     margin-right: 4px;
   }
 
   a {
     font-size: 13px;
-    color: var(--ion-color-primary, #5260ff);
+    color: var(--jo-accent, #5096ff);
     cursor: pointer;
     padding: 2px 6px;
     border-radius: 6px;
 
     &:hover {
-      background: var(--ion-color-step-100, #eceef2);
+      background: var(--jo-bg-hover, #232830);
       text-decoration: underline;
     }
   }
@@ -66,19 +73,26 @@
 h2 {
   margin-top: 40px;
   padding-top: 14px;
-  border-top: 1px solid var(--ion-color-step-150, #e2e4e8);
+  border-top: 1px solid var(--jo-border, #262b33);
   font-size: 22px;
+  color: var(--jo-fg-strong, #e7eaee);
   scroll-margin-top: 12px;
 }
 
 h3 {
   margin-top: 26px;
   font-size: 17px;
+  color: var(--jo-fg-strong, #e7eaee);
   scroll-margin-top: 12px;
 }
 
+p,
+li {
+  color: var(--jo-fg, #c5cbd3);
+}
+
 a {
-  color: var(--ion-color-primary, #5260ff);
+  color: var(--jo-accent, #5096ff);
   text-decoration: none;
 
   &:hover {
@@ -87,7 +101,8 @@ a {
 }
 
 code {
-  background: var(--ion-color-step-100, #eceef2);
+  background: var(--jo-bg-raised, #1a1d23);
+  color: var(--jo-fg-strong, #e7eaee);
   padding: 1px 6px;
   border-radius: 4px;
   font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -95,17 +110,19 @@ code {
 }
 
 pre {
-  background: var(--ion-color-step-50, #f7f8fa);
-  border: 1px solid var(--ion-color-step-150, #e2e4e8);
+  background: var(--jo-bg-elevated, #14171c);
+  border: 1px solid var(--jo-border, #262b33);
   border-radius: 8px;
   padding: 14px 16px;
   overflow: auto;
   font-size: 13px;
   line-height: 1.5;
+  color: var(--jo-fg-strong, #e7eaee);
 
   code {
     background: none;
     padding: 0;
+    color: inherit;
   }
 }
 
@@ -117,15 +134,17 @@ table {
 
 th,
 td {
-  border: 1px solid var(--ion-color-step-150, #e2e4e8);
+  border: 1px solid var(--jo-border, #262b33);
   padding: 8px 10px;
   text-align: left;
   font-size: 14px;
   vertical-align: top;
+  color: var(--jo-fg, #c5cbd3);
 }
 
 th {
-  background: var(--ion-color-step-50, #f7f8fa);
+  background: var(--jo-bg-elevated, #14171c);
+  color: var(--jo-fg-strong, #e7eaee);
 }
 
 .pill {
@@ -136,35 +155,36 @@ th {
   font-weight: 600;
 
   &.post {
-    background: rgba(82, 96, 255, 0.16);
-    color: var(--ion-color-primary, #5260ff);
+    background: rgba(80, 150, 255, 0.18);
+    color: var(--jo-accent, #5096ff);
   }
 
   &.ws {
-    background: rgba(224, 168, 0, 0.18);
-    color: #9a7400;
+    background: rgba(255, 180, 84, 0.18);
+    color: var(--jo-warn, #ffb454);
   }
 }
 
 .note {
-  background: var(--ion-color-step-50, #f7f8fa);
-  border-left: 3px solid var(--ion-color-primary, #5260ff);
+  background: var(--jo-bg-elevated, #14171c);
+  border-left: 3px solid var(--jo-accent, #5096ff);
   padding: 10px 14px;
   border-radius: 6px;
   margin: 14px 0;
+  color: var(--jo-fg, #c5cbd3);
 
   &.warn {
-    border-left-color: #e0a800;
+    border-left-color: var(--jo-warn, #ffb454);
   }
 }
 
 .muted {
-  color: var(--ion-color-medium, #6b7280);
+  color: var(--jo-fg-muted, #8a92a0);
 }
 
 .footer {
   margin-top: 40px;
-  border-top: 1px solid var(--ion-color-step-150, #e2e4e8);
+  border-top: 1px solid var(--jo-border, #262b33);
   padding-top: 16px;
   font-size: 13px;
 }
