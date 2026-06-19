@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>JohnnyOne Partner API — Integration Guide</title>
+<meta name="description" content="Integrate with JohnnyOne programmatically: GraphQL for session & plan lifecycle, authenticated WebSocket for live terminal I/O." />
+<style>
+  :root{--bg:#0e1116;--panel:#161b22;--border:#2b3340;--fg:#e6edf3;--muted:#9aa7b4;--accent:#5260ff;--green:#2dd36f;--code:#0b0e13;--amber:#e0a800}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  a{color:#8aa0ff;text-decoration:none}a:hover{text-decoration:underline}
+  .wrap{display:flex;max-width:1100px;margin:0 auto;min-height:100vh}
+  nav{position:sticky;top:0;align-self:flex-start;width:220px;padding:24px 16px;height:100vh;overflow:auto;border-right:1px solid var(--border)}
+  nav h1{font-size:15px;margin:0 0 4px}nav .tag{color:var(--muted);font-size:12px;margin-bottom:16px}
+  nav a{display:block;color:var(--muted);padding:5px 8px;border-radius:6px;font-size:14px}
+  nav a:hover{background:var(--panel);color:var(--fg);text-decoration:none}
+  main{flex:1;padding:32px 40px;max-width:860px}
+  h2{margin-top:40px;padding-top:12px;border-top:1px solid var(--border);font-size:22px}
+  h3{margin-top:28px;font-size:17px;color:#cdd9e5}
+  code{background:var(--code);padding:1px 6px;border-radius:4px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow:auto;font-size:13px;line-height:1.5}
+  pre code{background:none;padding:0}
+  table{border-collapse:collapse;width:100%;margin:14px 0}
+  th,td{border:1px solid var(--border);padding:8px 10px;text-align:left;font-size:14px;vertical-align:top}
+  th{background:var(--panel)}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600}
+  .get{background:#143;color:var(--green)}.post{background:#234;color:#8aa0ff}.ws{background:#332;color:var(--amber)}
+  .note{background:var(--panel);border-left:3px solid var(--accent);padding:10px 14px;border-radius:6px;margin:14px 0}
+  .warn{border-left-color:var(--amber)}
+  .muted{color:var(--muted)}
+  header.hero{padding:8px 0 4px}
+  header.hero p{color:var(--muted);font-size:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <h1>JohnnyOne Partner API</h1>
+  <div class="tag">Integration Guide</div>
+  <a href="#overview">Overview</a>
+  <a href="#auth">Authentication</a>
+  <a href="#graphql">GraphQL API</a>
+  <a href="#sessions">Terminal sessions</a>
+  <a href="#plans">Planner / development</a>
+  <a href="#wss">Live terminal (WebSocket)</a>
+  <a href="#apikeys">API keys (M2M, optional)</a>
+  <a href="#quickstart">Quickstart (Node.js)</a>
+  <a href="#errors">Errors &amp; limits</a>
+  <a href="#agents">For AI agents</a>
+</nav>
+<main>
+<header class="hero" id="overview">
+  <h1 style="font-size:30px;margin:0">JohnnyOne Partner API</h1>
+  <p>Drive JohnnyOne programmatically — no UI. Create and control AI/terminal sessions and planner/development runs, and stream live terminal output, over two authenticated transports.</p>
+</header>
+
+<div class="note">Base URLs use the real worker domain <code>johnnyone-dev.ethan-353.workers.dev</code> (dev for live validation; prod uses non-dev). All traffic is over TLS. For prod use the corresponding non-dev domain.</div>
+
+<h3>Two transports</h3>
+<table>
+  <tr><th>Transport</th><th>Use it for</th><th>Auth</th></tr>
+  <tr><td><span class="pill post">GraphQL</span> <code>https://johnnyone-dev.ethan-353.workers.dev/graphql</code></td><td>Login, session lifecycle CRUD, planner/development lifecycle CRUD, listing nodes &amp; tools.</td><td><code>Authorization: Bearer &lt;accessToken&gt;</code></td></tr>
+  <tr><td><span class="pill ws">WebSocket</span> <code>wss://johnnyone-dev.ethan-353.workers.dev/api/relay/ws</code></td><td>Live terminal I/O — subscribe to screen updates, send input, resize, kill.</td><td><code>Authorization: Bearer &lt;accessToken&gt;</code> on upgrade, or <code>?token=&lt;accessToken&gt;</code></td></tr>
+</table>
+<p class="muted">Your account is a dedicated service account (one tenant + user). JohnnyOne hosts the desktop runtime for you — you never install anything. The server resolves your desktop node from your token; you never supply a node id.</p>
+
+<h2 id="auth">Authentication</h2>
+<p>Log in once to get a short-lived <code>accessToken</code> (JWT) and a longer-lived <code>refreshToken</code>. Send the access token on every GraphQL request and on the WebSocket upgrade.</p>
+<pre><code>curl -s https://johnnyone-dev.ethan-353.workers.dev/graphql \
+  -H 'content-type: application/json' \
+  -H 'x-tenant-id: your-tenant' \
+  -d '{"query":"mutation($i:LoginInput!){login(input:$i){accessToken refreshToken}}",
+       "variables":{"i":{"email":"you@partner.com","password":"…","tenantId":"your-tenant"}}}'</code></pre>
+<p>Use the token as a Bearer header on GraphQL:</p>
+<pre><code>Authorization: Bearer &lt;accessToken&gt;</code></pre>
+<div class="note warn"><strong>Token lifetime.</strong> Access tokens are short-lived. When one expires, call <code>refreshToken(input: RefreshTokenInput!): AuthPayload</code> to get a new pair (returns <code>{ accessToken refreshToken ... }</code>). A WebSocket authenticates <em>once</em> at upgrade — if the token expires mid-connection, reconnect with a fresh token (see <a href="#errors">Errors &amp; limits</a>).</div>
+<div class="note warn"><strong><code>?token=</code> fallback.</strong> Browser WebSocket clients can't set headers, so the token may be passed as a query param. Only over TLS, only with a short-lived access token, and don't log or persist the URL.</div>
+
+<h2 id="graphql">GraphQL API</h2>
+<p>Endpoint: <code>POST https://johnnyone-dev.ethan-353.workers.dev/graphql</code>. The schema is introspectable — point a GraphQL client at it to discover every type and argument. The partner-usable operations are below.</p>
+
+<h3 id="sessions">Terminal / AI sessions</h3>
+<table>
+  <tr><th>Operation</th><th>Signature</th></tr>
+  <tr><td>Create</td><td><code>createAiSession(input: CreateAiSessionInput!): AiSession!</code></td></tr>
+  <tr><td>List</td><td><code>listAiSessions(status: String): [AiSession!]!</code></td></tr>
+  <tr><td>Get</td><td><code>getAiSession(id: ID!): AiSession</code></td></tr>
+  <tr><td>Rename</td><td><code>updateAiSessionTitle(id: ID!, title: String!): AiSession!</code></td></tr>
+  <tr><td>Set working dir</td><td><code>updateAiSessionWorkingDirectory(id: ID!, workingDirectory: String!): AiSession!</code></td></tr>
+  <tr><td>Set provider</td><td><code>updateAiSessionProvider(id: ID!, provider: String!): AiSession!</code></td></tr>
+  <tr><td>Archive</td><td><code>updateAiSessionArchived(id: ID!): AiSession!</code></td></tr>
+  <tr><td>Delete</td><td><code>deleteAiSession(id: ID!): Boolean!</code></td></tr>
+  <tr><td>List messages</td><td><code>listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!</code></td></tr>
+</table>
+<p><code>CreateAiSessionInput</code>: <code>{ title?, provider?, model?, workingDirectory? }</code>. The returned <code>AiSession.id</code> is the <code>sessionId</code> you use on the WebSocket.</p>
+<p><code>listAiMessages</code> returns messages for a session (use with <code>listAiSessions</code> / <code>getAiSession</code>).</p>
+<pre><code>curl -s https://johnnyone-dev.ethan-353.workers.dev/graphql \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"query":"mutation($i:CreateAiSessionInput!){createAiSession(input:$i){id title provider workingDirectory}}",
+       "variables":{"i":{"provider":"claude_code","workingDirectory":"/home/you/project"}}}'</code></pre>
+
+<h3 id="plans">Planner / development runs</h3>
+<table>
+  <tr><th>Operation</th><th>Signature</th></tr>
+  <tr><td>Create</td><td><code>createAgentPlan(input: CreateAgentPlanInput!): AgentPlanRun!</code></td></tr>
+  <tr><td>Start</td><td><code>startAgentPlan(id: ID!, phaseId: String, phaseRunMode: String): AgentPlanRun!</code></td></tr>
+  <tr><td>List</td><td><code>listAgentPlans(status: String, runType: String, onlyExisting: Boolean): [AgentPlan!]!</code></td></tr>
+  <tr><td>Get (with phases/tasks/events)</td><td><code>getAgentPlan(id: ID!): AgentPlanRun!</code></td></tr>
+  <tr><td>Rename</td><td><code>updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!</code></td></tr>
+  <tr><td>Amend</td><td><code>updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!</code></td></tr>
+  <tr><td>Stop</td><td><code>updateAgentPlanStopped(id: ID!): AgentPlanRun!</code></td></tr>
+  <tr><td>App scope</td><td><code>updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!</code></td></tr>
+  <tr><td>Block</td><td><code>updateAgentPlanBlocked(id: ID!, reason: String!): AgentPlanRun!</code></td></tr>
+  <tr><td>Delete</td><td><code>deleteAgentPlan(id: ID!): Boolean!</code></td></tr>
+</table>
+<p><code>CreateAgentPlanInput</code>: <code>{ runType?, title?, workspacePath!, planPath!, workerProvider!, reviewerProvider!, brief?, appScope?, docsScope?, referencePaths? }</code>. <code>getAgentPlan</code> returns an <code>AgentPlanRun</code> with <code>plan</code>, <code>phases</code>, <code>tasks</code>, and <code>events</code> — poll it (or watch <code>agent_plan_run_updated</code> on the WebSocket) to track progress.</p>
+
+<h3>Discovery helpers</h3>
+<p><code>listDesktopNodes</code> (your online desktop node) · <code>listDetectedCliTools</code> (available providers/CLIs on your host).</p>
+
+<h3 id="apikeys">API keys (M2M, optional)</h3>
+<p>JWT is primary. For long-lived server tokens use M2M API keys (created with a service-account JWT):</p>
+<table>
+  <tr><th>Operation</th><th>Signature</th></tr>
+  <tr><td>Create (returns secret once)</td><td><code>createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!</code></td></tr>
+  <tr><td>List</td><td><code>listApiKeys: [ApiKey!]!</code></td></tr>
+  <tr><td>Revoke</td><td><code>revokeApiKey(id: ID!): ApiKey!</code></td></tr>
+</table>
+<p><code>CreateApiKeyInput</code>: <code>{ name: String!, scopes: [String!]!, expiresAt?: String }</code>. Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>, <code>plans:read|write</code>. <code>CreateApiKeyResult</code> has <code>apiKey</code> (metadata only; never the secret again) + <code>secret</code> (the <code>jk_...</code> value, one-time). Use the secret as Bearer token (or <code>?token=</code>) on GraphQL/WSS exactly like a JWT.</p>
+<p>Keys are optional convenience; JWT always works for the account.</p>
+
+<h2 id="wss">Live terminal (WebSocket)</h2>
+<p>Connect to <code>wss://johnnyone-dev.ethan-353.workers.dev/api/relay/ws</code> with your token. The server validates the token, resolves your desktop node, and routes the socket. Messages are JSON <strong>envelopes</strong>:</p>
+<pre><code>{ "type": "&lt;envelope type&gt;", "sessionId": "&lt;AiSession.id&gt;", "data": &lt;payload&gt; }</code></pre>
+
+<h3>Client → server</h3>
+<table>
+  <tr><th>type</th><th>Payload</th><th>Meaning</th></tr>
+  <tr><td><code>terminal_visual_subscribe</code></td><td><code>{ sessionId }</code></td><td>Start receiving <code>terminal_screen</code> updates for the session.</td></tr>
+  <tr><td><code>terminal_command</code></td><td><code>{ sessionId, data: "&lt;input&gt;" }</code></td><td>Send keystrokes / input to the terminal.</td></tr>
+  <tr><td><code>terminal_resize</code></td><td><code>{ sessionId, data: { cols, rows } }</code></td><td>Resize the terminal.</td></tr>
+  <tr><td><code>terminal_visual_unsubscribe</code></td><td><code>{ sessionId }</code></td><td>Stop receiving updates.</td></tr>
+  <tr><td><code>terminal_kill</code></td><td><code>{ sessionId }</code></td><td>Terminate the terminal session.</td></tr>
+</table>
+
+<h3>Server → client</h3>
+<table>
+  <tr><th>type</th><th>Payload</th><th>Meaning</th></tr>
+  <tr><td><code>terminal_screen</code></td><td><code>{ sessionId, data: &lt;screen&gt; }</code></td><td>Current terminal screen contents (rendered output). Sent on subscribe and on change.</td></tr>
+  <tr><td><code>terminal_command_ack</code></td><td><code>{ sessionId, error? }</code></td><td>Input was accepted (or error e.g. 'forbidden_session').</td></tr>
+  <tr><td><code>session_deleted</code> / <code>session_updated</code></td><td><code>{ sessionId }</code></td><td>Session lifecycle change.</td></tr>
+  <tr><td><code>agent_plan_run_updated</code></td><td><code>{ data }</code></td><td>A plan run advanced (phase/status change) — handy for live plan progress.</td></tr>
+</table>
+<div class="note"><strong>Ownership.</strong> You may only act on sessions your account owns; an envelope referencing another account's <code>sessionId</code> is rejected. You never send a node id — the server derives your node from the token.</div>
+
+<h2 id="quickstart">Quickstart (Node.js)</h2>
+<p>Login → create a session → stream its terminal → send a command. Requires <code>ws</code> (and Node 18+ for <code>fetch</code>).</p>
+<pre><code>import WebSocket from 'ws';
+const BASE = 'https://johnnyone-dev.ethan-353.workers.dev';
+const gql = (q, variables, token) => fetch(BASE + '/graphql', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', ...(token && { authorization: `Bearer ${token}` }) },
+  body: JSON.stringify({ query: q, variables }),
+}).then(r => r.json());
+
+// 1. Login
+const { data: { login } } = await gql(
+  'mutation($i:LoginInput!){login(input:$i){accessToken refreshToken}}',
+  { i: { email: 'you@partner.com', password: process.env.PW, tenantId: 'your-tenant' } });
+const token = login.accessToken;
+
+// 2. Create a session
+const { data: { createAiSession: s } } = await gql(
+  'mutation($i:CreateAiSessionInput!){createAiSession(input:$i){id}}',
+  { i: { provider: 'claude_code', workingDirectory: '/home/you/project' } }, token);
+
+// 3. Open the live terminal
+const ws = new WebSocket(`${BASE.replace('https','wss')}/api/relay/ws`, {
+  headers: { authorization: `Bearer ${token}` },   // or append ?token= in the URL
+});
+ws.on('open', () => {
+  ws.send(JSON.stringify({ type: 'terminal_visual_subscribe', sessionId: s.id }));
+  ws.send(JSON.stringify({ type: 'terminal_command', sessionId: s.id, data: 'echo hello\r' }));
+});
+ws.on('message', (buf) => {
+  const msg = JSON.parse(buf.toString());
+  if (msg.type === 'terminal_screen') console.log(msg.data);
+});</code></pre>
+<p class="muted">A Python equivalent uses <code>httpx</code>/<code>urllib</code> for GraphQL and <code>websockets</code> for the socket — same envelopes.</p>
+
+<h2 id="errors">Errors &amp; limits</h2>
+<ul>
+  <li><strong>WebSocket upgrade rejected</strong>: <code>401</code> = missing/invalid token; <code>503</code> = no online desktop node for your account. Retry after re-authenticating / once the host is online.</li>
+  <li><strong>GraphQL errors</strong> come back in the standard <code>errors[]</code> array (e.g. <code>Authentication required</code> for a missing/expired token).</li>
+  <li><strong>Foreign session</strong>: an envelope or query for a session you don't own is rejected with error code <code>forbidden_session</code>.</li>
+  <li><strong>Scope violation (API key)</strong>: when using a scoped <code>jk_*</code> key without the needed scope, WSS returns <code>FORBIDDEN_SCOPE</code> (with <code>scope</code>); GraphQL errors name the missing scope.</li>
+  <li><strong>Token expiry mid-socket</strong>: the socket authenticates once at upgrade. When the access token nears expiry, refresh it and reconnect; re-subscribe after reconnect. Build in reconnect-with-backoff.</li>
+</ul>
+
+<h2 id="versioning">Versioning &amp; forward-compat</h2>
+<p>The endpoint is unversioned and additive. Select only the fields you need; tolerate unknown enum values and extra response fields.</p>
+<p>For errors use the real signals: GraphQL <code>errors[].message</code> text, WSS upgrade HTTP status 401/503, and in <code>terminal_command_ack</code> the <code>.error</code> (<code>'forbidden_session'</code> or <code>'FORBIDDEN_SCOPE'</code>). <code>RATE_LIMITED</code> is reserved (not emitted in v1).</p>
+
+<h2 id="changelog">Changelog</h2>
+<ul>
+  <li><strong>2026-06-18 — v1 initial public surface</strong>: AI-session lifecycle + AgentPlan GraphQL CRUD; live terminal I/O over WSS relay envelopes; JWT + <code>?token=</code> auth; server-side node resolution; session ownership gate; minimal Node.js + Python example clients; public docs site on CF Pages at <code>https://johnnyone-partner-api.pages.dev</code>.</li>
+</ul>
+<p class="muted">Full policy: see the inlined summary above and the runbook (deployed alongside). All changes additive unless removal sweep with deprecation.</p>
+
+<h2 id="agents">For AI agents</h2>
+<ul>
+  <li><strong>GraphQL is introspectable</strong> — run a standard introspection query against <code>/graphql</code> to get the full typed schema; you don't need to hardcode the operations above.</li>
+  <li><strong>The WebSocket protocol is the only non-introspectable part</strong> — the envelope tables in <a href="#wss">Live terminal</a> are the complete contract.</li>
+  <li><strong>Start from the <a href="#quickstart">Quickstart</a></strong> — it's the full happy path (login → session → subscribe → command → read screen) in ~25 lines.</li>
+  <li><strong>Identity is server-resolved</strong> — authenticate with the token only; never send a node id.</li>
+</ul>
+
+<p class="muted" style="margin-top:40px;border-top:1px solid var(--border);padding-top:16px">JohnnyOne Partner API · integration guide. Operations and envelopes reflect the live GraphQL schema (<code>worker/schema/*.graphql</code>) and relay protocol.</p>
+</main>
+</div>
+</body>
+</html>

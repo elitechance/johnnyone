@@ -172,13 +172,17 @@ chat_host.rs`, `agent/mod.rs` (reject or implement), and the frontend dropdowns
 
 ## Terminal attach path (debugging "stuck attaching")
 
-The terminal does NOT use the GraphQL relay-RPC path. The browser opens a
-**separate** WebSocket to the worker (`/api/relay/ws?...&clientType=mobile`);
-the worker's `ChatRelayDO` forwards `terminal_command`/`visual_subscribe` to the
-desktop (`clientType=desktop`) and streams `terminal_screen` frames back. Both
-sides pair by `idFromName(nodeId)`, so they must agree on the same online node.
-The desktop logs `terminal_command received from relay` and
-`terminal_command failed error=…` (in `agent/mod.rs`) to localize failures.
+The terminal does NOT use the GraphQL relay-RPC path. The browser (and
+partner clients) opens a **separate** WebSocket to the worker
+(`/api/relay/ws?clientType=mobile`). The JWT (or `?token=` fallback) is sent on
+upgrade; the worker validates it, resolves the caller's `desktop_node`
+**server-side** from the token (tenant+user), never from a client-supplied
+`nodeId`, and routes to the matching `ChatRelayDO`. A session-ownership gate
+rejects foreign `sessionId` (returns `forbidden_session` ack). The DO forwards
+`terminal_*` envelopes to the desktop (`clientType=desktop`) and streams
+`terminal_screen` frames back. Desktop logs `terminal_command received from
+relay` and `terminal_command failed error=…` (in `agent/mod.rs`) to localize
+failures. (See also `docs/api-partner/` for the partner WSS contract.)
 
 ## Deploying — use the `lokal` CLI
 

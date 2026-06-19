@@ -71,7 +71,7 @@ The WSS clientType for partners is `api` (or `mobile` for compat); the desktop m
 
 The partner's primary credential is a JWT obtained by calling the builtin auth `login` mutation (after the user has a password set at creation time via adminCreateUser or equivalent) against their `tenant_id` + `user_id`.
 
-- Optional: once Phase 05 ships, also issue a scoped `jk_` API key via `createApiKey` (JWT-only management path).
+- Optional M2M: issue a scoped `jk_*` API key via `createApiKey` (JWT-only; scopes e.g. `terminal:read`, `plans:write`); the secret is returned once and used as the token on GraphQL/WSS.
 - **Credentials are generated and delivered through secret storage / out-of-band channel only.**
 - **Literal token values, refresh tokens, or `JWT_SECRET` are never written into this runbook, the plan, or any committed file.**
 

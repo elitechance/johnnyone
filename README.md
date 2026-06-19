@@ -389,6 +389,7 @@ mutation/query that needs host data is routed via `relayRpc` /
 
 Schema files:
 - [`worker/schema/johnnyone-ai.graphql`](worker/schema/johnnyone-ai.graphql)
+- [`worker/schema/johnnyone-api-keys.graphql`](worker/schema/johnnyone-api-keys.graphql)
 - [`worker/schema/johnnyone-channels.graphql`](worker/schema/johnnyone-channels.graphql)
 
 ## Documentation
@@ -435,6 +436,13 @@ plan, so a fresh session can know what's already live.
   `<ion-modal>` + `<ion-segment>` + `<ion-list>` + `<ion-input>` /
   `<ion-textarea>` per `common/conventions/ui.md`. The legacy
   `.modal-backdrop` + `.setup-modal` markup is gone.
+- **Partner / third-party API ("J1 API") (2026-06)** — Authenticated
+  GraphQL + WSS (`/api/relay/ws`) for external partners (hosted service
+  account). JWT (or `?token=`) on WSS upgrade + server-side node
+  resolution from token (never client `nodeId`); session-ownership gate
+  (`forbidden_session`); optional scoped M2M API keys (`jk_*`,
+  `createApiKey` etc.); public docs site + examples. See
+  `docs/api-partner/`.
 - **Mobile-friendly navigation (2026-05-25)** — `<ion-split-pane>` left
   menu collapses to a swipe drawer below 768px. Hamburger menu button +
   page title chip (TERMINAL / PLANNING / DEVELOPMENT) in each page's
@@ -458,6 +466,7 @@ plan, so a fresh session can know what's already live.
 | Planner / Development modes restored from attic | Done (2026-05-23) |
 | Per-plan git history + amend workflow | Done (2026-05-25) |
 | Ionic-native modals + mobile responsive nav + mermaid zoom | Done (2026-05-25) |
+| Partner / third-party API (J1: authenticated GraphQL + WSS) | Done (2026-06) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 
