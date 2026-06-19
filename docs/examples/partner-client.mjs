@@ -117,9 +117,9 @@ const gql = async (query, variables, token, tenantId) => {
         if (visibleDelta && (hasCommandText || newContent.length > firstContent.length + 2)) {
           console.error('SUCCESS: updated screen differs from first with visible command/output (input round-trip observed)');
         } else if (visibleDelta) {
-          console.error('SUCCESS: updated screen differs (cursor/metadata only)');
+          console.error('INFO: updated screen differs (cursor/metadata only)');
         } else {
-          console.error('SUCCESS: received screen after command (input accepted)');
+          console.error('INFO: received screen after command (input accepted)');
         }
         process.exit(0);
       }
