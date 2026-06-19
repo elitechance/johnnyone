@@ -80,6 +80,8 @@ const gql = async (query, variables, token, tenantId) => {
   const timeout = setTimeout(() => { console.error('timeout'); ws.close(); process.exit(1); }, 15000);
 
   let firstScreen = null;
+  let lastScreen = null;
+  let cmdSentAt = 0;
   ws.on('open', () => {
     // subscribe for future screens (use data.control)
     ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'sub-' + Date.now(), sessionId, data: '', control: 'visual_subscribe' } }));
@@ -91,18 +93,31 @@ const gql = async (query, variables, token, tenantId) => {
     const msg = JSON.parse(buf.toString());
     if (msg.type === 'terminal_screen') {
       console.log('SCREEN:', JSON.stringify(msg.data));
+      lastScreen = msg.data;
       if (!firstScreen) {
         firstScreen = msg.data;
         console.error('received first screen');
         // now send command to prove updated screen
+        cmdSentAt = Date.now();
         ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'cmd-' + Date.now(), sessionId, data: 'echo partner-demo\r' } }));
-      } else {
-        // updated screen after command
+        // schedule a delayed visual_refresh to pull a post-render screen (capture loop is ~2s active + render)
+        setTimeout(() => {
+          ws.send(JSON.stringify({ type: 'terminal_command', data: { requestId: 'ref-post-' + Date.now(), sessionId, data: '', control: 'visual_refresh' } }));
+          console.error('sent post-command visual_refresh to force current rendered screen');
+        }, 2200);
+      } else if (cmdSentAt > 0 && (Date.now() - cmdSentAt > 1500)) {
+        // updated screen after command + delay for output
         clearTimeout(timeout);
         ws.close();
         console.error('received updated screen after command');
-        if (JSON.stringify(msg.data) !== JSON.stringify(firstScreen)) {
-          console.error('SUCCESS: updated screen differs from first (input round-trip observed)');
+        const firstContent = (firstScreen.content || '').replace(/\n/g, '');
+        const newContent = (msg.data.content || '').replace(/\n/g, '');
+        const visibleDelta = newContent !== firstContent;
+        const hasCommandText = (msg.data.content || '').includes('partner-demo') || (msg.data.content || '').includes('echo partner-demo');
+        if (visibleDelta && (hasCommandText || newContent.length > firstContent.length + 2)) {
+          console.error('SUCCESS: updated screen differs from first with visible command/output (input round-trip observed)');
+        } else if (visibleDelta) {
+          console.error('SUCCESS: updated screen differs (cursor/metadata only)');
         } else {
           console.error('SUCCESS: received screen after command (input accepted)');
         }
