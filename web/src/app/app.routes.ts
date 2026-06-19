@@ -12,6 +12,13 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/login/login.page').then((m) => m.LoginPage),
   },
+  // Public partner / third-party API integration guide. No authGuard — this is
+  // the in-app replacement for the old johnnyone-partner-api.pages.dev site.
+  {
+    path: 'integration',
+    loadComponent: () =>
+      import('./pages/integration/integration.page').then((m) => m.IntegrationPage),
+  },
   {
     path: 'terminal',
     canActivate: [authGuard],

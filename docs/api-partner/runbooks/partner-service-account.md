@@ -89,7 +89,7 @@ The partner **only ever hits the deployed worker**. Never `lokal sim` for produc
 - Worker base: `https://johnnyone-dev.ethan-353.workers.dev` (dev for live validation; prod uses non-dev).
 - GraphQL: `POST /graphql` with `Authorization: Bearer <jwt>` (and `x-tenant-id` if required by the flow).
 - Live terminal: WSS `wss://.../api/relay/ws` with `Authorization: Bearer <jwt>` on upgrade (or `?token=<jwt>` fallback for clients that cannot set headers). Use `clientType=api` or omit.
-- Public self-serve entry point: the **partner-docs-site URL** deployed in Phase 04 Task 06: https://johnnyone-partner-api.pages.dev (content points to johnnyone.ethan-353.workers.dev ; for dev live validation use https://johnnyone-dev.ethan-353.workers.dev ). The site contains the integration guide, example clients, and the reconciled GraphQL/WSS surface.
+- Public self-serve entry point: the **in-app integration guide** at the public `/integration` route — https://johnnyone.pages.dev/integration (for dev live validation use the dev Pages deployment's `/integration`). It contains the integration guide, example clients, and the reconciled GraphQL/WSS surface, and resolves its example base URLs from the env that serves it. (Replaces the retired standalone johnnyone-partner-api.pages.dev site.)
 
 Give the partner exactly these two URLs + their credential.
 
@@ -116,7 +116,7 @@ Blast-radius note: one identity per partner means revoking or tearing down one p
 - [ ] Tenant + user rows present in target env D1.
 - [ ] Hosted desktop running and `status='online'` for the partner's tenant+user.
 - [ ] Credential(s) delivered out-of-band only (JWT + optional key).
-- [ ] Partner has: base URL (https://johnnyone-dev.ethan-353.workers.dev for this live), `/graphql`, WSS endpoint, **https://johnnyone-partner-api.pages.dev**, and credential.
+- [ ] Partner has: base URL (https://johnnyone-dev.ethan-353.workers.dev for this live), `/graphql`, WSS endpoint, **https://johnnyone.pages.dev/integration**, and credential.
 - [ ] Rotation/teardown steps tested for this identity.
 - [ ] All commands used `lokal ... --env <env>` (no bare wrangler/raw-D1).
 

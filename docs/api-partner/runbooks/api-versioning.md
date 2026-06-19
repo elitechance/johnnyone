@@ -59,9 +59,9 @@ breakage is invisible to our build, so the human window in step 2 is mandatory.
   names the replacement and the earliest removal phase, e.g.
   `@deprecated(reason: "Use refreshToken(input: RefreshTokenInput!); the old refresh(refreshToken: String!) removed no earlier than Phase 06")`.
 - Deprecated fields keep working for the entire window — deprecation is a *label*, not a behavior change.
-- The partner docs site (`docs/api-partner/index.html`, reconciled in Phase 04 Task 01, deployed in
-  Task 06) renders deprecated fields with a visible "Deprecated" marker and the migration target, so a
-  developer reading the docs sees it without introspecting the schema.
+- The integration guide (the in-app `/integration` page, `web/src/app/pages/integration/`; design copy
+  in `docs/api-partner/index.html`) renders deprecated fields with a visible "Deprecated" marker and the
+  migration target, so a developer reading the docs sees it without introspecting the schema.
 
 ## 5. Guidance we publish to consumers (so additive stays safe)
 
@@ -77,9 +77,10 @@ Third parties are told, on the partner docs site, to build forward-compatibly:
 
 ## 6. How third parties are notified
 
-1. **Docs site changelog** — the published partner docs site (`docs/api-partner/index.html`; Phase 04
-   Task 01 content, Task 06 deploy) carries a dated changelog section; additive changes and new
-   deprecations are appended there at ship time, then redeployed (`lokal cf pages deploy`).
+1. **Guide changelog** — the in-app integration guide (`/integration`,
+   `web/src/app/pages/integration/`; design copy `docs/api-partner/index.html`) carries a dated
+   changelog section; additive changes and new deprecations are appended there at ship time, then
+   shipped with the web app (`npm run deploy:web`).
 2. **`@deprecated` reason in the schema** — visible via introspection and rendered on the docs site,
    stating the replacement and the earliest removal phase.
 3. **Deprecation window before any removal** — a removal (step 3 of §3) is announced when its
@@ -92,6 +93,6 @@ Third parties are told, on the partner docs site, to build forward-compatibly:
       of a removal sweep (§3), never both at once.
 - [ ] Removed/renamed fields were `@deprecated` with a reason for a full window first (§4).
 - [ ] `lokal cf worker validate` passes (schema ↔ resolver parity).
-- [ ] Partner docs site (`docs/api-partner/index.html`; Phase 04 Task 01) + changelog updated and
-      redeployed (Task 06); deprecated fields marked.
+- [ ] Integration guide (`/integration` page + `docs/api-partner/index.html` design copy) + changelog
+      updated and shipped (`npm run deploy:web`); deprecated fields marked.
 - [ ] No new `/vN` path was introduced.

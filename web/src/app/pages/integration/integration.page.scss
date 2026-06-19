@@ -1,0 +1,170 @@
+// Native-themed port of the partner API integration guide
+// (was the standalone johnnyone-partner-api.pages.dev site).
+// Styles are component-scoped (Angular emulated encapsulation), so the bare
+// element selectors below won't leak to the rest of the app.
+
+.integration-content {
+  --background: var(--ion-background-color, #fff);
+}
+
+.doc {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ion-text-color, #1a1a1a);
+}
+
+.hero {
+  h1 {
+    font-size: 30px;
+    margin: 0 0 8px;
+  }
+
+  .lede {
+    color: var(--ion-color-medium, #6b7280);
+    font-size: 16px;
+    margin: 0;
+  }
+}
+
+.toc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  margin: 20px 0 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--ion-color-step-150, #e2e4e8);
+  border-radius: 10px;
+  background: var(--ion-color-step-50, #f7f8fa);
+
+  .toc-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ion-color-medium, #6b7280);
+    margin-right: 4px;
+  }
+
+  a {
+    font-size: 13px;
+    color: var(--ion-color-primary, #5260ff);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 6px;
+
+    &:hover {
+      background: var(--ion-color-step-100, #eceef2);
+      text-decoration: underline;
+    }
+  }
+}
+
+h2 {
+  margin-top: 40px;
+  padding-top: 14px;
+  border-top: 1px solid var(--ion-color-step-150, #e2e4e8);
+  font-size: 22px;
+  scroll-margin-top: 12px;
+}
+
+h3 {
+  margin-top: 26px;
+  font-size: 17px;
+  scroll-margin-top: 12px;
+}
+
+a {
+  color: var(--ion-color-primary, #5260ff);
+  text-decoration: none;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+code {
+  background: var(--ion-color-step-100, #eceef2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+pre {
+  background: var(--ion-color-step-50, #f7f8fa);
+  border: 1px solid var(--ion-color-step-150, #e2e4e8);
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.5;
+
+  code {
+    background: none;
+    padding: 0;
+  }
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 14px 0;
+}
+
+th,
+td {
+  border: 1px solid var(--ion-color-step-150, #e2e4e8);
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 14px;
+  vertical-align: top;
+}
+
+th {
+  background: var(--ion-color-step-50, #f7f8fa);
+}
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+
+  &.post {
+    background: rgba(82, 96, 255, 0.16);
+    color: var(--ion-color-primary, #5260ff);
+  }
+
+  &.ws {
+    background: rgba(224, 168, 0, 0.18);
+    color: #9a7400;
+  }
+}
+
+.note {
+  background: var(--ion-color-step-50, #f7f8fa);
+  border-left: 3px solid var(--ion-color-primary, #5260ff);
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin: 14px 0;
+
+  &.warn {
+    border-left-color: #e0a800;
+  }
+}
+
+.muted {
+  color: var(--ion-color-medium, #6b7280);
+}
+
+.footer {
+  margin-top: 40px;
+  border-top: 1px solid var(--ion-color-step-150, #e2e4e8);
+  padding-top: 16px;
+  font-size: 13px;
+}

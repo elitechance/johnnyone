@@ -373,7 +373,9 @@ Full list (JWT_SECRET trap, D1 migration idempotency, `nx` on PATH, lokal naming
 The worker exposes ~75 auto-wired resolvers grouped by capability. Every
 mutation/query that needs host data is routed via `relayRpc` /
 `desktopRpc` to the user's online desktop binary. The same surface (plus
-`/api/relay/ws`) is the public Partner API — see
+`/api/relay/ws`) is the public Partner API. The integration guide is
+served in-app at the public **`/integration`** route
+(https://johnnyone.pages.dev/integration); the design copy lives at
 [`docs/api-partner/index.html`](docs/api-partner/index.html).
 
 - **Auth** (lokal builtin) — `login`, `loginWithOauth`, `myCompleteFirstLogin`, `adminCreate{User,Tenant}`, `refreshToken`
@@ -399,8 +401,10 @@ Repo-local docs live alongside the code:
 - **`README.md`** (this file) — overview, structure, run + deploy commands,
   feature inventory, deploy gotchas
 - **`CHANGELOG.md`** — dated log of what shipped, in Keep-a-Changelog format
-- **`docs/api-partner/index.html`** — Partner/third-party API guide (auth,
-  GraphQL, live WSS terminal envelopes, examples, errors)
+- **`docs/api-partner/index.html`** — Partner/third-party API guide design copy
+  (auth, GraphQL, live WSS terminal envelopes, examples, errors). The live guide
+  is served in-app at the public `/integration` route
+  (`web/src/app/pages/integration/`); keep the two in sync.
 - **`docs/api-partner/runbooks/`** — API versioning and partner service-account
   provisioning runbooks
 
@@ -441,8 +445,8 @@ plan, so a fresh session can know what's already live.
   account). JWT (or `?token=`) on WSS upgrade + server-side node
   resolution from token (never client `nodeId`); session-ownership gate
   (`forbidden_session`); optional scoped M2M API keys (`jk_*`,
-  `createApiKey` etc.); public docs site + examples. See
-  `docs/api-partner/`.
+  `createApiKey` etc.); public in-app integration guide at `/integration`
+  + examples. See `docs/api-partner/`.
 - **Mobile-friendly navigation (2026-05-25)** — `<ion-split-pane>` left
   menu collapses to a swipe drawer below 768px. Hamburger menu button +
   page title chip (TERMINAL / PLANNING / DEVELOPMENT) in each page's
