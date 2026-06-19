@@ -980,6 +980,17 @@ export class JohnnyApiService {
       .pipe(map((data) => data.revokeApiKey));
   }
 
+  deleteApiKey(id: string): Observable<boolean> {
+    return this.gql
+      .mutate<{ deleteApiKey: boolean }>(
+        `mutation DeleteApiKey($id: ID!) {
+          deleteApiKey(id: $id)
+        }`,
+        { id }
+      )
+      .pipe(map((data) => data.deleteApiKey));
+  }
+
   private agentPlanMutation(
     field: 'startAgentPlan' | 'updateAgentPlanStopped' | 'sendAgentFeedbackToWorker' | 'retryAgentReviewer',
     variables: { id: string }

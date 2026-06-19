@@ -31,4 +31,6 @@ extend type Query {
 extend type Mutation {
   createApiKey(input: CreateApiKeyInput!): CreateApiKeyResult!
   revokeApiKey(id: ID!): ApiKey!
+  # Hard-remove from the management surface (sets is_deleted = 1). JWT-only.
+  deleteApiKey(id: ID!): Boolean!
 }

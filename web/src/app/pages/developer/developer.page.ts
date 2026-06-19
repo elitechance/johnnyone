@@ -1,6 +1,4 @@
-import { Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
-import { FormsModule } from '@angular/forms';
-import { Subscription, firstValueFrom } from 'rxjs';
+import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import {
   IonBadge,
   IonButton,
@@ -15,33 +13,18 @@ import {
   IonList,
   IonListHeader,
   IonNote,
-  IonSegment,
-  IonSegmentButton,
   IonSpinner,
   IonText,
   IonTitle,
   IonToolbar,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import {
-  copyOutline,
-  keyOutline,
-  refreshOutline,
-  trashOutline,
-} from 'ionicons/icons';
-import {
-  AiSession,
-  ApiKey,
-  JohnnyApiService,
-  TerminalScreen,
-  TerminalScreenComponent,
-} from '@johnnyone/ui';
+import { copyOutline, keyOutline, refreshOutline, trashOutline } from 'ionicons/icons';
+import { ApiKey, JohnnyApiService } from '@johnnyone/ui';
+import { firstValueFrom } from 'rxjs';
 import { AuthService } from '../../services/auth.service';
-import { RelayTerminalService } from '../../services/relay-terminal.service';
 
-type DevSegment = 'auth' | 'agents' | 'wss';
-
-/** The scopes a partner API key can carry (worker scopes.ts / runbook §M2M). */
+/** Scopes a partner API key can carry (worker scopes.ts / runbook §M2M). */
 const ALL_SCOPES = [
   'terminal:read',
   'terminal:write',
@@ -52,27 +35,27 @@ const ALL_SCOPES = [
 ];
 
 /**
- * Developer console — the in-app UI for driving the partner API surface:
- * Auth/OAuth (account + access token + M2M API keys), Agents (AI/terminal
- * session CRUD), and a Live Terminal (WSS) playground. Authenticated route
- * (/developer); reuses the shared JohnnyApiService + RelayTerminalService so it
- * exercises the exact same GraphQL/WSS contract documented at /integration.
+ * Developer console — in-app management for the partner API credentials:
+ * the account identity, the current access token, and full M2M API-key
+ * lifecycle (create with scopes/expiry, reveal-once secret, revoke, delete).
+ *
+ * Authenticated route (/developer). Session CRUD and the live WSS terminal were
+ * intentionally removed: the session list reflected DB records, not live tmux
+ * state, which was misleading. Sessions + WSS remain documented at /integration
+ * for API consumers.
  */
 @Component({
   selector: 'app-developer-page',
   standalone: true,
   imports: [
-    FormsModule,
     IonHeader,
     IonToolbar,
     IonTitle,
     IonContent,
-    IonSegment,
-    IonSegmentButton,
-    IonLabel,
     IonList,
     IonListHeader,
     IonItem,
+    IonLabel,
     IonInput,
     IonButton,
     IonIcon,
@@ -82,20 +65,18 @@ const ALL_SCOPES = [
     IonChip,
     IonCheckbox,
     IonSpinner,
-    TerminalScreenComponent,
   ],
   templateUrl: './developer.page.html',
   styleUrl: './developer.page.scss',
 })
-export class DeveloperPage implements OnInit, OnDestroy {
+export class DeveloperPage implements OnInit {
   private readonly api = inject(JohnnyApiService);
   private readonly auth = inject(AuthService);
-  private readonly relay = inject(RelayTerminalService);
 
-  protected readonly segment = signal<DevSegment>('auth');
   protected readonly allScopes = ALL_SCOPES;
+  protected readonly error = signal<string>('');
 
-  // ── Auth / OAuth ────────────────────────────────────────────────────────
+  // ── Account ──────────────────────────────────────────────────────────────
   protected readonly user = this.auth.currentUser;
   protected readonly tenantId = this.auth.getTenantId();
   protected readonly accessToken = signal<string>(this.auth.getAccessToken() ?? '');
@@ -104,6 +85,7 @@ export class DeveloperPage implements OnInit, OnDestroy {
     return t ? `${t.slice(0, 12)}…${t.slice(-6)}` : '(none)';
   });
 
+  // ── API keys ─────────────────────────────────────────────────────────────
   protected readonly apiKeys = signal<ApiKey[]>([]);
   protected readonly keysLoading = signal(false);
   protected readonly keyName = signal('');
@@ -114,26 +96,6 @@ export class DeveloperPage implements OnInit, OnDestroy {
   protected readonly creatingKey = signal(false);
   /** Full jk_… secret, held transiently and shown once after create (reveal-once). */
   protected readonly revealedSecret = signal<string | null>(null);
-
-  // ── Agents (AI / terminal sessions) ──────────────────────────────────────
-  protected readonly sessions = signal<AiSession[]>([]);
-  protected readonly sessionsLoading = signal(false);
-  protected readonly newProvider = signal('claude_code');
-  protected readonly newWorkingDir = signal('');
-  protected readonly newTitle = signal('');
-  protected readonly creatingSession = signal(false);
-
-  // ── Live terminal (WSS) ──────────────────────────────────────────────────
-  protected readonly wssSessionId = signal<string>('');
-  protected readonly wssConnected = signal(false);
-  protected readonly wssScreen = signal<TerminalScreen | null>(null);
-  protected readonly wssInput = signal('');
-  protected readonly wssLog = signal<string[]>([]);
-  private screenSub?: Subscription;
-  private sessionUpdateSub?: Subscription;
-  private sessionDeleteSub?: Subscription;
-
-  protected readonly error = signal<string>('');
 
   constructor() {
     addIcons({
@@ -146,50 +108,6 @@ export class DeveloperPage implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     void this.loadApiKeys();
-    void this.loadSessions();
-    // Live updates: open the relay socket once and reflect session
-    // create/update/delete + terminal screens in real time — no manual refresh.
-    this.screenSub = this.relay.screens().subscribe((screen) => {
-      if (screen.sessionId === this.wssSessionId()) {
-        this.wssScreen.set(screen);
-        this.appendLog(`terminal_screen (${screen.rows}×${screen.cols}, ${screen.status})`);
-      }
-    });
-    this.sessionUpdateSub = this.relay
-      .sessionUpdates()
-      .subscribe(({ session }) => this.upsertSession(session));
-    this.sessionDeleteSub = this.relay
-      .sessionDeletes()
-      .subscribe((id) => this.removeSession(id));
-    void this.relay.connect().catch(() => { /* errors surface in the WSS tab on demand */ });
-  }
-
-  ngOnDestroy(): void {
-    this.screenSub?.unsubscribe();
-    this.sessionUpdateSub?.unsubscribe();
-    this.sessionDeleteSub?.unsubscribe();
-    this.relay.disconnect();
-  }
-
-  private upsertSession(session: AiSession): void {
-    this.sessions.update((list) => {
-      const i = list.findIndex((s) => s.id === session.id);
-      if (i === -1) return [session, ...list];
-      const next = [...list];
-      next[i] = session;
-      return next;
-    });
-  }
-
-  private removeSession(id: string): void {
-    this.sessions.update((list) => list.filter((s) => s.id !== id));
-    if (this.wssSessionId() === id) this.disconnectWss();
-  }
-
-  protected setSegment(value: string | number | undefined): void {
-    if (value === 'auth' || value === 'agents' || value === 'wss') {
-      this.segment.set(value);
-    }
   }
 
   private fail(err: unknown): void {
@@ -203,8 +121,6 @@ export class DeveloperPage implements OnInit, OnDestroy {
       // clipboard may be unavailable (insecure context); ignore silently
     }
   }
-
-  // ── Auth / API keys ──────────────────────────────────────────────────────
 
   protected scopeChecked(scope: string): boolean {
     return this.selectedScopes().has(scope);
@@ -268,124 +184,14 @@ export class DeveloperPage implements OnInit, OnDestroy {
     }
   }
 
-  // ── Agents (sessions) ────────────────────────────────────────────────────
-
-  protected async loadSessions(): Promise<void> {
-    this.sessionsLoading.set(true);
+  protected async deleteKey(key: ApiKey): Promise<void> {
+    if (!confirm(`Delete API key "${key.name}"? This permanently removes it.`)) return;
     this.error.set('');
     try {
-      const list = await firstValueFrom(this.api.listSessions());
-      this.sessions.set([...list].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')));
-    } catch (err) {
-      this.fail(err);
-    } finally {
-      this.sessionsLoading.set(false);
-    }
-  }
-
-  protected async createSession(): Promise<void> {
-    if (this.creatingSession()) return;
-    const provider = this.newProvider().trim() || 'claude_code';
-    this.creatingSession.set(true);
-    this.error.set('');
-    try {
-      await firstValueFrom(
-        this.api.createSession({
-          provider,
-          title: this.newTitle().trim() || undefined,
-          workingDirectory: this.newWorkingDir().trim() || undefined,
-        }),
-      );
-      this.newTitle.set('');
-      this.newWorkingDir.set('');
-      await this.loadSessions();
-    } catch (err) {
-      this.fail(err);
-    } finally {
-      this.creatingSession.set(false);
-    }
-  }
-
-  protected async deleteSession(session: AiSession): Promise<void> {
-    this.error.set('');
-    try {
-      await firstValueFrom(this.api.deleteSession(session.id));
-      if (this.wssSessionId() === session.id) this.disconnectWss();
-      await this.loadSessions();
+      await firstValueFrom(this.api.deleteApiKey(key.id));
+      await this.loadApiKeys();
     } catch (err) {
       this.fail(err);
     }
-  }
-
-  protected async archiveSession(session: AiSession): Promise<void> {
-    this.error.set('');
-    try {
-      await firstValueFrom(this.api.archiveSession(session.id));
-      await this.loadSessions();
-    } catch (err) {
-      this.fail(err);
-    }
-  }
-
-  protected useInTerminal(session: AiSession): void {
-    this.wssSessionId.set(session.id);
-    this.segment.set('wss');
-  }
-
-  // ── Live terminal (WSS) ──────────────────────────────────────────────────
-
-  private appendLog(line: string): void {
-    this.wssLog.update((lines) => [...lines.slice(-40), line]);
-  }
-
-  protected async connectWss(): Promise<void> {
-    const sessionId = this.wssSessionId().trim();
-    if (!sessionId) return;
-    this.error.set('');
-    try {
-      this.appendLog(`connecting → ${sessionId}`);
-      await this.relay.connect();
-      await this.relay.subscribeVisual(sessionId);
-      await this.relay.refreshVisual(sessionId);
-      this.wssConnected.set(true);
-      this.appendLog('visual_subscribe + visual_refresh');
-    } catch (err) {
-      this.fail(err);
-      this.appendLog(`error: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  protected async refreshScreen(): Promise<void> {
-    const sessionId = this.wssSessionId().trim();
-    if (!sessionId || !this.wssConnected()) return;
-    try {
-      await this.relay.refreshVisual(sessionId);
-      this.appendLog('visual_refresh');
-    } catch (err) {
-      this.fail(err);
-    }
-  }
-
-  protected async sendWssInput(): Promise<void> {
-    const sessionId = this.wssSessionId().trim();
-    const data = this.wssInput();
-    if (!sessionId || !this.wssConnected() || !data) return;
-    try {
-      await this.relay.sendInput(sessionId, `${data}\r`);
-      this.appendLog(`sent: ${JSON.stringify(data)}\\r`);
-      this.wssInput.set('');
-    } catch (err) {
-      this.fail(err);
-    }
-  }
-
-  protected disconnectWss(): void {
-    // Stop watching this session's terminal, but keep the relay socket open so
-    // the live session list keeps receiving updates.
-    const sid = this.wssSessionId().trim();
-    if (sid) void this.relay.unsubscribeVisual(sid).catch(() => {});
-    this.wssConnected.set(false);
-    this.wssScreen.set(null);
-    this.appendLog('unsubscribed');
   }
 }
