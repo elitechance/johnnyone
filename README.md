@@ -127,6 +127,7 @@ Recent planner/runtime behavior worth knowing:
 - Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
 - Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
 - The shared terminal widget lives in `ui/src/components/terminal-screen/` and is used by the standalone Terminal page plus Planning/Development T1/T2. Terminal affordances such as upload image, mobile input helpers, mermaid detection, and history loading should be implemented there, not forked per page.
+- The Terminal page reconciles all persisted/cached state (pane layouts, `closedPaneIds`, screen cache) against the active session list on load, so a deleted/archived session can never pin a pane or hide a live session across a reload. See [`docs/terminal-state-reconcile.md`](docs/terminal-state-reconcile.md).
 - The planner event log is enriched by the desktop backend. Events now carry actor/category/summary/status transitions plus derived review reasons. For T2 `NEEDS_CHANGES` or `BLOCKED`, the backend parses `SUMMARY`, `FINDINGS`, and `NEXT_STEPS` from the reviewer footer and promotes the first concrete finding into the event `reason`.
 - T2 send-back events are intended to explain the pushback, not only the transport action. If the event log only says something like `sent back` without a concrete reason, that is considered drift from current behavior.
 
@@ -407,6 +408,8 @@ Repo-local docs live alongside the code:
   (`web/src/app/pages/integration/`); keep the two in sync.
 - **`docs/api-partner/runbooks/`** — API versioning and partner service-account
   provisioning runbooks
+- **`docs/terminal-state-reconcile.md`** — how the Terminal page prunes stale
+  persisted/cached session state on load
 
 ## Notable features shipped beyond the multi-user-saas plan
 

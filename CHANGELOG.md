@@ -51,6 +51,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ownership, and review-reason expectations in the event log.
 
 ### Fixed
+- **Terminal stale-session reconcile.** On Terminal load, all persisted/cached
+  state — pane layouts, `closedPaneIds`, and the screen cache — is now reconciled
+  against the authoritative active session list (`listAiSessions` status
+  `active`) and any entry whose session id is not active is dropped (and the
+  cleaned state written back), before layout restore or selection. A
+  deleted/archived session can no longer pin a pane, hold the screen cache, or
+  hide the user's real active session across a reload. New pure helpers in
+  `web/src/app/pages/terminal/terminal-state-reconcile.ts`,
+  `TerminalScreenCacheService.retainOnly`, and
+  `RelayTerminalService.retainCachedScreens`. See
+  [`docs/terminal-state-reconcile.md`](docs/terminal-state-reconcile.md).
 - **Directory picker no longer hardcodes a machine path.** `browse_host_directory`
   now resolves empty/`~`/`~/…` against the host home directory and falls back to
   home for any unresolved path, instead of erroring `Invalid parent path`. The
