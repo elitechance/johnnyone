@@ -188,11 +188,25 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     this.bindMobileOrPointerScrollHandlers();
 
     let resizeFitTimer: ReturnType<typeof setTimeout> | null = null;
+    // Track the host's last height so we can tell a real resize from a visibility
+    // flip. When the host goes 0 → sized — a hidden mobile panel is switched in
+    // (planner T1/T2 panels and the Terminal tab hide the inactive pane with
+    // `display:none`), or the flex/grid layout settles after first paint — the
+    // xterm buffer was written while the host had no rows, so a plain `fit()`
+    // leaves the panel blank. Force a full repaint in that case.
+    let lastObservedHeight = 0;
     this.resizeObserver = new ResizeObserver(() => {
       if (resizeFitTimer) clearTimeout(resizeFitTimer);
       resizeFitTimer = setTimeout(() => {
         resizeFitTimer = null;
-        this.fit();
+        const height = this.terminalHost.nativeElement.clientHeight;
+        const becameVisible = lastObservedHeight === 0 && height > 0;
+        lastObservedHeight = height;
+        if (becameVisible) {
+          this.forceRepaint();
+        } else {
+          this.fit();
+        }
       }, this.mobileInputMode ? 120 : 0);
     });
     this.resizeObserver.observe(this.terminalShell.nativeElement);
@@ -289,12 +303,27 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private refreshTerminalLayout(): void {
     if (!this.terminal) return;
     this.userPinnedToLatest = true;
-    this.lastWrittenClipped = '';
+    queueMicrotask(() => this.forceRepaint());
+  }
+
+  /**
+   * Force a full repaint of the current snapshot, bypassing the dedup caches.
+   *
+   * The render path skips repaints when the prepared content matches
+   * `lastRenderedPlain`/`lastContent` (so unchanged frames don't thrash xterm).
+   * But after the host gains real dimensions — a hidden mobile panel switched in,
+   * the layout settling post-paint, or the tab being re-shown — the buffer was
+   * written while the host was 0-sized yet the *content* is identical, so those
+   * guards would skip the repaint and leave the panel blank. Clearing the caches
+   * first guarantees the now-correctly-sized terminal repaints.
+   */
+  private forceRepaint(): void {
+    if (!this.terminal) return;
+    this.lastContent = '';
     this.lastRenderedPlain = '';
-    queueMicrotask(() => {
-      this.fit();
-      this.renderScreen(true);
-    });
+    this.lastWrittenClipped = '';
+    this.fit();
+    this.renderScreen(true);
   }
 
   ngOnDestroy(): void {

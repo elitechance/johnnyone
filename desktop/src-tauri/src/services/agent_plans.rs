@@ -170,6 +170,8 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
             working_directory: Some(parsed.workspace_path.to_string_lossy().to_string()),
             title: Some(format!("T1 Worker - {}", title)),
             kind: Some("agent".to_string()),
+            setup_commands: input.worker_setup_commands.clone(),
+            tmux_session_name: None,
         },
     )?;
     // No persistent T2 reviewer session: the 3-lens fan-out spawns ephemeral
@@ -177,8 +179,8 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope)
-             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9)",
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope, reviewer_setup_commands)
+             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9, ?10)",
             params![
                 plan_id,
                 title,
@@ -189,6 +191,7 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
                 input.reviewer_provider,
                 parsed.phases.first().map(|phase| phase.phase_id.as_str()),
                 app_scope,
+                input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
             ],
         )
         .map_err(|e| format!("Failed to create agent plan: {}", e))?;
@@ -294,6 +297,8 @@ fn create_planning_run(
             working_directory: Some(workspace.to_string_lossy().to_string()),
             title: Some(format!("T1 Planner - {}", title)),
             kind: Some("agent".to_string()),
+            setup_commands: input.worker_setup_commands.clone(),
+            tmux_session_name: None,
         },
     )?;
     // No persistent T2 reviewer session — the 3-lens fan-out spawns ephemeral
@@ -301,8 +306,8 @@ fn create_planning_run(
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11)",
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12)",
             params![
                 plan_id,
                 title,
@@ -315,6 +320,7 @@ fn create_planning_run(
                 app_scope,
                 docs_scope,
                 reference_paths,
+                input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
             ],
         )
         .map_err(|e| format!("Failed to create planning run: {}", e))
@@ -1506,6 +1512,24 @@ async fn spawn_ephemeral_agent(
     prompt_for: impl FnOnce(&str) -> String,
 ) -> Result<String, String> {
     let short = &plan_id[..plan_id.len().min(8)];
+    // For a shell reviewer, run the plan's reviewer setup commands in the pane.
+    let setup_commands = if provider == "shell" {
+        state
+            .db
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT reviewer_setup_commands FROM agent_plans WHERE id = ?1",
+                        params![plan_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten())
+            })
+            .unwrap_or(None)
+    } else {
+        None
+    };
     let session = sessions::create_session(
         state,
         CreateSessionInput {
@@ -1514,6 +1538,8 @@ async fn spawn_ephemeral_agent(
             working_directory,
             title: Some(format!("{} · {}", role.to_uppercase(), short)),
             kind: Some("agent".to_string()),
+            setup_commands,
+            tmux_session_name: None,
         },
     )?;
     let session_id = session.id.clone();

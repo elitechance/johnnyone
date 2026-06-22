@@ -43,6 +43,7 @@ import {
   folderOpenOutline,
   folderOutline,
   imageOutline,
+  trashOutline,
 } from 'ionicons/icons';
 
 // Register the close icon for the Files modal's close button.
@@ -56,6 +57,7 @@ addIcons({
   'folder-open-outline': folderOpenOutline,
   'folder-outline': folderOutline,
   'image-outline': imageOutline,
+  'trash-outline': trashOutline,
 });
 import { firstValueFrom, Subscription } from 'rxjs';
 import { Marked, marked } from 'marked';
@@ -287,6 +289,10 @@ export class PlannerPage implements OnInit, OnDestroy {
   browsePath = '';
   workerProvider = 'codex';
   reviewerProvider = 'codex';
+  /** Setup commands for a shell worker — run in the spawned shell on first launch. */
+  workerSetupCommands = '';
+  /** Setup commands for a shell reviewer — run in each spawned reviewer shell. */
+  reviewerSetupCommands = '';
   userBrief = '';
   appScope = 'personal/apps';
   // Editable app-repo path shown in Run Settings (dev runs); synced from the
@@ -1115,6 +1121,14 @@ export class PlannerPage implements OnInit, OnDestroy {
         planPath: this.planPath.trim(),
         workerProvider: this.workerProvider,
         reviewerProvider: this.reviewerProvider,
+        workerSetupCommands:
+          this.workerProvider === 'shell' && this.workerSetupCommands.trim()
+            ? this.workerSetupCommands
+            : undefined,
+        reviewerSetupCommands:
+          this.reviewerProvider === 'shell' && this.reviewerSetupCommands.trim()
+            ? this.reviewerSetupCommands
+            : undefined,
         brief: this.userBrief.trim() || undefined,
         appScope: this.appScope.trim() || undefined,
         docsScope: this.docsScope.trim() || undefined,
@@ -1337,10 +1351,13 @@ export class PlannerPage implements OnInit, OnDestroy {
   async deletePlan(id: string, event?: Event): Promise<void> {
     event?.stopPropagation();
     if (!id || this.isBusy()) return;
+    if (!confirm('Delete this run? This permanently removes it.')) return;
     this.isBusy.set(true);
     this.error.set(null);
     try {
       await firstValueFrom(this.api.deleteAgentPlan(id));
+      // Drop it from the existing-plans picker as well as the open tab strip.
+      this.existingPlans.update((list) => list.filter((plan) => plan.id !== id));
       const nextPlans = this.plans().filter((plan) => plan.id !== id);
       this.plans.set(nextPlans);
       if (this.currentRun()?.plan.id === id) {

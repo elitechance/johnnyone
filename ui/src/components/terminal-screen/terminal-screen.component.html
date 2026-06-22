@@ -4,14 +4,8 @@
   [class.mobile-input-mode]="mobileInputMode"
   [class.grok-terminal-layout]="grokTerminalLayout"
 >
-  <header class="terminal-toolbar">
-    <div class="terminal-title">{{ title }}</div>
-    <div class="terminal-toolbar-actions">
-      <div class="terminal-status" [class.offline]="screen?.status !== 'attached'">
-        {{ screen?.status || 'detached' }}
-      </div>
-    </div>
-  </header>
+  <!-- Redundant title/status row removed: the host page's pane-header already shows
+       the title, id, working dir, status and the rename/full/close controls. -->
   <div #terminalHost class="terminal-host" [class.disabled]="disabled"></div>
   @if (copyToast) {
     <div class="terminal-copy-toast" role="status">{{ copyToast }}</div>

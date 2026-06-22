@@ -33,11 +33,13 @@ type AiSession {
   model: String!
   workingDirectory: String
   status: String!
-  totalInputTokens: Int!
-  totalOutputTokens: Int!
-  totalCostCents: Int!
+  totalInputTokens: Float!
+  totalOutputTokens: Float!
+  totalCostCents: Float!
   createdAt: String!
   updatedAt: String!
+  # True when this session attaches to an external tmux session (UI shows Detach).
+  attachedTmux: Boolean!
 }
 
 type AiMessage {
@@ -47,9 +49,9 @@ type AiMessage {
   content: String!
   toolCalls: String
   finishReason: String
-  inputTokens: Int!
-  outputTokens: Int!
-  costCents: Int!
+  inputTokens: Float!
+  outputTokens: Float!
+  costCents: Float!
   createdAt: String!
 }
 
@@ -293,6 +295,16 @@ input CreateAiSessionInput {
   provider: String
   model: String
   workingDirectory: String
+  # When set, the new terminal ATTACHES to this existing external tmux session
+  # (e.g. "kloo") instead of spawning a new shell. Closing it only detaches.
+  tmuxSessionName: String
+}
+
+# An external tmux session a terminal can attach to.
+type TmuxSession {
+  name: String!
+  attached: Boolean!
+  windows: Int!
 }
 
 input UpsertProviderConfigInput {
@@ -314,6 +326,12 @@ input CreateAgentPlanInput {
   appScope: String
   docsScope: String
   referencePaths: String
+  # When workerProvider is "shell", these commands are run in the spawned shell
+  # on first launch (e.g. cd into the app + start your agent CLI). Ignored for
+  # non-shell providers. Avoid inline secrets — prefer `source ~/.env`.
+  workerSetupCommands: String
+  # Same, for a "shell" reviewerProvider — run in each spawned reviewer shell.
+  reviewerSetupCommands: String
 }
 
 input PlannerPromptSettingsInput {
@@ -336,6 +354,7 @@ input PlannerPlanningPromptsInput {
 type Query {
   listDesktopNodes: [DesktopNode!]!
   listAiSessions(status: String): [AiSession!]!
+  listTmuxSessions: [TmuxSession!]!
   getAiSession(id: ID!): AiSession
   listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!
   listProviderConfigs: [ProviderConfig!]!

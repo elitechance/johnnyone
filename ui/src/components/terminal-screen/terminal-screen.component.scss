@@ -285,6 +285,10 @@
   // got clipped at the bottom. Keep horizontal padding for breathing room.
   padding: 0 8px;
   box-sizing: border-box;
+  // Small bottom gap so the LAST terminal row clears the input/button bar below.
+  // A margin (not padding) shrinks the height the FitAddon reads, so xterm lands
+  // a clean final row above the bar instead of flush against its top border.
+  margin-bottom: 6px;
 
   &.disabled {
     opacity: 0.72;

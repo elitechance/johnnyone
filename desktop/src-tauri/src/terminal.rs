@@ -70,6 +70,13 @@ struct SessionConfig {
     model: String,
     working_directory: String,
     cli_path: Option<String>,
+    /// For shell sessions: commands to run in the pane on first spawn.
+    setup_commands: Option<String>,
+    /// When true, this session attaches to the EXTERNAL tmux session named in
+    /// `tmux_session_name` instead of spawning a `johnnyone_<id>` pane.
+    attached_tmux: bool,
+    /// The stored tmux session name (the external name when `attached_tmux`).
+    tmux_session_name: Option<String>,
 }
 
 pub async fn attach_terminal(
@@ -542,16 +549,46 @@ async fn start_capture_loop(
     tasks.insert(session_id, handle);
 }
 
+/// True when the session row is `archived`. A subscribe/refresh/input that races
+/// an archive must NOT re-create the tmux or flip the row back to `active` — that
+/// resurrection is why "closed" terminals reappeared after a refresh.
+fn session_is_archived(state: &AppState, session_id: &str) -> bool {
+    state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map(|status| status == "archived")
+        .unwrap_or(false)
+}
+
 async fn ensure_terminal_session(
     state: &AppState,
     session_id: &str,
     cols: u16,
     rows: u16,
 ) -> Result<TerminalSession, String> {
+    if session_is_archived(state, session_id) {
+        return Err(format!(
+            "session {session_id} is archived; refusing to resurrect it"
+        ));
+    }
     let config = load_session_config(state, session_id)?;
-    let tmux_session_name = tmux_session_name(session_id);
+    let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
 
     if !tmux_has_session(&tmux_session_name).await {
+        if attached {
+            // Attached view of an external tmux that has since gone away — don't
+            // spawn a replacement under its name; report it as not running.
+            return Err(format!(
+                "external tmux session '{tmux_session_name}' is not running"
+            ));
+        }
         if let Err(error) = create_tmux_session(&tmux_session_name, &config, cols, rows).await {
             if !tmux_has_session(&tmux_session_name).await {
                 return Err(error);
@@ -560,7 +597,11 @@ async fn ensure_terminal_session(
     }
 
     let pane_id = list_first_pane(&tmux_session_name).await?;
-    resize_pane(&pane_id, cols, rows).await?;
+    // Don't resize an external tmux pane — that would fight the user's own
+    // terminal (tmux sessions have a single shared size). Capture it as-is.
+    if !attached {
+        resize_pane(&pane_id, cols, rows).await?;
+    }
 
     state.db.with_conn(|conn| {
         conn.execute(
@@ -583,10 +624,20 @@ async fn ensure_terminal_session_for_input(
     state: &AppState,
     session_id: &str,
 ) -> Result<TerminalSession, String> {
+    if session_is_archived(state, session_id) {
+        return Err(format!(
+            "session {session_id} is archived; refusing to resurrect it"
+        ));
+    }
     let config = load_session_config(state, session_id)?;
-    let tmux_session_name = tmux_session_name(session_id);
+    let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
 
     if !tmux_has_session(&tmux_session_name).await {
+        if attached {
+            return Err(format!(
+                "external tmux session '{tmux_session_name}' is not running"
+            ));
+        }
         if let Err(error) = create_tmux_session(&tmux_session_name, &config, 100, 30).await {
             if !tmux_has_session(&tmux_session_name).await {
                 return Err(error);
@@ -615,20 +666,24 @@ async fn ensure_terminal_session_for_input(
 }
 
 fn load_session_config(state: &AppState, session_id: &str) -> Result<SessionConfig, String> {
-    let (provider_str, model, working_directory) = state.db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT provider, model, working_directory FROM sessions WHERE id = ?1",
-            params![session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| format!("Session not found: {}", e))
-    })?;
+    let (provider_str, model, working_directory, setup_commands, tmux_session_name, attached_tmux) =
+        state.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT provider, model, working_directory, setup_commands, tmux_session_name, attached_tmux FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)? != 0,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Session not found: {}", e))
+        })?;
 
     let provider = CliProvider::from_str(&provider_str)
         .ok_or_else(|| format!("Unknown provider: {}", provider_str))?;
@@ -648,7 +703,26 @@ fn load_session_config(state: &AppState, session_id: &str) -> Result<SessionConf
         model,
         working_directory,
         cli_path,
+        setup_commands: setup_commands.filter(|s| !s.trim().is_empty()),
+        attached_tmux,
+        tmux_session_name,
     })
+}
+
+/// Resolve the tmux session name + whether it's external (attached) for a
+/// session: an attached session uses its stored external name and must NOT be
+/// (re)created; an owned session uses `johnnyone_<id>`.
+fn resolve_tmux_target(config: &SessionConfig) -> Result<(String, bool), String> {
+    if config.attached_tmux {
+        let name = config
+            .tmux_session_name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "attached session has no tmux_session_name".to_string())?;
+        Ok((name, true))
+    } else {
+        Ok((tmux_session_name(&config.session_id), false))
+    }
 }
 
 async fn create_tmux_session(
@@ -682,7 +756,39 @@ async fn create_tmux_session(
     ];
     tmux_args.extend(args);
 
-    run_tmux(tmux_args).await.map(|_| ())
+    run_tmux(tmux_args).await?;
+
+    // Shell sessions with setup commands: type them into the freshly-spawned
+    // pane (e.g. cd into the app + launch an agent CLI), then pause so an agent
+    // launched by the setup is ready before the caller sends any prompt/input.
+    if matches!(config.provider, CliProvider::Shell) {
+        if let Some(setup) = config.setup_commands.as_deref() {
+            for line in setup.lines() {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() {
+                    run_tmux(vec![
+                        "send-keys".to_string(),
+                        "-t".to_string(),
+                        tmux_session_name.to_string(),
+                        "-l".to_string(),
+                        trimmed.to_string(),
+                    ])
+                    .await?;
+                }
+                run_tmux(vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    tmux_session_name.to_string(),
+                    "Enter".to_string(),
+                ])
+                .await?;
+            }
+            // Boot delay for any agent CLI launched by the setup commands.
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        }
+    }
+
+    Ok(())
 }
 
 fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
@@ -1149,6 +1255,50 @@ async fn run_tmux(args: Vec<String>) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// An external tmux session a JohnnyOne terminal can attach to.
+#[derive(serde::Serialize)]
+pub struct ExternalTmuxSession {
+    pub name: String,
+    pub attached: bool,
+    pub windows: u32,
+}
+
+/// List tmux sessions on the default socket that JohnnyOne can attach to,
+/// EXCLUDING the `johnnyone_<id>` panes it already manages. A missing tmux
+/// server (no sessions) yields an empty list, not an error.
+pub async fn list_external_tmux_sessions() -> Result<Vec<ExternalTmuxSession>, String> {
+    let out = match run_tmux(vec![
+        "list-sessions".to_string(),
+        "-F".to_string(),
+        "#{session_name}\t#{session_attached}\t#{session_windows}".to_string(),
+    ])
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return Ok(vec![]),
+    };
+
+    let mut sessions = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        if name.is_empty() || name.starts_with("johnnyone_") {
+            continue;
+        }
+        let attached = parts.next().map(|s| s.trim() != "0").unwrap_or(false);
+        let windows = parts
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(1);
+        sessions.push(ExternalTmuxSession {
+            name,
+            attached,
+            windows,
+        });
+    }
+    Ok(sessions)
 }
 
 fn tmux_session_name(session_id: &str) -> String {

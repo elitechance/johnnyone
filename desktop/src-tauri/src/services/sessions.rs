@@ -7,9 +7,30 @@ use uuid::Uuid;
 
 pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Session, String> {
     let id = Uuid::new_v4().to_string();
-    let provider = input.provider.unwrap_or_else(|| "claude_code".to_string());
+    // Attach mode: when a tmux_session_name is given, this session views an
+    // existing EXTERNAL tmux session instead of spawning its own pane. Such
+    // sessions use the `shell` provider (no AI CLI is launched) and are flagged
+    // `attached_tmux` so archive leaves the real tmux alive.
+    let attach_tmux = input
+        .tmux_session_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let attached = attach_tmux.is_some();
+    let provider = if attached {
+        "shell".to_string()
+    } else {
+        input.provider.unwrap_or_else(|| "claude_code".to_string())
+    };
     let model = input.model.unwrap_or_default();
-    let title = input.title.unwrap_or_else(|| "New Session".to_string());
+    let default_title = attach_tmux
+        .clone()
+        .unwrap_or_else(|| "New Session".to_string());
+    let title = input
+        .title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(default_title);
     // Anything other than the known kinds normalizes to "user" — the kind
     // column has a CHECK-like guard at the application layer.
     let kind = match input.kind.as_deref() {
@@ -29,10 +50,15 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
         })?,
     };
 
+    // Only meaningful for shell sessions; stored regardless and read at spawn time.
+    let setup_commands = input
+        .setup_commands
+        .filter(|s| !s.trim().is_empty());
+
     let session = state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO sessions (id, title, provider, model, working_directory, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, title, provider, model, working_directory, kind],
+            "INSERT INTO sessions (id, title, provider, model, working_directory, kind, setup_commands, tmux_session_name, attached_tmux) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, title, provider, model, working_directory, kind, setup_commands, attach_tmux, attached as i64],
         )
         .map_err(|e| format!("Failed to create session: {}", e))?;
 
@@ -72,7 +98,7 @@ pub fn list_sessions_filtered(
             format!(" WHERE {}", clauses.join(" AND "))
         };
         let sql = format!(
-            "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at FROM sessions{} ORDER BY updated_at DESC",
+            "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux FROM sessions{} ORDER BY updated_at DESC",
             where_sql
         );
 
@@ -96,6 +122,7 @@ pub fn list_sessions_filtered(
                     kind: row.get(10)?,
                     created_at: row.get(11)?,
                     updated_at: row.get(12)?,
+                    attached_tmux: row.get::<_, i64>(13)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -178,9 +205,22 @@ pub async fn archive_session(state: &AppState, id: String) -> Result<Session, St
     }
 
     // Terminal-mode tmux session (separate lifecycle from active_processes) →
-    // tear it down too, otherwise archiving from the UI leaves the tmux pane
-    // running and the next list_sessions still has data for it.
-    if let Err(error) = crate::terminal::kill_terminal_session(state, &id).await {
+    // tear it down too, otherwise archiving from the UI leaves the johnnyone_<id>
+    // pane running. BUT for sessions ATTACHED to an external tmux (kloo, llm-app,
+    // …), only detach the view — never kill the user's real tmux session.
+    let attached = state.db.with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT attached_tmux FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            != 0)
+    })?;
+    if attached {
+        tracing::info!(session_id = %id, "archiving attached session — leaving external tmux running");
+    } else if let Err(error) = crate::terminal::kill_terminal_session(state, &id).await {
         tracing::warn!(%error, session_id = %id, "kill_terminal_session failed during archive");
     }
 
@@ -265,7 +305,7 @@ pub fn list_messages(
 
 fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, String> {
     conn.query_row(
-        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at FROM sessions WHERE id = ?1",
+        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux FROM sessions WHERE id = ?1",
         params![id],
         |row| {
             Ok(Session {
@@ -282,6 +322,7 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                 kind: row.get(10)?,
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
+                attached_tmux: row.get::<_, i64>(13)? != 0,
             })
         },
     )

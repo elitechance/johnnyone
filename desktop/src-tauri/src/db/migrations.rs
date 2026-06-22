@@ -13,6 +13,9 @@ const MIGRATION_010: &str = include_str!("../../migrations/010_host_planner_sett
 const MIGRATION_011: &str = include_str!("../../migrations/011_worker_url_without_dev.sql");
 const MIGRATION_012: &str = include_str!("../../migrations/012_worker_url_prod_naming.sql");
 const MIGRATION_013: &str = include_str!("../../migrations/013_agent_plan_review_sessions.sql");
+const MIGRATION_014: &str = include_str!("../../migrations/014_add_session_setup_commands.sql");
+const MIGRATION_015: &str = include_str!("../../migrations/015_add_reviewer_setup_commands.sql");
+const MIGRATION_016: &str = include_str!("../../migrations/016_add_attached_tmux.sql");
 
 /// Run all pending migrations. Uses a simple version table to track applied migrations.
 pub fn run_migrations(conn: &Connection) -> Result<(), String> {
@@ -52,6 +55,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (11, "011_worker_url_without_dev", MIGRATION_011),
         (12, "012_worker_url_prod_naming", MIGRATION_012),
         (13, "013_agent_plan_review_sessions", MIGRATION_013),
+        (14, "014_add_session_setup_commands", MIGRATION_014),
+        (15, "015_add_reviewer_setup_commands", MIGRATION_015),
+        (16, "016_add_attached_tmux", MIGRATION_016),
     ];
 
     for (version, name, sql) in migrations {

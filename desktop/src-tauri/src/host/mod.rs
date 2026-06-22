@@ -619,6 +619,11 @@ impl From<CreateAiSessionInput> for CreateSessionInput {
             // agent sessions directly via `sessions::create_session` with
             // `kind: Some("agent")`.
             kind: None,
+            // Setup commands are a planner/development (shell-worker) concern,
+            // not exposed on the host AiSession surface.
+            setup_commands: None,
+            // tmux-attach is exposed via the worker RPC surface, not the host.
+            tmux_session_name: None,
         }
     }
 }

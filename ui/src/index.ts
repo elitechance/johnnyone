@@ -43,6 +43,7 @@ export type {
   CreateAgentPlanInput,
   HostFileContent,
   HostFileEntry,
+  TmuxSession,
   PlannerPromptSettings,
   ChatAttachment,
   GitActionResult,

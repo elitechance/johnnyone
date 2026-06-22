@@ -10,6 +10,8 @@ export interface AiSession {
   totalCostCents: number;
   createdAt: string;
   updatedAt: string;
+  /** True when this session attaches to an external tmux session (UI shows Detach). */
+  attachedTmux?: boolean;
 }
 
 export interface CreateAiSessionInput {

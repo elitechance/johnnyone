@@ -22,6 +22,10 @@ pub struct Session {
     pub kind: String,
     pub created_at: String,
     pub updated_at: String,
+    /// True when this session attaches to an external tmux session (so the UI
+    /// offers "Detach" instead of "Close", and archive won't kill the tmux).
+    #[serde(default)]
+    pub attached_tmux: bool,
 }
 
 fn default_session_kind() -> String {
@@ -39,6 +43,16 @@ pub struct CreateSessionInput {
     /// `'agent'` so those sessions don't show up in the /terminal tab strip.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Optional. For `shell` sessions, commands run in the pane on first spawn
+    /// (e.g. cd into the app + launch an agent CLI). Ignored for other providers.
+    #[serde(default)]
+    pub setup_commands: Option<String>,
+    /// Optional. When set, this session ATTACHES to an existing external tmux
+    /// session of this name (e.g. "kloo") instead of spawning a new
+    /// `johnnyone_<id>` pane. Such sessions are never killed on archive — closing
+    /// the JohnnyOne view only detaches it, leaving the real tmux session running.
+    #[serde(default)]
+    pub tmux_session_name: Option<String>,
 }
 
 // ── Message ──────────────────────────────────────────────────────────────────
@@ -194,6 +208,14 @@ pub struct CreateAgentPlanInput {
     pub app_scope: Option<String>,
     pub docs_scope: Option<String>,
     pub reference_paths: Option<String>,
+    /// When `worker_provider` is "shell", commands run in the spawned shell on
+    /// first launch (e.g. cd + start an agent CLI). Stored on the worker session.
+    #[serde(default)]
+    pub worker_setup_commands: Option<String>,
+    /// Same, for a "shell" `reviewer_provider`. Stored on the plan and read when
+    /// each (lazily-created) reviewer shell is spawned.
+    #[serde(default)]
+    pub reviewer_setup_commands: Option<String>,
 }
 
 // ── Usage Log ────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import {
   inject,
   signal,
   computed,
+  effect,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -23,6 +24,8 @@ import {
   IonButton,
   IonContent,
   IonList,
+  IonListHeader,
+  IonInput,
   IonItem,
   IonLabel,
   IonIcon,
@@ -55,9 +58,16 @@ import {
   DetectedCliTool,
   TerminalScreen,
   HostFileEntry,
+  TmuxSession,
 } from '@johnnyone/ui';
 import { firstValueFrom, Subscription } from 'rxjs';
 import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
+import {
+  chooseSessionToSelect,
+  reconcilePersistedWorkspaceState,
+  type PaneLayout,
+  type PersistedTerminalWorkspaceState,
+} from './terminal-state-reconcile';
 
 interface Session {
   id: string;
@@ -71,6 +81,7 @@ interface Session {
   total_cost_cents: number;
   created_at: string;
   updated_at: string;
+  attached_tmux: boolean;
 }
 
 interface Message {
@@ -87,19 +98,6 @@ interface Message {
 }
 
 interface DetectedTool extends DetectedCliTool {}
-
-interface PaneLayout {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-interface PersistedTerminalWorkspaceState {
-  desktopLayouts: Record<string, PaneLayout>;
-  mobileLayouts: Record<string, PaneLayout>;
-  closedPaneIds: string[];
-}
 
 // Register Ionicons used by the workspace-picker modal once at module load.
 addIcons({
@@ -127,6 +125,8 @@ addIcons({
     IonButton,
     IonContent,
     IonList,
+    IonListHeader,
+    IonInput,
     IonItem,
     IonLabel,
     IonIcon,
@@ -211,6 +211,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   newSessionBrowsePath = signal('/');
   newSessionEntries = signal<HostFileEntry[]>([]);
   newSessionBrowserError = signal<string | null>(null);
+  newSessionTitle = signal('');
+  tmuxSessions = signal<TmuxSession[]>([]);
 
   sidebarOpen = signal(true);
   sidebarWidth = signal(this.defaultSidebarWidth);
@@ -244,15 +246,41 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   });
 
   aiSessions = computed<SharedAiSession[]>(() =>
-    this.filteredSessions()
-      .filter((session) => !this.closedPaneIds().has(session.id))
-      .map(s => this.mapSession(s))
+    // Source of truth is the API session list. Never hide an active terminal
+    // behind the local `closedPaneIds` set — that's a legacy multi-pane artifact
+    // that can desync from the server and empty the entire tab bar.
+    this.filteredSessions().map(s => this.mapSession(s))
   );
 
   visiblePaneSessions = computed<SharedAiSession[]>(() => {
     const currentId = this.currentSession()?.id;
     if (!currentId) return [];
     return this.aiSessions().filter((session) => session.id === currentId);
+  });
+
+  // Persisted, manually-arrangeable tab order. The tab bar renders by this order
+  // (not by updated_at), so selecting a tab never rearranges them, and drag-drop
+  // reorders persist. New sessions append; removed ones drop (kept in sync below).
+  private static readonly TAB_ORDER_KEY = 'johnnyone_terminal_tab_order';
+  tabOrder = signal<string[]>([]);
+  draggingTabId: string | null = null;
+
+  orderedAiSessions = computed<SharedAiSession[]>(() => {
+    const list = this.aiSessions();
+    const byId = new Map(list.map((s) => [s.id, s] as const));
+    const ordered: SharedAiSession[] = [];
+    for (const id of this.tabOrder()) {
+      const s = byId.get(id);
+      if (s) {
+        ordered.push(s);
+        byId.delete(id);
+      }
+    }
+    // Sessions not yet in tabOrder (created since the last sync) go to the end.
+    for (const s of list) {
+      if (byId.has(s.id)) ordered.push(s);
+    }
+    return ordered;
   });
 
   aiMessages = computed<SharedAiMessage[]>(() => {
@@ -323,9 +351,75 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return 'Streaming response…';
   });
 
+  constructor() {
+    // Keep the persisted tab order in sync with the live session set: append new
+    // sessions, drop removed ones, preserve the manual (drag) arrangement.
+    // Selecting a tab never reorders — orderedAiSessions is driven by tabOrder.
+    effect(
+      () => {
+        const ids = this.aiSessions().map((s) => s.id);
+        const idSet = new Set(ids);
+        const current = this.tabOrder();
+        const kept = current.filter((id) => idSet.has(id));
+        const added = ids.filter((id) => !current.includes(id));
+        if (added.length > 0 || kept.length !== current.length) {
+          const next = [...kept, ...added];
+          this.tabOrder.set(next);
+          this.persistTabOrder(next);
+        }
+      },
+      { allowSignalWrites: true },
+    );
+  }
+
+  private loadTabOrder(): void {
+    try {
+      const raw = localStorage.getItem(TerminalPage.TAB_ORDER_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        this.tabOrder.set(parsed.filter((x): x is string => typeof x === 'string'));
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  private persistTabOrder(order: string[]): void {
+    try {
+      localStorage.setItem(TerminalPage.TAB_ORDER_KEY, JSON.stringify(order));
+    } catch {
+      // best-effort
+    }
+  }
+
+  onTabDragStart(sessionId: string): void {
+    this.draggingTabId = sessionId;
+  }
+
+  onTabDragOver(event: DragEvent): void {
+    event.preventDefault(); // permit drop
+  }
+
+  // Drop the dragged tab before the target tab and persist the new order.
+  onTabDrop(targetId: string): void {
+    const from = this.draggingTabId;
+    this.draggingTabId = null;
+    if (!from || from === targetId) return;
+    const order = [...this.tabOrder()];
+    const fromIdx = order.indexOf(from);
+    const toIdx = order.indexOf(targetId);
+    if (fromIdx < 0 || toIdx < 0) return;
+    order.splice(fromIdx, 1);
+    order.splice(toIdx, 0, from);
+    this.tabOrder.set(order);
+    this.persistTabOrder(order);
+  }
+
   ngOnInit(): void {
     this.setupCompactWorkspaceMode();
     this.loadSidebarWidth();
+    this.loadTabOrder();
     this.loadPersistedWorkspaceState();
     this.subscribeToTerminalEvents();
     this.subscribeToRelayErrorEvents();
@@ -409,6 +503,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       totalCostCents: s.total_cost_cents,
       createdAt: s.created_at,
       updatedAt: s.updated_at,
+      attachedTmux: s.attached_tmux,
     };
   }
 
@@ -440,6 +535,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       total_cost_cents: session.totalCostCents,
       created_at: session.createdAt,
       updated_at: session.updatedAt,
+      attached_tmux: session.attachedTmux ?? false,
     };
   }
 
@@ -467,35 +563,62 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       );
       const sortedSessions = this.sortSessions(sessions);
       this.sessions.set(sortedSessions);
+      // Reconcile ALL persisted/cached Terminal state against the authoritative active
+      // list BEFORE layout restore or selection, so a deleted/archived session can never
+      // pin a pane, hold the screen cache, or be selected across a reload.
+      this.reconcilePersistedTerminalState(sortedSessions);
       this.restorePaneLayoutsFromStorage(sortedSessions);
       await this.syncTerminalVisualSubscriptions();
 
-      const current = this.currentSession();
-      if (targetSessionId) {
-        const target = sessions.find((session) => session.id === targetSessionId);
-        if (target) {
-          await this.selectSession(target.id);
-          return;
-        }
-      }
-
-      if (current) {
-        const refreshed = sessions.find((s) => s.id === current.id);
-        if (refreshed) {
-          await this.selectSession(refreshed.id);
-        } else {
-          this.currentSession.set(null);
-          this.messages.set([]);
-        }
-        return;
-      }
-
-      if (sessions.length > 0) {
-        await this.selectSession(sessions[0].id);
+      const toSelect = chooseSessionToSelect(sortedSessions, {
+        targetId: targetSessionId,
+        currentId: this.currentSession()?.id,
+      });
+      if (toSelect) {
+        await this.selectSession(toSelect);
+      } else {
+        this.currentSession.set(null);
+        this.messages.set([]);
       }
     } catch (err) {
       console.error('Failed to load sessions:', err);
     }
+  }
+
+  /**
+   * Single entry point for reconciling every persisted/cached Terminal store against the
+   * authoritative active session list. Drops any entry whose session id is not active from:
+   *   1. the in-memory signals (`terminalScreens`, `paneLayouts`, `closedPaneIds`) — via the
+   *      reused `removeInactivePaneState`;
+   *   2. the persisted `johnnyone_terminal_pane_workspace` localStorage blob (rewritten or
+   *      removed so the corruption cannot reload); and
+   *   3. the screen cache, via `relayTerminal.retainCachedScreens`.
+   * Called from `loadSessions` after the active list is fetched and before layout restore /
+   * selection, so a dead/deleted session can never pin or corrupt the Terminal UI.
+   */
+  private reconcilePersistedTerminalState(activeSessions: Session[]): void {
+    const activeIds = new Set(activeSessions.map((s) => s.id));
+
+    // 1. In-memory signals — reuse the existing prune (terminalScreens + paneLayouts + closedPaneIds).
+    this.removeInactivePaneState(activeIds);
+
+    // 2. Persisted workspace blob — rewrite cleaned state, or remove it when fully stale.
+    try {
+      const persisted = this.readPersistedWorkspaceState();
+      const { next, changed } = reconcilePersistedWorkspaceState(persisted, activeIds);
+      if (changed) {
+        if (next) {
+          localStorage.setItem(TerminalPage.PANE_WORKSPACE_STATE_KEY, JSON.stringify(next));
+        } else {
+          localStorage.removeItem(TerminalPage.PANE_WORKSPACE_STATE_KEY);
+        }
+      }
+    } catch {
+      // Ignore localStorage read/write failures (match the other workspace-state methods).
+    }
+
+    // 3. Screen cache — prune via the relay boundary (never reach into the cache service directly).
+    this.relayTerminal.retainCachedScreens(activeIds);
   }
 
   private removeInactivePaneState(activeIds: Set<string>): void {
@@ -613,8 +736,36 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const start = this.workingDirectory().trim() || '~';
     this.newSessionBrowsePath.set(start);
     this.newSessionBrowserError.set(null);
+    this.newSessionTitle.set('');
+    this.tmuxSessions.set([]);
     this.newSessionBrowserOpen.set(true);
     await this.loadNewSessionEntries(start);
+    // Load attachable external tmux sessions (kloo, llm-app, …) for the picker.
+    try {
+      this.tmuxSessions.set(await firstValueFrom(this.api.listTmuxSessions()));
+    } catch (err) {
+      console.error('Failed to list tmux sessions:', err);
+    }
+  }
+
+  /** Create a session that ATTACHES to an existing external tmux session. */
+  async attachTmuxSession(name: string): Promise<void> {
+    this.newSessionBrowserOpen.set(false);
+    try {
+      const session = this.mapApiSessionToState(
+        await firstValueFrom(
+          this.api.createSession({
+            title: this.newSessionTitle().trim() || name,
+            tmuxSessionName: name,
+          }),
+        ),
+      );
+      this.upsertSession(session);
+      await this.selectSession(session.id);
+    } catch (err) {
+      console.error('Failed to attach tmux session:', err);
+      this.terminalError.set(String(err));
+    }
   }
 
   closeNewSessionBrowser(): void {
@@ -649,8 +800,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
     try {
       const session = this.mapApiSessionToState(await firstValueFrom(this.api.createSession({
-        provider: this.selectedProvider(),
-        model: this.selectedProvider() === 'ollama' ? 'qwen3.5:2b' : undefined,
+        provider: 'shell',
+        title: this.newSessionTitle().trim() || undefined,
         workingDirectory: path,
       })));
       this.upsertSession(session);
@@ -1320,6 +1471,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.closePaneFullscreen();
       this.saveWorkspaceState();
       this.isCompactWorkspace.set(event.matches);
+      // Switching desktop↔mobile uses a different saved layout set, so clear the
+      // live layouts first (restore now only seeds missing ones, not overwrites).
+      this.paneLayouts.set({});
       this.restorePaneLayoutsFromStorage(this.sessions());
       void this.syncTerminalVisualSubscriptions();
     };
@@ -1524,9 +1678,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    const nextClosed = new Set(this.closedPaneIds());
-    nextClosed.add(sessionId);
-    this.closedPaneIds.set(nextClosed);
+    // "Close" archives the session server-side (above), which removes it from the
+    // authoritative active list. No need to also track it in a local closed set.
     this.sessions.update((sessions) => sessions.filter((session) => session.id !== sessionId));
     this.terminalScreens.update((screens) => this.omitRecordKey(screens, sessionId));
     this.paneLayouts.update((layouts) => this.omitRecordKey(layouts, sessionId));
@@ -1541,7 +1694,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!wasCurrentSession) return;
 
     this.terminalScreen.set(null);
-    const nextSession = this.sessions().find((session) => !nextClosed.has(session.id));
+    const nextSession = this.sessions().find((session) => session.id !== sessionId);
     if (nextSession) {
       await this.selectSession(nextSession.id);
     } else {
@@ -1646,19 +1799,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       const next = { ...layouts };
 
       sessions.forEach((session, index) => {
+        // Keep the live in-memory layout (including a just-made drag/resize) —
+        // only SEED sessions that don't have one yet (fresh load / new session).
+        // Overwriting here is what reverted a pane's size/position on tab switch.
+        if (next[session.id]) return;
         const saved = savedLayouts?.[session.id];
-        if (saved) {
-          const normalized = this.normalizePaneLayout(saved, index);
-          if (normalized) {
-            next[session.id] = normalized;
-            changed = true;
-          }
-          return;
-        }
-        if (!next[session.id]) {
-          next[session.id] = this.defaultPaneLayout(index);
-          changed = true;
-        }
+        const normalized = saved ? this.normalizePaneLayout(saved, index) : null;
+        next[session.id] = normalized ?? this.defaultPaneLayout(index);
+        changed = true;
       });
 
       for (const sessionId of Object.keys(next)) {
@@ -1963,7 +2111,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         ...sessions.filter((existing) => existing.id !== session.id),
       ])
     );
-    this.restorePaneLayoutsFromStorage([session]);
+    // Pass the FULL session list, not [session]: restorePaneLayoutsFromStorage
+    // prunes layouts for any session not in the list it's given. Passing only the
+    // just-upserted session deleted every OTHER tab's pane layout — which is what
+    // reset a pane's location/size on every tab switch (selectSession upserts the
+    // selected session each time). The list above already includes `session`, so
+    // this seeds the new one and prunes only genuinely-gone sessions.
+    this.restorePaneLayoutsFromStorage(this.sessions());
   }
 
   private upsertMessage(messages: Message[], message: Message): Message[] {
@@ -2038,12 +2192,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   mobileSessionLabel(session: SharedAiSession): string {
-    const shortId = this.toSessionNumber(session.id).slice(0, 4);
-    const title = (session.title || '').trim();
-    if (title && title !== 'New Session' && title !== 'Terminal') {
-      return title.length > 14 ? `${title.slice(0, 14)}…` : title;
-    }
-    return `${this.providerLabel(session.provider)} · ${shortId}`;
+    const raw = (session.title || '').trim() || 'Terminal';
+    return raw.length > 16 ? `${raw.slice(0, 16)}…` : raw;
   }
 
   mobileWorkingDirectoryLabel(path?: string | null): string {

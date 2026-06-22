@@ -363,6 +363,7 @@ pub struct RpcSessionView {
     pub total_cost_cents: i64,
     pub created_at: String,
     pub updated_at: String,
+    pub attached_tmux: bool,
 }
 
 /// Message view for RPC responses (camelCase for GraphQL compatibility).

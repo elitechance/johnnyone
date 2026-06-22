@@ -14,19 +14,13 @@ interface WorkerEnv {
   [key: string]: unknown;
 }
 
-interface CreateAiSessionInput {
-  title?: string;
-  provider?: string;
-  model?: string;
-  workingDirectory?: string;
-  tmuxSessionName?: string;
-}
-
-export default async function createAiSession(
+// Lists the external tmux sessions a new terminal can attach to (the desktop
+// excludes the johnnyone_<id> panes it already manages).
+export default async function listTmuxSessions(
   _parent: unknown,
-  args: { input: CreateAiSessionInput },
+  _args: Record<string, never>,
   ctx: ResolverContext,
 ) {
-  await authorizeForAltToken(ctx, 'sessions:write');
-  return desktopRpc<unknown>(ctx, 'create_session', { input: args.input });
+  await authorizeForAltToken(ctx, 'sessions:read');
+  return desktopRpc<unknown[]>(ctx, 'list_tmux_sessions', {});
 }

@@ -21,7 +21,7 @@
         scrollable
         aria-label="Terminal sessions"
       >
-        @for (session of aiSessions(); track session.id) {
+        @for (session of orderedAiSessions(); track session.id) {
           <ion-segment-button [value]="session.id" [title]="session.title || providerLabel(session.provider)">
             <ion-label>{{ mobileSessionLabel(session) }}</ion-label>
           </ion-segment-button>
@@ -29,34 +29,27 @@
       </ion-segment>
     } @else {
       <nav class="workspace-tabs" aria-label="Terminal sessions">
-        @for (session of aiSessions(); track session.id) {
+        @for (session of orderedAiSessions(); track session.id) {
           <button
             class="workspace-tab"
             [class.active]="session.id === currentSession()?.id"
+            [class.dragging]="draggingTabId === session.id"
+            draggable="true"
+            (dragstart)="onTabDragStart(session.id)"
+            (dragover)="onTabDragOver($event)"
+            (drop)="onTabDrop(session.id)"
+            (dragend)="draggingTabId = null"
             (click)="onSessionSelected(session.id)"
             [title]="session.id"
           >
             <span class="tab-status" aria-hidden="true"></span>
-            <span>{{ providerLabel(session.provider) }}</span>
-            <span class="tab-number">#{{ toSessionNumber(session.id) }}</span>
+            <span>{{ session.title || 'Terminal' }}</span>
           </button>
         }
       </nav>
     }
 
     <div class="workspace-actions">
-      <select
-        [value]="selectedProvider()"
-        (change)="onProviderChange($any($event.target).value)"
-        class="provider-dropdown"
-        aria-label="Provider"
-      >
-        @for (tool of detectedTools(); track tool.provider) {
-          <option [value]="tool.provider" [disabled]="!tool.found">
-            {{ providerLabel(tool.provider) }}{{ !tool.found ? ' (not found)' : '' }}
-          </option>
-        }
-      </select>
       <button class="primary-action" (click)="createNewSession()">New Terminal</button>
       @if (currentSession()) {
         <button class="icon-action" title="Copy session ID" (click)="copyCurrentSessionId()">
@@ -106,8 +99,12 @@
               <ion-icon [name]="isPaneFullscreen(session.id) ? 'contract-outline' : 'expand-outline'" aria-hidden="true"></ion-icon>
               <span class="pane-fullscreen-label">{{ isPaneFullscreen(session.id) ? 'exit' : 'full' }}</span>
             </button>
-            <button class="pane-tool danger" title="Close terminal" (click)="closeTerminalPane(session.id); $event.stopPropagation()">
-              close
+            <button
+              class="pane-tool danger"
+              [title]="session.attachedTmux ? 'Detach view (keeps the tmux session running)' : 'Close terminal'"
+              (click)="closeTerminalPane(session.id); $event.stopPropagation()"
+            >
+              {{ session.attachedTmux ? 'detach' : 'close' }}
             </button>
             <span class="pane-status" [class.offline]="screen?.status !== 'attached'">
               {{ screen?.status || (session.id === currentSession()?.id ? 'attaching' : 'detached') }}
@@ -182,38 +179,42 @@
         </ion-buttons>
       </ion-toolbar>
       <ion-toolbar>
-        <ion-segment
-          [value]="selectedProvider()"
-          (ionChange)="selectedProvider.set($any($event.detail.value))"
-          scrollable
-        >
-          <ion-segment-button value="shell">
-            <ion-label>Shell</ion-label>
-          </ion-segment-button>
-          <ion-segment-button value="claude_code">
-            <ion-label>Claude Code</ion-label>
-          </ion-segment-button>
-          <ion-segment-button value="codex">
-            <ion-label>Codex</ion-label>
-          </ion-segment-button>
-          <ion-segment-button value="cline">
-            <ion-label>Cline</ion-label>
-          </ion-segment-button>
-          <ion-segment-button value="ollama">
-            <ion-label>Ollama</ion-label>
-          </ion-segment-button>
-          <ion-segment-button value="grok">
-            <ion-label>Grok</ion-label>
-          </ion-segment-button>
-        </ion-segment>
+        <ion-input
+          class="new-session-title"
+          label="Title"
+          labelPlacement="stacked"
+          placeholder="Terminal name (optional)"
+          [value]="newSessionTitle()"
+          (ionInput)="newSessionTitle.set($any($event.target).value)"
+        ></ion-input>
       </ion-toolbar>
       <ion-toolbar>
         <ion-text color="medium">
-          <p class="picker-path">{{ newSessionBrowsePath() }}</p>
+          <p class="picker-path">New shell in: {{ newSessionBrowsePath() }}</p>
         </ion-text>
       </ion-toolbar>
     </ion-header>
     <ion-content>
+      @if (tmuxSessions().length > 0) {
+        <ion-list-header>
+          <ion-label>Attach to a running tmux session</ion-label>
+        </ion-list-header>
+        <ion-list>
+          @for (t of tmuxSessions(); track t.name) {
+            <ion-item button [detail]="false" (click)="attachTmuxSession(t.name)">
+              <ion-icon slot="start" name="terminal-outline" color="primary"></ion-icon>
+              <ion-label>
+                {{ t.name }}
+                <p>{{ t.windows }} window{{ t.windows === 1 ? '' : 's' }}{{ t.attached ? ' · attached' : '' }}</p>
+              </ion-label>
+              <ion-button slot="end" size="small" fill="clear">Attach</ion-button>
+            </ion-item>
+          }
+        </ion-list>
+        <ion-list-header>
+          <ion-label>Or start a new shell</ion-label>
+        </ion-list-header>
+      }
       @if (newSessionBrowserError()) {
         <div class="picker-empty">
           <ion-text color="danger">{{ newSessionBrowserError() }}</ion-text>

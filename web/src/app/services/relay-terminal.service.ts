@@ -211,6 +211,10 @@ export class RelayTerminalService {
     this.terminalScreenCache.remove(sessionId);
   }
 
+  retainCachedScreens(activeSessionIds: Iterable<string>): void {
+    this.terminalScreenCache.retainOnly(activeSessionIds);
+  }
+
   disconnect(): void {
     this.terminalScreenCache.flush();
     for (const timer of this.pendingTimers.values()) {

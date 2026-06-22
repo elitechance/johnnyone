@@ -823,6 +823,7 @@ impl AgentService {
     async fn handle_rpc(req: &RpcRequest, state: &Arc<AppState>) -> RpcResponse {
         let result = match req.method.as_str() {
             "list_sessions" => Self::rpc_list_sessions(&req.params, state),
+            "list_tmux_sessions" => Self::rpc_list_tmux_sessions().await,
             "create_session" => Self::rpc_create_session(&req.params, state),
             "get_session" => Self::rpc_get_session(&req.params, state),
             "update_session_title" => Self::rpc_update_session_title(&req.params, state),
@@ -908,6 +909,13 @@ impl AgentService {
             .map(Self::session_view)
             .collect::<Vec<_>>();
 
+        serde_json::to_value(&sessions).map_err(|e| e.to_string())
+    }
+
+    /// List external tmux sessions a new terminal can attach to (excludes the
+    /// johnnyone_<id> panes JohnnyOne already manages).
+    async fn rpc_list_tmux_sessions() -> Result<serde_json::Value, String> {
+        let sessions = crate::terminal::list_external_tmux_sessions().await?;
         serde_json::to_value(&sessions).map_err(|e| e.to_string())
     }
 
@@ -1566,6 +1574,7 @@ impl AgentService {
             total_cost_cents: session.total_cost_cents,
             created_at: session.created_at,
             updated_at: session.updated_at,
+            attached_tmux: session.attached_tmux,
         }
     }
 

@@ -407,6 +407,16 @@
                 </p>
                 <code>{{ workspaceRelativePath(plan.planPath) }}</code>
               </ion-label>
+              <ion-button
+                slot="end"
+                fill="clear"
+                color="danger"
+                [disabled]="isBusy()"
+                title="Delete run"
+                (click)="deletePlan(plan.id, $event)"
+              >
+                <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+              </ion-button>
             </ion-item>
           }
         </ion-list>
@@ -584,8 +594,23 @@
             <ion-select-option value="claude_code">Claude Code</ion-select-option>
             <ion-select-option value="grok">Grok</ion-select-option>
             <ion-select-option value="ollama">Ollama</ion-select-option>
+            <ion-select-option value="shell">Shell (bring your own agent)</ion-select-option>
           </ion-select>
         </ion-item>
+
+        @if (workerProvider === 'shell') {
+          <ion-item>
+            <ion-textarea
+              label="T1 setup commands"
+              labelPlacement="stacked"
+              [autoGrow]="true"
+              [rows]="4"
+              placeholder="cd /home/you/app&#10;source ~/.env&#10;aider --model gpt-5.5"
+              helperText="Run in the spawned shell on launch. End by starting an interactive agent that reads stdin (the coordinator sends each phase prompt to it). Avoid inline secrets — prefer source ~/.env."
+              [(ngModel)]="workerSetupCommands"
+            ></ion-textarea>
+          </ion-item>
+        }
 
         <ion-item>
           <ion-select
@@ -597,8 +622,23 @@
             <ion-select-option value="claude_code">Claude Code</ion-select-option>
             <ion-select-option value="grok">Grok</ion-select-option>
             <ion-select-option value="ollama">Ollama</ion-select-option>
+            <ion-select-option value="shell">Shell (bring your own agent)</ion-select-option>
           </ion-select>
         </ion-item>
+
+        @if (reviewerProvider === 'shell') {
+          <ion-item>
+            <ion-textarea
+              label="T2 setup commands"
+              labelPlacement="stacked"
+              [autoGrow]="true"
+              [rows]="4"
+              placeholder="cd /home/you/app&#10;source ~/.env&#10;aider --model gpt-5.5"
+              helperText="Run in each reviewer shell on launch. End by starting an interactive agent that reads stdin. Avoid inline secrets — prefer source ~/.env."
+              [(ngModel)]="reviewerSetupCommands"
+            ></ion-textarea>
+          </ion-item>
+        }
       </ion-list>
 
       <section class="prompt-settings-panel">

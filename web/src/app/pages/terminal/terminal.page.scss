@@ -86,8 +86,13 @@
   border: 1px solid transparent;
   background: transparent;
   color: #8fa0b3;
-  cursor: pointer;
+  cursor: grab;
   white-space: nowrap;
+
+  &.dragging {
+    opacity: 0.45;
+    cursor: grabbing;
+  }
 
   &.active {
     color: #dbe7f3;

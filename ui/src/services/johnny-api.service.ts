@@ -13,6 +13,15 @@ export interface CreateAiSessionInput {
   provider?: string;
   model?: string;
   workingDirectory?: string;
+  /** When set, attach to this existing external tmux session instead of spawning a shell. */
+  tmuxSessionName?: string;
+}
+
+/** An external tmux session a terminal can attach to. */
+export interface TmuxSession {
+  name: string;
+  attached: boolean;
+  windows: number;
 }
 
 export interface AiChatRunResult {
@@ -68,6 +77,10 @@ export interface CreateAgentPlanInput {
   appScope?: string;
   docsScope?: string;
   referencePaths?: string;
+  /** When workerProvider is 'shell', commands run in the spawned shell on first launch. */
+  workerSetupCommands?: string;
+  /** When reviewerProvider is 'shell', commands run in each spawned reviewer shell. */
+  reviewerSetupCommands?: string;
 }
 
 export interface AgentPlan {
@@ -256,7 +269,7 @@ export class JohnnyApiService {
     const sessionFields = `
       id title provider model workingDirectory status
       totalInputTokens totalOutputTokens totalCostCents
-      createdAt updatedAt
+      createdAt updatedAt attachedTmux
     `;
     const query = `query ListSessions($status: String) {
       listAiSessions(status: $status) { ${sessionFields} }
@@ -267,11 +280,21 @@ export class JohnnyApiService {
       .pipe(map((data) => data.listAiSessions));
   }
 
+  /** External tmux sessions a new terminal can attach to (excludes johnnyone_<id> panes). */
+  listTmuxSessions(): Observable<TmuxSession[]> {
+    const query = `query ListTmuxSessions {
+      listTmuxSessions { name attached windows }
+    }`;
+    return this.gql
+      .queryPreferLocalHost<{ listTmuxSessions: TmuxSession[] }>(query, query, {})
+      .pipe(map((data) => data.listTmuxSessions));
+  }
+
   getSession(id: string): Observable<AiSession> {
     const sessionFields = `
       id title provider model workingDirectory status
       totalInputTokens totalOutputTokens totalCostCents
-      createdAt updatedAt
+      createdAt updatedAt attachedTmux
     `;
     const query = `query GetSession($id: ID!) {
       getAiSession(id: $id) { ${sessionFields} }
@@ -300,7 +323,7 @@ export class JohnnyApiService {
           createAiSession(input: $input) {
             id title provider model workingDirectory status
             totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
+            createdAt updatedAt attachedTmux
           }
         }`,
         { input }

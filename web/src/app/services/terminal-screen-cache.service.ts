@@ -49,17 +49,57 @@ export class TerminalScreenCacheService {
   }
 
   remove(sessionId: string): void {
+    this.cancelPendingSave(sessionId);
+
+    const store = this.readStore();
+    if (!store.sessions[sessionId]) return;
+    delete store.sessions[sessionId];
+    this.writeStore(store);
+  }
+
+  /**
+   * Liveness prune: drop every cached session whose id is not in `activeSessionIds`,
+   * cancelling any pending debounced write for the dropped ids so it cannot re-add a
+   * dead session after the prune. Rewrites localStorage only when at least one entry
+   * was removed (idempotent no-op otherwise — the common steady-state path).
+   */
+  retainOnly(activeSessionIds: Iterable<string>): void {
+    const activeIds = new Set(activeSessionIds);
+
+    // Defuse any queued debounce for ids we are about to drop, so an in-flight
+    // remember() cannot resurrect a dead session after the store is rewritten.
+    for (const sessionId of this.pendingSaves.keys()) {
+      if (!activeIds.has(sessionId)) {
+        this.cancelPendingSave(sessionId);
+      }
+    }
+    for (const sessionId of this.pendingScreen.keys()) {
+      if (!activeIds.has(sessionId)) {
+        this.cancelPendingSave(sessionId);
+      }
+    }
+
+    const store = this.readStore();
+    let changed = false;
+    for (const sessionId of Object.keys(store.sessions)) {
+      if (!activeIds.has(sessionId)) {
+        delete store.sessions[sessionId];
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.writeStore(store);
+    }
+  }
+
+  private cancelPendingSave(sessionId: string): void {
     const timer = this.pendingSaves.get(sessionId);
     if (timer) {
       clearTimeout(timer);
       this.pendingSaves.delete(sessionId);
     }
     this.pendingScreen.delete(sessionId);
-
-    const store = this.readStore();
-    if (!store.sessions[sessionId]) return;
-    delete store.sessions[sessionId];
-    this.writeStore(store);
   }
 
   flush(): void {
