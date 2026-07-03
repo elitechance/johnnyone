@@ -7,6 +7,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Web-app shell — nav rail, initiative console, lifecycle bar, amber theme
+  (overhaul P8)**. Applies the approved 2026-07 mock to the web client; **web +
+  `ui` Angular only** — no Rust/worker/relay edit, no new route or GraphQL op, no
+  new npm dependency, no migration. This is **layout, theme, and assembly** of the
+  components P1–P7 already shipped, not new features. **(1) Amber tokens** — the
+  house `--jo-accent` is **retargeted** from the old blue `#5096ff` to the mock's
+  amber (`#e8a33d` dark / `#b9751a` light) so every existing `var(--jo-accent)`
+  consumer flips app-wide with **no consumer edit**; a new `--jo-accent-ink`
+  on-accent color and a semantic per-stage status palette (`--jo-st-briefing`
+  …`--jo-st-done`) are added, distinct from the kept health tokens
+  (`--jo-warn`/`--jo-bad`/`--jo-good`). A **dormant light palette** is authored
+  under `:root[data-theme="light"]` to the mock's light hexes, but **dark stays the
+  only rendered theme** (`dark.always.css` unchanged) — a light↔dark toggle is a
+  separate initiative. `theme-tokens.ts` mirrors the SCSS palette as one source of
+  truth (`theme-tokens.spec.ts` pins the hexes; the plugin-less vitest can't read
+  compiled custom properties). **(2) Lifecycle map + primitives** — a pure,
+  framework-free `ui/src/lib/lifecycle-status.ts` maps `initiativeStatus`/`health`
+  → `{cssVar,label,className}` (trim+lowercase, unknown → benign `--jo-fg-muted`
+  fallback, never throws) and exposes `LIFECYCLE_STAGES`/`stageIndex`; two `OnPush`
+  presentational primitives — **`johnny-lifecycle-bar`** (five ordered stages, the
+  active one `.on` in its semantic color + a health pill) and
+  **`johnny-status-pill`** — color themselves from that map via the tokens, no
+  inline color logic, no data fetch. **(3) Nav rail** — a single `nav-items.ts`
+  list (Work → `/terminal`, Files → `/files`, Shells → `/shells`, Settings →
+  `/settings`; all **existing** routes) drives both the widescreen icon rail and
+  the mobile bottom-nav so they can't drift; it replaces the old `ion-menu` text
+  sidebar, highlights the active route in amber, and the `+` **reuses the P6
+  `openLauncher`/`LauncherMenuComponent` verbatim**. **(4) Initiative console** —
+  "Work" at the existing `terminal` route becomes a master-detail grid wrapping the
+  existing Transcript/Raw terminal/Plan/Diff pane shell: a pure `console-logic.ts`
+  projects `listAgentPlans` → the initiative master-list (`initiativeRows`,
+  injected `nowIso` — no `Date.now()`), the Initiative's `validationConfig` → the
+  read-only lens summary (`lensSummary`, **reusing P7's `fromConfigJson` +
+  default triad**), and the **already-loaded** `gitDiff` view → the touched-files
+  panel (`touchedFiles`, `new`/`edited` badge, benign empty on clean/non-repo). A
+  §08 `consolePaneFor` drives the mobile segment switcher
+  (transcript/files/validation, unknown → transcript). Container queries collapse
+  the console to one column + bottom nav on phone and expand it to four regions on
+  widescreen. `nx build web`/`ui` green; web vitest green incl. `theme-tokens` /
+  `lifecycle-status` / `nav-items` / `console-logic` specs; **no Rust change → the
+  running desktop is not rebuilt/relaunched**, visual verification deferred to
+  orchestrator Playwright capture. See [`docs/app-shell.md`](docs/app-shell.md).
 - **Configurable validation + Diff tab (overhaul P7)**. Two independent things.
   **(1) Configurable validation** — the phase-review fan-out (development **and**
   planning) is now driven by an **ordered, N-lens array persisted on the
