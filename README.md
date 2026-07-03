@@ -125,6 +125,7 @@ Recent planner/runtime behavior worth knowing:
 
 - An Initiative can now start in a **briefing** stage — a clarify-before-planning conversation that ends in an explicit "Accept brief → Planning". Accept flips the *same* `agent_plans` row from `initiative_status='briefing'` to `'planning'` and starts the existing planner with the composed brief (no second row). See [`docs/briefing.md`](docs/briefing.md).
 - A two-pane **file manager** is reachable at **`/files`** (nav entry: Files) — browse the `files_root`-rooted tree with breadcrumbs, preview via the render core (markdown/code), inline-edit text with a `● unsaved` indicator + Save, run the CRUD toolbar (New file/folder · Rename · Delete), and drag-drop upload with per-file progress. UI only over the existing P2 host file ops; the host guards every path. See [`docs/files.md`](docs/files.md).
+- A **`+ New` launcher** (nav entry: New) and a **Shells destination** at **`/shells`** (nav entry: Shells) let the operator launch a plain shell and see their launched shells in one place. The launcher popover has four entries — New initiative (→ briefing), **Raw shell** (`createSession({provider:'shell'})` → open in the terminal surface), Attach to tmux session (`listTmuxSessions()` picker), Open file manager (→ /files). `/shells` lists active shell/attached-tmux sessions plus attachable external tmux panes; opening a row navigates to the existing terminal surface (no second terminal is embedded). Web-only, reuse-only — no new agent runner, spawn path, or transport. See [`docs/shells.md`](docs/shells.md).
 - Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.
 - Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
 - Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
@@ -425,6 +426,10 @@ Repo-local docs live alongside the code:
 - **`docs/files.md`** — the `/files` file manager (overhaul P5): the two-pane
   browse/preview/edit surface, CRUD toolbar and drag-drop upload over the P2 host
   file ops, the preview-mode classifier, and the pure navigation/upload seams
+- **`docs/shells.md`** — the `+ New` launcher + `/shells` destination (overhaul
+  P6): the four-entry launcher popover, raw-shell launch and attach-to-tmux over
+  the existing P2 session ops, the shells list (filter/dedupe), and the pure
+  launcher/list seams — all navigating to the existing P3 terminal surface
 
 ## Notable features shipped beyond the multi-user-saas plan
 
@@ -491,6 +496,7 @@ plan, so a fresh session can know what's already live.
 | Partner / third-party API (J1: authenticated GraphQL + WSS) | Done (2026-06) |
 | Briefing loop — clarify → accept → plan (overhaul P4) | Done (2026-07) |
 | Files manager — `/files` browse/preview/edit + CRUD + upload (overhaul P5) | Done (2026-07) |
+| Raw shell launcher + `/shells` destination (overhaul P6) | Done (2026-07) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 

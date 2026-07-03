@@ -7,6 +7,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Raw shell launcher + Shells destination (overhaul P6)**. A **`+ New`**
+  launcher popover (nav entry: New) and a **Shells** destination at **`/shells`**
+  (nav entry: Shells) — **web-only, reuse-only** (no new agent runner, session-spawn
+  path, transport, Rust/worker/relay surface, or npm dependency). The launcher
+  (`LauncherMenuComponent`, `ion-popover`) has four entries: **New initiative** →
+  `/briefing/new` (P4), **Raw shell** → `createSession({provider:'shell'})` (the
+  existing `CliProvider::Shell`) then open `/terminal?sessionId=` (P3), **Attach to
+  tmux session** → `listTmuxSessions()` radio picker → `createSession({tmuxSessionName})`
+  → open, **Open file manager** → `/files` (P5). Raw shell spawns with the persisted
+  `last_working_directory` (host default when unset); no cwd picker on the launcher.
+  The `ShellsPage` lists **active shells** (`listSessions('active')` filtered to
+  `provider==='shell'`/`attachedTmux`) + **attachable tmux** (`listTmuxSessions()`
+  minus already-attached); a shell row navigates to the existing terminal surface,
+  an attachable row attaches then opens — **no second terminal is embedded**, the
+  P3 renderer is not forked. A raw shell runs the host's `$SHELL` with the operator's
+  own privileges (same as the terminal page's New-session flow) — no new privilege
+  or attack surface; session ids are never logged as secrets. New web code
+  `web/src/app/components/launcher-menu/` + `web/src/app/pages/shells/` (each a thin
+  component + one pure, spec-pinned module) + a lazy `authGuard` `/shells` route +
+  `+ New`/Shells nav entries. `@johnnyone/ui` reused verbatim (`createSession`/
+  `listSessions`/`listTmuxSessions`/`getSetting`). nx build web/ui + web vitest
+  green; no Rust edits (running desktop app not rebuilt); visual verification
+  deferred. See [`docs/shells.md`](docs/shells.md).
 - **Files manager (overhaul P5)**. A two-pane **file manager** at **`/files`**
   (nav entry: Files) over the host filesystem — **UI only**, built entirely on the
   P2 host file ops and the P3 render core (no new backend / relay / worker / Rust
