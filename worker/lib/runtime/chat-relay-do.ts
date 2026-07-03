@@ -14,7 +14,7 @@
  */
 
 interface RelayEnvelope {
-  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'session_deleted' | 'session_updated' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response' | 'terminal_screen' | 'terminal_command' | 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_resize' | 'terminal_kill' | 'terminal_command_ack' | 'agent_plan_run_updated';
+  type: 'chat_request' | 'chat_delta' | 'chat_complete' | 'chat_message' | 'session_deleted' | 'session_updated' | 'heartbeat' | 'ping' | 'pong' | 'rpc_request' | 'rpc_response' | 'terminal_screen' | 'terminal_command' | 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_resize' | 'terminal_kill' | 'terminal_command_ack' | 'agent_plan_run_updated' | 'stream_event' | 'stream_subscribe' | 'stream_unsubscribe';
   relayId?: string;
   sessionId?: string;
   requestId?: string;
@@ -352,6 +352,10 @@ export class ChatRelayDO implements DurableObject {
         case 'terminal_visual_unsubscribe':
         case 'terminal_resize':
         case 'terminal_kill':
+        // Stream-event per-session subscription controls (overhaul P2, D6) ride the SAME
+        // client→desktop forward + ownership gate as the terminal visual controls.
+        case 'stream_subscribe':
+        case 'stream_unsubscribe':
           // Mobile/api → desktop: forward ONLY after ownership gate (Task 02)
           if (clientType !== 'desktop') {
             const sid = ((envelope.data as any)?.sessionId as string) || (envelope.sessionId as string) || '';
@@ -366,7 +370,11 @@ export class ChatRelayDO implements DurableObject {
             // Scope guard for api key sockets (JWT unrestricted)
             if ((authCtx as any).apiKey) {
               const sctx = { apiKey: (authCtx as any).apiKey };
-              const needed = (envelope.type === 'terminal_visual_subscribe') ? 'terminal:read' : 'terminal:write';
+              // Read-only controls (visual subscribe, stream subscribe/unsubscribe) need
+              // terminal:read; the mutating terminal controls need terminal:write. No new scope
+              // is invented — a per-session stream subscription is a read (overhaul P2, D6/D8).
+              const readOnlyControls = ['terminal_visual_subscribe', 'stream_subscribe', 'stream_unsubscribe'];
+              const needed = readOnlyControls.includes(envelope.type) ? 'terminal:read' : 'terminal:write';
               try {
                 requireScope(sctx as any, needed as any);
               } catch {
@@ -407,6 +415,9 @@ export class ChatRelayDO implements DurableObject {
         case 'terminal_screen':
         case 'terminal_command_ack':
         case 'agent_plan_run_updated':
+        // Structured stream events are desktop→clients only (overhaul P2, D6). A client must not
+        // be able to inject one to others — the `clientType === 'desktop'` guard below enforces it.
+        case 'stream_event':
           // Desktop → mobile + api: broadcast response data (api partners must receive terminal_screen etc.)
           if (clientType === 'desktop') {
             this.broadcastTo('mobile', envelope);

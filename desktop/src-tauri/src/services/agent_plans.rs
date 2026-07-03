@@ -4349,7 +4349,7 @@ fn resolve_workspace_file_path(root: &Path, path: &str) -> Result<PathBuf, Strin
     Ok(normalized)
 }
 
-fn content_type_for_path(path: &Path) -> String {
+pub(crate) fn content_type_for_path(path: &Path) -> String {
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -4564,7 +4564,7 @@ fn escape_html_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn is_text_content_type(content_type: &str) -> bool {
+pub(crate) fn is_text_content_type(content_type: &str) -> bool {
     content_type.starts_with("text/")
         || matches!(
             content_type,

@@ -224,6 +224,44 @@ type HostFileContent {
   size: Int!
 }
 
+# --- File manager (overhaul P2, files_root-rooted) ---
+# Global-rooted file surface (decision D2), separate from the plan-scoped HostFile* readers above.
+# Field names/types mirror the host serde camelCase (host_files.rs) so resolvers are pure
+# pass-throughs with no mapping.
+type FileEntry {
+  name: String!
+  path: String!
+  kind: String! # "file" | "dir"
+  size: Int
+  modified: Float
+}
+
+type DirListing {
+  path: String!
+  root: String!
+  entries: [FileEntry!]!
+}
+
+type FileContent {
+  path: String!
+  name: String!
+  contentType: String!
+  encoding: String! # "utf8" | "base64"
+  content: String!
+  size: Int!
+}
+
+type FileOpResult {
+  path: String!
+  ok: Boolean!
+}
+
+type UploadChunkResult {
+  path: String!
+  received: Int!
+  complete: Boolean!
+}
+
 type WorkspaceFileDiff {
   path: String!
   diff: String!
@@ -315,6 +353,23 @@ type TmuxSession {
   windows: Int!
 }
 
+# Deterministic one-shot pane snapshot (overhaul P2). Mirrors the host `TerminalSnapshot` serde
+# (terminal.rs, camelCase) so the resolver is a pure pass-through. The live stream still rides the
+# `terminal_screen` broadcast; this is the request/response capture for automation/tests.
+type TerminalScreen {
+  sessionId: ID!
+  tmuxSessionName: String!
+  paneId: String!
+  cursor: Int!
+  content: String!
+  cursorX: Int!
+  cursorY: Int!
+  historyLines: Int!
+  rows: Int!
+  cols: Int!
+  status: String!
+}
+
 input UpsertProviderConfigInput {
   provider: String!
   cliPath: String
@@ -363,6 +418,8 @@ type Query {
   listDesktopNodes: [DesktopNode!]!
   listAiSessions(status: String): [AiSession!]!
   listTmuxSessions: [TmuxSession!]!
+  # Deterministic one-shot pane capture (overhaul P2) — relay to host `capture_terminal`.
+  captureTerminal(sessionId: ID!, historyLines: Int): TerminalScreen!
   getAiSession(id: ID!): AiSession
   listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!
   listProviderConfigs: [ProviderConfig!]!
@@ -378,6 +435,9 @@ type Query {
   readHostFile(planId: ID!, path: String!): HostFileContent!
   getWorkspaceFileDiff(planId: ID!, path: String!): WorkspaceFileDiff!
   getChatAttachment(id: ID!): ChatAttachmentContent!
+  # File manager (overhaul P2) — relay to host files_root surface.
+  filesListDir(path: String!): DirListing!
+  filesRead(path: String!): FileContent!
 }
 
 # --- Mutations ---
@@ -412,6 +472,12 @@ type Mutation {
   updateGitAction(planId: ID!, path: String, action: String!, message: String): GitActionResult!
   createChatAttachment(input: ChatAttachmentInput!): ChatAttachment!
   deleteChatAttachment(input: MarkChatAttachmentDeliveredInput!): ChatAttachment!
+  # File manager (overhaul P2) — relay to host files_root surface.
+  filesWrite(path: String!, content: String!, encoding: String): FileOpResult!
+  filesMkdir(path: String!): FileOpResult!
+  filesRename(from: String!, to: String!): FileOpResult!
+  filesDelete(path: String!): FileOpResult!
+  filesUploadChunk(path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
 }
 
 # --- Subscriptions ---

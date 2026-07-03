@@ -7,6 +7,7 @@ import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
 import { ToolDefinition, ToolExecution } from '../models/tool.model';
 import { ProviderConfig, AiUsageSummary } from '../models/provider.model';
 import { DesktopNode } from '../models/desktop-node.model';
+import { TerminalScreen } from '../models/terminal.model';
 
 export interface CreateAiSessionInput {
   title?: string;
@@ -191,6 +192,38 @@ export interface HostFileContent {
   encoding: string;
   content: string;
   size: number;
+}
+
+// File manager (overhaul P2, files_root-rooted). Mirrors the Phase-02 GraphQL types and the host
+// serde (host_files.rs) — camelCase, separate from the plan-scoped HostFile* interfaces above.
+export interface FileEntry {
+  name: string;
+  path: string; // relative to files_root
+  kind: 'file' | 'dir' | string;
+  size?: number;
+  modified?: number; // unix millis
+}
+export interface DirListing {
+  path: string;
+  root: string;
+  entries: FileEntry[];
+}
+export interface FileContent {
+  path: string;
+  name: string;
+  contentType: string;
+  encoding: 'utf8' | 'base64' | string;
+  content: string;
+  size: number;
+}
+export interface FileOpResult {
+  path: string;
+  ok: boolean;
+}
+export interface UploadChunkResult {
+  path: string;
+  received: number;
+  complete: boolean;
 }
 
 export interface WorkspaceFileDiff {
@@ -924,6 +957,126 @@ export class JohnnyApiService {
         { planId, path }
       )
       .pipe(map((data) => data.getWorkspaceFileDiff));
+  }
+
+  // ── File manager (overhaul P2) — relay-RPC via the Phase-02 worker GraphQL surface. ──────────
+  // Auth (JWT Bearer + tenant/user headers) is attached centrally by graphql-client.ts; these
+  // methods inherit it. `content`/`dataBase64` are forwarded, never logged.
+  listDir(path: string): Observable<DirListing> {
+    return this.gql
+      .query<{ filesListDir: DirListing }>(
+        `query FilesListDir($path: String!) {
+          filesListDir(path: $path) {
+            path root entries { name path kind size modified }
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesListDir));
+  }
+
+  readFile(path: string): Observable<FileContent> {
+    return this.gql
+      .query<{ filesRead: FileContent }>(
+        `query FilesRead($path: String!) {
+          filesRead(path: $path) {
+            path name contentType encoding content size
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesRead));
+  }
+
+  writeFile(
+    path: string,
+    content: string,
+    encoding: 'utf8' | 'base64' = 'utf8'
+  ): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesWrite: FileOpResult }>(
+        `mutation FilesWrite($path: String!, $content: String!, $encoding: String) {
+          filesWrite(path: $path, content: $content, encoding: $encoding) {
+            path ok
+          }
+        }`,
+        { path, content, encoding }
+      )
+      .pipe(map((data) => data.filesWrite));
+  }
+
+  mkdir(path: string): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesMkdir: FileOpResult }>(
+        `mutation FilesMkdir($path: String!) {
+          filesMkdir(path: $path) {
+            path ok
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesMkdir));
+  }
+
+  rename(from: string, to: string): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesRename: FileOpResult }>(
+        `mutation FilesRename($from: String!, $to: String!) {
+          filesRename(from: $from, to: $to) {
+            path ok
+          }
+        }`,
+        { from, to }
+      )
+      .pipe(map((data) => data.filesRename));
+  }
+
+  deleteFile(path: string): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesDelete: FileOpResult }>(
+        `mutation FilesDelete($path: String!) {
+          filesDelete(path: $path) {
+            path ok
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesDelete));
+  }
+
+  uploadChunk(
+    path: string,
+    chunkIndex: number,
+    totalChunks: number,
+    dataBase64: string,
+    done: boolean
+  ): Observable<UploadChunkResult> {
+    return this.gql
+      .mutate<{ filesUploadChunk: UploadChunkResult }>(
+        `mutation FilesUploadChunk($path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
+          filesUploadChunk(path: $path, chunkIndex: $chunkIndex, totalChunks: $totalChunks, dataBase64: $dataBase64, done: $done) {
+            path received complete
+          }
+        }`,
+        { path, chunkIndex, totalChunks, dataBase64, done }
+      )
+      .pipe(map((data) => data.filesUploadChunk));
+  }
+
+  // Deterministic one-shot terminal capture (overhaul P2). The live stream still uses
+  // relay-terminal.service.ts; this request/response read is for deterministic reads (tests/automation).
+  captureTerminal(sessionId: string, historyLines?: number): Observable<TerminalScreen> {
+    return this.gql
+      .query<{ captureTerminal: TerminalScreen }>(
+        `query CaptureTerminal($sessionId: ID!, $historyLines: Int) {
+          captureTerminal(sessionId: $sessionId, historyLines: $historyLines) {
+            sessionId tmuxSessionName paneId cursor content
+            cursorX cursorY historyLines rows cols status
+          }
+        }`,
+        { sessionId, historyLines }
+      )
+      .pipe(map((data) => data.captureTerminal));
   }
 
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {

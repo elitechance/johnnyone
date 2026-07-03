@@ -117,3 +117,21 @@ pub struct CliSpawnConfig {
     /// Environment variables to set (empty value = unset the var).
     pub env_vars: Vec<(String, String)>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Confirms `Shell` is a first-class provider that resolves like the agent CLIs (overhaul P2,
+    /// decision D7) — so it spawns and captures over the same terminal path, no shell-specific
+    /// branch. `"bash"`/`"sh"` are accepted aliases; the static default command is `bash` (the
+    /// user's `$SHELL` is preferred at runtime in `terminal.rs::provider_command`).
+    #[test]
+    fn shell_provider_resolves() {
+        assert_eq!(CliProvider::from_str("shell"), Some(CliProvider::Shell));
+        assert_eq!(CliProvider::from_str("bash"), Some(CliProvider::Shell));
+        assert_eq!(CliProvider::from_str("sh"), Some(CliProvider::Shell));
+        assert_eq!(CliProvider::Shell.as_str(), "shell");
+        assert_eq!(CliProvider::Shell.default_command(), "bash");
+    }
+}

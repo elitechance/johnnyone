@@ -1,6 +1,6 @@
 use crate::state::app_state::AppState;
 use rusqlite::params;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const KEY_WORKER_URL: &str = "worker_url";
 pub const KEY_TENANT_ID: &str = "tenant_id";
@@ -19,6 +19,10 @@ pub const KEY_REFRESH_TOKEN: &str = "refresh_token";
 /// plans under `<initiatives_dir>/<initiative_id>/plan/`. Surfaced through the existing
 /// `get_setting`/`set_setting` pair — no dedicated command.
 pub const KEY_INITIATIVES_DIR: &str = "initiatives_dir";
+/// Global browse root for the file manager (design §5). Distinct from `initiatives_dir` (the plan
+/// store). Absolute, user-configurable via the existing `get_setting`/`set_setting` surface — no
+/// dedicated command.
+pub const KEY_FILES_ROOT: &str = "files_root";
 
 pub const DEFAULT_WORKER_URL: &str = "https://johnnyone.ethan-353.workers.dev";
 pub const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -29,6 +33,9 @@ pub const DEFAULT_WEB_CLIENT_URL: &str = "https://johnnyone.pages.dev/";
 /// Default global initiatives store — an absolute path at the Workspace root, outside every
 /// repo (design §5b). There is no existing "workspace root" constant to reuse.
 pub const DEFAULT_INITIATIVES_DIR: &str = "/home/creepy/Documents/Workspace/.johnnyone/initiatives";
+/// Default global file-manager browse root — an absolute path at the Workspace root (design §5).
+/// Distinct from the plan store (`DEFAULT_INITIATIVES_DIR`, decision D2).
+pub const DEFAULT_FILES_ROOT: &str = "/home/creepy/Documents/Workspace";
 
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -167,6 +174,70 @@ pub fn resolve_initiatives_dir(state: &AppState) -> PathBuf {
     })
 }
 
+/// Resolve the configured global file-manager root (absolute). Falls back to `DEFAULT_FILES_ROOT`
+/// when the setting is unset/empty. Mirrors [`resolve_initiatives_dir`].
+pub fn resolve_files_root(state: &AppState) -> PathBuf {
+    let configured = get_setting_or(state, KEY_FILES_ROOT, DEFAULT_FILES_ROOT);
+    let trimmed = configured.trim();
+    PathBuf::from(if trimmed.is_empty() {
+        DEFAULT_FILES_ROOT
+    } else {
+        trimmed
+    })
+}
+
+/// Resolve `rel` under `root`, rejecting traversal above `root` and any `..` segment.
+///
+/// Pure: canonicalizes the containment prefix (defeating symlink/`.`/`..` escapes) but performs no
+/// read/write. `rel` may be relative (joined onto `root`) or absolute (which must still resolve
+/// in-root). Handles not-yet-existing targets (write/mkdir/upload) by canonicalizing the deepest
+/// existing ancestor and re-appending the remaining components, so the guard runs *before* any
+/// directory is created. Reuses the single [`normalize_path`] for the root side.
+pub fn resolve_within_root(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let raw = Path::new(rel);
+    if raw.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("Path must not contain '..'".to_string());
+    }
+    let candidate = if raw.is_absolute() {
+        PathBuf::from(rel)
+    } else {
+        root.join(rel)
+    };
+    let normalized_root = normalize_path(root)?;
+    let normalized = normalize_existing_prefix(&candidate)?;
+    if !normalized.starts_with(&normalized_root) {
+        return Err("Path is outside the configured files_root".to_string());
+    }
+    Ok(normalized)
+}
+
+/// Canonicalize the deepest ancestor of `path` that exists (resolving symlinks) and re-append the
+/// remaining, not-yet-created components. Unlike [`normalize_path`], this tolerates an arbitrary
+/// number of missing nested segments (e.g. `write_file("a/b/c.txt")` before `a/b` exists) while
+/// still resolving symlinks on the existing prefix so containment cannot be escaped.
+fn normalize_existing_prefix(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| "Path has no file name".to_string())?
+            .to_os_string();
+        tail.push(name);
+        existing = existing
+            .parent()
+            .ok_or_else(|| "Path has no parent".to_string())?
+            .to_path_buf();
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .map_err(|e| format!("Invalid path: {}", e))?;
+    for name in tail.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
 /// Resolve a configured host path against a planner workspace root.
 /// Relative paths are joined to `workspace_path`; absolute paths are used as-is.
 pub fn resolve_workspace_host_path(
@@ -223,7 +294,7 @@ fn normalize_existing_dir(path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("Invalid workspace path: {}", e))
 }
 
-fn normalize_path(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn normalize_path(path: &Path) -> Result<PathBuf, String> {
     if path.exists() {
         path.canonicalize()
             .map_err(|e| format!("Invalid path: {}", e))
@@ -265,5 +336,44 @@ mod tests {
             initiative_plan_path(Path::new("/store"), "abc"),
             PathBuf::from("/store/abc/plan")
         );
+    }
+
+    /// A fresh, real temp dir so `canonicalize` succeeds for the containment branch. `Date::now`/
+    /// random are unavailable here, so make the suffix unique with the pid + a static counter
+    /// (mirrors the Phase-1 `tmp_dir` harness).
+    fn guard_tmp_root() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "j1-p2-guard-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn resolve_within_root_rejects_dotdot() {
+        let root = guard_tmp_root();
+        assert!(resolve_within_root(&root, "../etc/passwd").is_err());
+        assert!(resolve_within_root(&root, "a/../../b").is_err());
+    }
+
+    #[test]
+    fn resolve_within_root_rejects_above_root() {
+        let root = guard_tmp_root();
+        // Absolute path outside the root escapes containment even without a `..` segment.
+        assert!(resolve_within_root(&root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn resolve_within_root_allows_in_root() {
+        let root = guard_tmp_root();
+        let canonical_root = root.canonicalize().unwrap();
+        // A not-yet-existing nested target still resolves and stays contained.
+        let resolved = resolve_within_root(&root, "sub/file.txt").expect("in-root path");
+        assert!(resolved.starts_with(&canonical_root));
+        assert!(resolved.ends_with("sub/file.txt"));
     }
 }

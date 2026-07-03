@@ -1336,4 +1336,25 @@ mod tests {
         let long = "x".repeat(FILE_HANDOFF_MIN_LEN);
         assert!(should_use_file_handoff(&long, CliProvider::Codex));
     }
+
+    /// A `Shell` session spawns the plain shell command with NO agent args — proving Shell uses the
+    /// same spawn path as agents but without provider flags (overhaul P2, decision D7). Pure: no tmux
+    /// pane is created. `cli_path` pins the command so the result is deterministic regardless of the
+    /// test host's `$SHELL`.
+    #[test]
+    fn shell_provider_command_is_shell() {
+        let config = SessionConfig {
+            session_id: "t".to_string(),
+            provider: CliProvider::Shell,
+            model: String::new(),
+            working_directory: "/tmp".to_string(),
+            cli_path: Some("bash".to_string()),
+            setup_commands: None,
+            attached_tmux: false,
+            tmux_session_name: None,
+        };
+        let (command, args) = provider_command(&config);
+        assert_eq!(command, "bash");
+        assert!(args.is_empty(), "shell must launch with no agent args");
+    }
 }

@@ -43,6 +43,11 @@ export type {
   CreateAgentPlanInput,
   HostFileContent,
   HostFileEntry,
+  FileEntry,
+  DirListing,
+  FileContent,
+  FileOpResult,
+  UploadChunkResult,
   TmuxSession,
   PlannerPromptSettings,
   ChatAttachment,
@@ -70,3 +75,4 @@ export { NodeStatusComponent } from './components/node-status/node-status.compon
 export { StreamingTextComponent } from './components/streaming-text/streaming-text.component';
 export { TerminalScreenComponent } from './components/terminal-screen/terminal-screen.component';
 export type { TerminalScreen } from './models/terminal.model';
+export type { StreamEvent } from './models/stream-event.model';

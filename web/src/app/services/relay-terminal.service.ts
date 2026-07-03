@@ -1,6 +1,6 @@
 import { Injectable, NgZone, inject } from '@angular/core';
 import { Observable, Subject, firstValueFrom } from 'rxjs';
-import { AgentPlanRun, AiSession, TerminalScreen } from '@johnnyone/ui';
+import { AgentPlanRun, AiSession, StreamEvent, TerminalScreen } from '@johnnyone/ui';
 import { getWorkerBaseUrl, getWorkerGraphqlUrl } from '../../worker-url';
 import { TerminalScreenCacheService } from './terminal-screen-cache.service';
 import { AuthService } from './auth.service';
@@ -44,6 +44,9 @@ export class RelayTerminalService {
   private readonly terminalScreenCache = inject(TerminalScreenCacheService);
   private readonly auth = inject(AuthService);
   private readonly screenSubject = new Subject<TerminalScreen>();
+  // Structured provider/agent stream events (overhaul P2, D6). Parallel to the terminal screen lane;
+  // the transcript renderer that consumes this is Phase 3 — no rendering here.
+  private readonly streamEventSubject = new Subject<StreamEvent>();
   private readonly agentPlanRunSubject = new Subject<AgentPlanRunUpdate>();
   private readonly sessionUpdatedSubject = new Subject<SessionUpdate>();
   private readonly sessionDeletedSubject = new Subject<string>();
@@ -51,6 +54,7 @@ export class RelayTerminalService {
   private pendingInput = new Map<string, string>();
   private pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private visualSubscriptions = new Map<string, number>();
+  private streamSubscriptions = new Map<string, number>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly errorSubject = new Subject<string>();
   private authFailureCount = 0;
@@ -60,6 +64,35 @@ export class RelayTerminalService {
 
   screens(): Observable<TerminalScreen> {
     return this.screenSubject.asObservable();
+  }
+
+  /** Structured stream events (overhaul P2, D6). Callers filter by `sessionId` as needed, mirroring
+   *  how `screens()` is consumed. */
+  streamEvents(): Observable<StreamEvent> {
+    return this.streamEventSubject.asObservable();
+  }
+
+  /** Per-session stream-event subscription. Ref-counted + replayed on reconnect, exactly like
+   *  `subscribeVisual`. Sends the dedicated `stream_subscribe` envelope the DO forwards to desktop
+   *  through the same ownership gate as the terminal visual controls. */
+  async subscribeStream(sessionId: string): Promise<void> {
+    const current = this.streamSubscriptions.get(sessionId) ?? 0;
+    if (current > 0) {
+      this.streamSubscriptions.set(sessionId, current + 1);
+      return;
+    }
+    await this.sendStreamControl('stream_subscribe', sessionId);
+    this.streamSubscriptions.set(sessionId, 1);
+  }
+
+  async unsubscribeStream(sessionId: string): Promise<void> {
+    const current = this.streamSubscriptions.get(sessionId) ?? 0;
+    if (current <= 1) {
+      this.streamSubscriptions.delete(sessionId);
+      await this.sendStreamControl('stream_unsubscribe', sessionId);
+      return;
+    }
+    this.streamSubscriptions.set(sessionId, current - 1);
   }
 
   agentPlanRuns(): Observable<AgentPlanRunUpdate> {
@@ -230,6 +263,10 @@ export class RelayTerminalService {
       this.sendVisualControlIfOpen('visual_unsubscribe', sessionId);
     }
     this.visualSubscriptions.clear();
+    for (const sessionId of this.streamSubscriptions.keys()) {
+      this.sendStreamControlIfOpen('stream_unsubscribe', sessionId);
+    }
+    this.streamSubscriptions.clear();
     this.socket?.close();
     this.socket = null;
     this.connectAttemptEverOpened = false;
@@ -303,6 +340,30 @@ export class RelayTerminalService {
         data: '',
         control,
       },
+    }));
+  }
+
+  private async sendStreamControl(
+    type: 'stream_subscribe' | 'stream_unsubscribe',
+    sessionId: string,
+  ): Promise<void> {
+    await this.ensureConnected();
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WS_OPEN) {
+      throw new Error('Relay terminal socket is not connected');
+    }
+    socket.send(JSON.stringify({
+      type,
+      data: { requestId: crypto.randomUUID(), sessionId },
+    }));
+  }
+
+  private sendStreamControlIfOpen(type: 'stream_subscribe' | 'stream_unsubscribe', sessionId: string): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WS_OPEN) return;
+    socket.send(JSON.stringify({
+      type,
+      data: { requestId: crypto.randomUUID(), sessionId },
     }));
   }
 
@@ -395,6 +456,10 @@ export class RelayTerminalService {
     for (const sessionId of this.visualSubscriptions.keys()) {
       this.sendVisualControlIfOpen('visual_subscribe', sessionId);
     }
+    // Replay stream subscriptions on the same reconnect so the transcript lane survives a drop.
+    for (const sessionId of this.streamSubscriptions.keys()) {
+      this.sendStreamControlIfOpen('stream_subscribe', sessionId);
+    }
   }
 
   errors(): Observable<string> {
@@ -407,7 +472,8 @@ export class RelayTerminalService {
     const delay = 1000 * Math.min(this.authFailureCount + 1, 10); // backoff, bound max 10s
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      if (this.visualSubscriptions.size === 0) return;
+      // Reconnect if there is anything to replay — terminal visual OR stream subscriptions.
+      if (this.visualSubscriptions.size === 0 && this.streamSubscriptions.size === 0) return;
 
       try {
         // Branch per Task 04 #2: for AUTH rejection (pre-open), do refresh then ensure.
@@ -444,6 +510,11 @@ export class RelayTerminalService {
       // because viewport snapshots are shorter than a stored history snapshot.
       this.terminalScreenCache.remember(incoming);
       this.zone.run(() => this.screenSubject.next(incoming));
+      return;
+    }
+
+    if (envelope.type === 'stream_event') {
+      this.zone.run(() => this.streamEventSubject.next(envelope.data as StreamEvent));
       return;
     }
 

@@ -11,6 +11,8 @@ export const API_SCOPES = [
   'plans:write',
   'sessions:read',
   'sessions:write',
+  'files:read',
+  'files:write',
 ] as const;
 
 export type ApiScope = (typeof API_SCOPES)[number];

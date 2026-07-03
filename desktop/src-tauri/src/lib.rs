@@ -10,4 +10,6 @@ pub mod services;
 pub mod simulator;
 pub mod state;
 pub mod terminal;
+#[cfg(test)]
+pub mod test_support;
 pub mod tools;

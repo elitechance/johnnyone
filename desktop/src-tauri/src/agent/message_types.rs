@@ -64,6 +64,11 @@ pub enum AgentMessage {
     #[serde(rename = "terminal_screen")]
     TerminalScreen(TerminalScreen),
 
+    /// Desktop → remote clients: a structured provider/agent stream event (overhaul P2, D6).
+    /// Rides the same envelope lane as `terminal_screen`; emitted wire `type` is `stream_event`.
+    #[serde(rename = "stream_event")]
+    StreamEvent(crate::events::StreamEvent),
+
     /// Remote clients → desktop: raw terminal input for a tmux pane.
     #[serde(rename = "terminal_command")]
     TerminalCommand(TerminalCommand),
