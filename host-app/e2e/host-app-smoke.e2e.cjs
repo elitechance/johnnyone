@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
  * host-app local smoke — drives the Tauri control-panel Angular app in a browser.
- * Verifies: status page, providers page (detects real CLIs from the local host),
- * login page renders. Assumes:
+ * Verifies: the consolidated dashboard at /status (Status + Agent providers +
+ * Store & paths, detecting real CLIs from the local host), and that /login
+ * renders. The standalone /providers page was folded into the dashboard (P9/D3),
+ * so this asserts the "Agent providers" section inside host-status-page. Assumes:
  *   - johnnyone-host running on :7788 (so status chips can show "Up")
  *   - `nx serve host-app --port 4201` running
  *
@@ -48,9 +50,21 @@ const shot = async (page, name) => {
   if (!urlAfterRoot.includes('/status')) {
     log('  (router did NOT update URL but host-status-page rendered) — proceeding');
   }
-  // Let the HostStatusService refresh() complete (fetch :7788 + worker)
+  // Let the HostStatusService refresh() + detectCliTools()/settings.load() settle
   await new Promise((r) => setTimeout(r, 2000));
   await shot(page, '1-status');
+
+  // Providers card is now folded into the dashboard (P9/D3) — assert the
+  // "Agent providers" section renders inside host-status-page, no separate nav.
+  await page.waitForFunction(
+    () => {
+      const el = document.querySelector('host-status-page');
+      return !!el && (el.textContent || '').includes('Agent providers');
+    },
+    { timeout: 15000 },
+  ).catch(() => log('  (Agent providers section not found — taking screenshot anyway)'));
+  await new Promise((r) => setTimeout(r, 300));
+  await shot(page, '3-providers');
 
   // /login
   log('GET /login');
@@ -58,23 +72,6 @@ const shot = async (page, name) => {
   await page.waitForSelector('host-login-page', { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 800));
   await shot(page, '2-login');
-
-  // /providers — should detect real CLIs from the local johnnyone-host
-  log('GET /providers');
-  await page.goto(`${APP}/providers`, { waitUntil: 'networkidle2' });
-  await page.waitForSelector('host-providers-page', { timeout: 10000 });
-  // detectCliTools query is async — wait for load() to settle
-  await page.waitForFunction(
-    () => {
-      const card = document.querySelector('host-providers-page ion-card-content');
-      if (!card) return false;
-      const text = card.textContent || '';
-      return !text.includes('Checking…');
-    },
-    { timeout: 15000 },
-  ).catch(() => log('  (providers load wait timed out — taking screenshot anyway)'));
-  await new Promise((r) => setTimeout(r, 500));
-  await shot(page, '3-providers');
 
   await browser.close();
   log('✓ all steps complete');

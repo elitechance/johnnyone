@@ -17,11 +17,6 @@ export const appRoutes: Route[] = [
       import('./pages/status/status.page').then((m) => m.StatusPage),
   },
   {
-    path: 'providers',
-    loadComponent: () =>
-      import('./pages/providers/providers.page').then((m) => m.ProvidersPage),
-  },
-  {
     path: 'settings',
     loadComponent: () =>
       import('./pages/settings/settings.page').then((m) => m.SettingsPage),

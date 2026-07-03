@@ -4,11 +4,12 @@ import { HostSettingsService } from './host-settings.service';
 
 const HOST_URL = 'http://127.0.0.1:7788/graphql';
 
-interface DetectedTool {
+export interface DetectedTool {
   provider: string;
   command: string;
   found: boolean;
   path?: string | null;
+  defaultModel?: string | null;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -19,6 +20,8 @@ export class HostStatusService {
   readonly hostUp = signal(false);
   readonly workerUp = signal(false);
   readonly relayConnected = signal(false);
+  readonly relayHeartbeat = signal<string | null>(null);
+  readonly activeSessions = signal<number>(0);
   readonly workerUrl = signal('');
   readonly webClientUrl = signal('https://johnnyone.pages.dev/');
   readonly lastError = signal('');
@@ -33,6 +36,7 @@ export class HostStatusService {
         this.pingHost(),
         this.pingWorker(hostSettings.workerUrl),
         this.refreshRelayStatus(),
+        this.countSessions(),
       ]);
     } catch (err) {
       this.lastError.set(err instanceof Error ? err.message : String(err));
@@ -43,8 +47,30 @@ export class HostStatusService {
     try {
       const status = await this.relay.status();
       this.relayConnected.set(status.connected);
+      this.relayHeartbeat.set(status.lastHeartbeat);
     } catch {
       this.relayConnected.set(false);
+      this.relayHeartbeat.set(null);
+    }
+  }
+
+  private async countSessions(): Promise<void> {
+    try {
+      const res = await fetch(HOST_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: '{ listAiSessions { id } }' }),
+      });
+      if (!res.ok) {
+        this.activeSessions.set(0);
+        return;
+      }
+      const json = (await res.json()) as {
+        data?: { listAiSessions: Array<{ id: string }> };
+      };
+      this.activeSessions.set(json.data?.listAiSessions?.length ?? 0);
+    } catch {
+      this.activeSessions.set(0);
     }
   }
 
@@ -81,7 +107,7 @@ export class HostStatusService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query: '{ listProviderConfigs { provider cliPath isAvailable } }',
+          query: '{ listProviderConfigs { provider cliPath isAvailable defaultModel } }',
         }),
       });
       if (!res.ok) return [];
@@ -91,6 +117,7 @@ export class HostStatusService {
             provider: string;
             cliPath: string;
             isAvailable: boolean;
+            defaultModel?: string | null;
           }>;
         };
       };
@@ -100,6 +127,7 @@ export class HostStatusService {
         command: c.cliPath,
         found: c.isAvailable,
         path: c.cliPath || null,
+        defaultModel: c.defaultModel ?? null,
       }));
     } catch {
       return [];

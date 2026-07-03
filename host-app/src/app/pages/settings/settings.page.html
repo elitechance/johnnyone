@@ -97,6 +97,33 @@
     </ion-card-content>
   </ion-card>
 
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Store &amp; paths</ion-card-title>
+      <ion-card-subtitle>Where initiative plans and browsable files live on this machine</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="full">
+        <ion-item>
+          <ion-input
+            label="Initiatives directory"
+            labelPlacement="stacked"
+            placeholder="/home/…/.johnnyone/initiatives"
+            [(ngModel)]="initiativesDir"
+          ></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="Files root"
+            labelPlacement="stacked"
+            placeholder="/home/…/Workspace"
+            [(ngModel)]="filesRoot"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+    </ion-card-content>
+  </ion-card>
+
   @if (error()) {
     <ion-text color="danger"><p>{{ error() }}</p></ion-text>
   }
