@@ -1,3 +1,4 @@
+use crate::db::migrations::health_from_status;
 use crate::db::models::{
     AgentPlan, AgentPlanEvent, AgentPlanPhase, AgentPlanTask, CreateAgentPlanInput,
     CreateSessionInput,
@@ -144,6 +145,35 @@ struct TaskStatusYaml {
     status: Option<String>,
 }
 
+/// The initiative_id of the planning stage-run that owns this plan path, if any.
+/// Shared join key between a planning stage-run and its development stage-run (D3).
+/// Extracted so the linkage query is regression-covered directly (task 02-04 test 4).
+fn find_planning_initiative_id(conn: &rusqlite::Connection, plan_path: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT initiative_id FROM agent_plans \
+         WHERE plan_path = ?1 AND run_type = 'planning' \
+         ORDER BY created_at ASC LIMIT 1",
+        params![plan_path],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Set the execution `status` AND derive the `health` axis in one place so the two cannot
+/// drift. `error` is set alongside (`None` clears it). Returns rows affected. Health is
+/// derived via `health_from_status` so removing the pairing fails task 02-04 test 5.
+fn update_plan_status_and_health(
+    conn: &rusqlite::Connection,
+    plan_id: &str,
+    new_status: &str,
+    error: Option<&str>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_plans SET status = ?1, health = ?2, error = ?3, updated_at = datetime('now') WHERE id = ?4",
+        params![new_status, health_from_status(new_status), error, plan_id],
+    )
+}
+
 pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<AgentPlanRun, String> {
     let run_type = input
         .run_type
@@ -155,6 +185,12 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
 
     let parsed = parse_plan(&input.workspace_path, &input.plan_path)?;
     let plan_id = Uuid::new_v4().to_string();
+    // Link this development stage-run to the planning stage-run that owns the same plan_path
+    // (now the global store path). Reuse its initiative_id; mint a fresh one if none exists (D3).
+    let initiative_id = state
+        .db
+        .with_conn(|conn| Ok(find_planning_initiative_id(conn, &parsed.plan_path.to_string_lossy())))?
+        .unwrap_or_else(|| plan_id.clone());
     let title = input.title.unwrap_or_else(|| parsed.title.clone());
     // Explicit app-repo path (where the docs-commit agent commits on completion).
     let app_scope = normalize_optional_workspace_path(
@@ -179,8 +215,10 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope, reviewer_setup_commands)
-             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9, ?10)",
+            // A development run reuses its planning run's initiative_id (linked by shared store
+            // plan_path); initiative_status='development', health seeded 'in-progress'.
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope, reviewer_setup_commands, initiative_id, initiative_status, health)
+             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9, ?10, ?11, 'development', 'in-progress')",
             params![
                 plan_id,
                 title,
@@ -192,6 +230,7 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
                 parsed.phases.first().map(|phase| phase.phase_id.as_str()),
                 app_scope,
                 input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
+                initiative_id,
             ],
         )
         .map_err(|e| format!("Failed to create agent plan: {}", e))?;
@@ -255,35 +294,29 @@ fn create_planning_run(
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
     }
-    let raw_plan = Path::new(&input.plan_path);
-    // A new plan usually points at a directory that doesn't exist yet (and whose
-    // parent may not exist either), so create it before normalizing — otherwise
-    // canonicalize() on the missing parent fails with "Invalid parent path".
-    // Reject `..` and confirm absolute paths sit inside the workspace before we
-    // create anything, so mkdir can never escape the workspace.
+    // The inbound plan_path (the ui's `docs/plans/<slug>`) is now advisory only — the plan
+    // actually lives in the global initiatives store, outside every repo (D4). Still `..`-guard
+    // it defensively (same message/logic as parse_plan) so no user-influenced component can
+    // traverse, even though the derived store path is UUID-based and cannot contain `..`.
     if input.plan_path.split(['/', '\\']).any(|seg| seg == "..") {
         return Err("Plan path must not contain '..'".to_string());
     }
-    let candidate = if raw_plan.is_absolute() {
-        raw_plan.to_path_buf()
-    } else {
-        workspace.join(raw_plan)
-    };
-    if raw_plan.is_absolute() && !candidate.starts_with(&workspace) {
-        return Err("Plan path must be inside the selected workspace".to_string());
-    }
-    std::fs::create_dir_all(&candidate)
-        .map_err(|e| format!("Failed to create plan directory {}: {}", candidate.display(), e))?;
-    let plan = normalize_path(&candidate)?;
-    if !plan.starts_with(&workspace) {
-        return Err("Plan path must be inside the selected workspace".to_string());
-    }
+    // A planning stage-run's id IS its initiative id for a fresh initiative (D3).
+    let initiative_id = Uuid::new_v4().to_string();
+    let plan_id = initiative_id.clone();
+    // Derive `<initiatives_dir>/<initiative_id>/plan` and create it. The store lives outside
+    // every repo by design, so there is deliberately no in-workspace check on this path.
+    let store = settings_service::resolve_initiatives_dir(state);
+    let plan = settings_service::initiative_plan_path(&store, &initiative_id);
+    std::fs::create_dir_all(&plan)
+        .map_err(|e| format!("Failed to create initiative plan dir {}: {}", plan.display(), e))?;
     let app_scope = normalize_optional_workspace_path(&workspace, input.app_scope.as_deref())?;
     let docs_scope = normalize_optional_workspace_path(&workspace, input.docs_scope.as_deref())?;
     let reference_paths = normalize_reference_paths(&workspace, input.reference_paths.as_deref())?;
-    let plan_id = Uuid::new_v4().to_string();
     let title = input.title.clone().unwrap_or_else(|| {
-        plan.file_name()
+        // The advisory input path's last segment makes a nicer default than the store's "plan".
+        Path::new(&input.plan_path)
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .replace('-', " ")
@@ -306,8 +339,10 @@ fn create_planning_run(
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12)",
+            // Fresh initiative: id == initiative_id (?1); plan_path (?4) is the store path;
+            // initiative_status='planning', health seeded 'in-progress'.
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands, initiative_id, initiative_status, health)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?1, 'planning', 'in-progress')",
             params![
                 plan_id,
                 title,
@@ -344,7 +379,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, created_at, updated_at FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, created_at, updated_at FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -366,7 +401,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, created_at, updated_at FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, created_at, updated_at FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -676,11 +711,7 @@ pub async fn block_plan(
     reason: String,
 ) -> Result<AgentPlanRun, String> {
     state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'blocked', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![reason, id],
-        )
-        .map_err(|e| e.to_string())
+        update_plan_status_and_health(conn, &id, "blocked", Some(&reason)).map_err(|e| e.to_string())
     })?;
     append_event(
         state,
@@ -1262,9 +1293,12 @@ async fn spawn_coordinator_loop(state: AppState, plan_id: String) {
     tokio::spawn(async move {
         if let Err(error) = coordinator_loop(state.clone(), plan_id.clone()).await {
             let _ = state.db.with_conn(|conn| {
+                // Kept inline (not via update_plan_status_and_health) to preserve the
+                // `status NOT IN (...)` guard; health is still derived via health_from_status so
+                // the status+health pairing can't drift (documented in decisions.md D-inline).
                 conn.execute(
-                    "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2 AND status NOT IN ('approved', 'blocked', 'stopped')",
-                    params![error, plan_id],
+                    "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
+                    params![health_from_status("needs_attention"), error, plan_id],
                 )
                 .map_err(|e| e.to_string())
             });
@@ -2668,11 +2702,8 @@ async fn escalate_phase_no_converge(
         phase.phase_id, round, verdict, summary
     );
     state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![reason, run.plan.id],
-        )
-        .map_err(|e| e.to_string())
+        update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+            .map_err(|e| e.to_string())
     })?;
     append_event(
         state,
@@ -2693,11 +2724,8 @@ async fn handle_planning_reviewer_output(
     match verdict.as_deref() {
         Some("PASS") => {
             state.db.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE agent_plans SET status = 'approved', error = NULL, updated_at = datetime('now') WHERE id = ?1",
-                    params![run.plan.id],
-                )
-                .map_err(|e| e.to_string())
+                update_plan_status_and_health(conn, &run.plan.id, "approved", None)
+                    .map_err(|e| e.to_string())
             })?;
             // Commit the approved plan state. The message format depends on
             // whether this is the very first approval (initial commit) or a
@@ -2732,11 +2760,8 @@ async fn handle_planning_reviewer_output(
                     round, verdict, summary
                 );
                 state.db.with_conn(|conn| {
-                    conn.execute(
-                        "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-                        params![reason, run.plan.id],
-                    )
-                    .map_err(|e| e.to_string())
+                    update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+                        .map_err(|e| e.to_string())
                 })?;
                 return append_event(
                     state,
@@ -2795,9 +2820,11 @@ async fn clarify_planning_or_needs_attention(
     let attempts = planning_clarification_attempts(run)? + 1;
     if attempts > CLARIFICATION_LIMIT {
         state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'needs_attention', error = 'T2 did not return a parseable planning verdict after 5 clarification attempts', updated_at = datetime('now') WHERE id = ?1",
-                params![run.plan.id],
+            update_plan_status_and_health(
+                conn,
+                &run.plan.id,
+                "needs_attention",
+                Some("T2 did not return a parseable planning verdict after 5 clarification attempts"),
             )
             .map_err(|e| e.to_string())
         })?;
@@ -2970,9 +2997,11 @@ async fn clarify_or_needs_attention(
     let next_attempt = phase.clarification_attempts + 1;
     if next_attempt > CLARIFICATION_LIMIT {
         state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'needs_attention', error = 'T2 did not return a parseable verdict after 5 clarification attempts', updated_at = datetime('now') WHERE id = ?1",
-                params![run.plan.id],
+            update_plan_status_and_health(
+                conn,
+                &run.plan.id,
+                "needs_attention",
+                Some("T2 did not return a parseable verdict after 5 clarification attempts"),
             )
             .map_err(|e| e.to_string())?;
             conn.execute(
@@ -3049,15 +3078,19 @@ async fn pass_phase(
             )
             .map_err(|e| e.to_string())?;
         } else {
+            update_plan_status_and_health(conn, plan_id, "approved", None)
+                .map_err(|e| e.to_string())?;
             conn.execute(
-                "UPDATE agent_plans SET status = 'approved', phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
         }
         } else {
+            update_plan_status_and_health(conn, plan_id, "approved", None)
+                .map_err(|e| e.to_string())?;
             conn.execute(
-                "UPDATE agent_plans SET status = 'approved', phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
@@ -3125,19 +3158,24 @@ async fn pass_phase(
 }
 
 fn parse_plan(workspace_path: &str, plan_path: &str) -> Result<ParsedPlan, String> {
+    // Reject traversal on the raw input first, before any join/normalize (same message/logic as
+    // create_planning_run). This is the only path guard now that plans live in the global store.
+    if plan_path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err("Plan path must not contain '..'".to_string());
+    }
     let workspace = normalize_path(Path::new(workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
     }
     let raw_plan = Path::new(plan_path);
+    // Absolute store paths (outside the workspace) resolve as-is; relative paths join the
+    // workspace. The former "plan must be inside the workspace" rejection is intentionally gone
+    // (D6) — the initiatives store lives outside every repo.
     let plan = if raw_plan.is_absolute() {
         normalize_path(raw_plan)?
     } else {
         normalize_path(&workspace.join(raw_plan))?
     };
-    if !plan.starts_with(&workspace) {
-        return Err("Plan path must be inside the selected workspace".to_string());
-    }
     if !plan.join("overview.md").is_file() {
         return Err("Plan overview.md was not found".to_string());
     }
@@ -4555,8 +4593,11 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         reference_paths: row.get(16)?,
         amend_brief: row.get(17)?,
         phase_run_mode: row.get(18)?,
-        created_at: row.get(19)?,
-        updated_at: row.get(20)?,
+        initiative_id: row.get(19)?,
+        initiative_status: row.get(20)?,
+        health: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
     })
 }
 
@@ -5067,5 +5108,267 @@ mod coordinator_terminal_tests {
             normalize_terminal_snapshot_for_idle(&base),
             normalize_terminal_snapshot_for_idle(&working)
         );
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::db::migrations::run_migrations;
+    use crate::db::Database;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique temp dir. `Date::now`/random are unavailable in this environment, so make the
+    /// suffix unique with the pid + a static counter.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "j1-p1-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the rest
+    /// (broadcast channels) with no live process, relay, or Tauri handle.
+    fn test_state() -> (AppState, PathBuf) {
+        let root = tmp_dir("state");
+        let db = Database::open(&root.join("test.db")).expect("open db");
+        (AppState::new(db), root)
+    }
+
+    fn input(run_type: Option<&str>, workspace: &str, plan_path: &str) -> CreateAgentPlanInput {
+        CreateAgentPlanInput {
+            run_type: run_type.map(|s| s.to_string()),
+            title: None,
+            workspace_path: workspace.to_string(),
+            plan_path: plan_path.to_string(),
+            worker_provider: "claude_code".to_string(),
+            reviewer_provider: "claude_code".to_string(),
+            brief: None,
+            app_scope: None,
+            docs_scope: None,
+            reference_paths: None,
+            worker_setup_commands: None,
+            reviewer_setup_commands: None,
+        }
+    }
+
+    /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
+    fn scaffold_plan(plan_dir: &Path, title: &str) {
+        std::fs::create_dir_all(plan_dir.join("phases/01-x/tasks/01-y")).unwrap();
+        std::fs::write(plan_dir.join("overview.md"), format!("# {}\n", title)).unwrap();
+        std::fs::write(plan_dir.join("phases/01-x/overview.md"), "# Phase X\n").unwrap();
+        std::fs::write(plan_dir.join("phases/01-x/tasks/01-y/prompt.md"), "# Task Y\n").unwrap();
+    }
+
+    // ── Preflight (task 02-01): the AppState harness is constructible ─────────────────
+    #[test]
+    fn appstate_harness_constructs() {
+        let (state, root) = test_state();
+        assert!(state.db.with_conn(|_c| Ok(())).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Test 1: parse_plan resolves an out-of-workspace absolute store path ───────────
+    #[test]
+    fn parse_plan_resolves_out_of_workspace_store_path() {
+        let workspace = tmp_dir("ws");
+        let store_plan = tmp_dir("store").join("INIT/plan");
+        scaffold_plan(&store_plan, "My Plan");
+
+        let parsed = parse_plan(
+            workspace.to_string_lossy().as_ref(),
+            store_plan.to_string_lossy().as_ref(),
+        )
+        .expect("store path must parse even though it is outside the workspace");
+        assert_eq!(parsed.title, "My Plan");
+        assert_eq!(parsed.phases.len(), 1);
+        assert!(
+            !parsed.plan_path.starts_with(&workspace),
+            "resolved plan_path must NOT be under the workspace (proves the guard is relaxed)"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(store_plan.parent().unwrap().parent().unwrap());
+    }
+
+    // ── Test 2: parse_plan rejects `..` ──────────────────────────────────────────────
+    #[test]
+    fn parse_plan_rejects_dotdot() {
+        let workspace = tmp_dir("ws");
+        let ws = workspace.to_string_lossy().to_string();
+        for traversal in ["../escape", "sub/../../escape"] {
+            let err = parse_plan(&ws, traversal).expect_err("traversal must be rejected");
+            assert!(err.contains(".."), "error should mention '..': {}", err);
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // ── Test 3: store path helpers ───────────────────────────────────────────────────
+    #[test]
+    fn initiative_plan_path_is_pure() {
+        assert_eq!(
+            settings_service::initiative_plan_path(Path::new("/store"), "abc"),
+            PathBuf::from("/store/abc/plan")
+        );
+    }
+
+    #[test]
+    fn resolve_initiatives_dir_defaults_then_overrides() {
+        let (state, root) = test_state();
+        assert_eq!(
+            settings_service::resolve_initiatives_dir(&state),
+            PathBuf::from(settings_service::DEFAULT_INITIATIVES_DIR)
+        );
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            "/tmp/j1-store".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings_service::resolve_initiatives_dir(&state),
+            PathBuf::from("/tmp/j1-store")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Test 4: linkage query via shared find_planning_initiative_id ──────────────────
+    #[test]
+    fn find_planning_initiative_id_links_by_plan_path() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+             VALUES ('INIT1', 'planning', 't', '/w', '/store/INIT1/plan', 'claude_code', 'claude_code', 'INIT1', 'planning')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            find_planning_initiative_id(&conn, "/store/INIT1/plan"),
+            Some("INIT1".to_string())
+        );
+        assert_eq!(find_planning_initiative_id(&conn, "/store/UNKNOWN/plan"), None);
+    }
+
+    // ── Test 5: health sync via update_plan_status_and_health ─────────────────────────
+    #[test]
+    fn update_plan_status_and_health_syncs_all_transitions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+             VALUES ('P', 'development', 't', '/w', '/p', 'claude_code', 'claude_code', 'P', 'development')",
+            [],
+        )
+        .unwrap();
+
+        let read = |c: &rusqlite::Connection| -> (String, String, Option<String>) {
+            c.query_row(
+                "SELECT status, health, error FROM agent_plans WHERE id='P'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        update_plan_status_and_health(&conn, "P", "blocked", Some("x")).unwrap();
+        let (s, h, e) = read(&conn);
+        assert_eq!((s.as_str(), h.as_str()), ("blocked", "blocked"));
+        assert_eq!(e.as_deref(), Some("x"));
+
+        update_plan_status_and_health(&conn, "P", "needs_attention", Some("y")).unwrap();
+        let (s, h, _) = read(&conn);
+        assert_eq!((s.as_str(), h.as_str()), ("needs_attention", "needs-attention"));
+
+        update_plan_status_and_health(&conn, "P", "approved", None).unwrap();
+        let (s, h, e) = read(&conn);
+        assert_eq!((s.as_str(), h.as_str()), ("approved", "in-progress"));
+        assert!(e.is_none(), "approve must clear error");
+    }
+
+    // ── Test 6: create_planning_run writes to the store (end-to-end wiring) ───────────
+    #[tokio::test]
+    async fn create_planning_run_writes_under_store() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let run = create_planning_run(
+            &state,
+            input(Some("planning"), workspace.to_string_lossy().as_ref(), "docs/plans/whatever"),
+        )
+        .expect("create_planning_run");
+        let plan = run.plan;
+
+        assert!(!plan.initiative_id.is_empty());
+        assert_eq!(plan.initiative_status, "planning");
+        assert_eq!(plan.health, "in-progress");
+        // The wiring wrote the STORE path (not the advisory input path):
+        assert_eq!(
+            PathBuf::from(&plan.plan_path),
+            settings_service::initiative_plan_path(&store, &plan.initiative_id)
+        );
+        assert!(Path::new(&plan.plan_path).is_dir(), "store plan dir must exist");
+        assert!(
+            !Path::new(&plan.plan_path).starts_with(&workspace),
+            "plan_path must not be under the workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Test 7: dev→planning initiative_id reuse (end-to-end) ─────────────────────────
+    #[tokio::test]
+    async fn create_plan_dev_reuses_planning_initiative_id() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let planning = create_planning_run(
+            &state,
+            input(Some("planning"), workspace.to_string_lossy().as_ref(), "docs/plans/whatever"),
+        )
+        .expect("create_planning_run")
+        .plan;
+
+        // Scaffold a parseable plan at the planning run's store plan_path so create_plan parses it.
+        scaffold_plan(Path::new(&planning.plan_path), "E2E");
+
+        let dev = create_plan(
+            &state,
+            input(Some("development"), workspace.to_string_lossy().as_ref(), &planning.plan_path),
+        )
+        .expect("create_plan (development)")
+        .plan;
+
+        assert_eq!(
+            dev.initiative_id, planning.initiative_id,
+            "development run must share the planning run's initiative_id"
+        );
+        assert_eq!(dev.initiative_status, "development");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

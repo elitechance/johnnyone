@@ -133,6 +133,14 @@ type AgentPlan {
   referencePaths: String
   amendBrief: String
   phaseRunMode: String!
+  # Initiative axes (overhaul phase 1). Deliberately NULLABLE String (not String!) for
+  # deploy-skew safety (decision D8): a worker deploy against a not-yet-rebuilt (pre-migration
+  # 017) desktop returns JSON without these keys; nullable degrades to null instead of failing
+  # non-null coercion on every AgentPlan-returning operation. Rust struct + ui typing stay
+  # non-optional (values always present once migration 017 has run).
+  initiativeId: String
+  initiativeStatus: String
+  health: String
   createdAt: String!
   updatedAt: String!
 }

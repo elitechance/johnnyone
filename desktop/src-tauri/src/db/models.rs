@@ -131,6 +131,12 @@ pub struct AgentPlan {
     /// after T2 PASSes the amended state.
     pub amend_brief: Option<String>,
     pub phase_run_mode: String,
+    /// Groups a planning stage-run + a development stage-run into one Initiative.
+    pub initiative_id: String,
+    /// Lifecycle stage: briefing | planning | development | review | done.
+    pub initiative_status: String,
+    /// Condition axis: in-progress | needs-attention | blocked (independent of stage).
+    pub health: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -231,4 +237,58 @@ pub struct UsageLogEntry {
     pub output_tokens: i64,
     pub cost_cents: i64,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> AgentPlan {
+        AgentPlan {
+            id: "id".into(),
+            run_type: "planning".into(),
+            title: "t".into(),
+            workspace_path: "/w".into(),
+            plan_path: "/p".into(),
+            status: "draft".into(),
+            worker_session_id: None,
+            reviewer_session_id: None,
+            worker_provider: "claude_code".into(),
+            reviewer_provider: "claude_code".into(),
+            current_phase_id: None,
+            current_phase_index: 0,
+            error: None,
+            brief: None,
+            app_scope: None,
+            docs_scope: None,
+            reference_paths: None,
+            amend_brief: None,
+            phase_run_mode: "continue".into(),
+            initiative_id: "INIT".into(),
+            initiative_status: "planning".into(),
+            health: "in-progress".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+        }
+    }
+
+    /// Pins the DB→worker→ui camelCase naming contract (decision D8's silent-null failure mode):
+    /// the Rust field `initiative_id` MUST serialize as `initiativeId`, etc. Fails if
+    /// `#[serde(rename_all = "camelCase")]` is dropped or a field is misnamed.
+    #[test]
+    fn agent_plan_serializes_initiative_axes_as_camelcase() {
+        let v = serde_json::to_value(sample()).unwrap();
+        // camelCase keys present…
+        assert_eq!(v.get("initiativeId").and_then(|x| x.as_str()), Some("INIT"));
+        assert_eq!(
+            v.get("initiativeStatus").and_then(|x| x.as_str()),
+            Some("planning")
+        );
+        assert_eq!(v.get("health").and_then(|x| x.as_str()), Some("in-progress"));
+        // …and the snake_case forms are absent (guards against a missing rename_all).
+        assert!(v.get("initiative_id").is_none());
+        assert!(v.get("initiative_status").is_none());
+        // spot-check an existing renamed field so the whole struct's rename_all is proven.
+        assert!(v.get("runType").is_some());
+    }
 }

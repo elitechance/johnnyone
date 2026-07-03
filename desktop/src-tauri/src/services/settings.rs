@@ -15,6 +15,10 @@ pub const KEY_ACCESS_TOKEN: &str = "access_token";
 /// Refresh token persisted at login so the relay can refresh a short-lived JWT
 /// credential without a restart. Empty for durable `jk_` API-key credentials.
 pub const KEY_REFRESH_TOKEN: &str = "refresh_token";
+/// Global initiatives store: the directory (outside every repo) that holds Initiative
+/// plans under `<initiatives_dir>/<initiative_id>/plan/`. Surfaced through the existing
+/// `get_setting`/`set_setting` pair — no dedicated command.
+pub const KEY_INITIATIVES_DIR: &str = "initiatives_dir";
 
 pub const DEFAULT_WORKER_URL: &str = "https://johnnyone.ethan-353.workers.dev";
 pub const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -22,6 +26,9 @@ pub const DEFAULT_USER_ID: &str = "00000000-0000-0000-0000-000000000002";
 pub const DEFAULT_METHODOLOGY_REL: &str = "lokal/agents/common/methodology.md";
 pub const DEFAULT_CONVENTIONS_REL: &str = "lokal/agents/common/conventions";
 pub const DEFAULT_WEB_CLIENT_URL: &str = "https://johnnyone.pages.dev/";
+/// Default global initiatives store — an absolute path at the Workspace root, outside every
+/// repo (design §5b). There is no existing "workspace root" constant to reuse.
+pub const DEFAULT_INITIATIVES_DIR: &str = "/home/creepy/Documents/Workspace/.johnnyone/initiatives";
 
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -142,6 +149,24 @@ fn resolve_access_token(state: &AppState) -> String {
         .unwrap_or_else(|| get_setting_or(state, KEY_ACCESS_TOKEN, ""))
 }
 
+/// Absolute plan directory for an initiative inside the store: `<dir>/<id>/plan`.
+/// Pure — no filesystem or DB access, so it is unit-testable.
+pub fn initiative_plan_path(initiatives_dir: &Path, initiative_id: &str) -> PathBuf {
+    initiatives_dir.join(initiative_id).join("plan")
+}
+
+/// Resolve the configured global initiatives store dir (absolute).
+/// Falls back to `DEFAULT_INITIATIVES_DIR` when the setting is unset/empty.
+pub fn resolve_initiatives_dir(state: &AppState) -> PathBuf {
+    let configured = get_setting_or(state, KEY_INITIATIVES_DIR, DEFAULT_INITIATIVES_DIR);
+    let trimmed = configured.trim();
+    PathBuf::from(if trimmed.is_empty() {
+        DEFAULT_INITIATIVES_DIR
+    } else {
+        trimmed
+    })
+}
+
 /// Resolve a configured host path against a planner workspace root.
 /// Relative paths are joined to `workspace_path`; absolute paths are used as-is.
 pub fn resolve_workspace_host_path(
@@ -232,5 +257,13 @@ mod tests {
         .expect("relative path should resolve");
         assert!(resolved.contains("methodology.md"));
         assert!(Path::new(&resolved).is_file());
+    }
+
+    #[test]
+    fn initiative_plan_path_builds_id_plan() {
+        assert_eq!(
+            initiative_plan_path(Path::new("/store"), "abc"),
+            PathBuf::from("/store/abc/plan")
+        );
     }
 }

@@ -49,3 +49,5 @@ e2e-artifacts/mobile-terminal-review/*
 e2e-artifacts/*.png
 .johnnyone/
 **/__pycache__/
+.overhaul-refs/
+docs/plans/overhaul-*/

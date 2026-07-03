@@ -104,6 +104,12 @@ export interface AgentPlan {
   /** Non-empty when an amendment cycle is in flight; cleared when T2 PASSes. */
   amendBrief?: string;
   phaseRunMode: 'continue' | 'single' | string;
+  /** Groups a planning stage-run + a development stage-run into one Initiative. */
+  initiativeId: string;
+  /** Lifecycle stage. */
+  initiativeStatus: 'briefing' | 'planning' | 'development' | 'review' | 'done' | string;
+  /** Condition axis, independent of stage. */
+  health: 'in-progress' | 'needs-attention' | 'blocked' | string;
   createdAt: string;
   updatedAt: string;
 }
@@ -246,6 +252,7 @@ export class JohnnyApiService {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
       brief appScope docsScope referencePaths amendBrief phaseRunMode
+      initiativeId initiativeStatus health
       createdAt updatedAt
     }
     phases {
