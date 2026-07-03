@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Files manager (overhaul P5)**. A two-pane **file manager** at **`/files`**
+  (nav entry: Files) over the host filesystem — **UI only**, built entirely on the
+  P2 host file ops and the P3 render core (no new backend / relay / worker / Rust
+  surface, no new npm dependency). Left pane: the `files_root`-rooted directory
+  list (`filesListDir`) with **breadcrumb** navigation. Right pane: preview/editor
+  over `filesRead` — markdown rendered via `johnny-markdown-view`, source
+  highlighted via `highlightCode`, plain text in a `<textarea>` with **Save**
+  (`filesWrite`) + a **`● unsaved`** dirty indicator, binary as a notice. Toolbar
+  CRUD: New file (`filesWrite` empty) / New folder (`filesMkdir`) / Rename
+  (`filesRename`) / Delete (`filesDelete`, confirm-gated). Drag-drop + button
+  **upload** chunks each file into ≤1 MiB base64 chunks via `filesUploadChunk` with
+  a per-file progress chip. All paths are `files_root`-relative and rely on the P2
+  host path-guard + size caps (the client only surfaces their errors); file
+  `content`/`dataBase64` are never logged. New web page
+  `web/src/app/pages/files/` (`FilesPage` + two pure modules `files-page-logic.ts`
+  / `file-chunker.ts` + specs) + a lazy `authGuard` `/files` route + one nav entry
+  (`folder-outline`). `@johnnyone/ui` reused verbatim. nx build web/ui + web vitest
+  green; no Rust edits (running desktop app not rebuilt); visual verification
+  deferred. See [`docs/files.md`](docs/files.md).
 - **Briefing loop (overhaul P4)**. An Initiative now has a **front door**: a
   clarify-before-planning conversation that ends in an explicit
   **"✓ Accept brief → Planning"**. Accept flips the *same* `agent_plans` row from

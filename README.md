@@ -124,6 +124,7 @@ johnnyone/
 Recent planner/runtime behavior worth knowing:
 
 - An Initiative can now start in a **briefing** stage — a clarify-before-planning conversation that ends in an explicit "Accept brief → Planning". Accept flips the *same* `agent_plans` row from `initiative_status='briefing'` to `'planning'` and starts the existing planner with the composed brief (no second row). See [`docs/briefing.md`](docs/briefing.md).
+- A two-pane **file manager** is reachable at **`/files`** (nav entry: Files) — browse the `files_root`-rooted tree with breadcrumbs, preview via the render core (markdown/code), inline-edit text with a `● unsaved` indicator + Save, run the CRUD toolbar (New file/folder · Rename · Delete), and drag-drop upload with per-file progress. UI only over the existing P2 host file ops; the host guards every path. See [`docs/files.md`](docs/files.md).
 - Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.
 - Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
 - Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
@@ -421,6 +422,9 @@ Repo-local docs live alongside the code:
 - **`docs/briefing.md`** — the briefing loop (overhaul P4): the clarify-before-planning
   conversation, the `briefing → planning` accept transition on the same Initiative
   row, brief composition, attachments/reference paths, and the `/briefing` UI
+- **`docs/files.md`** — the `/files` file manager (overhaul P5): the two-pane
+  browse/preview/edit surface, CRUD toolbar and drag-drop upload over the P2 host
+  file ops, the preview-mode classifier, and the pure navigation/upload seams
 
 ## Notable features shipped beyond the multi-user-saas plan
 
@@ -486,6 +490,7 @@ plan, so a fresh session can know what's already live.
 | Ionic-native modals + mobile responsive nav + mermaid zoom | Done (2026-05-25) |
 | Partner / third-party API (J1: authenticated GraphQL + WSS) | Done (2026-06) |
 | Briefing loop — clarify → accept → plan (overhaul P4) | Done (2026-07) |
+| Files manager — `/files` browse/preview/edit + CRUD + upload (overhaul P5) | Done (2026-07) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 
