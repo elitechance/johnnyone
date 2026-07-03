@@ -384,6 +384,8 @@ served in-app at the public **`/integration`** route
 - **Chat** — `sendRelayChatMessage`, `cancelAiGeneration`, `listAiMessages`
 - **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
 - **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
+- **File manager (`files_root`-rooted)** — `filesListDir`, `filesRead`, `filesWrite`, `filesMkdir`, `filesRename`, `filesDelete`, `filesUploadChunk` (chunked upload). Path-guarded + size-capped, scoped by `files:read`/`files:write`. See [`docs/host-transport.md`](docs/host-transport.md)
+- **Terminal / shell** — `captureTerminal` (deterministic one-shot pane snapshot; live I/O still rides the WSS `terminal_*` envelopes)
 - **Providers / settings** — `listDetectedCliTools`, `listProviderConfigs`, `upsertProviderConfig`, `deleteProviderConfig`, `getSetting`, `setSetting`, `getPlannerPromptSettings`, `updatePlannerPromptSettings`
 - **Nodes** — `listDesktopNodes`, `registerDesktopNode`, `updateDesktopNodeStatus`
 - **API keys (M2M, optional)** — `createApiKey`, `listApiKeys`, `revokeApiKey`
@@ -410,6 +412,10 @@ Repo-local docs live alongside the code:
   provisioning runbooks
 - **`docs/terminal-state-reconcile.md`** — how the Terminal page prunes stale
   persisted/cached session state on load
+- **`docs/host-transport.md`** — the host↔web transport primitives (overhaul P2):
+  the `files_root` file-manager surface, shell I/O + `captureTerminal` over the
+  relay, and the per-session `StreamEvent` channel. Plumbing + types; the UIs that
+  consume them are later phases
 
 ## Notable features shipped beyond the multi-user-saas plan
 

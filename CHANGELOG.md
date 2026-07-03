@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Host↔web transport primitives (overhaul P2)**. Plumbing + types only — no
+  new screens. A `files_root`-rooted **file manager** over relay-RPC
+  (`filesListDir`/`filesRead`/`filesWrite`/`filesMkdir`/`filesRename`/
+  `filesDelete`/`filesUploadChunk`; host engine `host_files.rs`), path-guarded
+  (rejects `..` and above-root, symlink-safe) and size-capped (5 MiB reads,
+  1 MiB/chunk, 50 MiB total), gated by new `files:read`/`files:write` scopes.
+  A deterministic one-shot **`captureTerminal`** pane snapshot for shell
+  read-output (live I/O still rides the `terminal_*` envelopes). A per-session
+  **`StreamEvent`** channel (`stream_event` envelope + `stream_subscribe`/
+  `stream_unsubscribe`; Rust + TS types, ref-counted subscribe replayed on
+  reconnect) — the transcript renderer that consumes it is a later phase. All
+  additive; 74 cargo tests + nx worker/ui/web green. See
+  [`docs/host-transport.md`](docs/host-transport.md).
 - **Partner / third-party API ("J1 API")**. Authenticated GraphQL + WSS
   terminal access for external partners (hosted service account model). JWT
   (and `?token=`) on `/api/relay/ws` upgrade with server-side node resolution;
