@@ -1,0 +1,58 @@
+:host {
+  display: block;
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+}
+
+.msg {
+  display: block;
+}
+
+.body {
+  display: block;
+}
+
+.tool-card {
+  border: 1px solid var(--ion-color-step-150, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--ion-color-step-50, rgba(255, 255, 255, 0.03));
+  font-size: 0.85rem;
+}
+
+.tool-name {
+  font-weight: 600;
+  opacity: 0.9;
+}
+
+.tool-data {
+  margin: 6px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--ion-font-family-monospace, monospace);
+  font-size: 0.8rem;
+  opacity: 0.85;
+}
+
+.transcript-error {
+  border-left: 3px solid var(--ion-color-danger, #eb445a);
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: rgba(235, 68, 90, 0.08);
+  color: var(--ion-color-danger, #eb445a);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.transcript-empty {
+  opacity: 0.5;
+  font-style: italic;
+  padding: 12px;
+}

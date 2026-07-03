@@ -51,15 +51,27 @@ import {
   JohnnyApiService,
   ChatAttachment,
   TerminalScreenComponent,
+  TranscriptViewComponent,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
   AiChatComplete,
   DetectedCliTool,
   TerminalScreen,
+  StreamEvent,
   HostFileEntry,
   TmuxSession,
 } from '@johnnyone/ui';
+import {
+  PaneTab,
+  paneTabOf,
+  eventsAreStreaming,
+  appendTranscriptEvent,
+  diffStreamSubscriptions,
+} from './terminal-transcript-tab';
+
+// Re-export so existing/future importers of `PaneTab` from the page keep resolving.
+export type { PaneTab } from './terminal-transcript-tab';
 import { firstValueFrom, Subscription } from 'rxjs';
 import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 import {
@@ -116,6 +128,7 @@ addIcons({
     CommonModule,
     FormsModule,
     TerminalScreenComponent,
+    TranscriptViewComponent,
     IonMenuButton,
     IonModal,
     IonHeader,
@@ -148,7 +161,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly auth = inject(AuthService);
   private readonly route = inject(ActivatedRoute);
   private readonly relayTerminal = inject(RelayTerminalService);
-  private readonly mermaidZoom = inject(MermaidZoomService);
+  // Public so the transcript tab template can wire `(svgZoom)="mermaidZoom.open(...)"`
+  // — reuses the existing shared modal service (decision D4), no new zoom UI.
+  readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
@@ -166,6 +181,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private sessionUpdateSubscription: Subscription | null = null;
   private sessionDeleteSubscription: Subscription | null = null;
   private relayErrorSubscription: Subscription | null = null;
+  private streamEventsSubscription: Subscription | null = null;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
   private saveWorkspaceStateTimeout: ReturnType<typeof setTimeout> | null = null;
   private workspaceResizeObserver: ResizeObserver | null = null;
@@ -173,6 +189,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private compactWorkspaceMediaQuery: MediaQueryList | null = null;
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
   private terminalVisualSubscriptions = new Set<string>();
+  // Parallel "stream lane" mirroring the visual-subscription lifecycle (decision D6):
+  // subscribe/unsubscribe the per-session structured StreamEvent channel at the same
+  // points the screen-visual lane does.
+  private streamSubscriptions = new Set<string>();
   private terminalVisualSync: Promise<void> = Promise.resolve();
   private queryParamSub: Subscription | null = null;
   private readonly visibilityChangeHandler = () => {
@@ -221,6 +241,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   terminalScreen = signal<TerminalScreen | null>(null);
   terminalScreens = signal<Record<string, TerminalScreen>>({});
   terminalError = signal<string | null>(null);
+
+  // Per-session pane tab (Transcript default · Raw terminal; Plan/Diff reserved, D7)
+  // and the accumulated structured stream feeding the Transcript surface (D6).
+  paneTabs = signal<Record<string, PaneTab>>({});
+  transcriptEvents = signal<Record<string, StreamEvent[]>>({});
   paneLayouts = signal<Record<string, PaneLayout>>({});
   closedPaneIds = signal<Set<string>>(new Set());
   paneX = signal(44);
@@ -477,6 +502,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.queryParamSub?.unsubscribe();
     this.queryParamSub = null;
     void this.unsubscribeAllTerminalVisuals();
+    void this.unsubscribeAllStreamLanes();
     this.teardownChatSubscriptions();
     this.teardownTerminalSubscription();
     this.teardownRelaySessionEvents();
@@ -569,6 +595,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.reconcilePersistedTerminalState(sortedSessions);
       this.restorePaneLayoutsFromStorage(sortedSessions);
       await this.syncTerminalVisualSubscriptions();
+      void this.syncStreamSubscriptions();
 
       const toSelect = chooseSessionToSelect(sortedSessions, {
         targetId: targetSessionId,
@@ -670,8 +697,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
           this.upsertSession(mapped);
           this.restorePaneLayoutsFromStorage(this.sessions());
           void this.syncTerminalVisualSubscriptions();
+          void this.syncStreamSubscriptions();
         } else {
           void this.unsubscribeTerminalVisual(mapped.id);
+          void this.unsubscribeStreamLane(mapped.id);
+          this.dropTranscriptState(mapped.id);
           this.removeSessionLocally(mapped.id);
         }
         if (this.currentSession()?.id === mapped.id) {
@@ -689,6 +719,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!this.sessionDeleteSubscription) {
       this.sessionDeleteSubscription = this.relayTerminal.sessionDeletes().subscribe((sessionId) => {
         void this.unsubscribeTerminalVisual(sessionId);
+        void this.unsubscribeStreamLane(sessionId);
+        this.dropTranscriptState(sessionId);
         this.removeSessionLocally(sessionId);
         this.clearCurrentSession(sessionId);
       });
@@ -845,6 +877,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.messages.set(messages);
       this.hydrateTerminalScreenFromCache(id);
       await this.syncTerminalVisualSubscriptions();
+      void this.syncStreamSubscriptions();
 
       this.isStreaming.set(false);
       this.streamingContent.set('');
@@ -1207,11 +1240,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         this.terminalError.set(String(err));
       },
     });
+
+    // Parallel structured-stream lane feeding the Transcript tab (D6). Accumulate
+    // per session, bounded to MAX_TRANSCRIPT_EVENTS to cap long-session growth.
+    if (!this.streamEventsSubscription) {
+      this.streamEventsSubscription = this.relayTerminal.streamEvents().subscribe((event) => {
+        this.transcriptEvents.update((bySession) => appendTranscriptEvent(bySession, event));
+      });
+    }
   }
 
   private teardownTerminalSubscription(): void {
     this.terminalSubscription?.unsubscribe();
     this.terminalSubscription = null;
+    this.streamEventsSubscription?.unsubscribe();
+    this.streamEventsSubscription = null;
     this.relayErrorSubscription?.unsubscribe();
     this.relayErrorSubscription = null;
     if (this.resizeTerminalTimeout) {
@@ -1281,6 +1324,62 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     for (const sessionId of Array.from(this.terminalVisualSubscriptions)) {
       await this.unsubscribeTerminalVisual(sessionId);
     }
+  }
+
+  // ── Transcript tab state + stream lane ─────────────────────────────────
+
+  /** Active tab for a pane; defaults to the Transcript view (D6). */
+  paneTab(id: string): PaneTab {
+    return paneTabOf(this.paneTabs(), id);
+  }
+
+  setPaneTab(id: string, tab: PaneTab): void {
+    this.paneTabs.update((m) => ({ ...m, [id]: tab }));
+  }
+
+  /** Accumulated structured events for a session's transcript (empty if none yet). */
+  transcriptEventsFor(id: string): StreamEvent[] {
+    return this.transcriptEvents()[id] ?? [];
+  }
+
+  /** Live until the last event of the turn (`final`) — drives the tab's `.live` dot. */
+  isSessionStreaming(id: string): boolean {
+    return eventsAreStreaming(this.transcriptEventsFor(id));
+  }
+
+  /**
+   * Mirror `syncTerminalVisualSubscriptions` for the structured stream lane:
+   * subscribe visible sessions, unsubscribe ones no longer visible (D6).
+   */
+  private async syncStreamSubscriptions(): Promise<void> {
+    if (document.hidden) return;
+    const visible = new Set(this.visiblePaneSessions().map((session) => session.id));
+    const { toSubscribe, toUnsubscribe } = diffStreamSubscriptions(this.streamSubscriptions, visible);
+    for (const id of toSubscribe) {
+      await this.relayTerminal.subscribeStream(id);
+      this.streamSubscriptions.add(id);
+    }
+    for (const id of toUnsubscribe) {
+      await this.relayTerminal.unsubscribeStream(id);
+      this.streamSubscriptions.delete(id);
+    }
+  }
+
+  private async unsubscribeStreamLane(id: string): Promise<void> {
+    if (!this.streamSubscriptions.delete(id)) return;
+    await this.relayTerminal.unsubscribeStream(id);
+  }
+
+  private async unsubscribeAllStreamLanes(): Promise<void> {
+    for (const id of Array.from(this.streamSubscriptions)) {
+      await this.unsubscribeStreamLane(id);
+    }
+  }
+
+  /** Drop a removed session's accumulated transcript + pane-tab state. */
+  private dropTranscriptState(id: string): void {
+    this.transcriptEvents.update((m) => this.omitRecordKey(m, id));
+    this.paneTabs.update((m) => this.omitRecordKey(m, id));
   }
 
   async onTerminalRawInput(data: string, sessionId = this.currentSession()?.id): Promise<void> {

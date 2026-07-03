@@ -352,6 +352,63 @@
   overflow: hidden;
 }
 
+// Per-pane tab bar (Transcript · Raw terminal), mirroring mock §02/§04.
+.pane-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 10px;
+  border-bottom: 1px solid #263241;
+  background: #101722;
+  flex: 0 0 auto;
+}
+
+.pane-tab {
+  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 9px 12px;
+  color: #8fa0b3;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+
+  &.on {
+    color: #dbe7f3;
+    border-bottom-color: #64b5ff;
+  }
+
+  .live {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #3b82f6;
+    margin-left: 6px;
+    animation: pane-live-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pane-tab .live {
+    animation: none;
+  }
+}
+
+@keyframes pane-live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+// The transcript surface scrolls its reflowing content (the terminal surface manages
+// its own scroll internally, so this only applies to the Transcript tab).
+.transcript-surface {
+  overflow: auto;
+}
+
 ::ng-deep .terminal-pane johnny-terminal-screen {
   display: flex;
   flex-direction: column;

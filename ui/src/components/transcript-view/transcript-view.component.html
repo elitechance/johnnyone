@@ -1,0 +1,28 @@
+<div class="transcript" (click)="onClick($event)">
+  @for (block of blocks; track $index) {
+    @switch (block.kind) {
+      @case ('tool') {
+        <div class="msg tool-msg">
+          <div class="tool-card">
+            <div class="tool-name">{{ block.toolName || 'tool' }}</div>
+            @if (block.data != null) {
+              <pre class="tool-data">{{ toolPreview(block.data) }}</pre>
+            }
+          </div>
+        </div>
+      }
+      @case ('error') {
+        <div class="msg error-msg">
+          <div class="transcript-error">{{ block.markdown }}</div>
+        </div>
+      }
+      @default {
+        <div class="msg">
+          <johnny-markdown-view class="body" [markdown]="block.markdown || ''"></johnny-markdown-view>
+        </div>
+      }
+    }
+  } @empty {
+    <div class="transcript-empty">No transcript yet.</div>
+  }
+</div>

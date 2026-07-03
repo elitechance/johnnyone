@@ -112,22 +112,55 @@
           </div>
         </header>
 
-        <johnny-terminal-screen
-          class="terminal-surface"
-          [screen]="screen"
-          [title]="session.title || 'Terminal'"
-          [terminalProvider]="session.provider"
-          [disabled]="session.id !== currentSession()?.id"
-          [mobileInputMode]="isCompactWorkspace()"
-          [showInput]="true"
-          [imageAttachments]="pendingAttachmentsForSession(session.id)"
-          [imageSending]="isSendingAttachmentsForSession(session.id)"
-          (rawInput)="onTerminalRawInput($event, session.id)"
-          (terminalResize)="onTerminalResize($event, session.id)"
-          (imagePasted)="addPendingImageFiles(session.id, $event)"
-          (imageRemoved)="removePendingAttachment(session.id, $event)"
-          (imageMessageSubmitted)="sendAttachmentMessage(session.id, $event)"
-        />
+        <div class="pane-tabs" role="tablist">
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="paneTab(session.id) === 'transcript'"
+            [attr.aria-selected]="paneTab(session.id) === 'transcript'"
+            (click)="setPaneTab(session.id, 'transcript'); $event.stopPropagation()"
+          >
+            Transcript
+            @if (isSessionStreaming(session.id)) {
+              <span class="live" aria-hidden="true"></span>
+            }
+          </button>
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="paneTab(session.id) === 'raw'"
+            [attr.aria-selected]="paneTab(session.id) === 'raw'"
+            (click)="setPaneTab(session.id, 'raw'); $event.stopPropagation()"
+          >
+            Raw terminal
+          </button>
+        </div>
+
+        @if (paneTab(session.id) === 'transcript') {
+          <johnny-transcript-view
+            class="terminal-surface transcript-surface"
+            [events]="transcriptEventsFor(session.id)"
+            [streaming]="isSessionStreaming(session.id)"
+            (svgZoom)="mermaidZoom.open($event)"
+          />
+        } @else {
+          <johnny-terminal-screen
+            class="terminal-surface"
+            [screen]="screen"
+            [title]="session.title || 'Terminal'"
+            [terminalProvider]="session.provider"
+            [disabled]="session.id !== currentSession()?.id"
+            [mobileInputMode]="isCompactWorkspace()"
+            [showInput]="true"
+            [imageAttachments]="pendingAttachmentsForSession(session.id)"
+            [imageSending]="isSendingAttachmentsForSession(session.id)"
+            (rawInput)="onTerminalRawInput($event, session.id)"
+            (terminalResize)="onTerminalResize($event, session.id)"
+            (imagePasted)="addPendingImageFiles(session.id, $event)"
+            (imageRemoved)="removePendingAttachment(session.id, $event)"
+            (imageMessageSubmitted)="sendAttachmentMessage(session.id, $event)"
+          />
+        }
 
         @if (!isPaneFullscreen(session.id)) {
           <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>

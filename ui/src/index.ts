@@ -74,5 +74,20 @@ export { ProviderSelectorComponent } from './components/provider-selector/provid
 export { NodeStatusComponent } from './components/node-status/node-status.component';
 export { StreamingTextComponent } from './components/streaming-text/streaming-text.component';
 export { TerminalScreenComponent } from './components/terminal-screen/terminal-screen.component';
+export { MarkdownViewComponent } from './components/markdown-view/markdown-view.component';
+export { TranscriptViewComponent } from './components/transcript-view/transcript-view.component';
+export { eventsToBlocks } from './components/transcript-view/transcript-blocks';
+export type {
+  TranscriptBlock,
+  TranscriptBlockKind,
+} from './components/transcript-view/transcript-blocks';
 export type { TerminalScreen } from './models/terminal.model';
 export type { StreamEvent } from './models/stream-event.model';
+
+// ── Render core ──────────────────────────────────────────────────────────────
+export {
+  parseMarkdown,
+  hydrateMermaid,
+  escapeHtml,
+  highlightCode,
+} from './lib/markdown-render';
