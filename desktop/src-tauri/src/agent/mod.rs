@@ -890,6 +890,12 @@ impl AgentService {
             "files_rename" => Self::rpc_files_rename(&req.params, state),
             "files_delete" => Self::rpc_files_delete(&req.params, state),
             "files_upload_chunk" => Self::rpc_files_upload_chunk(&req.params, state),
+            "create_briefing_run" => Self::rpc_create_briefing_run(&req.params, state),
+            "initiative_upload_chunk" => Self::rpc_initiative_upload_chunk(&req.params, state),
+            "accept_brief" => Self::rpc_accept_brief(&req.params, state).await,
+            "add_initiative_reference_path" => {
+                Self::rpc_add_initiative_reference_path(&req.params, state)
+            }
             "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
             "update_planner_prompt_settings" => {
                 Self::rpc_update_planner_prompt_settings(&req.params)
@@ -1622,6 +1628,99 @@ impl AgentService {
             done,
         )?;
         serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
+    /// Overhaul P4 (D1): create an Initiative in `briefing`. Thin wrapper over
+    /// `agent_plans::create_briefing_run` — deserialize `{ input: CreateBriefingInput }`.
+    fn rpc_create_briefing_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let input_value = params
+            .get("input")
+            .cloned()
+            .ok_or_else(|| "Missing 'input' parameter".to_string())?;
+        let input: crate::db::models::CreateBriefingInput =
+            serde_json::from_value(input_value).map_err(|e| e.to_string())?;
+        let run = crate::services::agent_plans::create_briefing_run(state, input)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Overhaul P4 (D5): upload a briefing attachment into `<id>/attachments/`. Mirrors
+    /// `rpc_files_upload_chunk` but routes to the initiative-rooted engine. Never logs `dataBase64`.
+    fn rpc_initiative_upload_chunk(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let initiative_id = params
+            .get("initiativeId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'initiativeId' parameter".to_string())?;
+        let path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'path' parameter".to_string())?;
+        let chunk_index = params
+            .get("chunkIndex")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "Missing 'chunkIndex' parameter".to_string())?;
+        let total_chunks = params
+            .get("totalChunks")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let data_base64 = params
+            .get("dataBase64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'dataBase64' parameter".to_string())?;
+        let done = params.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+        let result = crate::services::host_files::initiative_upload_chunk(
+            state,
+            initiative_id,
+            path,
+            chunk_index,
+            total_chunks,
+            data_base64,
+            done,
+        )?;
+        serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
+    /// Overhaul P4 (D1/D4): accept a briefing brief — flips the same row briefing→planning and starts
+    /// the planner. Thin wrapper over `agent_plans::accept_brief`.
+    async fn rpc_accept_brief(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let initiative_id = params
+            .get("initiativeId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'initiativeId' parameter".to_string())?;
+        let final_brief = params
+            .get("finalBrief")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let run =
+            crate::services::agent_plans::accept_brief(state, initiative_id, final_brief).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Overhaul P4 (D6): record a ▤ Reference host path on a briefing Initiative. Thin wrapper over
+    /// `agent_plans::add_initiative_reference_path`.
+    fn rpc_add_initiative_reference_path(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let initiative_id = params
+            .get("initiativeId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'initiativeId' parameter".to_string())?;
+        let path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'path' parameter".to_string())?;
+        let run =
+            crate::services::agent_plans::add_initiative_reference_path(state, initiative_id, path)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
     fn rpc_get_planner_prompt_settings() -> Result<serde_json::Value, String> {

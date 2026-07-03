@@ -41,6 +41,8 @@ export type {
   AgentPlanEvent,
   AgentPlanRun,
   CreateAgentPlanInput,
+  CreateBriefingInput,
+  AcceptBriefInput,
   HostFileContent,
   HostFileEntry,
   FileEntry,

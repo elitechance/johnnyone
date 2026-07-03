@@ -1,7 +1,7 @@
 use crate::db::migrations::health_from_status;
 use crate::db::models::{
     AgentPlan, AgentPlanEvent, AgentPlanPhase, AgentPlanTask, CreateAgentPlanInput,
-    CreateSessionInput,
+    CreateBriefingInput, CreateSessionInput,
 };
 use crate::events::AgentPlanRunEvent;
 use crate::services::planner_prompts;
@@ -372,6 +372,258 @@ fn create_planning_run(
     get_plan(state, &plan_id)
 }
 
+/// Create an Initiative *in briefing* (overhaul P4, D1). Mirrors [`create_planning_run`] but:
+/// the row lands at `initiative_status='briefing'` with `worker_session_id` NULL (no planner yet),
+/// its conversation is a **`kind='user'`** chat session (routed through the headless
+/// `claude --print --resume` chat path, D2 — NOT a `kind='agent'` planner terminal), and both the
+/// `<id>/plan` and `<id>/attachments` store dirs are created. No agent is spawned here — the first
+/// briefing turn is sent later by the UI (Phase 04). Accept (Phase 02) flips this same row to
+/// `planning` and starts the planner.
+pub fn create_briefing_run(
+    state: &AppState,
+    input: CreateBriefingInput,
+) -> Result<AgentPlanRun, String> {
+    let workspace = normalize_path(Path::new(&input.workspace_path))?;
+    if !workspace.is_dir() {
+        return Err("Workspace path is not a directory".to_string());
+    }
+    // A briefing Initiative's id IS its initiative id (D1); the row will flip briefing→planning
+    // on the same id at Accept, so no fresh id is minted then.
+    let initiative_id = Uuid::new_v4().to_string();
+    let plan_id = initiative_id.clone();
+    // Provision both store dirs: the plan dir (populated on the later planning kickoff) and the
+    // attachments dir (📎/⤒ uploads land here via `initiative_upload_chunk`, D5).
+    let store = settings_service::resolve_initiatives_dir(state);
+    let plan = settings_service::initiative_plan_path(&store, &initiative_id);
+    let attachments = settings_service::initiative_attachments_path(&store, &initiative_id);
+    std::fs::create_dir_all(&plan)
+        .map_err(|e| format!("Failed to create initiative plan dir {}: {}", plan.display(), e))?;
+    std::fs::create_dir_all(&attachments).map_err(|e| {
+        format!(
+            "Failed to create initiative attachments dir {}: {}",
+            attachments.display(),
+            e
+        )
+    })?;
+    let title = input
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "Briefing".to_string());
+
+    // The conversation session: a `kind='user'` chat session on the worker provider. This is the
+    // lane the relay chat path (`handle_relay_chat` → `claude --print --resume`) drives (D2).
+    let chat_session = sessions::create_session(
+        state,
+        CreateSessionInput {
+            provider: Some(input.worker_provider.clone()),
+            model: input
+                .model
+                .clone()
+                .or_else(|| default_model_for_provider(&input.worker_provider)),
+            working_directory: Some(workspace.to_string_lossy().to_string()),
+            title: Some(format!("Briefing - {}", title)),
+            kind: Some("user".to_string()),
+            setup_commands: None,
+            tmux_session_name: None,
+        },
+    )?;
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            // Fresh briefing Initiative: id == initiative_id (?1); plan_path (?4) is the store path;
+            // initiative_status='briefing', worker/reviewer sessions NULL (no planner yet),
+            // briefing_session_id (?7) links the chat session, health seeded 'in-progress'.
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, initiative_id, initiative_status, health, briefing_session_id)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', NULL, NULL, ?5, ?6, 0, ?8, ?1, 'briefing', 'in-progress', ?7)",
+            params![
+                plan_id,
+                title,
+                workspace.to_string_lossy(),
+                plan.to_string_lossy(),
+                input.worker_provider,
+                input.reviewer_provider,
+                chat_session.id,
+                input.brief.clone().unwrap_or_default(),
+            ],
+        )
+        .map_err(|e| format!("Failed to create briefing run: {}", e))
+    })?;
+
+    append_event(
+        state,
+        &plan_id,
+        None,
+        "briefing_run_created",
+        json!({ "briefingSessionId": chat_session.id }),
+    )?;
+
+    get_plan(state, &plan_id)
+}
+
+/// Compose the accepted brief (overhaul P4, D6): the draft, then an `## Attached files` section of
+/// absolute store paths, then a `## Referenced host paths` section. Each trailing section is omitted
+/// when its slice is empty (no dangling header). Pure — no state/DB/FS, so its test needs no fixtures.
+/// (Absolute store paths are readable by the agent CLI directly — design §5b.)
+pub fn compose_accepted_brief(
+    draft: &str,
+    attachment_paths: &[String],
+    reference_paths: &[String],
+) -> String {
+    let mut out = draft.trim_end().to_string();
+    if !attachment_paths.is_empty() {
+        out.push_str("\n\n## Attached files\n");
+        for p in attachment_paths {
+            out.push_str(&format!("- {}\n", p));
+        }
+    }
+    if !reference_paths.is_empty() {
+        out.push_str("\n\n## Referenced host paths\n");
+        for p in reference_paths {
+            out.push_str(&format!("- {}\n", p));
+        }
+    }
+    out
+}
+
+/// Flip the row `briefing → planning` and store the composed brief — the SAME row (D1). DB-only so it
+/// is unit-testable against in-memory SQLite without spawning an agent (D8). `updated_at` uses the
+/// same `datetime('now')` idiom as the other UPDATEs in this file.
+fn apply_brief_acceptance(
+    conn: &rusqlite::Connection,
+    id: &str,
+    composed: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE agent_plans SET brief = ?2, initiative_status = 'planning', updated_at = datetime('now') WHERE id = ?1",
+        params![id, composed],
+    )
+    .map_err(|e| format!("Failed to apply brief acceptance: {}", e))?;
+    Ok(())
+}
+
+/// Record a ▤ Reference host path on a briefing Initiative (overhaul P4, D6): append `path` to the
+/// row's `reference_paths` and re-normalize the whole block with the SAME `normalize_reference_paths`
+/// the planner create uses (validation/dedup live there — not re-implemented here). Returns the
+/// refreshed run.
+pub fn add_initiative_reference_path(
+    state: &AppState,
+    id: &str,
+    path: &str,
+) -> Result<AgentPlanRun, String> {
+    let plan = get_plan(state, id)?.plan;
+    let workspace = Path::new(&plan.workspace_path);
+    let combined = match plan.reference_paths.as_deref() {
+        Some(existing) if !existing.trim().is_empty() => format!("{}\n{}", existing, path),
+        _ => path.to_string(),
+    };
+    let normalized = normalize_reference_paths(workspace, Some(&combined))?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET reference_paths = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, normalized],
+        )
+        .map_err(|e| format!("Failed to update reference paths: {}", e))
+    })?;
+    get_plan(state, id)
+}
+
+/// Accept a briefing brief (overhaul P4, D1/D4): the one transition out of `briefing`. Guards that the
+/// row is in `briefing`, composes the accepted brief (draft + attachment refs + reference paths),
+/// flips the **same** row `briefing → planning` storing that brief, provisions the T1 planner session
+/// + plan dir on the same row (reusing `create_planning_run`'s provisioning primitives — NOT its
+/// INSERT wrapper), and starts the planner via the existing **`start_planning_run`**. The compose +
+/// DB flip happen before the terminal-attaching spawn so they are assertable without a live agent (D8).
+pub async fn accept_brief(
+    state: &AppState,
+    id: &str,
+    final_brief: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    let plan = get_plan(state, id)?.plan;
+    if plan.initiative_status != "briefing" {
+        return Err("Initiative is not in briefing".to_string());
+    }
+    let store = settings_service::resolve_initiatives_dir(state);
+
+    // Attachment absolute paths (files only, sorted for determinism); [] if the dir is absent.
+    let attach_dir = settings_service::initiative_attachments_path(&store, id);
+    let mut attachments: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&attach_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                attachments.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    attachments.sort();
+
+    // Reference paths recorded during briefing (one per non-empty line).
+    let refs: Vec<String> = plan
+        .reference_paths
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let draft = final_brief
+        .as_deref()
+        .or(plan.brief.as_deref())
+        .unwrap_or("");
+    let composed = compose_accepted_brief(draft, &attachments, &refs);
+
+    // Flip the SAME row briefing→planning and store the composed brief BEFORE any spawn (D8).
+    state
+        .db
+        .with_conn(|conn| apply_brief_acceptance(conn, id, &composed))?;
+
+    // Provision the planner on THIS row — reuse create_planning_run's primitives (309-336): ensure the
+    // plan dir exists and create the T1 planner (kind='agent') session, then point worker_session_id
+    // at it. `start_planning_run`'s INSERT wrapper is deliberately NOT called (would duplicate — D1).
+    let plan_dir = settings_service::initiative_plan_path(&store, id);
+    std::fs::create_dir_all(&plan_dir).map_err(|e| {
+        format!(
+            "Failed to create initiative plan dir {}: {}",
+            plan_dir.display(),
+            e
+        )
+    })?;
+    let planner_session = sessions::create_session(
+        state,
+        CreateSessionInput {
+            provider: Some(plan.worker_provider.clone()),
+            model: default_model_for_provider(&plan.worker_provider),
+            working_directory: Some(plan.workspace_path.clone()),
+            title: Some(format!("T1 Planner - {}", plan.title)),
+            kind: Some("agent".to_string()),
+            setup_commands: None,
+            tmux_session_name: None,
+        },
+    )?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET worker_session_id = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, planner_session.id],
+        )
+        .map_err(|e| format!("Failed to set planner session: {}", e))
+    })?;
+
+    append_event(
+        state,
+        id,
+        None,
+        "brief_accepted",
+        json!({ "plannerSessionId": planner_session.id }),
+    )?;
+
+    // Existing kickoff (start_planning_run, 819): attaches the planner terminal + sends the prompt
+    // built from `user_brief = run.plan.brief` — now the composed accepted brief.
+    start_planning_run(state.clone(), id.to_string()).await?;
+    get_plan(state, id)
+}
+
 pub fn list_plans(
     state: &AppState,
     status: Option<String>,
@@ -379,7 +631,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, created_at, updated_at FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -401,7 +653,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, created_at, updated_at FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -4596,8 +4848,9 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         initiative_id: row.get(19)?,
         initiative_status: row.get(20)?,
         health: row.get(21)?,
-        created_at: row.get(22)?,
-        updated_at: row.get(23)?,
+        briefing_session_id: row.get(22)?,
+        created_at: row.get(23)?,
+        updated_at: row.get(24)?,
     })
 }
 
@@ -5238,6 +5491,45 @@ mod store_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── Task 01-01: briefing_session_id column round-trips through the mapper ─────────
+    #[test]
+    fn briefing_session_id_column_round_trips() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // The migration must have added the column…
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(agent_plans)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(
+            cols.iter().any(|c| c == "briefing_session_id"),
+            "agent_plans must have briefing_session_id (have: {:?})",
+            cols
+        );
+
+        // …and a row inserted with it set reads back through the shared row mapper.
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, initiative_id, initiative_status, briefing_session_id) \
+             VALUES ('B', 'planning', 't', '/w', '/p', 'draft', 'claude_code', 'claude_code', 'B', 'briefing', 'CHAT-SESSION')",
+            [],
+        )
+        .unwrap();
+
+        let plan = conn
+            .query_row(
+                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at FROM agent_plans WHERE id='B'",
+                [],
+                agent_plan_from_row,
+            )
+            .unwrap();
+        assert_eq!(plan.briefing_session_id.as_deref(), Some("CHAT-SESSION"));
+        assert_eq!(plan.initiative_status, "briefing");
+    }
+
     // ── Test 4: linkage query via shared find_planning_initiative_id ──────────────────
     #[test]
     fn find_planning_initiative_id_links_by_plan_path() {
@@ -5328,6 +5620,227 @@ mod store_tests {
 
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 01-03: create_briefing_run makes a briefing Initiative ───────────────────
+    #[tokio::test]
+    async fn create_briefing_run_makes_briefing_initiative() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let run = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("My Feature".to_string()),
+                workspace_path: workspace.to_string_lossy().to_string(),
+                brief: Some("raw ask".to_string()),
+                worker_provider: "claude_code".to_string(),
+                reviewer_provider: "claude_code".to_string(),
+                model: None,
+            },
+        )
+        .expect("create_briefing_run");
+        let plan = run.plan;
+
+        // Row shape: a briefing Initiative with no planner session yet.
+        assert_eq!(plan.initiative_status, "briefing");
+        assert_eq!(plan.health, "in-progress");
+        assert!(plan.worker_session_id.is_none(), "no planner session during briefing");
+        assert!(plan.reviewer_session_id.is_none());
+        assert_eq!(plan.brief.as_deref(), Some("raw ask"), "brief holds the raw ask");
+        let chat_id = plan
+            .briefing_session_id
+            .clone()
+            .expect("briefing_session_id must be set");
+
+        // The linked conversation session is a chat-lane (kind='user') session.
+        let kind: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT kind FROM sessions WHERE id = ?1",
+                    params![chat_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(kind, "user", "briefing conversation must be a kind='user' chat session");
+
+        // Both store dirs exist under the initiative id.
+        assert!(
+            settings_service::initiative_plan_path(&store, &plan.initiative_id).is_dir(),
+            "<id>/plan dir must exist"
+        );
+        assert!(
+            settings_service::initiative_attachments_path(&store, &plan.initiative_id).is_dir(),
+            "<id>/attachments dir must exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 02-01: compose_accepted_brief folds draft + attachments + reference paths ─
+    #[test]
+    fn compose_accepted_brief_folds_sections() {
+        // Draft-only → the trimmed draft, no dangling headers.
+        let only = compose_accepted_brief("just the ask\n\n", &[], &[]);
+        assert_eq!(only, "just the ask");
+        assert!(!only.contains("## Attached files"));
+        assert!(!only.contains("## Referenced host paths"));
+
+        // With both sections → draft + each path listed under its header.
+        let full = compose_accepted_brief(
+            "the ask",
+            &["/store/INIT/attachments/a.png".to_string(), "/store/INIT/attachments/b.pdf".to_string()],
+            &["/home/u/proj/docs".to_string()],
+        );
+        assert!(full.contains("the ask"));
+        assert!(full.contains("## Attached files"));
+        assert!(full.contains("- /store/INIT/attachments/a.png"));
+        assert!(full.contains("- /store/INIT/attachments/b.pdf"));
+        assert!(full.contains("## Referenced host paths"));
+        assert!(full.contains("- /home/u/proj/docs"));
+
+        // Only attachments → no reference-paths header.
+        let attach_only = compose_accepted_brief("x", &["/p/f".to_string()], &[]);
+        assert!(attach_only.contains("## Attached files"));
+        assert!(!attach_only.contains("## Referenced host paths"));
+
+        // Only reference paths → no attachments header.
+        let ref_only = compose_accepted_brief("x", &[], &["/p/d".to_string()]);
+        assert!(!ref_only.contains("## Attached files"));
+        assert!(ref_only.contains("## Referenced host paths"));
+    }
+
+    // ── Task 02-01: apply_brief_acceptance flips the SAME row briefing→planning ────────
+    #[test]
+    fn apply_brief_acceptance_flips_same_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, brief, reference_paths, initiative_id, initiative_status) \
+             VALUES ('INIT', 'planning', 't', '/w', '/p', 'draft', 'claude_code', 'claude_code', 'draft ask', '/w/docs', 'INIT', 'briefing')",
+            [],
+        )
+        .unwrap();
+
+        apply_brief_acceptance(&conn, "INIT", "COMPOSED BRIEF").unwrap();
+
+        let (status, brief): (String, Option<String>) = conn
+            .query_row(
+                "SELECT initiative_status, brief FROM agent_plans WHERE id='INIT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "planning", "same row must flip to planning");
+        assert_eq!(brief.as_deref(), Some("COMPOSED BRIEF"));
+        // The id is unchanged — one initiative, not a second row (D1).
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "no new row created on accept");
+    }
+
+    // ── Task 02-01: add_initiative_reference_path appends a normalized host path ───────
+    #[tokio::test]
+    async fn add_initiative_reference_path_appends() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let plan = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("Ref".to_string()),
+                workspace_path: workspace.to_string_lossy().to_string(),
+                brief: Some("ask".to_string()),
+                worker_provider: "claude_code".to_string(),
+                reviewer_provider: "claude_code".to_string(),
+                model: None,
+            },
+        )
+        .expect("create_briefing_run")
+        .plan;
+
+        // A real directory inside the (canonical) workspace — reference paths must stay in-workspace.
+        let ref_dir = Path::new(&plan.workspace_path).join("docs");
+        std::fs::create_dir_all(&ref_dir).unwrap();
+
+        let updated = add_initiative_reference_path(
+            &state,
+            &plan.id,
+            ref_dir.to_string_lossy().as_ref(),
+        )
+        .expect("add_initiative_reference_path");
+
+        let refs = updated.plan.reference_paths.expect("reference_paths set");
+        assert!(
+            refs.lines().any(|l| l == ref_dir.canonicalize().unwrap().to_string_lossy()),
+            "reference_paths must contain the appended dir (have: {:?})",
+            refs
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 02-02: accept_brief guards non-briefing rows (no mutation) ────────────────
+    #[tokio::test]
+    async fn accept_brief_rejects_non_briefing() {
+        let (state, root) = test_state();
+        // A planning-status row (raw insert): accept must refuse and leave it untouched.
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, brief, initiative_id, initiative_status) \
+                     VALUES ('P', 'planning', 't', '/w', '/p', 'draft', 'claude_code', 'claude_code', 'brief', 'P', 'planning')",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        let err = accept_brief(&state, "P", None)
+            .await
+            .expect_err("accept on a non-briefing row must error");
+        assert!(err.contains("not in briefing"), "unexpected error: {}", err);
+
+        // The row is unchanged — still planning, brief intact, no planner session provisioned.
+        let (status, brief, worker): (String, Option<String>, Option<String>) = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT initiative_status, brief, worker_session_id FROM agent_plans WHERE id='P'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(status, "planning", "guard must not mutate the row");
+        assert_eq!(brief.as_deref(), Some("brief"));
+        assert!(worker.is_none(), "no planner session on a rejected accept");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -137,6 +137,11 @@ pub struct AgentPlan {
     pub initiative_status: String,
     /// Condition axis: in-progress | needs-attention | blocked (independent of stage).
     pub health: String,
+    /// Non-null only for a briefing Initiative: the `kind='user'` chat session
+    /// that carries the clarification conversation (overhaul P4, D3). Stays NULL
+    /// on every non-briefing row; distinct from `worker_session_id` (the T1
+    /// planner session, set only when the brief is accepted).
+    pub briefing_session_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -224,6 +229,23 @@ pub struct CreateAgentPlanInput {
     pub reviewer_setup_commands: Option<String>,
 }
 
+/// Input for `create_briefing_run` (overhaul P4, D1). Mirrors the briefing-relevant
+/// subset of `CreateAgentPlanInput`: an Initiative created at
+/// `initiative_status='briefing'` with a draft `brief` (the raw ask) and the
+/// providers stored for the later planning kickoff on Accept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBriefingInput {
+    pub title: Option<String>,
+    pub workspace_path: String,
+    /// The raw ask; stored as the draft `brief` until Accept composes the final one.
+    pub brief: Option<String>,
+    pub worker_provider: String,
+    pub reviewer_provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 // ── Usage Log ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +289,7 @@ mod tests {
             initiative_id: "INIT".into(),
             initiative_status: "planning".into(),
             health: "in-progress".into(),
+            briefing_session_id: None,
             created_at: "".into(),
             updated_at: "".into(),
         }
@@ -285,6 +308,9 @@ mod tests {
             Some("planning")
         );
         assert_eq!(v.get("health").and_then(|x| x.as_str()), Some("in-progress"));
+        // The briefing link serializes camelCase (present as null on a non-briefing row).
+        assert!(v.as_object().unwrap().contains_key("briefingSessionId"));
+        assert!(v.get("briefing_session_id").is_none());
         // …and the snake_case forms are absent (guards against a missing rename_all).
         assert!(v.get("initiative_id").is_none());
         assert!(v.get("initiative_status").is_none());

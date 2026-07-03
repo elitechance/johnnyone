@@ -162,6 +162,13 @@ pub fn initiative_plan_path(initiatives_dir: &Path, initiative_id: &str) -> Path
     initiatives_dir.join(initiative_id).join("plan")
 }
 
+/// Absolute attachments directory for an initiative: `<dir>/<id>/attachments`.
+/// Pure — no filesystem or DB access, so it is unit-testable. Briefing uploads
+/// (📎 Attach / ⤒ Upload) land here via the re-rooted P2 upload engine (D5).
+pub fn initiative_attachments_path(initiatives_dir: &Path, initiative_id: &str) -> PathBuf {
+    initiatives_dir.join(initiative_id).join("attachments")
+}
+
 /// Resolve the configured global initiatives store dir (absolute).
 /// Falls back to `DEFAULT_INITIATIVES_DIR` when the setting is unset/empty.
 pub fn resolve_initiatives_dir(state: &AppState) -> PathBuf {
@@ -335,6 +342,14 @@ mod tests {
         assert_eq!(
             initiative_plan_path(Path::new("/store"), "abc"),
             PathBuf::from("/store/abc/plan")
+        );
+    }
+
+    #[test]
+    fn initiative_attachments_path_builds_id_attachments() {
+        assert_eq!(
+            initiative_attachments_path(Path::new("/store"), "abc"),
+            PathBuf::from("/store/abc/attachments")
         );
     }
 

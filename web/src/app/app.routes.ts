@@ -47,6 +47,22 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
+  // Briefing (overhaul P4) — the clarification conversation before planning. `new` must precede
+  // `:initiativeId` so it is not captured as an id. Accept advances the SAME initiative to planning.
+  {
+    path: 'briefing/new',
+    title: 'New briefing',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),
+  },
+  {
+    path: 'briefing/:initiativeId',
+    title: 'Briefing',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),
+  },
   // Development (T1=Worker, T2=Reviewer) — executes approved plans.
   {
     path: 'development',

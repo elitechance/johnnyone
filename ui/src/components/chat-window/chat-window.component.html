@@ -40,11 +40,13 @@
   <ng-content select="[chat-meta]"></ng-content>
 
   <div class="composer-container">
-    <johnny-message-composer
-      (messageSent)="onMessageSent($event)"
-      [disabled]="disabled"
-      [placeholder]="placeholder">
-    </johnny-message-composer>
+    @if (showComposer) {
+      <johnny-message-composer
+        (messageSent)="onMessageSent($event)"
+        [disabled]="disabled"
+        [placeholder]="placeholder">
+      </johnny-message-composer>
+    }
     <div class="chat-actions-slot">
       <ng-content select="[chat-actions]"></ng-content>
     </div>

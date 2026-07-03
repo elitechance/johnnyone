@@ -20,6 +20,7 @@ const MIGRATION_017: &str = include_str!("../../migrations/017_add_initiative_ax
 /// Backfill for migration 017. `pub` so the unit test can run the *shipped* SQL verbatim
 /// (single source of truth — the test can never drift from what the migration applies).
 pub const BACKFILL_017: &str = include_str!("../../migrations/017_backfill_initiative_axes.sql");
+const MIGRATION_018: &str = include_str!("../../migrations/018_add_briefing_session.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -73,6 +74,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (15, "015_add_reviewer_setup_commands", MIGRATION_015),
         (16, "016_add_attached_tmux", MIGRATION_016),
         (17, "017_add_initiative_axes", MIGRATION_017),
+        (18, "018_add_briefing_session", MIGRATION_018),
     ];
 
     for (version, name, sql) in migrations {
@@ -179,7 +181,12 @@ mod tests {
         run_migrations(&conn).expect("second run_migrations (idempotent)");
 
         let cols = column_names(&conn, "agent_plans");
-        for expected in ["initiative_id", "initiative_status", "health"] {
+        for expected in [
+            "initiative_id",
+            "initiative_status",
+            "health",
+            "briefing_session_id",
+        ] {
             assert!(
                 cols.iter().any(|c| c == expected),
                 "agent_plans missing column {} (have: {:?})",

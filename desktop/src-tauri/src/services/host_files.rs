@@ -11,7 +11,10 @@
 //! - Nothing here logs file `content`, decoded upload bytes, or base64 payloads.
 
 use crate::services::agent_plans::{content_type_for_path, is_text_content_type};
-use crate::services::settings::{normalize_path, resolve_files_root, resolve_within_root};
+use crate::services::settings::{
+    initiative_attachments_path, normalize_path, resolve_files_root, resolve_initiatives_dir,
+    resolve_within_root,
+};
 use crate::state::app_state::AppState;
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -306,7 +309,32 @@ pub fn upload_chunk(
     done: bool,
 ) -> Result<UploadChunkResult, String> {
     let (root, canonical_root) = root_context(state)?;
-    let target = resolve_within_root(&root, path)?;
+    upload_chunk_at(
+        &root,
+        &canonical_root,
+        path,
+        chunk_index,
+        total_chunks,
+        data_base64,
+        done,
+    )
+}
+
+/// The shared chunk-assembly engine, parametrized by an already-resolved `root` (and its
+/// canonical form for the returned relative path). Extracted verbatim from `upload_chunk` so
+/// the `files_root` op and the initiative-attachments op reuse the SAME guard
+/// (`resolve_within_root`), the SAME 1 MiB/chunk & 50 MiB/total caps, and the SAME atomic
+/// `.part` rename — never a fork. `data_base64` is never logged (D10).
+fn upload_chunk_at(
+    root: &Path,
+    canonical_root: &Path,
+    path: &str,
+    chunk_index: u64,
+    total_chunks: u64,
+    data_base64: &str,
+    done: bool,
+) -> Result<UploadChunkResult, String> {
+    let target = resolve_within_root(root, path)?;
     let bytes = general_purpose::STANDARD
         .decode(data_base64)
         .map_err(|_| "Invalid base64 chunk".to_string())?;
@@ -349,10 +377,38 @@ pub fn upload_chunk(
     }
 
     Ok(UploadChunkResult {
-        path: to_rel(&canonical_root, &target),
+        path: to_rel(canonical_root, &target),
         received,
         complete,
     })
+}
+
+/// Upload a briefing attachment: the SAME chunked-upload engine as [`upload_chunk`], but rooted
+/// at `<initiatives_dir>/<initiative_id>/attachments/` instead of `files_root` (overhaul P4, D5).
+/// Files land in the initiative's own store regardless of how `files_root` is configured; the
+/// path-guard + caps are reused byte-for-byte. `data_base64` is never logged (D10).
+pub fn initiative_upload_chunk(
+    state: &AppState,
+    initiative_id: &str,
+    path: &str,
+    chunk_index: u64,
+    total_chunks: u64,
+    data_base64: &str,
+    done: bool,
+) -> Result<UploadChunkResult, String> {
+    let root = initiative_attachments_path(&resolve_initiatives_dir(state), initiative_id);
+    fs::create_dir_all(&root)
+        .map_err(|e| format!("Failed to create attachments dir: {}", e))?;
+    let canonical = normalize_path(&root)?;
+    upload_chunk_at(
+        &root,
+        &canonical,
+        path,
+        chunk_index,
+        total_chunks,
+        data_base64,
+        done,
+    )
 }
 
 #[cfg(test)]
@@ -559,6 +615,81 @@ mod tests {
         let read = read_file(&state, "up/data.bin").unwrap();
         let bytes = general_purpose::STANDARD.decode(&read.content).unwrap();
         assert_eq!(bytes, original);
+    }
+
+    // ── Initiative attachments upload (task 01-02): re-rooted engine, same guard/caps ─────────
+    use crate::services::settings::{
+        initiative_attachments_path, resolve_initiatives_dir, KEY_INITIATIVES_DIR,
+    };
+
+    /// Point `initiatives_dir` at a fresh temp dir and return `(state, canonical_store)`. All FS
+    /// mutation stays inside that temp dir — never the real store.
+    fn state_with_store() -> (crate::state::app_state::AppState, std::path::PathBuf) {
+        let (state, _root) = test_state();
+        let store = tmp_dir("store");
+        set_setting(
+            &state,
+            KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        let canonical = store.canonicalize().unwrap();
+        (state, canonical)
+    }
+
+    #[test]
+    fn initiative_upload_rejects_traversal() {
+        let (state, _store) = state_with_store();
+        let ok = general_purpose::STANDARD.encode(b"x");
+        assert!(initiative_upload_chunk(&state, "INIT", "../escape.bin", 0, 1, &ok, true).is_err());
+        assert!(initiative_upload_chunk(&state, "INIT", "a/../../b.bin", 0, 1, &ok, true).is_err());
+        assert!(initiative_upload_chunk(&state, "INIT", "/etc/passwd", 0, 1, &ok, true).is_err());
+    }
+
+    #[test]
+    fn initiative_upload_rejects_oversize_chunk() {
+        let (state, _store) = state_with_store();
+        let oversize = general_purpose::STANDARD.encode(vec![0u8; MAX_UPLOAD_CHUNK_BYTES + 1]);
+        let err = initiative_upload_chunk(&state, "INIT", "big.bin", 0, 1, &oversize, true)
+            .unwrap_err();
+        assert!(err.contains("1 MiB"));
+    }
+
+    #[test]
+    fn initiative_upload_rejects_over_total_cap() {
+        let (state, _store) = state_with_store();
+        let chunk = general_purpose::STANDARD.encode(vec![7u8; MAX_UPLOAD_CHUNK_BYTES]);
+        let mut index = 0u64;
+        let mut hit_cap = false;
+        while index < 60 {
+            match initiative_upload_chunk(&state, "INIT", "big.bin", index, 0, &chunk, false) {
+                Ok(_) => index += 1,
+                Err(e) => {
+                    assert!(e.contains("50 MiB"));
+                    hit_cap = true;
+                    break;
+                }
+            }
+        }
+        assert!(hit_cap, "expected the total-cap guard to fire");
+    }
+
+    #[test]
+    fn initiative_upload_lands_under_attachments() {
+        let (state, store) = state_with_store();
+        let payload = b"briefing attachment contents";
+        let encoded = general_purpose::STANDARD.encode(payload);
+        let result =
+            initiative_upload_chunk(&state, "INIT", "notes.txt", 0, 1, &encoded, true).unwrap();
+        assert!(result.complete);
+
+        // The bytes must land at <store>/INIT/attachments/notes.txt (read back and compare).
+        let expected = initiative_attachments_path(&resolve_initiatives_dir(&state), "INIT")
+            .join("notes.txt");
+        let landed = std::fs::read(&expected).expect("attachment file must exist");
+        assert_eq!(landed, payload);
+        // And it is genuinely inside the initiative store (not files_root).
+        assert!(expected.starts_with(&store));
     }
 
     // ── serde camelCase contract ──────────────────────────────────────────────────────────────

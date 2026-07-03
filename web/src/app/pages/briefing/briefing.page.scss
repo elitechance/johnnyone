@@ -1,0 +1,89 @@
+:host {
+  display: block;
+  height: 100%;
+}
+
+.briefing-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.briefing-chat {
+  display: block;
+  height: 100%;
+}
+
+.briefing-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 4px 4px;
+}
+
+.brief-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--ion-color-step-150, #e2e2e8);
+
+  .accept {
+    --background: var(--ion-color-primary, #3161d6);
+  }
+
+  .hint {
+    flex: 1;
+    min-width: 140px;
+    font-size: 12px;
+    color: var(--ion-color-step-500, #6b6b75);
+  }
+}
+
+.status-pill {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  text-transform: lowercase;
+  background: color-mix(in srgb, var(--ion-color-primary, #3161d6) 16%, transparent);
+  color: var(--ion-color-primary, #3161d6);
+
+  &[data-status='briefing'] {
+    background: color-mix(in srgb, #0e8aa6 18%, transparent);
+    color: #0e8aa6;
+  }
+}
+
+// ── Create form (briefing/new) ────────────────────────────────────────────────
+.create-form {
+  max-width: 620px;
+  margin: 0 auto;
+  padding: 20px 16px;
+
+  h2 {
+    margin: 0 0 4px;
+  }
+}
+
+.create-hint {
+  color: var(--ion-color-step-500, #6b6b75);
+  font-size: 13px;
+  margin: 0 0 14px;
+}
+
+.create-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.form-error,
+.load-error {
+  display: block;
+  padding: 10px 16px;
+  font-size: 13px;
+  color: var(--ion-color-danger, #c0392b);
+}

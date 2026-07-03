@@ -84,6 +84,22 @@ export interface CreateAgentPlanInput {
   reviewerSetupCommands?: string;
 }
 
+/** Create an Initiative in briefing (overhaul P4, D1). `brief` is the raw ask. */
+export interface CreateBriefingInput {
+  title?: string;
+  workspacePath: string;
+  brief: string;
+  workerProvider: string;
+  reviewerProvider: string;
+  model?: string;
+}
+
+/** Accept a briefing brief (overhaul P4, D1/D4). `finalBrief` optionally overrides the stored draft. */
+export interface AcceptBriefInput {
+  initiativeId: string;
+  finalBrief?: string;
+}
+
 export interface AgentPlan {
   id: string;
   runType: 'planning' | 'development' | string;
@@ -111,6 +127,8 @@ export interface AgentPlan {
   initiativeStatus: 'briefing' | 'planning' | 'development' | 'review' | 'done' | string;
   /** Condition axis, independent of stage. */
   health: 'in-progress' | 'needs-attention' | 'blocked' | string;
+  /** Non-empty only on a briefing Initiative: its kind='user' chat session (overhaul P4, D3). */
+  briefingSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -285,7 +303,7 @@ export class JohnnyApiService {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
       brief appScope docsScope referencePaths amendBrief phaseRunMode
-      initiativeId initiativeStatus health
+      initiativeId initiativeStatus health briefingSessionId
       createdAt updatedAt
     }
     phases {
@@ -740,6 +758,73 @@ export class JohnnyApiService {
         { input }
       )
       .pipe(map((data) => data.createAgentPlan));
+  }
+
+  // ── Briefing loop (overhaul P4) ───────────────────────────────────────
+  // Thin GraphQL clients over the Phase 03 relay mutations (each a desktopRpc pass-through to a
+  // Phase 01/02 host method). Variable names match worker/schema/johnnyone-ai.graphql.
+
+  /** Create an Initiative in briefing (host `create_briefing_run`). */
+  createBriefingInitiative(input: CreateBriefingInput): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ createBriefingInitiative: AgentPlanRun }>(
+        `mutation CreateBriefingInitiative($input: CreateBriefingInput!) {
+          createBriefingInitiative(input: $input) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.createBriefingInitiative));
+  }
+
+  /** Accept the brief → flips the same Initiative briefing→planning (host `accept_brief`). */
+  acceptInitiativeBrief(input: AcceptBriefInput): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ acceptInitiativeBrief: AgentPlanRun }>(
+        `mutation AcceptInitiativeBrief($input: AcceptBriefInput!) {
+          acceptInitiativeBrief(input: $input) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.acceptInitiativeBrief));
+  }
+
+  /** Record a ▤ Reference host path on a briefing Initiative (host `add_initiative_reference_path`). */
+  addInitiativeReferencePath(initiativeId: string, path: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ addInitiativeReferencePath: AgentPlanRun }>(
+        `mutation AddInitiativeReferencePath($initiativeId: ID!, $path: String!) {
+          addInitiativeReferencePath(initiativeId: $initiativeId, path: $path) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { initiativeId, path }
+      )
+      .pipe(map((data) => data.addInitiativeReferencePath));
+  }
+
+  /** Upload a briefing attachment chunk into <id>/attachments/ (host `initiative_upload_chunk`). */
+  initiativeUploadChunk(
+    initiativeId: string,
+    path: string,
+    chunkIndex: number,
+    totalChunks: number,
+    dataBase64: string,
+    done: boolean
+  ): Observable<UploadChunkResult> {
+    return this.gql
+      .mutate<{ initiativeUploadChunk: UploadChunkResult }>(
+        `mutation InitiativeUploadChunk($initiativeId: ID!, $path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
+          initiativeUploadChunk(initiativeId: $initiativeId, path: $path, chunkIndex: $chunkIndex, totalChunks: $totalChunks, dataBase64: $dataBase64, done: $done) {
+            path received complete
+          }
+        }`,
+        { initiativeId, path, chunkIndex, totalChunks, dataBase64, done }
+      )
+      .pipe(map((data) => data.initiativeUploadChunk));
   }
 
   startAgentPlan(id: string, phaseId?: string, phaseRunMode?: 'continue' | 'single'): Observable<AgentPlanRun> {
