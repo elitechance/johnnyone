@@ -14,12 +14,15 @@ import {
   IonMenuToggle,
   IonRouterOutlet,
   IonSplitPane,
+  PopoverController,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
 import {
+  addOutline,
   chevronBackOutline,
   chevronForwardOutline,
   codeSlashOutline,
+  codeWorkingOutline,
   documentTextOutline,
   folderOutline,
   hammerOutline,
@@ -30,6 +33,7 @@ import {
 import { AuthService } from './services/auth.service';
 import { MermaidZoomService } from './services/mermaid-zoom.service';
 import { MermaidZoomModalComponent } from './components/mermaid-zoom-modal/mermaid-zoom-modal.component';
+import { LauncherMenuComponent } from './components/launcher-menu/launcher-menu.component';
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;
@@ -65,6 +69,7 @@ export class AppComponent {
   private readonly router = inject(Router);
   private readonly host = inject(ElementRef<HTMLElement>);
   private readonly mermaidZoom = inject(MermaidZoomService);
+  private readonly popoverCtrl = inject(PopoverController);
 
   /** True while the user is dragging the side-menu resize bar. */
   protected readonly isResizing = signal(false);
@@ -72,6 +77,7 @@ export class AppComponent {
 
   constructor() {
     addIcons({
+      'add-outline': addOutline,
       'terminal-outline': terminalOutline,
       'chevron-back-outline': chevronBackOutline,
       'chevron-forward-outline': chevronForwardOutline,
@@ -79,6 +85,7 @@ export class AppComponent {
       'folder-outline': folderOutline,
       'hammer-outline': hammerOutline,
       'code-slash-outline': codeSlashOutline,
+      'code-working-outline': codeWorkingOutline,
       'settings-outline': settingsOutline,
       'log-out-outline': logOutOutline,
     });
@@ -103,6 +110,16 @@ export class AppComponent {
     if (!svg) return;
     event.preventDefault();
     this.mermaidZoom.open(svg.outerHTML);
+  }
+
+  /** Open the §06 `+ New` launcher popover, anchored at the trigger (P6). */
+  async openLauncher(ev: Event): Promise<void> {
+    const popover = await this.popoverCtrl.create({
+      component: LauncherMenuComponent,
+      event: ev,
+      cssClass: 'launcher-popover',
+    });
+    await popover.present();
   }
 
   logout(): void {

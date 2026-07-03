@@ -73,6 +73,15 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/files/files.page').then((m) => m.FilesPage),
   },
+  // Shells (overhaul P6) — the list of launched raw shells + attachable external tmux panes. Opening a
+  // row navigates to the existing terminal surface (`/terminal?sessionId=`); no second terminal here.
+  {
+    path: 'shells',
+    title: 'Shells',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/shells/shells.page').then((m) => m.ShellsPage),
+  },
   // Development (T1=Worker, T2=Reviewer) — executes approved plans.
   {
     path: 'development',

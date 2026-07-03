@@ -1,0 +1,17 @@
+<ion-list class="launcher-list" lines="none">
+  @for (entry of entries; track entry.kind) {
+    <ion-item
+      button
+      detail="false"
+      class="launcher-item"
+      [class.hot]="entry.kind === 'shell'"
+      (click)="choose(entry)"
+    >
+      <ion-icon slot="start" [name]="entry.icon" aria-hidden="true"></ion-icon>
+      <ion-label>
+        <div class="launcher-title">{{ entry.title }}</div>
+        <div class="launcher-subtitle">{{ entry.subtitle }}</div>
+      </ion-label>
+    </ion-item>
+  }
+</ion-list>

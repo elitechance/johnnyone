@@ -1,0 +1,38 @@
+// §06 `+ New` launcher popover. Compact rows: icon · title/subtitle; the `shell` row gets a green
+// "hot" accent mirroring the mock's `.mi.hot`.
+:host {
+  display: block;
+  min-width: 260px;
+}
+
+.launcher-list {
+  padding: 4px 0;
+}
+
+.launcher-item {
+  --min-height: 52px;
+
+  ion-icon {
+    font-size: 20px;
+    color: var(--ion-color-medium);
+  }
+
+  .launcher-title {
+    font-weight: 600;
+    font-size: 14px;
+  }
+
+  .launcher-subtitle {
+    font-size: 12px;
+    color: var(--ion-color-medium);
+  }
+
+  // Raw shell — the emphasised action (mock §06 `.mi.hot`, green accent).
+  &.hot ion-icon {
+    color: #4bbd74;
+  }
+
+  &.hot .launcher-title {
+    color: #4bbd74;
+  }
+}

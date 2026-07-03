@@ -18,6 +18,13 @@
           </ion-list-header>
 
           <ion-menu-toggle auto-hide="false">
+            <ion-item button detail="false" lines="none" class="launcher-new" (click)="openLauncher($event)">
+              <ion-icon slot="start" name="add-outline"></ion-icon>
+              <ion-label>New</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+
+          <ion-menu-toggle auto-hide="false">
             <ion-item routerLink="/terminal" routerLinkActive="ion-color-primary" lines="none" detail="false">
               <ion-icon slot="start" name="terminal-outline"></ion-icon>
               <ion-label>Terminal</ion-label>
@@ -42,6 +49,13 @@
             <ion-item routerLink="/files" routerLinkActive="ion-color-primary" lines="none" detail="false">
               <ion-icon slot="start" name="folder-outline"></ion-icon>
               <ion-label>Files</ion-label>
+            </ion-item>
+          </ion-menu-toggle>
+
+          <ion-menu-toggle auto-hide="false">
+            <ion-item routerLink="/shells" routerLinkActive="ion-color-primary" lines="none" detail="false">
+              <ion-icon slot="start" name="code-working-outline"></ion-icon>
+              <ion-label>Shells</ion-label>
             </ion-item>
           </ion-menu-toggle>
 

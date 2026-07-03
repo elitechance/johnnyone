@@ -106,3 +106,13 @@ ion-split-pane.side-menu-collapsed ~ .side-resizer {
   border-radius: 1px;
   pointer-events: none;
 }
+
+// §06 `+ New` launcher trigger — the primary nav action (P6).
+.launcher-new {
+  --color: var(--ion-color-primary);
+  font-weight: 600;
+
+  ion-icon {
+    color: var(--ion-color-primary);
+  }
+}

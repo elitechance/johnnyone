@@ -1,0 +1,67 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Shells</ion-title>
+    <ion-buttons slot="end">
+      <ion-button fill="solid" color="primary" size="small" (click)="openLauncher($event)">
+        <ion-icon slot="start" name="add-outline"></ion-icon>
+        New
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <div class="shells">
+    @if (loadError()) {
+      <div class="shells-error">{{ loadError() }}</div>
+    }
+
+    @if (busy() && sessions().length === 0 && tmux().length === 0) {
+      <div class="shells-loading">
+        <ion-spinner name="dots"></ion-spinner>
+      </div>
+    } @else if (isEmpty()) {
+      <div class="shells-empty">No shells yet — hit “+ New” → Raw shell to launch one.</div>
+    } @else {
+      @if (shells().length > 0) {
+        <div class="grouphdr">Active shells</div>
+        @for (s of shells(); track s.id) {
+          <div class="row" (click)="open(s)">
+            <div class="ic" [class.tmux]="shellSessionLabel(s).tag === 'tmux'">
+              <ion-icon [name]="shellSessionLabel(s).tag === 'tmux' ? 'git-network-outline' : 'terminal-outline'"></ion-icon>
+            </div>
+            <div class="meta">
+              <div class="nm">
+                {{ shellSessionLabel(s).title }}
+                <span class="tag" [class.shell]="shellSessionLabel(s).tag === 'shell'" [class.tmux]="shellSessionLabel(s).tag === 'tmux'">
+                  {{ shellSessionLabel(s).tag === 'tmux' ? 'attached tmux' : 'shell' }}
+                </span>
+              </div>
+              <div class="sub">{{ formatRelTime((s.updatedAt || s.createdAt), nowIso()) }}</div>
+            </div>
+            <div class="act">Open ▸</div>
+          </div>
+        }
+      }
+
+      @if (attachable().length > 0) {
+        <div class="grouphdr">Attachable tmux sessions</div>
+        @for (t of attachable(); track t.name) {
+          <div class="row" (click)="attach(t.name)">
+            <div class="ic tmux">
+              <ion-icon name="git-network-outline"></ion-icon>
+            </div>
+            <div class="meta">
+              <div class="nm">{{ t.name }}</div>
+              <div class="sub">{{ t.windows }} window{{ t.windows === 1 ? '' : 's' }} · not attached</div>
+            </div>
+            <div class="act">Attach ▸</div>
+          </div>
+        }
+      }
+    }
+  </div>
+</ion-content>
