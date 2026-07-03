@@ -120,6 +120,9 @@ export interface AgentPlan {
   referencePaths?: string;
   /** Non-empty when an amendment cycle is in flight; cleared when T2 PASSes. */
   amendBrief?: string;
+  /** Configurable validation lenses as a JSON string (overhaul P7, D1). Null/empty → the desktop
+   * resolves the default product/qa/lead template. Nullable for deploy-skew safety. */
+  validationConfig?: string | null;
   phaseRunMode: 'continue' | 'single' | string;
   /** Groups a planning stage-run + a development stage-run into one Initiative. */
   initiativeId: string;
@@ -249,6 +252,25 @@ export interface WorkspaceFileDiff {
   diff: string;
 }
 
+/** One changed file in a whole-tree diff (overhaul P7, D7). Mirrors the Rust `GitDiffFile`. */
+export interface GitDiffFile {
+  path: string;
+  oldPath?: string | null;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  diff: string;
+}
+
+/** Working-tree diff of a repo (overhaul P7, D7/D10/D11). Mirrors the Rust `GitDiffView`; a non-repo
+ * or clean path yields `clean:true`, `files:[]`, `repoRoot:null` (benign empty state). */
+export interface GitDiffView {
+  repoRoot?: string | null;
+  branch?: string | null;
+  clean: boolean;
+  files: GitDiffFile[];
+}
+
 export interface GitFilesView {
   path: string;
   repoRoot?: string;
@@ -302,7 +324,7 @@ export class JohnnyApiService {
     plan {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
-      brief appScope docsScope referencePaths amendBrief phaseRunMode
+      brief appScope docsScope referencePaths amendBrief validationConfig phaseRunMode
       initiativeId initiativeStatus health briefingSessionId
       createdAt updatedAt
     }
@@ -881,6 +903,25 @@ export class JohnnyApiService {
       .pipe(map((data) => data.updateAgentPlanAppScope));
   }
 
+  /** Persist the Initiative's configurable validation lenses as a JSON string (overhaul P7, D1).
+   * Pass `null` (or an empty string) to clear it — the desktop then resolves the default
+   * product/qa/lead template. The desktop validates the JSON (parse + provider) before writing. */
+  updateAgentPlanValidationConfig(
+    id: string,
+    config: string | null,
+  ): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanValidationConfig: AgentPlanRun }>(
+        `mutation UpdateAgentPlanValidationConfig($id: ID!, $config: String) {
+          updateAgentPlanValidationConfig(id: $id, config: $config) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, config }
+      )
+      .pipe(map((data) => data.updateAgentPlanValidationConfig));
+  }
+
   /**
    * Amend an approved planning run. Stashes the brief on the plan, switches
    * T1 into "edit mode", and re-runs the T1→T2 planning cycle. On T2 PASS
@@ -1042,6 +1083,23 @@ export class JohnnyApiService {
         { planId, path }
       )
       .pipe(map((data) => data.getWorkspaceFileDiff));
+  }
+
+  /** Whole-tree working-tree diff of the repo at `path` (a session's workingDirectory) — overhaul
+   * P7, D7/D10. Scope-gated (`files:read`) + path-guarded on the worker/host; a non-repo/clean path
+   * resolves to `{ clean:true, files:[] }` (no error). One round-trip, per-file +/- counts + hunks. */
+  gitDiff(path: string): Observable<GitDiffView> {
+    return this.gql
+      .query<{ gitDiff: GitDiffView }>(
+        `query GitDiff($path: String!) {
+          gitDiff(path: $path) {
+            repoRoot branch clean
+            files { path oldPath additions deletions binary diff }
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.gitDiff));
   }
 
   // ── File manager (overhaul P2) — relay-RPC via the Phase-02 worker GraphQL surface. ──────────

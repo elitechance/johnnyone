@@ -861,6 +861,9 @@ impl AgentService {
             "update_agent_plan_app_scope" => {
                 Self::rpc_update_agent_plan_app_scope(&req.params, state)
             }
+            "update_agent_plan_validation_config" => {
+                Self::rpc_update_agent_plan_validation_config(&req.params, state)
+            }
             "refresh_agent_plan_phases" => {
                 Self::rpc_refresh_agent_plan_phases(&req.params, state)
             },
@@ -882,6 +885,7 @@ impl AgentService {
             "run_git_action" => Self::rpc_run_git_action(&req.params, state),
             "read_host_file" => Self::rpc_read_host_file(&req.params, state),
             "get_workspace_file_diff" => Self::rpc_get_workspace_file_diff(&req.params, state),
+            "git_diff" => Self::rpc_git_diff(&req.params, state),
             // --- file manager (overhaul P2, files_root-rooted) ---
             "files_list_dir" => Self::rpc_files_list_dir(&req.params, state),
             "files_read" => Self::rpc_files_read(&req.params, state),
@@ -1262,6 +1266,29 @@ impl AgentService {
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
+    fn rpc_update_agent_plan_validation_config(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        // `config` is optional — null/empty clears it (→ default resolve). The JSON string is
+        // validated (parse + provider) inside the service.
+        let config = params
+            .get("config")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty());
+        let run = crate::services::agent_plans::update_plan_validation_config(
+            state,
+            id.to_string(),
+            config,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
     fn rpc_refresh_agent_plan_phases(
         params: &serde_json::Value,
         state: &Arc<AppState>,
@@ -1507,6 +1534,21 @@ impl AgentService {
             path.to_string(),
         )?;
         serde_json::to_value(diff).map_err(|e| e.to_string())
+    }
+
+    /// Whole-tree working-tree diff, path-keyed off a session's `workingDirectory` (overhaul P7,
+    /// D7/D10). Mirrors `rpc_get_workspace_file_diff` but takes only `path` (no plan id) — the repo
+    /// is resolved from the path. The `files:read` scope gate lives in the worker resolver (D13).
+    fn rpc_git_diff(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let path = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'path' parameter".to_string())?;
+        let view = crate::services::agent_plans::git_diff(state, path.to_string())?;
+        serde_json::to_value(view).map_err(|e| e.to_string())
     }
 
     // --- file manager (overhaul P2, files_root-rooted) ---

@@ -1,0 +1,125 @@
+// Working-tree diff view (overhaul P7, mock §04). Colors reuse the Ionic theme tokens with
+// sensible fallbacks, mirroring `transcript-view.component.scss`. Green = additions, red =
+// deletions, amber = hunk header.
+:host {
+  display: block;
+}
+
+.diff-empty {
+  padding: 24px 16px;
+  color: var(--ion-color-medium, #92949c);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.diffview {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.diff-files {
+  border-bottom: 1px solid var(--ion-color-step-150, rgba(255, 255, 255, 0.1));
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  .dh {
+    color: var(--ion-color-medium, #92949c);
+    font-size: 0.72rem;
+    font-family: var(--ion-font-family-monospace, monospace);
+    margin-bottom: 4px;
+  }
+
+  .fr {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--ion-color-step-600, rgba(255, 255, 255, 0.7));
+    padding: 3px 6px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+
+    &.on {
+      color: var(--ion-text-color, #fff);
+      background: var(--ion-color-primary-tint, rgba(110, 168, 254, 0.12));
+    }
+
+    .nm {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+      min-width: 0;
+      font-family: var(--ion-font-family-monospace, monospace);
+    }
+  }
+
+  .adds {
+    color: var(--ion-color-success, #2dd36f);
+    font-family: var(--ion-font-family-monospace, monospace);
+    font-size: 0.72rem;
+  }
+  .dels {
+    color: var(--ion-color-danger, #eb445a);
+    font-family: var(--ion-font-family-monospace, monospace);
+    font-size: 0.72rem;
+  }
+  .bin {
+    color: var(--ion-color-medium, #92949c);
+    font-family: var(--ion-font-family-monospace, monospace);
+    font-size: 0.72rem;
+  }
+}
+
+.diffbody {
+  font-family: var(--ion-font-family-monospace, monospace);
+  font-size: 0.78rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  padding: 6px 0;
+  flex: 1;
+  min-height: 0;
+
+  .hunk {
+    color: var(--ion-color-warning, #ffc409);
+    background: var(--ion-color-warning-tint, rgba(255, 196, 9, 0.09));
+    padding: 0 14px;
+    white-space: pre;
+  }
+
+  .ln {
+    display: block;
+    padding: 0 14px;
+    white-space: pre;
+
+    &.add {
+      background: var(--ion-color-success-tint, rgba(45, 211, 111, 0.13));
+    }
+    &.del {
+      background: var(--ion-color-danger-tint, rgba(235, 68, 90, 0.13));
+    }
+    &.meta {
+      color: var(--ion-color-medium, #92949c);
+    }
+
+    .mk {
+      user-select: none;
+      color: var(--ion-color-medium, #92949c);
+      display: inline-block;
+      width: 1.2ch;
+    }
+    &.add .mk {
+      color: var(--ion-color-success, #2dd36f);
+    }
+    &.del .mk {
+      color: var(--ion-color-danger, #eb445a);
+    }
+
+    .code {
+      white-space: pre;
+    }
+  }
+}

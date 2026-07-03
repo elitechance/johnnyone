@@ -134,6 +134,15 @@
           >
             Raw terminal
           </button>
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="paneTab(session.id) === 'diff'"
+            [attr.aria-selected]="paneTab(session.id) === 'diff'"
+            (click)="setPaneTab(session.id, 'diff'); loadDiff(session); $event.stopPropagation()"
+          >
+            Diff
+          </button>
         </div>
 
         @if (paneTab(session.id) === 'transcript') {
@@ -142,6 +151,11 @@
             [events]="transcriptEventsFor(session.id)"
             [streaming]="isSessionStreaming(session.id)"
             (svgZoom)="mermaidZoom.open($event)"
+          />
+        } @else if (paneTab(session.id) === 'diff') {
+          <johnny-diff-view
+            class="terminal-surface diff-surface"
+            [view]="diffFor(session.id)"
           />
         } @else {
           <johnny-terminal-screen

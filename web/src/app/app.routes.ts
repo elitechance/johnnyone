@@ -82,6 +82,18 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/shells/shells.page').then((m) => m.ShellsPage),
   },
+  // Validation config (overhaul P7) — the §07 "Validation · configure" surface for one Initiative:
+  // the ordered N-lens array (provider/model/vision/BLOCK-WARN) persisted to `validationConfig`.
+  // One lazy authGuard route (mirrors /files, /shells — D12); reached from the planner run settings.
+  {
+    path: 'initiatives/:id/validation',
+    title: 'Validation',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/validation-config/validation-config.page').then(
+        (m) => m.ValidationConfigPage,
+      ),
+  },
   // Development (T1=Worker, T2=Reviewer) — executes approved plans.
   {
     path: 'development',

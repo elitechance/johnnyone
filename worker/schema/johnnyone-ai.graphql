@@ -132,6 +132,12 @@ type AgentPlan {
   docsScope: String
   referencePaths: String
   amendBrief: String
+  # Configurable validation (overhaul phase 7, decision D1/D3): an opaque JSON array of review
+  # lenses persisted on the Initiative. NULLABLE for the same deploy-skew reason as the initiative
+  # axes below — a worker deploy against a not-yet-rebuilt (pre-migration 019) desktop returns JSON
+  # without this key; nullable degrades to null. NULL/empty resolves to the default product/qa/lead
+  # template in the desktop, so an unconfigured Initiative reviews exactly as before.
+  validationConfig: String
   phaseRunMode: String!
   # Initiative axes (overhaul phase 1). Deliberately NULLABLE String (not String!) for
   # deploy-skew safety (decision D8): a worker deploy against a not-yet-rebuilt (pre-migration
@@ -272,6 +278,24 @@ type UploadChunkResult {
 type WorkspaceFileDiff {
   path: String!
   diff: String!
+}
+
+# Whole-tree working-tree diff (overhaul phase 7, D7/D10). One changed file with its +/- counts and
+# hunk section; camelCase mirrors the Rust GitDiffFile/GitDiffView structs exactly (repoRoot, oldPath).
+type GitDiffFile {
+  path: String!
+  oldPath: String
+  additions: Int!
+  deletions: Int!
+  binary: Boolean!
+  diff: String!
+}
+
+type GitDiffView {
+  repoRoot: String
+  branch: String
+  clean: Boolean!
+  files: [GitDiffFile!]!
 }
 
 type GitFilesView {
@@ -462,6 +486,8 @@ type Query {
   # File manager (overhaul P2) — relay to host files_root surface.
   filesListDir(path: String!): DirListing!
   filesRead(path: String!): FileContent!
+  # Whole-tree working-tree diff (overhaul P7, D7/D10) — path-keyed, scope-gated like the file ops.
+  gitDiff(path: String!): GitDiffView!
 }
 
 # --- Mutations ---
@@ -486,6 +512,9 @@ type Mutation {
   updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
   updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!
   updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!
+  # Overhaul phase 7 (D1). Persist the Initiative's ordered validation-lens array as a JSON string;
+  # a null/empty config clears it (→ desktop resolves the default product/qa/lead template).
+  updateAgentPlanValidationConfig(id: ID!, config: String): AgentPlanRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!

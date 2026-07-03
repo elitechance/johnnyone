@@ -52,6 +52,8 @@ import {
   ChatAttachment,
   TerminalScreenComponent,
   TranscriptViewComponent,
+  DiffViewComponent,
+  GitDiffView,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
@@ -129,6 +131,7 @@ addIcons({
     FormsModule,
     TerminalScreenComponent,
     TranscriptViewComponent,
+    DiffViewComponent,
     IonMenuButton,
     IonModal,
     IonHeader,
@@ -157,6 +160,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private static readonly WORKSPACE_PADDING_PX = 12;
   private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
   private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
+  /** Benign empty diff for a no-cwd / non-repo / failed-load session (overhaul P7, D11). */
+  private static readonly EMPTY_DIFF: GitDiffView = {
+    repoRoot: null,
+    branch: null,
+    clean: true,
+    files: [],
+  };
   private readonly api = inject(JohnnyApiService);
   private readonly auth = inject(AuthService);
   private readonly route = inject(ActivatedRoute);
@@ -245,6 +255,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // Per-session pane tab (Transcript default · Raw terminal; Plan/Diff reserved, D7)
   // and the accumulated structured stream feeding the Transcript surface (D6).
   paneTabs = signal<Record<string, PaneTab>>({});
+  /** Per-session working-tree diff (overhaul P7, D10), loaded lazily on Diff-tab activation. */
+  diffs = signal<Record<string, GitDiffView | null>>({});
   transcriptEvents = signal<Record<string, StreamEvent[]>>({});
   paneLayouts = signal<Record<string, PaneLayout>>({});
   closedPaneIds = signal<Set<string>>(new Set());
@@ -1335,6 +1347,31 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   setPaneTab(id: string, tab: PaneTab): void {
     this.paneTabs.update((m) => ({ ...m, [id]: tab }));
+  }
+
+  /** The loaded diff for a session's Diff tab (null until first activation). */
+  diffFor(id: string): GitDiffView | null {
+    return this.diffs()[id] ?? null;
+  }
+
+  /**
+   * Load the working-tree diff for a session's Diff tab (overhaul P7, D10/D11). Best-effort: a
+   * session with no `workingDirectory`, a non-repo cwd, or a failed RPC resolves to a benign
+   * clean/empty view (no error toast — `johnny-diff-view` shows its empty state). Refetches on each
+   * activation so a stale diff refreshes on tab click.
+   */
+  async loadDiff(session: SharedAiSession): Promise<void> {
+    const dir = session.workingDirectory?.trim();
+    if (!dir) {
+      this.diffs.update((m) => ({ ...m, [session.id]: TerminalPage.EMPTY_DIFF }));
+      return;
+    }
+    try {
+      const view = await firstValueFrom(this.api.gitDiff(dir));
+      this.diffs.update((m) => ({ ...m, [session.id]: view }));
+    } catch {
+      this.diffs.update((m) => ({ ...m, [session.id]: TerminalPage.EMPTY_DIFF }));
+    }
   }
 
   /** Accumulated structured events for a session's transcript (empty if none yet). */

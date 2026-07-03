@@ -875,6 +875,11 @@ export class PlannerPage implements OnInit, OnDestroy {
     void this.router.navigateByUrl(path);
   }
 
+  /** Open the §07 validation-config surface for this Initiative (overhaul P7, D12). */
+  openValidationConfig(planId: string): void {
+    void this.router.navigate(['/initiatives', planId, 'validation']);
+  }
+
   logout(): void {
     this.auth.logout();
   }

@@ -337,6 +337,14 @@
             <code>{{ run.plan.planPath }}</code>
             <label>Providers</label>
             <code>T1: {{ run.plan.workerProvider }} · T2: {{ run.plan.reviewerProvider }}</code>
+            <label>Validation <span class="hint">(configure the review lenses)</span></label>
+            <button
+              class="secondary-action"
+              type="button"
+              (click)="openValidationConfig(run.plan.id)"
+            >
+              Configure lenses
+            </button>
             @if (mode() === 'development') {
               <label>App repo path <span class="hint">(docs commit on completion — blank to skip)</span></label>
               <div class="app-scope-edit">

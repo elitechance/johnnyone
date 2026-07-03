@@ -21,6 +21,7 @@ const MIGRATION_017: &str = include_str!("../../migrations/017_add_initiative_ax
 /// (single source of truth — the test can never drift from what the migration applies).
 pub const BACKFILL_017: &str = include_str!("../../migrations/017_backfill_initiative_axes.sql");
 const MIGRATION_018: &str = include_str!("../../migrations/018_add_briefing_session.sql");
+const MIGRATION_019: &str = include_str!("../../migrations/019_add_validation_config.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -75,6 +76,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (16, "016_add_attached_tmux", MIGRATION_016),
         (17, "017_add_initiative_axes", MIGRATION_017),
         (18, "018_add_briefing_session", MIGRATION_018),
+        (19, "019_add_validation_config", MIGRATION_019),
     ];
 
     for (version, name, sql) in migrations {
@@ -194,6 +196,22 @@ mod tests {
                 cols
             );
         }
+    }
+
+    #[test]
+    fn migration_019_adds_validation_config_column_idempotently() {
+        // Overhaul P7 phase 01: the nullable JSON validation_config column lands on agent_plans
+        // and re-running migrations is a no-op (not a "duplicate column" error).
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).expect("first run_migrations");
+        run_migrations(&conn).expect("second run_migrations (idempotent)");
+
+        let cols = column_names(&conn, "agent_plans");
+        assert!(
+            cols.iter().any(|c| c == "validation_config"),
+            "agent_plans missing column validation_config (have: {:?})",
+            cols
+        );
     }
 
     #[test]

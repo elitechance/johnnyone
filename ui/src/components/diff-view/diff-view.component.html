@@ -1,0 +1,49 @@
+@if (isEmpty) {
+  <div class="diff-empty">No changes — the working tree is clean or this path is not a git repository.</div>
+} @else {
+  <div class="diffview">
+    <div class="diff-files">
+      <div class="dh">
+        {{ totals.count }} {{ totals.count === 1 ? 'file' : 'files' }} changed ·
+        <span class="adds">+{{ totals.additions }}</span>
+        <span class="dels">−{{ totals.deletions }}</span>
+      </div>
+      @for (f of files; track f.path) {
+        <div
+          class="fr"
+          role="button"
+          [class.on]="f.path === selectedPath()"
+          (click)="select(f.path)"
+        >
+          <span class="nm" [title]="f.path">{{ f.path }}</span>
+          @if (f.binary) {
+            <span class="bin">binary</span>
+          } @else {
+            <span class="adds">+{{ f.additions }}</span>
+            <span class="dels">−{{ f.deletions }}</span>
+          }
+        </div>
+      }
+    </div>
+
+    <div class="diffbody">
+      @for (line of lines; track $index) {
+        @switch (line.kind) {
+          @case ('hunk') {
+            <div class="hunk">{{ line.plain }}</div>
+          }
+          @case ('meta') {
+            <span class="ln meta"><span class="code">{{ line.plain }}</span></span>
+          }
+          @default {
+            <span class="ln" [class.add]="line.kind === 'add'" [class.del]="line.kind === 'del'">
+              <span class="mk">{{ line.marker }}</span><span class="code" [innerHTML]="line.html"></span>
+            </span>
+          }
+        }
+      } @empty {
+        <div class="diff-empty">Select a file to view its changes.</div>
+      }
+    </div>
+  </div>
+}

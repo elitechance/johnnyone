@@ -55,6 +55,8 @@ export type {
   ChatAttachment,
   GitActionResult,
   GitFilesView,
+  GitDiffFile,
+  GitDiffView,
   WorkspaceFileDiff,
   WorkspaceValidation,
 } from './services/johnny-api.service';
@@ -83,6 +85,16 @@ export type {
   TranscriptBlock,
   TranscriptBlockKind,
 } from './components/transcript-view/transcript-blocks';
+export { DiffViewComponent } from './components/diff-view/diff-view.component';
+export {
+  parseUnifiedDiff,
+  langForPath,
+  fileTotals,
+} from './components/diff-view/diff-parse';
+export type {
+  DiffLine,
+  DiffLineKind,
+} from './components/diff-view/diff-parse';
 export type { TerminalScreen } from './models/terminal.model';
 export type { StreamEvent } from './models/stream-event.model';
 

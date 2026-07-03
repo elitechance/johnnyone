@@ -106,6 +106,27 @@ pub struct UpsertProviderConfigInput {
 
 // ── Agent Planner ───────────────────────────────────────────────────────────
 
+/// One configurable review lens (overhaul P7, D1/D14). Persisted as an element of the
+/// nullable JSON array in `AgentPlan.validation_config`; when that column is NULL/empty the
+/// review fan-out resolves to `default_validation_config` (= today's product/qa/lead triad).
+/// `vision` traces to design-authority §3 ("a lens may be vision-capable"); a vision lens's
+/// reviewer prompt is told to approve on functional grounds when it can't read a screenshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationLens {
+    pub name: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// design-authority §3: a lens may be vision-capable (D14). `#[serde(default)]` so a
+    /// legacy/hand-written config lacking the key deserializes to `false`.
+    #[serde(default)]
+    pub vision: bool,
+    pub blocking: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPlan {
@@ -144,6 +165,11 @@ pub struct AgentPlan {
     pub briefing_session_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Nullable JSON array of `ValidationLens` (overhaul P7, D1/D3). NULL/empty → the review
+    /// fan-out resolves to `default_validation_config`. Appended last in the positional row map
+    /// and every SELECT (order is load-bearing); nullable for deploy-skew safety like the
+    /// initiative axes.
+    pub validation_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +318,7 @@ mod tests {
             briefing_session_id: None,
             created_at: "".into(),
             updated_at: "".into(),
+            validation_config: Some("[]".into()),
         }
     }
 
@@ -311,6 +338,13 @@ mod tests {
         // The briefing link serializes camelCase (present as null on a non-briefing row).
         assert!(v.as_object().unwrap().contains_key("briefingSessionId"));
         assert!(v.get("briefing_session_id").is_none());
+        // The P7 validation config serializes camelCase (D3): field `validation_config` → key
+        // `validationConfig`; snake_case form must be absent.
+        assert_eq!(
+            v.get("validationConfig").and_then(|x| x.as_str()),
+            Some("[]")
+        );
+        assert!(v.get("validation_config").is_none());
         // …and the snake_case forms are absent (guards against a missing rename_all).
         assert!(v.get("initiative_id").is_none());
         assert!(v.get("initiative_status").is_none());
