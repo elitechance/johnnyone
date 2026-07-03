@@ -9,6 +9,8 @@ import {
   LAUNCHER_ENTRIES,
   launcherIntent,
   terminalRoute,
+  plainTerminalRoute,
+  isPlainShellSurface,
   shellCreateInput,
   attachTmuxInput,
 } from './launcher-logic';
@@ -71,6 +73,48 @@ describe('launcher — pure logic', () => {
     it('is the shared /terminal?sessionId= nav shape', () => {
       expect(terminalRoute('abc')).toEqual({ path: '/terminal', queryParams: { sessionId: 'abc' } });
     });
+
+    it('carries NO surface param (non-shell callers unchanged)', () => {
+      expect('surface' in terminalRoute('abc').queryParams).toBe(false);
+    });
+  });
+
+  // P4 — plain-shell route + surface predicate
+  describe('plainTerminalRoute', () => {
+    it('is /terminal?sessionId=&surface=shell', () => {
+      expect(plainTerminalRoute('abc')).toEqual({
+        path: '/terminal',
+        queryParams: { sessionId: 'abc', surface: 'shell' },
+      });
+    });
+
+    it('always carries surface:shell', () => {
+      expect(plainTerminalRoute('x').queryParams.surface).toBe('shell');
+    });
+  });
+
+  describe('isPlainShellSurface', () => {
+    it('is true when the surface param is shell (drives first paint)', () => {
+      expect(isPlainShellSurface('shell')).toBe(true);
+      expect(isPlainShellSurface('shell', null)).toBe(true);
+      expect(isPlainShellSurface('shell', { provider: 'claude_code', attachedTmux: false })).toBe(true);
+    });
+
+    it('is true for a shell/attached session even with no param (backstop)', () => {
+      expect(isPlainShellSurface(null, { provider: 'shell', attachedTmux: false })).toBe(true);
+      expect(isPlainShellSurface(undefined, { provider: 'codex', attachedTmux: true })).toBe(true);
+    });
+
+    it('is false for an agent session with no shell param', () => {
+      expect(isPlainShellSurface(null, { provider: 'claude_code', attachedTmux: false })).toBe(false);
+      expect(isPlainShellSurface('', { provider: 'codex', attachedTmux: false })).toBe(false);
+    });
+
+    it('is false and null-safe when neither param nor session is a shell', () => {
+      expect(isPlainShellSurface(null)).toBe(false);
+      expect(isPlainShellSurface(null, null)).toBe(false);
+      expect(isPlainShellSurface(undefined, undefined)).toBe(false);
+    });
   });
 
   // A.5 — create inputs (both branches)
@@ -87,8 +131,12 @@ describe('launcher — pure logic', () => {
   });
 
   describe('attachTmuxInput', () => {
-    it('attaches to the named external tmux pane', () => {
-      expect(attachTmuxInput('kloo')).toEqual({ tmuxSessionName: 'kloo' });
+    it('attaches to the named external tmux pane AND carries title=name (de-dupe join fix)', () => {
+      expect(attachTmuxInput('kloo')).toEqual({ tmuxSessionName: 'kloo', title: 'kloo' });
+    });
+
+    it('keeps provider absent (host attaches without one)', () => {
+      expect('provider' in attachTmuxInput('kloo')).toBe(false);
     });
   });
 });

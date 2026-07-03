@@ -889,12 +889,90 @@ ion-modal.workspace-picker .picker-empty {
    =========================================================================== */
 .console {
   display: grid;
-  grid-template-columns: 216px minmax(0, 1fr) 262px;
+  /* P5: pre-hydration fallback only. The live template is bound inline via
+     `[style.grid-template-columns]="consoleCompact() ? '1fr' : consoleColumns()"` — gated by a
+     container-width signal so the stored widths never leak into the collapsed single-column layout
+     (a `container-type` element cannot restyle ITSELF via `@container`, so the collapse must be driven
+     by the inline binding, not the `@container .console { grid: 1fr }` rule below). */
+  grid-template-columns: 216px 6px minmax(0, 1fr) 6px 262px;
   min-height: 0;
   height: 100%;
   container-type: inline-size;
   container-name: console;
   background: var(--jo-bg-base);
+}
+
+/* P5: rail↔center and center↔right drag handles (mirrors planner `.file-resizer`). Full-height grid
+   tracks; hidden in the collapsed layout by the container query. */
+.console-divider {
+  cursor: col-resize;
+  touch-action: none;
+  background: var(--jo-border);
+  transition: background 0.12s ease;
+
+  &:hover {
+    background: var(--jo-accent);
+  }
+  &:active {
+    background: var(--jo-accent);
+  }
+}
+
+/* P4: plain-shell surface — the console collapses to a single center column (no rail/right/divider
+   tracks), and the center pane fills it edge-to-edge with just the terminal + status bar. */
+.console.plain-shell {
+  grid-template-columns: minmax(0, 1fr);
+
+  .console-center {
+    border-right: none;
+  }
+  .plain-shell-topbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--jo-border);
+    background: var(--jo-bg-elevated);
+    color: var(--jo-fg-muted);
+    font-size: 12px;
+    flex: 0 0 auto;
+
+    .ps-chip {
+      background: var(--jo-bg-raised);
+      border: 1px solid var(--jo-border);
+      border-radius: 6px;
+      padding: 1px 8px;
+      color: var(--jo-fg-strong);
+      font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+      font-size: 10.5px;
+    }
+    .ps-name {
+      color: var(--jo-fg-strong);
+      font-weight: 600;
+    }
+    .ps-dim {
+      color: var(--jo-fg-faint);
+    }
+    .ps-detach {
+      margin-left: auto;
+      background: none;
+      border: none;
+      color: var(--jo-fg-muted);
+      cursor: pointer;
+      font: inherit;
+
+      &:hover {
+        color: var(--jo-fg-strong);
+      }
+    }
+  }
+  .plain-shell-screen {
+    flex: 1;
+    min-height: 0;
+  }
+  .terminal-workspace {
+    min-height: 0;
+  }
 }
 
 .console .pane {
@@ -913,7 +991,9 @@ ion-modal.workspace-picker .picker-empty {
 .console .pane-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+  row-gap: 5px;
   padding: 11px 14px;
   border-bottom: 1px solid var(--jo-border);
   font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', Menlo, Consolas, monospace);
@@ -933,6 +1013,30 @@ ion-modal.workspace-picker .picker-empty {
     font-size: 10.5px;
     letter-spacing: 0;
     text-transform: none;
+    white-space: nowrap;
+  }
+}
+
+/* P3: validation source badge (mock artifacts/console-states.html P3 state). `def` = muted/dashed
+   "default template"; `cfg` = amber "configured". Also used on the Configure page header. */
+.lens-source-badge {
+  display: inline-block;
+  border-radius: 6px;
+  padding: 1px 7px;
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  white-space: nowrap;
+
+  &.def {
+    background: var(--jo-bg-raised, #26262b);
+    color: var(--jo-fg-muted, #8fa0b3);
+    border: 1px dashed var(--jo-fg-faint, #6b7a8d);
+  }
+  &.cfg {
+    background: color-mix(in srgb, var(--jo-accent, #ffb454) 18%, transparent);
+    color: var(--jo-accent, #ffb454);
+    border: 1px solid var(--jo-accent, #ffb454);
   }
 }
 
@@ -1006,6 +1110,286 @@ ion-modal.workspace-picker .picker-empty {
 .console-center .workspace-shell {
   flex: 1;
   min-height: 0;
+}
+
+/* P1: per-initiative console tab shell — the four `.pane-tabs` (reused styling above) sit atop a
+   surface that fills the workspace, replacing the old per-pane placement. */
+.console-tabshell {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  overflow: hidden;
+  z-index: 1;
+
+  .terminal-surface {
+    min-height: 0;
+  }
+}
+
+/* Raw-tab inline attach card (S2) — a centered affordance INSIDE the tab, not the whole-pane empty. */
+.raw-attach {
+  align-self: center;
+  justify-self: center;
+  margin: auto;
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  text-align: center;
+  max-width: 420px;
+  padding: 24px;
+  color: #cbd5e1;
+
+  .raw-attach-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+}
+
+/* Plan-tab loading / empty placeholders. */
+.plan-loading,
+.plan-empty {
+  align-self: center;
+  justify-self: center;
+  margin: auto;
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  text-align: center;
+  color: var(--jo-fg-muted, #8fa0b3);
+  font: 13px/1.4 var(--jo-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
+}
+.plan-empty .empty-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--jo-fg-strong, #dbe7f3);
+}
+
+/* ── Plan tab document view (P2, mock §03) — read-only: docnav │ rendered doc + phase cards. ── */
+.plandoc-surface {
+  overflow: auto;
+}
+.plandoc {
+  display: grid;
+  grid-template-columns: 216px 1fr;
+  min-height: 100%;
+}
+@media (max-width: 720px) {
+  .plandoc {
+    grid-template-columns: 1fr;
+  }
+  .plandoc .docnav {
+    display: none;
+  }
+}
+
+.plandoc .docnav {
+  border-right: 1px solid var(--jo-border, #263241);
+  display: flex;
+  flex-direction: column;
+  padding: 8px 0;
+  gap: 1px;
+  font: 12px/1.3 var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+
+  .dn {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    color: var(--jo-fg-muted, #8fa0b3);
+    white-space: nowrap;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: default;
+  }
+  button.dn {
+    cursor: pointer;
+  }
+  .dn.dir {
+    color: var(--jo-fg-strong, #dbe7f3);
+    font-weight: 600;
+  }
+  .dn.indent-1 {
+    padding-left: 24px;
+  }
+  .dn .ic {
+    color: var(--jo-fg-faint, #6b7a8d);
+    width: 12px;
+    text-align: center;
+    flex: none;
+  }
+  button.dn:hover {
+    background: var(--jo-bg-hover, #16202c);
+    color: var(--jo-fg-strong, #dbe7f3);
+  }
+  .dn.on {
+    background: color-mix(in srgb, var(--jo-accent, #64b5ff) 14%, transparent);
+    color: var(--jo-fg-strong, #dbe7f3);
+  }
+  .dn.done .ic {
+    color: var(--jo-st-done, #4ade80);
+  }
+  .docnav-foot {
+    margin-top: auto;
+    padding: 11px 12px;
+    border-top: 1px solid var(--jo-border, #263241);
+    color: var(--jo-fg-faint, #6b7a8d);
+    font-size: 10.5px;
+    line-height: 1.5;
+    white-space: normal;
+    word-break: break-all;
+
+    b {
+      color: var(--jo-fg-muted, #8fa0b3);
+      display: block;
+      margin-bottom: 6px;
+    }
+    span {
+      color: var(--jo-fg-faint, #6b7a8d);
+      word-break: normal;
+    }
+  }
+}
+
+.plandoc .docview {
+  padding: 18px 24px;
+  overflow-x: auto;
+  min-width: 0;
+
+  .doc-eyebrow {
+    font: 11px/1 var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--jo-fg-faint, #6b7a8d);
+    margin-bottom: 10px;
+  }
+  .doc-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    color: var(--jo-fg-muted, #8fa0b3);
+    font-size: 12px;
+    margin-bottom: 14px;
+  }
+  .plan-doc-note {
+    color: var(--jo-fg-faint, #6b7a8d);
+    font-size: 12.5px;
+    margin-bottom: 10px;
+  }
+  .plan-markdown {
+    display: block;
+  }
+  .plan-phases-head {
+    font: 12px/1 var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--jo-fg-muted, #8fa0b3);
+    margin: 18px 0 10px;
+  }
+}
+
+.plandoc .phasecard {
+  border: 1px solid var(--jo-border, #263241);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--jo-bg-raised, #0d1420);
+
+  .ph {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 10px;
+  }
+  .ph .pid {
+    font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    font-size: 10.5px;
+    color: var(--jo-fg-faint, #6b7a8d);
+  }
+  .ph .pt {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--jo-fg-strong, #dbe7f3);
+  }
+  .ph .pc {
+    margin-left: auto;
+    font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    font-size: 10px;
+    color: var(--jo-fg-faint, #6b7a8d);
+  }
+  .tasklist {
+    display: grid;
+    gap: 8px;
+  }
+}
+
+.plandoc .taskrow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--jo-fg-strong, #dbe7f3);
+
+  .box {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    border: 1.6px solid var(--jo-border, #3a4a5f);
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+  }
+  .tt {
+    min-width: 0;
+  }
+  .st {
+    margin-left: auto;
+    font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+    color: var(--jo-fg-faint, #6b7a8d);
+    white-space: nowrap;
+  }
+
+  &.st-done {
+    .box {
+      background: var(--jo-st-done, #4ade80);
+      border-color: var(--jo-st-done, #4ade80);
+      color: #06210f;
+    }
+    .tt {
+      color: var(--jo-fg-muted, #8fa0b3);
+    }
+    .st {
+      color: var(--jo-st-done, #4ade80);
+    }
+  }
+  &.st-done .box::before {
+    content: '✓';
+  }
+  &.st-in-progress {
+    .box {
+      border-color: var(--jo-st-development, #64b5ff);
+      background: color-mix(in srgb, var(--jo-st-development, #64b5ff) 16%, transparent);
+    }
+    .st {
+      color: var(--jo-st-development, #64b5ff);
+    }
+  }
+  &.st-in-progress .box::before {
+    content: '●';
+    color: var(--jo-st-development, #64b5ff);
+    font-size: 8px;
+  }
+  &.empty {
+    color: var(--jo-fg-faint, #6b7a8d);
+    font-style: italic;
+  }
 }
 
 /* §08 mobile segment switcher (mock 428-431) — hidden on widescreen, shown when
@@ -1134,20 +1518,31 @@ ion-modal.workspace-picker .picker-empty {
    list + right panes hidden, the segment switcher drives which pane shows. The
    Transcript surface is the mobile default. */
 @container console (max-width: 760px) {
+  /* The single-column collapse grid is driven by the inline `[style.grid-template-columns]` binding
+     (gated by `consoleCompact()`), because a `container-type` element can't restyle ITSELF via
+     `@container`. This rule is kept as a harmless belt-and-suspenders (it only matches a nested
+     `.console`, of which there is none). */
   .console {
     grid-template-columns: 1fr;
   }
+  /* P5: no dividers in the single-column layout. */
+  .console-divider {
+    display: none;
+  }
   /* Single column: the master-list is dropped; the switcher stays PERSISTENT (a direct
-     child of .console, not inside .console-center) and only the body below it swaps. */
-  .console-list {
+     child of .console, not inside .console-center) and only the body below it swaps.
+     The `.console` qualifier raises specificity to (0,2,0) so this ties `.console .pane`
+     (`display:flex`) and wins on source order — otherwise the rail would stay visible. */
+  .console .console-list {
     display: none;
   }
   .console-seg {
     display: flex;
   }
 
-  /* Default collapsed pane = Transcript: the center (existing pane shell) shows, right hides. */
-  .console-right {
+  /* Default collapsed pane = Transcript: the center (existing pane shell) shows, right hides.
+     Same `.console` qualifier so it out-specifies `.console .pane`. */
+  .console .console-right {
     display: none;
   }
 

@@ -35,6 +35,8 @@ import {
   toConfigJson,
   fromConfigJson,
   defaultLenses,
+  lensSourceOf,
+  type LensSource,
 } from './validation-config-logic';
 
 /**
@@ -82,6 +84,9 @@ export class ValidationConfigPage implements OnInit {
   protected readonly loading = signal(true);
   protected readonly saving = signal(false);
   protected readonly loadError = signal<string | null>(null);
+  /** Whether the editor started from this initiative's own saved config or the default template (P3).
+   *  Reuses the P7 parse-boundary owner (`lensSourceOf`) — no coupling to the terminal console module. */
+  protected readonly configSource = signal<LensSource>('default');
   /** Provider dropdown options — the real registry minus `shell` (D9). */
   protected readonly providers = providerOptions();
 
@@ -103,6 +108,7 @@ export class ValidationConfigPage implements OnInit {
     this.api.getAgentPlan(id).subscribe({
       next: (run) => {
         this.lenses.set(fromConfigJson(run.plan.validationConfig));
+        this.configSource.set(lensSourceOf(run.plan.validationConfig));
         this.loading.set(false);
       },
       error: () => {

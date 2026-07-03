@@ -16,7 +16,7 @@ import { firstValueFrom } from 'rxjs';
 import {
   LAUNCHER_ENTRIES,
   launcherIntent,
-  terminalRoute,
+  plainTerminalRoute,
   shellCreateInput,
   attachTmuxInput,
   type LauncherEntry,
@@ -144,9 +144,10 @@ export class LauncherMenuComponent {
     }
   }
 
-  /** Navigate to the existing terminal surface with the session deep-linked (P3 `?sessionId=`). */
+  /** Navigate to the terminal surface with the session deep-linked, as a PLAIN shell surface (P4
+   *  `?sessionId=&surface=shell`) — both launcher session kinds (raw shell, attach-tmux) open plain. */
   private async openInTerminal(sessionId: string): Promise<void> {
-    const route = terminalRoute(sessionId);
+    const route = plainTerminalRoute(sessionId);
     await this.router.navigate([route.path], { queryParams: route.queryParams });
   }
 

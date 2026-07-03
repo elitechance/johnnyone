@@ -9,7 +9,7 @@
 // defined once (D3), not re-derived here.
 import type { AiSession } from '../../../../../ui/src/models/ai-session.model';
 import type { TmuxSession } from '../../../../../ui/src/services/johnny-api.service';
-import { terminalRoute } from '../../components/launcher-menu/launcher-logic';
+import { plainTerminalRoute } from '../../components/launcher-menu/launcher-logic';
 
 /**
  * A session belongs on the Shells list when it is a raw `CliProvider::Shell` OR an attached external
@@ -81,7 +81,8 @@ export function formatRelTime(iso: string, nowIso: string): string {
 }
 
 /**
- * Route args to open a shell session on the existing terminal surface. Reuses Phase 01's
- * `terminalRoute` verbatim — the `/terminal?sessionId=` shape is defined once (D3).
+ * Route args to open a shell session on the terminal surface. Shells always open as a PLAIN terminal
+ * (no initiative chrome), so this reuses Phase 4's `plainTerminalRoute` — the `/terminal?sessionId=`
+ * shape plus `surface=shell`, defined once (D5). Fix for finding #3(b).
  */
-export const openIntent = terminalRoute;
+export const openIntent = plainTerminalRoute;

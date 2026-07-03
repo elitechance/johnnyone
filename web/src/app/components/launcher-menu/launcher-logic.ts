@@ -10,6 +10,7 @@
 // `tmuxSessionName`) is the one `createSession` actually accepts — not the narrower barrel-exported
 // `models/ai-session.model` shape.
 import type { CreateAiSessionInput } from '../../../../../ui/src/services/johnny-api.service';
+import type { AiSession } from '../../../../../ui/src/models/ai-session.model';
 
 /** The four §06 launcher rows. Order is the mock's order and is asserted by the spec. */
 export type LauncherKind = 'initiative' | 'shell' | 'attach' | 'files';
@@ -71,6 +72,32 @@ export function terminalRoute(sessionId: string): { path: string; queryParams: {
 }
 
 /**
+ * Nav shape for opening a **shell / attached-tmux** session on the terminal surface as a PLAIN terminal
+ * (overhaul P9 / phase P4, D5). Same `/terminal?sessionId=` deep-link as {@link terminalRoute} plus an
+ * explicit `surface=shell` marker the terminal page reads synchronously to render the plain surface from
+ * first paint (no console-chrome flash). `terminalRoute` is left unchanged for any non-shell caller.
+ */
+export function plainTerminalRoute(
+  sessionId: string,
+): { path: string; queryParams: { sessionId: string; surface: 'shell' } } {
+  return { path: '/terminal', queryParams: { sessionId, surface: 'shell' } };
+}
+
+/**
+ * Whether the terminal page should render the PLAIN shell surface (no initiative chrome): true when the
+ * `surface` query param is `'shell'` (drives first paint) OR the resolved session is a shell / attached
+ * -tmux pane (`provider === 'shell' || attachedTmux === true`, the backstop once the session loads).
+ * Pure/total and null-safe.
+ */
+export function isPlainShellSurface(
+  surfaceParam: string | null | undefined,
+  session?: Pick<AiSession, 'provider' | 'attachedTmux'> | null,
+): boolean {
+  if (surfaceParam === 'shell') return true;
+  return !!session && (session.provider === 'shell' || session.attachedTmux === true);
+}
+
+/**
  * Create-input for a raw shell (`CliProvider::Shell`, D5). The `workingDirectory` key is ABSENT when
  * there is no cwd (not set to `undefined`) so the host falls back to its own default — the launcher does
  * not carry a path-picker (that stays on the terminal page's New-session flow).
@@ -79,7 +106,12 @@ export function shellCreateInput(cwd?: string): CreateAiSessionInput {
   return cwd ? { provider: 'shell', workingDirectory: cwd } : { provider: 'shell' };
 }
 
-/** Create-input for attaching to an existing external tmux pane (D1) — attach instead of spawn. */
+/**
+ * Create-input for attaching to an existing external tmux pane (D1) — attach instead of spawn. Carries
+ * `title: name` so the attached pane matches the `attachableTmux` de-dupe join (`title === tmux.name`)
+ * and leaves the "attachable" list — mirroring the working terminal-page attach (`terminal.page.ts`,
+ * `title: … || name`). `provider` stays absent (the host attaches without one). Fix for finding #3(a).
+ */
 export function attachTmuxInput(name: string): CreateAiSessionInput {
-  return { tmuxSessionName: name };
+  return { tmuxSessionName: name, title: name };
 }

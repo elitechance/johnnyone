@@ -12,7 +12,7 @@ import {
   formatRelTime,
   openIntent,
 } from './shells-page-logic';
-import { terminalRoute } from '../../components/launcher-menu/launcher-logic';
+import { plainTerminalRoute, attachTmuxInput } from '../../components/launcher-menu/launcher-logic';
 
 // A minimal `AiSession`-shaped factory — only the fields the pure logic reads matter here.
 function session(over: Partial<{
@@ -135,14 +135,27 @@ describe('shells page — pure logic', () => {
     });
   });
 
-  // A.6 — open intent reuses terminalRoute
+  // A.6 — open intent is the plain-shell route (shells always open plain, P4)
   describe('openIntent', () => {
-    it('is the shared /terminal?sessionId= nav shape', () => {
-      expect(openIntent('abc')).toEqual({ path: '/terminal', queryParams: { sessionId: 'abc' } });
+    it('is the /terminal?sessionId=&surface=shell plain-shell nav shape', () => {
+      expect(openIntent('abc')).toEqual({
+        path: '/terminal',
+        queryParams: { sessionId: 'abc', surface: 'shell' },
+      });
     });
 
-    it('is the same function as Phase 01 terminalRoute (reused, not re-derived)', () => {
-      expect(openIntent).toBe(terminalRoute);
+    it('is the same function as plainTerminalRoute (reused, not re-derived)', () => {
+      expect(openIntent).toBe(plainTerminalRoute);
+    });
+  });
+
+  // P4 — end-to-end: a pane attached via attachTmuxInput leaves the attachable list (finding #3a fix)
+  describe('attach-then-dedupe (finding #3a)', () => {
+    it('an attached session created from attachTmuxInput carries title===name, so its pane drops out', () => {
+      const input = attachTmuxInput('kloo'); // { tmuxSessionName:'kloo', title:'kloo' }
+      const attached = session({ id: 'x', provider: 'codex', attachedTmux: true, title: input.title });
+      const result = attachableTmux([tmux('kloo', 2), tmux('llm-app', 3)], [attached]);
+      expect(result.map((t) => t.name)).toEqual(['llm-app']); // 'kloo' no longer attachable
     });
   });
 });

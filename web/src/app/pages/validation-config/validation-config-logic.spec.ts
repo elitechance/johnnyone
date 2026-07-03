@@ -7,8 +7,26 @@ import {
   providerOptions,
   toConfigJson,
   fromConfigJson,
+  lensSourceOf,
   type LensDraft,
 } from './validation-config-logic';
+
+describe('lensSourceOf', () => {
+  it("is 'custom' exactly when fromConfigJson does NOT fall back to the default template", () => {
+    const custom = JSON.stringify([{ name: 'peer-review', provider: 'codex', blocking: false }]);
+    expect(lensSourceOf(custom)).toBe('custom');
+    // Agreement with fromConfigJson's boundary: custom ⇒ parsed lenses ≠ default triad.
+    expect(fromConfigJson(custom).map((l) => l.name)).toEqual(['peer-review']);
+  });
+
+  it("is 'default' for null / '' / '[]' / non-array / malformed JSON", () => {
+    for (const cfg of [null, undefined, '', '[]', '{"a":1}', '42', 'nope']) {
+      expect(lensSourceOf(cfg)).toBe('default');
+      // In every 'default' case, fromConfigJson returns the default triad — boundaries agree.
+      expect(fromConfigJson(cfg).map((l) => l.name)).toEqual(['product', 'qa', 'lead']);
+    }
+  });
+});
 
 describe('defaultLenses', () => {
   it('is product/qa/lead, all blocking and all non-vision', () => {

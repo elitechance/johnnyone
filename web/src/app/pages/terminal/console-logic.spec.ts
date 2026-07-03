@@ -3,6 +3,8 @@ import type { AgentPlan, GitDiffView } from '../../../../../ui/src/services/john
 import {
   initiativeRows,
   lensSummary,
+  lensSource,
+  defaultLenses,
   touchedFiles,
   consolePaneFor,
   CONSOLE_SEGMENTS,
@@ -86,6 +88,46 @@ describe('lensSummary', () => {
       { name: 'peer-review', provider: 'claude_code', model: 'opus-4.8', blocking: true },
       { name: 'security', provider: 'codex', model: 'gpt-5', blocking: false },
     ]);
+  });
+});
+
+describe('validation is strictly per-initiative (isolation)', () => {
+  const cfgA = JSON.stringify([
+    { name: 'peer-review', provider: 'claude_code', model: 'opus-4.8', blocking: true },
+  ]);
+  const cfgB = JSON.stringify([
+    { name: 'security', provider: 'codex', model: 'gpt-5', blocking: false },
+    { name: 'a11y', provider: 'claude_code', model: '', blocking: true },
+  ]);
+
+  it('two distinct configs yield two distinct lens sets — A never yields B', () => {
+    const a = lensSummary(cfgA);
+    const b = lensSummary(cfgB);
+    expect(a).not.toEqual(b);
+    expect(a.map((l) => l.name)).toEqual(['peer-review']);
+    expect(b.map((l) => l.name)).toEqual(['security', 'a11y']);
+  });
+
+  it('a configured initiative does NOT equal the default triad; an unconfigured one DOES', () => {
+    const triad = defaultLenses().map((l) => l.name);
+    expect(lensSummary(cfgA).map((l) => l.name)).not.toEqual(triad);
+    expect(lensSummary(cfgB).map((l) => l.name)).not.toEqual(triad);
+    // null / '' / invalid → the shared default template (the source of the "looks global" perception).
+    for (const cfg of [null, undefined, '', '[]', 'not json']) {
+      expect(lensSummary(cfg).map((l) => l.name)).toEqual(triad);
+    }
+  });
+});
+
+describe('lensSource', () => {
+  it("is 'custom' for a valid non-empty config", () => {
+    expect(lensSource(JSON.stringify([{ name: 'x', provider: 'codex', blocking: true }]))).toBe('custom');
+  });
+
+  it("is 'default' for null / '' / '[]' / malformed JSON (matches fromConfigJson's fallback boundary)", () => {
+    for (const cfg of [null, undefined, '', '[]', '   ', '{bad json', '{"not":"array"}', '42']) {
+      expect(lensSource(cfg)).toBe('default');
+    }
   });
 });
 

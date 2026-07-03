@@ -10,6 +10,7 @@ import {
   signal,
   computed,
   effect,
+  type WritableSignal,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
@@ -52,10 +53,13 @@ import {
   TerminalScreenComponent,
   TranscriptViewComponent,
   DiffViewComponent,
+  MarkdownViewComponent,
   LifecycleBarComponent,
   StatusPillComponent,
   GitDiffView,
   AgentPlan,
+  AgentPlanRun,
+  FileContent,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
@@ -79,6 +83,7 @@ export type { PaneTab } from './terminal-transcript-tab';
 import {
   initiativeRows,
   lensSummary,
+  lensSource,
   touchedFiles,
   consolePaneFor,
   CONSOLE_SEGMENTS,
@@ -86,7 +91,31 @@ import {
   LensChip,
   TouchedFile,
   ConsoleSegment,
+  LensSource,
 } from './console-logic';
+import {
+  resolvePrimarySessionId,
+  initiativeTabOf,
+  rawAttachNeeded,
+} from './console-tabs-logic';
+import {
+  planCounts,
+  docNavModel,
+  phaseCards,
+  planDocPath,
+  taskStatusLabel,
+  PlanCounts,
+  DocNavEntry,
+  PhaseCard,
+  TaskStatusView,
+} from './plan-tab-logic';
+import { isPlainShellSurface } from '../../components/launcher-menu/launcher-logic';
+import {
+  clampRailWidth,
+  clampRightWidth,
+  consoleColumns as consoleColumnsTemplate,
+  parseStoredWidth,
+} from './console-layout-logic';
 import { firstValueFrom, Subscription } from 'rxjs';
 import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 import {
@@ -146,6 +175,7 @@ addIcons({
     TerminalScreenComponent,
     TranscriptViewComponent,
     DiffViewComponent,
+    MarkdownViewComponent,
     LifecycleBarComponent,
     StatusPillComponent,
     IonModal,
@@ -171,6 +201,9 @@ addIcons({
 })
 export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private static readonly SIDEBAR_WIDTH_KEY = 'johnnyone_desktop_sidebar_width';
+  // P5: persisted console divider widths (johnnyone_* convention, mirrors SIDEBAR_WIDTH_KEY).
+  private static readonly CONSOLE_RAIL_WIDTH_KEY = 'johnnyone_console_rail_width';
+  private static readonly CONSOLE_RIGHT_WIDTH_KEY = 'johnnyone_console_right_width';
   private static readonly PANE_WORKSPACE_STATE_KEY = 'johnnyone_terminal_pane_workspace';
   private static readonly WORKSPACE_PADDING_PX = 12;
   private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
@@ -270,6 +303,20 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // Per-session pane tab (Transcript default · Raw terminal; Plan/Diff reserved, D7)
   // and the accumulated structured stream feeding the Transcript surface (D6).
   paneTabs = signal<Record<string, PaneTab>>({});
+  // Per-INITIATIVE console tab (P1): a DISTINCT map from the session-keyed `paneTabs` (D2), keyed by
+  // initiative id, driving the four tabs in the center pane's per-initiative shell.
+  initiativeTabs = signal<Record<string, PaneTab>>({});
+
+  // Plan tab (P2, mock §03): the selected initiative's structured run + the currently-rendered doc.
+  // Loaded lazily from the EXISTING `getAgentPlan` + `readFile` when the Plan tab first opens for an
+  // initiative — no new GraphQL. Rendering delegates to `johnny-markdown-view` (no second renderer).
+  planRun = signal<AgentPlanRun | null>(null);
+  planSelectedDoc = signal<string>('overview.md');
+  planDocMarkdown = signal<string>('');
+  planLoading = signal<boolean>(false);
+  planError = signal<string | null>(null);
+  /** Guard so the plan is fetched once per initiative (re-fetches only when the initiative changes). */
+  private planLoadedForInitiative: string | null = null;
   /** Per-session working-tree diff (overhaul P7, D10), loaded lazily on Diff-tab activation. */
   diffs = signal<Record<string, GitDiffView | null>>({});
   transcriptEvents = signal<Record<string, StreamEvent[]>>({});
@@ -292,6 +339,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly agentPlans = signal<AgentPlan[]>([]);
   /** The selected initiative id (drives the center lifecycle bar + right validation column). */
   protected readonly selectedInitiativeId = signal<string | null>(null);
+  /** The `surface` query param (P4): `'shell'` opens the plain terminal surface (no initiative chrome).
+   *  Read synchronously in `ngOnInit` so plain mode renders from first paint (no console flash). */
+  protected readonly surfaceParam = signal<string | null>(null);
   /** "now" captured once per initiative load so `formatRelTime` stays deterministic. */
   protected readonly consoleNow = signal<string>(new Date(0).toISOString());
   /** §08 mobile segment (Transcript default). */
@@ -307,9 +357,68 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const id = this.selectedInitiativeId();
     return this.agentPlans().find((p) => p.id === id) ?? null;
   });
+  /** The session the selected initiative's tabs display: worker ?? reviewer ?? briefing (P1/D2). */
+  protected readonly primarySessionId = computed<string | null>(() =>
+    resolvePrimarySessionId(this.selectedInitiative()),
+  );
+  /** The primary session record (for the Raw tab's terminal-screen title/provider), if in the list. */
+  protected readonly primarySession = computed<SharedAiSession | null>(() => {
+    const id = this.primarySessionId();
+    return id ? this.aiSessions().find((s) => s.id === id) ?? null : null;
+  });
+  /** Active console tab for the selected initiative; defaults to Transcript. */
+  protected readonly activeTab = computed<PaneTab>(() =>
+    initiativeTabOf(this.initiativeTabs(), this.selectedInitiativeId() ?? ''),
+  );
+
+  // P5: resizable console divider widths, seeded from localStorage (clamped on read) and persisted on
+  // drag-end. Bound to `.console` via the `--console-cols` custom property (see `consoleColumns`).
+  protected readonly railWidth = signal<number>(
+    this.loadConsoleWidth(TerminalPage.CONSOLE_RAIL_WIDTH_KEY, clampRailWidth),
+  );
+  protected readonly rightWidth = signal<number>(
+    this.loadConsoleWidth(TerminalPage.CONSOLE_RIGHT_WIDTH_KEY, clampRightWidth),
+  );
+  /** `grid-template-columns` for the 3-pane console incl. the two divider tracks (pure T01 helper). */
+  protected readonly consoleColumns = computed<string>(() =>
+    consoleColumnsTemplate(this.railWidth(), this.rightWidth()),
+  );
+  /** True when the `.console` container is ≤760px wide — the collapsed single-column layout. Drives
+   *  the inline grid to `1fr` (so stored widths don't leak) at the SAME threshold the `@container`
+   *  query hides the dividers. A `container-type` element can't restyle itself via `@container`, so
+   *  the collapse grid is bound inline instead. */
+  protected readonly consoleCompact = signal<boolean>(false);
+  private static readonly CONSOLE_COLLAPSE_PX = 760;
+  private consoleResizeObserver: ResizeObserver | null = null;
+  /** Cleanup for an in-flight divider drag (removes the window pointer listeners). */
+  private consoleResizeCleanup: (() => void) | null = null;
+
+  /** Plain shell surface (P4): true when opened with `surface=shell` (first paint) or the resolved
+   *  session is a shell / attached-tmux pane (backstop). Hides all initiative console chrome. */
+  protected readonly plainShellMode = computed<boolean>(() => {
+    const cur = this.currentSession();
+    return isPlainShellSurface(
+      this.surfaceParam(),
+      cur ? { provider: cur.provider, attachedTmux: cur.attached_tmux } : null,
+    );
+  });
+
+  // Plan-tab projections over `planRun` (P2, pure `plan-tab-logic`).
+  protected readonly planNav = computed<DocNavEntry[]>(() => docNavModel(this.planRun()));
+  protected readonly planCards = computed<PhaseCard[]>(() => phaseCards(this.planRun()));
+  protected readonly planTotals = computed<PlanCounts>(() => planCounts(this.planRun()));
+  /** True once a run with at least one phase is loaded (else the Plan tab shows the empty state). */
+  protected readonly planHasContent = computed<boolean>(
+    () => (this.planRun()?.phases?.length ?? 0) > 0,
+  );
   /** Right-column validation lens summary (mock 658-673), reusing P7's parser. */
   protected readonly consoleLenses = computed<LensChip[]>(() =>
     lensSummary(this.selectedInitiative()?.validationConfig ?? null),
+  );
+  /** Whether the selected initiative's lenses are its own saved config or the shared default template
+   *  (P3) — drives the "configured" / "default template" badge. Reads the per-initiative field. */
+  protected readonly consoleLensSource = computed<LensSource>(() =>
+    lensSource(this.selectedInitiative()?.validationConfig ?? null),
   );
   /** Right-column touched files (mock 674-684) from the ALREADY-LOADED diff of the current session. */
   protected readonly consoleFiles = computed<TouchedFile[]>(() => {
@@ -321,6 +430,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   @ViewChild('terminalWorkspace', { static: true })
   private terminalWorkspace?: ElementRef<HTMLElement>;
+  @ViewChild('consoleRoot', { static: true })
+  private consoleRoot?: ElementRef<HTMLElement>;
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
   sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 
@@ -457,6 +568,32 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       },
       { allowSignalWrites: true },
     );
+
+    // P1: when the selected initiative's primary session changes, keep its visual + stream lanes
+    // subscribed on the SAME machinery as the visible pane (via `lanedSessionIds`), so its
+    // Transcript/Raw populate without attaching a pane. Refresh so a live screen shows immediately.
+    effect(() => {
+      this.primarySessionId();
+      this.enqueueTerminalVisualSync(() =>
+        this.syncTerminalVisualSubscriptions({ refresh: true }),
+      );
+      void this.syncStreamSubscriptions();
+    });
+
+    // P2: lazily load the Plan tab's document model the first time the Plan tab is opened for the
+    // selected initiative (and again when the selection changes while on the Plan tab). Reuses
+    // `getAgentPlan` + `readFile` — no new GraphQL. allowSignalWrites: `ensurePlanLoaded` resets the
+    // plan signals synchronously before its first await.
+    effect(
+      () => {
+        const isPlan = this.activeTab() === 'plan';
+        const init = this.selectedInitiative();
+        if (isPlan && init) {
+          void this.ensurePlanLoaded();
+        }
+      },
+      { allowSignalWrites: true },
+    );
   }
 
   private loadTabOrder(): void {
@@ -510,8 +647,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.loadPersistedWorkspaceState();
     this.subscribeToTerminalEvents();
     this.subscribeToRelayErrorEvents();
+    // P4: read `surface` synchronously so plain-shell mode is decided before first paint (no
+    // console-chrome flash). A shell / attached-tmux open carries `surface=shell`.
+    this.surfaceParam.set(this.route.snapshot.queryParamMap.get('surface'));
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
-    void this.loadInitiatives();
+    // Skip the initiative master-list entirely in plain-shell mode — a shell has no initiative chrome.
+    if (!this.plainShellMode()) {
+      void this.loadInitiatives();
+    }
     void this.detectTools();
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
@@ -519,6 +662,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // Support ?sessionId deep links after initial mount (e.g. e2e harness goto after create, or direct nav)
     if (!this.queryParamSub) {
       this.queryParamSub = this.route.queryParamMap.subscribe((map) => {
+        // Keep plain-shell mode in sync with later navigations (P4).
+        this.surfaceParam.set(map.get('surface'));
         const sid = map.get('sessionId');
         if (sid) {
           const current = this.currentSession()?.id;
@@ -540,9 +685,28 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   ngAfterViewInit(): void {
     this.setupWorkspaceResizeObserver();
+    this.setupConsoleCollapseObserver();
     if (this.sessions().length > 0) {
       this.restorePaneLayoutsFromStorage(this.sessions());
     }
+  }
+
+  /** Track the `.console` container width so the console collapses to a single column at
+   *  `CONSOLE_COLLAPSE_PX` (P5) — mirrors `@container console (max-width: 760px)`. */
+  private setupConsoleCollapseObserver(): void {
+    const el = this.consoleRoot?.nativeElement;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const update = (width: number): void => {
+      this.consoleCompact.set(width > 0 && width <= TerminalPage.CONSOLE_COLLAPSE_PX);
+    };
+    update(el.getBoundingClientRect().width);
+    this.consoleResizeObserver?.disconnect();
+    this.consoleResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        update(entry.contentRect.width);
+      }
+    });
+    this.consoleResizeObserver.observe(el);
   }
 
   @HostListener('document:keydown.escape')
@@ -562,6 +726,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
     document.removeEventListener('visibilitychange', this.visibilityChangeHandler);
     window.removeEventListener('pageshow', this.pageShowHandler);
+    this.consoleResizeCleanup?.(); // remove any in-flight divider drag listeners (P5)
+    this.consoleResizeCleanup = null;
+    this.consoleResizeObserver?.disconnect();
+    this.consoleResizeObserver = null;
     this.queryParamSub?.unsubscribe();
     this.queryParamSub = null;
     void this.unsubscribeAllTerminalVisuals();
@@ -1346,9 +1514,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  /**
+   * Sessions whose screen-visual + structured-stream lanes must stay live: the visible pane(s) PLUS
+   * the selected initiative's primary session (P1), so the console tabs' Transcript/Raw populate even
+   * when the primary session isn't the current pane. Reuses the existing lanes — no new channel.
+   */
+  private lanedSessionIds(): Set<string> {
+    const ids = new Set(this.visiblePaneSessions().map((session) => session.id));
+    const primary = this.primarySessionId();
+    if (primary) ids.add(primary);
+    return ids;
+  }
+
   private async syncTerminalVisualSubscriptions(options?: { refresh?: boolean }): Promise<void> {
     if (document.hidden) return;
-    const visibleIds = new Set(this.visiblePaneSessions().map((session) => session.id));
+    const visibleIds = this.lanedSessionIds();
 
     for (const sessionId of Array.from(this.terminalVisualSubscriptions)) {
       if (!visibleIds.has(sessionId)) {
@@ -1398,6 +1578,127 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   setPaneTab(id: string, tab: PaneTab): void {
     this.paneTabs.update((m) => ({ ...m, [id]: tab }));
+  }
+
+  /** Active console tab for an initiative; defaults to Transcript (P1, distinct from `paneTab`). */
+  initiativeTab(id: string): PaneTab {
+    return initiativeTabOf(this.initiativeTabs(), id);
+  }
+
+  setInitiativeTab(id: string | null, tab: PaneTab): void {
+    if (!id) return;
+    this.initiativeTabs.update((m) => ({ ...m, [id]: tab }));
+  }
+
+  /** Template wrapper for the pure predicate — the Raw tab shows the inline attach card when true. */
+  rawAttachNeeded(primarySessionId: string | null, hasScreen: boolean): boolean {
+    return rawAttachNeeded(primarySessionId, hasScreen);
+  }
+
+  /**
+   * Diff view for the selected initiative's Diff tab. Prefers the primary session's diff (keyed by
+   * session id, as `loadDiff` stores it); for a sessionless initiative it falls back to the
+   * workspace-path diff keyed by the initiative id.
+   */
+  initiativeDiffView(): GitDiffView | null {
+    const key = this.primarySessionId() ?? this.selectedInitiativeId();
+    return key ? this.diffs()[key] ?? null : null;
+  }
+
+  /**
+   * Load the selected initiative's working-tree diff on Diff-tab activation. Reuses `loadDiff` when a
+   * primary session exists in the list; otherwise diffs the initiative's `workspacePath` via the
+   * existing `api.gitDiff`, keyed by the primary session id when known, else the initiative id.
+   */
+  async openInitiativeDiff(): Promise<void> {
+    const sid = this.primarySessionId();
+    if (sid) {
+      const session = this.aiSessions().find((s) => s.id === sid);
+      if (session) {
+        await this.loadDiff(session);
+        return;
+      }
+    }
+    const init = this.selectedInitiative();
+    const dir = init?.workspacePath?.trim();
+    const key = sid ?? init?.id;
+    if (!key || !dir) return;
+    try {
+      const view = await firstValueFrom(this.api.gitDiff(dir));
+      this.diffs.update((m) => ({ ...m, [key]: view }));
+    } catch {
+      this.diffs.update((m) => ({ ...m, [key]: TerminalPage.EMPTY_DIFF }));
+    }
+  }
+
+  // ── Plan tab (P2, §03) ─────────────────────────────────────────────────
+
+  /** Template wrapper for the pure status-chip mapping (label + class token). */
+  taskStatus(status: string): TaskStatusView {
+    return taskStatusLabel(status);
+  }
+
+  /** Decode a `readFile` result to text (host returns utf8; base64 tolerated defensively). */
+  private decodeFileContent(fc: FileContent): string {
+    if (fc.encoding === 'base64') {
+      try {
+        return atob(fc.content ?? '');
+      } catch {
+        return '';
+      }
+    }
+    return fc.content ?? '';
+  }
+
+  /**
+   * Lazily load the selected initiative's plan when the Plan tab first opens for it (once per
+   * initiative). Reuses the EXISTING `getAgentPlan` (structured phases/tasks) + `readFile` (markdown
+   * bodies) — no new GraphQL. A plan-less initiative (e.g. briefing) or a failed fetch resolves to a
+   * benign empty state, never a crash.
+   */
+  private async ensurePlanLoaded(): Promise<void> {
+    const init = this.selectedInitiative();
+    if (!init || this.planLoadedForInitiative === init.id) return;
+    this.planLoadedForInitiative = init.id;
+    // Reset per-initiative plan state on (re)load.
+    this.planRun.set(null);
+    this.planSelectedDoc.set('overview.md');
+    this.planDocMarkdown.set('');
+    this.planError.set(null);
+    if (!init.planPath?.trim()) return; // benign empty (no plan to read)
+    this.planLoading.set(true);
+    try {
+      const run = await firstValueFrom(this.api.getAgentPlan(init.id));
+      this.planRun.set(run ?? null);
+      await this.loadPlanDoc('overview.md');
+    } catch {
+      this.planRun.set(null); // benign empty state, no crash
+    } finally {
+      this.planLoading.set(false);
+    }
+  }
+
+  /** Load one navigator doc's markdown via the safe fixed-suffix path builder (T01). */
+  private async loadPlanDoc(sel: string): Promise<void> {
+    this.planSelectedDoc.set(sel);
+    const path = planDocPath(this.selectedInitiative()?.planPath, sel);
+    if (!path) {
+      this.planDocMarkdown.set('');
+      return;
+    }
+    try {
+      const fc = await firstValueFrom(this.api.readFile(path));
+      this.planDocMarkdown.set(this.decodeFileContent(fc));
+      this.planError.set(null);
+    } catch {
+      this.planDocMarkdown.set('');
+      this.planError.set(`Could not read ${sel}`);
+    }
+  }
+
+  /** Doc-navigator click: switch the rendered doc (overview.md / status.md / a phase's overview). */
+  openPlanDoc(sel: string): void {
+    void this.loadPlanDoc(sel);
   }
 
   /** The loaded diff for a session's Diff tab (null until first activation). */
@@ -1470,7 +1771,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    */
   private async syncStreamSubscriptions(): Promise<void> {
     if (document.hidden) return;
-    const visible = new Set(this.visiblePaneSessions().map((session) => session.id));
+    const visible = this.lanedSessionIds();
     const { toSubscribe, toUnsubscribe } = diffStreamSubscriptions(this.streamSubscriptions, visible);
     for (const id of toSubscribe) {
       await this.relayTerminal.subscribeStream(id);
@@ -1993,6 +2294,76 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   private clampSidebarWidth(width: number): number {
     return Math.min(this.maxSidebarWidth, Math.max(this.minSidebarWidth, width));
+  }
+
+  // ── P5: resizable console dividers ─────────────────────────────────────
+  // Mirrors the planner grid-resize idiom (`startFileResize`) + the sidebar-width persistence idiom
+  // (`load/saveSidebarWidth`). Reuses the pure T01 clamp/parse helpers; no splitter library.
+
+  /** Rail↔center handle: dragging right widens the rail (`+1`). */
+  startRailResize(ev: PointerEvent): void {
+    this.startConsoleResize(
+      ev,
+      this.railWidth,
+      clampRailWidth,
+      TerminalPage.CONSOLE_RAIL_WIDTH_KEY,
+      1,
+    );
+  }
+
+  /** Center↔right handle: dragging LEFT widens the validation column (`-1`). */
+  startRightResize(ev: PointerEvent): void {
+    this.startConsoleResize(
+      ev,
+      this.rightWidth,
+      clampRightWidth,
+      TerminalPage.CONSOLE_RIGHT_WIDTH_KEY,
+      -1,
+    );
+  }
+
+  private startConsoleResize(
+    ev: PointerEvent,
+    width: WritableSignal<number>,
+    clamp: (px: number) => number,
+    key: string,
+    sign: 1 | -1,
+  ): void {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    const startX = ev.clientX;
+    const startWidth = width();
+    const move = (moveEvent: PointerEvent): void => {
+      const delta = (moveEvent.clientX - startX) * sign;
+      width.set(clamp(startWidth + delta));
+    };
+    const up = (): void => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      this.consoleResizeCleanup = null;
+      this.saveConsoleWidth(key, width());
+    };
+    this.consoleResizeCleanup?.();
+    this.consoleResizeCleanup = up;
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
+  /** Seed a divider width from localStorage, clamped on read (junk/out-of-range → clamp default). */
+  private loadConsoleWidth(key: string, clamp: (px: number) => number): number {
+    try {
+      return parseStoredWidth(localStorage.getItem(key), clamp);
+    } catch {
+      return clamp(NaN);
+    }
+  }
+
+  private saveConsoleWidth(key: string, width: number): void {
+    try {
+      localStorage.setItem(key, String(width));
+    } catch {
+      // Ignore localStorage write failures.
+    }
   }
 
   private clamp(value: number, min: number, max: number): number {
