@@ -1,108 +1,140 @@
-// Side menu width is bound to a CSS variable so the drag-handle component can
-// update it. Min/max prevent the user from shrinking the menu to invisibility
-// or growing it past half the viewport.
-:host {
-  --jo-side-menu-width: 240px;
-  --jo-side-menu-collapsed-width: 58px;
-}
+@use './styles/workspace-responsive' as workspace;
+
+// Overhaul P8 §03 — global icon nav rail (mock lines 128-139) replacing the old
+// ion-menu text sidebar + collapse/resize machinery. A fixed 64px rail shown at
+// widescreen; the mobile .botnav (below) covers the same four destinations,
+// viewport-keyed at the existing 900px system (D4/D12).
+
+$rail-width: 64px;
 
 ion-split-pane {
-  --side-width: var(--jo-side-menu-width);
-  --side-min-width: var(--jo-side-menu-width);
-  --side-max-width: var(--jo-side-menu-width);
-
-  &.side-menu-collapsed {
-    --side-width: var(--jo-side-menu-collapsed-width);
-    --side-min-width: var(--jo-side-menu-collapsed-width);
-    --side-max-width: var(--jo-side-menu-collapsed-width);
-  }
+  --side-width: #{$rail-width};
+  --side-min-width: #{$rail-width};
+  --side-max-width: #{$rail-width};
 }
 
-ion-list-header {
+.gnav {
+  flex: 0 0 #{$rail-width};
+  width: #{$rail-width};
+  height: 100%;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 48px;
-  padding-inline: 16px 8px;
+  gap: 4px;
+  padding: 9px 0;
+  border-right: 1px solid var(--jo-border);
+  background: var(--jo-bg-elevated);
 }
 
-.menu-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.gnav .glogo {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--jo-accent-ink);
+  display: grid;
+  place-items: center;
+  font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', Menlo, Consolas, monospace);
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 2px;
+  background: linear-gradient(150deg, var(--jo-accent-hover), var(--jo-accent));
 }
 
-.menu-collapse-button {
-  flex: 0 0 auto;
+// §06 `+ New` launcher trigger (reuses AppComponent.openLauncher — P6). Amber, per D2.
+.gnav .gplus {
   width: 34px;
   height: 34px;
-  --padding-start: 0;
-  --padding-end: 0;
-  --color: var(--ion-color-medium);
-}
-
-ion-menu.collapsed {
-  ion-list-header {
-    justify-content: center;
-    padding-inline: 0;
-  }
-
-  .menu-title,
-  ion-label {
-    display: none;
-  }
-
-  ion-item {
-    --padding-start: 0;
-    --inner-padding-end: 0;
-    --min-height: 48px;
-    justify-content: center;
-  }
-
-  ion-icon[slot='start'] {
-    margin-inline: auto;
-    font-size: 22px;
-  }
-}
-
-// Thin, draggable bar pinned to the right edge of the side menu (md+ only;
-// on mobile the menu is an overlay drawer with no need for resizing).
-.side-resizer {
-  position: fixed;
-  top: 0;
-  bottom: 0;
-  width: 6px;
-  left: calc(var(--jo-side-menu-width) - 3px);
-  cursor: col-resize;
-  z-index: 1000;
+  border-radius: 9px;
+  border: 1px dashed var(--jo-border-strong);
   background: transparent;
-  user-select: none;
+  color: var(--jo-accent);
+  display: grid;
+  place-items: center;
+  font-size: 17px;
+  margin-bottom: 6px;
+  cursor: pointer;
 
-  &:hover,
-  &.dragging {
-    background: var(--ion-color-step-200, rgba(0, 0, 0, 0.08));
-  }
-
-  // Hide on phone-narrow widths — split-pane collapses there anyway.
-  @media (max-width: 767px) {
-    display: none;
+  ion-icon {
+    font-size: 20px;
   }
 }
 
-ion-split-pane.side-menu-collapsed ~ .side-resizer {
+.gnav .ni {
+  width: 52px;
+  padding: 6px 0;
+  border-radius: 9px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  color: var(--jo-fg-muted);
+  text-decoration: none;
+
+  ion-icon {
+    font-size: 18px;
+  }
+
+  .cap {
+    font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', Menlo, Consolas, monospace);
+    font-size: 8px;
+    letter-spacing: 0.02em;
+  }
+
+  // routerLinkActive="on" → amber, mirroring mock `.gnav .ni.on`.
+  &.on {
+    background: color-mix(in srgb, var(--jo-accent) 13%, transparent);
+    color: var(--jo-accent);
+  }
+}
+
+// Settings pinned to the bottom of the rail (mock `.gspring`).
+.gnav .gspring {
+  margin-top: auto;
+}
+
+// §08 mobile bottom nav (mock lines 436-440). Hidden at widescreen; at mobile the
+// rail is hidden and this fixed bar takes over.
+.botnav {
   display: none;
 }
 
-.side-resizer-handle {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 2px;
-  height: 32px;
-  margin-top: -16px;
-  margin-left: -1px;
-  background: var(--ion-color-step-400, rgba(0, 0, 0, 0.15));
-  border-radius: 1px;
-  pointer-events: none;
+@media (max-width: 900px) {
+  .gnav {
+    display: none;
+  }
+
+  .botnav {
+    display: flex;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 100;
+    border-top: 1px solid var(--jo-border);
+    background: var(--jo-bg-elevated);
+    @include workspace.safe-bottom-padding(0px);
+
+    .b {
+      flex: 1;
+      text-align: center;
+      padding: 9px 0 11px;
+      font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', Menlo, Consolas, monospace);
+      font-size: 9.5px;
+      font-weight: 600;
+      color: var(--jo-fg-faint);
+      text-decoration: none;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+
+      ion-icon {
+        font-size: 18px;
+      }
+
+      &.on {
+        color: var(--jo-accent);
+      }
+    }
+  }
 }

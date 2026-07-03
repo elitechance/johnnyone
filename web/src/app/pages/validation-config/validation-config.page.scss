@@ -1,0 +1,106 @@
+// "Validation · configure" (mock §07). Ionic components carry most of the styling; this sheet
+// tightens the row layout to the mock's `.valrow` (drag · info · toggle · remove) and the compact
+// provider/model sub-line.
+.cap {
+  font-family: var(--ion-font-family-monospace, monospace);
+  font-size: 0.7rem;
+  padding-right: 8px;
+}
+
+.load-note {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 0.85rem;
+}
+
+.valcfg {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 640px;
+}
+
+.valrow {
+  --padding-start: 8px;
+  --inner-padding-end: 8px;
+  border-radius: 10px;
+  margin-bottom: 8px;
+
+  .info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+    padding: 6px 0;
+  }
+
+  .nm {
+    font-weight: 600;
+    font-size: 0.9rem;
+    --padding-start: 0;
+  }
+
+  .sub {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .sel-mini {
+    font-family: var(--ion-font-family-monospace, monospace);
+    font-size: 0.72rem;
+    border: 1px solid var(--ion-color-step-150, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+    padding: 2px 6px;
+    --padding-start: 6px;
+    min-height: 28px;
+  }
+
+  .sel-mini.model {
+    max-width: 160px;
+  }
+
+  .vision-toggle {
+    font-family: var(--ion-font-family-monospace, monospace);
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+  }
+
+  .toggle-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+
+    .toggle-label {
+      font-family: var(--ion-font-family-monospace, monospace);
+      font-size: 0.6rem;
+      letter-spacing: 0.06em;
+      color: var(--ion-color-medium, #92949c);
+    }
+  }
+
+  .rm {
+    --padding-start: 4px;
+    --padding-end: 4px;
+  }
+}
+
+.addlens {
+  --border-style: dashed;
+  font-family: var(--ion-font-family-monospace, monospace);
+  font-weight: 600;
+}
+
+.val-note {
+  display: block;
+  font-size: 0.78rem;
+  padding: 0 2px;
+  color: var(--ion-color-medium, #92949c);
+}
+
+.save {
+  margin-top: 4px;
+}

@@ -1,0 +1,282 @@
+:host {
+  display: block;
+  height: 100%;
+}
+
+.fm {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+// ── Toolbar: breadcrumb + (P02/P03) action slot ────────────────────────────────────────────────
+.fm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ion-color-step-150, #e2e2e8);
+}
+
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  min-width: 0;
+
+  .crumb-seg {
+    background: none;
+    border: none;
+    padding: 2px 4px;
+    margin: 0;
+    color: var(--ion-color-primary, #3161d6);
+    cursor: pointer;
+    font: inherit;
+    border-radius: 4px;
+
+    &:hover {
+      background: var(--ion-color-step-100, #f1f1f4);
+    }
+
+    &.current {
+      color: var(--ion-text-color, #1a1a1a);
+      font-weight: 600;
+      cursor: default;
+    }
+  }
+
+  .sep {
+    color: var(--ion-color-step-400, #9a9aa2);
+    font-size: 11px;
+  }
+}
+
+.fm-act {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.fm-error {
+  padding: 8px 12px;
+  color: var(--ion-color-danger, #c0392b);
+  font-size: 13px;
+  background: color-mix(in srgb, var(--ion-color-danger, #c0392b) 8%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--ion-color-danger, #c0392b) 24%, transparent);
+}
+
+// ── Two-pane body ───────────────────────────────────────────────────────────────────────────────
+.fm-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.fm-list {
+  flex: 0 0 260px;
+  max-width: 40%;
+  overflow-y: auto;
+  border-right: 1px solid var(--ion-color-step-150, #e2e2e8);
+  padding: 6px 0;
+
+  .fm-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 6px 12px;
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    color: var(--ion-text-color, #1a1a1a);
+    cursor: pointer;
+
+    &:hover {
+      background: var(--ion-color-step-100, #f1f1f4);
+    }
+
+    &.sel {
+      background: color-mix(in srgb, var(--ion-color-primary, #3161d6) 12%, transparent);
+    }
+
+    .ic {
+      color: var(--ion-color-step-500, #6b6b75);
+      width: 12px;
+      text-align: center;
+    }
+
+    &.dir .nm {
+      font-weight: 600;
+    }
+
+    .nm {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sz {
+      color: var(--ion-color-step-450, #86868e);
+      font-size: 11px;
+    }
+  }
+
+  .fm-loading,
+  .fm-empty {
+    padding: 12px;
+    color: var(--ion-color-step-450, #86868e);
+    font-size: 12px;
+  }
+}
+
+.fm-editor {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  .eh {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--ion-color-step-150, #e2e2e8);
+
+    .fname {
+      font-family: var(--ion-font-family-monospace, monospace);
+      font-size: 12px;
+      color: var(--ion-color-step-600, #55555d);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .dirty {
+      font-size: 12px;
+      color: var(--ion-color-warning, #b7791f);
+      white-space: nowrap;
+    }
+
+    .spacer {
+      flex: 1;
+    }
+
+    .save {
+      --background: var(--ion-color-primary, #3161d6);
+    }
+  }
+
+  .ebody {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 12px;
+
+    pre.code,
+    pre.text {
+      margin: 0;
+      font-family: var(--ion-font-family-monospace, monospace);
+      font-size: 12.5px;
+      line-height: 1.5;
+      white-space: pre;
+      overflow-x: auto;
+    }
+
+    .editor {
+      --background: var(--ion-color-step-50, #f7f7f9);
+      font-family: var(--ion-font-family-monospace, monospace);
+      font-size: 12.5px;
+      min-height: 100%;
+    }
+
+    .binary-notice {
+      color: var(--ion-color-step-500, #6b6b75);
+      font-size: 13px;
+      font-style: italic;
+    }
+  }
+
+  .fm-editor-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--ion-color-step-450, #86868e);
+    font-size: 13px;
+  }
+
+  // Upload drop zone (mock §05 `.dropzone`).
+  .dropzone {
+    margin: 8px 12px 12px;
+    padding: 12px;
+    border: 1px dashed var(--ion-color-step-300, #c7c7cf);
+    border-radius: 8px;
+    color: var(--ion-color-step-500, #6b6b75);
+    font-size: 13px;
+
+    &.dragging {
+      border-color: var(--ion-color-primary, #3161d6);
+      background: color-mix(in srgb, var(--ion-color-primary, #3161d6) 8%, transparent);
+    }
+
+    .drop-hint {
+      text-align: center;
+    }
+
+    .uprow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .upchip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--ion-color-step-100, #f1f1f4);
+      font-size: 12px;
+      white-space: nowrap;
+
+      &.error {
+        background: color-mix(in srgb, var(--ion-color-danger, #c0392b) 12%, transparent);
+        color: var(--ion-color-danger, #c0392b);
+      }
+
+      .bar {
+        display: inline-block;
+        width: 60px;
+        height: 6px;
+        border-radius: 3px;
+        background: var(--ion-color-step-200, #dcdce1);
+        overflow: hidden;
+
+        i {
+          display: block;
+          height: 100%;
+          background: var(--ion-color-primary, #3161d6);
+          transition: width 0.2s ease;
+        }
+      }
+
+      .uplabel {
+        color: var(--ion-color-step-500, #6b6b75);
+
+        &.err {
+          color: var(--ion-color-danger, #c0392b);
+          white-space: normal;
+        }
+      }
+    }
+  }
+}

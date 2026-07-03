@@ -13,9 +13,8 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ActivatedRoute, Router } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import {
-  IonMenuButton,
   IonModal,
   IonHeader,
   IonToolbar,
@@ -51,15 +50,43 @@ import {
   JohnnyApiService,
   ChatAttachment,
   TerminalScreenComponent,
+  TranscriptViewComponent,
+  DiffViewComponent,
+  LifecycleBarComponent,
+  StatusPillComponent,
+  GitDiffView,
+  AgentPlan,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
   AiChatComplete,
   DetectedCliTool,
   TerminalScreen,
+  StreamEvent,
   HostFileEntry,
   TmuxSession,
 } from '@johnnyone/ui';
+import {
+  PaneTab,
+  paneTabOf,
+  eventsAreStreaming,
+  appendTranscriptEvent,
+  diffStreamSubscriptions,
+} from './terminal-transcript-tab';
+
+// Re-export so existing/future importers of `PaneTab` from the page keep resolving.
+export type { PaneTab } from './terminal-transcript-tab';
+import {
+  initiativeRows,
+  lensSummary,
+  touchedFiles,
+  consolePaneFor,
+  CONSOLE_SEGMENTS,
+  InitiativeRow,
+  LensChip,
+  TouchedFile,
+  ConsoleSegment,
+} from './console-logic';
 import { firstValueFrom, Subscription } from 'rxjs';
 import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 import {
@@ -115,8 +142,12 @@ addIcons({
   imports: [
     CommonModule,
     FormsModule,
+    RouterLink,
     TerminalScreenComponent,
-    IonMenuButton,
+    TranscriptViewComponent,
+    DiffViewComponent,
+    LifecycleBarComponent,
+    StatusPillComponent,
     IonModal,
     IonHeader,
     IonToolbar,
@@ -144,11 +175,20 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private static readonly WORKSPACE_PADDING_PX = 12;
   private static readonly STREAM_FIRST_TOKEN_NOTICE_MS = 10_000;
   private static readonly STREAM_IDLE_NOTICE_MS = 8_000;
+  /** Benign empty diff for a no-cwd / non-repo / failed-load session (overhaul P7, D11). */
+  private static readonly EMPTY_DIFF: GitDiffView = {
+    repoRoot: null,
+    branch: null,
+    clean: true,
+    files: [],
+  };
   private readonly api = inject(JohnnyApiService);
   private readonly auth = inject(AuthService);
   private readonly route = inject(ActivatedRoute);
   private readonly relayTerminal = inject(RelayTerminalService);
-  private readonly mermaidZoom = inject(MermaidZoomService);
+  // Public so the transcript tab template can wire `(svgZoom)="mermaidZoom.open(...)"`
+  // — reuses the existing shared modal service (decision D4), no new zoom UI.
+  readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
@@ -166,6 +206,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private sessionUpdateSubscription: Subscription | null = null;
   private sessionDeleteSubscription: Subscription | null = null;
   private relayErrorSubscription: Subscription | null = null;
+  private streamEventsSubscription: Subscription | null = null;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
   private saveWorkspaceStateTimeout: ReturnType<typeof setTimeout> | null = null;
   private workspaceResizeObserver: ResizeObserver | null = null;
@@ -173,6 +214,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private compactWorkspaceMediaQuery: MediaQueryList | null = null;
   private compactWorkspaceListener: ((event: MediaQueryListEvent) => void) | null = null;
   private terminalVisualSubscriptions = new Set<string>();
+  // Parallel "stream lane" mirroring the visual-subscription lifecycle (decision D6):
+  // subscribe/unsubscribe the per-session structured StreamEvent channel at the same
+  // points the screen-visual lane does.
+  private streamSubscriptions = new Set<string>();
   private terminalVisualSync: Promise<void> = Promise.resolve();
   private queryParamSub: Subscription | null = null;
   private readonly visibilityChangeHandler = () => {
@@ -221,6 +266,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   terminalScreen = signal<TerminalScreen | null>(null);
   terminalScreens = signal<Record<string, TerminalScreen>>({});
   terminalError = signal<string | null>(null);
+
+  // Per-session pane tab (Transcript default · Raw terminal; Plan/Diff reserved, D7)
+  // and the accumulated structured stream feeding the Transcript surface (D6).
+  paneTabs = signal<Record<string, PaneTab>>({});
+  /** Per-session working-tree diff (overhaul P7, D10), loaded lazily on Diff-tab activation. */
+  diffs = signal<Record<string, GitDiffView | null>>({});
+  transcriptEvents = signal<Record<string, StreamEvent[]>>({});
   paneLayouts = signal<Record<string, PaneLayout>>({});
   closedPaneIds = signal<Set<string>>(new Set());
   paneX = signal(44);
@@ -231,6 +283,41 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   isResizingPane = signal(false);
   fullscreenPaneId = signal<string | null>(null);
   isCompactWorkspace = signal(false);
+
+  // ── Initiative console (overhaul P8 §02, phase 04) ─────────────────────────
+  // The Work console wraps this page's existing pane shell in a master-detail grid. All row/summary/
+  // file/segment decisions delegate to the pure `console-logic.ts` (D3/D6/D7/D8); the primitives are the
+  // P2 `johnny-status-pill`/`johnny-lifecycle-bar`. No transcript/diff/pane-shell code is forked.
+  /** Initiatives from `listAgentPlans` (best-effort; empty when none/unauthorized). */
+  protected readonly agentPlans = signal<AgentPlan[]>([]);
+  /** The selected initiative id (drives the center lifecycle bar + right validation column). */
+  protected readonly selectedInitiativeId = signal<string | null>(null);
+  /** "now" captured once per initiative load so `formatRelTime` stays deterministic. */
+  protected readonly consoleNow = signal<string>(new Date(0).toISOString());
+  /** §08 mobile segment (Transcript default). */
+  protected readonly consoleSegment = signal<ConsoleSegment>('transcript');
+  protected readonly consoleSegments = CONSOLE_SEGMENTS;
+
+  /** Master-list rows (mock §02 left `.pane.rail`). */
+  protected readonly consoleRows = computed<InitiativeRow[]>(() =>
+    initiativeRows(this.agentPlans(), this.selectedInitiativeId(), this.consoleNow()),
+  );
+  /** The selected initiative record (for the lifecycle bar + validation config). */
+  protected readonly selectedInitiative = computed<AgentPlan | null>(() => {
+    const id = this.selectedInitiativeId();
+    return this.agentPlans().find((p) => p.id === id) ?? null;
+  });
+  /** Right-column validation lens summary (mock 658-673), reusing P7's parser. */
+  protected readonly consoleLenses = computed<LensChip[]>(() =>
+    lensSummary(this.selectedInitiative()?.validationConfig ?? null),
+  );
+  /** Right-column touched files (mock 674-684) from the ALREADY-LOADED diff of the current session. */
+  protected readonly consoleFiles = computed<TouchedFile[]>(() => {
+    const id = this.currentSession()?.id;
+    return touchedFiles(id ? this.diffFor(id) : null);
+  });
+  /** Which pane the §08 mobile switcher currently shows. */
+  protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
 
   @ViewChild('terminalWorkspace', { static: true })
   private terminalWorkspace?: ElementRef<HTMLElement>;
@@ -424,6 +511,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.subscribeToTerminalEvents();
     this.subscribeToRelayErrorEvents();
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
+    void this.loadInitiatives();
     void this.detectTools();
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
@@ -477,6 +565,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.queryParamSub?.unsubscribe();
     this.queryParamSub = null;
     void this.unsubscribeAllTerminalVisuals();
+    void this.unsubscribeAllStreamLanes();
     this.teardownChatSubscriptions();
     this.teardownTerminalSubscription();
     this.teardownRelaySessionEvents();
@@ -569,6 +658,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.reconcilePersistedTerminalState(sortedSessions);
       this.restorePaneLayoutsFromStorage(sortedSessions);
       await this.syncTerminalVisualSubscriptions();
+      void this.syncStreamSubscriptions();
 
       const toSelect = chooseSessionToSelect(sortedSessions, {
         targetId: targetSessionId,
@@ -670,8 +760,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
           this.upsertSession(mapped);
           this.restorePaneLayoutsFromStorage(this.sessions());
           void this.syncTerminalVisualSubscriptions();
+          void this.syncStreamSubscriptions();
         } else {
           void this.unsubscribeTerminalVisual(mapped.id);
+          void this.unsubscribeStreamLane(mapped.id);
+          this.dropTranscriptState(mapped.id);
           this.removeSessionLocally(mapped.id);
         }
         if (this.currentSession()?.id === mapped.id) {
@@ -689,6 +782,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!this.sessionDeleteSubscription) {
       this.sessionDeleteSubscription = this.relayTerminal.sessionDeletes().subscribe((sessionId) => {
         void this.unsubscribeTerminalVisual(sessionId);
+        void this.unsubscribeStreamLane(sessionId);
+        this.dropTranscriptState(sessionId);
         this.removeSessionLocally(sessionId);
         this.clearCurrentSession(sessionId);
       });
@@ -845,6 +940,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.messages.set(messages);
       this.hydrateTerminalScreenFromCache(id);
       await this.syncTerminalVisualSubscriptions();
+      void this.syncStreamSubscriptions();
 
       this.isStreaming.set(false);
       this.streamingContent.set('');
@@ -1207,11 +1303,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         this.terminalError.set(String(err));
       },
     });
+
+    // Parallel structured-stream lane feeding the Transcript tab (D6). Accumulate
+    // per session, bounded to MAX_TRANSCRIPT_EVENTS to cap long-session growth.
+    if (!this.streamEventsSubscription) {
+      this.streamEventsSubscription = this.relayTerminal.streamEvents().subscribe((event) => {
+        this.transcriptEvents.update((bySession) => appendTranscriptEvent(bySession, event));
+      });
+    }
   }
 
   private teardownTerminalSubscription(): void {
     this.terminalSubscription?.unsubscribe();
     this.terminalSubscription = null;
+    this.streamEventsSubscription?.unsubscribe();
+    this.streamEventsSubscription = null;
     this.relayErrorSubscription?.unsubscribe();
     this.relayErrorSubscription = null;
     if (this.resizeTerminalTimeout) {
@@ -1281,6 +1387,116 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     for (const sessionId of Array.from(this.terminalVisualSubscriptions)) {
       await this.unsubscribeTerminalVisual(sessionId);
     }
+  }
+
+  // ── Transcript tab state + stream lane ─────────────────────────────────
+
+  /** Active tab for a pane; defaults to the Transcript view (D6). */
+  paneTab(id: string): PaneTab {
+    return paneTabOf(this.paneTabs(), id);
+  }
+
+  setPaneTab(id: string, tab: PaneTab): void {
+    this.paneTabs.update((m) => ({ ...m, [id]: tab }));
+  }
+
+  /** The loaded diff for a session's Diff tab (null until first activation). */
+  diffFor(id: string): GitDiffView | null {
+    return this.diffs()[id] ?? null;
+  }
+
+  /**
+   * Load the initiative master-list for the console (overhaul P8, phase 04). Best-effort: a failure
+   * (unauthorized / host down) leaves an empty list and the benign empty state — the console degrades to
+   * the plain pane shell. `consoleNow` is stamped once here so `formatRelTime` stays deterministic.
+   */
+  private async loadInitiatives(): Promise<void> {
+    try {
+      const plans = await firstValueFrom(this.api.listAgentPlans());
+      this.consoleNow.set(new Date().toISOString());
+      this.agentPlans.set(plans ?? []);
+      // Default the selection to the first initiative so the header/right column have context.
+      if (!this.selectedInitiativeId() && plans && plans.length > 0) {
+        this.selectedInitiativeId.set(plans[0].id);
+      }
+    } catch {
+      this.agentPlans.set([]);
+    }
+  }
+
+  /** Select an initiative row (highlights it + drives the lifecycle bar / validation column). */
+  selectInitiative(row: InitiativeRow): void {
+    this.selectedInitiativeId.set(row.id);
+  }
+
+  /** Switch the §08 mobile console segment (Transcript/Files/Validation). */
+  setConsoleSegment(segment: string): void {
+    this.consoleSegment.set(consolePaneFor(segment));
+  }
+
+  /**
+   * Load the working-tree diff for a session's Diff tab (overhaul P7, D10/D11). Best-effort: a
+   * session with no `workingDirectory`, a non-repo cwd, or a failed RPC resolves to a benign
+   * clean/empty view (no error toast — `johnny-diff-view` shows its empty state). Refetches on each
+   * activation so a stale diff refreshes on tab click.
+   */
+  async loadDiff(session: SharedAiSession): Promise<void> {
+    const dir = session.workingDirectory?.trim();
+    if (!dir) {
+      this.diffs.update((m) => ({ ...m, [session.id]: TerminalPage.EMPTY_DIFF }));
+      return;
+    }
+    try {
+      const view = await firstValueFrom(this.api.gitDiff(dir));
+      this.diffs.update((m) => ({ ...m, [session.id]: view }));
+    } catch {
+      this.diffs.update((m) => ({ ...m, [session.id]: TerminalPage.EMPTY_DIFF }));
+    }
+  }
+
+  /** Accumulated structured events for a session's transcript (empty if none yet). */
+  transcriptEventsFor(id: string): StreamEvent[] {
+    return this.transcriptEvents()[id] ?? [];
+  }
+
+  /** Live until the last event of the turn (`final`) — drives the tab's `.live` dot. */
+  isSessionStreaming(id: string): boolean {
+    return eventsAreStreaming(this.transcriptEventsFor(id));
+  }
+
+  /**
+   * Mirror `syncTerminalVisualSubscriptions` for the structured stream lane:
+   * subscribe visible sessions, unsubscribe ones no longer visible (D6).
+   */
+  private async syncStreamSubscriptions(): Promise<void> {
+    if (document.hidden) return;
+    const visible = new Set(this.visiblePaneSessions().map((session) => session.id));
+    const { toSubscribe, toUnsubscribe } = diffStreamSubscriptions(this.streamSubscriptions, visible);
+    for (const id of toSubscribe) {
+      await this.relayTerminal.subscribeStream(id);
+      this.streamSubscriptions.add(id);
+    }
+    for (const id of toUnsubscribe) {
+      await this.relayTerminal.unsubscribeStream(id);
+      this.streamSubscriptions.delete(id);
+    }
+  }
+
+  private async unsubscribeStreamLane(id: string): Promise<void> {
+    if (!this.streamSubscriptions.delete(id)) return;
+    await this.relayTerminal.unsubscribeStream(id);
+  }
+
+  private async unsubscribeAllStreamLanes(): Promise<void> {
+    for (const id of Array.from(this.streamSubscriptions)) {
+      await this.unsubscribeStreamLane(id);
+    }
+  }
+
+  /** Drop a removed session's accumulated transcript + pane-tab state. */
+  private dropTranscriptState(id: string): void {
+    this.transcriptEvents.update((m) => this.omitRecordKey(m, id));
+    this.paneTabs.update((m) => this.omitRecordKey(m, id));
   }
 
   async onTerminalRawInput(data: string, sessionId = this.currentSession()?.id): Promise<void> {

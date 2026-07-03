@@ -1,7 +1,9 @@
+use crate::db::migrations::health_from_status;
 use crate::db::models::{
     AgentPlan, AgentPlanEvent, AgentPlanPhase, AgentPlanTask, CreateAgentPlanInput,
-    CreateSessionInput,
+    CreateBriefingInput, CreateSessionInput, ValidationLens,
 };
+use crate::providers::CliProvider;
 use crate::events::AgentPlanRunEvent;
 use crate::services::planner_prompts;
 use crate::services::sessions;
@@ -76,6 +78,32 @@ pub struct WorkspaceFileDiff {
     pub diff: String,
 }
 
+/// One changed file in a whole-tree diff (overhaul P7, D7). `additions`/`deletions` come from
+/// `git diff HEAD --numstat`; `diff` is this file's unified-diff section (empty for a pure rename or
+/// a binary file). `old_path` is set only on a rename.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffFile {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub binary: bool,
+    pub diff: String,
+}
+
+/// The working-tree diff of a repo (overhaul P7, D7/D10/D11): tracked changes vs HEAD, with per-file
+/// +/- counts and hunks in one round-trip. A non-repo path (or a clean repo) yields `clean:true` /
+/// `files:[]` and a `None` `repo_root` (benign empty state, D11).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffView {
+    pub repo_root: Option<String>,
+    pub branch: Option<String>,
+    pub clean: bool,
+    pub files: Vec<GitDiffFile>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitFilesView {
@@ -144,6 +172,35 @@ struct TaskStatusYaml {
     status: Option<String>,
 }
 
+/// The initiative_id of the planning stage-run that owns this plan path, if any.
+/// Shared join key between a planning stage-run and its development stage-run (D3).
+/// Extracted so the linkage query is regression-covered directly (task 02-04 test 4).
+fn find_planning_initiative_id(conn: &rusqlite::Connection, plan_path: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT initiative_id FROM agent_plans \
+         WHERE plan_path = ?1 AND run_type = 'planning' \
+         ORDER BY created_at ASC LIMIT 1",
+        params![plan_path],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Set the execution `status` AND derive the `health` axis in one place so the two cannot
+/// drift. `error` is set alongside (`None` clears it). Returns rows affected. Health is
+/// derived via `health_from_status` so removing the pairing fails task 02-04 test 5.
+fn update_plan_status_and_health(
+    conn: &rusqlite::Connection,
+    plan_id: &str,
+    new_status: &str,
+    error: Option<&str>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_plans SET status = ?1, health = ?2, error = ?3, updated_at = datetime('now') WHERE id = ?4",
+        params![new_status, health_from_status(new_status), error, plan_id],
+    )
+}
+
 pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<AgentPlanRun, String> {
     let run_type = input
         .run_type
@@ -155,6 +212,12 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
 
     let parsed = parse_plan(&input.workspace_path, &input.plan_path)?;
     let plan_id = Uuid::new_v4().to_string();
+    // Link this development stage-run to the planning stage-run that owns the same plan_path
+    // (now the global store path). Reuse its initiative_id; mint a fresh one if none exists (D3).
+    let initiative_id = state
+        .db
+        .with_conn(|conn| Ok(find_planning_initiative_id(conn, &parsed.plan_path.to_string_lossy())))?
+        .unwrap_or_else(|| plan_id.clone());
     let title = input.title.unwrap_or_else(|| parsed.title.clone());
     // Explicit app-repo path (where the docs-commit agent commits on completion).
     let app_scope = normalize_optional_workspace_path(
@@ -179,8 +242,10 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope, reviewer_setup_commands)
-             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9, ?10)",
+            // A development run reuses its planning run's initiative_id (linked by shared store
+            // plan_path); initiative_status='development', health seeded 'in-progress'.
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, app_scope, reviewer_setup_commands, initiative_id, initiative_status, health, validation_config)
+             VALUES (?1, 'development', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, ?8, 0, ?9, ?10, ?11, 'development', 'in-progress', NULL)",
             params![
                 plan_id,
                 title,
@@ -192,6 +257,7 @@ pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<Agen
                 parsed.phases.first().map(|phase| phase.phase_id.as_str()),
                 app_scope,
                 input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
+                initiative_id,
             ],
         )
         .map_err(|e| format!("Failed to create agent plan: {}", e))?;
@@ -255,35 +321,29 @@ fn create_planning_run(
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
     }
-    let raw_plan = Path::new(&input.plan_path);
-    // A new plan usually points at a directory that doesn't exist yet (and whose
-    // parent may not exist either), so create it before normalizing — otherwise
-    // canonicalize() on the missing parent fails with "Invalid parent path".
-    // Reject `..` and confirm absolute paths sit inside the workspace before we
-    // create anything, so mkdir can never escape the workspace.
+    // The inbound plan_path (the ui's `docs/plans/<slug>`) is now advisory only — the plan
+    // actually lives in the global initiatives store, outside every repo (D4). Still `..`-guard
+    // it defensively (same message/logic as parse_plan) so no user-influenced component can
+    // traverse, even though the derived store path is UUID-based and cannot contain `..`.
     if input.plan_path.split(['/', '\\']).any(|seg| seg == "..") {
         return Err("Plan path must not contain '..'".to_string());
     }
-    let candidate = if raw_plan.is_absolute() {
-        raw_plan.to_path_buf()
-    } else {
-        workspace.join(raw_plan)
-    };
-    if raw_plan.is_absolute() && !candidate.starts_with(&workspace) {
-        return Err("Plan path must be inside the selected workspace".to_string());
-    }
-    std::fs::create_dir_all(&candidate)
-        .map_err(|e| format!("Failed to create plan directory {}: {}", candidate.display(), e))?;
-    let plan = normalize_path(&candidate)?;
-    if !plan.starts_with(&workspace) {
-        return Err("Plan path must be inside the selected workspace".to_string());
-    }
+    // A planning stage-run's id IS its initiative id for a fresh initiative (D3).
+    let initiative_id = Uuid::new_v4().to_string();
+    let plan_id = initiative_id.clone();
+    // Derive `<initiatives_dir>/<initiative_id>/plan` and create it. The store lives outside
+    // every repo by design, so there is deliberately no in-workspace check on this path.
+    let store = settings_service::resolve_initiatives_dir(state);
+    let plan = settings_service::initiative_plan_path(&store, &initiative_id);
+    std::fs::create_dir_all(&plan)
+        .map_err(|e| format!("Failed to create initiative plan dir {}: {}", plan.display(), e))?;
     let app_scope = normalize_optional_workspace_path(&workspace, input.app_scope.as_deref())?;
     let docs_scope = normalize_optional_workspace_path(&workspace, input.docs_scope.as_deref())?;
     let reference_paths = normalize_reference_paths(&workspace, input.reference_paths.as_deref())?;
-    let plan_id = Uuid::new_v4().to_string();
     let title = input.title.clone().unwrap_or_else(|| {
-        plan.file_name()
+        // The advisory input path's last segment makes a nicer default than the store's "plan".
+        Path::new(&input.plan_path)
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .replace('-', " ")
@@ -306,8 +366,10 @@ fn create_planning_run(
 
     state.db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12)",
+            // Fresh initiative: id == initiative_id (?1); plan_path (?4) is the store path;
+            // initiative_status='planning', health seeded 'in-progress'.
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands, initiative_id, initiative_status, health, validation_config)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?1, 'planning', 'in-progress', NULL)",
             params![
                 plan_id,
                 title,
@@ -337,6 +399,258 @@ fn create_planning_run(
     get_plan(state, &plan_id)
 }
 
+/// Create an Initiative *in briefing* (overhaul P4, D1). Mirrors [`create_planning_run`] but:
+/// the row lands at `initiative_status='briefing'` with `worker_session_id` NULL (no planner yet),
+/// its conversation is a **`kind='user'`** chat session (routed through the headless
+/// `claude --print --resume` chat path, D2 — NOT a `kind='agent'` planner terminal), and both the
+/// `<id>/plan` and `<id>/attachments` store dirs are created. No agent is spawned here — the first
+/// briefing turn is sent later by the UI (Phase 04). Accept (Phase 02) flips this same row to
+/// `planning` and starts the planner.
+pub fn create_briefing_run(
+    state: &AppState,
+    input: CreateBriefingInput,
+) -> Result<AgentPlanRun, String> {
+    let workspace = normalize_path(Path::new(&input.workspace_path))?;
+    if !workspace.is_dir() {
+        return Err("Workspace path is not a directory".to_string());
+    }
+    // A briefing Initiative's id IS its initiative id (D1); the row will flip briefing→planning
+    // on the same id at Accept, so no fresh id is minted then.
+    let initiative_id = Uuid::new_v4().to_string();
+    let plan_id = initiative_id.clone();
+    // Provision both store dirs: the plan dir (populated on the later planning kickoff) and the
+    // attachments dir (📎/⤒ uploads land here via `initiative_upload_chunk`, D5).
+    let store = settings_service::resolve_initiatives_dir(state);
+    let plan = settings_service::initiative_plan_path(&store, &initiative_id);
+    let attachments = settings_service::initiative_attachments_path(&store, &initiative_id);
+    std::fs::create_dir_all(&plan)
+        .map_err(|e| format!("Failed to create initiative plan dir {}: {}", plan.display(), e))?;
+    std::fs::create_dir_all(&attachments).map_err(|e| {
+        format!(
+            "Failed to create initiative attachments dir {}: {}",
+            attachments.display(),
+            e
+        )
+    })?;
+    let title = input
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "Briefing".to_string());
+
+    // The conversation session: a `kind='user'` chat session on the worker provider. This is the
+    // lane the relay chat path (`handle_relay_chat` → `claude --print --resume`) drives (D2).
+    let chat_session = sessions::create_session(
+        state,
+        CreateSessionInput {
+            provider: Some(input.worker_provider.clone()),
+            model: input
+                .model
+                .clone()
+                .or_else(|| default_model_for_provider(&input.worker_provider)),
+            working_directory: Some(workspace.to_string_lossy().to_string()),
+            title: Some(format!("Briefing - {}", title)),
+            kind: Some("user".to_string()),
+            setup_commands: None,
+            tmux_session_name: None,
+        },
+    )?;
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            // Fresh briefing Initiative: id == initiative_id (?1); plan_path (?4) is the store path;
+            // initiative_status='briefing', worker/reviewer sessions NULL (no planner yet),
+            // briefing_session_id (?7) links the chat session, health seeded 'in-progress'.
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, initiative_id, initiative_status, health, briefing_session_id, validation_config)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', NULL, NULL, ?5, ?6, 0, ?8, ?1, 'briefing', 'in-progress', ?7, NULL)",
+            params![
+                plan_id,
+                title,
+                workspace.to_string_lossy(),
+                plan.to_string_lossy(),
+                input.worker_provider,
+                input.reviewer_provider,
+                chat_session.id,
+                input.brief.clone().unwrap_or_default(),
+            ],
+        )
+        .map_err(|e| format!("Failed to create briefing run: {}", e))
+    })?;
+
+    append_event(
+        state,
+        &plan_id,
+        None,
+        "briefing_run_created",
+        json!({ "briefingSessionId": chat_session.id }),
+    )?;
+
+    get_plan(state, &plan_id)
+}
+
+/// Compose the accepted brief (overhaul P4, D6): the draft, then an `## Attached files` section of
+/// absolute store paths, then a `## Referenced host paths` section. Each trailing section is omitted
+/// when its slice is empty (no dangling header). Pure — no state/DB/FS, so its test needs no fixtures.
+/// (Absolute store paths are readable by the agent CLI directly — design §5b.)
+pub fn compose_accepted_brief(
+    draft: &str,
+    attachment_paths: &[String],
+    reference_paths: &[String],
+) -> String {
+    let mut out = draft.trim_end().to_string();
+    if !attachment_paths.is_empty() {
+        out.push_str("\n\n## Attached files\n");
+        for p in attachment_paths {
+            out.push_str(&format!("- {}\n", p));
+        }
+    }
+    if !reference_paths.is_empty() {
+        out.push_str("\n\n## Referenced host paths\n");
+        for p in reference_paths {
+            out.push_str(&format!("- {}\n", p));
+        }
+    }
+    out
+}
+
+/// Flip the row `briefing → planning` and store the composed brief — the SAME row (D1). DB-only so it
+/// is unit-testable against in-memory SQLite without spawning an agent (D8). `updated_at` uses the
+/// same `datetime('now')` idiom as the other UPDATEs in this file.
+fn apply_brief_acceptance(
+    conn: &rusqlite::Connection,
+    id: &str,
+    composed: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE agent_plans SET brief = ?2, initiative_status = 'planning', updated_at = datetime('now') WHERE id = ?1",
+        params![id, composed],
+    )
+    .map_err(|e| format!("Failed to apply brief acceptance: {}", e))?;
+    Ok(())
+}
+
+/// Record a ▤ Reference host path on a briefing Initiative (overhaul P4, D6): append `path` to the
+/// row's `reference_paths` and re-normalize the whole block with the SAME `normalize_reference_paths`
+/// the planner create uses (validation/dedup live there — not re-implemented here). Returns the
+/// refreshed run.
+pub fn add_initiative_reference_path(
+    state: &AppState,
+    id: &str,
+    path: &str,
+) -> Result<AgentPlanRun, String> {
+    let plan = get_plan(state, id)?.plan;
+    let workspace = Path::new(&plan.workspace_path);
+    let combined = match plan.reference_paths.as_deref() {
+        Some(existing) if !existing.trim().is_empty() => format!("{}\n{}", existing, path),
+        _ => path.to_string(),
+    };
+    let normalized = normalize_reference_paths(workspace, Some(&combined))?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET reference_paths = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, normalized],
+        )
+        .map_err(|e| format!("Failed to update reference paths: {}", e))
+    })?;
+    get_plan(state, id)
+}
+
+/// Accept a briefing brief (overhaul P4, D1/D4): the one transition out of `briefing`. Guards that the
+/// row is in `briefing`, composes the accepted brief (draft + attachment refs + reference paths),
+/// flips the **same** row `briefing → planning` storing that brief, provisions the T1 planner session
+/// + plan dir on the same row (reusing `create_planning_run`'s provisioning primitives — NOT its
+/// INSERT wrapper), and starts the planner via the existing **`start_planning_run`**. The compose +
+/// DB flip happen before the terminal-attaching spawn so they are assertable without a live agent (D8).
+pub async fn accept_brief(
+    state: &AppState,
+    id: &str,
+    final_brief: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    let plan = get_plan(state, id)?.plan;
+    if plan.initiative_status != "briefing" {
+        return Err("Initiative is not in briefing".to_string());
+    }
+    let store = settings_service::resolve_initiatives_dir(state);
+
+    // Attachment absolute paths (files only, sorted for determinism); [] if the dir is absent.
+    let attach_dir = settings_service::initiative_attachments_path(&store, id);
+    let mut attachments: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&attach_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                attachments.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    attachments.sort();
+
+    // Reference paths recorded during briefing (one per non-empty line).
+    let refs: Vec<String> = plan
+        .reference_paths
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let draft = final_brief
+        .as_deref()
+        .or(plan.brief.as_deref())
+        .unwrap_or("");
+    let composed = compose_accepted_brief(draft, &attachments, &refs);
+
+    // Flip the SAME row briefing→planning and store the composed brief BEFORE any spawn (D8).
+    state
+        .db
+        .with_conn(|conn| apply_brief_acceptance(conn, id, &composed))?;
+
+    // Provision the planner on THIS row — reuse create_planning_run's primitives (309-336): ensure the
+    // plan dir exists and create the T1 planner (kind='agent') session, then point worker_session_id
+    // at it. `start_planning_run`'s INSERT wrapper is deliberately NOT called (would duplicate — D1).
+    let plan_dir = settings_service::initiative_plan_path(&store, id);
+    std::fs::create_dir_all(&plan_dir).map_err(|e| {
+        format!(
+            "Failed to create initiative plan dir {}: {}",
+            plan_dir.display(),
+            e
+        )
+    })?;
+    let planner_session = sessions::create_session(
+        state,
+        CreateSessionInput {
+            provider: Some(plan.worker_provider.clone()),
+            model: default_model_for_provider(&plan.worker_provider),
+            working_directory: Some(plan.workspace_path.clone()),
+            title: Some(format!("T1 Planner - {}", plan.title)),
+            kind: Some("agent".to_string()),
+            setup_commands: None,
+            tmux_session_name: None,
+        },
+    )?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET worker_session_id = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![id, planner_session.id],
+        )
+        .map_err(|e| format!("Failed to set planner session: {}", e))
+    })?;
+
+    append_event(
+        state,
+        id,
+        None,
+        "brief_accepted",
+        json!({ "plannerSessionId": planner_session.id }),
+    )?;
+
+    // Existing kickoff (start_planning_run, 819): attaches the planner terminal + sends the prompt
+    // built from `user_brief = run.plan.brief` — now the composed accepted brief.
+    start_planning_run(state.clone(), id.to_string()).await?;
+    get_plan(state, id)
+}
+
 pub fn list_plans(
     state: &AppState,
     status: Option<String>,
@@ -344,7 +658,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, created_at, updated_at FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -366,7 +680,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, created_at, updated_at FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -611,6 +925,50 @@ pub fn update_plan_app_scope(
     get_plan(state, &id)
 }
 
+/// Set/clear the Initiative's `validation_config` (overhaul P7, D1/D13). Mirrors
+/// [`update_plan_app_scope`]: a `None`/empty value clears the column so `resolve_validation_lenses`
+/// falls back to the default template. When `Some`, the JSON must parse as a `Vec<ValidationLens>`
+/// (a malformed string is rejected, not silently written) and each lens's `provider` must be a
+/// real `CliProvider` (D13 — a typo/hostile config can't smuggle an unrunnable provider into the
+/// review fan-out). An empty array is allowed and stored as-is (→ resolve falls back to default).
+pub fn update_plan_validation_config(
+    state: &AppState,
+    id: String,
+    config: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    // Treat blank/whitespace-only as a clear (→ NULL → default resolve).
+    let config = config.filter(|s| !s.trim().is_empty());
+    if let Some(json) = config.as_deref() {
+        let lenses: Vec<ValidationLens> = serde_json::from_str(json)
+            .map_err(|e| format!("Invalid validation config JSON: {}", e))?;
+        for lens in &lenses {
+            if CliProvider::from_str(&lens.provider).is_none() {
+                return Err(format!(
+                    "Unknown provider '{}' for lens '{}'",
+                    lens.provider, lens.name
+                ));
+            }
+        }
+    }
+    // Ensure the plan exists (clear error if not) before writing.
+    get_plan(state, &id)?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET validation_config = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![config, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_plan_validation_config_updated",
+        json!({ "hasConfig": config.is_some() }),
+    )?;
+    get_plan(state, &id)
+}
+
 pub fn update_plan_title(
     state: &AppState,
     id: String,
@@ -676,11 +1034,7 @@ pub async fn block_plan(
     reason: String,
 ) -> Result<AgentPlanRun, String> {
     state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'blocked', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![reason, id],
-        )
-        .map_err(|e| e.to_string())
+        update_plan_status_and_health(conn, &id, "blocked", Some(&reason)).map_err(|e| e.to_string())
     })?;
     append_event(
         state,
@@ -1258,13 +1612,185 @@ pub fn get_workspace_file_diff(
     Ok(WorkspaceFileDiff { path: rel, diff })
 }
 
+/// One parsed `git diff --numstat -z` record.
+struct NumstatRecord {
+    additions: u32,
+    deletions: u32,
+    binary: bool,
+    path: String,
+    old_path: Option<String>,
+}
+
+/// Parse `git diff --numstat -z` output. The `-z` numstat format is NUL-terminated: a normal record
+/// is `add\tdel\t<path>\0`; a rename is `add\tdel\t\0<old>\0<new>\0` (an empty path right after the
+/// second tab signals the two following NUL fields are old/new). `-`/`-` counts mean a binary file.
+fn parse_numstat_z(output: &str) -> Vec<NumstatRecord> {
+    let fields: Vec<&str> = output.split('\0').collect();
+    let mut records = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let field = fields[i];
+        if field.is_empty() {
+            i += 1;
+            continue;
+        }
+        // field = "add\tdel\t<path-or-empty>"
+        let mut parts = field.splitn(3, '\t');
+        let add_tok = parts.next().unwrap_or("");
+        let del_tok = parts.next().unwrap_or("");
+        let path_part = parts.next().unwrap_or("");
+        let binary = add_tok == "-" || del_tok == "-";
+        let additions = add_tok.parse::<u32>().unwrap_or(0);
+        let deletions = del_tok.parse::<u32>().unwrap_or(0);
+        if path_part.is_empty() {
+            // Rename: the next two NUL fields are the old and new paths.
+            let old_path = fields.get(i + 1).map(|s| s.to_string());
+            let new_path = fields.get(i + 2).map(|s| s.to_string()).unwrap_or_default();
+            records.push(NumstatRecord {
+                additions,
+                deletions,
+                binary,
+                path: new_path,
+                old_path,
+            });
+            i += 3;
+        } else {
+            records.push(NumstatRecord {
+                additions,
+                deletions,
+                binary,
+                path: path_part.to_string(),
+                old_path: None,
+            });
+            i += 1;
+        }
+    }
+    records
+}
+
+/// Split a unified `git diff` blob into per-file sections keyed by the file's new (`b/`) path. The
+/// `+++ b/<path>` line is the authoritative path source when present (content changes); the
+/// `diff --git a/… b/…` header is the fallback (pure renames / binary, which have no `+++`).
+fn split_diff_sections(diff: &str) -> HashMap<String, String> {
+    let mut sections: HashMap<String, String> = HashMap::new();
+    let mut current_path: Option<String> = None;
+    let mut current = String::new();
+    let flush = |sections: &mut HashMap<String, String>,
+                 path: &mut Option<String>,
+                 buf: &mut String| {
+        if let Some(p) = path.take() {
+            sections.insert(p, std::mem::take(buf));
+        } else {
+            buf.clear();
+        }
+    };
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            flush(&mut sections, &mut current_path, &mut current);
+            current.push_str(line);
+            current.push('\n');
+            // Fallback path from the header (overridden by a later `+++ b/` when present).
+            current_path = line.split(" b/").nth(1).map(|s| s.to_string());
+        } else {
+            current.push_str(line);
+            current.push('\n');
+            if let Some(rest) = line.strip_prefix("+++ b/") {
+                current_path = Some(rest.to_string());
+            }
+        }
+    }
+    flush(&mut sections, &mut current_path, &mut current);
+    sections
+}
+
+/// Run `git diff HEAD <extra>`, falling back to `git diff --cached <extra>` when the repo has no
+/// HEAD yet (no commits) — matching `get_workspace_file_diff`'s staged fallback (D11). Read-only.
+fn git_diff_output(repo_root: &Path, extra: &[&str]) -> Result<String, String> {
+    let mut head_args: Vec<&str> = vec!["diff", "HEAD"];
+    head_args.extend_from_slice(extra);
+    let output = std::process::Command::new("git")
+        .args(&head_args)
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("Failed to run git diff: {}", e))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let mut cached_args: Vec<&str> = vec!["diff", "--cached"];
+    cached_args.extend_from_slice(extra);
+    let staged = std::process::Command::new("git")
+        .args(&cached_args)
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| format!("Failed to run staged git diff: {}", e))?;
+    if staged.status.success() {
+        return Ok(String::from_utf8_lossy(&staged.stdout).to_string());
+    }
+    Err(String::from_utf8_lossy(&staged.stderr).trim().to_string())
+}
+
+/// Whole-tree working-tree diff of the repo at `path` (overhaul P7, D7/D10/D11/D13). Path-keyed off a
+/// session's `workingDirectory`: guards the path under the configured `files_root` (rejects traversal
+/// — D13), resolves the repo via `git rev-parse --show-toplevel`, then runs `git diff HEAD --numstat`
+/// (per-file +/- counts, rename-aware, `-` for binary) + `git diff HEAD` (hunks) in ONE call (no
+/// N+1). Tracked changes vs HEAD only; untracked files excluded (D11). A non-repo/clean path returns
+/// a benign empty view. Only ever runs READ git commands (`rev-parse`/`branch`/`diff`).
+pub fn git_diff(state: &AppState, path: String) -> Result<GitDiffView, String> {
+    let root = settings_service::resolve_files_root(state);
+    let dir = resolve_workspace_file_path(&root, &path)?;
+    let git_root = match git_root_for_path(&dir) {
+        Ok(root) => root,
+        // Not a git repository → benign empty state (D11), no error toast in the UI.
+        Err(_) => {
+            return Ok(GitDiffView {
+                repo_root: None,
+                branch: None,
+                clean: true,
+                files: vec![],
+            });
+        }
+    };
+    let branch = git_current_branch(&git_root).ok();
+
+    let numstat = git_diff_output(&git_root, &["--numstat", "-z"])?;
+    let records = parse_numstat_z(&numstat);
+    let hunks = git_diff_output(&git_root, &[])?;
+    let sections = split_diff_sections(&hunks);
+
+    let files: Vec<GitDiffFile> = records
+        .into_iter()
+        .map(|rec| {
+            let diff = sections.get(&rec.path).cloned().unwrap_or_default();
+            GitDiffFile {
+                // A file is only "binary" when numstat gave `-`/`-` AND there is no textual hunk.
+                binary: rec.binary && diff.trim().is_empty(),
+                path: rec.path,
+                old_path: rec.old_path,
+                additions: rec.additions,
+                deletions: rec.deletions,
+                diff,
+            }
+        })
+        .collect();
+
+    Ok(GitDiffView {
+        repo_root: Some(git_root.to_string_lossy().to_string()),
+        branch,
+        clean: files.is_empty(),
+        files,
+    })
+}
+
 async fn spawn_coordinator_loop(state: AppState, plan_id: String) {
     tokio::spawn(async move {
         if let Err(error) = coordinator_loop(state.clone(), plan_id.clone()).await {
             let _ = state.db.with_conn(|conn| {
+                // Kept inline (not via update_plan_status_and_health) to preserve the
+                // `status NOT IN (...)` guard; health is still derived via health_from_status so
+                // the status+health pairing can't drift (documented in decisions.md D-inline).
                 conn.execute(
-                    "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2 AND status NOT IN ('approved', 'blocked', 'stopped')",
-                    params![error, plan_id],
+                    "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
+                    params![health_from_status("needs_attention"), error, plan_id],
                 )
                 .map_err(|e| e.to_string())
             });
@@ -1745,9 +2271,6 @@ fn maybe_notify_discord(
 }
 
 /// The development-review lenses: (registration role, display name).
-const REVIEW_LENSES: [(&str, &str); 3] =
-    [("product", "Product"), ("qa", "QA"), ("lead", "Lead")];
-
 /// Self-contained prompt for one ephemeral lens reviewer. Bakes the verdict report
 /// `curl` for `session_id`; the agent runs only its lens.
 /// Per-session file the lens writes its GraphQL request body into, then POSTs with
@@ -1817,13 +2340,87 @@ fn insights_from_report(report: &AgentReport) -> ReviewInsights {
     }
 }
 
+/// The per-lens decision the fan-out needs to spawn one ephemeral reviewer: which provider/model to
+/// launch and the lens's identity/rubric. Pure so it can be unit-pinned (D2/D6) without live agents.
+#[derive(Debug, Clone, PartialEq)]
+struct LensSpawnDescriptor {
+    name: String,
+    provider: String,
+    model: Option<String>,
+    prompt: Option<String>,
+    vision: bool,
+    blocking: bool,
+}
+
+/// Resolve one lens's spawn descriptor: its own `provider`, and `model` falling back to the
+/// provider default when the lens leaves it unset (mirrors the ephemeral-reviewer model choice).
+fn lens_spawn_descriptor(lens: &ValidationLens) -> LensSpawnDescriptor {
+    let provider = lens.provider.clone();
+    let model = lens
+        .model
+        .clone()
+        .or_else(|| default_model_for_provider(&provider));
+    LensSpawnDescriptor {
+        name: lens.name.clone(),
+        provider,
+        model,
+        prompt: lens.prompt.clone(),
+        vision: lens.vision,
+        blocking: lens.blocking,
+    }
+}
+
+/// Build every lens's spawn descriptor, validating each `provider` against the real `CliProvider`
+/// registry first (D13) — an unknown/typo provider is rejected up front rather than spawned. Pure:
+/// the N-arity + per-lens provider/model test seam (A1/A2). Order is preserved so `descriptors[i]`
+/// aligns with `lenses[i]` (and, after `join_all`, with `outcomes[i]`).
+fn lens_spawn_descriptors(lenses: &[ValidationLens]) -> Result<Vec<LensSpawnDescriptor>, String> {
+    lenses
+        .iter()
+        .map(|lens| {
+            if CliProvider::from_str(&lens.provider).is_none() {
+                return Err(format!(
+                    "Unknown provider '{}' for lens '{}'",
+                    lens.provider, lens.name
+                ));
+            }
+            Ok(lens_spawn_descriptor(lens))
+        })
+        .collect()
+}
+
+/// The lens-specific tail appended to a reviewer prompt (after the standard lens instructions,
+/// before the report protocol): the lens's own rubric (`lens.prompt`, for a custom lens) and the
+/// design-authority §3 vision clause when the lens is vision-capable (D14). Empty for a default,
+/// non-vision lens — so the default template's prompt is byte-for-byte today's prompt plus nothing.
+fn lens_prompt_extras(lens: &ValidationLens) -> String {
+    let mut out = String::new();
+    if let Some(p) = lens
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str("\n\nAdditional rubric for this lens (supplied by the validation config):\n");
+        out.push_str(p);
+    }
+    if lens.vision {
+        out.push_str(
+            "\n\nYou may be running on a vision-capable model. If you cannot read a screenshot for \
+this phase, approve on functional grounds rather than blocking.",
+        );
+    }
+    out
+}
+
 fn lens_reviewer_prompt(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
-    lens_name: &str,
+    lens: &ValidationLens,
     session_id: &str,
 ) -> String {
+    let lens_name = lens.name.as_str();
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
@@ -1839,7 +2436,7 @@ fn lens_reviewer_prompt(
     format!(
         "You are the {name} reviewer for phase {phase_id} of a development run. Run ONLY the {name} lens — do not run the other lenses.\n\n\
 Read first: methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
-Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{report}",
+Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
         phase_id = phase.phase_id,
         methodology = get("methodology_path"),
@@ -1847,6 +2444,7 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{re
         plan = get("plan_path"),
         phase_path = get("phase_path"),
         tasks = get("tasks_path"),
+        extras = lens_prompt_extras(lens),
         report = lens_report_instruction(session_id, lens_name),
     )
 }
@@ -1951,6 +2549,49 @@ fn merged_verdict<'a>(verdicts: impl IntoIterator<Item = &'a str>) -> &'static s
     }
 }
 
+/// Gate promotion on the **blocking** lenses only (overhaul P7, D4). Pairs each outcome with its
+/// lens by index (ordering preserved by `join_all`), filters to `blocking == true`, and feeds ONLY
+/// those verdicts to the existing `merged_verdict` — which stays the single verdict authority (this
+/// is a filter on its input, not a second gate). When there are no blocking lenses nothing can halt
+/// promotion, so the gate is PASS (warn findings still surface via `merge_lens_body`). With the
+/// default all-blocking template this is identical to feeding `merged_verdict` every outcome (A5).
+fn gate_verdict_over_blocking(
+    outcomes: &[(String, String, ReviewInsights)],
+    lenses: &[ValidationLens],
+) -> &'static str {
+    let blocking: Vec<&str> = outcomes
+        .iter()
+        .zip(lenses.iter())
+        .filter(|(_, lens)| lens.blocking)
+        .map(|((_, verdict, _), _)| verdict.as_str())
+        .collect();
+    if blocking.is_empty() {
+        return "PASS";
+    }
+    merged_verdict(blocking)
+}
+
+/// One-line "name: VERDICT" roll-up for the merged reviewer footer, marking warn-only lenses with a
+/// `(warn)` tag so a reviewer reading the summary can see a non-PASS from a warn lens did not gate.
+fn lens_summary_line(
+    outcomes: &[(String, String, ReviewInsights)],
+    lenses: &[ValidationLens],
+) -> String {
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(i, (name, verdict, _))| {
+            let blocking = lenses.get(i).map(|l| l.blocking).unwrap_or(true);
+            if blocking {
+                format!("{}: {}", name, verdict)
+            } else {
+                format!("{}: {} (warn)", name, verdict)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Shared body for a merged lens review: rolls the per-lens verdicts up via
 /// `merged_verdict` and concatenates their findings. Returns
 /// `(summary, findings_block, merged_verdict)` so callers can prepend whatever
@@ -1976,54 +2617,75 @@ fn merge_lens_body(outcomes: &[(String, String, ReviewInsights)]) -> (String, St
     (summary, findings, merged)
 }
 
+/// Compose the development reviewer footer. Findings fold in **all** lenses (blocking + warn) via
+/// `merge_lens_body` so warnings surface; the `VERDICT:` line is the **gate** verdict (blocking
+/// lenses only, D4) — the promotion authority `handle_reviewer_output` routes on. The summary marks
+/// warn lenses so a non-PASS from a warn lens is visibly non-gating.
 fn merge_lens_outcomes(
     phase: &AgentPlanPhase,
     outcomes: &[(String, String, ReviewInsights)],
+    lenses: &[ValidationLens],
+    gate_verdict: &str,
 ) -> String {
-    let (summary, findings, merged) = merge_lens_body(outcomes);
+    let (_summary, findings, _merged) = merge_lens_body(outcomes);
+    let summary = lens_summary_line(outcomes, lenses);
     format!(
-        "PHASE: {}\nSUMMARY: 3-lens review — {}\nFINDINGS:\n{}NEXT_STEPS:\n- none\nVERDICT: {}",
-        phase.phase_id, summary, findings, merged
+        "PHASE: {}\nSUMMARY: {}-lens review — {}\nFINDINGS:\n{}NEXT_STEPS:\n- none\nVERDICT: {}",
+        phase.phase_id,
+        outcomes.len(),
+        summary,
+        findings,
+        gate_verdict
     )
 }
 
 /// Planning variant of `merge_lens_outcomes` — no `PHASE:` line (planning is a
 /// whole-plan review); `handle_planning_reviewer_output` parses VERDICT/SUMMARY/
-/// FINDINGS and ignores any phase header.
-fn merge_planning_lens_outcomes(outcomes: &[(String, String, ReviewInsights)]) -> String {
-    let (summary, findings, merged) = merge_lens_body(outcomes);
+/// FINDINGS and ignores any phase header. Same blocking/warn split (D4).
+fn merge_planning_lens_outcomes(
+    outcomes: &[(String, String, ReviewInsights)],
+    lenses: &[ValidationLens],
+    gate_verdict: &str,
+) -> String {
+    let (_summary, findings, _merged) = merge_lens_body(outcomes);
+    let summary = lens_summary_line(outcomes, lenses);
     format!(
-        "SUMMARY: 3-lens plan review — {}\nFINDINGS:\n{}NEXT_STEPS:\n- none\nVERDICT: {}",
-        summary, findings, merged
+        "SUMMARY: {}-lens plan review — {}\nFINDINGS:\n{}NEXT_STEPS:\n- none\nVERDICT: {}",
+        outcomes.len(),
+        summary,
+        findings,
+        gate_verdict
     )
 }
 
-/// Development phase review via lens fan-out: spawn Product/QA/Lead ephemeral
-/// reviewers in parallel, collect verdicts, dispose, merge, and route through the
-/// existing reviewer-output handler.
+/// Development phase review via lens fan-out (overhaul P7, D2): spawn one ephemeral reviewer per
+/// **configured** lens (`resolve_validation_lenses`, default = product/qa/lead), each on its own
+/// provider/model, await them with `join_all` (N-arity — no hand-unrolled join), gate over the
+/// blocking lenses (D4), and route through the existing reviewer-output handler. EXTENDS the loop —
+/// the spawn/dispose/merge/verdict machinery is unchanged, only the arity and per-lens plumbing.
 async fn run_lens_fanout_review(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
 ) -> Result<(), String> {
-    let provider = run.plan.reviewer_provider.clone();
-    let model = default_model_for_provider(&provider);
+    let lenses = resolve_validation_lenses(run);
+    let descriptors = lens_spawn_descriptors(&lenses)?; // validates each provider (D13)
     let working_dir = Some(run.plan.workspace_path.clone());
     let plan_id = run.plan.id.clone();
     // Lenses POST their review body from a file under here; make sure it exists.
     let _ = std::fs::create_dir_all(std::env::temp_dir().join("johnnyone-reviews"));
 
-    // Spawn all three (they run concurrently once their prompts are sent).
-    let mut sessions: Vec<(&str, String)> = Vec::new(); // (display name, session_id)
-    for (role, name) in REVIEW_LENSES {
+    // Spawn one reviewer per lens (they run concurrently once their prompts are sent).
+    let mut sessions: Vec<(String, String)> = Vec::new(); // (lens name, session_id)
+    for (lens, desc) in lenses.iter().zip(descriptors.iter()) {
         let sid = spawn_ephemeral_agent(
             state,
             &plan_id,
-            role,
-            &provider,
-            model.clone(),
+            &desc.name,
+            &desc.provider,
+            desc.model.clone(),
             working_dir.clone(),
-            |sid| lens_reviewer_prompt(state, run, phase, name, sid),
+            |sid| lens_reviewer_prompt(state, run, phase, lens, sid),
         )
         .await?;
         let _ = append_event(
@@ -2031,30 +2693,24 @@ async fn run_lens_fanout_review(
             &plan_id,
             Some(&phase.phase_id),
             "agent_lens_review_started",
-            json!({ "lens": name }),
+            json!({ "lens": desc.name }),
         );
-        sessions.push((name, sid));
+        sessions.push((desc.name.clone(), sid));
     }
 
-    // Collect all three verdicts concurrently.
-    let (r0, r1, r2) = tokio::join!(
-        wait_for_lens_verdict(state, &sessions[0].1, sessions[0].0),
-        wait_for_lens_verdict(state, &sessions[1].1, sessions[1].0),
-        wait_for_lens_verdict(state, &sessions[2].1, sessions[2].0),
-    );
+    // Collect every verdict concurrently — order preserved so results[i] aligns with lenses[i].
+    let futures = sessions
+        .iter()
+        .map(|(name, sid)| wait_for_lens_verdict(state, sid, name));
+    let results = futures_util::future::join_all(futures).await;
 
     // Tear the reviewers down regardless of outcome.
     for (_, sid) in &sessions {
         dispose_ephemeral_agent(state, sid).await;
     }
 
-    let results = [
-        (sessions[0].0, r0),
-        (sessions[1].0, r1),
-        (sessions[2].0, r2),
-    ];
     let mut outcomes: Vec<(String, String, ReviewInsights)> = Vec::new();
-    for (name, res) in results {
+    for ((name, _sid), res) in sessions.iter().zip(results.into_iter()) {
         let report = res?; // any lens escalation → needs_attention
         let verdict = report
             .verdict
@@ -2068,19 +2724,21 @@ async fn run_lens_fanout_review(
             "agent_lens_verdict",
             lens_verdict_payload(name, &verdict, &insights),
         );
-        outcomes.push((name.to_string(), verdict, insights));
+        outcomes.push((name.clone(), verdict, insights));
     }
 
-    let merged = merge_lens_outcomes(phase, &outcomes);
+    let gate = gate_verdict_over_blocking(&outcomes, &lenses);
+    let merged = merge_lens_outcomes(phase, &outcomes, &lenses, gate);
     handle_reviewer_output(state, run, phase, &merged).await
 }
 
 fn planning_lens_reviewer_prompt(
     state: &AppState,
     run: &AgentPlanRun,
-    lens_name: &str,
+    lens: &ValidationLens,
     session_id: &str,
 ) -> String {
+    let lens_name = lens.name.as_str();
     let values = planning_template_values(state, run);
     let get = |k: &str| {
         values
@@ -2092,39 +2750,40 @@ fn planning_lens_reviewer_prompt(
     format!(
         "You are the {name} reviewer for a PLAN (planning run). Run ONLY the {name} lens — do not run the other lenses.\n\n\
 Read first: methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the planning-review {name} checklist); then read the plan at {plan_output}. Judge whether the PLAN itself is ready along the {name} dimension (e.g. Product: clear scope, mocks, and a screens-to-verify inventory; QA: testable acceptance criteria per phase; Lead: a sound, reuse-aware, secure approach with phases sized right).\n\n\
-Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{report}",
+Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
         methodology = get("methodology_path"),
         conventions = get("conventions_path"),
         plan_output = get("plan_output_path"),
+        extras = lens_prompt_extras(lens),
         report = lens_report_instruction(session_id, lens_name),
     )
 }
 
-/// Planning review via lens fan-out: spawn Product/QA/Lead ephemeral reviewers in
-/// parallel against the whole plan, collect verdicts, dispose, merge, and route
-/// through the planning reviewer-output handler. Mirrors `run_lens_fanout_review`
-/// but has no phase (planning is a whole-plan review).
+/// Planning review via lens fan-out (overhaul P7, D2): one ephemeral reviewer per **configured**
+/// lens against the whole plan, each on its own provider/model, awaited with `join_all`, gated over
+/// the blocking lenses (D4). Mirrors `run_lens_fanout_review` but has no phase (planning is a
+/// whole-plan review). EXTENDS the loop — only the arity and per-lens plumbing changed.
 async fn run_planning_lens_fanout_review(
     state: &AppState,
     run: &AgentPlanRun,
 ) -> Result<(), String> {
-    let provider = run.plan.reviewer_provider.clone();
-    let model = default_model_for_provider(&provider);
+    let lenses = resolve_validation_lenses(run);
+    let descriptors = lens_spawn_descriptors(&lenses)?; // validates each provider (D13)
     let working_dir = Some(run.plan.workspace_path.clone());
     let plan_id = run.plan.id.clone();
     let _ = std::fs::create_dir_all(std::env::temp_dir().join("johnnyone-reviews"));
 
-    let mut sessions: Vec<(&str, String)> = Vec::new(); // (display name, session_id)
-    for (role, name) in REVIEW_LENSES {
+    let mut sessions: Vec<(String, String)> = Vec::new(); // (lens name, session_id)
+    for (lens, desc) in lenses.iter().zip(descriptors.iter()) {
         let sid = spawn_ephemeral_agent(
             state,
             &plan_id,
-            role,
-            &provider,
-            model.clone(),
+            &desc.name,
+            &desc.provider,
+            desc.model.clone(),
             working_dir.clone(),
-            |sid| planning_lens_reviewer_prompt(state, run, name, sid),
+            |sid| planning_lens_reviewer_prompt(state, run, lens, sid),
         )
         .await?;
         let _ = append_event(
@@ -2132,28 +2791,22 @@ async fn run_planning_lens_fanout_review(
             &plan_id,
             None,
             "agent_lens_review_started",
-            json!({ "lens": name }),
+            json!({ "lens": desc.name }),
         );
-        sessions.push((name, sid));
+        sessions.push((desc.name.clone(), sid));
     }
 
-    let (r0, r1, r2) = tokio::join!(
-        wait_for_lens_verdict(state, &sessions[0].1, sessions[0].0),
-        wait_for_lens_verdict(state, &sessions[1].1, sessions[1].0),
-        wait_for_lens_verdict(state, &sessions[2].1, sessions[2].0),
-    );
+    let futures = sessions
+        .iter()
+        .map(|(name, sid)| wait_for_lens_verdict(state, sid, name));
+    let results = futures_util::future::join_all(futures).await;
 
     for (_, sid) in &sessions {
         dispose_ephemeral_agent(state, sid).await;
     }
 
-    let results = [
-        (sessions[0].0, r0),
-        (sessions[1].0, r1),
-        (sessions[2].0, r2),
-    ];
     let mut outcomes: Vec<(String, String, ReviewInsights)> = Vec::new();
-    for (name, res) in results {
+    for ((name, _sid), res) in sessions.iter().zip(results.into_iter()) {
         let report = res?; // any lens escalation → needs_attention
         let verdict = report
             .verdict
@@ -2167,10 +2820,11 @@ async fn run_planning_lens_fanout_review(
             "agent_lens_verdict",
             lens_verdict_payload(name, &verdict, &insights),
         );
-        outcomes.push((name.to_string(), verdict, insights));
+        outcomes.push((name.clone(), verdict, insights));
     }
 
-    let merged = merge_planning_lens_outcomes(&outcomes);
+    let gate = gate_verdict_over_blocking(&outcomes, &lenses);
+    let merged = merge_planning_lens_outcomes(&outcomes, &lenses, gate);
     handle_planning_reviewer_output(state, run, &merged).await
 }
 
@@ -2668,11 +3322,8 @@ async fn escalate_phase_no_converge(
         phase.phase_id, round, verdict, summary
     );
     state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![reason, run.plan.id],
-        )
-        .map_err(|e| e.to_string())
+        update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+            .map_err(|e| e.to_string())
     })?;
     append_event(
         state,
@@ -2693,11 +3344,8 @@ async fn handle_planning_reviewer_output(
     match verdict.as_deref() {
         Some("PASS") => {
             state.db.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE agent_plans SET status = 'approved', error = NULL, updated_at = datetime('now') WHERE id = ?1",
-                    params![run.plan.id],
-                )
-                .map_err(|e| e.to_string())
+                update_plan_status_and_health(conn, &run.plan.id, "approved", None)
+                    .map_err(|e| e.to_string())
             })?;
             // Commit the approved plan state. The message format depends on
             // whether this is the very first approval (initial commit) or a
@@ -2732,11 +3380,8 @@ async fn handle_planning_reviewer_output(
                     round, verdict, summary
                 );
                 state.db.with_conn(|conn| {
-                    conn.execute(
-                        "UPDATE agent_plans SET status = 'needs_attention', error = ?1, updated_at = datetime('now') WHERE id = ?2",
-                        params![reason, run.plan.id],
-                    )
-                    .map_err(|e| e.to_string())
+                    update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+                        .map_err(|e| e.to_string())
                 })?;
                 return append_event(
                     state,
@@ -2795,9 +3440,11 @@ async fn clarify_planning_or_needs_attention(
     let attempts = planning_clarification_attempts(run)? + 1;
     if attempts > CLARIFICATION_LIMIT {
         state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'needs_attention', error = 'T2 did not return a parseable planning verdict after 5 clarification attempts', updated_at = datetime('now') WHERE id = ?1",
-                params![run.plan.id],
+            update_plan_status_and_health(
+                conn,
+                &run.plan.id,
+                "needs_attention",
+                Some("T2 did not return a parseable planning verdict after 5 clarification attempts"),
             )
             .map_err(|e| e.to_string())
         })?;
@@ -2970,9 +3617,11 @@ async fn clarify_or_needs_attention(
     let next_attempt = phase.clarification_attempts + 1;
     if next_attempt > CLARIFICATION_LIMIT {
         state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'needs_attention', error = 'T2 did not return a parseable verdict after 5 clarification attempts', updated_at = datetime('now') WHERE id = ?1",
-                params![run.plan.id],
+            update_plan_status_and_health(
+                conn,
+                &run.plan.id,
+                "needs_attention",
+                Some("T2 did not return a parseable verdict after 5 clarification attempts"),
             )
             .map_err(|e| e.to_string())?;
             conn.execute(
@@ -3049,15 +3698,19 @@ async fn pass_phase(
             )
             .map_err(|e| e.to_string())?;
         } else {
+            update_plan_status_and_health(conn, plan_id, "approved", None)
+                .map_err(|e| e.to_string())?;
             conn.execute(
-                "UPDATE agent_plans SET status = 'approved', phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
         }
         } else {
+            update_plan_status_and_health(conn, plan_id, "approved", None)
+                .map_err(|e| e.to_string())?;
             conn.execute(
-                "UPDATE agent_plans SET status = 'approved', phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
@@ -3125,19 +3778,24 @@ async fn pass_phase(
 }
 
 fn parse_plan(workspace_path: &str, plan_path: &str) -> Result<ParsedPlan, String> {
+    // Reject traversal on the raw input first, before any join/normalize (same message/logic as
+    // create_planning_run). This is the only path guard now that plans live in the global store.
+    if plan_path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err("Plan path must not contain '..'".to_string());
+    }
     let workspace = normalize_path(Path::new(workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
     }
     let raw_plan = Path::new(plan_path);
+    // Absolute store paths (outside the workspace) resolve as-is; relative paths join the
+    // workspace. The former "plan must be inside the workspace" rejection is intentionally gone
+    // (D6) — the initiatives store lives outside every repo.
     let plan = if raw_plan.is_absolute() {
         normalize_path(raw_plan)?
     } else {
         normalize_path(&workspace.join(raw_plan))?
     };
-    if !plan.starts_with(&workspace) {
-        return Err("Plan path must be inside the selected workspace".to_string());
-    }
     if !plan.join("overview.md").is_file() {
         return Err("Plan overview.md was not found".to_string());
     }
@@ -3342,6 +4000,46 @@ fn default_model_for_provider(provider: &str) -> Option<String> {
         "grok" => Some("grok-build".to_string()),
         _ => None,
     }
+}
+
+/// The default validation template (overhaul P7, D1/D6/D14): today's fixed review triad —
+/// `product` / `qa` / `lead`, in that order, every lens `blocking:true` and `vision:false`,
+/// all on the plan's reviewer provider/model. Reproduces the hardcoded `REVIEW_LENSES` + the
+/// single-provider choice the fan-out makes today, so an unconfigured Initiative behaves EXACTLY
+/// as before this feature. `model` falls back to `default_model_for_provider(provider)` when the
+/// caller passes `None` (mirrors the ephemeral-reviewer model choice).
+pub fn default_validation_config(reviewer_provider: &str, model: Option<String>) -> Vec<ValidationLens> {
+    let model = model.or_else(|| default_model_for_provider(reviewer_provider));
+    ["product", "qa", "lead"]
+        .iter()
+        .map(|name| ValidationLens {
+            name: name.to_string(),
+            provider: reviewer_provider.to_string(),
+            model: model.clone(),
+            prompt: None,
+            vision: false,
+            blocking: true,
+        })
+        .collect()
+}
+
+/// Resolve the ordered lens list a review fan-out should iterate (overhaul P7, D1). Parses the
+/// Initiative's persisted `validation_config` JSON array; when it is absent, malformed, or an
+/// empty array, falls back to `default_validation_config` on the plan's reviewer provider. This
+/// is the single contract Phase 02's fan-out reads — an unconfigured/empty config is today's
+/// product/qa/lead triad.
+pub fn resolve_validation_lenses(run: &AgentPlanRun) -> Vec<ValidationLens> {
+    if let Some(json) = run.plan.validation_config.as_deref() {
+        if let Ok(lenses) = serde_json::from_str::<Vec<ValidationLens>>(json) {
+            if !lenses.is_empty() {
+                return lenses;
+            }
+        }
+    }
+    default_validation_config(
+        &run.plan.reviewer_provider,
+        default_model_for_provider(&run.plan.reviewer_provider),
+    )
 }
 
 fn worker_phase_prompt(
@@ -4311,7 +5009,7 @@ fn resolve_workspace_file_path(root: &Path, path: &str) -> Result<PathBuf, Strin
     Ok(normalized)
 }
 
-fn content_type_for_path(path: &Path) -> String {
+pub(crate) fn content_type_for_path(path: &Path) -> String {
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -4526,7 +5224,7 @@ fn escape_html_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn is_text_content_type(content_type: &str) -> bool {
+pub(crate) fn is_text_content_type(content_type: &str) -> bool {
     content_type.starts_with("text/")
         || matches!(
             content_type,
@@ -4555,8 +5253,15 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         reference_paths: row.get(16)?,
         amend_brief: row.get(17)?,
         phase_run_mode: row.get(18)?,
-        created_at: row.get(19)?,
-        updated_at: row.get(20)?,
+        initiative_id: row.get(19)?,
+        initiative_status: row.get(20)?,
+        health: row.get(21)?,
+        briefing_session_id: row.get(22)?,
+        created_at: row.get(23)?,
+        updated_at: row.get(24)?,
+        // Appended last (P7, D3) — order is load-bearing; every SELECT feeding this mapper
+        // ends with validation_config.
+        validation_config: row.get(25)?,
     })
 }
 
@@ -4938,6 +5643,184 @@ mod coordinator_terminal_tests {
         assert_eq!(merged_verdict(["PASS", "weird", "PASS"]), "NEEDS_CHANGES");
     }
 
+    // ── P7 Phase 02: dynamic fan-out plumbing + blocking/warn gate (pure) ─────────────
+    fn lens(name: &str, provider: &str, blocking: bool) -> ValidationLens {
+        ValidationLens {
+            name: name.into(),
+            provider: provider.into(),
+            model: None,
+            prompt: None,
+            vision: false,
+            blocking,
+        }
+    }
+
+    fn outcome(name: &str, verdict: &str) -> (String, String, ReviewInsights) {
+        (
+            name.into(),
+            verdict.into(),
+            ReviewInsights {
+                summary: None,
+                findings: vec![format!("{} finding", name)],
+                next_steps: vec![],
+                reason: None,
+            },
+        )
+    }
+
+    // A1/A2 — lens_spawn_descriptors: N-arity, order, per-lens provider/model, provider validation.
+    #[test]
+    fn lens_spawn_descriptors_honor_one_and_five_lens_configs() {
+        // 1-lens config → exactly one descriptor.
+        let one = vec![lens("solo", "grok", true)];
+        let d1 = lens_spawn_descriptors(&one).unwrap();
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].name, "solo");
+        assert_eq!(d1[0].provider, "grok");
+        // grok seeds its default model when the lens leaves model None.
+        assert_eq!(d1[0].model.as_deref(), Some("grok-build"));
+
+        // 5-lens config → five descriptors, order + per-lens provider preserved.
+        let five = vec![
+            lens("one", "claude_code", true),
+            lens("two", "codex", false),
+            lens("three", "cline", true),
+            lens("four", "ollama", false),
+            lens("five", "grok", true),
+        ];
+        let d5 = lens_spawn_descriptors(&five).unwrap();
+        assert_eq!(d5.len(), 5);
+        assert_eq!(
+            d5.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["one", "two", "three", "four", "five"]
+        );
+        assert_eq!(
+            d5.iter().map(|d| d.provider.as_str()).collect::<Vec<_>>(),
+            ["claude_code", "codex", "cline", "ollama", "grok"]
+        );
+    }
+
+    #[test]
+    fn lens_spawn_descriptors_two_providers_are_distinct() {
+        let cfg = vec![lens("a", "claude_code", true), lens("b", "grok", true)];
+        let d = lens_spawn_descriptors(&cfg).unwrap();
+        assert_ne!(d[0].provider, d[1].provider);
+        assert_eq!(d[0].provider, "claude_code");
+        assert_eq!(d[1].provider, "grok");
+    }
+
+    #[test]
+    fn lens_spawn_descriptor_prefers_explicit_model() {
+        let mut l = lens("x", "grok", true);
+        l.model = Some("grok-custom".into());
+        assert_eq!(lens_spawn_descriptor(&l).model.as_deref(), Some("grok-custom"));
+    }
+
+    #[test]
+    fn lens_spawn_descriptors_reject_unknown_provider() {
+        let cfg = vec![lens("bad", "kloo", true)];
+        assert!(lens_spawn_descriptors(&cfg).is_err());
+    }
+
+    // A3v — vision clause + custom rubric appear only when set (pure half of the prompt builders).
+    #[test]
+    fn lens_prompt_extras_appends_vision_and_custom_prompt() {
+        let plain = lens("product", "claude_code", true);
+        assert_eq!(lens_prompt_extras(&plain), "", "default non-vision lens adds nothing");
+
+        let mut vision = lens("security", "grok", true);
+        vision.vision = true;
+        let vx = lens_prompt_extras(&vision);
+        assert!(vx.contains("approve on functional grounds"));
+        assert!(vx.contains("cannot read a screenshot"));
+
+        let mut custom = lens("custom", "codex", false);
+        custom.prompt = Some("Check the licence headers.".into());
+        let cx = lens_prompt_extras(&custom);
+        assert!(cx.contains("Check the licence headers."));
+        assert!(!cx.contains("functional grounds"), "no vision clause when vision=false");
+    }
+
+    // A4 — blocking gates, warn only annotates.
+    #[test]
+    fn gate_over_blocking_warn_does_not_halt() {
+        // Two blocking lenses PASS, a warn lens BLOCKED → gate PASS (warn cannot halt).
+        let lenses = vec![
+            lens("product", "claude_code", true),
+            lens("qa", "claude_code", true),
+            lens("perf", "claude_code", false),
+        ];
+        let outcomes = vec![
+            outcome("product", "PASS"),
+            outcome("qa", "PASS"),
+            outcome("perf", "BLOCKED"),
+        ];
+        assert_eq!(gate_verdict_over_blocking(&outcomes, &lenses), "PASS");
+        // …but the warn lens's finding still surfaces in the merged body.
+        let (_s, findings, _m) = merge_lens_body(&outcomes);
+        assert!(findings.contains("[perf] perf finding"));
+    }
+
+    #[test]
+    fn gate_over_blocking_blocking_lens_halts() {
+        let lenses = vec![
+            lens("product", "claude_code", true),
+            lens("perf", "claude_code", false),
+        ];
+        // Blocking NEEDS_CHANGES → gate NEEDS_CHANGES (warn PASS is irrelevant).
+        let nc = vec![outcome("product", "NEEDS_CHANGES"), outcome("perf", "PASS")];
+        assert_eq!(gate_verdict_over_blocking(&nc, &lenses), "NEEDS_CHANGES");
+        // Blocking BLOCKED → gate BLOCKED.
+        let bl = vec![outcome("product", "BLOCKED"), outcome("perf", "PASS")];
+        assert_eq!(gate_verdict_over_blocking(&bl, &lenses), "BLOCKED");
+    }
+
+    #[test]
+    fn gate_over_blocking_all_warn_is_pass() {
+        let lenses = vec![
+            lens("a", "claude_code", false),
+            lens("b", "claude_code", false),
+        ];
+        let outcomes = vec![outcome("a", "BLOCKED"), outcome("b", "NEEDS_CHANGES")];
+        assert_eq!(gate_verdict_over_blocking(&outcomes, &lenses), "PASS");
+    }
+
+    // A5 — no regression: default 3 blocking lenses → gate == merged_verdict over all three.
+    #[test]
+    fn gate_over_blocking_default_matches_merged_verdict() {
+        let lenses = default_validation_config("claude_code", None); // 3 blocking
+        for verdicts in [
+            ["PASS", "PASS", "PASS"],
+            ["PASS", "NEEDS_CHANGES", "PASS"],
+            ["PASS", "NEEDS_CHANGES", "BLOCKED"],
+            ["BLOCKED", "PASS", "PASS"],
+        ] {
+            let outcomes: Vec<_> = lenses
+                .iter()
+                .zip(verdicts.iter())
+                .map(|(l, v)| outcome(&l.name, v))
+                .collect();
+            assert_eq!(
+                gate_verdict_over_blocking(&outcomes, &lenses),
+                merged_verdict(verdicts),
+                "gate must equal today's merged_verdict for the all-blocking default"
+            );
+        }
+    }
+
+    // The summary line marks warn lenses so a non-PASS from a warn lens reads as non-gating.
+    #[test]
+    fn lens_summary_line_marks_warn_lenses() {
+        let lenses = vec![
+            lens("product", "claude_code", true),
+            lens("perf", "claude_code", false),
+        ];
+        let outcomes = vec![outcome("product", "PASS"), outcome("perf", "NEEDS_CHANGES")];
+        let line = lens_summary_line(&outcomes, &lenses);
+        assert!(line.contains("product: PASS"));
+        assert!(line.contains("perf: NEEDS_CHANGES (warn)"));
+    }
+
     fn gate_event(event_type: &str, phase_id: Option<&str>, verdict: &str) -> AgentPlanEvent {
         AgentPlanEvent {
             id: String::new(),
@@ -5067,5 +5950,999 @@ mod coordinator_terminal_tests {
             normalize_terminal_snapshot_for_idle(&base),
             normalize_terminal_snapshot_for_idle(&working)
         );
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::db::migrations::run_migrations;
+    use crate::db::Database;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique temp dir. `Date::now`/random are unavailable in this environment, so make the
+    /// suffix unique with the pid + a static counter.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "j1-p1-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the rest
+    /// (broadcast channels) with no live process, relay, or Tauri handle.
+    fn test_state() -> (AppState, PathBuf) {
+        let root = tmp_dir("state");
+        let db = Database::open(&root.join("test.db")).expect("open db");
+        (AppState::new(db), root)
+    }
+
+    fn input(run_type: Option<&str>, workspace: &str, plan_path: &str) -> CreateAgentPlanInput {
+        CreateAgentPlanInput {
+            run_type: run_type.map(|s| s.to_string()),
+            title: None,
+            workspace_path: workspace.to_string(),
+            plan_path: plan_path.to_string(),
+            worker_provider: "claude_code".to_string(),
+            reviewer_provider: "claude_code".to_string(),
+            brief: None,
+            app_scope: None,
+            docs_scope: None,
+            reference_paths: None,
+            worker_setup_commands: None,
+            reviewer_setup_commands: None,
+        }
+    }
+
+    /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
+    fn scaffold_plan(plan_dir: &Path, title: &str) {
+        std::fs::create_dir_all(plan_dir.join("phases/01-x/tasks/01-y")).unwrap();
+        std::fs::write(plan_dir.join("overview.md"), format!("# {}\n", title)).unwrap();
+        std::fs::write(plan_dir.join("phases/01-x/overview.md"), "# Phase X\n").unwrap();
+        std::fs::write(plan_dir.join("phases/01-x/tasks/01-y/prompt.md"), "# Task Y\n").unwrap();
+    }
+
+    // ── Preflight (task 02-01): the AppState harness is constructible ─────────────────
+    #[test]
+    fn appstate_harness_constructs() {
+        let (state, root) = test_state();
+        assert!(state.db.with_conn(|_c| Ok(())).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Test 1: parse_plan resolves an out-of-workspace absolute store path ───────────
+    #[test]
+    fn parse_plan_resolves_out_of_workspace_store_path() {
+        let workspace = tmp_dir("ws");
+        let store_plan = tmp_dir("store").join("INIT/plan");
+        scaffold_plan(&store_plan, "My Plan");
+
+        let parsed = parse_plan(
+            workspace.to_string_lossy().as_ref(),
+            store_plan.to_string_lossy().as_ref(),
+        )
+        .expect("store path must parse even though it is outside the workspace");
+        assert_eq!(parsed.title, "My Plan");
+        assert_eq!(parsed.phases.len(), 1);
+        assert!(
+            !parsed.plan_path.starts_with(&workspace),
+            "resolved plan_path must NOT be under the workspace (proves the guard is relaxed)"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(store_plan.parent().unwrap().parent().unwrap());
+    }
+
+    // ── Test 2: parse_plan rejects `..` ──────────────────────────────────────────────
+    #[test]
+    fn parse_plan_rejects_dotdot() {
+        let workspace = tmp_dir("ws");
+        let ws = workspace.to_string_lossy().to_string();
+        for traversal in ["../escape", "sub/../../escape"] {
+            let err = parse_plan(&ws, traversal).expect_err("traversal must be rejected");
+            assert!(err.contains(".."), "error should mention '..': {}", err);
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // ── Test 3: store path helpers ───────────────────────────────────────────────────
+    #[test]
+    fn initiative_plan_path_is_pure() {
+        assert_eq!(
+            settings_service::initiative_plan_path(Path::new("/store"), "abc"),
+            PathBuf::from("/store/abc/plan")
+        );
+    }
+
+    #[test]
+    fn resolve_initiatives_dir_defaults_then_overrides() {
+        let (state, root) = test_state();
+        assert_eq!(
+            settings_service::resolve_initiatives_dir(&state),
+            PathBuf::from(settings_service::DEFAULT_INITIATIVES_DIR)
+        );
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            "/tmp/j1-store".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings_service::resolve_initiatives_dir(&state),
+            PathBuf::from("/tmp/j1-store")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 01-01: briefing_session_id column round-trips through the mapper ─────────
+    #[test]
+    fn briefing_session_id_column_round_trips() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // The migration must have added the column…
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(agent_plans)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(
+            cols.iter().any(|c| c == "briefing_session_id"),
+            "agent_plans must have briefing_session_id (have: {:?})",
+            cols
+        );
+
+        // …and a row inserted with it set reads back through the shared row mapper.
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, initiative_id, initiative_status, briefing_session_id) \
+             VALUES ('B', 'planning', 't', '/w', '/p', 'draft', 'claude_code', 'claude_code', 'B', 'briefing', 'CHAT-SESSION')",
+            [],
+        )
+        .unwrap();
+
+        let plan = conn
+            .query_row(
+                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans WHERE id='B'",
+                [],
+                agent_plan_from_row,
+            )
+            .unwrap();
+        assert_eq!(plan.briefing_session_id.as_deref(), Some("CHAT-SESSION"));
+        assert_eq!(plan.initiative_status, "briefing");
+    }
+
+    // ── Test 4: linkage query via shared find_planning_initiative_id ──────────────────
+    #[test]
+    fn find_planning_initiative_id_links_by_plan_path() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+             VALUES ('INIT1', 'planning', 't', '/w', '/store/INIT1/plan', 'claude_code', 'claude_code', 'INIT1', 'planning')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            find_planning_initiative_id(&conn, "/store/INIT1/plan"),
+            Some("INIT1".to_string())
+        );
+        assert_eq!(find_planning_initiative_id(&conn, "/store/UNKNOWN/plan"), None);
+    }
+
+    // ── Test 5: health sync via update_plan_status_and_health ─────────────────────────
+    #[test]
+    fn update_plan_status_and_health_syncs_all_transitions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+             VALUES ('P', 'development', 't', '/w', '/p', 'claude_code', 'claude_code', 'P', 'development')",
+            [],
+        )
+        .unwrap();
+
+        let read = |c: &rusqlite::Connection| -> (String, String, Option<String>) {
+            c.query_row(
+                "SELECT status, health, error FROM agent_plans WHERE id='P'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        update_plan_status_and_health(&conn, "P", "blocked", Some("x")).unwrap();
+        let (s, h, e) = read(&conn);
+        assert_eq!((s.as_str(), h.as_str()), ("blocked", "blocked"));
+        assert_eq!(e.as_deref(), Some("x"));
+
+        update_plan_status_and_health(&conn, "P", "needs_attention", Some("y")).unwrap();
+        let (s, h, _) = read(&conn);
+        assert_eq!((s.as_str(), h.as_str()), ("needs_attention", "needs-attention"));
+
+        update_plan_status_and_health(&conn, "P", "approved", None).unwrap();
+        let (s, h, e) = read(&conn);
+        assert_eq!((s.as_str(), h.as_str()), ("approved", "in-progress"));
+        assert!(e.is_none(), "approve must clear error");
+    }
+
+    // ── Test 6: create_planning_run writes to the store (end-to-end wiring) ───────────
+    #[tokio::test]
+    async fn create_planning_run_writes_under_store() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let run = create_planning_run(
+            &state,
+            input(Some("planning"), workspace.to_string_lossy().as_ref(), "docs/plans/whatever"),
+        )
+        .expect("create_planning_run");
+        let plan = run.plan;
+
+        assert!(!plan.initiative_id.is_empty());
+        assert_eq!(plan.initiative_status, "planning");
+        assert_eq!(plan.health, "in-progress");
+        // The wiring wrote the STORE path (not the advisory input path):
+        assert_eq!(
+            PathBuf::from(&plan.plan_path),
+            settings_service::initiative_plan_path(&store, &plan.initiative_id)
+        );
+        assert!(Path::new(&plan.plan_path).is_dir(), "store plan dir must exist");
+        assert!(
+            !Path::new(&plan.plan_path).starts_with(&workspace),
+            "plan_path must not be under the workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 01-03: create_briefing_run makes a briefing Initiative ───────────────────
+    #[tokio::test]
+    async fn create_briefing_run_makes_briefing_initiative() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let run = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("My Feature".to_string()),
+                workspace_path: workspace.to_string_lossy().to_string(),
+                brief: Some("raw ask".to_string()),
+                worker_provider: "claude_code".to_string(),
+                reviewer_provider: "claude_code".to_string(),
+                model: None,
+            },
+        )
+        .expect("create_briefing_run");
+        let plan = run.plan;
+
+        // Row shape: a briefing Initiative with no planner session yet.
+        assert_eq!(plan.initiative_status, "briefing");
+        assert_eq!(plan.health, "in-progress");
+        assert!(plan.worker_session_id.is_none(), "no planner session during briefing");
+        assert!(plan.reviewer_session_id.is_none());
+        assert_eq!(plan.brief.as_deref(), Some("raw ask"), "brief holds the raw ask");
+        let chat_id = plan
+            .briefing_session_id
+            .clone()
+            .expect("briefing_session_id must be set");
+
+        // The linked conversation session is a chat-lane (kind='user') session.
+        let kind: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT kind FROM sessions WHERE id = ?1",
+                    params![chat_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(kind, "user", "briefing conversation must be a kind='user' chat session");
+
+        // Both store dirs exist under the initiative id.
+        assert!(
+            settings_service::initiative_plan_path(&store, &plan.initiative_id).is_dir(),
+            "<id>/plan dir must exist"
+        );
+        assert!(
+            settings_service::initiative_attachments_path(&store, &plan.initiative_id).is_dir(),
+            "<id>/attachments dir must exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 02-01: compose_accepted_brief folds draft + attachments + reference paths ─
+    #[test]
+    fn compose_accepted_brief_folds_sections() {
+        // Draft-only → the trimmed draft, no dangling headers.
+        let only = compose_accepted_brief("just the ask\n\n", &[], &[]);
+        assert_eq!(only, "just the ask");
+        assert!(!only.contains("## Attached files"));
+        assert!(!only.contains("## Referenced host paths"));
+
+        // With both sections → draft + each path listed under its header.
+        let full = compose_accepted_brief(
+            "the ask",
+            &["/store/INIT/attachments/a.png".to_string(), "/store/INIT/attachments/b.pdf".to_string()],
+            &["/home/u/proj/docs".to_string()],
+        );
+        assert!(full.contains("the ask"));
+        assert!(full.contains("## Attached files"));
+        assert!(full.contains("- /store/INIT/attachments/a.png"));
+        assert!(full.contains("- /store/INIT/attachments/b.pdf"));
+        assert!(full.contains("## Referenced host paths"));
+        assert!(full.contains("- /home/u/proj/docs"));
+
+        // Only attachments → no reference-paths header.
+        let attach_only = compose_accepted_brief("x", &["/p/f".to_string()], &[]);
+        assert!(attach_only.contains("## Attached files"));
+        assert!(!attach_only.contains("## Referenced host paths"));
+
+        // Only reference paths → no attachments header.
+        let ref_only = compose_accepted_brief("x", &[], &["/p/d".to_string()]);
+        assert!(!ref_only.contains("## Attached files"));
+        assert!(ref_only.contains("## Referenced host paths"));
+    }
+
+    // ── Task 02-01: apply_brief_acceptance flips the SAME row briefing→planning ────────
+    #[test]
+    fn apply_brief_acceptance_flips_same_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, brief, reference_paths, initiative_id, initiative_status) \
+             VALUES ('INIT', 'planning', 't', '/w', '/p', 'draft', 'claude_code', 'claude_code', 'draft ask', '/w/docs', 'INIT', 'briefing')",
+            [],
+        )
+        .unwrap();
+
+        apply_brief_acceptance(&conn, "INIT", "COMPOSED BRIEF").unwrap();
+
+        let (status, brief): (String, Option<String>) = conn
+            .query_row(
+                "SELECT initiative_status, brief FROM agent_plans WHERE id='INIT'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "planning", "same row must flip to planning");
+        assert_eq!(brief.as_deref(), Some("COMPOSED BRIEF"));
+        // The id is unchanged — one initiative, not a second row (D1).
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "no new row created on accept");
+    }
+
+    // ── Task 02-01: add_initiative_reference_path appends a normalized host path ───────
+    #[tokio::test]
+    async fn add_initiative_reference_path_appends() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let plan = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("Ref".to_string()),
+                workspace_path: workspace.to_string_lossy().to_string(),
+                brief: Some("ask".to_string()),
+                worker_provider: "claude_code".to_string(),
+                reviewer_provider: "claude_code".to_string(),
+                model: None,
+            },
+        )
+        .expect("create_briefing_run")
+        .plan;
+
+        // A real directory inside the (canonical) workspace — reference paths must stay in-workspace.
+        let ref_dir = Path::new(&plan.workspace_path).join("docs");
+        std::fs::create_dir_all(&ref_dir).unwrap();
+
+        let updated = add_initiative_reference_path(
+            &state,
+            &plan.id,
+            ref_dir.to_string_lossy().as_ref(),
+        )
+        .expect("add_initiative_reference_path");
+
+        let refs = updated.plan.reference_paths.expect("reference_paths set");
+        assert!(
+            refs.lines().any(|l| l == ref_dir.canonicalize().unwrap().to_string_lossy()),
+            "reference_paths must contain the appended dir (have: {:?})",
+            refs
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 02-02: accept_brief guards non-briefing rows (no mutation) ────────────────
+    #[tokio::test]
+    async fn accept_brief_rejects_non_briefing() {
+        let (state, root) = test_state();
+        // A planning-status row (raw insert): accept must refuse and leave it untouched.
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, brief, initiative_id, initiative_status) \
+                     VALUES ('P', 'planning', 't', '/w', '/p', 'draft', 'claude_code', 'claude_code', 'brief', 'P', 'planning')",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        let err = accept_brief(&state, "P", None)
+            .await
+            .expect_err("accept on a non-briefing row must error");
+        assert!(err.contains("not in briefing"), "unexpected error: {}", err);
+
+        // The row is unchanged — still planning, brief intact, no planner session provisioned.
+        let (status, brief, worker): (String, Option<String>, Option<String>) = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT initiative_status, brief, worker_session_id FROM agent_plans WHERE id='P'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(status, "planning", "guard must not mutate the row");
+        assert_eq!(brief.as_deref(), Some("brief"));
+        assert!(worker.is_none(), "no planner session on a rejected accept");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Test 7: dev→planning initiative_id reuse (end-to-end) ─────────────────────────
+    #[tokio::test]
+    async fn create_plan_dev_reuses_planning_initiative_id() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let planning = create_planning_run(
+            &state,
+            input(Some("planning"), workspace.to_string_lossy().as_ref(), "docs/plans/whatever"),
+        )
+        .expect("create_planning_run")
+        .plan;
+
+        // Scaffold a parseable plan at the planning run's store plan_path so create_plan parses it.
+        scaffold_plan(Path::new(&planning.plan_path), "E2E");
+
+        let dev = create_plan(
+            &state,
+            input(Some("development"), workspace.to_string_lossy().as_ref(), &planning.plan_path),
+        )
+        .expect("create_plan (development)")
+        .plan;
+
+        assert_eq!(
+            dev.initiative_id, planning.initiative_id,
+            "development run must share the planning run's initiative_id"
+        );
+        assert_eq!(dev.initiative_status, "development");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P7 Task 01-02: update_plan_validation_config persists / clears / validates ────
+    #[test]
+    fn update_plan_validation_config_persists_clears_and_validates() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let store = tmp_dir("store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let plan = create_planning_run(
+            &state,
+            input(Some("planning"), workspace.to_string_lossy().as_ref(), "docs/plans/vc"),
+        )
+        .expect("create_planning_run")
+        .plan;
+
+        // A valid 2-lens JSON persists and reloads; resolve returns those two (not the default 3).
+        let two = r#"[{"name":"a","provider":"claude_code","blocking":true},{"name":"b","provider":"grok","blocking":false}]"#;
+        let run = update_plan_validation_config(&state, plan.id.clone(), Some(two.to_string()))
+            .expect("persist 2-lens config");
+        assert!(run.plan.validation_config.is_some());
+        let lenses = resolve_validation_lenses(&run);
+        assert_eq!(lenses.len(), 2);
+        assert_eq!(lenses[0].name, "a");
+        assert_eq!(lenses[1].name, "b");
+        assert!(!lenses[1].blocking);
+
+        // Clearing (None) drops the column → resolve falls back to the 3-lens default.
+        let run = update_plan_validation_config(&state, plan.id.clone(), None)
+            .expect("clear config");
+        assert!(run.plan.validation_config.is_none());
+        assert_eq!(resolve_validation_lenses(&run).len(), 3);
+
+        // Malformed JSON is rejected (not silently written).
+        assert!(update_plan_validation_config(&state, plan.id.clone(), Some("{not json".into())).is_err());
+
+        // A lens with an unknown provider is rejected (D13).
+        let bad = r#"[{"name":"x","provider":"kloo","blocking":true}]"#;
+        assert!(update_plan_validation_config(&state, plan.id.clone(), Some(bad.to_string())).is_err());
+
+        // The column is still cleared (the two rejected writes never touched it).
+        let reloaded = get_plan(&state, &plan.id).unwrap();
+        assert!(reloaded.plan.validation_config.is_none());
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P7 Phase 02 (A3/A3v): the prompt builders emit the lens name, keep the
+    // review-lenses.md pointer for a default lens, and append the custom rubric + vision clause. ──
+    fn sample_run_for_prompt() -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "PLAN".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: "/w/docs/plans/x".into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn sample_phase_for_prompt() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "PLAN".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+        }
+    }
+
+    #[test]
+    fn lens_reviewer_prompts_carry_name_pointer_rubric_and_vision() {
+        let (state, root) = test_state();
+        let run = sample_run_for_prompt();
+        let phase = sample_phase_for_prompt();
+
+        // Default lens: name substituted, review-lenses.md pointer kept, no vision clause.
+        let default_lens = ValidationLens {
+            name: "product".into(),
+            provider: "claude_code".into(),
+            model: None,
+            prompt: None,
+            vision: false,
+            blocking: true,
+        };
+        let dev = lens_reviewer_prompt(&state, &run, &phase, &default_lens, "SESS");
+        assert!(dev.contains("Run ONLY the product lens"));
+        assert!(dev.contains("review-lenses.md"));
+        assert!(!dev.contains("functional grounds"));
+        let plan = planning_lens_reviewer_prompt(&state, &run, &default_lens, "SESS");
+        assert!(plan.contains("Run ONLY the product lens"));
+        assert!(plan.contains("review-lenses.md"));
+        assert!(!plan.contains("functional grounds"));
+
+        // Vision + custom-rubric lens: clause + rubric present in BOTH builders (A3v).
+        let vision_lens = ValidationLens {
+            name: "security".into(),
+            provider: "grok".into(),
+            model: None,
+            prompt: Some("Audit for leaked secrets.".into()),
+            vision: true,
+            blocking: false,
+        };
+        let devv = lens_reviewer_prompt(&state, &run, &phase, &vision_lens, "SESS");
+        assert!(devv.contains("Run ONLY the security lens"));
+        assert!(devv.contains("Audit for leaked secrets."));
+        assert!(devv.contains("approve on functional grounds"));
+        let planv = planning_lens_reviewer_prompt(&state, &run, &vision_lens, "SESS");
+        assert!(planv.contains("Run ONLY the security lens"));
+        assert!(planv.contains("Audit for leaked secrets."));
+        assert!(planv.contains("approve on functional grounds"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ── P7 Task 01-01: default template + resolve (pure — no DB) ──────────────────────────
+#[cfg(test)]
+mod validation_lens_tests {
+    use super::*;
+
+    /// Build a minimal `AgentPlanRun` carrying only the fields `resolve_validation_lenses` reads
+    /// (`validation_config`, `reviewer_provider`); everything else is filler.
+    fn plan_run(validation_config: Option<&str>, reviewer_provider: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "id".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: "/p".into(),
+                status: "draft".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: reviewer_provider.into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: validation_config.map(|s| s.to_string()),
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn default_validation_config_is_todays_three_lenses() {
+        let lenses = default_validation_config("claude_code", None);
+        assert_eq!(lenses.len(), 3);
+        assert_eq!(
+            lenses.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["product", "qa", "lead"]
+        );
+        for lens in &lenses {
+            assert!(lens.blocking, "default lenses are all blocking");
+            assert!(!lens.vision, "today's lenses are non-vision (D14)");
+            assert_eq!(lens.prompt, None);
+            assert_eq!(lens.provider, "claude_code");
+            assert_eq!(lens.model, default_model_for_provider("claude_code"));
+        }
+    }
+
+    #[test]
+    fn default_validation_config_threads_provider_model() {
+        // Grok seeds its stronger default model even when `model` is None.
+        let lenses = default_validation_config("grok", None);
+        assert!(lenses.iter().all(|l| l.provider == "grok"));
+        assert!(lenses
+            .iter()
+            .all(|l| l.model.as_deref() == Some("grok-build")));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_when_none() {
+        let run = plan_run(None, "claude_code");
+        assert_eq!(
+            resolve_validation_lenses(&run),
+            default_validation_config("claude_code", None)
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_when_empty_array() {
+        let run = plan_run(Some("[]"), "claude_code");
+        assert_eq!(resolve_validation_lenses(&run).len(), 3);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_when_malformed() {
+        let run = plan_run(Some("{ not json"), "claude_code");
+        assert_eq!(resolve_validation_lenses(&run).len(), 3);
+    }
+
+    #[test]
+    fn resolve_honors_one_lens_config() {
+        let run = plan_run(
+            Some(r#"[{"name":"solo","provider":"grok","blocking":true}]"#),
+            "claude_code",
+        );
+        let lenses = resolve_validation_lenses(&run);
+        assert_eq!(lenses.len(), 1);
+        assert_eq!(lenses[0].name, "solo");
+        // `vision` key absent → #[serde(default)] false.
+        assert!(!lenses[0].vision);
+    }
+
+    #[test]
+    fn resolve_honors_five_lens_config_in_order() {
+        let cfg = r#"[
+            {"name":"one","provider":"claude_code","blocking":true},
+            {"name":"two","provider":"codex","blocking":false},
+            {"name":"three","provider":"cline","blocking":true,"vision":true},
+            {"name":"four","provider":"ollama","blocking":false},
+            {"name":"five","provider":"grok","blocking":true}
+        ]"#;
+        let run = plan_run(Some(cfg), "claude_code");
+        let lenses = resolve_validation_lenses(&run);
+        assert_eq!(lenses.len(), 5);
+        assert_eq!(
+            lenses.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            ["one", "two", "three", "four", "five"]
+        );
+        // The vision:true lens round-trips its flag.
+        assert!(lenses[2].vision);
+        assert!(!lenses[0].vision);
+    }
+
+    #[test]
+    fn validation_lens_json_round_trips_camelcase() {
+        let lens = ValidationLens {
+            name: "sec".into(),
+            provider: "grok".into(),
+            model: Some("grok-build".into()),
+            prompt: Some("check secrets".into()),
+            vision: true,
+            blocking: false,
+        };
+        let v = serde_json::to_value(&lens).unwrap();
+        assert_eq!(v.get("vision").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("blocking").and_then(|x| x.as_bool()), Some(false));
+        let back: ValidationLens = serde_json::from_value(v).unwrap();
+        assert_eq!(back, lens);
+    }
+}
+
+// ── P7 Phase 03: git_diff whole-tree diff (temp-repo) ─────────────────────────────────
+#[cfg(test)]
+mod git_diff_tests {
+    use super::*;
+    use crate::test_support::{test_state, tmp_dir};
+
+    /// Run a git command in `dir`, asserting success (git identity/signing are set locally so the
+    /// test never depends on the host's global git config).
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {}", args, e));
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    /// Point `files_root` at `root` so the path guard accepts paths beneath it.
+    fn set_files_root(state: &AppState, root: &Path) {
+        settings_service::set_setting(
+            state,
+            settings_service::KEY_FILES_ROOT.to_string(),
+            root.to_string_lossy().to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn git_diff_parses_counts_hunks_and_aggregates_files() {
+        let (state, state_root) = test_state();
+        let base = tmp_dir("gitdiff");
+        set_files_root(&state, &base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Commit a.txt with 3 lines.
+        std::fs::write(repo.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+
+        // Modify a.txt: delete line2 (-1), append newA + newB (+2).
+        std::fs::write(repo.join("a.txt"), "line1\nline3\nnewA\nnewB\n").unwrap();
+
+        let view = git_diff(&state, repo.to_string_lossy().to_string()).unwrap();
+        assert!(!view.clean, "modified repo is not clean");
+        assert!(view.branch.is_some(), "branch should resolve");
+        assert!(view.repo_root.is_some());
+        assert_eq!(view.files.len(), 1, "one changed file");
+        let f = &view.files[0];
+        assert_eq!(f.path, "a.txt");
+        assert_eq!(f.additions, 2, "two additions");
+        assert_eq!(f.deletions, 1, "one deletion");
+        assert!(!f.binary);
+        assert!(f.diff.contains("@@"), "diff carries a hunk header: {}", f.diff);
+
+        // Commit b.txt ONLY (stage just b.txt so a.txt's working change stays dirty), then edit
+        // b.txt → two files aggregate with per-file counts.
+        std::fs::write(repo.join("b.txt"), "x\ny\n").unwrap();
+        git(&repo, &["add", "b.txt"]);
+        git(&repo, &["commit", "-q", "-m", "add b"]);
+        std::fs::write(repo.join("b.txt"), "x\ny\nz\n").unwrap();
+
+        let view2 = git_diff(&state, repo.to_string_lossy().to_string()).unwrap();
+        assert_eq!(view2.files.len(), 2, "a.txt (still dirty) + b.txt");
+        let by_path: std::collections::HashMap<_, _> =
+            view2.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["a.txt"].additions, 2);
+        assert_eq!(by_path["a.txt"].deletions, 1);
+        assert_eq!(by_path["b.txt"].additions, 1, "b.txt: one line appended");
+        assert_eq!(by_path["b.txt"].deletions, 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn git_diff_clean_repo_has_no_files() {
+        let (state, state_root) = test_state();
+        let base = tmp_dir("gitdiff-clean");
+        set_files_root(&state, &base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+
+        // No working-tree changes → clean, no files, but it IS a repo (repo_root Some).
+        let view = git_diff(&state, repo.to_string_lossy().to_string()).unwrap();
+        assert!(view.clean);
+        assert!(view.files.is_empty());
+        assert!(view.repo_root.is_some());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn git_diff_non_repo_is_benign_empty() {
+        let (state, state_root) = test_state();
+        let base = tmp_dir("gitdiff-norepo");
+        set_files_root(&state, &base);
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("readme.txt"), "not a repo\n").unwrap();
+
+        let view = git_diff(&state, plain.to_string_lossy().to_string()).unwrap();
+        assert!(view.clean, "non-repo path is clean");
+        assert!(view.files.is_empty());
+        assert!(view.repo_root.is_none(), "no repo_root for a non-repo path");
+        assert!(view.branch.is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn git_diff_rejects_path_outside_files_root() {
+        // Path guard (D13): a path above the configured files_root is rejected, not diffed.
+        let (state, state_root) = test_state();
+        let base = tmp_dir("gitdiff-guard");
+        set_files_root(&state, &base.join("inner"));
+        std::fs::create_dir_all(base.join("inner")).unwrap();
+        // `base` is the parent of the configured root → outside it.
+        let outside = base.to_string_lossy().to_string();
+        assert!(git_diff(&state, outside).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn parse_numstat_z_handles_normal_and_rename_records() {
+        // Normal file: add\tdel\tpath\0
+        let normal = "2\t1\ta.txt\0";
+        let recs = parse_numstat_z(normal);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].path, "a.txt");
+        assert_eq!(recs[0].additions, 2);
+        assert_eq!(recs[0].deletions, 1);
+        assert!(recs[0].old_path.is_none());
+        assert!(!recs[0].binary);
+
+        // Rename: add\tdel\t\0old\0new\0
+        let rename = "0\t0\t\0old.txt\0new.txt\0";
+        let recs = parse_numstat_z(rename);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].path, "new.txt");
+        assert_eq!(recs[0].old_path.as_deref(), Some("old.txt"));
+
+        // Binary: -\t-\tbin.png\0
+        let binary = "-\t-\tbin.png\0";
+        let recs = parse_numstat_z(binary);
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].binary);
+        assert_eq!(recs[0].additions, 0);
+        assert_eq!(recs[0].deletions, 0);
     }
 }

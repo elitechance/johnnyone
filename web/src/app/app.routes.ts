@@ -47,6 +47,53 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
+  // Briefing (overhaul P4) — the clarification conversation before planning. `new` must precede
+  // `:initiativeId` so it is not captured as an id. Accept advances the SAME initiative to planning.
+  {
+    path: 'briefing/new',
+    title: 'New briefing',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),
+  },
+  {
+    path: 'briefing/:initiativeId',
+    title: 'Briefing',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),
+  },
+  // Files (overhaul P5) — the two-pane file manager over the host `files_root` (browse/preview here;
+  // edit/CRUD + upload land in Phases 02/03). Standalone entry point; the briefing/launcher links are
+  // Phase 8 (D7).
+  {
+    path: 'files',
+    title: 'Files',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/files/files.page').then((m) => m.FilesPage),
+  },
+  // Shells (overhaul P6) — the list of launched raw shells + attachable external tmux panes. Opening a
+  // row navigates to the existing terminal surface (`/terminal?sessionId=`); no second terminal here.
+  {
+    path: 'shells',
+    title: 'Shells',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/shells/shells.page').then((m) => m.ShellsPage),
+  },
+  // Validation config (overhaul P7) — the §07 "Validation · configure" surface for one Initiative:
+  // the ordered N-lens array (provider/model/vision/BLOCK-WARN) persisted to `validationConfig`.
+  // One lazy authGuard route (mirrors /files, /shells — D12); reached from the planner run settings.
+  {
+    path: 'initiatives/:id/validation',
+    title: 'Validation',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/validation-config/validation-config.page').then(
+        (m) => m.ValidationConfigPage,
+      ),
+  },
   // Development (T1=Worker, T2=Reviewer) — executes approved plans.
   {
     path: 'development',

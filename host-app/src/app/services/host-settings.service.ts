@@ -1,4 +1,5 @@
 import { Injectable } from '@angular/core';
+import { DEFAULT_STORE_PATHS, resolveStorePath } from '../pages/settings/host-settings-logic';
 
 const HOST_URL = 'http://127.0.0.1:7788/graphql';
 
@@ -10,6 +11,10 @@ export interface HostSettings {
   plannerConventionsPath: string;
   webClientUrl: string;
   discordWebhookUrl: string;
+  // Generic setting keys (initiatives_dir / files_root) — read via getSetting,
+  // NOT part of the typed hostSettings query (P9 / D2).
+  initiativesDir: string;
+  filesRoot: string;
 }
 
 export const DEFAULT_HOST_SETTINGS: HostSettings = {
@@ -20,23 +25,46 @@ export const DEFAULT_HOST_SETTINGS: HostSettings = {
   plannerConventionsPath: 'lokal/agents/common/conventions',
   webClientUrl: 'https://johnnyone.pages.dev/',
   discordWebhookUrl: '',
+  initiativesDir: DEFAULT_STORE_PATHS.initiativesDir,
+  filesRoot: DEFAULT_STORE_PATHS.filesRoot,
 };
 
 @Injectable({ providedIn: 'root' })
 export class HostSettingsService {
   async load(): Promise<HostSettings> {
-    const data = await this.query<{ hostSettings: HostSettings }>(`{
-      hostSettings {
-        workerUrl
-        tenantId
-        userId
-        plannerMethodologyPath
-        plannerConventionsPath
-        webClientUrl
-        discordWebhookUrl
-      }
-    }`);
-    return data.hostSettings;
+    // The typed hostSettings query carries the seven persisted fields; the two
+    // store paths are generic keys read via getSetting (P9 / D2). Fetch them
+    // concurrently and fold into one HostSettings.
+    const [data, initiativesDirRaw, filesRootRaw] = await Promise.all([
+      this.query<{ hostSettings: Omit<HostSettings, 'initiativesDir' | 'filesRoot'> }>(`{
+        hostSettings {
+          workerUrl
+          tenantId
+          userId
+          plannerMethodologyPath
+          plannerConventionsPath
+          webClientUrl
+          discordWebhookUrl
+        }
+      }`),
+      this.getSetting('initiatives_dir'),
+      this.getSetting('files_root'),
+    ]);
+    return {
+      ...data.hostSettings,
+      initiativesDir: resolveStorePath(initiativesDirRaw, DEFAULT_STORE_PATHS.initiativesDir),
+      filesRoot: resolveStorePath(filesRootRaw, DEFAULT_STORE_PATHS.filesRoot),
+    };
+  }
+
+  async getSetting(key: string): Promise<string> {
+    const data = await this.query<{ getSetting: string | null }>(
+      `query GetSetting($key: String!) {
+        getSetting(key: $key)
+      }`,
+      { key },
+    );
+    return data.getSetting ?? '';
   }
 
   async save(settings: HostSettings): Promise<void> {
@@ -48,6 +76,8 @@ export class HostSettingsService {
       this.setSetting('planner_conventions_path', settings.plannerConventionsPath.trim()),
       this.setSetting('web_client_url', settings.webClientUrl.trim()),
       this.setSetting('discord_webhook_url', settings.discordWebhookUrl.trim()),
+      this.setSetting('initiatives_dir', settings.initiativesDir.trim()),
+      this.setSetting('files_root', settings.filesRoot.trim()),
     ]);
   }
 

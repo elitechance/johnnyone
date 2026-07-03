@@ -123,6 +123,11 @@ johnnyone/
 
 Recent planner/runtime behavior worth knowing:
 
+- An Initiative can now start in a **briefing** stage — a clarify-before-planning conversation that ends in an explicit "Accept brief → Planning". Accept flips the *same* `agent_plans` row from `initiative_status='briefing'` to `'planning'` and starts the existing planner with the composed brief (no second row). See [`docs/briefing.md`](docs/briefing.md).
+- A two-pane **file manager** is reachable at **`/files`** (nav entry: Files) — browse the `files_root`-rooted tree with breadcrumbs, preview via the render core (markdown/code), inline-edit text with a `● unsaved` indicator + Save, run the CRUD toolbar (New file/folder · Rename · Delete), and drag-drop upload with per-file progress. UI only over the existing P2 host file ops; the host guards every path. See [`docs/files.md`](docs/files.md).
+- A **`+ New` launcher** (nav entry: New) and a **Shells destination** at **`/shells`** (nav entry: Shells) let the operator launch a plain shell and see their launched shells in one place. The launcher popover has four entries — New initiative (→ briefing), **Raw shell** (`createSession({provider:'shell'})` → open in the terminal surface), Attach to tmux session (`listTmuxSessions()` picker), Open file manager (→ /files). `/shells` lists active shell/attached-tmux sessions plus attachable external tmux panes; opening a row navigates to the existing terminal surface (no second terminal is embedded). Web-only, reuse-only — no new agent runner, spawn path, or transport. See [`docs/shells.md`](docs/shells.md).
+- **Validation is a configurable, ordered N-lens array persisted on the Initiative** (min 1, no max) instead of a fixed 3-lens set. Each lens has its own provider/model, a `vision` flag, and a **BLOCK/WARN** role — `blocking:true` gates phase promotion, `blocking:false` warns/annotates only. An unconfigured Initiative resolves the default template (today's `product`/`qa`/`lead`), so nothing regresses. Configured at **`/initiatives/:id/validation`** and persisted via `updateAgentPlanValidationConfig`. The session terminal also gains a **Diff** pane tab that renders the working-tree git diff (changed-file list + per-file hunks, highlighted via the render core) using the new whole-tree `gitDiff(path)` op. New Rust lands with deferred activation (live after the next `npm run desktop`). See [`docs/validation-diff.md`](docs/validation-diff.md).
+- **The web app now wears the 2026-07 mock**: a global **icon nav rail** (J1 logo · `+ New` · Work / Files / Shells / Settings) replaces the old text sidebar (with a mobile bottom-nav from the same list), and **"Work"** is a unified **initiative console** at the existing `/terminal` route — a master-detail grid wrapping the existing Transcript / Raw terminal / Plan / Diff pane shell with an initiative master-list, a **lifecycle bar** + status pills rendering the P1 `initiativeStatus`/`health` in per-stage colors, and a right column (validation-lens summary + touched host files). The accent flips **blue → amber** app-wide via the token layer (both light + dark palettes authored to the mock; dark stays active). Web + `ui` only — no Rust/worker/relay edit, no new route or GraphQL op, no new dependency; every surface reuses the P1–P7 components. See [`docs/app-shell.md`](docs/app-shell.md).
 - Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.
 - Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
 - Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
@@ -382,8 +387,11 @@ served in-app at the public **`/integration`** route
 - **Auth** (lokal builtin) — `login`, `loginWithOauth`, `myCompleteFirstLogin`, `adminCreate{User,Tenant}`, `refreshToken`
 - **Sessions** — `listAiSessions`, `getAiSession`, `createAiSession`, `updateAiSession{Title,Provider,WorkingDirectory,Archived}`, `deleteAiSession`
 - **Chat** — `sendRelayChatMessage`, `cancelAiGeneration`, `listAiMessages`
-- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
-- **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
+- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `updateAgentPlanValidationConfig` (persist the Initiative's ordered validation-lens array), `deleteAgentPlan`
+- **Briefing loop** — `createBriefingInitiative`, `acceptInitiativeBrief`, `initiativeUploadChunk`, `addInitiativeReferencePath` (an Initiative's clarify-before-planning front door; `AgentPlan.briefingSessionId` links the conversation). See [`docs/briefing.md`](docs/briefing.md)
+- **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff` (per-file), `gitDiff` (whole working-tree diff by path, `files:read`-scoped), `validateWorkspacePlan`
+- **File manager (`files_root`-rooted)** — `filesListDir`, `filesRead`, `filesWrite`, `filesMkdir`, `filesRename`, `filesDelete`, `filesUploadChunk` (chunked upload). Path-guarded + size-capped, scoped by `files:read`/`files:write`. See [`docs/host-transport.md`](docs/host-transport.md)
+- **Terminal / shell** — `captureTerminal` (deterministic one-shot pane snapshot; live I/O still rides the WSS `terminal_*` envelopes)
 - **Providers / settings** — `listDetectedCliTools`, `listProviderConfigs`, `upsertProviderConfig`, `deleteProviderConfig`, `getSetting`, `setSetting`, `getPlannerPromptSettings`, `updatePlannerPromptSettings`
 - **Nodes** — `listDesktopNodes`, `registerDesktopNode`, `updateDesktopNodeStatus`
 - **API keys (M2M, optional)** — `createApiKey`, `listApiKeys`, `revokeApiKey`
@@ -410,6 +418,31 @@ Repo-local docs live alongside the code:
   provisioning runbooks
 - **`docs/terminal-state-reconcile.md`** — how the Terminal page prunes stale
   persisted/cached session state on load
+- **`docs/host-transport.md`** — the host↔web transport primitives (overhaul P2):
+  the `files_root` file-manager surface, shell I/O + `captureTerminal` over the
+  relay, and the per-session `StreamEvent` channel. Plumbing + types; the UIs that
+  consume them are later phases
+- **`docs/briefing.md`** — the briefing loop (overhaul P4): the clarify-before-planning
+  conversation, the `briefing → planning` accept transition on the same Initiative
+  row, brief composition, attachments/reference paths, and the `/briefing` UI
+- **`docs/files.md`** — the `/files` file manager (overhaul P5): the two-pane
+  browse/preview/edit surface, CRUD toolbar and drag-drop upload over the P2 host
+  file ops, the preview-mode classifier, and the pure navigation/upload seams
+- **`docs/shells.md`** — the `+ New` launcher + `/shells` destination (overhaul
+  P6): the four-entry launcher popover, raw-shell launch and attach-to-tmux over
+  the existing P2 session ops, the shells list (filter/dedupe), and the pure
+  launcher/list seams — all navigating to the existing P3 terminal surface
+- **`docs/validation-diff.md`** — configurable validation + the Diff tab (overhaul
+  P7): the Initiative-scoped ordered N-lens array (per-lens provider/model/vision +
+  BLOCK/WARN gate split, default = product/qa/lead), the dynamic review fan-out,
+  the whole-tree `gitDiff` RPC, and the `johnny-diff-view` Diff pane tab reusing
+  the render core
+- **`docs/app-shell.md`** — the web-app shell (overhaul P8): the amber token
+  retarget (blue→amber `--jo-accent` + `--jo-st-*` palette, dormant light theme),
+  the pure `lifecycle-status` map + the `johnny-lifecycle-bar`/`johnny-status-pill`
+  primitives, the icon nav rail + mobile bottom-nav from one `nav-items` list, and
+  the initiative console assembled at `/terminal` via the pure `console-logic`
+  projection — layout/theme only, reusing the P1–P7 components
 
 ## Notable features shipped beyond the multi-user-saas plan
 
@@ -474,6 +507,11 @@ plan, so a fresh session can know what's already live.
 | Per-plan git history + amend workflow | Done (2026-05-25) |
 | Ionic-native modals + mobile responsive nav + mermaid zoom | Done (2026-05-25) |
 | Partner / third-party API (J1: authenticated GraphQL + WSS) | Done (2026-06) |
+| Briefing loop — clarify → accept → plan (overhaul P4) | Done (2026-07) |
+| Files manager — `/files` browse/preview/edit + CRUD + upload (overhaul P5) | Done (2026-07) |
+| Raw shell launcher + `/shells` destination (overhaul P6) | Done (2026-07) |
+| Configurable validation (N lenses) + Diff tab (overhaul P7) | Done (2026-07) |
+| Web-app shell — nav rail + initiative console + lifecycle bar + amber theme (overhaul P8) | Done (2026-07) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 

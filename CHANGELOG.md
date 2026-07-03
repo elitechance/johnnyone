@@ -7,6 +7,162 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Web-app shell — nav rail, initiative console, lifecycle bar, amber theme
+  (overhaul P8)**. Applies the approved 2026-07 mock to the web client; **web +
+  `ui` Angular only** — no Rust/worker/relay edit, no new route or GraphQL op, no
+  new npm dependency, no migration. This is **layout, theme, and assembly** of the
+  components P1–P7 already shipped, not new features. **(1) Amber tokens** — the
+  house `--jo-accent` is **retargeted** from the old blue `#5096ff` to the mock's
+  amber (`#e8a33d` dark / `#b9751a` light) so every existing `var(--jo-accent)`
+  consumer flips app-wide with **no consumer edit**; a new `--jo-accent-ink`
+  on-accent color and a semantic per-stage status palette (`--jo-st-briefing`
+  …`--jo-st-done`) are added, distinct from the kept health tokens
+  (`--jo-warn`/`--jo-bad`/`--jo-good`). A **dormant light palette** is authored
+  under `:root[data-theme="light"]` to the mock's light hexes, but **dark stays the
+  only rendered theme** (`dark.always.css` unchanged) — a light↔dark toggle is a
+  separate initiative. `theme-tokens.ts` mirrors the SCSS palette as one source of
+  truth (`theme-tokens.spec.ts` pins the hexes; the plugin-less vitest can't read
+  compiled custom properties). **(2) Lifecycle map + primitives** — a pure,
+  framework-free `ui/src/lib/lifecycle-status.ts` maps `initiativeStatus`/`health`
+  → `{cssVar,label,className}` (trim+lowercase, unknown → benign `--jo-fg-muted`
+  fallback, never throws) and exposes `LIFECYCLE_STAGES`/`stageIndex`; two `OnPush`
+  presentational primitives — **`johnny-lifecycle-bar`** (five ordered stages, the
+  active one `.on` in its semantic color + a health pill) and
+  **`johnny-status-pill`** — color themselves from that map via the tokens, no
+  inline color logic, no data fetch. **(3) Nav rail** — a single `nav-items.ts`
+  list (Work → `/terminal`, Files → `/files`, Shells → `/shells`, Settings →
+  `/settings`; all **existing** routes) drives both the widescreen icon rail and
+  the mobile bottom-nav so they can't drift; it replaces the old `ion-menu` text
+  sidebar, highlights the active route in amber, and the `+` **reuses the P6
+  `openLauncher`/`LauncherMenuComponent` verbatim**. **(4) Initiative console** —
+  "Work" at the existing `terminal` route becomes a master-detail grid wrapping the
+  existing Transcript/Raw terminal/Plan/Diff pane shell: a pure `console-logic.ts`
+  projects `listAgentPlans` → the initiative master-list (`initiativeRows`,
+  injected `nowIso` — no `Date.now()`), the Initiative's `validationConfig` → the
+  read-only lens summary (`lensSummary`, **reusing P7's `fromConfigJson` +
+  default triad**), and the **already-loaded** `gitDiff` view → the touched-files
+  panel (`touchedFiles`, `new`/`edited` badge, benign empty on clean/non-repo). A
+  §08 `consolePaneFor` drives the mobile segment switcher
+  (transcript/files/validation, unknown → transcript). Container queries collapse
+  the console to one column + bottom nav on phone and expand it to four regions on
+  widescreen. `nx build web`/`ui` green; web vitest green incl. `theme-tokens` /
+  `lifecycle-status` / `nav-items` / `console-logic` specs; **no Rust change → the
+  running desktop is not rebuilt/relaunched**, visual verification deferred to
+  orchestrator Playwright capture. See [`docs/app-shell.md`](docs/app-shell.md).
+- **Configurable validation + Diff tab (overhaul P7)**. Two independent things.
+  **(1) Configurable validation** — the phase-review fan-out (development **and**
+  planning) is now driven by an **ordered, N-lens array persisted on the
+  Initiative** (`agent_plans.validation_config TEXT`, migration `019`) instead of
+  a hardcoded 3-lens set. Each `ValidationLens` carries `{name, provider, model?,
+  prompt?, vision, blocking}`; **min 1, no max**. `resolve_validation_lenses`
+  falls back to `default_validation_config` (today's `product`/`qa`/`lead`, all
+  blocking, non-vision) when the config is absent/malformed/empty, so an
+  unconfigured Initiative behaves **exactly** as before. The fan-out was
+  **extended, not rewritten**: `run_lens_fanout_review` /
+  `run_planning_lens_fanout_review` now iterate the resolved list with
+  `futures_util::future::join_all` (N-arity, replacing the hand-unrolled
+  `tokio::join!`), each lens on its own provider/model. A new pure
+  `gate_verdict_over_blocking` computes PASS/FAIL from **only** the `blocking:true`
+  lenses; `blocking:false` (warn) lenses still fold findings into the merged
+  reviewer body (tagged `(warn)`) but do not gate. `merged_verdict` /
+  `count_consecutive_non_pass` untouched. Persisted via
+  `updateAgentPlanValidationConfig(id, config)` (`plans:write`-scoped;
+  `update_plan_validation_config` validates JSON + provider before writing) and
+  configured at the lazy `/initiatives/:id/validation` route (`ion-reorder-group`
+  + per-lens provider/model + vision + BLOCK/WARN toggles; add/remove min-1),
+  whose list decisions live in the pure `validation-config-logic.ts`.
+  **(2) Diff tab** — a **Diff** pane tab in the session center pane (beside
+  Transcript / Raw terminal) renders the **working-tree git diff** of the
+  session's directory. New whole-tree, **path-keyed** `git_diff(path)` host op
+  (`git rev-parse --show-toplevel` + `git diff HEAD --numstat` + `git diff HEAD` →
+  `GitDiffView { repoRoot?, branch?, clean, files[] }`), path-guarded + read-only,
+  excluding untracked files; exposed as `gitDiff(path): GitDiffView!`
+  (`files:read`-scoped, same posture as `filesListDir`/`filesRead`). Rendered by a
+  new standalone `johnny-diff-view` + pure `diff-parse.ts` (`parseUnifiedDiff` /
+  `langForPath` / `fileTotals`) that **reuses the P3 render core** (`highlightCode`)
+  — no second highlighter. `terminal.page` loads it best-effort on tab activation
+  (`gitDiff(session.workingDirectory)`; no cwd / non-repo / failed RPC → benign
+  empty view). New Rust lands with **deferred activation** (live after the next
+  `npm run desktop`); the running desktop app is not relaunched. `cargo build`/
+  `cargo test`, nx build worker/web/ui, and web vitest
+  (`diff-parse.spec.ts`/`validation-config-logic.spec.ts`) green; visual
+  verification deferred. See [`docs/validation-diff.md`](docs/validation-diff.md).
+- **Raw shell launcher + Shells destination (overhaul P6)**. A **`+ New`**
+  launcher popover (nav entry: New) and a **Shells** destination at **`/shells`**
+  (nav entry: Shells) — **web-only, reuse-only** (no new agent runner, session-spawn
+  path, transport, Rust/worker/relay surface, or npm dependency). The launcher
+  (`LauncherMenuComponent`, `ion-popover`) has four entries: **New initiative** →
+  `/briefing/new` (P4), **Raw shell** → `createSession({provider:'shell'})` (the
+  existing `CliProvider::Shell`) then open `/terminal?sessionId=` (P3), **Attach to
+  tmux session** → `listTmuxSessions()` radio picker → `createSession({tmuxSessionName})`
+  → open, **Open file manager** → `/files` (P5). Raw shell spawns with the persisted
+  `last_working_directory` (host default when unset); no cwd picker on the launcher.
+  The `ShellsPage` lists **active shells** (`listSessions('active')` filtered to
+  `provider==='shell'`/`attachedTmux`) + **attachable tmux** (`listTmuxSessions()`
+  minus already-attached); a shell row navigates to the existing terminal surface,
+  an attachable row attaches then opens — **no second terminal is embedded**, the
+  P3 renderer is not forked. A raw shell runs the host's `$SHELL` with the operator's
+  own privileges (same as the terminal page's New-session flow) — no new privilege
+  or attack surface; session ids are never logged as secrets. New web code
+  `web/src/app/components/launcher-menu/` + `web/src/app/pages/shells/` (each a thin
+  component + one pure, spec-pinned module) + a lazy `authGuard` `/shells` route +
+  `+ New`/Shells nav entries. `@johnnyone/ui` reused verbatim (`createSession`/
+  `listSessions`/`listTmuxSessions`/`getSetting`). nx build web/ui + web vitest
+  green; no Rust edits (running desktop app not rebuilt); visual verification
+  deferred. See [`docs/shells.md`](docs/shells.md).
+- **Files manager (overhaul P5)**. A two-pane **file manager** at **`/files`**
+  (nav entry: Files) over the host filesystem — **UI only**, built entirely on the
+  P2 host file ops and the P3 render core (no new backend / relay / worker / Rust
+  surface, no new npm dependency). Left pane: the `files_root`-rooted directory
+  list (`filesListDir`) with **breadcrumb** navigation. Right pane: preview/editor
+  over `filesRead` — markdown rendered via `johnny-markdown-view`, source
+  highlighted via `highlightCode`, plain text in a `<textarea>` with **Save**
+  (`filesWrite`) + a **`● unsaved`** dirty indicator, binary as a notice. Toolbar
+  CRUD: New file (`filesWrite` empty) / New folder (`filesMkdir`) / Rename
+  (`filesRename`) / Delete (`filesDelete`, confirm-gated). Drag-drop + button
+  **upload** chunks each file into ≤1 MiB base64 chunks via `filesUploadChunk` with
+  a per-file progress chip. All paths are `files_root`-relative and rely on the P2
+  host path-guard + size caps (the client only surfaces their errors); file
+  `content`/`dataBase64` are never logged. New web page
+  `web/src/app/pages/files/` (`FilesPage` + two pure modules `files-page-logic.ts`
+  / `file-chunker.ts` + specs) + a lazy `authGuard` `/files` route + one nav entry
+  (`folder-outline`). `@johnnyone/ui` reused verbatim. nx build web/ui + web vitest
+  green; no Rust edits (running desktop app not rebuilt); visual verification
+  deferred. See [`docs/files.md`](docs/files.md).
+- **Briefing loop (overhaul P4)**. An Initiative now has a **front door**: a
+  clarify-before-planning conversation that ends in an explicit
+  **"✓ Accept brief → Planning"**. Accept flips the *same* `agent_plans` row from
+  `initiative_status='briefing'` to `'planning'` (no second row) and starts the
+  existing planner with the composed brief. New host methods `create_briefing_run`
+  (row at `briefing` + a `kind='user'` chat session + `<id>/{plan,attachments}`
+  dirs), `accept_brief` (guard → `compose_accepted_brief` → flip → provision →
+  reused `start_planning_run`), `add_initiative_reference_path`, and
+  `initiative_upload_chunk` (the P2 upload engine re-rooted at `<id>/attachments/`,
+  same path-guard + 1/50 MiB caps). New GraphQL mutations
+  `createBriefingInitiative`/`acceptInitiativeBrief`/`initiativeUploadChunk`/
+  `addInitiativeReferencePath` (thin `desktopRpc` pass-throughs, scoped
+  `plans:write`/`files:write`) + `AgentPlan.briefingSessionId`. New web
+  `/briefing/:initiativeId` page reusing `johnny-chat-window` (additive
+  `showComposer` input) + a `BriefingComposerComponent` (📎 Attach / ⤒ Upload /
+  ▤ Reference path / Send). The conversation rides the existing relay chat path
+  (`claude --print --resume`, multi-turn) — no new agent runner, no new transport,
+  no forked renderer. Migration `018` adds the nullable `briefing_session_id`
+  column. Desktop lands as source + migration + `cargo test` (not rebuilt); nx
+  worker/web/ui + web vitest green; visual verification deferred. See
+  [`docs/briefing.md`](docs/briefing.md).
+- **Host↔web transport primitives (overhaul P2)**. Plumbing + types only — no
+  new screens. A `files_root`-rooted **file manager** over relay-RPC
+  (`filesListDir`/`filesRead`/`filesWrite`/`filesMkdir`/`filesRename`/
+  `filesDelete`/`filesUploadChunk`; host engine `host_files.rs`), path-guarded
+  (rejects `..` and above-root, symlink-safe) and size-capped (5 MiB reads,
+  1 MiB/chunk, 50 MiB total), gated by new `files:read`/`files:write` scopes.
+  A deterministic one-shot **`captureTerminal`** pane snapshot for shell
+  read-output (live I/O still rides the `terminal_*` envelopes). A per-session
+  **`StreamEvent`** channel (`stream_event` envelope + `stream_subscribe`/
+  `stream_unsubscribe`; Rust + TS types, ref-counted subscribe replayed on
+  reconnect) — the transcript renderer that consumes it is a later phase. All
+  additive; 74 cargo tests + nx worker/ui/web green. See
+  [`docs/host-transport.md`](docs/host-transport.md).
 - **Partner / third-party API ("J1 API")**. Authenticated GraphQL + WSS
   terminal access for external partners (hosted service account model). JWT
   (and `?token=`) on `/api/relay/ws` upgrade with server-side node resolution;

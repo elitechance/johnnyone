@@ -1,1 +1,294 @@
-ion-card { max-width: 560px; margin: 16px auto; }
+// Consolidated host dashboard — ports host-app-mock.html's `.frame` control
+// panel (mock lines 44-87), painting from the P01 `--jo-*` tokens instead of the
+// mock's bare custom props. Tray/Suggestions columns are out of scope (D7).
+
+:host {
+  --jo-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+.host-content {
+  --background: var(--jo-ground);
+}
+
+.host-shell {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: clamp(16px, 4vw, 34px) clamp(14px, 4vw, 28px) 60px;
+}
+
+// ── masthead ──────────────────────────────────────────────────────────────
+.masthead {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--jo-line);
+  margin-bottom: 24px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.brand .glyph {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex: none;
+  background: linear-gradient(150deg, var(--jo-accent-2), var(--jo-accent));
+  display: grid;
+  place-items: center;
+  color: var(--jo-accent-ink);
+  font-family: var(--jo-mono);
+  font-weight: 700;
+  font-size: 13px;
+}
+.masthead h1 {
+  font-size: clamp(20px, 3vw, 26px);
+  line-height: 1.1;
+  margin: 0;
+  color: var(--jo-ink);
+  font-weight: 640;
+}
+.masthead .sub {
+  color: var(--jo-ink-2);
+  font-size: 13.5px;
+  margin-top: 6px;
+  max-width: 52ch;
+}
+
+// ── window frame ──────────────────────────────────────────────────────────
+.frame {
+  background: var(--jo-panel);
+  border: 1px solid var(--jo-line);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 40px -16px rgba(0, 0, 0, 0.6);
+}
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  height: 38px;
+  padding: 0 12px;
+  background: var(--jo-panel-2);
+  border-bottom: 1px solid var(--jo-line);
+}
+.titlebar .wm {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--jo-mono);
+  font-size: 12px;
+  color: var(--jo-ink-2);
+  font-weight: 600;
+}
+.titlebar .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--jo-accent);
+}
+.titlebar .win-controls {
+  display: flex;
+  gap: 7px;
+}
+.titlebar .win-controls i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--jo-line-2);
+}
+
+// ── toolbar ───────────────────────────────────────────────────────────────
+.host-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--jo-line);
+  background: var(--jo-panel-2);
+}
+.host-toolbar .ht {
+  font-size: 14.5px;
+  font-weight: 640;
+  color: var(--jo-ink);
+}
+.host-toolbar .hsub {
+  font-family: var(--jo-mono);
+  font-size: 10.5px;
+  color: var(--jo-ink-3);
+  margin-top: 2px;
+}
+.host-toolbar .cog {
+  background: transparent;
+  border: none;
+  color: var(--jo-ink-3);
+  font-size: 18px;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+
+// ── cards & rows ──────────────────────────────────────────────────────────
+.host-body {
+  padding: 16px;
+}
+.hcard {
+  background: var(--jo-panel);
+  border: 1px solid var(--jo-line);
+  border-radius: 11px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.hcard-h {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--jo-line);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--jo-panel-2);
+}
+.hcard-h .ht {
+  font-family: var(--jo-mono);
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--jo-ink-2);
+  font-weight: 700;
+}
+.hcard-h .hs {
+  margin-left: auto;
+  font-family: var(--jo-mono);
+  font-size: 10.5px;
+  color: var(--jo-ink-3);
+}
+.hrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--jo-line);
+}
+.hrow:last-child {
+  border-bottom: none;
+}
+.hrow .lb {
+  min-width: 0;
+}
+.hrow .lb .t {
+  font-size: 13px;
+  font-weight: 540;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--jo-ink);
+}
+.hrow .lb .v {
+  font-family: var(--jo-mono);
+  font-size: 11px;
+  color: var(--jo-ink-3);
+  margin-top: 3px;
+  word-break: break-all;
+}
+.hrow .lb .v.err {
+  color: var(--jo-crit);
+}
+.hrow .end {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: none;
+}
+
+// ── chips & buttons ───────────────────────────────────────────────────────
+.schip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--jo-mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 9px;
+  border-radius: 999px;
+  letter-spacing: 0.03em;
+}
+.schip::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.schip.ok {
+  color: var(--jo-good);
+  background: color-mix(in srgb, var(--jo-good) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--jo-good) 32%, transparent);
+}
+.schip.warn {
+  color: var(--jo-warn);
+  background: color-mix(in srgb, var(--jo-warn) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--jo-warn) 32%, transparent);
+}
+.schip.off {
+  color: var(--jo-ink-3);
+  background: var(--jo-panel-2);
+  border: 1px solid var(--jo-line);
+}
+.sel-mini {
+  font-family: var(--jo-mono);
+  font-size: 11px;
+  color: var(--jo-ink-2);
+  background: var(--jo-panel);
+  border: 1px solid var(--jo-line);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+.fbtn {
+  font-family: var(--jo-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--jo-line-2);
+  background: var(--jo-panel);
+  color: var(--jo-ink-2);
+  cursor: pointer;
+}
+.newbadge {
+  font-family: var(--jo-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--jo-accent-ink);
+  background: var(--jo-accent);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.hopen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  width: 100%;
+  background: var(--jo-accent);
+  color: var(--jo-accent-ink);
+  border: none;
+  border-radius: 10px;
+  padding: 12px;
+  font-weight: 680;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+.hopen:hover {
+  background: var(--jo-accent-hover);
+}
+.hopen .sub {
+  font-family: var(--jo-mono);
+  font-weight: 600;
+  font-size: 10.5px;
+  opacity: 0.85;
+}

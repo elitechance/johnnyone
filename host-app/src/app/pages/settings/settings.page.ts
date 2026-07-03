@@ -25,6 +25,7 @@ import {
   HostSettingsService,
 } from '../../services/host-settings.service';
 import { HostRelayService } from '../../services/host-relay.service';
+import { trimStorePaths } from './host-settings-logic';
 
 @Component({
   selector: 'host-settings-page',
@@ -68,6 +69,8 @@ export class SettingsPage {
   plannerConventionsPath = DEFAULT_HOST_SETTINGS.plannerConventionsPath;
   webClientUrl = DEFAULT_HOST_SETTINGS.webClientUrl;
   discordWebhookUrl = DEFAULT_HOST_SETTINGS.discordWebhookUrl;
+  initiativesDir = DEFAULT_HOST_SETTINGS.initiativesDir;
+  filesRoot = DEFAULT_HOST_SETTINGS.filesRoot;
 
   constructor() {
     void this.load();
@@ -115,9 +118,15 @@ export class SettingsPage {
     this.plannerConventionsPath = settings.plannerConventionsPath;
     this.webClientUrl = settings.webClientUrl;
     this.discordWebhookUrl = settings.discordWebhookUrl;
+    this.initiativesDir = settings.initiativesDir;
+    this.filesRoot = settings.filesRoot;
   }
 
   private snapshot(): HostSettings {
+    const storePaths = trimStorePaths({
+      initiativesDir: this.initiativesDir,
+      filesRoot: this.filesRoot,
+    });
     return {
       workerUrl: this.workerUrl.trim(),
       tenantId: this.tenantId.trim(),
@@ -126,6 +135,8 @@ export class SettingsPage {
       plannerConventionsPath: this.plannerConventionsPath.trim(),
       webClientUrl: this.webClientUrl.trim(),
       discordWebhookUrl: this.discordWebhookUrl.trim(),
+      initiativesDir: storePaths.initiativesDir,
+      filesRoot: storePaths.filesRoot,
     };
   }
 }

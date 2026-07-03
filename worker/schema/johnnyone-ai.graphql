@@ -132,7 +132,25 @@ type AgentPlan {
   docsScope: String
   referencePaths: String
   amendBrief: String
+  # Configurable validation (overhaul phase 7, decision D1/D3): an opaque JSON array of review
+  # lenses persisted on the Initiative. NULLABLE for the same deploy-skew reason as the initiative
+  # axes below — a worker deploy against a not-yet-rebuilt (pre-migration 019) desktop returns JSON
+  # without this key; nullable degrades to null. NULL/empty resolves to the default product/qa/lead
+  # template in the desktop, so an unconfigured Initiative reviews exactly as before.
+  validationConfig: String
   phaseRunMode: String!
+  # Initiative axes (overhaul phase 1). Deliberately NULLABLE String (not String!) for
+  # deploy-skew safety (decision D8): a worker deploy against a not-yet-rebuilt (pre-migration
+  # 017) desktop returns JSON without these keys; nullable degrades to null instead of failing
+  # non-null coercion on every AgentPlan-returning operation. Rust struct + ui typing stay
+  # non-optional (values always present once migration 017 has run).
+  initiativeId: String
+  initiativeStatus: String
+  health: String
+  # Briefing conversation link (overhaul P4, D3). Nullable for the same deploy-skew reason as the
+  # initiative axes above: a worker deploy against a not-yet-rebuilt (pre-migration 018) desktop
+  # returns JSON without this key; nullable degrades to null. Non-null only on a briefing Initiative.
+  briefingSessionId: String
   createdAt: String!
   updatedAt: String!
 }
@@ -196,6 +214,9 @@ type AgentPlanRun {
   phases: [AgentPlanPhase!]!
   tasks: [AgentPlanTask!]!
   events: [AgentPlanEvent!]!
+  # Mirror of `plan.briefingSessionId` at the run level for symmetry with the plan type (overhaul
+  # P4). Nullable/deploy-skew-safe; the UI reads the conversation link via `plan.briefingSessionId`.
+  briefingSessionId: String
 }
 
 type HostFileEntry {
@@ -216,9 +237,65 @@ type HostFileContent {
   size: Int!
 }
 
+# --- File manager (overhaul P2, files_root-rooted) ---
+# Global-rooted file surface (decision D2), separate from the plan-scoped HostFile* readers above.
+# Field names/types mirror the host serde camelCase (host_files.rs) so resolvers are pure
+# pass-throughs with no mapping.
+type FileEntry {
+  name: String!
+  path: String!
+  kind: String! # "file" | "dir"
+  size: Int
+  modified: Float
+}
+
+type DirListing {
+  path: String!
+  root: String!
+  entries: [FileEntry!]!
+}
+
+type FileContent {
+  path: String!
+  name: String!
+  contentType: String!
+  encoding: String! # "utf8" | "base64"
+  content: String!
+  size: Int!
+}
+
+type FileOpResult {
+  path: String!
+  ok: Boolean!
+}
+
+type UploadChunkResult {
+  path: String!
+  received: Int!
+  complete: Boolean!
+}
+
 type WorkspaceFileDiff {
   path: String!
   diff: String!
+}
+
+# Whole-tree working-tree diff (overhaul phase 7, D7/D10). One changed file with its +/- counts and
+# hunk section; camelCase mirrors the Rust GitDiffFile/GitDiffView structs exactly (repoRoot, oldPath).
+type GitDiffFile {
+  path: String!
+  oldPath: String
+  additions: Int!
+  deletions: Int!
+  binary: Boolean!
+  diff: String!
+}
+
+type GitDiffView {
+  repoRoot: String
+  branch: String
+  clean: Boolean!
+  files: [GitDiffFile!]!
 }
 
 type GitFilesView {
@@ -307,6 +384,23 @@ type TmuxSession {
   windows: Int!
 }
 
+# Deterministic one-shot pane snapshot (overhaul P2). Mirrors the host `TerminalSnapshot` serde
+# (terminal.rs, camelCase) so the resolver is a pure pass-through. The live stream still rides the
+# `terminal_screen` broadcast; this is the request/response capture for automation/tests.
+type TerminalScreen {
+  sessionId: ID!
+  tmuxSessionName: String!
+  paneId: String!
+  cursor: Int!
+  content: String!
+  cursorX: Int!
+  cursorY: Int!
+  historyLines: Int!
+  rows: Int!
+  cols: Int!
+  status: String!
+}
+
 input UpsertProviderConfigInput {
   provider: String!
   cliPath: String
@@ -334,6 +428,23 @@ input CreateAgentPlanInput {
   reviewerSetupCommands: String
 }
 
+# Briefing loop (overhaul P4, D1). Create an Initiative at initiative_status='briefing' with a draft
+# brief (the raw ask); providers are stored for the later planning kickoff on accept.
+input CreateBriefingInput {
+  title: String
+  workspacePath: String!
+  brief: String! # the raw ask
+  workerProvider: String!
+  reviewerProvider: String!
+  model: String
+}
+
+# Accept a briefing brief (overhaul P4, D1/D4): flips the same Initiative briefing→planning.
+input AcceptBriefInput {
+  initiativeId: ID!
+  finalBrief: String # optional override of the stored draft
+}
+
 input PlannerPromptSettingsInput {
   development: PlannerDevelopmentPromptsInput!
   planning: PlannerPlanningPromptsInput!
@@ -355,6 +466,8 @@ type Query {
   listDesktopNodes: [DesktopNode!]!
   listAiSessions(status: String): [AiSession!]!
   listTmuxSessions: [TmuxSession!]!
+  # Deterministic one-shot pane capture (overhaul P2) — relay to host `capture_terminal`.
+  captureTerminal(sessionId: ID!, historyLines: Int): TerminalScreen!
   getAiSession(id: ID!): AiSession
   listAiMessages(sessionId: ID!, limit: Int, offset: Int): [AiMessage!]!
   listProviderConfigs: [ProviderConfig!]!
@@ -370,6 +483,23 @@ type Query {
   readHostFile(planId: ID!, path: String!): HostFileContent!
   getWorkspaceFileDiff(planId: ID!, path: String!): WorkspaceFileDiff!
   getChatAttachment(id: ID!): ChatAttachmentContent!
+  # File manager (overhaul P2) — relay to the host files_root surface.
+  # NOTE: the write ops (filesWrite/filesMkdir/filesRename/filesDelete/filesUploadChunk) and
+  # initiativeUploadChunk live under Query (not Mutation) to satisfy lokal's resolver-file naming
+  # convention: field type is inferred from the filename's leading verb, and `files-*` / `initiative-*`
+  # are not mutation prefixes, so their resolvers auto-wire as Query. The client's query/mutate are the
+  # same no-cache POST (graphql-client.ts), so there is no caching/idempotency concern — the resolvers
+  # still perform the write, scope-gated by files:write. Keeps the cohesive files* namespace consistent.
+  filesListDir(path: String!): DirListing!
+  filesRead(path: String!): FileContent!
+  filesWrite(path: String!, content: String!, encoding: String): FileOpResult!
+  filesMkdir(path: String!): FileOpResult!
+  filesRename(from: String!, to: String!): FileOpResult!
+  filesDelete(path: String!): FileOpResult!
+  filesUploadChunk(path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
+  initiativeUploadChunk(initiativeId: ID!, path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
+  # Whole-tree working-tree diff (overhaul P7, D7/D10) — path-keyed, scope-gated like the file ops.
+  gitDiff(path: String!): GitDiffView!
 }
 
 # --- Mutations ---
@@ -394,6 +524,9 @@ type Mutation {
   updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
   updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!
   updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!
+  # Overhaul phase 7 (D1). Persist the Initiative's ordered validation-lens array as a JSON string;
+  # a null/empty config clears it (→ desktop resolves the default product/qa/lead template).
+  updateAgentPlanValidationConfig(id: ID!, config: String): AgentPlanRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
@@ -404,6 +537,12 @@ type Mutation {
   updateGitAction(planId: ID!, path: String, action: String!, message: String): GitActionResult!
   createChatAttachment(input: ChatAttachmentInput!): ChatAttachment!
   deleteChatAttachment(input: MarkChatAttachmentDeliveredInput!): ChatAttachment!
+  # Briefing loop (overhaul P4) — thin desktopRpc pass-throughs to the Phase 01/02 host methods.
+  # (filesWrite/filesMkdir/filesRename/filesDelete/filesUploadChunk + initiativeUploadChunk moved to
+  # Query above to match lokal's resolver-filename type inference — see the note there.)
+  createBriefingInitiative(input: CreateBriefingInput!): AgentPlanRun!
+  acceptInitiativeBrief(input: AcceptBriefInput!): AgentPlanRun!
+  addInitiativeReferencePath(initiativeId: ID!, path: String!): AgentPlanRun!
 }
 
 # --- Subscriptions ---

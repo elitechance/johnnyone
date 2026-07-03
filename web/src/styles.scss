@@ -44,14 +44,46 @@
   --jo-border:      #262b33;
   --jo-border-strong: #353c47;
 
-  /* Accent (matches Ionic primary in dark) */
-  --jo-accent:      #5096ff;
-  --jo-accent-hover:#73abff;
+  /* Accent — amber, per the 2026-07 overhaul mock (§P8/D2). Retargeted from the
+     old blue #5096ff so every existing `var(--jo-accent)` consumer flips to amber
+     with no consumer edits. `--jo-accent-ink` is the on-accent text color. */
+  --jo-accent:      #e8a33d;
+  --jo-accent-hover:#f2b556;
+  --jo-accent-ink:  #1a130a;
 
-  /* Status */
+  /* Semantic per-stage status palette (mock dark values, §P8/D2). Distinct from
+     the health tokens below (warn/bad/good). Consumed by the lifecycle bar and
+     status pills (P02+). */
+  --jo-st-briefing:    #2fbcd8;
+  --jo-st-planning:    #5d8bf7;
+  --jo-st-development: #9a7ef0;
+  --jo-st-review:      #e070a8;
+  --jo-st-done:        #4bbd74;
+
+  /* Status / health (attention / blocked / done|pass) */
   --jo-warn:        #ffb454;
   --jo-bad:         #ff6868;
   --jo-good:        #5fd78f;
+}
+
+/* Dormant light palette — authored to the mock's light hexes so a future
+   light↔dark toggle has a ready contract, but NOT active: `dark.always.css`
+   (above) keeps the app rendering dark, the only theme the components are tuned
+   for (§P8/D1). Activating light is a separate initiative. */
+:root[data-theme="light"] {
+  --jo-accent:      #b9751a;
+  --jo-accent-hover:#d68a24;
+  --jo-accent-ink:  #ffffff;
+
+  --jo-st-briefing:    #0e8aa6;
+  --jo-st-planning:    #3161d6;
+  --jo-st-development: #6f4fd0;
+  --jo-st-review:      #bd3f82;
+  --jo-st-done:        #268a4d;
+
+  --jo-warn:        #c96a1f;
+  --jo-bad:         #c93f3a;
+  --jo-good:        #268a4d;
 }
 
 html, body {
@@ -102,7 +134,7 @@ html, body {
 }
 .primary-action {
   background: var(--jo-accent) !important;
-  color: #0d0f12 !important;
+  color: var(--jo-accent-ink) !important;
   border: none !important;
 }
 .primary-action:hover { background: var(--jo-accent-hover) !important; }

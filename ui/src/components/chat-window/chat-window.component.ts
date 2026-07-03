@@ -31,6 +31,12 @@ export class ChatWindowComponent implements AfterViewChecked {
   @Input() emptyDescription = 'Start a conversation.';
   @Input() emptyHint = '';
   @Input() showEmpty = true;
+  /**
+   * Additive (overhaul P4, D7): when false, the built-in `johnny-message-composer` is hidden so a
+   * host page can supply its own composer via the `[chat-actions]` slot (e.g. the briefing view).
+   * Defaults to true — existing callers are unaffected.
+   */
+  @Input() showComposer = true;
 
   @Output() messageSent = new EventEmitter<string>();
 

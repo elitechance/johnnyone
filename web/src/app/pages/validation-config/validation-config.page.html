@@ -1,0 +1,101 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-back-button defaultHref="/planning"></ion-back-button>
+    </ion-buttons>
+    <ion-title>Validation · configure</ion-title>
+    <ion-buttons slot="end">
+      <ion-note class="cap">min 1 · no max</ion-note>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content class="ion-padding">
+  @if (loadError()) {
+    <ion-note color="warning" class="load-note">{{ loadError() }}</ion-note>
+  }
+
+  <div class="valcfg">
+    <ion-reorder-group [disabled]="false" (ionItemReorder)="onReorder($event)">
+      @for (lens of lenses(); track $index; let i = $index) {
+        <ion-item class="valrow" lines="full">
+          <ion-reorder slot="start">
+            <ion-icon name="reorder-three-outline" aria-label="Drag to reorder"></ion-icon>
+          </ion-reorder>
+
+          <div class="info">
+            <ion-input
+              class="nm"
+              [(ngModel)]="lens.name"
+              placeholder="lens name"
+              aria-label="Lens name"
+            ></ion-input>
+            <div class="sub">
+              <ion-select
+                class="sel-mini"
+                interface="popover"
+                [(ngModel)]="lens.provider"
+                aria-label="Provider"
+              >
+                @for (p of providers; track p) {
+                  <ion-select-option [value]="p">{{ p }}</ion-select-option>
+                }
+              </ion-select>
+              <ion-input
+                class="sel-mini model"
+                [(ngModel)]="lens.model"
+                placeholder="model (default)"
+                aria-label="Model"
+              ></ion-input>
+              <ion-toggle
+                class="vision-toggle"
+                [(ngModel)]="lens.vision"
+                aria-label="Vision-capable lens"
+              >vision</ion-toggle>
+            </div>
+          </div>
+
+          <div class="toggle-wrap" slot="end">
+            <ion-toggle
+              [(ngModel)]="lens.blocking"
+              aria-label="Blocking (BLOCK) or warning-only (WARN)"
+            ></ion-toggle>
+            <span class="toggle-label">{{ lens.blocking ? 'BLOCK' : 'WARN' }}</span>
+          </div>
+
+          <ion-button
+            slot="end"
+            class="rm"
+            fill="clear"
+            color="medium"
+            [disabled]="!canRemove()"
+            (click)="removeLensAt(i)"
+            aria-label="Remove lens"
+          >
+            <ion-icon name="trash-outline" slot="icon-only"></ion-icon>
+          </ion-button>
+        </ion-item>
+      }
+    </ion-reorder-group>
+
+    <ion-button class="addlens" fill="outline" expand="block" (click)="onAddLens()">
+      <ion-icon name="add-outline" slot="start"></ion-icon>
+      Add lens
+    </ion-button>
+
+    <ion-note class="val-note">
+      The old default (product · qa · lead) is now just the starting template. Drop to a single
+      reviewer for small work, or stack five for a release. The last lens cannot be removed (min 1).
+      Blocking lenses gate phase promotion; warn lenses annotate only.
+    </ion-note>
+
+    <ion-button
+      class="save"
+      expand="block"
+      [disabled]="saving() || lenses().length === 0"
+      (click)="save()"
+    >
+      {{ saving() ? 'Saving…' : 'Save validation config' }}
+    </ion-button>
+  </div>
+</ion-content>

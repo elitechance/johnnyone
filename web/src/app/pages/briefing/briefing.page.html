@@ -1,0 +1,100 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>
+      @if (isCreate()) {
+        New briefing
+      } @else {
+        {{ plan()?.title || 'Briefing' }}
+        @if (plan()?.initiativeStatus) {
+          <span class="status-pill" [attr.data-status]="plan()?.initiativeStatus">
+            {{ plan()?.initiativeStatus }}
+          </span>
+        }
+      }
+    </ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  @if (isCreate()) {
+    <!-- Minimal create form (briefing/new). The full rail launcher is Phase 6. -->
+    <div class="create-form">
+      <h2>Start a briefing</h2>
+      <p class="create-hint">
+        Describe what you want. J1 will ask clarifying questions and draft a brief before planning.
+      </p>
+      <ion-list>
+        <ion-item>
+          <ion-input
+            label="Title (optional)"
+            labelPlacement="stacked"
+            [(ngModel)]="createTitle"
+            placeholder="Add a file browser"></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="Workspace path"
+            labelPlacement="stacked"
+            [(ngModel)]="createWorkspacePath"
+            placeholder="/home/you/project"></ion-input>
+        </ion-item>
+        <ion-item>
+          <ion-textarea
+            label="Initial ask"
+            labelPlacement="stacked"
+            [autoGrow]="true"
+            [(ngModel)]="createRawAsk"
+            placeholder="What should this initiative do?"></ion-textarea>
+        </ion-item>
+        <ion-item>
+          <ion-input
+            label="Provider"
+            labelPlacement="stacked"
+            [(ngModel)]="createProvider"></ion-input>
+        </ion-item>
+      </ion-list>
+      @if (createError()) {
+        <ion-note color="danger" class="form-error">{{ createError() }}</ion-note>
+      }
+      <div class="create-actions">
+        <ion-button [disabled]="creating()" (click)="createBriefing()">
+          {{ creating() ? 'Creating…' : 'Start briefing' }}
+        </ion-button>
+      </div>
+    </div>
+  } @else if (loadError()) {
+    <div class="load-error">{{ loadError() }}</div>
+  } @else {
+    <div class="briefing-shell">
+      <johnny-chat-window
+        class="briefing-chat"
+        [messages]="messages()"
+        [isStreaming]="streaming()"
+        [showComposer]="false"
+        emptyTitle="Briefing"
+        emptyDescription="Starting the conversation…">
+        <div chat-actions class="briefing-actions">
+          @if (initiativeId(); as id) {
+            <app-briefing-composer
+              [initiativeId]="id"
+              (messageSent)="onSend($event)"
+              (attachmentsChanged)="onAttachmentsChanged($event)"
+              (referencePathAdded)="onReferencePathAdded($event)"></app-briefing-composer>
+          }
+          <div class="brief-foot">
+            <ion-button
+              class="accept"
+              [disabled]="!canAcceptNow() || accepting()"
+              (click)="onAccept()">
+              ✓ Accept brief → Planning
+            </ion-button>
+            <ion-button fill="clear" (click)="onKeepRefining()">Keep refining</ion-button>
+            <span class="hint">
+              Accepting advances the same initiative from <b>briefing</b> to <b>planning</b>.
+            </span>
+          </div>
+        </div>
+      </johnny-chat-window>
+    </div>
+  }
+</ion-content>

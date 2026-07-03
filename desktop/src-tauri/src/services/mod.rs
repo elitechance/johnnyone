@@ -1,6 +1,7 @@
 pub mod agent_plans;
 pub mod chat_host;
 pub mod git_history;
+pub mod host_files;
 pub mod planner_prompts;
 pub mod providers;
 pub mod relay;

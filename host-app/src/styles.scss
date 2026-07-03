@@ -4,3 +4,78 @@
 @import '@ionic/angular/css/typography.css';
 @import '@ionic/angular/css/padding.css';
 @import '@ionic/angular/css/flex-utils.css';
+
+/* Force dark mode globally (Ionic ships a "dark.always" palette), matching the
+   web app (web/src/styles.scss). Dark is the theme the host-app dashboard/mock
+   are tuned for; the light block below is authored but dormant (Overhaul P9 /
+   D1). */
+@import '@ionic/angular/css/palettes/dark.always.css';
+
+/* Amber `--jo-*` token layer for the host app — the same accent as the web app
+   (P8) plus the host mock's fuller SURFACE palette (docs/plans/overhaul-p9-host/
+   artifacts/host-app-mock.html :root blocks). This `:root` block is the ACTIVE
+   dark palette (rendered under dark.always.css); the values here are mirrored by
+   host-app/src/app/pages/status/host-theme-tokens.ts, whose spec parses this
+   file to guard against drift (P9 / D1). */
+:root {
+  /* Accent — amber, identical to web P8. `--jo-accent-2` is the mock's second
+     accent stop (glyph gradient); `--jo-accent-ink` is on-accent text. */
+  --jo-accent:      #e8a33d;
+  --jo-accent-hover:#f2b556;
+  --jo-accent-2:    #f2b556;
+  --jo-accent-ink:  #1a130a;
+
+  /* Surface (mock dark hexes) */
+  --jo-ground:      #0c1016;
+  --jo-panel:       #141a23;
+  --jo-panel-2:     #1a212c;
+  --jo-panel-3:     #222b38;
+  --jo-ink:         #e7ecf3;
+  --jo-ink-2:       #9aa6b8;
+  --jo-ink-3:       #657085;
+  --jo-line:        #232c39;
+  --jo-line-2:      #2e3948;
+
+  /* State (mock dark hexes) */
+  --jo-good:        #4bbd74;
+  --jo-warn:        #e59042;
+  --jo-crit:        #e86560;
+  --jo-info:        #5d8bf7;
+  --jo-violet:      #9a7ef0;
+
+  /* Map Ionic's primary onto the amber accent so every reused Ionic
+     `color="primary"` control (Open-workspace button, settings inputs, chips)
+     inherits amber instead of Ionic default blue. */
+  --ion-color-primary:          var(--jo-accent);
+  --ion-color-primary-rgb:       232,163,61;
+  --ion-color-primary-shade:    var(--jo-accent-hover);
+  --ion-color-primary-tint:     var(--jo-accent-hover);
+  --ion-color-primary-contrast: var(--jo-accent-ink);
+  --ion-color-primary-contrast-rgb: 26,19,10;
+}
+
+/* Dormant light palette — authored to the mock's light hexes so a future
+   light↔dark toggle has a ready contract, but NOT active: dark.always.css keeps
+   the app rendering dark (P9 / D1). */
+:root[data-theme="light"] {
+  --jo-accent:      #b9751a;
+  --jo-accent-hover:#d68a24;
+  --jo-accent-2:    #d68a24;
+  --jo-accent-ink:  #ffffff;
+
+  --jo-ground:      #f4f6f9;
+  --jo-panel:       #ffffff;
+  --jo-panel-2:     #eef1f6;
+  --jo-panel-3:     #e6eaf1;
+  --jo-ink:         #161b25;
+  --jo-ink-2:       #525c6e;
+  --jo-ink-3:       #8b95a6;
+  --jo-line:        #dce1ea;
+  --jo-line-2:      #cbd2de;
+
+  --jo-good:        #268a4d;
+  --jo-warn:        #c96a1f;
+  --jo-crit:        #c93f3a;
+  --jo-info:        #3161d6;
+  --jo-violet:      #6f4fd0;
+}

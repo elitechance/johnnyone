@@ -41,13 +41,22 @@ export type {
   AgentPlanEvent,
   AgentPlanRun,
   CreateAgentPlanInput,
+  CreateBriefingInput,
+  AcceptBriefInput,
   HostFileContent,
   HostFileEntry,
+  FileEntry,
+  DirListing,
+  FileContent,
+  FileOpResult,
+  UploadChunkResult,
   TmuxSession,
   PlannerPromptSettings,
   ChatAttachment,
   GitActionResult,
   GitFilesView,
+  GitDiffFile,
+  GitDiffView,
   WorkspaceFileDiff,
   WorkspaceValidation,
 } from './services/johnny-api.service';
@@ -69,4 +78,41 @@ export { ProviderSelectorComponent } from './components/provider-selector/provid
 export { NodeStatusComponent } from './components/node-status/node-status.component';
 export { StreamingTextComponent } from './components/streaming-text/streaming-text.component';
 export { TerminalScreenComponent } from './components/terminal-screen/terminal-screen.component';
+export { MarkdownViewComponent } from './components/markdown-view/markdown-view.component';
+export { TranscriptViewComponent } from './components/transcript-view/transcript-view.component';
+export { eventsToBlocks } from './components/transcript-view/transcript-blocks';
+export type {
+  TranscriptBlock,
+  TranscriptBlockKind,
+} from './components/transcript-view/transcript-blocks';
+export { DiffViewComponent } from './components/diff-view/diff-view.component';
+export {
+  parseUnifiedDiff,
+  langForPath,
+  fileTotals,
+} from './components/diff-view/diff-parse';
+export type {
+  DiffLine,
+  DiffLineKind,
+} from './components/diff-view/diff-parse';
+export { StatusPillComponent } from './components/status-pill/status-pill.component';
+export { LifecycleBarComponent } from './components/lifecycle-bar/lifecycle-bar.component';
+export {
+  statusMeta,
+  healthMeta,
+  stageIndex,
+  STATUS_META,
+  HEALTH_META,
+  LIFECYCLE_STAGES,
+} from './lib/lifecycle-status';
+export type { StatusMeta, LifecycleStage } from './lib/lifecycle-status';
 export type { TerminalScreen } from './models/terminal.model';
+export type { StreamEvent } from './models/stream-event.model';
+
+// ── Render core ──────────────────────────────────────────────────────────────
+export {
+  parseMarkdown,
+  hydrateMermaid,
+  escapeHtml,
+  highlightCode,
+} from './lib/markdown-render';

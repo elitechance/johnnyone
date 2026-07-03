@@ -1,0 +1,116 @@
+// `/shells` list destination (overhaul P6). Mirrors the layout contract in
+// `docs/plans/overhaul-p6-shells/artifacts/shells-destination-mock.html`: two grouped lists of rows,
+// each row = icon · label/sub · Open/Attach affordance; an empty state when both groups are empty.
+.shells {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 8px 0 24px;
+}
+
+.shells-error {
+  margin: 12px 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--ion-color-danger-tint, rgba(235, 68, 90, 0.12));
+  color: var(--ion-color-danger, #eb445a);
+  font-size: 13px;
+}
+
+.shells-loading {
+  display: flex;
+  justify-content: center;
+  padding: 32px 0;
+}
+
+.shells-empty {
+  padding: 20px 16px;
+  color: var(--ion-color-medium);
+  font-size: 12.5px;
+  font-style: italic;
+}
+
+.grouphdr {
+  padding: 14px 16px 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ion-color-medium);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  border-top: 1px solid var(--ion-color-step-150, rgba(255, 255, 255, 0.08));
+  cursor: pointer;
+
+  &:hover {
+    background: var(--ion-color-step-100, rgba(255, 255, 255, 0.04));
+  }
+}
+
+.ic {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: var(--ion-color-step-100, rgba(0, 0, 0, 0.25));
+  color: var(--ion-color-success, #4bbd74);
+  flex: none;
+
+  ion-icon {
+    font-size: 16px;
+  }
+
+  &.tmux {
+    color: var(--ion-color-primary, #5b9dff);
+  }
+}
+
+.meta {
+  min-width: 0;
+}
+
+.nm {
+  font-size: 13.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sub {
+  font-size: 12px;
+  color: var(--ion-color-medium);
+}
+
+.tag {
+  font-size: 9.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
+
+  &.shell {
+    background: color-mix(in srgb, var(--ion-color-success, #4bbd74) 18%, transparent);
+    color: var(--ion-color-success, #4bbd74);
+  }
+
+  &.tmux {
+    background: color-mix(in srgb, var(--ion-color-primary, #5b9dff) 18%, transparent);
+    color: var(--ion-color-primary, #5b9dff);
+  }
+}
+
+.act {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--ion-color-medium);
+  border: 1px solid var(--ion-color-step-200, rgba(255, 255, 255, 0.12));
+  border-radius: 7px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}

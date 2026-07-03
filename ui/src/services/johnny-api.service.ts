@@ -7,6 +7,7 @@ import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
 import { ToolDefinition, ToolExecution } from '../models/tool.model';
 import { ProviderConfig, AiUsageSummary } from '../models/provider.model';
 import { DesktopNode } from '../models/desktop-node.model';
+import { TerminalScreen } from '../models/terminal.model';
 
 export interface CreateAiSessionInput {
   title?: string;
@@ -83,6 +84,22 @@ export interface CreateAgentPlanInput {
   reviewerSetupCommands?: string;
 }
 
+/** Create an Initiative in briefing (overhaul P4, D1). `brief` is the raw ask. */
+export interface CreateBriefingInput {
+  title?: string;
+  workspacePath: string;
+  brief: string;
+  workerProvider: string;
+  reviewerProvider: string;
+  model?: string;
+}
+
+/** Accept a briefing brief (overhaul P4, D1/D4). `finalBrief` optionally overrides the stored draft. */
+export interface AcceptBriefInput {
+  initiativeId: string;
+  finalBrief?: string;
+}
+
 export interface AgentPlan {
   id: string;
   runType: 'planning' | 'development' | string;
@@ -103,7 +120,18 @@ export interface AgentPlan {
   referencePaths?: string;
   /** Non-empty when an amendment cycle is in flight; cleared when T2 PASSes. */
   amendBrief?: string;
+  /** Configurable validation lenses as a JSON string (overhaul P7, D1). Null/empty → the desktop
+   * resolves the default product/qa/lead template. Nullable for deploy-skew safety. */
+  validationConfig?: string | null;
   phaseRunMode: 'continue' | 'single' | string;
+  /** Groups a planning stage-run + a development stage-run into one Initiative. */
+  initiativeId: string;
+  /** Lifecycle stage. */
+  initiativeStatus: 'briefing' | 'planning' | 'development' | 'review' | 'done' | string;
+  /** Condition axis, independent of stage. */
+  health: 'in-progress' | 'needs-attention' | 'blocked' | string;
+  /** Non-empty only on a briefing Initiative: its kind='user' chat session (overhaul P4, D3). */
+  briefingSessionId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -187,9 +215,60 @@ export interface HostFileContent {
   size: number;
 }
 
+// File manager (overhaul P2, files_root-rooted). Mirrors the Phase-02 GraphQL types and the host
+// serde (host_files.rs) — camelCase, separate from the plan-scoped HostFile* interfaces above.
+export interface FileEntry {
+  name: string;
+  path: string; // relative to files_root
+  kind: 'file' | 'dir' | string;
+  size?: number;
+  modified?: number; // unix millis
+}
+export interface DirListing {
+  path: string;
+  root: string;
+  entries: FileEntry[];
+}
+export interface FileContent {
+  path: string;
+  name: string;
+  contentType: string;
+  encoding: 'utf8' | 'base64' | string;
+  content: string;
+  size: number;
+}
+export interface FileOpResult {
+  path: string;
+  ok: boolean;
+}
+export interface UploadChunkResult {
+  path: string;
+  received: number;
+  complete: boolean;
+}
+
 export interface WorkspaceFileDiff {
   path: string;
   diff: string;
+}
+
+/** One changed file in a whole-tree diff (overhaul P7, D7). Mirrors the Rust `GitDiffFile`. */
+export interface GitDiffFile {
+  path: string;
+  oldPath?: string | null;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  diff: string;
+}
+
+/** Working-tree diff of a repo (overhaul P7, D7/D10/D11). Mirrors the Rust `GitDiffView`; a non-repo
+ * or clean path yields `clean:true`, `files:[]`, `repoRoot:null` (benign empty state). */
+export interface GitDiffView {
+  repoRoot?: string | null;
+  branch?: string | null;
+  clean: boolean;
+  files: GitDiffFile[];
 }
 
 export interface GitFilesView {
@@ -245,7 +324,8 @@ export class JohnnyApiService {
     plan {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
-      brief appScope docsScope referencePaths amendBrief phaseRunMode
+      brief appScope docsScope referencePaths amendBrief validationConfig phaseRunMode
+      initiativeId initiativeStatus health briefingSessionId
       createdAt updatedAt
     }
     phases {
@@ -668,6 +748,7 @@ export class JohnnyApiService {
             id runType title workspacePath planPath status workerSessionId reviewerSessionId
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
             brief appScope docsScope referencePaths
+            initiativeId initiativeStatus health validationConfig
             createdAt updatedAt
           }
         }`,
@@ -700,6 +781,73 @@ export class JohnnyApiService {
         { input }
       )
       .pipe(map((data) => data.createAgentPlan));
+  }
+
+  // ── Briefing loop (overhaul P4) ───────────────────────────────────────
+  // Thin GraphQL clients over the Phase 03 relay mutations (each a desktopRpc pass-through to a
+  // Phase 01/02 host method). Variable names match worker/schema/johnnyone-ai.graphql.
+
+  /** Create an Initiative in briefing (host `create_briefing_run`). */
+  createBriefingInitiative(input: CreateBriefingInput): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ createBriefingInitiative: AgentPlanRun }>(
+        `mutation CreateBriefingInitiative($input: CreateBriefingInput!) {
+          createBriefingInitiative(input: $input) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.createBriefingInitiative));
+  }
+
+  /** Accept the brief → flips the same Initiative briefing→planning (host `accept_brief`). */
+  acceptInitiativeBrief(input: AcceptBriefInput): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ acceptInitiativeBrief: AgentPlanRun }>(
+        `mutation AcceptInitiativeBrief($input: AcceptBriefInput!) {
+          acceptInitiativeBrief(input: $input) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { input }
+      )
+      .pipe(map((data) => data.acceptInitiativeBrief));
+  }
+
+  /** Record a ▤ Reference host path on a briefing Initiative (host `add_initiative_reference_path`). */
+  addInitiativeReferencePath(initiativeId: string, path: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ addInitiativeReferencePath: AgentPlanRun }>(
+        `mutation AddInitiativeReferencePath($initiativeId: ID!, $path: String!) {
+          addInitiativeReferencePath(initiativeId: $initiativeId, path: $path) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { initiativeId, path }
+      )
+      .pipe(map((data) => data.addInitiativeReferencePath));
+  }
+
+  /** Upload a briefing attachment chunk into <id>/attachments/ (host `initiative_upload_chunk`). */
+  initiativeUploadChunk(
+    initiativeId: string,
+    path: string,
+    chunkIndex: number,
+    totalChunks: number,
+    dataBase64: string,
+    done: boolean
+  ): Observable<UploadChunkResult> {
+    return this.gql
+      .mutate<{ initiativeUploadChunk: UploadChunkResult }>(
+        `query InitiativeUploadChunk($initiativeId: ID!, $path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
+          initiativeUploadChunk(initiativeId: $initiativeId, path: $path, chunkIndex: $chunkIndex, totalChunks: $totalChunks, dataBase64: $dataBase64, done: $done) {
+            path received complete
+          }
+        }`,
+        { initiativeId, path, chunkIndex, totalChunks, dataBase64, done }
+      )
+      .pipe(map((data) => data.initiativeUploadChunk));
   }
 
   startAgentPlan(id: string, phaseId?: string, phaseRunMode?: 'continue' | 'single'): Observable<AgentPlanRun> {
@@ -754,6 +902,25 @@ export class JohnnyApiService {
         { id, appScope }
       )
       .pipe(map((data) => data.updateAgentPlanAppScope));
+  }
+
+  /** Persist the Initiative's configurable validation lenses as a JSON string (overhaul P7, D1).
+   * Pass `null` (or an empty string) to clear it — the desktop then resolves the default
+   * product/qa/lead template. The desktop validates the JSON (parse + provider) before writing. */
+  updateAgentPlanValidationConfig(
+    id: string,
+    config: string | null,
+  ): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanValidationConfig: AgentPlanRun }>(
+        `mutation UpdateAgentPlanValidationConfig($id: ID!, $config: String) {
+          updateAgentPlanValidationConfig(id: $id, config: $config) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, config }
+      )
+      .pipe(map((data) => data.updateAgentPlanValidationConfig));
   }
 
   /**
@@ -917,6 +1084,143 @@ export class JohnnyApiService {
         { planId, path }
       )
       .pipe(map((data) => data.getWorkspaceFileDiff));
+  }
+
+  /** Whole-tree working-tree diff of the repo at `path` (a session's workingDirectory) — overhaul
+   * P7, D7/D10. Scope-gated (`files:read`) + path-guarded on the worker/host; a non-repo/clean path
+   * resolves to `{ clean:true, files:[] }` (no error). One round-trip, per-file +/- counts + hunks. */
+  gitDiff(path: string): Observable<GitDiffView> {
+    return this.gql
+      .query<{ gitDiff: GitDiffView }>(
+        `query GitDiff($path: String!) {
+          gitDiff(path: $path) {
+            repoRoot branch clean
+            files { path oldPath additions deletions binary diff }
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.gitDiff));
+  }
+
+  // ── File manager (overhaul P2) — relay-RPC via the Phase-02 worker GraphQL surface. ──────────
+  // Auth (JWT Bearer + tenant/user headers) is attached centrally by graphql-client.ts; these
+  // methods inherit it. `content`/`dataBase64` are forwarded, never logged.
+  listDir(path: string): Observable<DirListing> {
+    return this.gql
+      .query<{ filesListDir: DirListing }>(
+        `query FilesListDir($path: String!) {
+          filesListDir(path: $path) {
+            path root entries { name path kind size modified }
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesListDir));
+  }
+
+  readFile(path: string): Observable<FileContent> {
+    return this.gql
+      .query<{ filesRead: FileContent }>(
+        `query FilesRead($path: String!) {
+          filesRead(path: $path) {
+            path name contentType encoding content size
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesRead));
+  }
+
+  writeFile(
+    path: string,
+    content: string,
+    encoding: 'utf8' | 'base64' = 'utf8'
+  ): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesWrite: FileOpResult }>(
+        `query FilesWrite($path: String!, $content: String!, $encoding: String) {
+          filesWrite(path: $path, content: $content, encoding: $encoding) {
+            path ok
+          }
+        }`,
+        { path, content, encoding }
+      )
+      .pipe(map((data) => data.filesWrite));
+  }
+
+  mkdir(path: string): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesMkdir: FileOpResult }>(
+        `query FilesMkdir($path: String!) {
+          filesMkdir(path: $path) {
+            path ok
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesMkdir));
+  }
+
+  rename(from: string, to: string): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesRename: FileOpResult }>(
+        `query FilesRename($from: String!, $to: String!) {
+          filesRename(from: $from, to: $to) {
+            path ok
+          }
+        }`,
+        { from, to }
+      )
+      .pipe(map((data) => data.filesRename));
+  }
+
+  deleteFile(path: string): Observable<FileOpResult> {
+    return this.gql
+      .mutate<{ filesDelete: FileOpResult }>(
+        `query FilesDelete($path: String!) {
+          filesDelete(path: $path) {
+            path ok
+          }
+        }`,
+        { path }
+      )
+      .pipe(map((data) => data.filesDelete));
+  }
+
+  uploadChunk(
+    path: string,
+    chunkIndex: number,
+    totalChunks: number,
+    dataBase64: string,
+    done: boolean
+  ): Observable<UploadChunkResult> {
+    return this.gql
+      .mutate<{ filesUploadChunk: UploadChunkResult }>(
+        `query FilesUploadChunk($path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
+          filesUploadChunk(path: $path, chunkIndex: $chunkIndex, totalChunks: $totalChunks, dataBase64: $dataBase64, done: $done) {
+            path received complete
+          }
+        }`,
+        { path, chunkIndex, totalChunks, dataBase64, done }
+      )
+      .pipe(map((data) => data.filesUploadChunk));
+  }
+
+  // Deterministic one-shot terminal capture (overhaul P2). The live stream still uses
+  // relay-terminal.service.ts; this request/response read is for deterministic reads (tests/automation).
+  captureTerminal(sessionId: string, historyLines?: number): Observable<TerminalScreen> {
+    return this.gql
+      .query<{ captureTerminal: TerminalScreen }>(
+        `query CaptureTerminal($sessionId: ID!, $historyLines: Int) {
+          captureTerminal(sessionId: $sessionId, historyLines: $historyLines) {
+            sessionId tmuxSessionName paneId cursor content
+            cursorX cursorY historyLines rows cols status
+          }
+        }`,
+        { sessionId, historyLines }
+      )
+      .pipe(map((data) => data.captureTerminal));
   }
 
   registerDesktopNode(input: Partial<DesktopNode>): Observable<DesktopNode> {

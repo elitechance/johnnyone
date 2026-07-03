@@ -1,0 +1,73 @@
+<!-- Briefing composer (mock §07 .composer). Chips row, message input, affordance bar. -->
+<div class="briefing-composer">
+  @if (pendingAttachments().length > 0 || referencePaths().length > 0) {
+    <div class="attrow">
+      @for (att of pendingAttachments(); track att) {
+        <span class="attchip" (click)="removeAttachment(att)" title="Remove">
+          <span class="ic">📄</span>{{ att }}
+        </span>
+      }
+      @for (ref of referencePaths(); track ref) {
+        <span class="attchip path" (click)="removeReferencePath(ref)" title="Remove">
+          <span class="ic">▤</span>{{ ref }}
+        </span>
+      }
+    </div>
+  }
+
+  @if (uploadError()) {
+    <div class="composer-error">{{ uploadError() }}</div>
+  }
+
+  <div class="composer">
+    <textarea
+      class="cin"
+      rows="1"
+      [(ngModel)]="message"
+      [disabled]="disabled"
+      (keydown)="onInputKeydown($event)"
+      placeholder="Reply, attach files, or paste a path…"></textarea>
+
+    <div class="cbar">
+      <button type="button" class="cbtn acc" [disabled]="disabled || uploading()" (click)="fileInput.click()">
+        📎 Attach
+      </button>
+      <button type="button" class="cbtn acc" [disabled]="disabled || uploading()" (click)="fileInput.click()">
+        ⤒ Upload
+      </button>
+      <button type="button" class="cbtn" [disabled]="disabled" (click)="openPathBrowser()">
+        ▤ Reference path
+      </button>
+      <button type="button" class="send" [disabled]="disabled || !message.trim()" (click)="send()">
+        Send
+      </button>
+    </div>
+
+    <input #fileInput type="file" multiple hidden (change)="onFilesSelected($event)" />
+  </div>
+
+  @if (browserOpen()) {
+    <div class="path-browser">
+      <div class="pb-head">
+        <span class="pb-title">Reference a host path</span>
+        <button type="button" class="pb-close" (click)="closePathBrowser()">✕</button>
+      </div>
+      <div class="pb-path">{{ browsePath() }}</div>
+      @if (browserError()) {
+        <div class="pb-error">{{ browserError() }}</div>
+      }
+      <div class="pb-list">
+        <button type="button" class="pb-entry up" (click)="browseParent()">⬆ ..</button>
+        @for (entry of browserEntries(); track entry.path) {
+          <button type="button" class="pb-entry" (click)="browseInto(entry)">
+            <span class="pb-ic">{{ entry.kind === 'directory' || entry.kind === 'dir' ? '📁' : '📄' }}</span>
+            {{ entry.name }}
+          </button>
+        }
+      </div>
+      <div class="pb-foot">
+        <button type="button" class="pb-use" (click)="useReferencePath()">Use this directory</button>
+      </div>
+    </div>
+  }
+</div>

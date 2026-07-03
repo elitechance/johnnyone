@@ -1,0 +1,14 @@
+<div class="lifecycle">
+  @for (stage of stages; track stage.key) {
+    <div class="stage" [class]="stage.className" [class.on]="stage.on" [style.--sc]="stage.sc">
+      <div class="k"><span class="num">{{ stage.num }}</span> {{ stage.label }}</div>
+      <div class="d">{{ stage.description }}</div>
+      <div class="bar"><i [style.width]="stage.fill"></i></div>
+    </div>
+  }
+</div>
+
+<div class="health-axis">
+  <span class="lbl">health</span>
+  <johnny-status-pill kind="health" [value]="health"></johnny-status-pill>
+</div>

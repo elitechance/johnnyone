@@ -5,7 +5,6 @@ import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { ActivatedRoute } from '@angular/router';
 import {
-  IonMenuButton,
   IonModal,
   IonHeader,
   IonFooter,
@@ -143,7 +142,6 @@ interface TaskStatusDetail {
     CommonModule,
     FormsModule,
     TerminalScreenComponent,
-    IonMenuButton,
     IonModal,
     IonHeader,
     IonFooter,
@@ -873,6 +871,11 @@ export class PlannerPage implements OnInit, OnDestroy {
 
   navigateTo(path: string): void {
     void this.router.navigateByUrl(path);
+  }
+
+  /** Open the §07 validation-config surface for this Initiative (overhaul P7, D12). */
+  openValidationConfig(planId: string): void {
+    void this.router.navigate(['/initiatives', planId, 'validation']);
   }
 
   logout(): void {
