@@ -63,6 +63,16 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),
   },
+  // Files (overhaul P5) — the two-pane file manager over the host `files_root` (browse/preview here;
+  // edit/CRUD + upload land in Phases 02/03). Standalone entry point; the briefing/launcher links are
+  // Phase 8 (D7).
+  {
+    path: 'files',
+    title: 'Files',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/files/files.page').then((m) => m.FilesPage),
+  },
   // Development (T1=Worker, T2=Reviewer) — executes approved plans.
   {
     path: 'development',

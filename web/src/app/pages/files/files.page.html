@@ -1,0 +1,157 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-menu-button></ion-menu-button>
+    </ion-buttons>
+    <ion-title>Files</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <div class="fm">
+    <!-- Toolbar: breadcrumb + CRUD actions (upload lands in Phase 03). -->
+    <div class="fm-toolbar">
+      <div class="crumb">
+        @for (crumb of crumbs(); track crumb.path; let last = $last) {
+          <button type="button" class="crumb-seg" [class.current]="last" (click)="onCrumbClick(crumb.path)">
+            {{ crumb.label }}
+          </button>
+          @if (!last) {
+            <span class="sep">▸</span>
+          }
+        }
+      </div>
+      <div class="fm-act">
+        <ion-button size="small" fill="outline" [disabled]="busy()" (click)="newFile()">+ File</ion-button>
+        <ion-button size="small" fill="outline" [disabled]="busy()" (click)="newFolder()">+ Folder</ion-button>
+        <ion-button size="small" fill="outline" color="primary" (click)="triggerUpload()">⤒ Upload</ion-button>
+        <ion-button size="small" fill="outline" [disabled]="busy() || !selected()" (click)="rename()">
+          Rename
+        </ion-button>
+        <ion-button size="small" fill="outline" color="danger" [disabled]="busy() || !selected()" (click)="remove()">
+          🗑 Delete
+        </ion-button>
+        <input
+          #fileInput
+          type="file"
+          multiple
+          hidden
+          (change)="onFilePicked($event)"
+        />
+      </div>
+    </div>
+
+    @if (loadError()) {
+      <div class="fm-error">{{ loadError() }}</div>
+    }
+
+    <div class="fm-body">
+      <!-- Left pane: directory list. -->
+      <div class="fm-list">
+        @if (busy() && entries().length === 0) {
+          <div class="fm-loading"><ion-spinner name="dots"></ion-spinner></div>
+        }
+        @for (entry of entries(); track entry.path) {
+          <button
+            type="button"
+            class="fm-item"
+            [class.dir]="entry.kind === 'dir'"
+            [class.sel]="selected()?.path === entry.path"
+            (click)="onEntryClick(entry)"
+          >
+            <span class="ic">{{ entry.kind === 'dir' ? '▸' : '•' }}</span>
+            <span class="nm">{{ entry.name }}</span>
+            @if (entry.kind !== 'dir' && sizeLabel(entry)) {
+              <span class="sz">{{ sizeLabel(entry) }}</span>
+            }
+          </button>
+        }
+        @if (!busy() && entries().length === 0) {
+          <div class="fm-empty">Empty directory</div>
+        }
+      </div>
+
+      <!-- Right pane: preview / inline editor of the selected file. -->
+      <div class="fm-editor">
+        @if (content(); as file) {
+          <div class="eh">
+            <span class="fname">{{ file.path }}</span>
+            @if (dirty()) {
+              <span class="dirty">● unsaved</span>
+            }
+            @if (canEdit()) {
+              <span class="spacer"></span>
+              <ion-button size="small" fill="clear" (click)="toggleEdit()">
+                {{ editing() ? 'Preview' : 'Edit' }}
+              </ion-button>
+              <ion-button
+                class="save"
+                size="small"
+                [disabled]="!dirty() || busy()"
+                (click)="save()"
+              >
+                Save
+              </ion-button>
+            }
+          </div>
+          <div class="ebody">
+            @if (editing() && canEdit()) {
+              <ion-textarea
+                class="editor"
+                [autoGrow]="false"
+                [spellcheck]="false"
+                [value]="current()"
+                (ionInput)="onEditInput($any($event).target.value)"
+              ></ion-textarea>
+            } @else {
+              @switch (mode()) {
+                @case ('markdown') {
+                  <johnny-markdown-view [markdown]="file.content"></johnny-markdown-view>
+                }
+                @case ('code') {
+                  <pre class="code" [innerHTML]="highlighted()"></pre>
+                }
+                @case ('binary') {
+                  <div class="binary-notice">
+                    Binary file — download / upload only. Preview is not available.
+                  </div>
+                }
+                @default {
+                  <pre class="text">{{ file.content }}</pre>
+                }
+              }
+            }
+          </div>
+        } @else {
+          <div class="fm-editor-empty">Select a file to preview or edit it.</div>
+        }
+
+        <!-- Upload drop zone (mock §05 `.dropzone`) — drops/picks land in the current directory. -->
+        <div
+          class="dropzone"
+          [class.dragging]="dragging()"
+          (dragover)="onDragOver($event)"
+          (dragleave)="onDragLeave($event)"
+          (drop)="onDrop($event)"
+        >
+          <div class="drop-hint"><b>Drop files to upload</b> — or click ⤒ Upload</div>
+          @if (uploads().length > 0) {
+            <div class="uprow">
+              @for (chip of uploads(); track $index) {
+                <span class="upchip" [class.error]="!!chip.error">
+                  {{ chip.name }}
+                  @if (chip.error) {
+                    <span class="uplabel err">{{ chip.error }}</span>
+                  } @else {
+                    <span class="bar"><i [style.width.%]="progressPercent(chip)"></i></span>
+                    <span class="uplabel">{{ chip.done ? 'done' : progressPercent(chip) + '%' }}</span>
+                  }
+                </span>
+              }
+            </div>
+          }
+        </div>
+      </div>
+    </div>
+  </div>
+</ion-content>
