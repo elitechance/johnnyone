@@ -149,6 +149,14 @@ console — all via container queries (D12). `console-logic.spec.ts` pins the ro
 summary, file, and segment mappings; the render wiring is build-checked and its
 visual confirmation deferred (see below).
 
+> **Fix-forward (post-P8).** A later console fix-forward makes the tab shell
+> (Transcript · Raw terminal · Plan · Diff) the **primary per-initiative surface**
+> — rendered for the selected initiative whether or not a terminal is attached
+> (P8 wrapped the session-keyed pane shell, so a no-terminal initiative showed no
+> tabs) — **builds the Plan tab**, adds a **default-template vs configured** badge
+> to the validation column, and adds **resizable rail↔center↔validation dividers**
+> with persisted widths. See [`console-fixes.md`](console-fixes.md).
+
 ## Where the code lives
 
 New:

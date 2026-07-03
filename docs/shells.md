@@ -86,7 +86,7 @@ entry and their icon registrations.
 | `launcherIntent(kind)` | row → descriptor: `initiative`/`files` → `{type:'navigate',path}`; `shell` → `{type:'createShell'}`; `attach` → `{type:'attachPicker'}` |
 | `terminalRoute(sessionId)` | the shared open-in-terminal nav shape `{path:'/terminal', queryParams:{sessionId}}` (also reused by the Shells page) |
 | `shellCreateInput(cwd?)` | create-input for a raw shell — `{provider:'shell'}`, adding `workingDirectory` **only** when a cwd is given (absent key ⇒ host default) |
-| `attachTmuxInput(name)` | create-input for attaching an external pane — `{tmuxSessionName:name}` (attach instead of spawn) |
+| `attachTmuxInput(name)` | create-input for attaching an external pane — `{tmuxSessionName:name, title:name}` (attach instead of spawn). The `title` was **added by the console fix-forward** so the attached pane matches the `attachableTmux` de-dupe join and leaves the "attachable" list — see [`console-fixes.md`](console-fixes.md) §4 |
 
 ### `shells-page-logic.ts` — list decisions
 
@@ -97,7 +97,7 @@ entry and their icon registrations.
 | `attachableTmux(tmux, sessions)` | external panes minus any already attached (join by name = an attached session's `title`); best-effort UX dedupe — the host prevents a real double-attach |
 | `shellSessionLabel(s)` | row label `{title, tag:'shell'\|'tmux'}` (`title \|\| 'Shell'`) — a trivial label, not a fork of the terminal page's `providerLabel` |
 | `formatRelTime(iso, nowIso)` | coarse "just now / Nm / Nh / Nd ago" — `nowIso` is a **parameter** (no `Date.now()` inside) so the spec is deterministic |
-| `openIntent` | re-exports `terminalRoute` — the `/terminal?sessionId=` shape is defined once |
+| `openIntent` | re-exports `plainTerminalRoute` — the `/terminal?sessionId=&surface=shell` shape, defined once. The console fix-forward switched this from `terminalRoute` so a shell opens as a **plain terminal surface** (no initiative chrome) — see [`console-fixes.md`](console-fixes.md) §4 |
 
 ## Security posture
 
