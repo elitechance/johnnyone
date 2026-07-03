@@ -7,6 +7,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Briefing loop (overhaul P4)**. An Initiative now has a **front door**: a
+  clarify-before-planning conversation that ends in an explicit
+  **"✓ Accept brief → Planning"**. Accept flips the *same* `agent_plans` row from
+  `initiative_status='briefing'` to `'planning'` (no second row) and starts the
+  existing planner with the composed brief. New host methods `create_briefing_run`
+  (row at `briefing` + a `kind='user'` chat session + `<id>/{plan,attachments}`
+  dirs), `accept_brief` (guard → `compose_accepted_brief` → flip → provision →
+  reused `start_planning_run`), `add_initiative_reference_path`, and
+  `initiative_upload_chunk` (the P2 upload engine re-rooted at `<id>/attachments/`,
+  same path-guard + 1/50 MiB caps). New GraphQL mutations
+  `createBriefingInitiative`/`acceptInitiativeBrief`/`initiativeUploadChunk`/
+  `addInitiativeReferencePath` (thin `desktopRpc` pass-throughs, scoped
+  `plans:write`/`files:write`) + `AgentPlan.briefingSessionId`. New web
+  `/briefing/:initiativeId` page reusing `johnny-chat-window` (additive
+  `showComposer` input) + a `BriefingComposerComponent` (📎 Attach / ⤒ Upload /
+  ▤ Reference path / Send). The conversation rides the existing relay chat path
+  (`claude --print --resume`, multi-turn) — no new agent runner, no new transport,
+  no forked renderer. Migration `018` adds the nullable `briefing_session_id`
+  column. Desktop lands as source + migration + `cargo test` (not rebuilt); nx
+  worker/web/ui + web vitest green; visual verification deferred. See
+  [`docs/briefing.md`](docs/briefing.md).
 - **Host↔web transport primitives (overhaul P2)**. Plumbing + types only — no
   new screens. A `files_root`-rooted **file manager** over relay-RPC
   (`filesListDir`/`filesRead`/`filesWrite`/`filesMkdir`/`filesRename`/

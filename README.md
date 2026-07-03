@@ -123,6 +123,7 @@ johnnyone/
 
 Recent planner/runtime behavior worth knowing:
 
+- An Initiative can now start in a **briefing** stage — a clarify-before-planning conversation that ends in an explicit "Accept brief → Planning". Accept flips the *same* `agent_plans` row from `initiative_status='briefing'` to `'planning'` and starts the existing planner with the composed brief (no second row). See [`docs/briefing.md`](docs/briefing.md).
 - Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.
 - Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
 - Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
@@ -383,6 +384,7 @@ served in-app at the public **`/integration`** route
 - **Sessions** — `listAiSessions`, `getAiSession`, `createAiSession`, `updateAiSession{Title,Provider,WorkingDirectory,Archived}`, `deleteAiSession`
 - **Chat** — `sendRelayChatMessage`, `cancelAiGeneration`, `listAiMessages`
 - **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
+- **Briefing loop** — `createBriefingInitiative`, `acceptInitiativeBrief`, `initiativeUploadChunk`, `addInitiativeReferencePath` (an Initiative's clarify-before-planning front door; `AgentPlan.briefingSessionId` links the conversation). See [`docs/briefing.md`](docs/briefing.md)
 - **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
 - **File manager (`files_root`-rooted)** — `filesListDir`, `filesRead`, `filesWrite`, `filesMkdir`, `filesRename`, `filesDelete`, `filesUploadChunk` (chunked upload). Path-guarded + size-capped, scoped by `files:read`/`files:write`. See [`docs/host-transport.md`](docs/host-transport.md)
 - **Terminal / shell** — `captureTerminal` (deterministic one-shot pane snapshot; live I/O still rides the WSS `terminal_*` envelopes)
@@ -416,6 +418,9 @@ Repo-local docs live alongside the code:
   the `files_root` file-manager surface, shell I/O + `captureTerminal` over the
   relay, and the per-session `StreamEvent` channel. Plumbing + types; the UIs that
   consume them are later phases
+- **`docs/briefing.md`** — the briefing loop (overhaul P4): the clarify-before-planning
+  conversation, the `briefing → planning` accept transition on the same Initiative
+  row, brief composition, attachments/reference paths, and the `/briefing` UI
 
 ## Notable features shipped beyond the multi-user-saas plan
 
@@ -480,6 +485,7 @@ plan, so a fresh session can know what's already live.
 | Per-plan git history + amend workflow | Done (2026-05-25) |
 | Ionic-native modals + mobile responsive nav + mermaid zoom | Done (2026-05-25) |
 | Partner / third-party API (J1: authenticated GraphQL + WSS) | Done (2026-06) |
+| Briefing loop — clarify → accept → plan (overhaul P4) | Done (2026-07) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 
