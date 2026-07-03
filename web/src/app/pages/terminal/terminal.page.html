@@ -1,15 +1,62 @@
+<!-- Overhaul P8 §02 initiative console — the global rail is the app shell (P03); this grid adds the
+     initiative master-list (left), the lifecycle bar + the EXISTING pane shell (center), and the
+     validation-summary/host-files column (right), collapsing to §08 single-column at container width. -->
+<div class="console" [attr.data-console-pane]="mobileConsolePane()">
+  <!-- LEFT: initiative master-list (mock 550-579) -->
+  <aside class="pane rail console-list">
+    <div class="pane-head">Initiatives <span class="ct tnum">{{ consoleRows().length }}</span></div>
+    @for (row of consoleRows(); track row.id) {
+      <button type="button" class="init" [class.sel]="row.selected" (click)="selectInitiative(row)">
+        <div class="t">{{ row.title }}</div>
+        <div class="m">
+          <johnny-status-pill kind="status" [value]="row.status"></johnny-status-pill>
+          @if (row.showHealth) {
+            <johnny-status-pill kind="health" [value]="row.health"></johnny-status-pill>
+          }
+        </div>
+        <div class="ago">updated {{ row.ago }}</div>
+      </button>
+    } @empty {
+      <div class="pane-empty">No initiatives yet.</div>
+    }
+  </aside>
+
+  <!-- §08 mobile segment switcher (mock 1082-1085) — a PERSISTENT sibling of the panes so it stays
+       visible in the collapsed layout while only the body beneath it swaps (container-query only). -->
+  <div class="seg console-seg" role="tablist" aria-label="Console view">
+    @for (seg of consoleSegments; track seg) {
+      <button
+        type="button"
+        class="s"
+        role="tab"
+        [class.on]="mobileConsolePane() === seg"
+        [attr.aria-selected]="mobileConsolePane() === seg"
+        (click)="setConsoleSegment(seg)"
+      >
+        {{ seg }}
+      </button>
+    }
+  </div>
+
+  <!-- CENTER: lifecycle bar (mock 583-590) + the existing pane shell -->
+  <section class="pane console-center">
+    @if (selectedInitiative(); as sel) {
+      <div class="init-top">
+        <johnny-lifecycle-bar [status]="sel.initiativeStatus" [health]="sel.health"></johnny-lifecycle-bar>
+        <div class="path">{{ sel.workspacePath }}</div>
+      </div>
+    }
+
 <div
   class="workspace-shell"
   (paste)="onWorkspacePaste($event)"
   (dragover)="onWorkspaceDragOver($event)"
   (drop)="onWorkspaceDrop($event)"
 >
-  <!-- Page-level brand/header removed — the side menu carries that. -->
   <header class="workspace-topbar">
-    <!-- Hamburger to pop the side drawer on phone-narrow viewports only;
-         hidden by CSS at md+ where the split-pane shows the menu permanently. -->
+    <!-- Mobile navigation is the global .botnav (app.component) — no per-page
+         hamburger; the old ion-menu it toggled was removed in P8-03. -->
     <div class="workspace-topbar-brand">
-      <ion-menu-button class="mobile-menu-btn" autoHide="false" aria-label="Open menu"></ion-menu-button>
       <div class="page-title-chip">Terminal</div>
     </div>
 
@@ -199,6 +246,49 @@
     <span>relay <strong>connected</strong></span>
     <span>raw input batched at <strong>200ms</strong></span>
   </footer>
+</div>
+  </section>
+
+  <!-- RIGHT: validation lens summary + host files (mock 658-684). The two groups are separately
+       toggleable so the collapsed §08 layout can show Validation vs Files distinctly. -->
+  <aside class="pane console-right">
+    <div class="rpane rpane-validation">
+      <div class="pane-head">Validation <span class="ct tnum">{{ consoleLenses().length }} lenses</span></div>
+      <div class="rgroup">
+        @for (lens of consoleLenses(); track lens.name) {
+          <div class="lens">
+            <div class="lh"><span class="nm">{{ lens.name }}</span></div>
+            <div class="meta">
+              <span class="chip">{{ lens.provider }}</span>
+              @if (lens.model) {
+                <span class="chip">{{ lens.model }}</span>
+              }
+              <span class="chip" [class.block]="lens.blocking">{{ lens.blocking ? 'blocking' : 'warn-only' }}</span>
+            </div>
+          </div>
+        }
+        @if (selectedInitiative(); as sel) {
+          <div class="lens lens-cfg">
+            <a class="cfg" [routerLink]="['/initiatives', sel.id, 'validation']">Configure →</a>
+          </div>
+        }
+      </div>
+    </div>
+    <div class="rpane rpane-files">
+      <div class="pane-head rgroup-head">Host files</div>
+      <div class="filetree">
+        @for (f of consoleFiles(); track f.path) {
+          <div class="fnode touched">
+            <span class="ic">•</span>{{ f.path }}
+            <span class="badge-a">+{{ f.badge }}</span>
+            <span class="counts tnum">+{{ f.adds }} −{{ f.dels }}</span>
+          </div>
+        } @empty {
+          <div class="fnode file-empty">No touched files.</div>
+        }
+      </div>
+    </div>
+  </aside>
 </div>
 
 <ion-modal

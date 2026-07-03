@@ -95,6 +95,17 @@ export type {
   DiffLine,
   DiffLineKind,
 } from './components/diff-view/diff-parse';
+export { StatusPillComponent } from './components/status-pill/status-pill.component';
+export { LifecycleBarComponent } from './components/lifecycle-bar/lifecycle-bar.component';
+export {
+  statusMeta,
+  healthMeta,
+  stageIndex,
+  STATUS_META,
+  HEALTH_META,
+  LIFECYCLE_STAGES,
+} from './lib/lifecycle-status';
+export type { StatusMeta, LifecycleStage } from './lib/lifecycle-status';
 export type { TerminalScreen } from './models/terminal.model';
 export type { StreamEvent } from './models/stream-event.model';
 

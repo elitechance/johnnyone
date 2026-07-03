@@ -1,0 +1,100 @@
+// Mirrors mock §01 `.lifecycle` / `.stage` / `.stage.on` / `.stage .k` / `.bar`
+// (lines 105-123). Each stage's `--sc` is bound by the component to its mapped
+// P01 status token; the active stage gets `.on`.
+:host {
+  display: block;
+}
+
+.lifecycle {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex-wrap: wrap;
+  background: var(--jo-bg-elevated);
+  border: 1px solid var(--jo-border);
+  border-radius: 14px;
+  padding: 8px;
+}
+
+.stage {
+  flex: 1 1 130px;
+  min-width: 120px;
+  position: relative;
+  padding: 16px 14px 14px;
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.stage + .stage::before {
+  content: '';
+  position: absolute;
+  left: -1px;
+  top: 22px;
+  bottom: 22px;
+  width: 1px;
+  background: var(--jo-border);
+}
+
+.stage .k {
+  font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sc);
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.stage .k .num {
+  color: var(--jo-fg-faint);
+  font-weight: 600;
+}
+
+.stage .d {
+  font-size: 12.5px;
+  color: var(--jo-fg-muted);
+  line-height: 1.4;
+}
+
+.stage.on {
+  background: color-mix(in srgb, var(--sc) 10%, transparent);
+  outline: 1.5px solid color-mix(in srgb, var(--sc) 40%, transparent);
+  outline-offset: -1px;
+}
+
+.stage .bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--jo-border);
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.stage .bar i {
+  display: block;
+  height: 100%;
+  background: var(--sc);
+  border-radius: 2px;
+}
+
+.health-axis {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--jo-fg-muted);
+}
+
+.health-axis .lbl {
+  font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--jo-fg-faint);
+}

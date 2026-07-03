@@ -13,9 +13,8 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ActivatedRoute, Router } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import {
-  IonMenuButton,
   IonModal,
   IonHeader,
   IonToolbar,
@@ -53,7 +52,10 @@ import {
   TerminalScreenComponent,
   TranscriptViewComponent,
   DiffViewComponent,
+  LifecycleBarComponent,
+  StatusPillComponent,
   GitDiffView,
+  AgentPlan,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
@@ -74,6 +76,17 @@ import {
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
+import {
+  initiativeRows,
+  lensSummary,
+  touchedFiles,
+  consolePaneFor,
+  CONSOLE_SEGMENTS,
+  InitiativeRow,
+  LensChip,
+  TouchedFile,
+  ConsoleSegment,
+} from './console-logic';
 import { firstValueFrom, Subscription } from 'rxjs';
 import { WORKSPACE_MOBILE_MEDIA_QUERY } from '../../workspace-responsive';
 import {
@@ -129,10 +142,12 @@ addIcons({
   imports: [
     CommonModule,
     FormsModule,
+    RouterLink,
     TerminalScreenComponent,
     TranscriptViewComponent,
     DiffViewComponent,
-    IonMenuButton,
+    LifecycleBarComponent,
+    StatusPillComponent,
     IonModal,
     IonHeader,
     IonToolbar,
@@ -268,6 +283,41 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   isResizingPane = signal(false);
   fullscreenPaneId = signal<string | null>(null);
   isCompactWorkspace = signal(false);
+
+  // ── Initiative console (overhaul P8 §02, phase 04) ─────────────────────────
+  // The Work console wraps this page's existing pane shell in a master-detail grid. All row/summary/
+  // file/segment decisions delegate to the pure `console-logic.ts` (D3/D6/D7/D8); the primitives are the
+  // P2 `johnny-status-pill`/`johnny-lifecycle-bar`. No transcript/diff/pane-shell code is forked.
+  /** Initiatives from `listAgentPlans` (best-effort; empty when none/unauthorized). */
+  protected readonly agentPlans = signal<AgentPlan[]>([]);
+  /** The selected initiative id (drives the center lifecycle bar + right validation column). */
+  protected readonly selectedInitiativeId = signal<string | null>(null);
+  /** "now" captured once per initiative load so `formatRelTime` stays deterministic. */
+  protected readonly consoleNow = signal<string>(new Date(0).toISOString());
+  /** §08 mobile segment (Transcript default). */
+  protected readonly consoleSegment = signal<ConsoleSegment>('transcript');
+  protected readonly consoleSegments = CONSOLE_SEGMENTS;
+
+  /** Master-list rows (mock §02 left `.pane.rail`). */
+  protected readonly consoleRows = computed<InitiativeRow[]>(() =>
+    initiativeRows(this.agentPlans(), this.selectedInitiativeId(), this.consoleNow()),
+  );
+  /** The selected initiative record (for the lifecycle bar + validation config). */
+  protected readonly selectedInitiative = computed<AgentPlan | null>(() => {
+    const id = this.selectedInitiativeId();
+    return this.agentPlans().find((p) => p.id === id) ?? null;
+  });
+  /** Right-column validation lens summary (mock 658-673), reusing P7's parser. */
+  protected readonly consoleLenses = computed<LensChip[]>(() =>
+    lensSummary(this.selectedInitiative()?.validationConfig ?? null),
+  );
+  /** Right-column touched files (mock 674-684) from the ALREADY-LOADED diff of the current session. */
+  protected readonly consoleFiles = computed<TouchedFile[]>(() => {
+    const id = this.currentSession()?.id;
+    return touchedFiles(id ? this.diffFor(id) : null);
+  });
+  /** Which pane the §08 mobile switcher currently shows. */
+  protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
 
   @ViewChild('terminalWorkspace', { static: true })
   private terminalWorkspace?: ElementRef<HTMLElement>;
@@ -461,6 +511,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.subscribeToTerminalEvents();
     this.subscribeToRelayErrorEvents();
     void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
+    void this.loadInitiatives();
     void this.detectTools();
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
@@ -1352,6 +1403,35 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** The loaded diff for a session's Diff tab (null until first activation). */
   diffFor(id: string): GitDiffView | null {
     return this.diffs()[id] ?? null;
+  }
+
+  /**
+   * Load the initiative master-list for the console (overhaul P8, phase 04). Best-effort: a failure
+   * (unauthorized / host down) leaves an empty list and the benign empty state — the console degrades to
+   * the plain pane shell. `consoleNow` is stamped once here so `formatRelTime` stays deterministic.
+   */
+  private async loadInitiatives(): Promise<void> {
+    try {
+      const plans = await firstValueFrom(this.api.listAgentPlans());
+      this.consoleNow.set(new Date().toISOString());
+      this.agentPlans.set(plans ?? []);
+      // Default the selection to the first initiative so the header/right column have context.
+      if (!this.selectedInitiativeId() && plans && plans.length > 0) {
+        this.selectedInitiativeId.set(plans[0].id);
+      }
+    } catch {
+      this.agentPlans.set([]);
+    }
+  }
+
+  /** Select an initiative row (highlights it + drives the lifecycle bar / validation column). */
+  selectInitiative(row: InitiativeRow): void {
+    this.selectedInitiativeId.set(row.id);
+  }
+
+  /** Switch the §08 mobile console segment (Transcript/Files/Validation). */
+  setConsoleSegment(segment: string): void {
+    this.consoleSegment.set(consolePaneFor(segment));
   }
 
   /**

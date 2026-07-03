@@ -2090,11 +2090,6 @@ label {
     align-items: center;
   }
 
-  .mobile-menu-btn {
-    grid-row: 1;
-    grid-column: 1;
-  }
-
   .page-title-chip {
     grid-row: 1;
     grid-column: 2;
@@ -2417,15 +2412,6 @@ label {
     align-items: start;
     flex-direction: column;
   }
-}
-
-/* === Mobile menu button (hidden on md+; split-pane shows the menu permanently) === */
-.mobile-menu-btn {
-  display: none;
-  --color: var(--ion-color-step-650, #444);
-}
-@media (max-width: 767px) {
-  .mobile-menu-btn { display: inline-flex; }
 }
 
 /* Make planner-rendered mermaid clickable to open the zoom modal

@@ -1,5 +1,6 @@
 import { Component, OnInit, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { RouterLink } from '@angular/router';
 import {
   IonButton,
   IonCard,
@@ -28,6 +29,7 @@ const DISCORD_WEBHOOK_SETTING = 'discord_webhook_url';
   standalone: true,
   imports: [
     FormsModule,
+    RouterLink,
     IonHeader,
     IonToolbar,
     IonTitle,
@@ -111,6 +113,27 @@ const DISCORD_WEBHOOK_SETTING = 'discord_webhook_url';
               <em>
                 Fires only on attention (a run is blocked / needs a human decision) — never on
                 routine review changes. Leave blank to disable. Stored on the host.
+              </em>
+            </p>
+          </ion-text>
+        </ion-card-content>
+      </ion-card>
+
+      <ion-card>
+        <ion-card-header>
+          <ion-card-title>Workspace tools</ion-card-title>
+          <ion-card-subtitle>Surfaces the P8 nav rail does not list — folding into Work (P8 D13)</ion-card-subtitle>
+        </ion-card-header>
+        <ion-card-content>
+          <ion-button expand="block" fill="outline" routerLink="/development">Development runs</ion-button>
+          <ion-button expand="block" fill="outline" routerLink="/developer" class="ion-margin-top">
+            Developer API console
+          </ion-button>
+          <ion-text color="medium">
+            <p>
+              <em>
+                Development becomes a stage of an Initiative in the Work console (P8 D6); until that
+                master-detail path lands (P04), these keep the legacy surfaces reachable.
               </em>
             </p>
           </ion-text>

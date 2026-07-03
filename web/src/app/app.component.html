@@ -1,105 +1,44 @@
 <ion-app>
-  <ion-split-pane contentId="main-content" when="md" [class.side-menu-collapsed]="isMenuCollapsed()">
-    <ion-menu contentId="main-content" type="overlay" *ngIf="auth.isAuthenticated()" [class.collapsed]="isMenuCollapsed()">
-      <ion-content>
-        <ion-list lines="none">
-          <ion-list-header>
-            <span class="menu-title">JohnnyOne</span>
-            <ion-button
-              fill="clear"
-              size="small"
-              class="menu-collapse-button"
-              [attr.aria-label]="isMenuCollapsed() ? 'Expand side menu' : 'Collapse side menu'"
-              [title]="isMenuCollapsed() ? 'Expand side menu' : 'Collapse side menu'"
-              (click)="toggleSideMenu()"
-            >
-              <ion-icon slot="icon-only" [name]="isMenuCollapsed() ? 'chevron-forward-outline' : 'chevron-back-outline'"></ion-icon>
-            </ion-button>
-          </ion-list-header>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item button detail="false" lines="none" class="launcher-new" (click)="openLauncher($event)">
-              <ion-icon slot="start" name="add-outline"></ion-icon>
-              <ion-label>New</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/terminal" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="terminal-outline"></ion-icon>
-              <ion-label>Terminal</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/planning" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="document-text-outline"></ion-icon>
-              <ion-label>Planning</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/development" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="hammer-outline"></ion-icon>
-              <ion-label>Development</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/files" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="folder-outline"></ion-icon>
-              <ion-label>Files</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/shells" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="code-working-outline"></ion-icon>
-              <ion-label>Shells</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/developer" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="code-slash-outline"></ion-icon>
-              <ion-label>Developer</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-
-          <ion-menu-toggle auto-hide="false">
-            <ion-item routerLink="/settings" routerLinkActive="ion-color-primary" lines="none" detail="false">
-              <ion-icon slot="start" name="settings-outline"></ion-icon>
-              <ion-label>Settings</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-        </ion-list>
-
-        <ion-list lines="none" class="ion-margin-top">
-          <ion-menu-toggle auto-hide="false">
-            <ion-item button (click)="logout()" lines="none" detail="false">
-              <ion-icon slot="start" name="log-out-outline"></ion-icon>
-              <ion-label>Sign out</ion-label>
-            </ion-item>
-          </ion-menu-toggle>
-        </ion-list>
-      </ion-content>
-    </ion-menu>
+  <ion-split-pane contentId="main-content" when="(min-width: 900px)">
+    <!-- §02 global icon nav rail (mock lines 542-549) — replaces the old ion-menu
+         text sidebar. Widescreen only; the .botnav below covers mobile. -->
+    @if (auth.isAuthenticated()) {
+      <div class="gnav">
+        <div class="glogo">J1</div>
+        <button type="button" class="gplus" title="New…" aria-label="New…" (click)="openLauncher($event)">
+          <ion-icon name="add-outline"></ion-icon>
+        </button>
+        @for (item of navItems; track item.id) {
+          <a
+            class="ni"
+            [class.gspring]="item.id === 'settings'"
+            [routerLink]="item.path"
+            routerLinkActive="on"
+            [title]="item.label"
+            [attr.aria-label]="item.label"
+          >
+            <ion-icon [name]="item.icon"></ion-icon>
+            <span class="cap">{{ item.label }}</span>
+          </a>
+        }
+      </div>
+    }
 
     <ion-router-outlet id="main-content"></ion-router-outlet>
   </ion-split-pane>
 
-  <!-- Draggable resizer pinned to the right edge of the side menu (md+ only). -->
-  <div
-    *ngIf="auth.isAuthenticated()"
-    class="side-resizer"
-    [class.dragging]="isResizing()"
-    (mousedown)="startResize($event)"
-    role="separator"
-    aria-orientation="vertical"
-    aria-label="Resize side menu"
-  >
-    <div class="side-resizer-handle"></div>
-  </div>
+  <!-- §08 mobile bottom nav (mock lines 1090-1095) — same four destinations from
+       NAV_ITEMS, shown only at mobile width (viewport-keyed, 900px — D12). -->
+  @if (auth.isAuthenticated()) {
+    <nav class="botnav" aria-label="Primary">
+      @for (item of navItems; track item.id) {
+        <a class="b" [routerLink]="item.path" routerLinkActive="on" [attr.aria-label]="item.label">
+          <ion-icon [name]="item.icon"></ion-icon>
+          {{ item.label }}
+        </a>
+      }
+    </nav>
+  }
 
   <!-- Mermaid zoom modal — open via MermaidZoomService. Mounted once globally
        so any page (planner, terminal chat, etc.) can summon it. -->

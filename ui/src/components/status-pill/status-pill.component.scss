@@ -1,0 +1,31 @@
+// Mirrors mock `.pill` / `.pill .tick` (lines 94-103). Color comes from `--sc`,
+// which the component binds to the mapped P01 token (`--jo-st-*` / `--jo-warn`
+// / `--jo-bad` / `--jo-good`). The `.st-*` / `.health*` class is applied for
+// semantic hooks; `--sc` carries the actual color.
+:host {
+  display: inline-flex;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--jo-font-mono, ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  color: var(--sc);
+  background: color-mix(in srgb, var(--sc) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--sc) 34%, transparent);
+}
+
+.pill .tick {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sc);
+  flex: none;
+}
