@@ -840,7 +840,7 @@ export class JohnnyApiService {
   ): Observable<UploadChunkResult> {
     return this.gql
       .mutate<{ initiativeUploadChunk: UploadChunkResult }>(
-        `mutation InitiativeUploadChunk($initiativeId: ID!, $path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
+        `query InitiativeUploadChunk($initiativeId: ID!, $path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
           initiativeUploadChunk(initiativeId: $initiativeId, path: $path, chunkIndex: $chunkIndex, totalChunks: $totalChunks, dataBase64: $dataBase64, done: $done) {
             path received complete
           }
@@ -1139,7 +1139,7 @@ export class JohnnyApiService {
   ): Observable<FileOpResult> {
     return this.gql
       .mutate<{ filesWrite: FileOpResult }>(
-        `mutation FilesWrite($path: String!, $content: String!, $encoding: String) {
+        `query FilesWrite($path: String!, $content: String!, $encoding: String) {
           filesWrite(path: $path, content: $content, encoding: $encoding) {
             path ok
           }
@@ -1152,7 +1152,7 @@ export class JohnnyApiService {
   mkdir(path: string): Observable<FileOpResult> {
     return this.gql
       .mutate<{ filesMkdir: FileOpResult }>(
-        `mutation FilesMkdir($path: String!) {
+        `query FilesMkdir($path: String!) {
           filesMkdir(path: $path) {
             path ok
           }
@@ -1165,7 +1165,7 @@ export class JohnnyApiService {
   rename(from: string, to: string): Observable<FileOpResult> {
     return this.gql
       .mutate<{ filesRename: FileOpResult }>(
-        `mutation FilesRename($from: String!, $to: String!) {
+        `query FilesRename($from: String!, $to: String!) {
           filesRename(from: $from, to: $to) {
             path ok
           }
@@ -1178,7 +1178,7 @@ export class JohnnyApiService {
   deleteFile(path: string): Observable<FileOpResult> {
     return this.gql
       .mutate<{ filesDelete: FileOpResult }>(
-        `mutation FilesDelete($path: String!) {
+        `query FilesDelete($path: String!) {
           filesDelete(path: $path) {
             path ok
           }
@@ -1197,7 +1197,7 @@ export class JohnnyApiService {
   ): Observable<UploadChunkResult> {
     return this.gql
       .mutate<{ filesUploadChunk: UploadChunkResult }>(
-        `mutation FilesUploadChunk($path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
+        `query FilesUploadChunk($path: String!, $chunkIndex: Int!, $totalChunks: Int!, $dataBase64: String!, $done: Boolean!) {
           filesUploadChunk(path: $path, chunkIndex: $chunkIndex, totalChunks: $totalChunks, dataBase64: $dataBase64, done: $done) {
             path received complete
           }

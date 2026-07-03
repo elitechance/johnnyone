@@ -483,9 +483,21 @@ type Query {
   readHostFile(planId: ID!, path: String!): HostFileContent!
   getWorkspaceFileDiff(planId: ID!, path: String!): WorkspaceFileDiff!
   getChatAttachment(id: ID!): ChatAttachmentContent!
-  # File manager (overhaul P2) — relay to host files_root surface.
+  # File manager (overhaul P2) — relay to the host files_root surface.
+  # NOTE: the write ops (filesWrite/filesMkdir/filesRename/filesDelete/filesUploadChunk) and
+  # initiativeUploadChunk live under Query (not Mutation) to satisfy lokal's resolver-file naming
+  # convention: field type is inferred from the filename's leading verb, and `files-*` / `initiative-*`
+  # are not mutation prefixes, so their resolvers auto-wire as Query. The client's query/mutate are the
+  # same no-cache POST (graphql-client.ts), so there is no caching/idempotency concern — the resolvers
+  # still perform the write, scope-gated by files:write. Keeps the cohesive files* namespace consistent.
   filesListDir(path: String!): DirListing!
   filesRead(path: String!): FileContent!
+  filesWrite(path: String!, content: String!, encoding: String): FileOpResult!
+  filesMkdir(path: String!): FileOpResult!
+  filesRename(from: String!, to: String!): FileOpResult!
+  filesDelete(path: String!): FileOpResult!
+  filesUploadChunk(path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
+  initiativeUploadChunk(initiativeId: ID!, path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
   # Whole-tree working-tree diff (overhaul P7, D7/D10) — path-keyed, scope-gated like the file ops.
   gitDiff(path: String!): GitDiffView!
 }
@@ -525,16 +537,11 @@ type Mutation {
   updateGitAction(planId: ID!, path: String, action: String!, message: String): GitActionResult!
   createChatAttachment(input: ChatAttachmentInput!): ChatAttachment!
   deleteChatAttachment(input: MarkChatAttachmentDeliveredInput!): ChatAttachment!
-  # File manager (overhaul P2) — relay to host files_root surface.
-  filesWrite(path: String!, content: String!, encoding: String): FileOpResult!
-  filesMkdir(path: String!): FileOpResult!
-  filesRename(from: String!, to: String!): FileOpResult!
-  filesDelete(path: String!): FileOpResult!
-  filesUploadChunk(path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
   # Briefing loop (overhaul P4) — thin desktopRpc pass-throughs to the Phase 01/02 host methods.
+  # (filesWrite/filesMkdir/filesRename/filesDelete/filesUploadChunk + initiativeUploadChunk moved to
+  # Query above to match lokal's resolver-filename type inference — see the note there.)
   createBriefingInitiative(input: CreateBriefingInput!): AgentPlanRun!
   acceptInitiativeBrief(input: AcceptBriefInput!): AgentPlanRun!
-  initiativeUploadChunk(initiativeId: ID!, path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
   addInitiativeReferencePath(initiativeId: ID!, path: String!): AgentPlanRun!
 }
 
