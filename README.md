@@ -126,6 +126,7 @@ Recent planner/runtime behavior worth knowing:
 - An Initiative can now start in a **briefing** stage — a clarify-before-planning conversation that ends in an explicit "Accept brief → Planning". Accept flips the *same* `agent_plans` row from `initiative_status='briefing'` to `'planning'` and starts the existing planner with the composed brief (no second row). See [`docs/briefing.md`](docs/briefing.md).
 - A two-pane **file manager** is reachable at **`/files`** (nav entry: Files) — browse the `files_root`-rooted tree with breadcrumbs, preview via the render core (markdown/code), inline-edit text with a `● unsaved` indicator + Save, run the CRUD toolbar (New file/folder · Rename · Delete), and drag-drop upload with per-file progress. UI only over the existing P2 host file ops; the host guards every path. See [`docs/files.md`](docs/files.md).
 - A **`+ New` launcher** (nav entry: New) and a **Shells destination** at **`/shells`** (nav entry: Shells) let the operator launch a plain shell and see their launched shells in one place. The launcher popover has four entries — New initiative (→ briefing), **Raw shell** (`createSession({provider:'shell'})` → open in the terminal surface), Attach to tmux session (`listTmuxSessions()` picker), Open file manager (→ /files). `/shells` lists active shell/attached-tmux sessions plus attachable external tmux panes; opening a row navigates to the existing terminal surface (no second terminal is embedded). Web-only, reuse-only — no new agent runner, spawn path, or transport. See [`docs/shells.md`](docs/shells.md).
+- **Validation is a configurable, ordered N-lens array persisted on the Initiative** (min 1, no max) instead of a fixed 3-lens set. Each lens has its own provider/model, a `vision` flag, and a **BLOCK/WARN** role — `blocking:true` gates phase promotion, `blocking:false` warns/annotates only. An unconfigured Initiative resolves the default template (today's `product`/`qa`/`lead`), so nothing regresses. Configured at **`/initiatives/:id/validation`** and persisted via `updateAgentPlanValidationConfig`. The session terminal also gains a **Diff** pane tab that renders the working-tree git diff (changed-file list + per-file hunks, highlighted via the render core) using the new whole-tree `gitDiff(path)` op. New Rust lands with deferred activation (live after the next `npm run desktop`). See [`docs/validation-diff.md`](docs/validation-diff.md).
 - Planning and Development tabs use a soft-close model. Closing a run removes it from the active tab strip but keeps the plan row, sessions, and plan path so it can be re-opened from `Existing Plans` if the plan path still exists.
 - Planning and Development run titles are renameable from the coordinator UI and the title is persisted in the local SQLite `agent_plans` row, so reopened runs keep the renamed title.
 - Development can start from a selected phase in either `continue` mode or `single` mode. `single` runs stop after the selected phase is approved instead of automatically continuing to later phases.
@@ -385,9 +386,9 @@ served in-app at the public **`/integration`** route
 - **Auth** (lokal builtin) — `login`, `loginWithOauth`, `myCompleteFirstLogin`, `adminCreate{User,Tenant}`, `refreshToken`
 - **Sessions** — `listAiSessions`, `getAiSession`, `createAiSession`, `updateAiSession{Title,Provider,WorkingDirectory,Archived}`, `deleteAiSession`
 - **Chat** — `sendRelayChatMessage`, `cancelAiGeneration`, `listAiMessages`
-- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `deleteAgentPlan`
+- **Agent planner** — `listAgentPlans`, `getAgentPlan`, `createAgentPlan`, `startAgentPlan`, `updateAgentPlanAmend`, `updateAgentPlan{Stopped,Blocked}`, `updateAgentPhaseManualPass`, `retryAgentReviewer`, `sendAgentFeedbackToWorker`, `updateAgentPlanValidationConfig` (persist the Initiative's ordered validation-lens array), `deleteAgentPlan`
 - **Briefing loop** — `createBriefingInitiative`, `acceptInitiativeBrief`, `initiativeUploadChunk`, `addInitiativeReferencePath` (an Initiative's clarify-before-planning front door; `AgentPlan.briefingSessionId` links the conversation). See [`docs/briefing.md`](docs/briefing.md)
-- **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff`, `validateWorkspacePlan`
+- **Workspace / host files** — `browseHostDirectory`, `listWorkspaceFiles`, `readHostFile`, `getWorkspaceFileDiff` (per-file), `gitDiff` (whole working-tree diff by path, `files:read`-scoped), `validateWorkspacePlan`
 - **File manager (`files_root`-rooted)** — `filesListDir`, `filesRead`, `filesWrite`, `filesMkdir`, `filesRename`, `filesDelete`, `filesUploadChunk` (chunked upload). Path-guarded + size-capped, scoped by `files:read`/`files:write`. See [`docs/host-transport.md`](docs/host-transport.md)
 - **Terminal / shell** — `captureTerminal` (deterministic one-shot pane snapshot; live I/O still rides the WSS `terminal_*` envelopes)
 - **Providers / settings** — `listDetectedCliTools`, `listProviderConfigs`, `upsertProviderConfig`, `deleteProviderConfig`, `getSetting`, `setSetting`, `getPlannerPromptSettings`, `updatePlannerPromptSettings`
@@ -430,6 +431,11 @@ Repo-local docs live alongside the code:
   P6): the four-entry launcher popover, raw-shell launch and attach-to-tmux over
   the existing P2 session ops, the shells list (filter/dedupe), and the pure
   launcher/list seams — all navigating to the existing P3 terminal surface
+- **`docs/validation-diff.md`** — configurable validation + the Diff tab (overhaul
+  P7): the Initiative-scoped ordered N-lens array (per-lens provider/model/vision +
+  BLOCK/WARN gate split, default = product/qa/lead), the dynamic review fan-out,
+  the whole-tree `gitDiff` RPC, and the `johnny-diff-view` Diff pane tab reusing
+  the render core
 
 ## Notable features shipped beyond the multi-user-saas plan
 
@@ -497,6 +503,7 @@ plan, so a fresh session can know what's already live.
 | Briefing loop — clarify → accept → plan (overhaul P4) | Done (2026-07) |
 | Files manager — `/files` browse/preview/edit + CRUD + upload (overhaul P5) | Done (2026-07) |
 | Raw shell launcher + `/shells` destination (overhaul P6) | Done (2026-07) |
+| Configurable validation (N lenses) + Diff tab (overhaul P7) | Done (2026-07) |
 | Channel adapters (Telegram, Discord, WhatsApp) | In progress (resolvers stubbed) |
 | Browser automation, cron scheduling, voice input | Planned |
 

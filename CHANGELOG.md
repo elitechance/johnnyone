@@ -7,6 +7,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Configurable validation + Diff tab (overhaul P7)**. Two independent things.
+  **(1) Configurable validation** — the phase-review fan-out (development **and**
+  planning) is now driven by an **ordered, N-lens array persisted on the
+  Initiative** (`agent_plans.validation_config TEXT`, migration `019`) instead of
+  a hardcoded 3-lens set. Each `ValidationLens` carries `{name, provider, model?,
+  prompt?, vision, blocking}`; **min 1, no max**. `resolve_validation_lenses`
+  falls back to `default_validation_config` (today's `product`/`qa`/`lead`, all
+  blocking, non-vision) when the config is absent/malformed/empty, so an
+  unconfigured Initiative behaves **exactly** as before. The fan-out was
+  **extended, not rewritten**: `run_lens_fanout_review` /
+  `run_planning_lens_fanout_review` now iterate the resolved list with
+  `futures_util::future::join_all` (N-arity, replacing the hand-unrolled
+  `tokio::join!`), each lens on its own provider/model. A new pure
+  `gate_verdict_over_blocking` computes PASS/FAIL from **only** the `blocking:true`
+  lenses; `blocking:false` (warn) lenses still fold findings into the merged
+  reviewer body (tagged `(warn)`) but do not gate. `merged_verdict` /
+  `count_consecutive_non_pass` untouched. Persisted via
+  `updateAgentPlanValidationConfig(id, config)` (`plans:write`-scoped;
+  `update_plan_validation_config` validates JSON + provider before writing) and
+  configured at the lazy `/initiatives/:id/validation` route (`ion-reorder-group`
+  + per-lens provider/model + vision + BLOCK/WARN toggles; add/remove min-1),
+  whose list decisions live in the pure `validation-config-logic.ts`.
+  **(2) Diff tab** — a **Diff** pane tab in the session center pane (beside
+  Transcript / Raw terminal) renders the **working-tree git diff** of the
+  session's directory. New whole-tree, **path-keyed** `git_diff(path)` host op
+  (`git rev-parse --show-toplevel` + `git diff HEAD --numstat` + `git diff HEAD` →
+  `GitDiffView { repoRoot?, branch?, clean, files[] }`), path-guarded + read-only,
+  excluding untracked files; exposed as `gitDiff(path): GitDiffView!`
+  (`files:read`-scoped, same posture as `filesListDir`/`filesRead`). Rendered by a
+  new standalone `johnny-diff-view` + pure `diff-parse.ts` (`parseUnifiedDiff` /
+  `langForPath` / `fileTotals`) that **reuses the P3 render core** (`highlightCode`)
+  — no second highlighter. `terminal.page` loads it best-effort on tab activation
+  (`gitDiff(session.workingDirectory)`; no cwd / non-repo / failed RPC → benign
+  empty view). New Rust lands with **deferred activation** (live after the next
+  `npm run desktop`); the running desktop app is not relaunched. `cargo build`/
+  `cargo test`, nx build worker/web/ui, and web vitest
+  (`diff-parse.spec.ts`/`validation-config-logic.spec.ts`) green; visual
+  verification deferred. See [`docs/validation-diff.md`](docs/validation-diff.md).
 - **Raw shell launcher + Shells destination (overhaul P6)**. A **`+ New`**
   launcher popover (nav entry: New) and a **Shells** destination at **`/shells`**
   (nav entry: Shells) — **web-only, reuse-only** (no new agent runner, session-spawn
