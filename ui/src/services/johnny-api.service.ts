@@ -792,7 +792,7 @@ export class JohnnyApiService {
             id runType title workspacePath planPath status workerSessionId reviewerSessionId
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
             brief appScope docsScope referencePaths
-            initiativeId initiativeStatus health validationConfig
+            initiativeId initiativeStatus health validationConfig briefingSessionId
             createdAt updatedAt
           }
         }`,
