@@ -3,6 +3,10 @@ import { GRAPHQL_API_URL, GRAPHQL_WS_URL, HOST_GRAPHQL_API_URL } from '@johnnyon
 import { appConfig } from './app/app.config';
 import { AppComponent } from './app/app.component';
 import { getWorkerGraphqlUrl, getWorkerGraphqlWsUrl } from './worker-url';
+import { installChunkReload } from './chunk-reload';
+
+// Recover open tabs after a deploy (old chunk names → MIME/module errors) by reloading once.
+installChunkReload();
 
 bootstrapApplication(AppComponent, {
   ...appConfig,
