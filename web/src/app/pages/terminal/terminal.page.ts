@@ -915,7 +915,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    * selection, so a dead/deleted session can never pin or corrupt the Terminal UI.
    */
   private reconcilePersistedTerminalState(activeSessions: Session[]): void {
-    const activeIds = new Set(activeSessions.map((s) => s.id));
+    // Retain the console's laned sessions (the selected initiative's primary session + visible panes)
+    // in addition to the AI-session list. A briefing initiative's agent session may not appear in
+    // `listAiSessions`, and without this its live screen would be purged here → the Raw terminal
+    // renders blank even though the desktop is publishing it.
+    const activeIds = new Set([
+      ...activeSessions.map((s) => s.id),
+      ...this.lanedSessionIds(),
+    ]);
 
     // 1. In-memory signals — reuse the existing prune (terminalScreens + paneLayouts + closedPaneIds).
     this.removeInactivePaneState(activeIds);
