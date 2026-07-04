@@ -691,22 +691,31 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  /** Track the `.console` container width so the console collapses to a single column at
-   *  `CONSOLE_COLLAPSE_PX` (P5) — mirrors `@container console (max-width: 760px)`. */
+  /** Track the console's AVAILABLE width so it collapses to a single column at
+   *  `CONSOLE_COLLAPSE_PX` (P5) — mirrors `@container console (max-width: 760px)`.
+   *
+   *  #10 fix: observe `.console`'s PARENT (the display:block page host filling the
+   *  router-outlet content area — a stable width unaffected by the collapse), NOT `.console`
+   *  itself. The collapse binding shrinks `.console`, so observing the element being restyled
+   *  feedback-loops: once collapsed, `.console` measures ≤ threshold forever and can never
+   *  climb back out (opening a second terminal permanently latched the narrow layout). The
+   *  parent's width comes from the app shell (viewport − nav rail) and does not shrink. */
   private setupConsoleCollapseObserver(): void {
     const el = this.consoleRoot?.nativeElement;
-    if (!el || typeof ResizeObserver === 'undefined') return;
+    // Measure a stable ancestor, never the collapsing `.console` itself (else it latches).
+    const target = el?.parentElement ?? el;
+    if (!target || typeof ResizeObserver === 'undefined') return;
     const update = (width: number): void => {
       this.consoleCompact.set(width > 0 && width <= TerminalPage.CONSOLE_COLLAPSE_PX);
     };
-    update(el.getBoundingClientRect().width);
+    update(target.getBoundingClientRect().width);
     this.consoleResizeObserver?.disconnect();
     this.consoleResizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         update(entry.contentRect.width);
       }
     });
-    this.consoleResizeObserver.observe(el);
+    this.consoleResizeObserver.observe(target);
   }
 
   @HostListener('document:keydown.escape')
