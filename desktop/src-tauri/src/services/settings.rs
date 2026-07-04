@@ -259,13 +259,26 @@ pub fn resolve_workspace_host_path(
     };
 
     let workspace = normalize_existing_dir(Path::new(workspace_path))?;
-    let candidate = if Path::new(fallback).is_absolute() {
-        PathBuf::from(fallback)
-    } else {
-        workspace.join(fallback)
-    };
-
-    normalize_path(&candidate).map(|path| path.to_string_lossy().to_string())
+    if Path::new(fallback).is_absolute() {
+        return normalize_path(&PathBuf::from(fallback)).map(|path| path.to_string_lossy().to_string());
+    }
+    // Relative config path (e.g. the default `lokal/agents/common/methodology.md`). The shared
+    // methodology/conventions usually live at the WORKSPACE-tree root, not inside each app's own
+    // workspace dir — so try the workspace, then walk up its ancestors and return the first place the
+    // path actually EXISTS. Without this, a nested workspace (…/personal/hello-e2e) resolves to a
+    // non-existent …/hello-e2e/lokal/agents/common/methodology.md and the planner, given a missing
+    // methodology, improvises an off-spec plan (flat plan.md instead of overview.md + phases/).
+    for ancestor in workspace.ancestors() {
+        let candidate = ancestor.join(fallback);
+        if candidate.exists() {
+            return candidate
+                .canonicalize()
+                .map(|path| path.to_string_lossy().to_string())
+                .map_err(|e| format!("Invalid path: {}", e));
+        }
+    }
+    // Nothing found up the tree — fall back to the workspace-relative path (may not exist yet).
+    normalize_path(&workspace.join(fallback)).map(|path| path.to_string_lossy().to_string())
 }
 
 pub fn resolve_methodology_path(state: &AppState, workspace_path: &str) -> Result<String, String> {
