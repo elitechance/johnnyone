@@ -15,8 +15,8 @@
     <!-- End the briefing from the always-visible header (the in-chat Accept bar can scroll off). -->
     @if (!isCreate() && canAcceptNow()) {
       <ion-buttons slot="end">
-        <ion-button fill="solid" color="primary" [disabled]="accepting()" (click)="onAccept()">
-          {{ accepting() ? 'Accepting…' : '✓ Accept brief → Planning' }}
+        <ion-button fill="solid" color="primary" [disabled]="accepting() || generatingBrief()" (click)="finalizeBrief()">
+          {{ generatingBrief() ? 'Finalizing…' : '✓ Finalize brief → Planning' }}
         </ion-button>
       </ion-buttons>
     }
@@ -209,17 +209,55 @@
           <div class="brief-foot">
             <ion-button
               class="accept"
-              [disabled]="!canAcceptNow() || accepting()"
-              (click)="onAccept()">
-              ✓ Accept brief → Planning
+              [disabled]="!canAcceptNow() || accepting() || generatingBrief()"
+              (click)="finalizeBrief()">
+              ✓ Finalize brief → Planning
             </ion-button>
             <ion-button fill="clear" (click)="onKeepRefining()">Keep refining</ion-button>
             <span class="hint">
-              Accepting advances the same initiative from <b>briefing</b> to <b>planning</b>.
+              J1 consolidates the whole discussion into a brief you review; it's what the planner
+              <b>and the validation lenses</b> receive.
             </span>
           </div>
         </div>
       </johnny-chat-window>
     </div>
+
+    <!-- Review the consolidated brief before it goes to planning + the lenses (editable). -->
+    <ion-modal [isOpen]="reviewOpen()" (didDismiss)="reviewOpen.set(false)">
+      <ng-template>
+        <ion-header>
+          <ion-toolbar>
+            <ion-title>Review brief → Planning</ion-title>
+            <ion-buttons slot="end">
+              <ion-button (click)="reviewOpen.set(false)">Cancel</ion-button>
+            </ion-buttons>
+          </ion-toolbar>
+        </ion-header>
+        <ion-content class="brief-review-content">
+          @if (generatingBrief()) {
+            <div class="brief-generating">Johnny is consolidating the discussion into a brief…</div>
+          } @else {
+            <p class="brief-review-hint">
+              This is what the <b>planner</b> and the <b>validation lenses</b> will receive. Edit as needed.
+            </p>
+            <ion-textarea
+              class="brief-review"
+              [autoGrow]="true"
+              [ngModel]="draftBrief()"
+              (ngModelChange)="draftBrief.set($event)"
+              placeholder="The consolidated brief…"></ion-textarea>
+          }
+        </ion-content>
+        <div class="brief-review-actions">
+          <ion-button
+            expand="block"
+            [disabled]="generatingBrief() || accepting() || !draftBrief().trim()"
+            (click)="confirmBrief()">
+            {{ accepting() ? 'Accepting…' : '✓ Accept → Planning' }}
+          </ion-button>
+        </div>
+      </ng-template>
+    </ion-modal>
   }
 </ion-content>

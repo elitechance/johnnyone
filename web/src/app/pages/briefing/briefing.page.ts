@@ -1,5 +1,5 @@
 import { CommonModule } from '@angular/common';
-import { Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { Component, OnDestroy, OnInit, computed, effect, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
 import {
@@ -127,6 +127,28 @@ export class BriefingPage implements OnInit, OnDestroy {
   protected readonly dirError = signal<string | null>(null);
 
   protected readonly canAcceptNow = computed(() => canAccept(this.plan()?.initiativeStatus));
+
+  // ── Finalize brief (capture the conversation into the brief planning + lenses receive) ───────────
+  private static readonly FINALIZE_PROMPT =
+    'We are done discussing. Write the FINAL consolidated brief for this initiative now — a short, ' +
+    'concrete brief the planner and the validation lenses can act on. Include: Goal, Scope (in/out), ' +
+    'Constraints, and Acceptance criteria. Output only the brief (markdown), no preamble.';
+  protected readonly reviewOpen = signal(false);
+  protected readonly generatingBrief = signal(false);
+  protected readonly draftBrief = signal('');
+  private briefBaseline = 0;
+  /** When a finalize turn finishes streaming, lift Johnny's consolidated brief into the editable box. */
+  private readonly briefCaptureEffect = effect(() => {
+    const streaming = this.streaming();
+    if (streaming || !this.generatingBrief()) return;
+    const msgs = this.messages();
+    if (msgs.length <= this.briefBaseline) return;
+    const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');
+    if (lastAssistant) {
+      this.draftBrief.set(lastAssistant.content);
+      this.generatingBrief.set(false);
+    }
+  });
 
   ngOnInit(): void {
     const id = this.route.snapshot.paramMap.get('initiativeId');
@@ -263,13 +285,29 @@ export class BriefingPage implements OnInit, OnDestroy {
   }
 
   // ── Accept → planning (same initiative) ─────────────────────────────────────────────────────────
-  protected onAccept(): void {
+  /** Step 1: ask Johnny to consolidate the whole discussion into a final brief, then open the review
+   *  box (the effect above lifts the reply in). This is what makes the CONVERSATION — not just the
+   *  original one-line ask — reach planning AND the validation lenses. */
+  protected finalizeBrief(): void {
+    if (!this.canAcceptNow() || this.accepting() || this.generatingBrief()) return;
+    this.draftBrief.set('');
+    this.generatingBrief.set(true);
+    this.reviewOpen.set(true);
+    this.briefBaseline = this.messages().length;
+    this.chat.sendMessage(BriefingPage.FINALIZE_PROMPT);
+  }
+
+  /** Step 2: send the (edited) consolidated brief as `finalBrief` so it is stored on the initiative,
+   *  written to the plan store, and handed to both the planner and the lenses. */
+  protected confirmBrief(): void {
     const id = this.initiativeId();
-    if (!id || !this.canAcceptNow() || this.accepting()) return;
+    const finalBrief = this.draftBrief().trim();
+    if (!id || !this.canAcceptNow() || this.accepting() || !finalBrief) return;
     this.accepting.set(true);
-    this.api.acceptInitiativeBrief({ initiativeId: id }).subscribe({
+    this.api.acceptInitiativeBrief({ initiativeId: id, finalBrief }).subscribe({
       next: () => {
         this.accepting.set(false);
+        this.reviewOpen.set(false);
         void this.router.navigateByUrl('/planning/' + id);
       },
       error: (err) => {
