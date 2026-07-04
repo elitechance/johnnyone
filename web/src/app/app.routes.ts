@@ -35,25 +35,13 @@ export const appRoutes: Route[] = [
     redirectTo: 'initiatives',
     pathMatch: 'full',
   },
-  // Planner (T1=Planner, T2=Plan Reviewer) — produces methodology plans.
-  // Same component renders both modes; route data tells it which.
-  {
-    path: 'planning',
-    title: 'Planning',
-    canActivate: [authGuard],
-    data: { mode: 'planning' },
-    loadComponent: () =>
-      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
-  },
-  // Deep link to a specific selected run, e.g. /planning/<planId>.
-  {
-    path: 'planning/:planId',
-    title: 'Planning',
-    canActivate: [authGuard],
-    data: { mode: 'planning' },
-    loadComponent: () =>
-      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
-  },
+  // Legacy /planning + /development (the split PlannerPage) were REMOVED: planning and development are
+  // now stages of one Initiative, run and controlled entirely on the /initiatives console (progression
+  // is automatic; Stop/Amend live inline there). Old links redirect to the console.
+  { path: 'planning', redirectTo: 'initiatives', pathMatch: 'full' },
+  { path: 'planning/:planId', redirectTo: 'initiatives', pathMatch: 'full' },
+  { path: 'development', redirectTo: 'initiatives', pathMatch: 'full' },
+  { path: 'development/:planId', redirectTo: 'initiatives', pathMatch: 'full' },
   // New-initiative create form (overhaul P4, briefing step removed). Creating provisions the
   // initiative and immediately accepts it, so the lifecycle starts at planning — there is no
   // interactive briefing conversation, hence no `briefing/:initiativeId` route.
@@ -105,23 +93,6 @@ export const appRoutes: Route[] = [
       import('./pages/validation-config/validation-config.page').then(
         (m) => m.ValidationConfigPage,
       ),
-  },
-  // Development (T1=Worker, T2=Reviewer) — executes approved plans.
-  {
-    path: 'development',
-    title: 'Development',
-    canActivate: [authGuard],
-    data: { mode: 'development' },
-    loadComponent: () =>
-      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
-  },
-  {
-    path: 'development/:planId',
-    title: 'Development',
-    canActivate: [authGuard],
-    data: { mode: 'development' },
-    loadComponent: () =>
-      import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
   // Developer console — authenticated UI for the partner API surface
   // (auth/keys, agent-session CRUD, live WSS terminal). The public docs live
