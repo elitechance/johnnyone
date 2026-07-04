@@ -174,3 +174,33 @@
   padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--ion-color-step-100, #e6e6ea);
 }
+
+/* Finalize-brief review modal. */
+.brief-review-content {
+  --padding-start: 16px;
+  --padding-end: 16px;
+  --padding-top: 12px;
+}
+.brief-generating {
+  padding: 24px 8px;
+  color: var(--ion-color-step-500, #7a7a82);
+  font-style: italic;
+}
+.brief-review-hint {
+  margin: 4px 0 10px;
+  font-size: 13px;
+  color: var(--ion-color-step-600, #55555d);
+}
+.brief-review {
+  --background: var(--ion-color-step-50, #f7f7f9);
+  --padding-start: 10px;
+  --padding-end: 10px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+  min-height: 40vh;
+}
+.brief-review-actions {
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--ion-color-step-100, #e6e6ea);
+}
