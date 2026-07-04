@@ -1818,6 +1818,35 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     void this.router.navigateByUrl('/briefing/new');
   }
 
+  /** True while an Accept-brief request is in flight (drives the console Accept button). */
+  protected readonly acceptingBrief = signal(false);
+
+  /** Accept a briefing-stage initiative → planning. Briefing is an interactive terminal now; the
+   *  agent writes the final brief to brief.md, which the backend reads on accept. */
+  async acceptBrief(initiativeId: string): Promise<void> {
+    const alert = await this.alertCtrl.create({
+      header: 'Accept brief → Planning',
+      message:
+        'This advances the initiative from briefing to planning using the brief the agent wrote to brief.md. Make sure you asked the agent (in the Raw terminal) to finalize the brief first.',
+      buttons: [
+        { text: 'Cancel', role: 'cancel' },
+        { text: 'Accept → Planning', role: 'confirm' },
+      ],
+    });
+    await alert.present();
+    const { role } = await alert.onDidDismiss();
+    if (role !== 'confirm') return;
+    this.acceptingBrief.set(true);
+    try {
+      await firstValueFrom(this.api.acceptInitiativeBrief({ initiativeId }));
+      await this.loadInitiatives();
+    } catch (err) {
+      await this.showInitiativeError('Failed to accept brief', err);
+    } finally {
+      this.acceptingBrief.set(false);
+    }
+  }
+
   /** Mobile master-detail: clear the selection to return to the initiatives list, and drop the
    *  `?initiativeId&tab` deep-link params so a refresh/back stays on the list. */
   backToInitiativesList(): void {
