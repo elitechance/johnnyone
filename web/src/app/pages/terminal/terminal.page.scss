@@ -9,6 +9,21 @@
   background: #07090d;
 }
 
+/* Mobile: the global .botnav is position:fixed at the bottom (~56px). Nothing reserved space for it,
+   so the bottom of the surface — notably the shell/terminal composer — rendered BEHIND it and was
+   unreachable. Lift the whole terminal page above the botnav and make the inner 100dvh shells fill
+   this reduced host instead of the full viewport. */
+@media (max-width: 900px) {
+  :host {
+    height: auto;
+    bottom: calc(56px + env(safe-area-inset-bottom));
+  }
+  .workspace-shell,
+  .console {
+    height: 100%;
+  }
+}
+
 .workspace-shell {
   @include workspace.shell-vars;
   @include workspace.viewport-height;
