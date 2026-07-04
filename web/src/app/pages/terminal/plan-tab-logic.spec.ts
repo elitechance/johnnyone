@@ -7,6 +7,7 @@ import type {
 import {
   planCounts,
   docNavModel,
+  defaultPlanDoc,
   phaseCards,
   planDocPath,
   taskStatusLabel,
@@ -51,12 +52,19 @@ describe('planCounts', () => {
 });
 
 describe('docNavModel', () => {
-  it('lists overview.md, status.md, then phases in host order, each with its task rows', () => {
+  it('lists brief/plan, then (when phases exist) overview/status + phases in host order', () => {
     const nav = docNavModel(SAMPLE);
-    expect(nav.map((e) => e.id)).toEqual(['overview.md', 'status.md', 'P1-schema', 'P2-runner']);
-    expect(nav[0]).toEqual({ kind: 'file', id: 'overview.md', label: 'overview.md' });
-    expect(nav[1]).toEqual({ kind: 'file', id: 'status.md', label: 'status.md' });
-    const p2 = nav[3];
+    expect(nav.map((e) => e.id)).toEqual([
+      'brief.md',
+      'plan.md',
+      'overview.md',
+      'status.md',
+      'P1-schema',
+      'P2-runner',
+    ]);
+    expect(nav[0]).toEqual({ kind: 'file', id: 'brief.md', label: 'brief.md' });
+    expect(nav[1]).toEqual({ kind: 'file', id: 'plan.md', label: 'plan.md' });
+    const p2 = nav[5];
     expect(p2.kind).toBe('phase');
     if (p2.kind === 'phase') {
       expect(p2.label).toBe('Parallel runner');
@@ -68,8 +76,8 @@ describe('docNavModel', () => {
       ]);
     }
   });
-  it('returns just the two fixed files for a null/empty run', () => {
-    expect(docNavModel(null).map((e) => e.id)).toEqual(['overview.md', 'status.md']);
+  it('returns just the planning artifacts (brief/plan) for a null/phase-less run', () => {
+    expect(docNavModel(null).map((e) => e.id)).toEqual(['brief.md', 'plan.md']);
   });
 });
 
@@ -99,10 +107,20 @@ describe('phaseCards', () => {
   });
 });
 
+describe('defaultPlanDoc', () => {
+  it('opens plan.md while planning (no phases) and overview.md once decomposed', () => {
+    expect(defaultPlanDoc(null)).toBe('plan.md');
+    expect(defaultPlanDoc({ phases: [] } as unknown as AgentPlanRun)).toBe('plan.md');
+    expect(defaultPlanDoc(SAMPLE)).toBe('overview.md');
+  });
+});
+
 describe('planDocPath', () => {
   const BASE = '/store/.johnnyone/initiatives/abc/plan';
 
-  it('builds fixed-suffix paths for the two files and a phase id', () => {
+  it('builds fixed-suffix paths for planning + development files and a phase id', () => {
+    expect(planDocPath(BASE, 'brief.md')).toBe(`${BASE}/brief.md`);
+    expect(planDocPath(BASE, 'plan.md')).toBe(`${BASE}/plan.md`);
     expect(planDocPath(BASE, 'overview.md')).toBe(`${BASE}/overview.md`);
     expect(planDocPath(BASE, 'status.md')).toBe(`${BASE}/status.md`);
     expect(planDocPath(BASE, 'P2-runner')).toBe(`${BASE}/phases/P2-runner/overview.md`);

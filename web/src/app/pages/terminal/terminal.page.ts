@@ -102,6 +102,7 @@ import {
 import {
   planCounts,
   docNavModel,
+  defaultPlanDoc,
   phaseCards,
   planDocPath,
   taskStatusLabel,
@@ -239,6 +240,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** The initiative id the events pane currently tracks (dedupes redundant reloads/polls). */
   private eventsInitiativeId: string | null = null;
   private eventsStamp: string | null = null;
+  /** Raw-terminal fallback poll: pulls the primary session's screen via the reliable `captureTerminal`
+   *  request/response path (the push visual-stream doesn't deliver for coordinator-spawned agent
+   *  sessions — planner/worker/reviewer aren't in listAiSessions), so the pane isn't black. */
+  private primaryScreenPollInterval: ReturnType<typeof setInterval> | null = null;
+  private primaryScreenSessionId: string | null = null;
   private sessionIdCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
@@ -624,6 +630,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       },
       { allowSignalWrites: true },
     );
+
+    // Raw-terminal fallback: while the Raw tab is showing a primary agent session (planner/worker/
+    // reviewer), keep its screen fresh via `captureTerminal` — the push visual-stream doesn't deliver
+    // for these coordinator-spawned sessions, so without this the pane is black.
+    effect(
+      () => {
+        const onRaw = this.activeTab() === 'raw';
+        const id = this.primarySessionId();
+        this.syncPrimaryScreenPoll(onRaw ? id : null);
+      },
+      { allowSignalWrites: true },
+    );
   }
 
   private loadTabOrder(): void {
@@ -828,6 +846,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.clearSessionIdCopiedTimeout();
     this.resetStreamingStatus();
     this.stopEventsPoll();
+    this.stopPrimaryScreenPoll();
     this.stopSidebarResize();
     this.stopPaneInteraction();
     this.teardownCompactWorkspaceMode();
@@ -1793,9 +1812,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const init = this.selectedInitiative();
     if (!init || this.planLoadedForInitiative === init.id) return;
     this.planLoadedForInitiative = init.id;
-    // Reset per-initiative plan state on (re)load.
+    // Reset per-initiative plan state on (re)load. Default to the planning artifact (plan.md) so the
+    // tab isn't empty during planning; switched to overview.md below once the run reports phases.
     this.planRun.set(null);
-    this.planSelectedDoc.set('overview.md');
+    this.planSelectedDoc.set('plan.md');
     this.planDocMarkdown.set('');
     this.planError.set(null);
     if (!init.planPath?.trim()) return; // benign empty (no plan to read)
@@ -1803,7 +1823,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     try {
       const run = await firstValueFrom(this.api.getAgentPlan(init.id));
       this.planRun.set(run ?? null);
-      await this.loadPlanDoc('overview.md');
+      // Stage-aware default: overview.md when the plan has phases (development), else plan.md (planning).
+      await this.loadPlanDoc(defaultPlanDoc(run));
     } catch {
       this.planRun.set(null); // benign empty state, no crash
     } finally {
@@ -1915,6 +1936,39 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!this.eventsPollInterval) return;
     clearInterval(this.eventsPollInterval);
     this.eventsPollInterval = null;
+  }
+
+  /** Start/stop the Raw-terminal capture poll for the given primary session (null = stop). Seeds the
+   *  pane immediately, then refreshes every 2.5s so a mostly-idle agent session still renders live. */
+  private syncPrimaryScreenPoll(sessionId: string | null): void {
+    if (sessionId === this.primaryScreenSessionId) return;
+    this.primaryScreenSessionId = sessionId;
+    this.stopPrimaryScreenPoll();
+    if (!sessionId) return;
+    void this.capturePrimaryScreen(sessionId); // seed immediately (no black-frame wait)
+    this.primaryScreenPollInterval = setInterval(() => {
+      if (this.primaryScreenSessionId !== sessionId || document.hidden) return;
+      void this.capturePrimaryScreen(sessionId);
+    }, 2500);
+  }
+
+  /** Pull one screen snapshot via the reliable `captureTerminal` request/response path and inject it
+   *  into `terminalScreens` (same shape the push stream produces), unless the selection has moved on. */
+  private async capturePrimaryScreen(sessionId: string): Promise<void> {
+    try {
+      const screen = await firstValueFrom(this.api.captureTerminal(sessionId, 200));
+      if (screen && this.primaryScreenSessionId === sessionId && this.primarySessionId() === sessionId) {
+        this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: screen }));
+      }
+    } catch {
+      // best-effort — a transient relay/host hiccup just skips this tick
+    }
+  }
+
+  private stopPrimaryScreenPoll(): void {
+    if (!this.primaryScreenPollInterval) return;
+    clearInterval(this.primaryScreenPollInterval);
+    this.primaryScreenPollInterval = null;
   }
 
   /** Select an initiative row (highlights it + drives the lifecycle bar / validation column). */
