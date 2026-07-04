@@ -67,6 +67,31 @@ describe('initiativeRows', () => {
     expect(initiativeRows([], null, NOW)).toEqual([]);
     expect(initiativeRows(null, null, NOW)).toEqual([]);
   });
+
+  it('collapses the planning + development runs of one initiative into a SINGLE row', () => {
+    // The two runs share initiativeId = 'init-1' (the planning run's id IS the initiative id).
+    const rows = initiativeRows(
+      [
+        plan({ id: 'dev-1', initiativeId: 'init-1', title: 'Feature', initiativeStatus: 'done', health: 'complete', updatedAt: '2026-07-04T10:20:00.000Z' }),
+        plan({ id: 'init-1', initiativeId: 'init-1', title: 'Feature', initiativeStatus: 'planning', health: 'in-progress', updatedAt: '2026-07-04T10:00:00.000Z' }),
+      ],
+      null,
+      NOW,
+    );
+    expect(rows).toHaveLength(1);
+    // Represented by the run furthest along the lifecycle (the development run: done).
+    expect(rows[0]).toMatchObject({ id: 'dev-1', status: 'done', health: 'complete' });
+  });
+
+  it('highlights the merged row when EITHER run id (or the initiativeId) is selected', () => {
+    const runs = [
+      plan({ id: 'dev-1', initiativeId: 'init-1', initiativeStatus: 'development' }),
+      plan({ id: 'init-1', initiativeId: 'init-1', initiativeStatus: 'planning', updatedAt: '2026-07-04T09:00:00.000Z' }),
+    ];
+    expect(initiativeRows(runs, 'dev-1', NOW)[0].selected).toBe(true); // development run id
+    expect(initiativeRows(runs, 'init-1', NOW)[0].selected).toBe(true); // planning run id == initiativeId
+    expect(initiativeRows(runs, 'other', NOW)[0].selected).toBe(false);
+  });
 });
 
 describe('lensSummary', () => {

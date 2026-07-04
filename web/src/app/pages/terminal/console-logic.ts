@@ -10,6 +10,7 @@ import {
   statusMeta,
   healthMeta,
   StatusMeta,
+  LIFECYCLE_STAGES,
 } from '../../../../../ui/src/lib/lifecycle-status';
 import {
   defaultLenses,
@@ -36,28 +37,58 @@ export interface InitiativeRow {
   selected: boolean;
 }
 
+/** Lifecycle progression rank; unknown/blank sorts LEAST advanced (-1). */
+function stageRank(status: string | null | undefined): number {
+  return (LIFECYCLE_STAGES as readonly string[]).indexOf(status ?? '');
+}
+
 /**
  * Project `listAgentPlans` rows to the master-list model. `nowIso` is injected (no `Date.now()` here)
  * so the spec is deterministic; status/health meta come from P2 `lifecycle-status.ts`.
+ *
+ * An Initiative can span TWO plan-runs (planning + development) that share one `initiativeId`, and
+ * `listAgentPlans` returns one row PER run. Collapse them to ONE master-list row per initiative,
+ * represented by the run FURTHEST along the lifecycle (the development run once it exists — it carries
+ * the live status/health while the planning run stays pinned at `planning`). So the console shows one
+ * entity, not a planning + development duplicate. Selection matches EITHER run's `id` or the shared
+ * `initiativeId`, so a deep-link to either still highlights the merged row.
  */
 export function initiativeRows(
   plans: AgentPlan[] | null | undefined,
   selectedId: string | null,
   nowIso: string,
 ): InitiativeRow[] {
-  return (plans ?? []).map((p) => {
-    const status = p.initiativeStatus ?? '';
-    const health = p.health ?? '';
+  const groups = new Map<string, AgentPlan[]>();
+  const order: string[] = [];
+  for (const p of plans ?? []) {
+    const key = p.initiativeId || p.id;
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      order.push(key);
+    }
+    groups.get(key)!.push(p);
+  }
+  return order.map((key) => {
+    const group = groups.get(key)!;
+    // Representative = most-advanced lifecycle stage, then most-recently updated.
+    const rep = group.reduce((best, p) => {
+      const delta = stageRank(p.initiativeStatus) - stageRank(best.initiativeStatus);
+      if (delta > 0) return p;
+      if (delta < 0) return best;
+      return (p.updatedAt ?? '') > (best.updatedAt ?? '') ? p : best;
+    });
+    const status = rep.initiativeStatus ?? '';
+    const health = rep.health ?? '';
     return {
-      id: p.id,
-      title: p.title || '(untitled)',
+      id: rep.id,
+      title: rep.title || '(untitled)',
       status,
       health,
       statusMeta: statusMeta(status),
       healthMeta: healthMeta(health),
       showHealth: !!health && health !== 'in-progress',
-      ago: formatRelTime(p.updatedAt, nowIso),
-      selected: p.id === selectedId,
+      ago: formatRelTime(rep.updatedAt, nowIso),
+      selected: key === selectedId || group.some((p) => p.id === selectedId),
     };
   });
 }
