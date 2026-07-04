@@ -2041,6 +2041,74 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  /** Run control — Stop: halt the selected initiative's running agents (folded from the legacy
+   *  planner page; the console is now the single run surface). Targets the selected run. */
+  async stopInitiative(): Promise<void> {
+    const init = this.selectedInitiative();
+    if (!init) return;
+    const alert = await this.alertCtrl.create({
+      header: 'Stop initiative',
+      message: `Stop "${init.title || 'this initiative'}"? The running agents are halted. Its plan and files are kept.`,
+      buttons: [
+        { text: 'Cancel', role: 'cancel' },
+        { text: 'Stop', role: 'confirm' },
+      ],
+    });
+    await alert.present();
+    const { role } = await alert.onDidDismiss();
+    if (role !== 'confirm') return;
+    try {
+      await firstValueFrom(this.api.stopAgentPlan(init.id));
+      await this.loadInitiatives();
+    } catch (err) {
+      await this.showInitiativeError('Failed to stop initiative', err);
+    }
+  }
+
+  /** Run control — Amend: revise an approved/complete plan in place. The planner edits the plan,
+   *  T2 re-reviews it, and on PASS the automatic handoff continues development. */
+  async amendInitiative(): Promise<void> {
+    const init = this.selectedInitiative();
+    if (!init) return;
+    const alert = await this.alertCtrl.create({
+      header: 'Amend plan',
+      message:
+        'Describe the change. The planner revises the plan in place and re-reviews it; on pass, development continues automatically.',
+      inputs: [
+        {
+          name: 'brief',
+          type: 'textarea',
+          placeholder: 'e.g. Also create a README.md containing the project name',
+        },
+      ],
+      buttons: [
+        { text: 'Cancel', role: 'cancel' },
+        { text: 'Amend', role: 'confirm' },
+      ],
+    });
+    await alert.present();
+    const { role, data } = await alert.onDidDismiss();
+    if (role !== 'confirm') return;
+    const brief = String(data?.values?.brief ?? '').trim();
+    if (!brief) return;
+    try {
+      await firstValueFrom(this.api.amendAgentPlan(init.id, brief));
+      await this.loadInitiatives();
+    } catch (err) {
+      await this.showInitiativeError('Failed to amend plan', err);
+    }
+  }
+
+  /** Whether the selected initiative has agents actively running (drives the Stop control). */
+  protected initiativeRunning(status: string | null | undefined): boolean {
+    return ['planning', 'development', 'review'].includes((status ?? '').trim().toLowerCase());
+  }
+
+  /** Whether the selected initiative has a settled plan to revise (drives the Amend control). */
+  protected initiativeAmendable(status: string | null | undefined): boolean {
+    return ['planning', 'done'].includes((status ?? '').trim().toLowerCase());
+  }
+
   private async showInitiativeError(header: string, err: unknown): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
     const alert = await this.alertCtrl.create({ header, message, buttons: ['OK'] });

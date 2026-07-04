@@ -125,15 +125,14 @@ const DISCORD_WEBHOOK_SETTING = 'discord_webhook_url';
           <ion-card-subtitle>Surfaces the P8 nav rail does not list — folding into Work (P8 D13)</ion-card-subtitle>
         </ion-card-header>
         <ion-card-content>
-          <ion-button expand="block" fill="outline" routerLink="/development">Development runs</ion-button>
-          <ion-button expand="block" fill="outline" routerLink="/developer" class="ion-margin-top">
+          <ion-button expand="block" fill="outline" routerLink="/developer">
             Developer API console
           </ion-button>
           <ion-text color="medium">
             <p>
               <em>
-                Development becomes a stage of an Initiative in the Work console (P8 D6); until that
-                master-detail path lands (P04), these keep the legacy surfaces reachable.
+                Planning &amp; development are now stages of an Initiative in the Work console — run
+                them there. The legacy /planning &amp; /development pages were removed.
               </em>
             </p>
           </ion-text>
