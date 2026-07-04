@@ -8,6 +8,14 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { IonicModule } from '@ionic/angular';
+import { addIcons } from 'ionicons';
+import {
+  personOutline,
+  sparklesOutline,
+  settingsOutline,
+  constructOutline,
+  copyOutline,
+} from 'ionicons/icons';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { AiMessage } from '../../models/ai-message.model';
 import { parseMarkdown, hydrateMermaid } from '../../lib/markdown-render';
@@ -25,7 +33,17 @@ export class MessageBubbleComponent implements AfterViewChecked {
   @Input() isStreamingMessage = false;
   private readonly host: ElementRef<HTMLElement> = inject(ElementRef);
 
-  constructor(private sanitizer: DomSanitizer) {}
+  constructor(private sanitizer: DomSanitizer) {
+    // Register the ion-icons this bubble uses — without this, Ionicons standalone tries to fetch the
+    // SVG by URL and throws "Failed to construct 'URL': Invalid base URL" for each icon.
+    addIcons({
+      'person-outline': personOutline,
+      'sparkles-outline': sparklesOutline,
+      'settings-outline': settingsOutline,
+      'construct-outline': constructOutline,
+      'copy-outline': copyOutline,
+    });
+  }
 
   /**
    * Hydrate any `<div class="mermaid-svg">` placeholders the markdown parser
