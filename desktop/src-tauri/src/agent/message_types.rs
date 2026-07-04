@@ -81,6 +81,18 @@ pub enum AgentMessage {
     #[serde(rename = "terminal_visual_unsubscribe")]
     TerminalVisualUnsubscribe(TerminalVisualSubscription),
 
+    /// Remote clients → desktop: transcript view started/stopped watching a session's
+    /// structured stream (overhaul P2/P3, the `stream_event` lane). Advisory only — stream
+    /// events are broadcast unconditionally on the `stream_event` select arm, so these are
+    /// no-ops (handled by the match catch-all). The reason they MUST exist as variants: an
+    /// unknown `stream_subscribe` failed to deserialize and tore down the whole relay socket
+    /// ("Desktop not connected" flakiness / empty transcript). #9 fix.
+    #[serde(rename = "stream_subscribe")]
+    StreamSubscribe(TerminalVisualSubscription),
+
+    #[serde(rename = "stream_unsubscribe")]
+    StreamUnsubscribe(TerminalVisualSubscription),
+
     /// Remote clients → desktop: resize a tmux pane to match the UI terminal.
     #[serde(rename = "terminal_resize")]
     TerminalResize(TerminalResize),
