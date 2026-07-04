@@ -8,21 +8,37 @@ import {
   IonTitle,
   IonContent,
   IonButton,
+  IonButtons,
   IonInput,
   IonTextarea,
   IonItem,
   IonLabel,
   IonList,
   IonNote,
+  IonSelect,
+  IonSelectOption,
+  IonToggle,
+  IonModal,
 } from '@ionic/angular/standalone';
 import {
   AiChatService,
   ChatWindowComponent,
   JohnnyApiService,
   AgentPlan,
+  DetectedCliTool,
+  DirListing,
 } from '@johnnyone/ui';
+import { firstValueFrom } from 'rxjs';
 import { BriefingComposerComponent } from '../../components/briefing-composer/briefing-composer.component';
 import { canAccept, composeBriefingSeed, shouldSeed } from './briefing-page-logic';
+import {
+  LensDraft,
+  defaultLenses,
+  addLens,
+  removeLens,
+  toConfigJson,
+  providerOptions,
+} from '../validation-config/validation-config-logic';
 
 /**
  * The briefing view (mock §07, overhaul P4). Reuses `johnny-chat-window` for the conversation
@@ -49,6 +65,11 @@ import { canAccept, composeBriefingSeed, shouldSeed } from './briefing-page-logi
     IonLabel,
     IonList,
     IonNote,
+    IonButtons,
+    IonSelect,
+    IonSelectOption,
+    IonToggle,
+    IonModal,
     ChatWindowComponent,
     BriefingComposerComponent,
   ],
@@ -83,6 +104,28 @@ export class BriefingPage implements OnInit, OnDestroy {
   protected readonly creating = signal(false);
   protected readonly createError = signal<string | null>(null);
 
+  // Agent (provider) choices come from the host's detected CLIs — a dropdown, not free text.
+  protected readonly detectedTools = signal<DetectedCliTool[]>([]);
+  protected readonly providerChoices = computed<string[]>(() => {
+    const found = this.detectedTools()
+      .filter((t) => t.found)
+      .map((t) => t.provider)
+      .filter((p) => p !== 'shell');
+    // Union the detected providers with the known reviewer-capable set, de-duped, detected first.
+    const known = providerOptions();
+    return [...new Set([...found, ...known])];
+  });
+
+  // Per-initiative validation lenses, editable AT creation (seeded from the default triad). Saved to
+  // the new initiative right after it is created, so each initiative owns its own config from birth.
+  protected readonly createLenses = signal<LensDraft[]>(defaultLenses());
+
+  // Host directory browser (workspace picker) — navigates via listDir instead of free-text entry.
+  protected readonly dirBrowserOpen = signal(false);
+  protected readonly dirListing = signal<DirListing | null>(null);
+  protected readonly dirLoading = signal(false);
+  protected readonly dirError = signal<string | null>(null);
+
   protected readonly canAcceptNow = computed(() => canAccept(this.plan()?.initiativeStatus));
 
   ngOnInit(): void {
@@ -90,7 +133,82 @@ export class BriefingPage implements OnInit, OnDestroy {
     this.initiativeId.set(id);
     if (id) {
       this.loadInitiative(id);
+    } else {
+      // Create form: populate the agent dropdown from the host's detected CLIs.
+      void this.loadDetectedTools();
     }
+  }
+
+  private async loadDetectedTools(): Promise<void> {
+    try {
+      const tools = await firstValueFrom(this.api.detectCliTools());
+      this.detectedTools.set(tools ?? []);
+      // Default to the first detected agent if the current pick isn't installed.
+      if (!tools?.some((t) => t.provider === this.createProvider && t.found)) {
+        const first = this.providerChoices()[0];
+        if (first) this.createProvider = first;
+      }
+    } catch {
+      // Non-fatal: fall back to the static provider list in `providerChoices`.
+    }
+  }
+
+  // ── Validation lens editor (per-initiative, at creation) ────────────────────────────────────────
+  protected addValidationLens(): void {
+    this.createLenses.update((list) => addLens(list));
+  }
+  protected removeValidationLens(index: number): void {
+    this.createLenses.update((list) => removeLens(list, index));
+  }
+  protected setLensField(index: number, field: keyof LensDraft, value: string | boolean): void {
+    this.createLenses.update((list) =>
+      list.map((lens, i) => (i === index ? { ...lens, [field]: value } : lens)),
+    );
+  }
+
+  // ── Workspace directory browser ─────────────────────────────────────────────────────────────────
+  protected async openDirBrowser(): Promise<void> {
+    this.dirBrowserOpen.set(true);
+    await this.browseTo('');
+  }
+  protected closeDirBrowser(): void {
+    this.dirBrowserOpen.set(false);
+  }
+  protected async browseTo(relPath: string): Promise<void> {
+    this.dirLoading.set(true);
+    this.dirError.set(null);
+    try {
+      const listing = await firstValueFrom(this.api.listDir(relPath));
+      this.dirListing.set(listing);
+    } catch (err) {
+      this.dirError.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      this.dirLoading.set(false);
+    }
+  }
+  /** Directories in the current listing (files are hidden — we pick a folder). */
+  protected browserDirs = computed(() =>
+    (this.dirListing()?.entries ?? []).filter((e) => e.kind === 'dir'),
+  );
+  /** Go up one level from the current relative path (no-op at the root). */
+  protected async dirUp(): Promise<void> {
+    const cur = this.dirListing()?.path ?? '';
+    if (!cur) return;
+    const parent = cur.includes('/') ? cur.slice(0, cur.lastIndexOf('/')) : '';
+    await this.browseTo(parent);
+  }
+  /** Absolute path of the currently-browsed directory (root + relative). */
+  private currentAbsoluteDir(): string {
+    const l = this.dirListing();
+    if (!l) return '';
+    const root = (l.root || '').replace(/\/+$/, '');
+    return l.path ? `${root}/${l.path}` : root;
+  }
+  /** Choose the currently-open directory as the workspace path. */
+  protected useCurrentDir(): void {
+    const abs = this.currentAbsoluteDir();
+    if (abs) this.createWorkspacePath = abs;
+    this.dirBrowserOpen.set(false);
   }
 
   ngOnDestroy(): void {
@@ -180,7 +298,17 @@ export class BriefingPage implements OnInit, OnDestroy {
         reviewerProvider: this.createProvider,
       })
       .subscribe({
-        next: (run) => {
+        next: async (run) => {
+          // Persist THIS initiative's own validation lenses right after creation, so the config is
+          // per-initiative from the start (not the shared default template). Best-effort: a failed
+          // save still leaves the initiative on the default template, so it must not block the flow.
+          try {
+            await firstValueFrom(
+              this.api.updateAgentPlanValidationConfig(run.plan.id, toConfigJson(this.createLenses())),
+            );
+          } catch {
+            // Non-fatal — the initiative keeps the default template; user can Configure later.
+          }
           this.creating.set(false);
           void this.router.navigateByUrl('/briefing/' + run.plan.id);
         },
