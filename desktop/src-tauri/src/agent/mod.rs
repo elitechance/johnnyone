@@ -903,7 +903,7 @@ impl AgentService {
             "files_rename" => Self::rpc_files_rename(&req.params, state),
             "files_delete" => Self::rpc_files_delete(&req.params, state),
             "files_upload_chunk" => Self::rpc_files_upload_chunk(&req.params, state),
-            "create_briefing_run" => Self::rpc_create_briefing_run(&req.params, state),
+            "create_briefing_run" => Self::rpc_create_briefing_run(&req.params, state).await,
             "initiative_upload_chunk" => Self::rpc_initiative_upload_chunk(&req.params, state),
             "accept_brief" => Self::rpc_accept_brief(&req.params, state).await,
             "add_initiative_reference_path" => {
@@ -1683,7 +1683,7 @@ impl AgentService {
 
     /// Overhaul P4 (D1): create an Initiative in `briefing`. Thin wrapper over
     /// `agent_plans::create_briefing_run` — deserialize `{ input: CreateBriefingInput }`.
-    fn rpc_create_briefing_run(
+    async fn rpc_create_briefing_run(
         params: &serde_json::Value,
         state: &Arc<AppState>,
     ) -> Result<serde_json::Value, String> {
@@ -1693,7 +1693,7 @@ impl AgentService {
             .ok_or_else(|| "Missing 'input' parameter".to_string())?;
         let input: crate::db::models::CreateBriefingInput =
             serde_json::from_value(input_value).map_err(|e| e.to_string())?;
-        let run = crate::services::agent_plans::create_briefing_run(state, input)?;
+        let run = crate::services::agent_plans::create_briefing_run(state, input).await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 

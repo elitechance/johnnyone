@@ -59,7 +59,16 @@
       <button type="button" class="mobile-back" (click)="backToInitiativesList()">← Initiatives</button>
       <div class="init-top">
         <johnny-lifecycle-bar [status]="sel.initiativeStatus" [health]="sel.health"></johnny-lifecycle-bar>
-        <div class="path">{{ sel.workspacePath }}</div>
+        <div class="init-top-row">
+          <div class="path">{{ sel.workspacePath }}</div>
+          @if (sel.initiativeStatus === 'briefing') {
+            <!-- Briefing is an interactive terminal (Raw tab). Accept advances briefing → planning
+                 using the brief the agent wrote to brief.md. -->
+            <button type="button" class="accept-brief" [disabled]="acceptingBrief()" (click)="acceptBrief(sel.id)">
+              {{ acceptingBrief() ? 'Accepting…' : '✓ Accept brief → Planning' }}
+            </button>
+          }
+        </div>
       </div>
     }
 

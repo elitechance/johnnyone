@@ -406,7 +406,7 @@ fn create_planning_run(
 /// `<id>/plan` and `<id>/attachments` store dirs are created. No agent is spawned here — the first
 /// briefing turn is sent later by the UI (Phase 04). Accept (Phase 02) flips this same row to
 /// `planning` and starts the planner.
-pub fn create_briefing_run(
+pub async fn create_briefing_run(
     state: &AppState,
     input: CreateBriefingInput,
 ) -> Result<AgentPlanRun, String> {
@@ -438,8 +438,9 @@ pub fn create_briefing_run(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "Briefing".to_string());
 
-    // The conversation session: a `kind='user'` chat session on the worker provider. This is the
-    // lane the relay chat path (`handle_relay_chat` → `claude --print --resume`) drives (D2).
+    // The conversation session: a `kind='agent'` INTERACTIVE terminal (tmux CLI) on the worker
+    // provider. The user briefs the agent directly in the terminal (the reliable TUI path the
+    // planner/workers use) — NOT the headless `claude --print` relay chat (which proved flaky).
     let chat_session = sessions::create_session(
         state,
         CreateSessionInput {
@@ -450,7 +451,7 @@ pub fn create_briefing_run(
                 .or_else(|| default_model_for_provider(&input.worker_provider)),
             working_directory: Some(workspace.to_string_lossy().to_string()),
             title: Some(format!("Briefing - {}", title)),
-            kind: Some("user".to_string()),
+            kind: Some("agent".to_string()),
             setup_commands: None,
             tmux_session_name: None,
         },
@@ -484,6 +485,29 @@ pub fn create_briefing_run(
         "briefing_run_created",
         json!({ "briefingSessionId": chat_session.id }),
     )?;
+
+    // Spawn the interactive briefing terminal and seed the facilitator prompt (same pattern as the
+    // planner kickoff). The user briefs the agent live in the TUI; the agent writes the final brief
+    // to brief.md when done — the file the planner + validation lenses read. Best-effort: a spawn/seed
+    // failure must not fail creation (the terminal can still be attached + driven from the console).
+    if let Err(e) = terminal::attach_terminal_headless(state, chat_session.id.clone(), 120, 36).await
+    {
+        tracing::warn!(%plan_id, error=%e, "Briefing terminal attach failed (non-fatal)");
+    }
+    let seed = format!(
+        "You are J1's briefing facilitator for this initiative. Ask concise clarifying questions and \
+pin down scope (in/out), constraints, and acceptance criteria. When the brief is solid and the user \
+says they are done, WRITE the final consolidated brief (Goal / Scope / Constraints / Acceptance) to \
+{brief} — that exact file is what the planner and the validation lenses receive; then tell the user \
+it's ready to Accept.\n\nInitial ask:\n{ask}",
+        brief = plan.join("brief.md").display(),
+        ask = input.brief.clone().unwrap_or_default(),
+    );
+    if let Err(e) =
+        terminal::send_terminal_input(state, chat_session.id.clone(), format!("{}\r", seed)).await
+    {
+        tracing::warn!(%plan_id, error=%e, "Briefing seed send failed (non-fatal)");
+    }
 
     get_plan(state, &plan_id)
 }
@@ -595,8 +619,16 @@ pub async fn accept_brief(
         .map(str::to_string)
         .collect();
 
+    // Draft precedence: an explicit finalBrief (edited in the UI) wins; otherwise the brief the
+    // interactive briefing agent wrote to brief.md; otherwise the original stored ask. This is what
+    // carries the TERMINAL briefing conversation forward — the agent consolidates it into brief.md.
+    let agent_brief = std::fs::read_to_string(Path::new(&plan.plan_path).join("brief.md"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let draft = final_brief
         .as_deref()
+        .or(agent_brief.as_deref())
         .or(plan.brief.as_deref())
         .unwrap_or("");
     let composed = compose_accepted_brief(draft, &attachments, &refs);
@@ -6251,6 +6283,7 @@ mod store_tests {
                 model: None,
             },
         )
+        .await
         .expect("create_briefing_run");
         let plan = run.plan;
 
@@ -6381,6 +6414,7 @@ mod store_tests {
                 model: None,
             },
         )
+        .await
         .expect("create_briefing_run")
         .plan;
 

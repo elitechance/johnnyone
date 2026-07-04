@@ -353,7 +353,11 @@ export class BriefingPage implements OnInit, OnDestroy {
             // Non-fatal — the initiative keeps the default template; user can Configure later.
           }
           this.creating.set(false);
-          void this.router.navigateByUrl('/briefing/' + run.plan.id);
+          // Briefing now happens in the INTERACTIVE terminal (the console's Raw tab shows the
+          // seeded briefing agent). Land there instead of the old -p chat page.
+          void this.router.navigate(['/initiatives'], {
+            queryParams: { initiativeId: run.plan.id, tab: 'raw' },
+          });
         },
         error: (err) => {
           this.creating.set(false);

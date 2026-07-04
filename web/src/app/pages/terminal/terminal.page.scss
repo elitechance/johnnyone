@@ -1182,10 +1182,31 @@ ion-modal.workspace-picker .picker-empty {
   flex-direction: column;
   gap: 6px;
 
+  .init-top-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
   .path {
     font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
     font-size: 11.5px;
     color: var(--jo-fg-faint);
+  }
+  .accept-brief {
+    flex: none;
+    padding: 6px 14px;
+    border: 1px solid var(--jo-accent, #64b5ff);
+    border-radius: 8px;
+    background: var(--jo-accent, #64b5ff);
+    color: #06121f;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+
+    &:disabled { opacity: 0.6; cursor: default; }
+    &:hover:not(:disabled) { filter: brightness(1.08); }
   }
 }
 /* Existing pane shell fills the rest of the center column. */
