@@ -12,6 +12,14 @@
         }
       }
     </ion-title>
+    <!-- End the briefing from the always-visible header (the in-chat Accept bar can scroll off). -->
+    @if (!isCreate() && canAcceptNow()) {
+      <ion-buttons slot="end">
+        <ion-button fill="solid" color="primary" [disabled]="accepting()" (click)="onAccept()">
+          {{ accepting() ? 'Accepting…' : '✓ Accept brief → Planning' }}
+        </ion-button>
+      </ion-buttons>
+    }
   </ion-toolbar>
 </ion-header>
 
