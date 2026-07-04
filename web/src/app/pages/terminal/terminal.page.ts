@@ -1870,8 +1870,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.acceptingBrief.set(true);
     try {
       await firstValueFrom(this.api.acceptInitiativeBrief({ initiativeId }));
-      // briefing → planning: go to the planner for this initiative.
-      void this.router.navigate(['/planning', initiativeId]);
+      // Advance to planning and stay on the UNIFIED console (planning is a status, not a page).
+      void this.router.navigate(['/initiatives'], { queryParams: { initiativeId } });
     } catch (err) {
       await this.showInitiativeError('Failed to accept brief', err);
     } finally {
