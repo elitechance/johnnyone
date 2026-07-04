@@ -2756,11 +2756,13 @@ fn planning_lens_reviewer_prompt(
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     };
+    let brief_path = Path::new(&run.plan.plan_path).join("brief.md");
     format!(
         "You are the {name} reviewer for a PLAN (planning run). Run ONLY the {name} lens — do not run the other lenses.\n\n\
-Read first: methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the planning-review {name} checklist); then read the plan at {plan_output}. Judge whether the PLAN itself is ready along the {name} dimension (e.g. Product: clear scope, mocks, and a screens-to-verify inventory; QA: testable acceptance criteria per phase; Lead: a sound, reuse-aware, secure approach with phases sized right).\n\n\
+Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — the plan must not narrow, drift from, or exceed it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the planning-review {name} checklist); then read the plan at {plan_output}. Judge whether the PLAN itself is ready along the {name} dimension AND faithful to the brief (e.g. Product: clear scope, mocks, and a screens-to-verify inventory; QA: testable acceptance criteria per phase, not narrower than the brief; Lead: a sound, reuse-aware, secure approach with phases sized right).\n\n\
 Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
+        brief = brief_path.display(),
         methodology = get("methodology_path"),
         conventions = get("conventions_path"),
         plan_output = get("plan_output_path"),
