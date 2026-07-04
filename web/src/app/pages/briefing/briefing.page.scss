@@ -110,13 +110,23 @@
     }
   }
 
+  .lens-item {
+    padding: 8px 0;
+    border-top: 1px solid var(--ion-color-step-100, #e6e6ea);
+  }
+  .lens-prompt {
+    margin-top: 4px;
+    --background: var(--ion-color-step-50, #f7f7f9);
+    --padding-start: 8px;
+    --padding-end: 8px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
   .lens-row {
     display: grid;
     grid-template-columns: 1.2fr 1fr 1fr auto auto;
     gap: 8px;
     align-items: end;
-    padding: 6px 0;
-    border-top: 1px solid var(--ion-color-step-100, #e6e6ea);
 
     .lens-block {
       align-self: center;

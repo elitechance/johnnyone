@@ -65,48 +65,63 @@
       <div class="lens-config">
         <div class="lens-config-head">
           <h3>Validation lenses</h3>
-          <span class="lens-config-hint">Run in parallel when this initiative reaches review. Saved to this initiative only.</span>
+          <span class="lens-config-hint">
+            Run in parallel when this initiative reaches review. The built-in
+            <b>product · qa · lead</b> lenses have named checklists (in review-lenses.md); a new/custom
+            lens has no checklist, so give it a <b>Prompt</b> describing what it should check.
+          </span>
         </div>
         @for (lens of createLenses(); track $index) {
-          <div class="lens-row">
-            <ion-input
-              class="lens-name"
-              label="Name"
+          <div class="lens-item">
+            <div class="lens-row">
+              <ion-input
+                class="lens-name"
+                label="Name"
+                labelPlacement="stacked"
+                [ngModel]="lens.name"
+                (ngModelChange)="setLensField($index, 'name', $event)"
+                placeholder="product"></ion-input>
+              <ion-select
+                class="lens-provider"
+                label="Agent"
+                labelPlacement="stacked"
+                interface="popover"
+                [ngModel]="lens.provider"
+                (ngModelChange)="setLensField($index, 'provider', $event)">
+                @for (p of providerChoices(); track p) {
+                  <ion-select-option [value]="p">{{ p }}</ion-select-option>
+                }
+              </ion-select>
+              <ion-input
+                class="lens-model"
+                label="Model (optional)"
+                labelPlacement="stacked"
+                [ngModel]="lens.model"
+                (ngModelChange)="setLensField($index, 'model', $event)"
+                placeholder="default"></ion-input>
+              <ion-toggle
+                class="lens-block"
+                [checked]="lens.blocking"
+                (ionChange)="setLensField($index, 'blocking', $any($event).detail.checked)">
+                blocking
+              </ion-toggle>
+              <ion-button
+                class="lens-remove"
+                fill="clear"
+                color="medium"
+                [disabled]="createLenses().length <= 1"
+                (click)="removeValidationLens($index)"
+                aria-label="Remove lens">✕</ion-button>
+            </div>
+            <ion-textarea
+              class="lens-prompt"
+              [label]="isNamedLens(lens.name) ? 'Prompt / extra rubric (optional — has a built-in ' + lens.name + ' checklist)' : 'Prompt / rubric — what should this lens check?'"
               labelPlacement="stacked"
-              [ngModel]="lens.name"
-              (ngModelChange)="setLensField($index, 'name', $event)"
-              placeholder="product"></ion-input>
-            <ion-select
-              class="lens-provider"
-              label="Agent"
-              labelPlacement="stacked"
-              interface="popover"
-              [ngModel]="lens.provider"
-              (ngModelChange)="setLensField($index, 'provider', $event)">
-              @for (p of providerChoices(); track p) {
-                <ion-select-option [value]="p">{{ p }}</ion-select-option>
-              }
-            </ion-select>
-            <ion-input
-              class="lens-model"
-              label="Model (optional)"
-              labelPlacement="stacked"
-              [ngModel]="lens.model"
-              (ngModelChange)="setLensField($index, 'model', $event)"
-              placeholder="default"></ion-input>
-            <ion-toggle
-              class="lens-block"
-              [checked]="lens.blocking"
-              (ionChange)="setLensField($index, 'blocking', $any($event).detail.checked)">
-              blocking
-            </ion-toggle>
-            <ion-button
-              class="lens-remove"
-              fill="clear"
-              color="medium"
-              [disabled]="createLenses().length <= 1"
-              (click)="removeValidationLens($index)"
-              aria-label="Remove lens">✕</ion-button>
+              [autoGrow]="true"
+              rows="2"
+              [ngModel]="lens.prompt || ''"
+              (ngModelChange)="setLensField($index, 'prompt', $event)"
+              [placeholder]="isNamedLens(lens.name) ? 'Leave blank to use the built-in checklist' : 'e.g. Verify accessibility: focus order, ARIA roles, color contrast ≥ 4.5:1'"></ion-textarea>
           </div>
         }
         <ion-button class="lens-add" fill="outline" size="small" (click)="addValidationLens()">+ Add lens</ion-button>

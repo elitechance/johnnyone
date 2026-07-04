@@ -1606,14 +1606,16 @@ ion-modal.workspace-picker .picker-empty {
   }
 }
 
-/* §08 phone collapse — container query on the console width (D12): single column,
-   list + right panes hidden, the segment switcher drives which pane shows. The
-   Transcript surface is the mobile default. */
+/* The "← Initiatives" back button is mobile-only (master-detail); hidden on the widescreen 3-pane. */
+.mobile-back {
+  display: none;
+}
+
+/* §08 phone collapse — container query on the console width (D12): single column, MASTER-DETAIL.
+   The old Console/Files/Validation segment switcher was removed. Instead: show the initiatives LIST
+   until one is picked, then show that initiative's console with a back button. Files is reached via
+   the bottom nav; validation is set at creation / via Configure. */
 @container console (max-width: 760px) {
-  /* The single-column collapse grid is driven by the inline `[style.grid-template-columns]` binding
-     (gated by `consoleCompact()`), because a `container-type` element can't restyle ITSELF via
-     `@container`. This rule is kept as a harmless belt-and-suspenders (it only matches a nested
-     `.console`, of which there is none). */
   .console {
     grid-template-columns: 1fr;
   }
@@ -1621,38 +1623,39 @@ ion-modal.workspace-picker .picker-empty {
   .console-divider {
     display: none;
   }
-  /* Single column: the master-list is dropped; the switcher stays PERSISTENT (a direct
-     child of .console, not inside .console-center) and only the body below it swaps.
-     The `.console` qualifier raises specificity to (0,2,0) so this ties `.console .pane`
-     (`display:flex`) and wins on source order — otherwise the rail would stay visible. */
-  .console .console-list {
-    display: none;
-  }
-  .console-seg {
-    display: flex;
-  }
-
-  /* Default collapsed pane = Transcript: the center (existing pane shell) shows, right hides.
-     Same `.console` qualifier so it out-specifies `.console .pane`. */
+  /* Validation/host-files right column is not shown on the phone console. */
   .console .console-right {
     display: none;
   }
 
-  /* Files / Validation: hide the center, reveal the right column, and within it show only the
-     matching sub-pane so the two segments render distinct content. */
-  .console[data-console-pane='files'] .console-center,
-  .console[data-console-pane='validation'] .console-center {
-    display: none;
-  }
-  .console[data-console-pane='files'] .console-right,
-  .console[data-console-pane='validation'] .console-right {
+  /* No selection → the initiatives list fills the screen; the center is hidden.
+     `:not(.has-selection)` (0,3,0) out-specifies `.console .pane` (0,2,0). */
+  .console:not(.has-selection) .console-list {
     display: flex;
-    grid-column: 1;
   }
-  .console[data-console-pane='files'] .console-right .rpane-validation {
+  .console:not(.has-selection) .console-center {
     display: none;
   }
-  .console[data-console-pane='validation'] .console-right .rpane-files {
+  /* A selection → the center console fills the screen; the list is hidden. */
+  .console.has-selection .console-list {
     display: none;
+  }
+  .console.has-selection .console-center {
+    display: flex;
+  }
+
+  .mobile-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-start;
+    margin: 8px 8px 0;
+    padding: 6px 12px;
+    background: var(--jo-bg-raised, #0d1420);
+    border: 1px solid var(--jo-border, #263241);
+    border-radius: 8px;
+    color: var(--jo-fg-strong, #dbe7f3);
+    font-size: 13px;
+    cursor: pointer;
   }
 }

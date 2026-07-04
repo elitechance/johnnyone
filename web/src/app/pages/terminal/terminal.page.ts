@@ -1818,6 +1818,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     void this.router.navigateByUrl('/briefing/new');
   }
 
+  /** Mobile master-detail: clear the selection to return to the initiatives list, and drop the
+   *  `?initiativeId&tab` deep-link params so a refresh/back stays on the list. */
+  backToInitiativesList(): void {
+    this.selectedInitiativeId.set(null);
+    void this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: {},
+      replaceUrl: true,
+    });
+  }
+
   /** CRUD — Rename: prompt for a new title, then `updateAgentPlanTitle` and refresh the list. */
   async renameInitiative(row: InitiativeRow): Promise<void> {
     const alert = await this.alertCtrl.create({
