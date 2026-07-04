@@ -5,6 +5,13 @@
     </ion-buttons>
     <ion-title>Validation · configure</ion-title>
     <ion-buttons slot="end">
+      <!-- P3: shows whether the editor started from this initiative's own saved config or the shared
+           default template — same source badge as the console validation pane. -->
+      <span
+        class="lens-source-badge"
+        [class.cfg]="configSource() === 'custom'"
+        [class.def]="configSource() === 'default'"
+      >{{ configSource() === 'custom' ? 'configured' : 'default template' }}</span>
       <ion-note class="cap">min 1 · no max</ion-note>
     </ion-buttons>
   </ion-toolbar>

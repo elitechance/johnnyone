@@ -17,6 +17,8 @@ import {
 import {
   defaultLenses,
   fromConfigJson,
+  lensSourceOf,
+  type LensSource,
 } from '../validation-config/validation-config-logic';
 import { formatRelTime } from '../shells/shells-page-logic';
 
@@ -87,6 +89,18 @@ export function lensSummary(validationConfig: string | null | undefined): LensCh
 
 /** Re-export so a caller can assert the reused default triad without importing the P7 module directly. */
 export { defaultLenses };
+
+/**
+ * Whether the selected initiative's validation lenses come from its OWN saved config (`'custom'`) or
+ * the shared default template (`'default'`) — the signal that makes per-initiative validation legible
+ * (phase P3). Delegates to `lensSourceOf` (the P7 parse-boundary owner) so the console and the
+ * Configure page share one rule and never drift. Pure/total.
+ */
+export function lensSource(validationConfig: string | null | undefined): LensSource {
+  return lensSourceOf(validationConfig);
+}
+
+export type { LensSource };
 
 /** One touched-file row (mock §02 `.filetree` `.fnode`, 674-684). */
 export interface TouchedFile {

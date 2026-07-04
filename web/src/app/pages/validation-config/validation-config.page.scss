@@ -104,3 +104,26 @@
 .save {
   margin-top: 4px;
 }
+
+/* P3: validation source badge in the header — mirrors the console pane badge
+   (artifacts/console-states.html P3 state). `def` = muted/dashed; `cfg` = amber. */
+.lens-source-badge {
+  display: inline-block;
+  border-radius: 6px;
+  padding: 1px 8px;
+  margin-right: 8px;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+
+  &.def {
+    background: var(--jo-bg-raised, #26262b);
+    color: var(--jo-fg-muted, #8fa0b3);
+    border: 1px dashed var(--jo-fg-faint, #6b7a8d);
+  }
+  &.cfg {
+    background: color-mix(in srgb, var(--jo-accent, #ffb454) 18%, transparent);
+    color: var(--jo-accent, #ffb454);
+    border: 1px solid var(--jo-accent, #ffb454);
+  }
+}

@@ -92,6 +92,24 @@ export function toConfigJson(list: LensDraft[]): string {
   return JSON.stringify(wire);
 }
 
+/** Whether a persisted `validationConfig` is the shared **default template** or the initiative's own
+ *  **saved config** (overhaul P9 / phase P3). `'custom'` exactly when `fromConfigJson` would NOT fall
+ *  back to `defaultLenses()` — i.e. a non-empty string that JSON-parses to a non-empty array. This is
+ *  the single source of that parse boundary; `console-logic.lensSource` delegates here so the console
+ *  and the Configure page agree without duplicating the rule. Pure/total. */
+export type LensSource = 'default' | 'custom';
+
+export function lensSourceOf(json: string | null | undefined): LensSource {
+  if (!json) return 'default';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return 'default';
+  }
+  return Array.isArray(parsed) && parsed.length > 0 ? 'custom' : 'default';
+}
+
 /** Parse persisted `validationConfig` → drafts. `null`/`''`/invalid/empty-array → `defaultLenses()`.
  * A wire lens missing `vision` becomes `vision:false` (legacy config safety, D14); missing `model`
  * becomes `''`; missing `blocking` defaults to `true` (matches the all-blocking default posture). */

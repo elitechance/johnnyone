@@ -79,6 +79,16 @@ describe('healthMeta', () => {
     });
   });
 
+  it('maps the terminal complete/done health to the done token', () => {
+    expect(healthMeta('complete')).toEqual({
+      cssVar: '--jo-st-done',
+      label: 'complete',
+      className: 'health done',
+    });
+    // Backend may report either 'complete' or 'done' on the health axis.
+    expect(healthMeta('done')).toEqual(healthMeta('complete'));
+  });
+
   it('is case-tolerant and falls back for unknown', () => {
     expect(healthMeta('Blocked')).toEqual(healthMeta('blocked'));
     expect(healthMeta('exploded')).toEqual({

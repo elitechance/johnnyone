@@ -42,6 +42,10 @@ export const STATUS_META: Record<LifecycleStage, StatusMeta> = {
 /** Health axis color/label/class (mock `.health` / `.health.att` / `.health.blk`). */
 export const HEALTH_META: Record<string, StatusMeta> = {
   'in-progress': { cssVar: '--jo-good', label: 'in-progress', className: 'health' },
+  // Terminal, healthy end state — a fully-approved run is done, not "in-progress".
+  // Backend `health_from_status` maps approved/complete → 'complete'; 'done' is an alias.
+  complete: { cssVar: '--jo-st-done', label: 'complete', className: 'health done' },
+  done: { cssVar: '--jo-st-done', label: 'complete', className: 'health done' },
   'needs-attention': { cssVar: '--jo-warn', label: 'needs-attention', className: 'health att' },
   blocked: { cssVar: '--jo-bad', label: 'blocked', className: 'health blk' },
 };

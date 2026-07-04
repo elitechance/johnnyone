@@ -1,24 +1,39 @@
 <!-- Overhaul P8 §02 initiative console — the global rail is the app shell (P03); this grid adds the
      initiative master-list (left), the lifecycle bar + the EXISTING pane shell (center), and the
      validation-summary/host-files column (right), collapsing to §08 single-column at container width. -->
-<div class="console" [attr.data-console-pane]="mobileConsolePane()">
+<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [style.grid-template-columns]="(consoleCompact() || plainShellMode()) ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
+  <!-- P4: a plain shell / attached-tmux surface (`?surface=shell`) suppresses ALL initiative chrome
+       — rail, mobile segment, lifecycle, validation/host-files, and (P5) dividers — leaving only the
+       center terminal surface. -->
+  @if (!plainShellMode()) {
   <!-- LEFT: initiative master-list (mock 550-579) -->
   <aside class="pane rail console-list">
-    <div class="pane-head">Initiatives <span class="ct tnum">{{ consoleRows().length }}</span></div>
-    @for (row of consoleRows(); track row.id) {
-      <button type="button" class="init" [class.sel]="row.selected" (click)="selectInitiative(row)">
-        <div class="t">{{ row.title }}</div>
-        <div class="m">
-          <johnny-status-pill kind="status" [value]="row.status"></johnny-status-pill>
-          @if (row.showHealth) {
-            <johnny-status-pill kind="health" [value]="row.health"></johnny-status-pill>
-          }
+    <div class="pane-head">
+      Initiatives <span class="ct tnum">{{ consoleRows().length }}</span>
+      <button type="button" class="init-new" title="New initiative" aria-label="New initiative" (click)="newInitiative()">＋</button>
+    </div>
+    <div class="init-scroll">
+      @for (row of consoleRows(); track row.id) {
+        <div class="init-row" [class.sel]="row.selected">
+          <button type="button" class="init" [class.sel]="row.selected" (click)="selectInitiative(row)">
+            <div class="t">{{ row.title }}</div>
+            <div class="m">
+              <johnny-status-pill kind="status" [value]="row.status"></johnny-status-pill>
+              @if (row.showHealth) {
+                <johnny-status-pill kind="health" [value]="row.health"></johnny-status-pill>
+              }
+            </div>
+            <div class="ago">updated {{ row.ago }}</div>
+          </button>
+          <div class="init-actions">
+            <button type="button" class="ia" title="Rename initiative" aria-label="Rename initiative" (click)="renameInitiative(row); $event.stopPropagation()">✎</button>
+            <button type="button" class="ia danger" title="Delete initiative" aria-label="Delete initiative" (click)="deleteInitiative(row); $event.stopPropagation()">✕</button>
+          </div>
         </div>
-        <div class="ago">updated {{ row.ago }}</div>
-      </button>
-    } @empty {
-      <div class="pane-empty">No initiatives yet.</div>
-    }
+      } @empty {
+        <div class="pane-empty">No initiatives yet.</div>
+      }
+    </div>
   </aside>
 
   <!-- §08 mobile segment switcher (mock 1082-1085) — a PERSISTENT sibling of the panes so it stays
@@ -38,6 +53,17 @@
     }
   </div>
 
+  <!-- P5: rail↔center divider (grid child between the rail and the center pane). Hidden in the
+       collapsed layout via the container query. -->
+  <div
+    class="console-divider"
+    role="separator"
+    aria-orientation="vertical"
+    aria-label="Resize initiatives panel"
+    (pointerdown)="startRailResize($event)"
+  ></div>
+  }
+
   <!-- CENTER: lifecycle bar (mock 583-590) + the existing pane shell -->
   <section class="pane console-center">
     @if (selectedInitiative(); as sel) {
@@ -53,6 +79,7 @@
   (dragover)="onWorkspaceDragOver($event)"
   (drop)="onWorkspaceDrop($event)"
 >
+  @if (!plainShellMode()) {
   <header class="workspace-topbar">
     <!-- Mobile navigation is the global .botnav (app.component) — no per-page
          hamburger; the old ion-menu it toggled was removed in P8-03. -->
@@ -105,9 +132,234 @@
       }
     </div>
   </header>
+  }
+
+  @if (plainShellMode()) {
+    <!-- P4: minimal plain-shell top bar (mock console-states State C) — chip + session name + detach,
+         no session tabs / New Terminal chrome. -->
+    @let sh = currentSession();
+    <header class="plain-shell-topbar">
+      <span class="ps-chip">{{ sh?.attached_tmux ? 'tmux' : 'shell' }}</span>
+      <span class="ps-name">{{ sh?.title || 'Shell' }}</span>
+      @if (sh?.provider) {
+        <span class="ps-dim">· {{ providerLabel(sh!.provider) }}</span>
+      }
+      @if (sh) {
+        <button class="ps-detach" (click)="closeTerminalPane(sh.id)">
+          {{ sh.attached_tmux ? 'detach' : 'close' }}
+        </button>
+      }
+    </header>
+  }
 
   <main #terminalWorkspace class="terminal-workspace" [class.has-fullscreen-pane]="fullscreenPaneId() !== null">
-    @if (visiblePaneSessions().length > 0) {
+    @if (plainShellMode()) {
+      <!-- P4: the plain terminal surface — reuses johnny-terminal-screen full-bleed for the resolved
+           shell session (no per-pane header/tabs, no initiative chrome). -->
+      @let sh = currentSession();
+      @let shScreen = sh ? (terminalScreens()[sh.id] || null) : null;
+      @if (sh) {
+        <johnny-terminal-screen
+          class="terminal-surface plain-shell-screen"
+          [screen]="shScreen"
+          [title]="sh.title || 'Shell'"
+          [terminalProvider]="sh.provider"
+          [disabled]="false"
+          [mobileInputMode]="isCompactWorkspace()"
+          [showInput]="true"
+          [imageAttachments]="pendingAttachmentsForSession(sh.id)"
+          [imageSending]="isSendingAttachmentsForSession(sh.id)"
+          (rawInput)="onTerminalRawInput($event, sh.id)"
+          (terminalResize)="onTerminalResize($event, sh.id)"
+          (imagePasted)="addPendingImageFiles(sh.id, $event)"
+          (imageRemoved)="removePendingAttachment(sh.id, $event)"
+          (imageMessageSubmitted)="sendAttachmentMessage(sh.id, $event)"
+        />
+      } @else {
+        <section class="workspace-empty">
+          <div class="empty-title">No shell session</div>
+          <div class="empty-copy">Open a shell from /shells or the launcher.</div>
+        </section>
+      }
+    } @else {
+    @if (selectedInitiative(); as sel) {
+      <!-- P1: the four console tabs are the PRIMARY per-initiative surface, bound to the selected
+           initiative's primary session (worker ?? reviewer ?? briefing). Shown whether or not a pane
+           is attached; the Raw tab carries the inline attach affordance when none is (S1/S2). -->
+      <section class="console-tabshell">
+        <div class="pane-tabs" role="tablist" aria-label="Initiative console">
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="activeTab() === 'transcript'"
+            [attr.aria-selected]="activeTab() === 'transcript'"
+            (click)="setInitiativeTab(sel.id, 'transcript')"
+          >
+            Transcript
+            @if (isSessionStreaming(primarySessionId() ?? '')) {
+              <span class="live" aria-hidden="true"></span>
+            }
+          </button>
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="activeTab() === 'raw'"
+            [attr.aria-selected]="activeTab() === 'raw'"
+            (click)="setInitiativeTab(sel.id, 'raw')"
+          >
+            Raw terminal
+          </button>
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="activeTab() === 'plan'"
+            [attr.aria-selected]="activeTab() === 'plan'"
+            (click)="setInitiativeTab(sel.id, 'plan')"
+          >
+            Plan
+          </button>
+          <button
+            class="pane-tab"
+            role="tab"
+            [class.on]="activeTab() === 'diff'"
+            [attr.aria-selected]="activeTab() === 'diff'"
+            (click)="setInitiativeTab(sel.id, 'diff'); openInitiativeDiff()"
+          >
+            Diff
+          </button>
+        </div>
+
+        @if (activeTab() === 'transcript') {
+          <johnny-transcript-view
+            class="terminal-surface transcript-surface"
+            [events]="transcriptEventsFor(primarySessionId() ?? '')"
+            [streaming]="isSessionStreaming(primarySessionId() ?? '')"
+            (svgZoom)="mermaidZoom.open($event)"
+          />
+        } @else if (activeTab() === 'diff') {
+          <johnny-diff-view
+            class="terminal-surface diff-surface"
+            [view]="initiativeDiffView()"
+          />
+        } @else if (activeTab() === 'plan') {
+          <!-- P2: read-only Plan document view (mock §03). Structured phases/tasks from getAgentPlan;
+               markdown bodies from readFile; rendered via the shared johnny-markdown-view (no fork). -->
+          <section class="terminal-surface plandoc-surface">
+            @if (planLoading()) {
+              <div class="plan-loading">Loading plan…</div>
+            } @else if (planHasContent() || planDocMarkdown()) {
+              <div class="plandoc">
+                <nav class="docnav" aria-label="Plan documents">
+                  <div class="dn dir"><span class="ic">▾</span>plan</div>
+                  @for (entry of planNav(); track entry.id) {
+                    @if (entry.kind === 'file') {
+                      <button
+                        type="button"
+                        class="dn indent-1"
+                        [class.on]="planSelectedDoc() === entry.id"
+                        (click)="openPlanDoc(entry.id)"
+                      >
+                        <span class="ic">•</span><span class="lbl">{{ entry.label }}</span>
+                      </button>
+                    } @else {
+                      <button
+                        type="button"
+                        class="dn phase indent-1"
+                        [class.on]="planSelectedDoc() === entry.id"
+                        [class.done]="taskStatus(entry.status).token === 'done'"
+                        (click)="openPlanDoc(entry.id)"
+                        [title]="entry.label"
+                      >
+                        <span class="ic">{{ taskStatus(entry.status).token === 'done' ? '✓' : '▸' }}</span><span class="lbl">{{ entry.label }}</span>
+                      </button>
+                    }
+                  }
+                  <div class="docnav-foot">
+                    <b>{{ selectedInitiative()?.planPath }}</b>
+                    <span>global store · read-only render</span>
+                  </div>
+                </nav>
+
+                <div class="docview">
+                  <div class="doc-eyebrow">{{ planSelectedDoc() }} · rendered</div>
+                  <div class="doc-meta tnum">
+                    <span>{{ planTotals().phases }} phases</span><span>·</span>
+                    <span>{{ planTotals().tasks }} tasks</span><span>·</span>
+                    <span>{{ planTotals().done }} done</span>
+                  </div>
+
+                  @if (planError()) {
+                    <div class="plan-doc-note">{{ planError() }}</div>
+                  }
+                  <johnny-markdown-view class="plan-markdown" [markdown]="planDocMarkdown()"></johnny-markdown-view>
+
+                  @if (planCards().length > 0) {
+                    <h2 class="plan-phases-head">Phases</h2>
+                    @for (card of planCards(); track card.phaseId) {
+                      <div class="phasecard">
+                        <div class="ph">
+                          <span class="pid">{{ card.phaseId }}</span>
+                          <span class="pt">{{ card.phaseTitle }}</span>
+                          <span class="pc tnum">{{ card.done }} / {{ card.total }}</span>
+                        </div>
+                        <div class="tasklist">
+                          @for (t of card.tasks; track t.id) {
+                            @let sv = taskStatus(t.status);
+                            <div class="taskrow" [ngClass]="'st-' + sv.token">
+                              <span class="box" aria-hidden="true"></span>
+                              <span class="tt">{{ t.title }}</span>
+                              <span class="st" [ngClass]="sv.token">{{ sv.label }}</span>
+                            </div>
+                          } @empty {
+                            <div class="taskrow empty"><span class="tt">No tasks.</span></div>
+                          }
+                        </div>
+                      </div>
+                    }
+                  }
+                </div>
+              </div>
+            } @else {
+              <div class="plan-empty">
+                <div class="empty-title">No plan to show</div>
+                <div class="empty-copy">This initiative has no readable plan document yet.</div>
+              </div>
+            }
+          </section>
+        } @else {
+          @if (rawAttachNeeded(primarySessionId(), !!terminalScreens()[primarySessionId() ?? ''])) {
+            <section class="raw-attach">
+              <div class="empty-title">No terminal attached</div>
+              <div class="empty-copy">
+                Start a tmux-backed terminal for this initiative, or attach an existing tmux session.
+              </div>
+              <div class="raw-attach-actions">
+                <button class="primary-action" (click)="createNewSession()">New Terminal</button>
+                <button class="secondary-action" (click)="createNewSession()">Attach tmux…</button>
+              </div>
+            </section>
+          } @else {
+            @let primaryScreen = terminalScreens()[primarySessionId() ?? ''] || null;
+            <johnny-terminal-screen
+              class="terminal-surface"
+              [screen]="primaryScreen"
+              [title]="primarySession()?.title || 'Terminal'"
+              [terminalProvider]="primarySession()?.provider ?? ''"
+              [disabled]="primarySessionId() !== currentSession()?.id"
+              [mobileInputMode]="isCompactWorkspace()"
+              [showInput]="true"
+              [imageAttachments]="pendingAttachmentsForSession(primarySessionId() ?? '')"
+              [imageSending]="isSendingAttachmentsForSession(primarySessionId() ?? '')"
+              (rawInput)="onTerminalRawInput($event, primarySessionId() ?? '')"
+              (terminalResize)="onTerminalResize($event, primarySessionId() ?? '')"
+              (imagePasted)="addPendingImageFiles(primarySessionId() ?? '', $event)"
+              (imageRemoved)="removePendingAttachment(primarySessionId() ?? '', $event)"
+              (imageMessageSubmitted)="sendAttachmentMessage(primarySessionId() ?? '', $event)"
+            />
+          }
+        }
+      </section>
+    } @else if (visiblePaneSessions().length > 0) {
       @for (session of visiblePaneSessions(); track session.id; let index = $index) {
       @if (!fullscreenPaneId() || fullscreenPaneId() === session.id) {
       @let layout = paneLayoutForDisplay(session.id, index);
@@ -240,6 +492,7 @@
         <button class="primary-action" (click)="createNewSession()">New Terminal</button>
       </section>
     }
+    }
   </main>
 
   <footer class="workspace-statusbar">
@@ -250,10 +503,30 @@
   </section>
 
   <!-- RIGHT: validation lens summary + host files (mock 658-684). The two groups are separately
-       toggleable so the collapsed §08 layout can show Validation vs Files distinctly. -->
+       toggleable so the collapsed §08 layout can show Validation vs Files distinctly.
+       P4: suppressed entirely in plain-shell mode. -->
+  @if (!plainShellMode()) {
+  <!-- P5: center↔right divider (grid child between the center pane and the validation column). -->
+  <div
+    class="console-divider"
+    role="separator"
+    aria-orientation="vertical"
+    aria-label="Resize validation panel"
+    (pointerdown)="startRightResize($event)"
+  ></div>
   <aside class="pane console-right">
     <div class="rpane rpane-validation">
-      <div class="pane-head">Validation <span class="ct tnum">{{ consoleLenses().length }} lenses</span></div>
+      <div class="pane-head">
+        Validation
+        <!-- P3: per-initiative source badge — makes "default template" vs "configured" legible so
+             unconfigured initiatives no longer read as a single global config. -->
+        <span
+          class="lens-source-badge"
+          [class.cfg]="consoleLensSource() === 'custom'"
+          [class.def]="consoleLensSource() === 'default'"
+        >{{ consoleLensSource() === 'custom' ? 'configured' : 'default template' }}</span>
+        <span class="ct tnum">{{ consoleLenses().length }} lenses</span>
+      </div>
       <div class="rgroup">
         @for (lens of consoleLenses(); track lens.name) {
           <div class="lens">
@@ -289,6 +562,7 @@
       </div>
     </div>
   </aside>
+  }
 </div>
 
 <ion-modal

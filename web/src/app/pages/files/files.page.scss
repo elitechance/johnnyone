@@ -202,6 +202,37 @@
       font-size: 13px;
       font-style: italic;
     }
+
+    /* Single-page HTML render (mode==='html') — a sandboxed iframe filling the body on a white
+       ground so the file's own styles read correctly. */
+    .html-preview {
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: 60vh;
+      border: 0;
+      border-radius: 6px;
+      background: #fff;
+    }
+
+    /* Inline image preview (mode==='image') — centered, fit-to-pane, on a checker-neutral ground. */
+    .img-wrap {
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 8px;
+    }
+    .img-preview {
+      max-width: 100%;
+      max-height: 78vh;
+      object-fit: contain;
+      border-radius: 6px;
+      background: repeating-conic-gradient(#e9e9ee 0% 25%, #f7f7f9 0% 50%) 50% / 20px 20px;
+    }
+  }
+  /* Give the iframe a definite height to fill: drop the body padding only in html mode. */
+  .ebody:has(.html-preview) {
+    padding: 0;
   }
 
   .fm-editor-empty {

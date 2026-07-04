@@ -206,12 +206,21 @@ impl AgentService {
                 msg = ws_read.next() => {
                     match msg {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            Self::handle_text_message(
+                            // A single malformed/unknown message must NOT tear down the relay
+                            // connection. Previously `?` propagated a parse error, which the caller
+                            // logged as "WebSocket disconnected" — so one unknown frame (e.g. a
+                            // `stream_subscribe` before it was a known variant) dropped the whole
+                            // socket ("Desktop not connected" flakiness). Log and keep going. #9 fix.
+                            if let Err(e) = Self::handle_text_message(
                                 &text,
                                 &ws_write,
                                 &state,
                                 &tool_dispatcher,
-                            ).await?;
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "Skipping unhandled relay message; keeping connection alive");
+                            }
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
                             let mut writer = ws_write.lock().await;

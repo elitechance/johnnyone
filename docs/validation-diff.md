@@ -157,8 +157,10 @@ and the selected file's hunks. Each code line is classified by the pure
 `loadDiff(session)` fires on tab activation and calls
 `gitDiff(session.workingDirectory)`, refetching each activation. Best-effort: no
 cwd / non-repo / failed RPC resolves to a benign empty view (the component shows
-its own empty state, no toast). The `Plan` pane tab stays reserved for its own
-phase; only `Diff` is wired here.
+its own empty state, no toast). At P7 only `Diff` was wired and the `Plan` pane
+tab was left reserved; the **Plan tab has since been built** (doc navigator +
+rendered plan markdown + phase cards) — see [`console-fixes.md`](console-fixes.md)
+§2.
 
 The planner page's existing inline diff (`planner.page.ts` `diffLines` +
 `.diff-table`) is intentionally left as-is — migrating it onto `johnny-diff-view`
@@ -220,7 +222,8 @@ web/src/app/
   `nx build worker`/`web`/`ui` + `cargo test` + the pure specs
   (`diff-parse.spec.ts`, `validation-config-logic.spec.ts`), with mock §07
   (validation) and §04 (Diff tab) as the layout contracts.
-- **Out of scope:** the `Plan` pane tab (its own phase); migrating the planner's
+- **Out of scope for P7** (the `Plan` pane tab was its own later phase — now
+  delivered, see [`console-fixes.md`](console-fixes.md) §2): migrating the planner's
   inline diff onto `johnny-diff-view`; a model catalog / provider-config picker
   (model is free-text); untracked-file diffs; any new npm dependency or second
   render core.

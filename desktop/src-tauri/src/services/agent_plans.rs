@@ -3700,8 +3700,11 @@ async fn pass_phase(
         } else {
             update_plan_status_and_health(conn, plan_id, "approved", None)
                 .map_err(|e| e.to_string())?;
+            // Final phase passed → the development run is complete. Advance the
+            // initiative lifecycle to 'done' (health is derived to 'complete' above);
+            // otherwise the stepper stays stuck on 'development' forever.
             conn.execute(
-                "UPDATE agent_plans SET phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET phase_run_mode = 'continue', initiative_status = 'done', updated_at = datetime('now') WHERE id = ?1 AND run_type = 'development'",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
@@ -3709,8 +3712,9 @@ async fn pass_phase(
         } else {
             update_plan_status_and_health(conn, plan_id, "approved", None)
                 .map_err(|e| e.to_string())?;
+            // Single-phase run approved → development complete; advance to 'done'.
             conn.execute(
-                "UPDATE agent_plans SET phase_run_mode = 'continue', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE agent_plans SET phase_run_mode = 'continue', initiative_status = 'done', updated_at = datetime('now') WHERE id = ?1 AND run_type = 'development'",
                 params![plan_id],
             )
             .map_err(|e| e.to_string())?;
@@ -6169,7 +6173,7 @@ mod store_tests {
 
         update_plan_status_and_health(&conn, "P", "approved", None).unwrap();
         let (s, h, e) = read(&conn);
-        assert_eq!((s.as_str(), h.as_str()), ("approved", "in-progress"));
+        assert_eq!((s.as_str(), h.as_str()), ("approved", "complete"));
         assert!(e.is_none(), "approve must clear error");
     }
 
