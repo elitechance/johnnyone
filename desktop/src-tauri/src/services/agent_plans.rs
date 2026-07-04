@@ -617,6 +617,13 @@ pub async fn accept_brief(
             e
         )
     })?;
+    // Persist the accepted brief as `brief.md` in the (shared) plan dir so EVERY agent on this
+    // initiative can read it from disk — the planner, and crucially the development validation lenses
+    // (their prompt points here). The DB `brief` column drives the planner prompt; this file is the
+    // durable, agent-readable source of the original intent for planning AND review.
+    if let Err(e) = std::fs::write(plan_dir.join("brief.md"), &composed) {
+        tracing::warn!(%id, error=%e, "Failed to write brief.md (non-fatal)");
+    }
     let planner_session = sessions::create_session(
         state,
         CreateSessionInput {
@@ -2433,12 +2440,14 @@ fn lens_reviewer_prompt(
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     };
+    let brief_path = Path::new(&run.plan.plan_path).join("brief.md");
     format!(
         "You are the {name} reviewer for phase {phase_id} of a development run. Run ONLY the {name} lens — do not run the other lenses.\n\n\
-Read first: methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
+Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
 Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
         phase_id = phase.phase_id,
+        brief = brief_path.display(),
         methodology = get("methodology_path"),
         conventions = get("conventions_path"),
         plan = get("plan_path"),
