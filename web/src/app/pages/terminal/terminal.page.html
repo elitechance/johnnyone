@@ -340,118 +340,19 @@
           }
         }
       </section>
-    } @else if (visiblePaneSessions().length > 0) {
-      @for (session of visiblePaneSessions(); track session.id; let index = $index) {
-      @if (!fullscreenPaneId() || fullscreenPaneId() === session.id) {
-      @let layout = paneLayoutForDisplay(session.id, index);
-      @let screen = terminalScreens()[session.id] || null;
-      <section
-        class="terminal-pane"
-        [class.active]="session.id === currentSession()?.id"
-        [class.fullscreen]="isPaneFullscreen(session.id)"
-        [class.dragging]="isDraggingPane()"
-        [class.resizing]="isResizingPane()"
-        [style.left.px]="layout.x"
-        [style.top.px]="layout.y"
-        [style.width.px]="layout.width"
-        [style.height.px]="layout.height"
-        (pointerdown)="onSessionSelected(session.id)"
-      >
-        <header class="pane-header" (pointerdown)="startPaneDrag($event, session.id)">
-          <div class="pane-title">
-            <span class="provider-badge">{{ providerLabel(session.provider) }}</span>
-            <span class="pane-name">{{ session.title || 'Terminal' }}</span>
-            <span class="pane-id">#{{ toSessionNumber(session.id) }}</span>
-          </div>
-          <div class="pane-meta">
-            <button class="pane-tool pane-cwd" [title]="session.workingDirectory || '~'" (click)="pickWorkingDirectoryForSession(session.id); $event.stopPropagation()">
-              {{ isCompactWorkspace() ? mobileWorkingDirectoryLabel(session.workingDirectory) : (session.workingDirectory || '~') }}
-            </button>
-            <button class="pane-tool" title="Rename session" (click)="onSessionRenamed(session.id); $event.stopPropagation()">
-              rename
-            </button>
-            <button
-              class="pane-tool pane-fullscreen-btn"
-              [title]="isPaneFullscreen(session.id) ? 'Exit fullscreen' : 'Fullscreen in workspace'"
-              [attr.aria-label]="isPaneFullscreen(session.id) ? 'Exit fullscreen' : 'Fullscreen in workspace'"
-              (click)="togglePaneFullscreen(session.id, $event)"
-            >
-              <ion-icon [name]="isPaneFullscreen(session.id) ? 'contract-outline' : 'expand-outline'" aria-hidden="true"></ion-icon>
-              <span class="pane-fullscreen-label">{{ isPaneFullscreen(session.id) ? 'exit' : 'full' }}</span>
-            </button>
-            <button
-              class="pane-tool danger"
-              [title]="session.attachedTmux ? 'Detach view (keeps the tmux session running)' : 'Close terminal'"
-              (click)="closeTerminalPane(session.id); $event.stopPropagation()"
-            >
-              {{ session.attachedTmux ? 'detach' : 'close' }}
-            </button>
-            <span class="pane-status" [class.offline]="screen?.status !== 'attached'">
-              {{ screen?.status || (session.id === currentSession()?.id ? 'attaching' : 'detached') }}
-            </span>
-          </div>
-        </header>
-
-        <div class="pane-tabs" role="tablist">
-          <button
-            class="pane-tab"
-            role="tab"
-            [class.on]="paneTab(session.id) === 'raw'"
-            [attr.aria-selected]="paneTab(session.id) === 'raw'"
-            (click)="setPaneTab(session.id, 'raw'); $event.stopPropagation()"
-          >
-            Raw terminal
-          </button>
-          <button
-            class="pane-tab"
-            role="tab"
-            [class.on]="paneTab(session.id) === 'diff'"
-            [attr.aria-selected]="paneTab(session.id) === 'diff'"
-            (click)="setPaneTab(session.id, 'diff'); loadDiff(session); $event.stopPropagation()"
-          >
-            Diff
-          </button>
-        </div>
-
-        @if (paneTab(session.id) === 'diff') {
-          <johnny-diff-view
-            class="terminal-surface diff-surface"
-            [view]="diffFor(session.id)"
-          />
-        } @else {
-          <johnny-terminal-screen
-            class="terminal-surface"
-            [screen]="screen"
-            [title]="session.title || 'Terminal'"
-            [terminalProvider]="session.provider"
-            [disabled]="session.id !== currentSession()?.id"
-            [mobileInputMode]="isCompactWorkspace()"
-            [showInput]="true"
-            [imageAttachments]="pendingAttachmentsForSession(session.id)"
-            [imageSending]="isSendingAttachmentsForSession(session.id)"
-            (rawInput)="onTerminalRawInput($event, session.id)"
-            (terminalResize)="onTerminalResize($event, session.id)"
-            (imagePasted)="addPendingImageFiles(session.id, $event)"
-            (imageRemoved)="removePendingAttachment(session.id, $event)"
-            (imageMessageSubmitted)="sendAttachmentMessage(session.id, $event)"
-          />
-        }
-
-        @if (!isPaneFullscreen(session.id)) {
-          <div class="pane-resize-handle" (pointerdown)="startPaneResize($event, session.id)" aria-label="Resize terminal pane"></div>
-        }
-
-        @if (terminalError() && session.id === currentSession()?.id) {
-          <div class="terminal-error">{{ terminalError() }}</div>
-        }
-      </section>
-      }
-      }
     } @else {
+      <!-- No initiative selected. Standalone terminals/shells live on /shells now, so the console
+           does NOT surface floating session panes here — an active shell must not make an empty
+           initiative list render a terminal. Show an initiative-oriented empty state instead. -->
       <section class="workspace-empty">
-        <div class="empty-title">No terminal attached</div>
-        <div class="empty-copy">Start a tmux-backed terminal using the selected provider.</div>
-        <button class="primary-action" (click)="createNewSession()">New Terminal</button>
+        @if (consoleRows().length === 0) {
+          <div class="empty-title">No initiatives yet</div>
+          <div class="empty-copy">Create an initiative to start briefing, planning, and development.</div>
+        } @else {
+          <div class="empty-title">No initiative selected</div>
+          <div class="empty-copy">Pick an initiative from the list, or create a new one.</div>
+        }
+        <button class="primary-action" (click)="newInitiative()">New initiative</button>
       </section>
     }
     }
