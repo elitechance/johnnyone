@@ -4,7 +4,7 @@
 // rel-time/open decisions to exactly these functions and stays thin wiring.
 //
 // `AiSession`/`TmuxSession` are imported type-only (erased at build) at the same relative depth the
-// shipped pure siblings use (`briefing-page-logic.ts:6` — five `../`), so no Angular/runtime dependency
+// shipped pure siblings use (`validation-config-logic.ts` — five `../`), so no Angular/runtime dependency
 // leaks in. `openIntent` REUSES Phase 01's `terminalRoute` — the `/terminal?sessionId=` nav shape is
 // defined once (D3), not re-derived here.
 import type { AiSession } from '../../../../../ui/src/models/ai-session.model';
