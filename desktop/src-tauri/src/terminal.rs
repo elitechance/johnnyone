@@ -26,6 +26,18 @@ const CURSOR_ONLY_MIN_INTERVAL_MS: u128 = 2_000;
 const MIN_TERMINAL_SCREEN_PUBLISH_MS: u128 = 2_000;
 const DEFAULT_HISTORY_CAPTURE_LINES: u16 = 200;
 const MAX_HISTORY_CAPTURE_LINES: u16 = 2000;
+
+/// Clamp a client-requested history-capture depth (from `captureTerminal(sessionId, historyLines)`) to
+/// the supported window. `None` ⇒ the default depth; a present value is bounded to
+/// `[1, MAX_HISTORY_CAPTURE_LINES]` so a zero, a huge, or a `> u16` request can neither no-op nor
+/// overflow the capture. Pure/deterministic — this is the seam the C2b console scrollback depth flows
+/// through, and the regression guard for "the 1500 request silently captured only 200".
+pub fn clamp_history_capture_lines(requested: Option<u64>) -> u16 {
+    match requested {
+        None => DEFAULT_HISTORY_CAPTURE_LINES,
+        Some(n) => n.clamp(1, MAX_HISTORY_CAPTURE_LINES as u64) as u16,
+    }
+}
 /// Live relay captures include recent tmux scrollback so mobile viewports still
 /// receive Grok/TUI responses that scrolled above the visible pane.
 const LIVE_CAPTURE_SCROLLBACK_LINES: u16 = 120;
@@ -279,6 +291,20 @@ pub async fn capture_terminal_session_with_history(
 ) -> Result<TerminalSnapshot, String> {
     let terminal = ensure_terminal_session_for_input(state, session_id).await?;
     capture_snapshot_with_history(state, &terminal).await
+}
+
+/// Capture a session's pane WITH an explicit scrollback depth (C2b). The console primary pane requests
+/// `CONSOLE_CAPTURE_LINES` (1500) so the home-anchored repaint carries real history the user can scroll
+/// within; coordinator callers keep the default-depth `capture_terminal_session_with_history`. `history_rows`
+/// should already be clamped via `clamp_history_capture_lines`; the downstream tmux `-<rows>` is clamped
+/// again defensively.
+pub async fn capture_terminal_session_with_history_rows(
+    state: &AppState,
+    session_id: &str,
+    history_rows: u16,
+) -> Result<TerminalSnapshot, String> {
+    let terminal = ensure_terminal_session_for_input(state, session_id).await?;
+    capture_snapshot_with_history_rows(state, &terminal, history_rows).await
 }
 
 async fn publish_snapshot(
@@ -1323,6 +1349,24 @@ mod tests {
     fn normalize_unescapes_json_newlines() {
         let input = "line one\\n\\nline two";
         assert_eq!(normalize_terminal_input(input), "line one\n\nline two");
+    }
+
+    #[test]
+    fn clamp_history_capture_lines_honors_request_within_window() {
+        // C2b regression guard: a client asking for 1500 (the console pane's CONSOLE_CAPTURE_LINES)
+        // must get 1500 — NOT the old 200 default. This is the bug T2 caught: the RPC discarded the
+        // value and always captured DEFAULT_HISTORY_CAPTURE_LINES.
+        assert_eq!(clamp_history_capture_lines(Some(1500)), 1500);
+        assert!(clamp_history_capture_lines(Some(1500)) > DEFAULT_HISTORY_CAPTURE_LINES);
+    }
+
+    #[test]
+    fn clamp_history_capture_lines_defaults_and_bounds() {
+        assert_eq!(clamp_history_capture_lines(None), DEFAULT_HISTORY_CAPTURE_LINES); // 200
+        assert_eq!(clamp_history_capture_lines(Some(0)), 1); // never zero rows
+        assert_eq!(clamp_history_capture_lines(Some(5000)), MAX_HISTORY_CAPTURE_LINES); // 2000 ceiling
+        // A value larger than u16::MAX must clamp, not wrap/overflow the `as u16` cast.
+        assert_eq!(clamp_history_capture_lines(Some(10_000_000_000)), MAX_HISTORY_CAPTURE_LINES);
     }
 
     #[test]

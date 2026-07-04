@@ -33,7 +33,11 @@ import {
   IonFooter,
   IonSegment,
   IonSegmentButton,
+  IonRadioGroup,
+  IonRadio,
+  IonTextarea,
   AlertController,
+  ToastController,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
 import {
@@ -111,6 +115,19 @@ import {
   PhaseCard,
   TaskStatusView,
 } from './plan-tab-logic';
+import {
+  panelVisible,
+  bannerModel,
+  runButtonLabel,
+  defaultSelectedPhaseId,
+  defaultRunMode,
+  phasePickerRows,
+  validateComment,
+  buildRunFromPhaseArgs,
+  PhasePickerRow,
+} from './run-resume-logic';
+import { resolveSelectedInitiative } from './console-selection-logic';
+import { consoleCaptureLines } from '../../../../../ui/src/components/terminal-screen/terminal-scroll-logic';
 import { isPlainShellSurface } from '../../components/launcher-menu/launcher-logic';
 import {
   clampRailWidth,
@@ -197,6 +214,9 @@ addIcons({
     IonFooter,
     IonSegment,
     IonSegmentButton,
+    IonRadioGroup,
+    IonRadio,
+    IonTextarea,
   ],
   templateUrl: './terminal.page.html',
   styleUrls: ['./terminal.page.scss'],
@@ -226,6 +246,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
   private readonly alertCtrl = inject(AlertController);
+  private readonly toastCtrl = inject(ToastController);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
   private readonly defaultSidebarWidth = 360;
@@ -367,10 +388,15 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     initiativeRows(this.agentPlans(), this.selectedInitiativeId(), this.consoleNow()),
   );
   /** The selected initiative record (for the lifecycle bar + validation config). */
-  protected readonly selectedInitiative = computed<AgentPlan | null>(() => {
-    const id = this.selectedInitiativeId();
-    return this.agentPlans().find((p) => p.id === id) ?? null;
-  });
+  // C1: resolve the selection by plan-run `id` OR group `initiativeId` so a `?initiativeId=<id>`
+  // deep-link renders the terminal instead of stranding on the empty state (console-selection-logic).
+  protected readonly selectedInitiative = computed<AgentPlan | null>(() =>
+    resolveSelectedInitiative(this.agentPlans(), this.selectedInitiativeId()),
+  );
+  // Mobile master-detail hides the list only when the selection actually RESOLVES to a plan. A
+  // `recoverableEmpty` selection (set but unresolved) keeps the list/back affordance visible so the
+  // user can recover instead of being stranded (C1).
+  protected readonly hasResolvedSelection = computed<boolean>(() => !!this.selectedInitiative());
   /** The session the selected initiative's tabs display: worker ?? reviewer ?? briefing (P1/D2). */
   protected readonly primarySessionId = computed<string | null>(() =>
     resolvePrimarySessionId(this.selectedInitiative()),
@@ -424,6 +450,30 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly planHasContent = computed<boolean>(
     () => (this.planRun()?.phases?.length ?? 0) > 0,
   );
+
+  // Run/Resume panel (console-features P01) — all decisions come from the pure `run-resume-logic`
+  // seam; these signals hold only the form state the user edits. Pre-seeded from the run when the
+  // Plan tab (re)loads via `applyPlanRun`.
+  /** The phase the picker currently has selected (radio value). */
+  protected readonly runFromPhaseId = signal<string | null>(null);
+  /** The optional comment/guidance textarea value. */
+  protected readonly runComment = signal<string>('');
+  /** The run mode toggle: continue (from here) / single (only this phase). */
+  protected readonly runMode = signal<'continue' | 'single'>(defaultRunMode());
+  /** True while a run/resume submit is in flight (disables the button). */
+  protected readonly runSubmitting = signal<boolean>(false);
+  /** Whole-panel visibility — dev run with ≥1 phase, else hidden. */
+  protected readonly runResumeVisible = computed<boolean>(() => panelVisible(this.planRun()));
+  /** Error banner model (shown above the panel when the run is paused). */
+  protected readonly runBanner = computed(() => bannerModel(this.planRun()));
+  /** Primary button label: Run / Resume. */
+  protected readonly runBtnLabel = computed<'Run' | 'Resume'>(() => runButtonLabel(this.planRun()));
+  /** Radio rows for the Start-at-phase picker, reactive to the current selection. */
+  protected readonly runPhaseRows = computed<PhasePickerRow[]>(() =>
+    phasePickerRows(this.planRun(), this.runFromPhaseId()),
+  );
+  /** Comment validation (drives the inline error + button disabled state). */
+  protected readonly runCommentValid = computed(() => validateComment(this.runComment()));
   /** Right-column validation lens summary (mock 658-673), reusing P7's parser. */
   protected readonly consoleLenses = computed<LensChip[]>(() =>
     lensSummary(this.selectedInitiative()?.validationConfig ?? null),
@@ -1822,11 +1872,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.planLoading.set(true);
     try {
       const run = await firstValueFrom(this.api.getAgentPlan(init.id));
-      this.planRun.set(run ?? null);
+      this.applyPlanRun(run ?? null);
       // Stage-aware default: overview.md when the plan has phases (development), else plan.md (planning).
       await this.loadPlanDoc(defaultPlanDoc(run));
     } catch {
-      this.planRun.set(null); // benign empty state, no crash
+      this.applyPlanRun(null); // benign empty state, no crash
     } finally {
       this.planLoading.set(false);
     }
@@ -1953,10 +2003,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   /** Pull one screen snapshot via the reliable `captureTerminal` request/response path and inject it
-   *  into `terminalScreens` (same shape the push stream produces), unless the selection has moved on. */
+   *  into `terminalScreens` (same shape the push stream produces), unless the selection has moved on.
+   *  C2b: capture `CONSOLE_CAPTURE_LINES` (1500) of history — not 200 — so the home-anchored repaint
+   *  carries real scrollback the user can scroll within. The widget's content-change gate keeps a deep
+   *  repaint from running while idle, and the `\x1b[3J`+home repaint (never `\x1b[2J`) stays black-free. */
   private async capturePrimaryScreen(sessionId: string): Promise<void> {
     try {
-      const screen = await firstValueFrom(this.api.captureTerminal(sessionId, 200));
+      const screen = await firstValueFrom(this.api.captureTerminal(sessionId, consoleCaptureLines()));
       if (screen && this.primaryScreenSessionId === sessionId && this.primarySessionId() === sessionId) {
         this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: screen }));
       }
@@ -2097,6 +2150,85 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     } catch (err) {
       await this.showInitiativeError('Failed to amend plan', err);
     }
+  }
+
+  /** Set `planRun` and (re)seed the Run/Resume form to its defaults for that run — the pre-selected
+   *  phase (paused/current/first), a cleared comment, and the default `continue` mode. Called on plan
+   *  (re)load and after a successful submit so the panel always reflects the freshest run. */
+  private applyPlanRun(run: AgentPlanRun | null): void {
+    this.planRun.set(run);
+    this.runFromPhaseId.set(defaultSelectedPhaseId(run));
+    this.runComment.set('');
+    this.runMode.set(defaultRunMode());
+  }
+
+  /** Radio-group change → selected phase id. */
+  protected setRunPhase(event: Event): void {
+    const value = (event as CustomEvent<{ value?: unknown }>).detail?.value;
+    this.runFromPhaseId.set(typeof value === 'string' && value ? value : null);
+  }
+
+  /** Textarea input → comment text (kept verbatim; blank/whitespace handled by `validateComment`). */
+  protected setRunComment(event: Event): void {
+    const value = (event as CustomEvent<{ value?: unknown }>).detail?.value;
+    this.runComment.set(typeof value === 'string' ? value : '');
+  }
+
+  /** Mode segment change → run mode ('continue' default; only 'single' flips it). */
+  protected setRunMode(event: Event): void {
+    const value = (event as CustomEvent<{ value?: unknown }>).detail?.value;
+    this.runMode.set(value === 'single' ? 'single' : 'continue');
+  }
+
+  /**
+   * Run control — Run/Resume: (re)start the selected development run at the chosen phase, with the
+   * optional comment/guidance, in ONE action (Phase 00's `runInitiativeFromPhase`). Mirrors the
+   * `stopInitiative`/`amendInitiative` handler shape. Guarded by the button's disabled state
+   * (`validateComment`); on success refreshes the plan + events timeline, on error toasts.
+   */
+  async runResumeInitiative(): Promise<void> {
+    const run = this.planRun();
+    const init = this.selectedInitiative();
+    if (!run || !init || this.runSubmitting()) return;
+    if (!this.runCommentValid().ok) return; // whitespace-only comment — button already disabled
+    let args: ReturnType<typeof buildRunFromPhaseArgs>;
+    try {
+      args = buildRunFromPhaseArgs(init.id, this.runFromPhaseId(), this.runComment(), this.runMode());
+    } catch {
+      return; // defensive: validateComment already gates the button
+    }
+    this.runSubmitting.set(true);
+    try {
+      await firstValueFrom(
+        this.api.runInitiativeFromPhase(
+          args.id,
+          args.phaseId ?? undefined,
+          args.phaseRunMode,
+          args.comment ?? undefined,
+        ),
+      );
+      // Refresh the plan (new status/phase) + the events timeline (the human_comment row, if any).
+      const fresh = await firstValueFrom(this.api.getAgentPlan(init.id));
+      this.applyPlanRun(fresh ?? null);
+      await this.loadInitiativeEvents(init.initiativeId || init.id, false);
+      await this.loadInitiatives();
+    } catch (err) {
+      await this.showRunResumeToast(err);
+    } finally {
+      this.runSubmitting.set(false);
+    }
+  }
+
+  /** Error toast for a failed run/resume (does not throw to the console). */
+  private async showRunResumeToast(err: unknown): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err);
+    const toast = await this.toastCtrl.create({
+      message: `Run/Resume failed: ${message}`,
+      duration: 4000,
+      color: 'danger',
+      position: 'bottom',
+    });
+    await toast.present();
   }
 
   /** Whether the selected initiative has agents actively running (drives the Stop control). */

@@ -867,6 +867,9 @@ impl AgentService {
             "get_agent_plan" => Self::rpc_get_agent_plan(&req.params, state),
             "list_initiative_events" => Self::rpc_list_initiative_events(&req.params, state),
             "start_agent_plan" => Self::rpc_start_agent_plan(&req.params, state).await,
+            "run_initiative_from_phase" => {
+                Self::rpc_run_initiative_from_phase(&req.params, state).await
+            }
             "update_agent_plan_title" => Self::rpc_update_agent_plan_title(&req.params, state),
             "update_agent_plan_app_scope" => {
                 Self::rpc_update_agent_plan_app_scope(&req.params, state)
@@ -977,9 +980,14 @@ impl AgentService {
             .get("sessionId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
-        let with_history = params.get("historyLines").and_then(|v| v.as_u64()).is_some();
-        let snapshot = if with_history {
-            crate::terminal::capture_terminal_session_with_history(state, session_id).await?
+        // C2b: honor the REQUESTED depth, not just its presence. The old code checked `.is_some()`
+        // then captured the hardcoded DEFAULT_HISTORY_CAPTURE_LINES (200), so `captureTerminal(id, 1500)`
+        // was a silent no-op. Thread the clamped value through to the depth-aware capture path.
+        let requested_history = params.get("historyLines").and_then(|v| v.as_u64());
+        let snapshot = if requested_history.is_some() {
+            let history_rows = crate::terminal::clamp_history_capture_lines(requested_history);
+            crate::terminal::capture_terminal_session_with_history_rows(state, session_id, history_rows)
+                .await?
         } else {
             crate::terminal::capture_terminal_session(state, session_id).await?
         };
@@ -1237,6 +1245,47 @@ impl AgentService {
                 phase_run_mode,
             )
             .await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Unified run/resume dispatch. Extracts `id`/`phaseId`/`phaseRunMode`/`comment`
+    /// (empty strings coerced to `None`, same idiom as `rpc_start_agent_plan`) and
+    /// delegates to the service fn, which records/injects the optional comment, clears a
+    /// paused run, and (re)starts development at the chosen phase.
+    async fn rpc_run_initiative_from_phase(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let phase_run_mode = params
+            .get("phaseRunMode")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        // Coerce only a truly-empty string to None — do NOT trim-filter here, or a
+        // whitespace-only comment would collapse to None and skip the service's
+        // whitespace-only rejection (brief: whitespace-only, when provided, is rejected).
+        let comment = params
+            .get("comment")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let run = crate::services::agent_plans::run_initiative_from_phase(
+            (**state).clone(),
+            id.to_string(),
+            phase_id,
+            phase_run_mode,
+            comment,
+        )
+        .await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 

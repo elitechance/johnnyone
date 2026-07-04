@@ -1814,3 +1814,103 @@ ion-modal.workspace-picker .picker-empty {
     cursor: pointer;
   }
 }
+
+/* ---- Run/Resume panel (console-features P01) — Plan tab, above the doc navigator ---- */
+.run-resume {
+  margin: 0 0 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+/* Error-reason banner shown above the panel when the run is paused (needs_attention/blocked). */
+.run-resume .rr-banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--jo-bad) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--jo-bad) 40%, transparent);
+  border-left: 3px solid var(--jo-bad);
+}
+.run-resume .rr-banner-dot { color: var(--jo-bad); font-size: 14px; line-height: 1.3; }
+.run-resume .rr-banner-title {
+  font-size: 11.5px; font-weight: 700; color: var(--jo-bad);
+  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px;
+}
+.run-resume .rr-banner-reason {
+  font-size: 12.5px; color: var(--jo-fg-strong);
+  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+}
+.run-resume .rr-panel {
+  background: var(--jo-bg-raised, #141a23);
+  border: 1px solid var(--jo-border, #2e3948);
+  border-radius: 10px;
+  padding: 14px;
+}
+.run-resume .rr-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; font-weight: 700; color: var(--jo-fg-strong);
+}
+.run-resume .rr-ico { color: var(--jo-accent); }
+.run-resume .rr-help { font-size: 12px; color: var(--jo-fg-faint); margin: 4px 0 14px; }
+.run-resume .rr-field { margin: 0 0 14px; }
+.run-resume .rr-flabel {
+  display: flex; justify-content: space-between;
+  font-size: 11px; font-weight: 600; color: var(--jo-fg-muted);
+  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;
+}
+.run-resume .rr-opt { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--jo-fg-faint); }
+
+/* Start-at-phase radio list */
+.run-resume .rr-phases { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; }
+.run-resume .rr-phase {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 11px;
+  border: 1px solid var(--jo-border);
+  border-radius: 7px;
+  background: var(--jo-bg-base);
+  min-height: 44px; /* mobile tap target */
+}
+.run-resume .rr-phase.sel {
+  border-color: var(--jo-accent);
+  background: color-mix(in srgb, var(--jo-accent) 8%, transparent);
+}
+.run-resume .rr-radio { flex: 1; min-width: 0; }
+.run-resume .rr-pid {
+  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 12px; color: var(--jo-fg-faint); margin-right: 6px;
+}
+.run-resume .rr-ptitle { font-size: 13px; color: var(--jo-fg-strong); }
+.run-resume .rr-paused-tag { font-size: 11px; color: var(--jo-warn); font-weight: 600; margin-left: 4px; }
+.run-resume .rr-chip {
+  flex: 0 0 auto;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 12px;
+  background: var(--jo-bg-elevated); color: var(--jo-fg-muted);
+}
+.run-resume .rr-chip.st-done { background: color-mix(in srgb, var(--jo-st-done) 16%, transparent); color: var(--jo-st-done); }
+.run-resume .rr-chip.st-in-progress { background: color-mix(in srgb, var(--jo-st-development) 16%, transparent); color: var(--jo-st-development); }
+.run-resume .rr-chip.st-needs-changes,
+.run-resume .rr-chip.st-needs-attention,
+.run-resume .rr-chip.st-blocked { background: color-mix(in srgb, var(--jo-warn) 18%, transparent); color: var(--jo-warn); }
+
+/* Comment + hint */
+.run-resume .rr-comment { margin-top: 2px; --background: var(--jo-bg-base); }
+.run-resume .rr-hint { font-size: 11.5px; color: var(--jo-fg-faint); margin: 5px 0 0; }
+.run-resume .rr-hint.err { color: var(--jo-bad); }
+
+/* Mode segment — two-line labels */
+.run-resume .rr-mode ion-label { display: flex; flex-direction: column; gap: 1px; line-height: 1.2; }
+.run-resume .rr-mode ion-label small { font-size: 10px; opacity: 0.7; }
+
+/* Run/Resume button */
+.run-resume .rr-run-btn { margin-top: 4px; min-height: 44px; }
+
+/* human_comment chip on the Events timeline (actor "you", "human" chip) */
+.console-right .ev-humanchip {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 12px;
+  background: color-mix(in srgb, var(--jo-accent) 16%, transparent);
+  color: var(--jo-accent);
+}

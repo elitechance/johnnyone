@@ -793,6 +793,81 @@ pub async fn start_plan(
     get_plan(&state, &id)
 }
 
+/// Validate an optional human comment/guidance attached to a run/resume.
+///
+/// - `None` or an empty string → `Ok(None)`: a pure re-run/resume — no event, no
+///   injected feedback (brief: "Resume with no comment → resumes, no injected
+///   feedback, no human_comment event").
+/// - A non-empty string that trims to empty (whitespace-only) → `Err`.
+/// - Otherwise → `Ok(Some(text))` with the ORIGINAL text preserved (trimmed only for
+///   the blank check) so the guidance is recorded and injected verbatim.
+fn validate_comment(comment: Option<&str>) -> Result<Option<String>, String> {
+    match comment {
+        None => Ok(None),
+        Some(text) if text.is_empty() => Ok(None),
+        Some(text) if text.trim().is_empty() => {
+            Err("comment must not be whitespace-only".to_string())
+        }
+        Some(text) => Ok(Some(text.to_string())),
+    }
+}
+
+/// Unified run/resume entry point: optionally record + inject a human comment, clear a
+/// paused (`needs_attention`/`blocked`) run, then (re)start development at `phase_id`
+/// via the existing `start_plan` path. Composes existing helpers — no new coordinator
+/// logic (overhaul §Key decisions D1).
+pub async fn run_initiative_from_phase(
+    state: AppState,
+    id: String,
+    phase_id: Option<String>,
+    phase_run_mode: Option<String>,
+    comment: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    // Reject a whitespace-only comment up front (early return before any side effect).
+    let comment = validate_comment(comment.as_deref())?;
+    let run = get_plan(&state, &id)?;
+
+    if let Some(text) = comment.as_deref() {
+        // Record the comment as a timeline event, then inject it into the run's active
+        // session so the guidance enters the agent's context BEFORE the phase directive
+        // start_plan sends — awaited sequentially, no interleave. `worker_session_id`
+        // holds the planner session for a planning run and the worker/T1 session for a
+        // development run, exactly as `send_feedback_to_worker` resolves it.
+        append_event(
+            &state,
+            &id,
+            phase_id.as_deref(),
+            "human_comment",
+            json!({ "text": text, "phaseId": phase_id.clone(), "mode": phase_run_mode.clone() }),
+        )?;
+        let session_id = run
+            .plan
+            .worker_session_id
+            .clone()
+            .ok_or_else(|| "Run has no active session".to_string())?;
+        terminal::send_terminal_input(&state, session_id, format!("{}\r", text)).await?;
+    }
+
+    // Clear a paused run before delegating: start_plan early-returns for `blocked`
+    // (and start_planning_run_inner for `blocked`), so move off the terminal status and
+    // NULL the error (mirrors the error-clearing in amend_plan). `needs_attention` also
+    // breaks the coordinator loop, so it must be cleared too. start_plan then re-enters
+    // the full (re)start path and spawns the coordinator loop (overhaul §Key decisions D2).
+    if matches!(run.plan.status.as_str(), "needs_attention" | "blocked") {
+        let resume_status = if run.plan.run_type == "planning" {
+            "planning_planner_running"
+        } else {
+            "needs_changes"
+        };
+        state.db.with_conn(|conn| {
+            update_plan_status_and_health(conn, &id, resume_status, None)
+                .map_err(|e| e.to_string())
+        })?;
+    }
+
+    start_plan(state, id, phase_id, phase_run_mode).await
+}
+
 pub async fn resume_active_plan_loops(state: AppState) -> Result<usize, String> {
     let plan_ids = state.db.with_conn(|conn| {
         let mut stmt = conn
@@ -1929,7 +2004,7 @@ pub async fn record_agent_report(
             None
         }
         "verdict" => {
-            if !matches!(role.as_str(), "reviewer" | "product" | "qa" | "lead") {
+            if !verdict_role_allowed(&role) {
                 return Err(
                     "'verdict' may only be reported by the reviewer or a lens session".to_string(),
                 );
@@ -1963,6 +2038,20 @@ pub async fn record_agent_report(
     );
     tracing::info!(session_id, role, kind = %kind_norm, "recorded structured agent report");
     Ok(())
+}
+
+/// A `verdict` report is legitimate from the plan's `reviewer` or any lens session.
+/// Lens sessions are registered (in `agent_plan_review_sessions`) under their
+/// *configured* lens name — `product`/`qa`/`lead` by default, but a run may configure
+/// custom names (e.g. `pr`/`le`), so the set is open-ended. The only roles that may
+/// NOT report a verdict are the `worker`/planner (it reports `ready`) and the `docs`
+/// agent (it reports `done`). Gating by exclusion — rather than a hardcoded lens
+/// allow-list — keeps custom lens names working instead of silently stranding them
+/// (a custom-named lens could never land its verdict and the review would time out).
+/// Scope/least-privilege rationale recorded in the Phase 00 review record:
+/// `.johnnyone/initiatives/.../plan/phases/00-backend-run-from-phase/decisions.md`.
+fn verdict_role_allowed(role: &str) -> bool {
+    !matches!(role, "worker" | "docs")
 }
 
 /// Resolve a session's role: an ephemeral review/agent session's registered role
@@ -5518,6 +5607,9 @@ fn enrich_agent_plan_event(
 
 fn event_actor(event_type: &str) -> &'static str {
     match event_type {
+        // A human's run/resume guidance — a NEW actor value (the timeline renders it as
+        // the "you" chip). Distinct from `user` (system-attributed lifecycle events).
+        "human_comment" => "human",
         "planning_planner_ready" | "agent_phase_worker_idle" => "t1",
         "planning_gate_result" | "agent_phase_gate_result" => "t2",
         "agent_plan_created"
@@ -5550,7 +5642,10 @@ fn event_category(event_type: &str) -> &'static str {
         | "agent_phase_verdict_clarification_requested"
         | "agent_phase_needs_attention"
         | "agent_phase_unlocked"
-        | "agent_single_phase_completed" => "phase",
+        | "agent_single_phase_completed"
+        // A human comment on a run/resume is phase-scoped guidance; the "phase" category
+        // maps to the console's development stage (frontend `stageOf`) — see decisions.md.
+        | "human_comment" => "phase",
         _ => "run",
     }
 }
@@ -5689,6 +5784,15 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
         }
         "agent_docs_commit_failed" => "Docs commit failed".to_string(),
         "agent_single_phase_completed" => "Completed the selected phase only".to_string(),
+        // Human run/resume guidance. When the comment rode a resume that named a target
+        // phase, surface it: "Resume · <PHASE> + comment: <text>"; otherwise "Comment: <text>".
+        "human_comment" => {
+            let text = payload_str(payload, "text").unwrap_or_default();
+            match payload_str(payload, "phaseId") {
+                Some(phase) => format!("Resume · {} + comment: {}", phase, text),
+                None => format!("Comment: {}", text),
+            }
+        }
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
         _ => humanize_event_type(&event.event_type),
     }
@@ -5761,6 +5865,24 @@ fn humanize_event_type(event_type: &str) -> String {
 #[cfg(test)]
 mod coordinator_terminal_tests {
     use super::*;
+
+    #[test]
+    fn verdict_role_allows_reviewer_and_any_lens_name() {
+        // The plan reviewer and every lens — default or custom-named — may report a verdict.
+        for role in ["reviewer", "product", "qa", "lead", "pr", "le", "perf", "security"] {
+            assert!(
+                verdict_role_allowed(role),
+                "expected lens/reviewer role '{role}' to be allowed to report a verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_role_rejects_worker_and_docs() {
+        // The worker/planner reports `ready`; the docs agent reports `done` — neither votes a verdict.
+        assert!(!verdict_role_allowed("worker"));
+        assert!(!verdict_role_allowed("docs"));
+    }
 
     #[test]
     fn parse_verdict_accepts_grok_style_verdict_label() {
@@ -6102,6 +6224,59 @@ mod coordinator_terminal_tests {
             count_consecutive_non_pass(&dev, "agent_phase_gate_result", "agent_phase_started", Some("01-x")),
             1
         );
+    }
+
+    // --- Task 00-01: comment validation ---
+
+    #[test]
+    fn validate_comment_treats_missing_or_empty_as_none() {
+        // Pure re-run/resume: no feedback, no event.
+        assert_eq!(validate_comment(None).unwrap(), None);
+        assert_eq!(validate_comment(Some("")).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_comment_rejects_whitespace_only() {
+        // A field that IS used but carries only whitespace is a user error.
+        assert!(validate_comment(Some("   \t\n ")).is_err());
+    }
+
+    #[test]
+    fn validate_comment_preserves_non_blank_text() {
+        // Non-blank text is accepted and kept verbatim (stored/injected as guidance).
+        assert_eq!(
+            validate_comment(Some("recompute total")).unwrap(),
+            Some("recompute total".to_string())
+        );
+    }
+
+    // --- Task 00-02: human_comment read-time enrichment ---
+
+    #[test]
+    fn human_comment_actor_is_human() {
+        assert_eq!(event_actor("human_comment"), "human");
+    }
+
+    #[test]
+    fn human_comment_category_groups_under_development_stage() {
+        // "phase" maps to the console's development stage in the frontend `stageOf`.
+        assert_eq!(event_category("human_comment"), "phase");
+    }
+
+    #[test]
+    fn human_comment_summary_composes_resume_with_phase() {
+        let event = gate_event("human_comment", None, "");
+        let payload = json!({ "text": "recompute total", "phaseId": "P02", "mode": "continue" });
+        let summary = event_summary(&event, &payload);
+        assert!(summary.contains("Resume · P02"), "got: {summary}");
+        assert!(summary.contains("recompute total"), "got: {summary}");
+    }
+
+    #[test]
+    fn human_comment_summary_falls_back_to_comment_form() {
+        let event = gate_event("human_comment", None, "");
+        let payload = json!({ "text": "looks good" });
+        assert_eq!(event_summary(&event, &payload), "Comment: looks good");
     }
 
     #[test]

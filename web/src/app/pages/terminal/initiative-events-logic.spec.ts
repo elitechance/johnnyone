@@ -6,6 +6,7 @@ import {
   lensOf,
   phaseLabelOf,
   stageOf,
+  actorLabel,
 } from './initiative-events-logic';
 
 /** Minimal AgentPlanEvent factory — only the fields the timeline reads. */
@@ -79,6 +80,50 @@ describe('stageOf', () => {
     expect(stageOf('briefing_run_created', 'run')).toBe('planning');
     expect(stageOf('brief_accepted', 'run')).toBe('planning');
     expect(stageOf('agent_plan_created', 'run')).toBe('development');
+  });
+
+  it('maps human_comment to development (or planning per category), never "other"', () => {
+    expect(stageOf('human_comment', 'phase')).toBe('development');
+    expect(stageOf('human_comment', 'planning')).toBe('planning');
+  });
+});
+
+describe('actorLabel', () => {
+  it('renders a human actor as "you" and passes others through', () => {
+    expect(actorLabel('human')).toBe('you');
+    expect(actorLabel('coordinator')).toBe('coordinator');
+    expect(actorLabel('t2')).toBe('t2');
+    expect(actorLabel('')).toBe('');
+    expect(actorLabel(null)).toBe('');
+  });
+});
+
+describe('initiativeTimeline — human_comment', () => {
+  it('projects a Resume-with-comment as a development human row (chip data + label)', () => {
+    const [row] = initiativeTimeline([
+      ev({
+        id: 'hc',
+        eventType: 'human_comment',
+        category: 'phase',
+        actor: 'human',
+        summary: 'Resume · P02 + comment: fix it',
+      }),
+    ]);
+    expect(row).toMatchObject({
+      stage: 'development',
+      actor: 'human',
+      actorLabel: 'you',
+      title: 'Resume · P02 + comment: fix it',
+      milestone: false,
+    });
+  });
+
+  it('honors a planning-stage human_comment', () => {
+    const [row] = initiativeTimeline([
+      ev({ eventType: 'human_comment', category: 'planning', actor: 'human', summary: 'Comment: looks good' }),
+    ]);
+    expect(row.stage).toBe('planning');
+    expect(row.actorLabel).toBe('you');
   });
 });
 

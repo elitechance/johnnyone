@@ -1,7 +1,7 @@
 <!-- Overhaul P8 §02 initiative console — the global rail is the app shell (P03); this grid adds the
      initiative master-list (left), the lifecycle bar + the EXISTING pane shell (center), and the
      validation-summary/host-files column (right), collapsing to §08 single-column at container width. -->
-<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [class.has-selection]="!!selectedInitiativeId()" [style.grid-template-columns]="(consoleCompact() || plainShellMode()) ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
+<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [class.has-selection]="hasResolvedSelection()" [style.grid-template-columns]="(consoleCompact() || plainShellMode()) ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
   <!-- P4: a plain shell / attached-tmux surface (`?surface=shell`) suppresses ALL initiative chrome
        — rail, mobile segment, lifecycle, validation/host-files, and (P5) dividers — leaving only the
        center terminal surface. -->
@@ -177,6 +177,109 @@
           <!-- P2: read-only Plan document view (mock §03). Structured phases/tasks from getAgentPlan;
                markdown bodies from readFile; rendered via the shared johnny-markdown-view (no fork). -->
           <section class="terminal-surface plandoc-surface">
+            <!-- Run/Resume panel (console-features P01). Shown only for a development run with phases
+                 (`panelVisible`). All decisions come from the pure `run-resume-logic` seam. -->
+            @if (runResumeVisible()) {
+              <div class="run-resume">
+                @if (runBanner().show) {
+                  <div class="rr-banner" role="alert">
+                    <span class="rr-banner-dot" aria-hidden="true">●</span>
+                    <div class="rr-banner-body">
+                      <div class="rr-banner-title">Needs attention · paused</div>
+                      @if (runBanner().reason) {
+                        <div class="rr-banner-reason">{{ runBanner().reason }}</div>
+                      }
+                    </div>
+                  </div>
+                }
+
+                <div class="rr-panel">
+                  <div class="rr-title"><span class="rr-ico" aria-hidden="true">▶</span> Run / Resume</div>
+                  <p class="rr-help">
+                    Choose where the development run (re)starts and optionally leave guidance for the
+                    worker — in one action.
+                  </p>
+
+                  <div class="rr-field">
+                    <div class="rr-flabel">Start at phase</div>
+                    <ion-radio-group
+                      class="rr-phases"
+                      [value]="runFromPhaseId()"
+                      (ionChange)="setRunPhase($event)"
+                    >
+                      @for (row of runPhaseRows(); track row.phaseId) {
+                        <div class="rr-phase" [class.sel]="row.selected">
+                          <ion-radio
+                            class="rr-radio"
+                            [value]="row.phaseId"
+                            labelPlacement="end"
+                            justify="start"
+                          >
+                            <span class="rr-pid">{{ row.phaseId }}</span>
+                            <span class="rr-ptitle">{{ row.phaseTitle }}</span>
+                            @if (row.paused) { <span class="rr-paused-tag">· paused here</span> }
+                          </ion-radio>
+                          <span class="rr-chip" [ngClass]="'st-' + row.statusChip.token">
+                            {{ row.statusChip.label }}
+                          </span>
+                        </div>
+                      }
+                    </ion-radio-group>
+                  </div>
+
+                  <div class="rr-field">
+                    <div class="rr-flabel">
+                      Comment / guidance <span class="rr-opt">optional</span>
+                    </div>
+                    <ion-textarea
+                      class="rr-comment"
+                      fill="outline"
+                      [autoGrow]="true"
+                      [rows]="3"
+                      placeholder="Leave blank for a pure re-run."
+                      [value]="runComment()"
+                      (ionInput)="setRunComment($event)"
+                    ></ion-textarea>
+                    @if (!runCommentValid().ok) {
+                      <p class="rr-hint err">Comment can’t be only whitespace — clear it or add text.</p>
+                    } @else {
+                      <p class="rr-hint">Blank ⇒ pure re-run: no feedback injected, no human_comment event.</p>
+                    }
+                  </div>
+
+                  <div class="rr-field">
+                    <div class="rr-flabel">Mode</div>
+                    <ion-segment
+                      class="rr-mode"
+                      [value]="runMode()"
+                      (ionChange)="setRunMode($event)"
+                    >
+                      <ion-segment-button value="continue">
+                        <ion-label>from here<small>continue through later phases</small></ion-label>
+                      </ion-segment-button>
+                      <ion-segment-button value="single">
+                        <ion-label>only this phase<small>single</small></ion-label>
+                      </ion-segment-button>
+                    </ion-segment>
+                  </div>
+
+                  <ion-button
+                    class="rr-run-btn"
+                    expand="block"
+                    [color]="runBanner().show ? 'warning' : 'primary'"
+                    [disabled]="runSubmitting() || !runCommentValid().ok || !runFromPhaseId()"
+                    (click)="runResumeInitiative()"
+                  >
+                    @if (runSubmitting()) {
+                      Working…
+                    } @else {
+                      {{ runBtnLabel() }}@if (runFromPhaseId()) { &nbsp;from {{ runFromPhaseId() }} }
+                    }
+                  </ion-button>
+                </div>
+              </div>
+            }
+
             @if (planLoading()) {
               <div class="plan-loading">Loading plan…</div>
             } @else if (planHasContent() || planDocMarkdown()) {
@@ -380,7 +483,8 @@
                 @if (e.verdict) {
                   <span class="ev-verdict" [attr.data-verdict]="e.verdict">{{ e.verdict }}</span>
                 }
-                <span class="ev-actor">{{ e.actor }}</span>
+                @if (e.actor === 'human') { <span class="ev-humanchip">human</span> }
+                <span class="ev-actor">{{ e.actorLabel }}</span>
               </div>
               <div class="ev-title">{{ e.title }}</div>
               @if (e.phaseLabel) { <div class="ev-phase">{{ e.phaseLabel }}</div> }

@@ -923,6 +923,28 @@ export class JohnnyApiService {
       .pipe(map((data) => data.startAgentPlan));
   }
 
+  /** Unified run/resume: (re)start a development run at `phaseId` (omit ⇒ current/paused phase)
+   * with an OPTIONAL comment/guidance recorded + injected in the same action. Blanks → null so
+   * a missing/empty comment is a pure re-run/resume; a whitespace-only comment is rejected
+   * server-side. Reuses the shared `agentPlanRunFields` selection set. */
+  runInitiativeFromPhase(
+    id: string,
+    phaseId?: string,
+    phaseRunMode?: 'continue' | 'single',
+    comment?: string,
+  ): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ runInitiativeFromPhase: AgentPlanRun }>(
+        `mutation RunInitiativeFromPhase($id: ID!, $phaseId: String, $phaseRunMode: String, $comment: String) {
+          runInitiativeFromPhase(id: $id, phaseId: $phaseId, phaseRunMode: $phaseRunMode, comment: $comment) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, phaseId: phaseId || null, phaseRunMode: phaseRunMode || null, comment: comment || null }
+      )
+      .pipe(map((data) => data.runInitiativeFromPhase));
+  }
+
   refreshAgentPlanPhases(id: string): Observable<AgentPlanRun> {
     return this.gql
       .mutate<{ updateAgentPlanPhasesRefresh: AgentPlanRun }>(

@@ -18,6 +18,12 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { TerminalScreen } from '../../models/terminal.model';
 import { normalizeTerminalPlainText } from '../../services/terminal-transcript';
+import {
+  viewportAnchorFromBottom,
+  restoreTargetTop,
+  shouldPreserveReadingPosition,
+  nextPinState,
+} from './terminal-scroll-logic';
 
 export interface TerminalImageAttachmentPreview {
   id: string;
@@ -815,7 +821,7 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
     if (!contentChanged && reflowAttempt === 0) {
       return;
     }
-    const preserveReadingPosition = !this.userPinnedToLatest;
+    const preserveReadingPosition = shouldPreserveReadingPosition(this.userPinnedToLatest);
     const linesFromBottom = preserveReadingPosition
       ? this.captureViewportAnchorFromBottom()
       : 0;
@@ -1311,14 +1317,13 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private captureViewportAnchorFromBottom(): number {
     if (!this.terminal) return 0;
     const buffer = this.terminal.buffer.active;
-    return Math.max(0, buffer.length - buffer.viewportY - this.terminal.rows);
+    return viewportAnchorFromBottom(buffer.length, buffer.viewportY, this.terminal.rows);
   }
 
   private restoreViewportAnchorFromBottom(linesFromBottom: number): void {
     if (!this.terminal) return;
     const buffer = this.terminal.buffer.active;
-    const targetTop = Math.max(0, buffer.length - this.terminal.rows - linesFromBottom);
-    this.terminal.scrollToLine(targetTop);
+    this.terminal.scrollToLine(restoreTargetTop(buffer.length, this.terminal.rows, linesFromBottom));
   }
 
   private resetIdlePromptTimer(): void {
@@ -1388,11 +1393,11 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
         // a phone) keep following live, re-pinning once near the bottom.
         const scrolledUp = top < this.lastMobileScrollTop - 4;
         this.lastMobileScrollTop = top;
-        if (this.isViewportAtBottom()) {
-          this.userPinnedToLatest = true;
-        } else if (scrolledUp) {
-          this.userPinnedToLatest = false;
-        }
+        this.userPinnedToLatest = nextPinState(
+          this.isViewportAtBottom(),
+          scrolledUp,
+          this.userPinnedToLatest,
+        );
       });
     };
     viewport.addEventListener('scroll', this.xtermViewportScrollHandler, { passive: true });
@@ -1652,13 +1657,13 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   private syncPinnedToLatestAfterUserScroll(scrolledUp: boolean): void {
     if (scrolledUp) {
-      this.userPinnedToLatest = false;
+      // A deliberate upward scroll (wheel or pointer drag) unpins follow-live.
+      this.userPinnedToLatest = nextPinState(false, true, this.userPinnedToLatest);
       return;
     }
     queueMicrotask(() => {
-      if (this.isViewportAtBottom()) {
-        this.userPinnedToLatest = true;
-      }
+      // Re-pin once the viewport lands back at the bottom; otherwise keep the current state.
+      this.userPinnedToLatest = nextPinState(this.isViewportAtBottom(), false, this.userPinnedToLatest);
     });
   }
 
