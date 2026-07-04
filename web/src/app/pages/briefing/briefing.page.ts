@@ -154,6 +154,11 @@ export class BriefingPage implements OnInit, OnDestroy {
   }
 
   // ── Validation lens editor (per-initiative, at creation) ────────────────────────────────────────
+  /** The built-in lenses that have a named checklist in review-lenses.md (no prompt required). */
+  private static readonly NAMED_LENSES = new Set(['product', 'qa', 'lead', 'reviewer']);
+  protected isNamedLens(name: string): boolean {
+    return BriefingPage.NAMED_LENSES.has((name ?? '').trim().toLowerCase());
+  }
   protected addValidationLens(): void {
     this.createLenses.update((list) => addLens(list));
   }
