@@ -576,6 +576,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // Transcript/Raw populate without attaching a pane. Refresh so a live screen shows immediately.
     effect(() => {
       this.primarySessionId();
+      // Load the initiative's primary session into `sessions` (like /shells' selectSession does) so
+      // its live screen is RETAINED (in activeIds) instead of purged — otherwise a briefing agent
+      // session that isn't in listAiSessions renders a blank Raw terminal even though it's streaming.
+      void this.ensurePrimarySessionLoaded();
       this.enqueueTerminalVisualSync(() =>
         this.syncTerminalVisualSubscriptions({ refresh: true }),
       );
@@ -656,6 +660,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // though the URL carries no `surface` query.
     const routeSurface = (this.route.snapshot.data['surface'] as string | undefined) ?? null;
     this.surfaceParam.set(routeSurface ?? this.route.snapshot.queryParamMap.get('surface'));
+    // A briefing opened on the shell surface carries its initiative id so the surface can show an
+    // "Accept brief → Planning" bar over the interactive briefing terminal.
+    this.briefingInitiativeId.set(this.route.snapshot.queryParamMap.get('briefingInitiative'));
     // Deep-link: select the linked initiative + tab from the URL BEFORE the list loads, so
     // `loadInitiatives` (which otherwise defaults to the first initiative) honors the link.
     const linkedInitiative = this.route.snapshot.queryParamMap.get('initiativeId');
@@ -1157,6 +1164,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!path || path === '/') return null;
     const idx = path.replace(/\/+$/, '').lastIndexOf('/');
     return idx <= 0 ? '/' : path.slice(0, idx);
+  }
+
+  /** Ensure the selected initiative's primary session is present in `sessions` (so it survives the
+   *  reconcile purge and its terminal screen renders). Mirrors the load part of `selectSession`
+   *  WITHOUT taking over `currentSession` — the console just needs the session known + retained. */
+  private async ensurePrimarySessionLoaded(): Promise<void> {
+    const id = this.primarySessionId();
+    if (!id || this.sessions().some((s) => s.id === id)) return;
+    try {
+      const session = this.mapApiSessionToState(await firstValueFrom(this.api.getSession(id)));
+      this.upsertSession(session);
+      this.hydrateTerminalScreenFromCache(id);
+    } catch (err) {
+      console.error('Failed to load initiative primary session:', err);
+    }
   }
 
   async selectSession(id: string): Promise<void> {
@@ -1827,6 +1849,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   /** True while an Accept-brief request is in flight (drives the console Accept button). */
   protected readonly acceptingBrief = signal(false);
+  /** Set when a briefing is opened on the shell surface (`?briefingInitiative=`) — shows the Accept bar. */
+  protected readonly briefingInitiativeId = signal<string | null>(null);
 
   /** Accept a briefing-stage initiative → planning. Briefing is an interactive terminal now; the
    *  agent writes the final brief to brief.md, which the backend reads on accept. */
@@ -1846,7 +1870,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.acceptingBrief.set(true);
     try {
       await firstValueFrom(this.api.acceptInitiativeBrief({ initiativeId }));
-      await this.loadInitiatives();
+      // briefing → planning: go to the planner for this initiative.
+      void this.router.navigate(['/planning', initiativeId]);
     } catch (err) {
       await this.showInitiativeError('Failed to accept brief', err);
     } finally {

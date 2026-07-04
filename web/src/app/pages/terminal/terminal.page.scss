@@ -968,6 +968,23 @@ ion-modal.workspace-picker .picker-empty {
     .ps-dim {
       color: var(--jo-fg-faint);
     }
+    .ps-accept {
+      margin-left: auto;
+      padding: 5px 12px;
+      border: 1px solid var(--jo-accent, #64b5ff);
+      border-radius: 8px;
+      background: var(--jo-accent, #64b5ff);
+      color: #06121f;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+
+      &:disabled { opacity: 0.6; cursor: default; }
+      &:hover:not(:disabled) { filter: brightness(1.08); }
+    }
+    .ps-accept + .ps-detach {
+      margin-left: 10px;
+    }
     .ps-detach {
       margin-left: auto;
       background: none;
