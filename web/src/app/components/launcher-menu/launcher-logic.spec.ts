@@ -70,8 +70,8 @@ describe('launcher — pure logic', () => {
 
   // A.4 — terminal route
   describe('terminalRoute', () => {
-    it('is the shared /terminal?sessionId= nav shape', () => {
-      expect(terminalRoute('abc')).toEqual({ path: '/terminal', queryParams: { sessionId: 'abc' } });
+    it('is the shared /initiatives?sessionId= nav shape', () => {
+      expect(terminalRoute('abc')).toEqual({ path: '/initiatives', queryParams: { sessionId: 'abc' } });
     });
 
     it('carries NO surface param (non-shell callers unchanged)', () => {

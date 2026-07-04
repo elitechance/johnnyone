@@ -5,7 +5,7 @@ export const appRoutes: Route[] = [
   {
     path: '',
     pathMatch: 'full',
-    redirectTo: 'terminal',
+    redirectTo: 'initiatives',
   },
   {
     path: 'login',
@@ -22,11 +22,18 @@ export const appRoutes: Route[] = [
       import('./pages/integration/integration.page').then((m) => m.IntegrationPage),
   },
   {
-    path: 'terminal',
-    title: 'Terminal',
+    path: 'initiatives',
+    title: 'Initiatives',
     canActivate: [authGuard],
     loadComponent: () =>
       import('./pages/terminal/terminal.page').then((m) => m.TerminalPage),
+  },
+  // Back-compat: the console used to live at /terminal. Redirect old links/bookmarks
+  // (incl. ?initiativeId&tab query params, which survive the redirect) to /initiatives.
+  {
+    path: 'terminal',
+    redirectTo: 'initiatives',
+    pathMatch: 'full',
   },
   // Planner (T1=Planner, T2=Plan Reviewer) — produces methodology plans.
   // Same component renders both modes; route data tells it which.
@@ -148,6 +155,6 @@ export const appRoutes: Route[] = [
   },
   {
     path: '**',
-    redirectTo: 'terminal',
+    redirectTo: 'initiatives',
   },
 ];
