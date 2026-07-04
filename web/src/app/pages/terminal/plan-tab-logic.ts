@@ -56,24 +56,41 @@ export type DocNavEntry =
   | { kind: 'phase'; id: string; label: string; status: string; tasks: PlanTaskRow[] };
 
 /**
- * Doc navigator model: fixed `overview.md`, `status.md`, then one entry per phase (in host order),
- * each carrying its task rows so the nav can expand them (§03 `:728-737`).
+ * Doc navigator model. The `brief.md` + `plan.md` planning artifacts (written by the T1 planner) are
+ * ALWAYS listed — they exist from the planning stage on, so the Plan tab is never empty while a plan is
+ * being produced. The structured development docs (`overview.md`, `status.md`) and per-phase entries are
+ * only added once the plan has been decomposed into phases (development), since those files don't exist
+ * during planning (§03 `:728-737`).
  */
 export function docNavModel(run: AgentPlanRun | null | undefined): DocNavEntry[] {
   const entries: DocNavEntry[] = [
-    { kind: 'file', id: 'overview.md', label: 'overview.md' },
-    { kind: 'file', id: 'status.md', label: 'status.md' },
+    { kind: 'file', id: 'brief.md', label: 'brief.md' },
+    { kind: 'file', id: 'plan.md', label: 'plan.md' },
   ];
-  for (const ph of run?.phases ?? []) {
-    entries.push({
-      kind: 'phase',
-      id: ph.phaseId,
-      label: ph.phaseTitle,
-      status: ph.status,
-      tasks: taskRowsFor(run, ph.phaseId),
-    });
+  const phases = run?.phases ?? [];
+  if (phases.length) {
+    entries.push({ kind: 'file', id: 'overview.md', label: 'overview.md' });
+    entries.push({ kind: 'file', id: 'status.md', label: 'status.md' });
+    for (const ph of phases) {
+      entries.push({
+        kind: 'phase',
+        id: ph.phaseId,
+        label: ph.phaseTitle,
+        status: ph.status,
+        tasks: taskRowsFor(run, ph.phaseId),
+      });
+    }
   }
   return entries;
+}
+
+/**
+ * The doc the Plan tab should open by default for a run. During DEVELOPMENT (the plan has phases) the
+ * structured `overview.md` is the entry point; during PLANNING (no phases yet) the flat `plan.md` the
+ * planner is producing is what to show. Total.
+ */
+export function defaultPlanDoc(run: AgentPlanRun | null | undefined): string {
+  return (run?.phases?.length ?? 0) > 0 ? 'overview.md' : 'plan.md';
 }
 
 /** A §03 phase card: `phaseId`, `phaseTitle`, `done/total`, and its task rows. */
@@ -111,6 +128,9 @@ export function planDocPath(
 ): string | null {
   const base = (planPath ?? '').trim().replace(/\/+$/, '');
   if (!base) return null;
+  // Fixed top-level docs: planning artifacts (brief.md, plan.md) + development artifacts.
+  if (sel === 'brief.md') return `${base}/brief.md`;
+  if (sel === 'plan.md') return `${base}/plan.md`;
   if (sel === 'overview.md') return `${base}/overview.md`;
   if (sel === 'status.md') return `${base}/status.md`;
   const id = (sel ?? '').trim();

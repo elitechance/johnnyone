@@ -28,7 +28,11 @@
   @include workspace.shell-vars;
   @include workspace.viewport-height;
   display: grid;
-  grid-template-rows: 48px 1fr auto;
+  // Row 1 (topbar) only exists on the /shells plain surface; the initiative console has no topbar, so
+  // the track is `auto` (collapses to 0 when absent) and each child is pinned to an EXPLICIT row below.
+  // Without the pinning, dropping the conditional topbar shifts terminal-workspace into the fixed row
+  // and collapses the terminal/plan to a thin strip.
+  grid-template-rows: auto 1fr auto;
   background: #07090d;
   color: #dbe7f3;
 }
@@ -192,6 +196,7 @@
 }
 
 .terminal-workspace {
+  grid-row: 2; // the flexible (1fr) track — stable whether or not the shell topbar is present
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -484,6 +489,7 @@
 }
 
 .workspace-statusbar {
+  grid-row: 3; // pinned to the last (auto) track so the conditional topbar can't shift it
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -942,6 +948,7 @@ ion-modal.workspace-picker .picker-empty {
     border-right: none;
   }
   .plain-shell-topbar {
+    grid-row: 1; // the collapsible top track (shell surface only)
     display: flex;
     align-items: center;
     gap: 8px;
