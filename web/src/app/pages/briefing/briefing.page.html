@@ -2,9 +2,9 @@
   <ion-toolbar>
     <ion-title>
       @if (isCreate()) {
-        New briefing
+        New initiative
       } @else {
-        {{ plan()?.title || 'Briefing' }}
+        {{ plan()?.title || 'Initiative' }}
         @if (plan()?.initiativeStatus) {
           <span class="status-pill" [attr.data-status]="plan()?.initiativeStatus">
             {{ plan()?.initiativeStatus }}
@@ -12,24 +12,17 @@
         }
       }
     </ion-title>
-    <!-- End the briefing from the always-visible header (the in-chat Accept bar can scroll off). -->
-    @if (!isCreate() && canAcceptNow()) {
-      <ion-buttons slot="end">
-        <ion-button fill="solid" color="primary" [disabled]="accepting() || generatingBrief()" (click)="finalizeBrief()">
-          {{ generatingBrief() ? 'Finalizing…' : '✓ Finalize brief → Planning' }}
-        </ion-button>
-      </ion-buttons>
-    }
   </ion-toolbar>
 </ion-header>
 
 <ion-content>
   @if (isCreate()) {
-    <!-- Minimal create form (briefing/new). The full rail launcher is Phase 6. -->
+    <!-- New-initiative create form. Creating goes STRAIGHT to planning (no briefing step). -->
     <div class="create-form">
-      <h2>Start a briefing</h2>
+      <h2>New initiative</h2>
       <p class="create-hint">
-        Describe what you want. J1 will ask clarifying questions and draft a brief before planning.
+        Describe what to build. J1 plans it into a task tree, then builds and validates it —
+        planning → development → review → done.
       </p>
       <ion-list>
         <ion-item>
@@ -50,11 +43,11 @@
         </ion-item>
         <ion-item>
           <ion-textarea
-            label="Initial ask"
+            label="Brief — what to build"
             labelPlacement="stacked"
             [autoGrow]="true"
             [(ngModel)]="createRawAsk"
-            placeholder="What should this initiative do?"></ion-textarea>
+            placeholder="Describe the initiative: goal, scope, constraints, acceptance…"></ion-textarea>
         </ion-item>
         <ion-item>
           <ion-select
@@ -140,7 +133,7 @@
       }
       <div class="create-actions">
         <ion-button [disabled]="creating()" (click)="createBriefing()">
-          {{ creating() ? 'Creating…' : 'Start briefing' }}
+          {{ creating() ? 'Creating…' : 'Create & start planning' }}
         </ion-button>
       </div>
     </div>

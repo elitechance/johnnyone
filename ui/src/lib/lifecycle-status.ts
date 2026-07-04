@@ -19,20 +19,14 @@ export interface StatusMeta {
   className: string;
 }
 
-/** The five initiative stages, in lifecycle order (mock §01). */
-export const LIFECYCLE_STAGES = [
-  'briefing',
-  'planning',
-  'development',
-  'review',
-  'done',
-] as const;
+/** The initiative stages, in lifecycle order. The briefing step was removed — creation goes straight
+ *  to planning. */
+export const LIFECYCLE_STAGES = ['planning', 'development', 'review', 'done'] as const;
 
 export type LifecycleStage = (typeof LIFECYCLE_STAGES)[number];
 
 /** Per-stage color/label/class (mock `.st-*`). */
 export const STATUS_META: Record<LifecycleStage, StatusMeta> = {
-  briefing: { cssVar: '--jo-st-briefing', label: 'briefing', className: 'st-briefing' },
   planning: { cssVar: '--jo-st-planning', label: 'planning', className: 'st-planning' },
   development: { cssVar: '--jo-st-development', label: 'development', className: 'st-development' },
   review: { cssVar: '--jo-st-review', label: 'review', className: 'st-review' },
