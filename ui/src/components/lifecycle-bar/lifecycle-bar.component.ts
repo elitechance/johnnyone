@@ -22,8 +22,7 @@ interface StageCell {
 
 /** Static per-stage copy mirroring mock §01 (`.stage .d`). */
 const STAGE_COPY: Record<string, string> = {
-  briefing: 'Clarify scope with a back-and-forth until the brief is accepted.',
-  planning: 'Turn the accepted brief into a task tree.',
+  planning: 'Turn the brief into a task tree.',
   development: 'T1 workers build against the plan.',
   review: 'Configurable validation lenses run in parallel.',
   // "Done" = work complete (all phases validated). J1 does not auto-merge/deploy,

@@ -12,11 +12,6 @@ import {
 
 describe('statusMeta', () => {
   it('maps every lifecycle stage to its token/label/class', () => {
-    expect(statusMeta('briefing')).toEqual({
-      cssVar: '--jo-st-briefing',
-      label: 'briefing',
-      className: 'st-briefing',
-    });
     expect(statusMeta('planning')).toEqual({
       cssVar: '--jo-st-planning',
       label: 'planning',
@@ -101,21 +96,15 @@ describe('healthMeta', () => {
 });
 
 describe('stageIndex / LIFECYCLE_STAGES', () => {
-  it('orders the five stages briefing→done', () => {
-    expect([...LIFECYCLE_STAGES]).toEqual([
-      'briefing',
-      'planning',
-      'development',
-      'review',
-      'done',
-    ]);
+  it('orders the stages planning→done (briefing removed)', () => {
+    expect([...LIFECYCLE_STAGES]).toEqual(['planning', 'development', 'review', 'done']);
   });
 
   it('returns the ordinal for known stages and -1 for unknown', () => {
-    expect(stageIndex('briefing')).toBe(0);
-    expect(stageIndex('development')).toBe(2);
-    expect(stageIndex('done')).toBe(4);
-    expect(stageIndex('  Review ')).toBe(3);
+    expect(stageIndex('planning')).toBe(0);
+    expect(stageIndex('development')).toBe(1);
+    expect(stageIndex('done')).toBe(3);
+    expect(stageIndex('  Review ')).toBe(2);
     expect(stageIndex('nope')).toBe(-1);
     expect(stageIndex('')).toBe(-1);
     expect(stageIndex(null)).toBe(-1);

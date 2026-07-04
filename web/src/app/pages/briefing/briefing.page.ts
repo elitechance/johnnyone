@@ -352,19 +352,16 @@ export class BriefingPage implements OnInit, OnDestroy {
           } catch {
             // Non-fatal — the initiative keeps the default template; user can Configure later.
           }
-          this.creating.set(false);
-          // Briefing happens in the INTERACTIVE terminal. Use the PROVEN plain-shell surface
-          // (/shells/:sessionId — the same one shells/workers use, which reliably renders the agent
-          // TUI) rather than the console Raw tab. `briefingInitiative` makes it show the Accept bar.
-          const sid = run.plan.briefingSessionId;
-          if (sid) {
-            void this.router.navigate(['/shells', sid], {
-              queryParams: { briefingInitiative: run.plan.id },
-            });
-          } else {
-            void this.router.navigate(['/initiatives'], {
-              queryParams: { initiativeId: run.plan.id, tab: 'raw' },
-            });
+          // Briefing step removed: go STRAIGHT to planning. Accept immediately (the "Initial ask" is
+          // the brief) — this flips the initiative to planning and starts the T1 planner — then land
+          // on the planner. Lifecycle is planning → development → review → done.
+          try {
+            await firstValueFrom(this.api.acceptInitiativeBrief({ initiativeId: run.plan.id }));
+            this.creating.set(false);
+            void this.router.navigate(['/planning', run.plan.id]);
+          } catch (err) {
+            this.creating.set(false);
+            this.createError.set('Created, but failed to start planning: ' + String(err));
           }
         },
         error: (err) => {
