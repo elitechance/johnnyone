@@ -11,7 +11,7 @@ describe('NAV_ITEMS', () => {
 
   it('maps each entry to its existing route path', () => {
     const byId = Object.fromEntries(NAV_ITEMS.map((n) => [n.id, n]));
-    expect(byId['work'].path).toBe('/terminal');
+    expect(byId['work'].path).toBe('/initiatives');
     expect(byId['files'].path).toBe('/files');
     expect(byId['shells'].path).toBe('/shells');
     expect(byId['settings'].path).toBe('/settings');

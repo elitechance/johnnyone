@@ -98,3 +98,39 @@
   text-transform: uppercase;
   color: var(--jo-fg-faint);
 }
+
+/* Mobile: the 5 stage cards WITH descriptions stack into a tall block that eats the whole screen,
+   hiding the Raw/Plan/Diff content below. Collapse to a compact, horizontally-scrollable strip —
+   stage keys + progress bars only, descriptions hidden. */
+@media (max-width: 720px) {
+  .lifecycle {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    gap: 4px;
+    padding: 6px;
+    border-radius: 10px;
+  }
+  .stage {
+    flex: 0 0 auto;
+    min-width: max-content;
+    padding: 7px 10px;
+    gap: 4px;
+  }
+  .stage .d {
+    display: none;
+  }
+  .stage + .stage::before {
+    display: none;
+  }
+  .stage .k {
+    font-size: 10px;
+  }
+  .stage .bar {
+    min-width: 44px;
+  }
+  .health-axis {
+    margin-top: 8px;
+    font-size: 12px;
+  }
+}

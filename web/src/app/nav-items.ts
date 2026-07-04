@@ -20,7 +20,7 @@ export interface NavItem {
 
 export const NAV_ITEMS: NavItem[] = [
   // "Work" is the initiative console, which lands on the existing `terminal` route (D6).
-  { id: 'work', label: 'Work', icon: 'apps-outline', path: '/terminal' },
+  { id: 'work', label: 'Work', icon: 'apps-outline', path: '/initiatives' },
   { id: 'files', label: 'Files', icon: 'folder-outline', path: '/files' },
   { id: 'shells', label: 'Shells', icon: 'code-working-outline', path: '/shells' },
   { id: 'settings', label: 'Settings', icon: 'settings-outline', path: '/settings' },

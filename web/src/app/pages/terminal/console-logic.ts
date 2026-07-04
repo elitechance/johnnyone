@@ -129,13 +129,15 @@ export function touchedFiles(view: GitDiffView | null | undefined): TouchedFile[
   });
 }
 
-/** The §08 mobile segment switcher (mock 1083-1085). */
-export const CONSOLE_SEGMENTS = ['transcript', 'files', 'validation'] as const;
+/** The §08 mobile segment switcher: which console COLUMN to show on a narrow screen. `console` is the
+ *  center pane (Raw terminal / Plan / Diff) — renamed from the old `transcript` id after the Transcript
+ *  surface was removed. */
+export const CONSOLE_SEGMENTS = ['console', 'files', 'validation'] as const;
 export type ConsoleSegment = (typeof CONSOLE_SEGMENTS)[number];
 
-/** Map a (possibly untrusted) segment id to the pane it shows; unknown → `'transcript'` (mobile default). */
+/** Map a (possibly untrusted) segment id to the pane it shows; unknown → `'console'` (mobile default). */
 export function consolePaneFor(segment: string | null | undefined): ConsoleSegment {
   return (CONSOLE_SEGMENTS as readonly string[]).includes(segment ?? '')
     ? (segment as ConsoleSegment)
-    : 'transcript';
+    : 'console';
 }

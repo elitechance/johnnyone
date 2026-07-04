@@ -7,10 +7,11 @@
 // on `@johnnyone/ui`.
 import type { StreamEvent } from '@johnnyone/ui';
 
-/** Per-session terminal pane tab. `plan`/`diff` are reserved structurally (D7). */
-export type PaneTab = 'transcript' | 'raw' | 'plan' | 'diff';
+/** Per-session terminal pane tab. The Transcript surface was removed (the rendered-stream lane only
+ *  covered structured chat-API sessions, not J1's tmux-driven agents); Raw terminal is the default. */
+export type PaneTab = 'raw' | 'plan' | 'diff';
 
-export const DEFAULT_PANE_TAB: PaneTab = 'transcript';
+export const DEFAULT_PANE_TAB: PaneTab = 'raw';
 
 /** Cap per-session transcript growth in long sessions. */
 export const MAX_TRANSCRIPT_EVENTS = 2000;

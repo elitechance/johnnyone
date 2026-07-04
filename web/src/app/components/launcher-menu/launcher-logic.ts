@@ -68,7 +68,7 @@ export function launcherIntent(kind: LauncherKind): LauncherIntent {
  * `router.navigate([route.path], { queryParams: route.queryParams })`.
  */
 export function terminalRoute(sessionId: string): { path: string; queryParams: { sessionId: string } } {
-  return { path: '/terminal', queryParams: { sessionId } };
+  return { path: '/initiatives', queryParams: { sessionId } };
 }
 
 /**

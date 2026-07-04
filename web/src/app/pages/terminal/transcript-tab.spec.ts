@@ -17,15 +17,15 @@ import type { StreamEvent } from '../../../../../ui/src/models/stream-event.mode
 const ev = (p: Partial<StreamEvent>): StreamEvent => ({ sessionId: 's1', seq: 0, kind: 'text', ...p });
 
 describe('terminal page — transcript tab shell', () => {
-  it('defaults each pane to the Transcript tab', () => {
-    expect(paneTabOf({}, 's1')).toBe('transcript');
-    expect(DEFAULT_PANE_TAB).toBe('transcript');
+  it('defaults each pane to the Raw terminal tab (Transcript removed)', () => {
+    expect(paneTabOf({}, 's1')).toBe('raw');
+    expect(DEFAULT_PANE_TAB).toBe('raw');
   });
 
   it('reads a set tab, other panes stay on the default (setPaneTab isolation)', () => {
-    const tabs = { s1: 'raw' as const }; // shape produced by setPaneTab(id,'raw')
-    expect(paneTabOf(tabs, 's1')).toBe('raw');
-    expect(paneTabOf(tabs, 's2')).toBe('transcript');
+    const tabs = { s1: 'plan' as const }; // shape produced by setPaneTab(id,'plan')
+    expect(paneTabOf(tabs, 's1')).toBe('plan');
+    expect(paneTabOf(tabs, 's2')).toBe('raw');
   });
 
   it('subscribes visible sessions and unsubscribes removed ones', () => {

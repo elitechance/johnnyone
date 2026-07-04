@@ -348,7 +348,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** "now" captured once per initiative load so `formatRelTime` stays deterministic. */
   protected readonly consoleNow = signal<string>(new Date(0).toISOString());
   /** §08 mobile segment (Transcript default). */
-  protected readonly consoleSegment = signal<ConsoleSegment>('transcript');
+  protected readonly consoleSegment = signal<ConsoleSegment>('console');
   protected readonly consoleSegments = CONSOLE_SEGMENTS;
 
   /** Master-list rows (mock §02 left `.pane.rail`). */
@@ -1669,7 +1669,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private isPaneTab(value: string | null): value is PaneTab {
-    return value === 'transcript' || value === 'raw' || value === 'plan' || value === 'diff';
+    return value === 'raw' || value === 'plan' || value === 'diff';
   }
 
   /** Template wrapper for the pure predicate — the Raw tab shows the inline attach card when true. */
