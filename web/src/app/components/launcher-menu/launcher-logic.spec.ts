@@ -81,15 +81,17 @@ describe('launcher — pure logic', () => {
 
   // P4 — plain-shell route + surface predicate
   describe('plainTerminalRoute', () => {
-    it('is /terminal?sessionId=&surface=shell', () => {
+    it('opens the session on its own /shells/:sessionId destination (not /terminal)', () => {
       expect(plainTerminalRoute('abc')).toEqual({
-        path: '/terminal',
-        queryParams: { sessionId: 'abc', surface: 'shell' },
+        path: '/shells/abc',
+        queryParams: {},
       });
     });
 
-    it('always carries surface:shell', () => {
-      expect(plainTerminalRoute('x').queryParams.surface).toBe('shell');
+    it('carries the id as a path segment and no surface query (route data drives plain mode)', () => {
+      const route = plainTerminalRoute('x');
+      expect(route.path).toBe('/shells/x');
+      expect(route.queryParams).toEqual({});
     });
   });
 

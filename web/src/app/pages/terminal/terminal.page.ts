@@ -33,6 +33,7 @@ import {
   IonFooter,
   IonSegment,
   IonSegmentButton,
+  AlertController,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
 import {
@@ -223,6 +224,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // — reuses the existing shared modal service (decision D4), no new zoom UI.
   readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
+  private readonly alertCtrl = inject(AlertController);
   private readonly minSidebarWidth = 260;
   private readonly maxSidebarWidth = 560;
   private readonly defaultSidebarWidth = 360;
@@ -253,6 +255,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private streamSubscriptions = new Set<string>();
   private terminalVisualSync: Promise<void> = Promise.resolve();
   private queryParamSub: Subscription | null = null;
+  private paramSub: Subscription | null = null;
   private readonly visibilityChangeHandler = () => {
     if (document.hidden) {
       this.enqueueTerminalVisualSync(() => this.unsubscribeAllTerminalVisuals());
@@ -393,15 +396,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** Cleanup for an in-flight divider drag (removes the window pointer listeners). */
   private consoleResizeCleanup: (() => void) | null = null;
 
-  /** Plain shell surface (P4): true when opened with `surface=shell` (first paint) or the resolved
-   *  session is a shell / attached-tmux pane (backstop). Hides all initiative console chrome. */
-  protected readonly plainShellMode = computed<boolean>(() => {
-    const cur = this.currentSession();
-    return isPlainShellSurface(
-      this.surfaceParam(),
-      cur ? { provider: cur.provider, attachedTmux: cur.attached_tmux } : null,
-    );
-  });
+  /** Plain shell surface: true ONLY when the route asks for it (`surface=shell` — set by the
+   *  dedicated `/shells/:sessionId` route via `data.surface`, or a legacy `?surface=shell` query).
+   *  Deliberately does NOT key off the auto-selected `currentSession`: bare `/terminal` may have a
+   *  shell as the most-recent session, and keying off it wrongly flipped the initiative console into
+   *  plain-shell mode. A shell always opens on `/shells/:id`, so the route flag is authoritative. */
+  protected readonly plainShellMode = computed<boolean>(
+    () => isPlainShellSurface(this.surfaceParam(), null),
+  );
 
   // Plan-tab projections over `planRun` (P2, pure `plan-tab-logic`).
   protected readonly planNav = computed<DocNavEntry[]>(() => docNavModel(this.planRun()));
@@ -648,9 +650,29 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.subscribeToTerminalEvents();
     this.subscribeToRelayErrorEvents();
     // P4: read `surface` synchronously so plain-shell mode is decided before first paint (no
-    // console-chrome flash). A shell / attached-tmux open carries `surface=shell`.
-    this.surfaceParam.set(this.route.snapshot.queryParamMap.get('surface'));
-    void this.loadSessions(this.route.snapshot.queryParamMap.get('sessionId') ?? undefined);
+    // console-chrome flash). The `/shells/:sessionId` route sets `data.surface = 'shell'`; a legacy
+    // `?surface=shell` query is still honored as a fallback. `routeSurface` (static for the activated
+    // route) is the fallback for the query-param subscription below so a shell open stays plain even
+    // though the URL carries no `surface` query.
+    const routeSurface = (this.route.snapshot.data['surface'] as string | undefined) ?? null;
+    this.surfaceParam.set(routeSurface ?? this.route.snapshot.queryParamMap.get('surface'));
+    // Deep-link: select the linked initiative + tab from the URL BEFORE the list loads, so
+    // `loadInitiatives` (which otherwise defaults to the first initiative) honors the link.
+    const linkedInitiative = this.route.snapshot.queryParamMap.get('initiativeId');
+    if (linkedInitiative) {
+      this.selectedInitiativeId.set(linkedInitiative);
+      const linkedTab = this.route.snapshot.queryParamMap.get('tab');
+      if (this.isPaneTab(linkedTab)) {
+        this.initiativeTabs.update((m) => ({ ...m, [linkedInitiative]: linkedTab }));
+      }
+    }
+    // Session id arrives as a `:sessionId` path segment on `/shells/:sessionId`, or as `?sessionId` on
+    // the initiative console — accept either.
+    const initialSessionId =
+      this.route.snapshot.paramMap.get('sessionId') ??
+      this.route.snapshot.queryParamMap.get('sessionId') ??
+      undefined;
+    void this.loadSessions(initialSessionId);
     // Skip the initiative master-list entirely in plain-shell mode — a shell has no initiative chrome.
     if (!this.plainShellMode()) {
       void this.loadInitiatives();
@@ -659,11 +681,26 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
 
+    // React to the `:sessionId` PATH segment changing while this component is reused (e.g. navigating
+    // from one `/shells/:id` to another). Mirrors the `?sessionId` handling below.
+    if (!this.paramSub) {
+      this.paramSub = this.route.paramMap.subscribe((map) => {
+        const sid = map.get('sessionId');
+        if (!sid || sid === this.currentSession()?.id) return;
+        if (this.sessions().some((s) => s.id === sid)) {
+          void this.selectSession(sid);
+        } else {
+          void this.loadSessions(sid);
+        }
+      });
+    }
+
     // Support ?sessionId deep links after initial mount (e.g. e2e harness goto after create, or direct nav)
     if (!this.queryParamSub) {
       this.queryParamSub = this.route.queryParamMap.subscribe((map) => {
-        // Keep plain-shell mode in sync with later navigations (P4).
-        this.surfaceParam.set(map.get('surface'));
+        // Keep plain-shell mode in sync with later navigations (P4). Fall back to the route's static
+        // `data.surface` so a `/shells/:sessionId` open (no `surface` query) stays plain.
+        this.surfaceParam.set(map.get('surface') ?? routeSurface);
         const sid = map.get('sessionId');
         if (sid) {
           const current = this.currentSession()?.id;
@@ -675,6 +712,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
               void this.loadSessions(sid);
             }
           }
+        }
+        // Deep-link: react to `?initiativeId`/`?tab` changing (back/forward, external links).
+        // Set the signals DIRECTLY (not via the setters, which push back to the URL) — the
+        // diff checks below make this a no-op when the URL merely echoes our own push.
+        const linkedInit = map.get('initiativeId');
+        if (linkedInit && linkedInit !== this.selectedInitiativeId()) {
+          this.selectedInitiativeId.set(linkedInit);
+        }
+        const active = this.selectedInitiativeId();
+        const linkedTab = map.get('tab');
+        if (active && this.isPaneTab(linkedTab) && this.initiativeTab(active) !== linkedTab) {
+          this.initiativeTabs.update((m) => ({ ...m, [active]: linkedTab }));
         }
       });
     }
@@ -741,6 +790,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.consoleResizeObserver = null;
     this.queryParamSub?.unsubscribe();
     this.queryParamSub = null;
+    this.paramSub?.unsubscribe();
+    this.paramSub = null;
     void this.unsubscribeAllTerminalVisuals();
     void this.unsubscribeAllStreamLanes();
     this.teardownChatSubscriptions();
@@ -1597,6 +1648,28 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   setInitiativeTab(id: string | null, tab: PaneTab): void {
     if (!id) return;
     this.initiativeTabs.update((m) => ({ ...m, [id]: tab }));
+    if (id === this.selectedInitiativeId()) this.syncConsoleUrl();
+  }
+
+  /** Deep-linking: mirror the selected initiative + its active tab into the URL
+   *  (`?initiativeId&tab`) so the console is linkable and back/forward works. Loop-safe: the
+   *  query-param subscription only re-applies when the URL value differs from the signal, and we
+   *  always set the signal BEFORE pushing here, so the echo is a no-op. Plain-shell mode (a raw
+   *  shell) carries no console/initiative state, so it never writes these params. */
+  private syncConsoleUrl(): void {
+    if (this.plainShellMode()) return;
+    const initiativeId = this.selectedInitiativeId();
+    if (!initiativeId) return;
+    void this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { initiativeId, tab: this.initiativeTab(initiativeId) },
+      queryParamsHandling: 'merge',
+      replaceUrl: true,
+    });
+  }
+
+  private isPaneTab(value: string | null): value is PaneTab {
+    return value === 'transcript' || value === 'raw' || value === 'plan' || value === 'diff';
   }
 
   /** Template wrapper for the pure predicate — the Raw tab shows the inline attach card when true. */
@@ -1737,6 +1810,65 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** Select an initiative row (highlights it + drives the lifecycle bar / validation column). */
   selectInitiative(row: InitiativeRow): void {
     this.selectedInitiativeId.set(row.id);
+    this.syncConsoleUrl();
+  }
+
+  /** CRUD — Create: start a new initiative at the briefing step (same entry as the launcher). */
+  newInitiative(): void {
+    void this.router.navigateByUrl('/briefing/new');
+  }
+
+  /** CRUD — Rename: prompt for a new title, then `updateAgentPlanTitle` and refresh the list. */
+  async renameInitiative(row: InitiativeRow): Promise<void> {
+    const alert = await this.alertCtrl.create({
+      header: 'Rename initiative',
+      inputs: [{ name: 'title', type: 'text', value: row.title, attributes: { maxlength: 200 } }],
+      buttons: [
+        { text: 'Cancel', role: 'cancel' },
+        { text: 'Save', role: 'confirm' },
+      ],
+    });
+    await alert.present();
+    const { role, data } = await alert.onDidDismiss();
+    if (role !== 'confirm') return;
+    const title = String(data?.values?.title ?? '').trim();
+    if (!title || title === row.title) return;
+    try {
+      await firstValueFrom(this.api.updateAgentPlanTitle(row.id, title));
+      await this.loadInitiatives();
+    } catch (err) {
+      await this.showInitiativeError('Failed to rename initiative', err);
+    }
+  }
+
+  /** CRUD — Delete: confirm, then `deleteAgentPlan` (soft-delete) and refresh; clears selection if it was this one. */
+  async deleteInitiative(row: InitiativeRow): Promise<void> {
+    const alert = await this.alertCtrl.create({
+      header: 'Delete initiative',
+      message: `Delete "${row.title}"? Its plan files on disk are kept; this removes it from the list.`,
+      buttons: [
+        { text: 'Cancel', role: 'cancel' },
+        { text: 'Delete', role: 'confirm' },
+      ],
+    });
+    await alert.present();
+    const { role } = await alert.onDidDismiss();
+    if (role !== 'confirm') return;
+    try {
+      await firstValueFrom(this.api.deleteAgentPlan(row.id));
+      if (this.selectedInitiativeId() === row.id) {
+        this.selectedInitiativeId.set(null);
+      }
+      await this.loadInitiatives();
+    } catch (err) {
+      await this.showInitiativeError('Failed to delete initiative', err);
+    }
+  }
+
+  private async showInitiativeError(header: string, err: unknown): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err);
+    const alert = await this.alertCtrl.create({ header, message, buttons: ['OK'] });
+    await alert.present();
   }
 
   /** Switch the §08 mobile console segment (Transcript/Files/Validation). */

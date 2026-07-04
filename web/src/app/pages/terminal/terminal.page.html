@@ -1,28 +1,39 @@
 <!-- Overhaul P8 §02 initiative console — the global rail is the app shell (P03); this grid adds the
      initiative master-list (left), the lifecycle bar + the EXISTING pane shell (center), and the
      validation-summary/host-files column (right), collapsing to §08 single-column at container width. -->
-<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [style.grid-template-columns]="consoleCompact() ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
+<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [style.grid-template-columns]="(consoleCompact() || plainShellMode()) ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
   <!-- P4: a plain shell / attached-tmux surface (`?surface=shell`) suppresses ALL initiative chrome
        — rail, mobile segment, lifecycle, validation/host-files, and (P5) dividers — leaving only the
        center terminal surface. -->
   @if (!plainShellMode()) {
   <!-- LEFT: initiative master-list (mock 550-579) -->
   <aside class="pane rail console-list">
-    <div class="pane-head">Initiatives <span class="ct tnum">{{ consoleRows().length }}</span></div>
-    @for (row of consoleRows(); track row.id) {
-      <button type="button" class="init" [class.sel]="row.selected" (click)="selectInitiative(row)">
-        <div class="t">{{ row.title }}</div>
-        <div class="m">
-          <johnny-status-pill kind="status" [value]="row.status"></johnny-status-pill>
-          @if (row.showHealth) {
-            <johnny-status-pill kind="health" [value]="row.health"></johnny-status-pill>
-          }
+    <div class="pane-head">
+      Initiatives <span class="ct tnum">{{ consoleRows().length }}</span>
+      <button type="button" class="init-new" title="New initiative" aria-label="New initiative" (click)="newInitiative()">＋</button>
+    </div>
+    <div class="init-scroll">
+      @for (row of consoleRows(); track row.id) {
+        <div class="init-row" [class.sel]="row.selected">
+          <button type="button" class="init" [class.sel]="row.selected" (click)="selectInitiative(row)">
+            <div class="t">{{ row.title }}</div>
+            <div class="m">
+              <johnny-status-pill kind="status" [value]="row.status"></johnny-status-pill>
+              @if (row.showHealth) {
+                <johnny-status-pill kind="health" [value]="row.health"></johnny-status-pill>
+              }
+            </div>
+            <div class="ago">updated {{ row.ago }}</div>
+          </button>
+          <div class="init-actions">
+            <button type="button" class="ia" title="Rename initiative" aria-label="Rename initiative" (click)="renameInitiative(row); $event.stopPropagation()">✎</button>
+            <button type="button" class="ia danger" title="Delete initiative" aria-label="Delete initiative" (click)="deleteInitiative(row); $event.stopPropagation()">✕</button>
+          </div>
         </div>
-        <div class="ago">updated {{ row.ago }}</div>
-      </button>
-    } @empty {
-      <div class="pane-empty">No initiatives yet.</div>
-    }
+      } @empty {
+        <div class="pane-empty">No initiatives yet.</div>
+      }
+    </div>
   </aside>
 
   <!-- §08 mobile segment switcher (mock 1082-1085) — a PERSISTENT sibling of the panes so it stays
@@ -248,7 +259,7 @@
                         [class.on]="planSelectedDoc() === entry.id"
                         (click)="openPlanDoc(entry.id)"
                       >
-                        <span class="ic">•</span>{{ entry.label }}
+                        <span class="ic">•</span><span class="lbl">{{ entry.label }}</span>
                       </button>
                     } @else {
                       <button
@@ -257,8 +268,9 @@
                         [class.on]="planSelectedDoc() === entry.id"
                         [class.done]="taskStatus(entry.status).token === 'done'"
                         (click)="openPlanDoc(entry.id)"
+                        [title]="entry.label"
                       >
-                        <span class="ic">{{ taskStatus(entry.status).token === 'done' ? '✓' : '▸' }}</span>{{ entry.label }}
+                        <span class="ic">{{ taskStatus(entry.status).token === 'done' ? '✓' : '▸' }}</span><span class="lbl">{{ entry.label }}</span>
                       </button>
                     }
                   }

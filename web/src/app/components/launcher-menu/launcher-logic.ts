@@ -72,15 +72,18 @@ export function terminalRoute(sessionId: string): { path: string; queryParams: {
 }
 
 /**
- * Nav shape for opening a **shell / attached-tmux** session on the terminal surface as a PLAIN terminal
- * (overhaul P9 / phase P4, D5). Same `/terminal?sessionId=` deep-link as {@link terminalRoute} plus an
- * explicit `surface=shell` marker the terminal page reads synchronously to render the plain surface from
- * first paint (no console-chrome flash). `terminalRoute` is left unchanged for any non-shell caller.
+ * Nav shape for opening a **shell / attached-tmux** session as a PLAIN terminal (overhaul P9 / phase P4,
+ * D5). A shell is NOT an initiative, so it gets its OWN destination — `/shells/:sessionId` — instead of
+ * the initiative console at `/terminal` (fix for the shells-route finding). The route carries
+ * `data: { surface: 'shell' }`, so the terminal page renders the plain surface from first paint with no
+ * `surface=shell` query param. `queryParams` stays empty (the session id is a path segment) so the
+ * `router.navigate([route.path], { queryParams })` call shape at both callers is unchanged.
+ * `terminalRoute` is left unchanged for any non-shell caller.
  */
 export function plainTerminalRoute(
   sessionId: string,
-): { path: string; queryParams: { sessionId: string; surface: 'shell' } } {
-  return { path: '/terminal', queryParams: { sessionId, surface: 'shell' } };
+): { path: string; queryParams: Record<string, never> } {
+  return { path: `/shells/${sessionId}`, queryParams: {} };
 }
 
 /**

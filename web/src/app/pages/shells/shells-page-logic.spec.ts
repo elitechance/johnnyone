@@ -137,10 +137,10 @@ describe('shells page — pure logic', () => {
 
   // A.6 — open intent is the plain-shell route (shells always open plain, P4)
   describe('openIntent', () => {
-    it('is the /terminal?sessionId=&surface=shell plain-shell nav shape', () => {
+    it('opens the shell on its own /shells/:sessionId destination (not the initiative console)', () => {
       expect(openIntent('abc')).toEqual({
-        path: '/terminal',
-        queryParams: { sessionId: 'abc', surface: 'shell' },
+        path: '/shells/abc',
+        queryParams: {},
       });
     });
 

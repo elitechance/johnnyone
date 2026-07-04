@@ -1042,7 +1042,74 @@ ion-modal.workspace-picker .picker-empty {
 
 /* Left: initiative master-list */
 .console-list {
+  /* The aside itself stays clipped (matches `.console .pane`); the header is pinned and only the
+     row list scrolls, so long initiative lists are reachable (fixes the no-scroll finding). */
+  overflow: hidden;
+
+  .pane-head {
+    flex: none;
+  }
+  .init-new {
+    margin-left: auto;
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--jo-border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--jo-fg-muted);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    &:hover { background: var(--jo-bg-hover); color: var(--jo-fg-strong); }
+  }
+}
+.console-list .init-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.console-list .init-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+
+  &:hover .init-actions,
+  &.sel .init-actions {
+    opacity: 1;
+  }
+}
+.console-list .init-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+
+  .ia {
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--jo-border);
+    border-radius: 6px;
+    background: var(--jo-bg-raised, #0d1420);
+    color: var(--jo-fg-muted);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    &:hover { background: var(--jo-bg-hover); color: var(--jo-fg-strong); }
+    &.danger:hover { color: var(--jo-bad, #ff6b6b); border-color: var(--jo-bad, #ff6b6b); }
+  }
+}
+.console-list .init-row .init {
+  flex: 1 1 auto;
 }
 .console-list .init {
   width: 100%;
@@ -1192,6 +1259,8 @@ ion-modal.workspace-picker .picker-empty {
   padding: 8px 0;
   gap: 1px;
   font: 12px/1.3 var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+  overflow: hidden; /* clip long phase labels so they never paint over the doc view */
+  min-width: 0;
 
   .dn {
     display: flex;
@@ -1204,6 +1273,14 @@ ion-modal.workspace-picker .picker-empty {
     border: none;
     text-align: left;
     cursor: default;
+    min-width: 0; /* allow the label child to shrink + ellipsis */
+
+    .lbl {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
   }
   button.dn {
     cursor: pointer;

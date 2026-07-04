@@ -73,14 +73,25 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/files/files.page').then((m) => m.FilesPage),
   },
-  // Shells (overhaul P6) — the list of launched raw shells + attachable external tmux panes. Opening a
-  // row navigates to the existing terminal surface (`/terminal?sessionId=`); no second terminal here.
+  // Shells (overhaul P6) — the list of launched raw shells + attachable external tmux panes.
   {
     path: 'shells',
     title: 'Shells',
     canActivate: [authGuard],
     loadComponent: () =>
       import('./pages/shells/shells.page').then((m) => m.ShellsPage),
+  },
+  // A single shell / attached-tmux session opens on its OWN plain-terminal destination — NOT the
+  // initiative console at /terminal (a shell is not an initiative). `data.surface = 'shell'` makes the
+  // terminal page render the plain surface (no lifecycle bar / tabs / validation) from first paint; the
+  // session id is the `:sessionId` path segment. Must follow `shells` so `/shells` alone still lists.
+  {
+    path: 'shells/:sessionId',
+    title: 'Shell',
+    canActivate: [authGuard],
+    data: { surface: 'shell' },
+    loadComponent: () =>
+      import('./pages/terminal/terminal.page').then((m) => m.TerminalPage),
   },
   // Validation config (overhaul P7) — the §07 "Validation · configure" surface for one Initiative:
   // the ordered N-lens array (provider/model/vision/BLOCK-WARN) persisted to `validationConfig`.
