@@ -229,6 +229,21 @@ export interface DirListing {
   root: string;
   entries: FileEntry[];
 }
+/** A streaming delta of a relay chat response (worker `RelayChatDelta`). */
+export interface RelayChatDeltaMsg {
+  relayId: string;
+  sessionId: string;
+  delta: string;
+  chunkType: string;
+  isFinal: boolean;
+}
+/** A completed relay chat message (worker `RelayChatMessage`). */
+export interface RelayChatMessageMsg {
+  relayId: string;
+  sessionId: string;
+  role: string;
+  content: string;
+}
 export interface FileContent {
   path: string;
   name: string;
@@ -559,6 +574,35 @@ export class JohnnyApiService {
   // onAiChatDelta / onAiChatComplete (forward subscriptions) removed by Phase 2 task 05.
   // Use onRelayChatDelta + onRelayChatMessage (relay-WS via ChatRelayDO) for
   // streaming + completion.
+
+  /** Live streaming deltas for ONE relay chat response, keyed by the `relayId` returned from
+   *  `sendRelayMessage`. (The worker has no session-level delta subscription — deltas are per-request.) */
+  onRelayChatDelta(relayId: string): Observable<RelayChatDeltaMsg> {
+    return this.gql
+      .subscribe<{ onRelayChatDelta: RelayChatDeltaMsg }>(
+        `subscription OnRelayChatDelta($relayId: String!) {
+          onRelayChatDelta(relayId: $relayId) {
+            relayId sessionId delta chunkType isFinal
+          }
+        }`,
+        { relayId }
+      )
+      .pipe(map((data) => data.onRelayChatDelta));
+  }
+
+  /** Completed relay chat messages for a session (user + assistant), as they are persisted. */
+  onRelayChatMessage(sessionId: string): Observable<RelayChatMessageMsg> {
+    return this.gql
+      .subscribe<{ onRelayChatMessage: RelayChatMessageMsg }>(
+        `subscription OnRelayChatMessage($sessionId: String!) {
+          onRelayChatMessage(sessionId: $sessionId) {
+            relayId sessionId role content
+          }
+        }`,
+        { sessionId }
+      )
+      .pipe(map((data) => data.onRelayChatMessage));
+  }
 
   // ── Tools ─────────────────────────────────────────────────────────────
 

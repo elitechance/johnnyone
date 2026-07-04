@@ -1,8 +1,12 @@
 import { Injectable, inject, signal, computed } from '@angular/core';
 import { Subscription } from 'rxjs';
-import { JohnnyApiService } from './johnny-api.service';
+import {
+  JohnnyApiService,
+  RelayChatDeltaMsg,
+  RelayChatMessageMsg,
+} from './johnny-api.service';
 import { AiSession } from '../models/ai-session.model';
-import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
+import { AiMessage } from '../models/ai-message.model';
 
 @Injectable({ providedIn: 'root' })
 export class AiChatService {
@@ -42,7 +46,8 @@ export class AiChatService {
       next: (session) => {
         this.currentSession.set(session);
         this.fetchMessages(session.id);
-        this.subscribeToDeltas(session.id);
+        // Deltas are subscribed per-send (keyed by relayId); at load we only watch for
+        // completed messages on this session.
         this.subscribeToMessages(session.id);
       },
       error: (err) => {
@@ -78,8 +83,10 @@ export class AiChatService {
     this.streamingContent = '';
 
     this.api.sendRelayMessage({ sessionId: session.id, content }).subscribe({
-      next: () => {
-        // Message relayed to desktop — deltas will arrive via subscription
+      next: ({ relayId }) => {
+        // The assistant's reply streams back keyed by THIS relayId (the worker has no
+        // session-level delta subscription — deltas are per-request).
+        this.subscribeToDeltas(relayId);
       },
       error: (err) => {
         console.error('[AiChatService] Failed to send message:', err);
@@ -91,17 +98,14 @@ export class AiChatService {
   }
 
   /**
-   * Subscribe to streaming deltas for a session.
+   * Subscribe to streaming deltas for ONE relay response (keyed by relayId).
    */
-  subscribeToDeltas(sessionId?: string): void {
-    const id = sessionId ?? this.currentSession()?.id;
-    if (!id) return;
-
+  subscribeToDeltas(relayId: string): void {
+    if (!relayId) return;
     this.deltaSubscription?.unsubscribe();
-    this.deltaSubscription = this.api.onMessageDelta(id).subscribe({
-      next: (delta: AiMessageDelta) => {
-        this.handleDelta(delta);
-      },
+    this.streamingContent = '';
+    this.deltaSubscription = this.api.onRelayChatDelta(relayId).subscribe({
+      next: (delta) => this.handleDelta(delta),
       error: (err) => {
         console.error('[AiChatService] Delta subscription error:', err);
       },
@@ -109,17 +113,15 @@ export class AiChatService {
   }
 
   /**
-   * Subscribe to new complete messages for a session.
+   * Subscribe to completed messages for a session (relay chat, via ChatRelayDO).
    */
   subscribeToMessages(sessionId?: string): void {
     const id = sessionId ?? this.currentSession()?.id;
     if (!id) return;
 
     this.messageSubscription?.unsubscribe();
-    this.messageSubscription = this.api.onNewMessage(id).subscribe({
-      next: (message: AiMessage) => {
-        this.handleNewMessage(message);
-      },
+    this.messageSubscription = this.api.onRelayChatMessage(id).subscribe({
+      next: (message) => this.handleNewMessage(message),
       error: (err) => {
         console.error('[AiChatService] Message subscription error:', err);
       },
@@ -149,60 +151,79 @@ export class AiChatService {
     });
   }
 
-  private handleDelta(delta: AiMessageDelta): void {
-    this.streamingContent += delta.delta;
-    this.streamingMessageId.set(delta.messageId);
-    this.isStreaming.set(true);
-
-    // Update or insert the streaming assistant message
-    this.messages.update((msgs) => {
-      const existingIdx = msgs.findIndex((m) => m.id === delta.messageId);
-      if (existingIdx >= 0) {
-        const updated = [...msgs];
-        updated[existingIdx] = {
-          ...updated[existingIdx],
-          content: this.streamingContent,
-        };
-        return updated;
-      } else {
-        return [
-          ...msgs,
-          {
-            id: delta.messageId,
-            sessionId: delta.sessionId,
-            role: 'assistant' as const,
-            content: this.streamingContent,
-            inputTokens: 0,
-            outputTokens: 0,
-            costCents: 0,
-            createdAt: new Date().toISOString(),
-          },
-        ];
-      }
-    });
-
-    if (delta.finishReason) {
-      this.isStreaming.set(false);
-      this.streamingMessageId.set(null);
-      this.streamingContent = '';
-    }
+  /** Stable id for the streamed/finalized assistant message of one relay response. */
+  private assistantMessageId(relayId: string): string {
+    return `relay-${relayId}-assistant`;
   }
 
-  private handleNewMessage(message: AiMessage): void {
+  private handleDelta(delta: RelayChatDeltaMsg): void {
+    // Skip control chunks (system/result/error) — only assistant text accumulates. The final
+    // `onRelayChatMessage` reconciles the clean content, so minor noise self-corrects.
+    const kind = (delta.chunkType || '').toLowerCase();
+    if (kind === 'system' || kind === 'result' || kind === 'error') {
+      if (delta.isFinal) this.finishStreaming();
+      return;
+    }
+    this.streamingContent += delta.delta ?? '';
+    const id = this.assistantMessageId(delta.relayId);
+    this.streamingMessageId.set(id);
+    this.isStreaming.set(true);
+
     this.messages.update((msgs) => {
-      const existingIdx = msgs.findIndex((m) => m.id === message.id);
+      const existingIdx = msgs.findIndex((m) => m.id === id);
       if (existingIdx >= 0) {
         const updated = [...msgs];
-        updated[existingIdx] = message;
+        updated[existingIdx] = { ...updated[existingIdx], content: this.streamingContent };
         return updated;
       }
-      return [...msgs, message];
+      return [
+        ...msgs,
+        {
+          id,
+          sessionId: delta.sessionId,
+          role: 'assistant' as const,
+          content: this.streamingContent,
+          inputTokens: 0,
+          outputTokens: 0,
+          costCents: 0,
+          createdAt: new Date().toISOString(),
+        },
+      ];
     });
 
-    if (message.role === 'assistant' && message.finishReason) {
-      this.isStreaming.set(false);
-      this.streamingMessageId.set(null);
-      this.streamingContent = '';
-    }
+    if (delta.isFinal) this.finishStreaming();
+  }
+
+  private handleNewMessage(message: RelayChatMessageMsg): void {
+    // The user message is already shown optimistically — only reconcile assistant/system messages
+    // (matched to their streamed placeholder by relayId) with the clean final content.
+    if (message.role === 'user') return;
+    const id = this.assistantMessageId(message.relayId);
+    this.messages.update((msgs) => {
+      const existingIdx = msgs.findIndex((m) => m.id === id);
+      const finalized: AiMessage = {
+        id,
+        sessionId: message.sessionId,
+        role: 'assistant',
+        content: message.content,
+        inputTokens: 0,
+        outputTokens: 0,
+        costCents: 0,
+        createdAt: new Date().toISOString(),
+      };
+      if (existingIdx >= 0) {
+        const updated = [...msgs];
+        updated[existingIdx] = { ...updated[existingIdx], content: message.content };
+        return updated;
+      }
+      return [...msgs, finalized];
+    });
+    this.finishStreaming();
+  }
+
+  private finishStreaming(): void {
+    this.isStreaming.set(false);
+    this.streamingMessageId.set(null);
+    this.streamingContent = '';
   }
 }
