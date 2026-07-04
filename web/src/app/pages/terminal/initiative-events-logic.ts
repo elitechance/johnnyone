@@ -14,8 +14,10 @@ export type TimelineStage = 'planning' | 'development' | 'review' | 'done' | 'ot
 export interface TimelineEvent {
   id: string;
   stage: TimelineStage;
-  /** Who acted — t1 / t2 / coordinator / user (from the enriched `actor`). */
+  /** Who acted — t1 / t2 / coordinator / user / human (from the enriched `actor`). */
   actor: string;
+  /** Display label for the actor — `human` renders as "you"; everything else passes through. */
+  actorLabel: string;
   /** Human one-liner (the backend-composed `summary`, already lens/verdict-aware). */
   title: string;
   /** "Phase 2 · Cashier atomicity" when the event is phase-scoped, else null. */
@@ -65,6 +67,11 @@ export function stageOf(eventType: string, category: string): TimelineStage {
     case 'development_autostarted':
     case 'development_autostart_failed':
       return 'development';
+    // A human's run/resume comment. Grouped under the run's SDLC stage — development by default
+    // (its backend category is `phase`), or planning when it rode a planning-run resume. Never falls
+    // through to the neutral "other" bucket.
+    case 'human_comment':
+      return category === 'planning' ? 'planning' : 'development';
   }
   if (category === 'planning' || eventType.startsWith('planning_')) return 'planning';
   if (category === 'phase' || eventType.startsWith('agent_phase') || eventType === 'agent_feedback_sent_to_worker') {
@@ -106,6 +113,14 @@ export function lensOf(payloadJson: string | null | undefined): string | null {
   }
 }
 
+/** Display label for a row's actor. A `human_comment`'s actor is the backend `human`; surface it as
+ *  "you" so the timeline reads as first-person guidance. All other actors (t1/t2/coordinator/user)
+ *  pass through unchanged. Kept here (pure) so the component has no inline label logic. */
+export function actorLabel(actor: string | null | undefined): string {
+  const a = (actor ?? '').trim();
+  return a === 'human' ? 'you' : a;
+}
+
 /** Compose the phase label ("Phase 2 · Cashier atomicity") from the enriched index/title. */
 export function phaseLabelOf(ev: AgentPlanEvent): string | null {
   const hasIndex = typeof ev.phaseIndex === 'number';
@@ -126,6 +141,7 @@ export function initiativeTimeline(events: AgentPlanEvent[] | null | undefined):
       id: ev.id,
       stage: stageOf(ev.eventType, ev.category),
       actor: (ev.actor ?? '').trim(),
+      actorLabel: actorLabel(ev.actor),
       title: (ev.summary ?? '').trim() || ev.eventType,
       phaseLabel: phaseLabelOf(ev),
       lens: lensOf(ev.payloadJson),

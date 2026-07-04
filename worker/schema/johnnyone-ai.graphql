@@ -523,6 +523,9 @@ type Mutation {
   updatePlannerPromptSettings(input: PlannerPromptSettingsInput!): PlannerPromptSettings!
   createAgentPlan(input: CreateAgentPlanInput!): AgentPlanRun!
   startAgentPlan(id: ID!, phaseId: String, phaseRunMode: String): AgentPlanRun!
+  # Unified run/resume: (re)start development at phaseId (null ⇒ current/paused phase) with an
+  # OPTIONAL comment/guidance recorded + injected to the run's active session in the same action.
+  runInitiativeFromPhase(id: ID!, phaseId: String, phaseRunMode: String, comment: String): AgentPlanRun!
   updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
   updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!
   updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!
