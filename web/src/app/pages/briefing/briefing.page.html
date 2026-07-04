@@ -29,14 +29,16 @@
             label="Title (optional)"
             labelPlacement="stacked"
             [(ngModel)]="createTitle"
-            placeholder="Add a file browser"></ion-input>
+            placeholder="e.g. Add a file browser"></ion-input>
         </ion-item>
         <ion-item>
           <ion-input
-            label="Workspace path"
+            label="Workspace directory"
             labelPlacement="stacked"
             [(ngModel)]="createWorkspacePath"
-            placeholder="/home/you/project"></ion-input>
+            placeholder="Browse to pick a folder…"
+            readonly="true"></ion-input>
+          <ion-button slot="end" fill="outline" size="small" (click)="openDirBrowser()">Browse…</ion-button>
         </ion-item>
         <ion-item>
           <ion-textarea
@@ -47,12 +49,69 @@
             placeholder="What should this initiative do?"></ion-textarea>
         </ion-item>
         <ion-item>
-          <ion-input
-            label="Provider"
+          <ion-select
+            label="Agent"
             labelPlacement="stacked"
-            [(ngModel)]="createProvider"></ion-input>
+            interface="popover"
+            [(ngModel)]="createProvider">
+            @for (p of providerChoices(); track p) {
+              <ion-select-option [value]="p">{{ p }}</ion-select-option>
+            }
+          </ion-select>
         </ion-item>
       </ion-list>
+
+      <!-- Per-initiative validation lenses, set AT creation (was global-only via the Configure page). -->
+      <div class="lens-config">
+        <div class="lens-config-head">
+          <h3>Validation lenses</h3>
+          <span class="lens-config-hint">Run in parallel when this initiative reaches review. Saved to this initiative only.</span>
+        </div>
+        @for (lens of createLenses(); track $index) {
+          <div class="lens-row">
+            <ion-input
+              class="lens-name"
+              label="Name"
+              labelPlacement="stacked"
+              [ngModel]="lens.name"
+              (ngModelChange)="setLensField($index, 'name', $event)"
+              placeholder="product"></ion-input>
+            <ion-select
+              class="lens-provider"
+              label="Agent"
+              labelPlacement="stacked"
+              interface="popover"
+              [ngModel]="lens.provider"
+              (ngModelChange)="setLensField($index, 'provider', $event)">
+              @for (p of providerChoices(); track p) {
+                <ion-select-option [value]="p">{{ p }}</ion-select-option>
+              }
+            </ion-select>
+            <ion-input
+              class="lens-model"
+              label="Model (optional)"
+              labelPlacement="stacked"
+              [ngModel]="lens.model"
+              (ngModelChange)="setLensField($index, 'model', $event)"
+              placeholder="default"></ion-input>
+            <ion-toggle
+              class="lens-block"
+              [checked]="lens.blocking"
+              (ionChange)="setLensField($index, 'blocking', $any($event).detail.checked)">
+              blocking
+            </ion-toggle>
+            <ion-button
+              class="lens-remove"
+              fill="clear"
+              color="medium"
+              [disabled]="createLenses().length <= 1"
+              (click)="removeValidationLens($index)"
+              aria-label="Remove lens">✕</ion-button>
+          </div>
+        }
+        <ion-button class="lens-add" fill="outline" size="small" (click)="addValidationLens()">+ Add lens</ion-button>
+      </div>
+
       @if (createError()) {
         <ion-note color="danger" class="form-error">{{ createError() }}</ion-note>
       }
@@ -62,6 +121,49 @@
         </ion-button>
       </div>
     </div>
+
+    <!-- Workspace directory browser (task: workspace dir is an explorer, not free text). -->
+    <ion-modal [isOpen]="dirBrowserOpen()" (didDismiss)="closeDirBrowser()">
+      <ng-template>
+        <ion-header>
+          <ion-toolbar>
+            <ion-title>Pick a workspace folder</ion-title>
+            <ion-buttons slot="end">
+              <ion-button (click)="closeDirBrowser()">Cancel</ion-button>
+            </ion-buttons>
+          </ion-toolbar>
+        </ion-header>
+        <ion-content>
+          <div class="dir-browser">
+            <div class="dir-path">{{ dirListing()?.path ? (dirListing()!.root + '/' + dirListing()!.path) : dirListing()?.root || '…' }}</div>
+            @if (dirError()) {
+              <ion-note color="danger" class="dir-error">{{ dirError() }}</ion-note>
+            }
+            <ion-list>
+              @if (dirListing()?.path) {
+                <ion-item button detail="false" (click)="dirUp()">
+                  <ion-label>📁 ..</ion-label>
+                </ion-item>
+              }
+              @for (d of browserDirs(); track d.path) {
+                <ion-item button detail="false" (click)="browseTo(d.path)">
+                  <ion-label>📁 {{ d.name }}</ion-label>
+                </ion-item>
+              } @empty {
+                @if (!dirLoading()) {
+                  <ion-item lines="none"><ion-label class="dir-empty">No sub-folders here.</ion-label></ion-item>
+                }
+              }
+            </ion-list>
+          </div>
+        </ion-content>
+        <div class="dir-actions">
+          <ion-button expand="block" [disabled]="!dirListing()" (click)="useCurrentDir()">
+            Use this folder
+          </ion-button>
+        </div>
+      </ng-template>
+    </ion-modal>
   } @else if (loadError()) {
     <div class="load-error">{{ loadError() }}</div>
   } @else {
