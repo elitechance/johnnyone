@@ -37,6 +37,7 @@ const MILESTONE_TYPES = new Set<string>([
   'planning_started',
   'planning_planner_ready',
   'agent_plan_created',
+  'development_autostarted',
   'agent_phase_review_started',
   'agent_plan_completed',
   'agent_single_phase_completed',
@@ -59,8 +60,10 @@ export function stageOf(eventType: string, category: string): TimelineStage {
     case 'brief_accepted':
     case 'planning_run_created':
       return 'planning';
-    // The development plan-run's creation opens the development stage.
+    // The development plan-run's creation / automatic handoff opens the development stage.
     case 'agent_plan_created':
+    case 'development_autostarted':
+    case 'development_autostart_failed':
       return 'development';
   }
   if (category === 'planning' || eventType.startsWith('planning_')) return 'planning';

@@ -3379,7 +3379,10 @@ async fn handle_planning_reviewer_output(
                 None,
                 "planning_gate_result",
                 review_payload("PASS", None, &review),
-            )
+            )?;
+            // Continuous SDLC (D-auto): hand the approved plan straight to development — no manual step.
+            // `auto_start_development` returns a boxed future (breaks the async-recursion type cycle).
+            auto_start_development(state, run).await
         }
         Some("NEEDS_CHANGES") | Some("BLOCKED") => {
             let verdict = verdict.unwrap();
@@ -3422,6 +3425,87 @@ async fn handle_planning_reviewer_output(
         }
         _ => clarify_planning_or_needs_attention(state, run).await,
     }
+}
+
+/// Continuous SDLC: when a planning run PASSes review, create the development stage-run from the
+/// approved plan and start it — the initiative flows planning → development → review → done with no
+/// manual step. Best-effort: any failure (most likely the plan is off-spec and `parse_plan` finds no
+/// `overview.md`/`phases/`) is recorded as an event and leaves the initiative at planning-approved for
+/// a human to resolve, rather than breaking the coordinator.
+fn auto_start_development<'a>(
+    state: &'a AppState,
+    planning: &'a AgentPlanRun,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    // Returns a BOXED future (rather than an `async fn`) to break the async-recursion type cycle:
+    // this transitively calls start_plan → spawn_coordinator_loop → coordinator_loop →
+    // handle_planning_reviewer_output → back here. A concrete boxed return type stops the opaque-type
+    // cycle the compiler otherwise can't resolve.
+    Box::pin(async move {
+    let input = CreateAgentPlanInput {
+        run_type: Some("development".to_string()),
+        title: Some(planning.plan.title.clone()),
+        workspace_path: planning.plan.workspace_path.clone(),
+        plan_path: planning.plan.plan_path.clone(),
+        worker_provider: planning.plan.worker_provider.clone(),
+        reviewer_provider: planning.plan.reviewer_provider.clone(),
+        brief: planning.plan.brief.clone(),
+        app_scope: planning.plan.app_scope.clone(),
+        docs_scope: planning.plan.docs_scope.clone(),
+        reference_paths: planning.plan.reference_paths.clone(),
+        worker_setup_commands: None,
+        reviewer_setup_commands: None,
+    };
+    let dev = match create_plan(state, input) {
+        Ok(dev) => dev,
+        Err(err) => {
+            let reason = format!(
+                "Could not auto-start development from the approved plan: {}. The plan may not follow \
+                 the methodology's overview.md + phases/ structure.",
+                err
+            );
+            tracing::warn!(planning_id = %planning.plan.id, %err, "auto_start_development: create_plan failed");
+            let _ = append_event(
+                state,
+                &planning.plan.id,
+                None,
+                "development_autostart_failed",
+                json!({ "reason": reason }),
+            );
+            return Ok(()); // leave the initiative at planning-approved; a human resolves it
+        }
+    };
+    // Carry the initiative's configured validation lenses onto the development run — `create_plan`
+    // seeds validation_config NULL, so without this the review fan-out would fall back to the default
+    // template instead of the lenses the user set at creation.
+    if let Some(cfg) = planning.plan.validation_config.clone() {
+        let _ = state.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agent_plans SET validation_config = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![cfg, dev.plan.id],
+            )
+            .map_err(|e| e.to_string())
+        });
+    }
+    let _ = append_event(
+        state,
+        &dev.plan.id,
+        None,
+        "development_autostarted",
+        json!({ "fromPlanningRun": planning.plan.id }),
+    );
+    // Kick the development coordinator loop on its OWN task — not inline. `start_plan` runs the worker
+    // attach + phase kickoff and must not be folded into the (tokio::spawn'd, Send-bound) planning
+    // coordinator future; spawning it also lets planning-review completion return promptly. (The
+    // async-recursion type cycle is broken by boxing this fn's future at the call site.)
+    let state_clone = state.clone();
+    let dev_id = dev.plan.id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = start_plan(state_clone, dev_id, None, None).await {
+            tracing::error!(%err, "auto_start_development: start_plan failed");
+        }
+    });
+    Ok(())
+    })
 }
 
 async fn send_planning_feedback_to_planner(
@@ -5567,6 +5651,11 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
                 None => format!("{} lens → {}", lens, verdict),
             }
         }
+        "development_autostarted" => "Development started automatically".to_string(),
+        "development_autostart_failed" => match payload_str(payload, "reason") {
+            Some(reason) => format!("Auto-start development failed — {}", reason),
+            None => "Auto-start development failed".to_string(),
+        },
         "agent_phase_started" => "Started phase work".to_string(),
         "agent_phase_worker_idle" => "T1 finished the current pass".to_string(),
         "agent_phase_review_started" => "Started T2 review".to_string(),
