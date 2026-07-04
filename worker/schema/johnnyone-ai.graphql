@@ -476,6 +476,8 @@ type Query {
   getPlannerPromptSettings: PlannerPromptSettings!
   listAgentPlans(status: String, runType: String, onlyExisting: Boolean): [AgentPlan!]!
   getAgentPlan(id: ID!): AgentPlanRun!
+  "Full SDLC event timeline for one Initiative — the union of every plan-run's events (planning + development share one initiativeId), oldest-first."
+  listInitiativeEvents(initiativeId: ID!): [AgentPlanEvent!]!
   browseHostDirectory(path: String!): [HostFileEntry!]!
   validateWorkspacePlan(workspacePath: String!, planPath: String!): WorkspaceValidation!
   listWorkspaceFiles(planId: ID!, mode: String!, path: String): [HostFileEntry!]!

@@ -814,6 +814,22 @@ export class JohnnyApiService {
       .pipe(map((data) => data.getAgentPlan));
   }
 
+  /** Full SDLC event timeline for one Initiative (planning-run + development-run events merged,
+   *  oldest-first) — backs the console Events pane. */
+  listInitiativeEvents(initiativeId: string): Observable<AgentPlanEvent[]> {
+    return this.gql
+      .query<{ listInitiativeEvents: AgentPlanEvent[] }>(
+        `query ListInitiativeEvents($initiativeId: ID!) {
+          listInitiativeEvents(initiativeId: $initiativeId) {
+            id planId phaseId phaseIndex phaseTitle eventType actor category summary
+            statusBefore statusAfter reason verdict taskId clarificationAttempt payloadJson createdAt
+          }
+        }`,
+        { initiativeId }
+      )
+      .pipe(map((data) => data.listInitiativeEvents));
+  }
+
   createAgentPlan(input: CreateAgentPlanInput): Observable<AgentPlanRun> {
     return this.gql
       .mutate<{ createAgentPlan: AgentPlanRun }>(

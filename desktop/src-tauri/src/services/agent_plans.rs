@@ -3506,8 +3506,11 @@ async fn dispatch_review(
     // transition the phase into review; the persistent reviewer session is not used
     // for the fan-out.
     state.db.with_conn(|conn| {
+        // Enter the `review` lifecycle stage while the configured lenses fan out. This is the single
+        // per-phase entry into review, co-located with the `agent_phase_review_started` marker below,
+        // so the lifecycle bar pulses development → review each phase (reverted on loop-back / advance).
         conn.execute(
-            "UPDATE agent_plans SET status = 'phase_review_running', updated_at = datetime('now') WHERE id = ?1",
+            "UPDATE agent_plans SET status = 'phase_review_running', initiative_status = 'review', updated_at = datetime('now') WHERE id = ?1 AND run_type = 'development'",
             params![run.plan.id],
         )
         .map_err(|e| e.to_string())?;
@@ -3609,8 +3612,10 @@ async fn send_reviewer_feedback_to_worker(
     let prompt = append_worker_report(run, reviewer_feedback_prompt(phase, reviewer_output));
     terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
     state.db.with_conn(|conn| {
+        // Review requested changes → loop back to the worker: leave the `review` stage, return to
+        // `development` for the same phase (the bar reverts review → development).
         conn.execute(
-            "UPDATE agent_plans SET status = 'phase_worker_running', updated_at = datetime('now') WHERE id = ?1",
+            "UPDATE agent_plans SET status = 'phase_worker_running', initiative_status = 'development', updated_at = datetime('now') WHERE id = ?1 AND run_type = 'development'",
             params![run.plan.id],
         )
         .map_err(|e| e.to_string())?;
@@ -3707,8 +3712,10 @@ async fn pass_phase(
         .map_err(|e| e.to_string())?;
         if should_continue {
         if let Some(next) = &next_phase {
+            // Phase passed, more phases remain → leave `review`, return to `development` as the next
+            // phase's worker starts (the bar reverts review → development for the next iteration).
             conn.execute(
-                "UPDATE agent_plans SET status = 'phase_worker_running', current_phase_id = ?1, current_phase_index = ?2, updated_at = datetime('now') WHERE id = ?3",
+                "UPDATE agent_plans SET status = 'phase_worker_running', initiative_status = 'development', current_phase_id = ?1, current_phase_index = ?2, updated_at = datetime('now') WHERE id = ?3 AND run_type = 'development'",
                 params![next.phase_id, next.phase_index, plan_id],
             )
             .map_err(|e| e.to_string())?;
@@ -4734,6 +4741,56 @@ fn list_events(state: &AppState, plan_id: &str, limit: i64) -> Result<Vec<AgentP
     })
 }
 
+/// Events for a whole Initiative — the UNION of every plan-run's events (planning-run + development-run
+/// share one `initiative_id`), enriched with phase index/title and returned oldest-first so the console
+/// can render the full SDLC timeline (planning → approval → development → review loop → done). Mirrors
+/// `list_events` but keys on `initiative_id` via a join instead of a single `plan_id`.
+pub fn list_initiative_events(
+    state: &AppState,
+    initiative_id: &str,
+    limit: i64,
+) -> Result<Vec<AgentPlanEvent>, String> {
+    state.db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.id, e.plan_id, e.phase_id, e.type, e.payload_json, e.created_at \
+                 FROM agent_plan_events e JOIN agent_plans p ON e.plan_id = p.id \
+                 WHERE p.initiative_id = ?1 ORDER BY e.created_at ASC, e.rowid ASC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows: Vec<AgentPlanEvent> = stmt
+            .query_map(params![initiative_id, limit], agent_plan_event_from_row)
+            .map_err(|e| e.to_string())?
+            .filter_map(|row| row.ok())
+            .collect();
+        // Phase metadata spans every run of the initiative (each run owns its own phases).
+        let mut phase_meta = HashMap::new();
+        let mut phase_stmt = conn
+            .prepare(
+                "SELECT phase_id, phase_index, phase_title FROM agent_plan_phases \
+                 WHERE plan_id IN (SELECT id FROM agent_plans WHERE initiative_id = ?1)",
+            )
+            .map_err(|e| e.to_string())?;
+        let phase_rows = phase_stmt
+            .query_map(params![initiative_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in phase_rows {
+            let (phase_id, phase_index, phase_title) = row.map_err(|e| e.to_string())?;
+            phase_meta.insert(phase_id, (phase_index, phase_title));
+        }
+        for event in &mut rows {
+            enrich_agent_plan_event(event, &phase_meta);
+        }
+        Ok(rows)
+    })
+}
+
 fn append_event(
     state: &AppState,
     plan_id: &str,
@@ -5488,6 +5545,28 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             },
             _ => "Planning review returned a verdict".to_string(),
         },
+        // Configured validation lenses (the "review"). Surface WHICH lens and WHAT it decided so the
+        // console Events timeline can show "qa lens → NEEDS_CHANGES: <reason>" per the user's ask.
+        "agent_lens_review_started" => match payload_str(payload, "lens") {
+            Some(lens) => format!("{} lens started review", lens),
+            None => "Lens started review".to_string(),
+        },
+        "agent_lens_verdict" => {
+            let lens = payload_str(payload, "lens").unwrap_or_else(|| "lens".to_string());
+            let verdict = payload_str(payload, "verdict").unwrap_or_else(|| "reviewed".to_string());
+            let detail = payload_str(payload, "summary").or_else(|| {
+                payload
+                    .get("findings")
+                    .and_then(|f| f.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+            match detail {
+                Some(detail) => format!("{} lens → {}: {}", lens, verdict, detail),
+                None => format!("{} lens → {}", lens, verdict),
+            }
+        }
         "agent_phase_started" => "Started phase work".to_string(),
         "agent_phase_worker_idle" => "T1 finished the current pass".to_string(),
         "agent_phase_review_started" => "Started T2 review".to_string(),

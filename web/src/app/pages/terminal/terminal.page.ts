@@ -60,6 +60,7 @@ import {
   GitDiffView,
   AgentPlan,
   AgentPlanRun,
+  AgentPlanEvent,
   FileContent,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
@@ -85,15 +86,14 @@ import {
   initiativeRows,
   lensSummary,
   lensSource,
-  touchedFiles,
   consolePaneFor,
   CONSOLE_SEGMENTS,
   InitiativeRow,
   LensChip,
-  TouchedFile,
   ConsoleSegment,
   LensSource,
 } from './console-logic';
+import { initiativeTimeline, TimelineEvent } from './initiative-events-logic';
 import {
   resolvePrimarySessionId,
   initiativeTabOf,
@@ -234,6 +234,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private paneUpHandler: (() => void) | null = null;
   private paneInteractionStart = { x: 0, y: 0, left: 0, top: 0, width: 0, height: 0 };
   private streamingStatusInterval: ReturnType<typeof setInterval> | null = null;
+  /** Events-pane poll: refreshes the selected initiative's timeline while it's live. */
+  private eventsPollInterval: ReturnType<typeof setInterval> | null = null;
+  /** The initiative id the events pane currently tracks (dedupes redundant reloads/polls). */
+  private eventsInitiativeId: string | null = null;
+  private eventsStamp: string | null = null;
   private sessionIdCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
   private deltaSubscription: Subscription | null = null;
   private completeSubscription: Subscription | null = null;
@@ -422,11 +427,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly consoleLensSource = computed<LensSource>(() =>
     lensSource(this.selectedInitiative()?.validationConfig ?? null),
   );
-  /** Right-column touched files (mock 674-684) from the ALREADY-LOADED diff of the current session. */
-  protected readonly consoleFiles = computed<TouchedFile[]>(() => {
-    const id = this.currentSession()?.id;
-    return touchedFiles(id ? this.diffFor(id) : null);
-  });
+  /** Right-column SDLC Events timeline (replaces the old Host-files pane). The initiative-level events
+   *  (planning-run + development-run merged, oldest-first) loaded for the selected initiative. */
+  protected readonly initiativeEvents = signal<AgentPlanEvent[]>([]);
+  protected readonly eventsLoading = signal(false);
+  /** Projected timeline rows (stage/lens/verdict/normalized-ISO) — reverse to newest-first for display. */
+  protected readonly consoleTimeline = computed<TimelineEvent[]>(() =>
+    [...initiativeTimeline(this.initiativeEvents())].reverse(),
+  );
   /** Which pane the §08 mobile switcher currently shows. */
   protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
 
@@ -597,6 +605,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         if (isPlan && init) {
           void this.ensurePlanLoaded();
         }
+      },
+      { allowSignalWrites: true },
+    );
+
+    // Events pane: (re)load the selected initiative's full SDLC timeline whenever the selection or its
+    // `updatedAt` changes (the latter bumps as the run progresses / after a mutation), and run a gentle
+    // poll while the initiative is live so the timeline follows planning → review loop → done without a
+    // manual refresh. Keyed on `initiativeId` (the group), not the plan-run id.
+    effect(
+      () => {
+        const init = this.selectedInitiative();
+        // Track `updatedAt` so a status change re-reads events even if the id is unchanged.
+        const stamp = init?.updatedAt;
+        const initiativeId = init?.initiativeId ?? null;
+        const isLive = !!init && init.initiativeStatus !== 'done';
+        this.syncEventsWatch(initiativeId, stamp, isLive);
       },
       { allowSignalWrites: true },
     );
@@ -803,6 +827,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.teardownRelaySessionEvents();
     this.clearSessionIdCopiedTimeout();
     this.resetStreamingStatus();
+    this.stopEventsPoll();
     this.stopSidebarResize();
     this.stopPaneInteraction();
     this.teardownCompactWorkspaceMode();
@@ -1809,11 +1834,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     void this.loadPlanDoc(sel);
   }
 
-  /** The loaded diff for a session's Diff tab (null until first activation). */
-  diffFor(id: string): GitDiffView | null {
-    return this.diffs()[id] ?? null;
-  }
-
   /**
    * Load the initiative master-list for the console (overhaul P8, phase 04). Best-effort: a failure
    * (unauthorized / host down) leaves an empty list and the benign empty state — the console degrades to
@@ -1831,6 +1851,70 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     } catch {
       this.agentPlans.set([]);
     }
+  }
+
+  /**
+   * Reconcile the Events pane with the selected initiative. Reloads the timeline when the initiative
+   * (or its `updatedAt` stamp) changes, and keeps a gentle 6s poll running while the initiative is live
+   * (not 'done') so the SDLC timeline follows planning → review loop → done on its own. Idempotent —
+   * called from an effect on every selection/stamp change.
+   */
+  private syncEventsWatch(
+    initiativeId: string | null,
+    stamp: string | null | undefined,
+    isLive: boolean,
+  ): void {
+    const changedInitiative = initiativeId !== this.eventsInitiativeId;
+    if (changedInitiative) {
+      this.eventsInitiativeId = initiativeId;
+      this.initiativeEvents.set([]);
+      this.stopEventsPoll();
+    }
+    if (!initiativeId) return;
+    // Reload on first selection or when the run advanced (updatedAt changed).
+    if (changedInitiative || stamp !== this.eventsStamp) {
+      this.eventsStamp = stamp ?? null;
+      void this.loadInitiativeEvents(initiativeId, changedInitiative);
+    }
+    if (isLive) {
+      this.startEventsPoll(initiativeId);
+    } else {
+      this.stopEventsPoll();
+    }
+  }
+
+  /** Fetch the initiative's full SDLC timeline (planning + development runs merged). Best-effort:
+   *  a failure leaves the last-loaded events and the benign empty state. */
+  private async loadInitiativeEvents(initiativeId: string, showSpinner: boolean): Promise<void> {
+    if (showSpinner) this.eventsLoading.set(true);
+    try {
+      const events = await firstValueFrom(this.api.listInitiativeEvents(initiativeId));
+      // Guard against a late response for a since-changed selection.
+      if (this.eventsInitiativeId === initiativeId) {
+        this.initiativeEvents.set(events ?? []);
+      }
+    } catch {
+      // keep prior events
+    } finally {
+      if (showSpinner) this.eventsLoading.set(false);
+    }
+  }
+
+  private startEventsPoll(initiativeId: string): void {
+    if (this.eventsPollInterval) return;
+    this.eventsPollInterval = setInterval(() => {
+      if (this.eventsInitiativeId !== initiativeId) {
+        this.stopEventsPoll();
+        return;
+      }
+      void this.loadInitiativeEvents(initiativeId, false);
+    }, 6000);
+  }
+
+  private stopEventsPoll(): void {
+    if (!this.eventsPollInterval) return;
+    clearInterval(this.eventsPollInterval);
+    this.eventsPollInterval = null;
   }
 
   /** Select an initiative row (highlights it + drives the lifecycle bar / validation column). */
