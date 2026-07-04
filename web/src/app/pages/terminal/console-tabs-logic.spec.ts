@@ -52,10 +52,10 @@ describe('initiativeTabOf', () => {
     expect(initiativeTabOf(tabs, 'i2')).toBe('raw');
   });
 
-  it("defaults to 'transcript' for an unknown id or empty map", () => {
-    expect(initiativeTabOf({}, 'nope')).toBe('transcript');
+  it("defaults to 'raw' for an unknown id or empty map (Transcript removed)", () => {
+    expect(initiativeTabOf({}, 'nope')).toBe('raw');
     expect(initiativeTabOf({ i1: 'plan' }, 'other')).toBe(DEFAULT_PANE_TAB);
-    expect(DEFAULT_PANE_TAB).toBe('transcript');
+    expect(DEFAULT_PANE_TAB).toBe('raw');
   });
 });
 

@@ -160,15 +160,15 @@ describe('touchedFiles', () => {
 
 describe('consolePaneFor / CONSOLE_SEGMENTS', () => {
   it('lists the three segments in order', () => {
-    expect([...CONSOLE_SEGMENTS]).toEqual(['transcript', 'files', 'validation']);
+    expect([...CONSOLE_SEGMENTS]).toEqual(['console', 'files', 'validation']);
   });
 
-  it('maps each segment to itself and falls back to transcript', () => {
-    expect(consolePaneFor('transcript')).toBe('transcript');
+  it('maps each segment to itself and falls back to console', () => {
+    expect(consolePaneFor('console')).toBe('console');
     expect(consolePaneFor('files')).toBe('files');
     expect(consolePaneFor('validation')).toBe('validation');
-    expect(consolePaneFor('nope')).toBe('transcript');
-    expect(consolePaneFor(null)).toBe('transcript');
-    expect(consolePaneFor(undefined)).toBe('transcript');
+    expect(consolePaneFor('nope')).toBe('console');
+    expect(consolePaneFor(null)).toBe('console');
+    expect(consolePaneFor(undefined)).toBe('console');
   });
 });
