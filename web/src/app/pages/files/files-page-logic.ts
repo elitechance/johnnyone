@@ -15,7 +15,18 @@ export interface Breadcrumb {
 }
 
 /** The preview surface a file routes to (mutually exclusive, evaluated in a fixed order — D3). */
-export type PreviewMode = 'markdown' | 'code' | 'binary' | 'text';
+export type PreviewMode = 'markdown' | 'code' | 'binary' | 'text' | 'html' | 'image';
+
+/** Raster/vector image extensions rendered inline as an `<img>` (mode==='image') rather than the
+ *  "binary — download only" notice. */
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'svg', 'avif']);
+
+/** True when a file should preview as an inline image (by `image/*` contentType or a known extension). */
+function isImagePreview(name: string, contentType: string): boolean {
+  const type = (contentType ?? '').toLowerCase().trim();
+  if (type.startsWith('image/')) return true;
+  return IMAGE_EXTENSIONS.has(extensionOf(name));
+}
 
 /**
  * Split a root-relative `path` into cumulative breadcrumbs. Index 0 is always the root
@@ -142,18 +153,27 @@ function isTextualContentType(contentType: string): boolean {
  * Classify how a file should be previewed, in a FIXED order so the modes are mutually exclusive (D3):
  *   1. `encoding==='base64'` OR a non-textual `contentType`      ⇒ 'binary'
  *   2. `.md`/`.markdown` extension OR a markdown `contentType`   ⇒ 'markdown'
- *   3. a recognized source extension (`codeLanguage(name)!==''`) ⇒ 'code'
- *   4. everything else                                            ⇒ 'text'
+ *   3. `.html`/`.htm` extension OR an html `contentType`         ⇒ 'html'  (rendered single page)
+ *   4. a recognized source extension (`codeLanguage(name)!==''`) ⇒ 'code'
+ *   5. everything else                                            ⇒ 'text'
  *
  * `code` is driven by the EXTENSION, not by `text/*` — a bare `text/plain` with no recognized source
- * extension falls through to `'text'` (so `x.ts` ⇒ `code` but `notes.txt` ⇒ `text`).
+ * extension falls through to `'text'` (so `x.ts` ⇒ `code` but `notes.txt` ⇒ `text`). `html` precedes
+ * `code` so a `.html` file renders as a page (in a sandboxed iframe) rather than as highlighted source
+ * — the Edit toggle still exposes the raw source.
  */
 export function previewMode(name: string, contentType: string, encoding: string): PreviewMode {
+  // Images render inline (as an <img>) even though they arrive base64-encoded — checked BEFORE the
+  // binary gate, which would otherwise classify every base64 payload as "download only".
+  if (isImagePreview(name, contentType)) return 'image';
+
   if (encoding === 'base64' || !isTextualContentType(contentType)) return 'binary';
 
   const ext = extensionOf(name);
   const type = (contentType ?? '').toLowerCase();
   if (ext === 'md' || ext === 'markdown' || type.includes('markdown')) return 'markdown';
+
+  if (ext === 'html' || ext === 'htm' || type.includes('html')) return 'html';
 
   if (codeLanguage(name) !== '') return 'code';
 

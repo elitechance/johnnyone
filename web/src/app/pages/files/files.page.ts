@@ -1,7 +1,7 @@
 import { CommonModule } from '@angular/common';
 import { Component, ElementRef, OnInit, ViewChild, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
+import { DomSanitizer, SafeHtml, SafeUrl } from '@angular/platform-browser';
 import {
   IonHeader,
   IonToolbar,
@@ -107,8 +107,34 @@ export class FilesPage implements OnInit {
   protected readonly current = signal('');
   /** Unsaved-edits flag driving the `● unsaved` badge — the pure `isDirty` (D4). */
   protected readonly dirty = computed(() => isDirty(this.original(), this.current()));
-  /** Only text/code files are editable; markdown previews rendered, binary is a notice (D3). */
-  protected readonly canEdit = computed(() => this.mode() === 'code' || this.mode() === 'text');
+  /** text/code/html files are editable (html toggles to its raw source); markdown is render-only,
+   *  binary is a notice (D3). */
+  protected readonly canEdit = computed(
+    () => this.mode() === 'code' || this.mode() === 'text' || this.mode() === 'html',
+  );
+
+  /** Sandboxed single-page render of an `.html` file (mode==='html'). Rendered inside a sandboxed
+   *  iframe via `[srcdoc]`, so it needs to be a trusted-HTML value; the iframe `sandbox` (no
+   *  allow-same-origin) keeps the host file isolated from the app origin. */
+  protected readonly htmlDoc = computed<SafeHtml>(() => {
+    const file = this.content();
+    if (!file || this.mode() !== 'html') return '';
+    return this.sanitizer.bypassSecurityTrustHtml(file.content);
+  });
+
+  /** Inline image source (mode==='image') as a data URL. Host images arrive base64-encoded; a utf8
+   *  payload (e.g. an `.svg`) is percent-encoded instead. `<img>`-referenced SVG cannot execute
+   *  scripts, so trusting the data URL is safe. */
+  protected readonly imageSrc = computed<SafeUrl>(() => {
+    const file = this.content();
+    if (!file || this.mode() !== 'image') return '';
+    const type = file.contentType?.trim() || 'image/*';
+    const url =
+      file.encoding === 'base64'
+        ? `data:${type};base64,${file.content}`
+        : `data:${type};utf8,${encodeURIComponent(file.content)}`;
+    return this.sanitizer.bypassSecurityTrustUrl(url);
+  });
 
   // ── Upload state (Phase 03) ─────────────────────────────────────────────────────────────────────
   /** Per-file progress chips (mock §05 `.uprow`/`.upchip`). */

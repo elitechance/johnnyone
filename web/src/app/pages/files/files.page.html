@@ -105,6 +105,20 @@
                 @case ('markdown') {
                   <johnny-markdown-view [markdown]="file.content"></johnny-markdown-view>
                 }
+                @case ('html') {
+                  <iframe
+                    class="html-preview"
+                    [srcdoc]="htmlDoc()"
+                    sandbox="allow-scripts allow-popups allow-forms"
+                    referrerpolicy="no-referrer"
+                    title="HTML preview"
+                  ></iframe>
+                }
+                @case ('image') {
+                  <div class="img-wrap">
+                    <img class="img-preview" [src]="imageSrc()" [alt]="file.name" />
+                  </div>
+                }
                 @case ('code') {
                   <pre class="code" [innerHTML]="highlighted()"></pre>
                 }

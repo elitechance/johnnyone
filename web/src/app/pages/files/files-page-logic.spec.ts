@@ -65,8 +65,22 @@ describe('files page — pure logic', () => {
       expect(previewMode('notes.txt', 'text/plain', 'utf8')).toBe('text');
     });
 
-    it('classifies base64 / non-text payloads as binary', () => {
-      expect(previewMode('x.png', 'image/png', 'base64')).toBe('binary');
+    it('renders .html/.htm as a page (html mode), ahead of code', () => {
+      expect(previewMode('page.html', 'text/html', 'utf8')).toBe('html');
+      expect(previewMode('page.htm', 'text/plain', 'utf8')).toBe('html');
+      // markdown still wins over html when both could apply (order)
+      expect(previewMode('x.md', 'text/html', 'utf8')).toBe('markdown');
+    });
+
+    it('renders images inline (image mode), ahead of the binary gate', () => {
+      expect(previewMode('shot.png', 'image/png', 'base64')).toBe('image');
+      expect(previewMode('pic.jpeg', 'image/jpeg', 'base64')).toBe('image');
+      expect(previewMode('logo.svg', 'image/svg+xml', 'utf8')).toBe('image');
+      // extension alone is enough even without an image contentType
+      expect(previewMode('x.webp', 'application/octet-stream', 'base64')).toBe('image');
+    });
+
+    it('classifies non-image base64 / non-text payloads as binary', () => {
       expect(previewMode('x.bin', 'application/octet-stream', 'base64')).toBe('binary');
       // A non-textual contentType alone (even utf8-labelled) is binary.
       expect(previewMode('x.bin', 'application/octet-stream', 'utf8')).toBe('binary');
