@@ -660,9 +660,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // though the URL carries no `surface` query.
     const routeSurface = (this.route.snapshot.data['surface'] as string | undefined) ?? null;
     this.surfaceParam.set(routeSurface ?? this.route.snapshot.queryParamMap.get('surface'));
-    // A briefing opened on the shell surface carries its initiative id so the surface can show an
-    // "Accept brief → Planning" bar over the interactive briefing terminal.
-    this.briefingInitiativeId.set(this.route.snapshot.queryParamMap.get('briefingInitiative'));
     // Deep-link: select the linked initiative + tab from the URL BEFORE the list loads, so
     // `loadInitiatives` (which otherwise defaults to the first initiative) honors the link.
     const linkedInitiative = this.route.snapshot.queryParamMap.get('initiativeId');
@@ -1842,41 +1839,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.syncConsoleUrl();
   }
 
-  /** CRUD — Create: start a new initiative at the briefing step (same entry as the launcher). */
+  /** CRUD — Create: start a new initiative (the create form provisions it and goes straight to
+   *  planning; same entry as the launcher). */
   newInitiative(): void {
     void this.router.navigateByUrl('/briefing/new');
-  }
-
-  /** True while an Accept-brief request is in flight (drives the console Accept button). */
-  protected readonly acceptingBrief = signal(false);
-  /** Set when a briefing is opened on the shell surface (`?briefingInitiative=`) — shows the Accept bar. */
-  protected readonly briefingInitiativeId = signal<string | null>(null);
-
-  /** Accept a briefing-stage initiative → planning. Briefing is an interactive terminal now; the
-   *  agent writes the final brief to brief.md, which the backend reads on accept. */
-  async acceptBrief(initiativeId: string): Promise<void> {
-    const alert = await this.alertCtrl.create({
-      header: 'Accept brief → Planning',
-      message:
-        'This advances the initiative from briefing to planning using the brief the agent wrote to brief.md. Make sure you asked the agent (in the Raw terminal) to finalize the brief first.',
-      buttons: [
-        { text: 'Cancel', role: 'cancel' },
-        { text: 'Accept → Planning', role: 'confirm' },
-      ],
-    });
-    await alert.present();
-    const { role } = await alert.onDidDismiss();
-    if (role !== 'confirm') return;
-    this.acceptingBrief.set(true);
-    try {
-      await firstValueFrom(this.api.acceptInitiativeBrief({ initiativeId }));
-      // Advance to planning and stay on the UNIFIED console (planning is a status, not a page).
-      void this.router.navigate(['/initiatives'], { queryParams: { initiativeId } });
-    } catch (err) {
-      await this.showInitiativeError('Failed to accept brief', err);
-    } finally {
-      this.acceptingBrief.set(false);
-    }
   }
 
   /** Mobile master-detail: clear the selection to return to the initiatives list, and drop the

@@ -30,7 +30,7 @@ describe('launcher — pure logic', () => {
 
     it('carries the §06 titles/subtitles verbatim (incl. the · middle dot)', () => {
       expect(LAUNCHER_ENTRIES).toEqual([
-        { kind: 'initiative', title: 'New initiative', subtitle: 'start at briefing', icon: 'create-outline' },
+        { kind: 'initiative', title: 'New initiative', subtitle: 'describe it → plan & build', icon: 'create-outline' },
         { kind: 'shell', title: 'Raw shell', subtitle: '$SHELL · run commands yourself', icon: 'terminal-outline' },
         { kind: 'attach', title: 'Attach to tmux session', subtitle: 'pick an existing pane', icon: 'git-network-outline' },
         { kind: 'files', title: 'Open file manager', subtitle: 'browse the host FS', icon: 'folder-outline' },

@@ -5,7 +5,7 @@
 // functions and stays thin wiring; Phase 02's `/shells` page reuses `terminalRoute` verbatim.
 //
 // `CreateAiSessionInput` is imported type-only (erased at build time) at the same relative depth the
-// shipped pure siblings use to reach `ui/` types (`briefing-page-logic.ts:6` — five `../`), so no
+// shipped pure siblings use to reach `ui/` types (`shells-page-logic.ts` — five `../`), so no
 // Angular/runtime dependency leaks in. NOTE: the service-file interface (with `workingDirectory` +
 // `tmuxSessionName`) is the one `createSession` actually accepts — not the narrower barrel-exported
 // `models/ai-session.model` shape.
@@ -38,7 +38,7 @@ export type LauncherIntent =
  * the `·` middle dot in the shell subtitle). Icons are ionicons names the component registers.
  */
 export const LAUNCHER_ENTRIES: readonly LauncherEntry[] = [
-  { kind: 'initiative', title: 'New initiative', subtitle: 'start at briefing', icon: 'create-outline' },
+  { kind: 'initiative', title: 'New initiative', subtitle: 'describe it → plan & build', icon: 'create-outline' },
   { kind: 'shell', title: 'Raw shell', subtitle: '$SHELL · run commands yourself', icon: 'terminal-outline' },
   { kind: 'attach', title: 'Attach to tmux session', subtitle: 'pick an existing pane', icon: 'git-network-outline' },
   { kind: 'files', title: 'Open file manager', subtitle: 'browse the host FS', icon: 'folder-outline' },

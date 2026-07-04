@@ -54,18 +54,12 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/planner/planner.page').then((m) => m.PlannerPage),
   },
-  // Briefing (overhaul P4) — the clarification conversation before planning. `new` must precede
-  // `:initiativeId` so it is not captured as an id. Accept advances the SAME initiative to planning.
+  // New-initiative create form (overhaul P4, briefing step removed). Creating provisions the
+  // initiative and immediately accepts it, so the lifecycle starts at planning — there is no
+  // interactive briefing conversation, hence no `briefing/:initiativeId` route.
   {
     path: 'briefing/new',
-    title: 'New briefing',
-    canActivate: [authGuard],
-    loadComponent: () =>
-      import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),
-  },
-  {
-    path: 'briefing/:initiativeId',
-    title: 'Briefing',
+    title: 'New initiative',
     canActivate: [authGuard],
     loadComponent: () =>
       import('./pages/briefing/briefing.page').then((m) => m.BriefingPage),

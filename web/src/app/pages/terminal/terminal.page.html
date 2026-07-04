@@ -61,13 +61,6 @@
         <johnny-lifecycle-bar [status]="sel.initiativeStatus" [health]="sel.health"></johnny-lifecycle-bar>
         <div class="init-top-row">
           <div class="path">{{ sel.workspacePath }}</div>
-          @if (sel.initiativeStatus === 'briefing') {
-            <!-- Briefing is an interactive terminal (Raw tab). Accept advances briefing → planning
-                 using the brief the agent wrote to brief.md. -->
-            <button type="button" class="accept-brief" [disabled]="acceptingBrief()" (click)="acceptBrief(sel.id)">
-              {{ acceptingBrief() ? 'Accepting…' : '✓ Accept brief → Planning' }}
-            </button>
-          }
         </div>
       </div>
     }
@@ -87,16 +80,10 @@
          no session tabs / New Terminal chrome. -->
     @let sh = currentSession();
     <header class="plain-shell-topbar">
-      <span class="ps-chip">{{ briefingInitiativeId() ? 'briefing' : (sh?.attached_tmux ? 'tmux' : 'shell') }}</span>
+      <span class="ps-chip">{{ sh?.attached_tmux ? 'tmux' : 'shell' }}</span>
       <span class="ps-name">{{ sh?.title || 'Shell' }}</span>
       @if (sh?.provider) {
         <span class="ps-dim">· {{ providerLabel(sh!.provider) }}</span>
-      }
-      @if (briefingInitiativeId(); as bid) {
-        <!-- Briefing on the (working) shell surface: brief the agent live, then accept → planning. -->
-        <button class="ps-accept" [disabled]="acceptingBrief()" (click)="acceptBrief(bid)">
-          {{ acceptingBrief() ? 'Accepting…' : '✓ Accept brief → Planning' }}
-        </button>
       }
       @if (sh) {
         <button class="ps-detach" (click)="closeTerminalPane(sh.id)">

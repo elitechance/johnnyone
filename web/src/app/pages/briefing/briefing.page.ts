@@ -1,7 +1,7 @@
 import { CommonModule } from '@angular/common';
-import { Component, OnDestroy, OnInit, computed, effect, inject, signal } from '@angular/core';
+import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { ActivatedRoute, Router } from '@angular/router';
+import { Router } from '@angular/router';
 import {
   IonHeader,
   IonToolbar,
@@ -20,17 +20,8 @@ import {
   IonToggle,
   IonModal,
 } from '@ionic/angular/standalone';
-import {
-  AiChatService,
-  ChatWindowComponent,
-  JohnnyApiService,
-  AgentPlan,
-  DetectedCliTool,
-  DirListing,
-} from '@johnnyone/ui';
+import { JohnnyApiService, DetectedCliTool, DirListing } from '@johnnyone/ui';
 import { firstValueFrom } from 'rxjs';
-import { BriefingComposerComponent } from '../../components/briefing-composer/briefing-composer.component';
-import { canAccept, composeBriefingSeed, shouldSeed } from './briefing-page-logic';
 import {
   LensDraft,
   defaultLenses,
@@ -41,12 +32,10 @@ import {
 } from '../validation-config/validation-config-logic';
 
 /**
- * The briefing view (mock §07, overhaul P4). Reuses `johnny-chat-window` for the conversation
- * (`message-bubble` renders via the P3 markdown core), supplies the new `app-briefing-composer` and
- * the Accept bar through the window's `[chat-actions]` slot, and drives the multi-turn conversation
- * with the existing `AiChatService` on the initiative's `briefingSessionId` (D2). Accept flips the
- * same initiative briefing→planning (D1/D4) and navigates to its planning run. `briefing/new` shows a
- * minimal create form so the flow is reachable (the full rail launcher is Phase 6).
+ * New-initiative create form (overhaul P4, briefing step removed). Creating provisions the initiative
+ * and immediately accepts it, so the lifecycle starts at planning — there is no interactive briefing
+ * conversation. On success it lands on the unified initiative console (`/initiatives?initiativeId=`),
+ * where planning → development → review → done are just statuses of the one Initiative.
  */
 @Component({
   selector: 'app-briefing',
@@ -70,33 +59,14 @@ import {
     IonSelectOption,
     IonToggle,
     IonModal,
-    ChatWindowComponent,
-    BriefingComposerComponent,
   ],
   templateUrl: './briefing.page.html',
   styleUrls: ['./briefing.page.scss'],
 })
-export class BriefingPage implements OnInit, OnDestroy {
+export class BriefingPage implements OnInit {
   private readonly api = inject(JohnnyApiService);
-  private readonly chat = inject(AiChatService);
   private readonly router = inject(Router);
-  private readonly route = inject(ActivatedRoute);
 
-  /** Conversation state comes straight from the reused AiChatService signals. */
-  protected readonly messages = this.chat.messages;
-  protected readonly streaming = this.chat.isStreaming;
-
-  protected readonly initiativeId = signal<string | null>(null);
-  protected readonly plan = signal<AgentPlan | null>(null);
-  protected readonly loadError = signal<string | null>(null);
-  protected readonly accepting = signal(false);
-
-  /** Pending attachment paths surfaced by the composer (folded into a re-seed if needed). */
-  protected readonly attachmentPaths = signal<string[]>([]);
-  private seeded = false;
-
-  // ── Create form (briefing/new) ──────────────────────────────────────────────────────────────────
-  protected readonly isCreate = computed(() => this.initiativeId() === null);
   protected createTitle = '';
   protected createWorkspacePath = '';
   protected createRawAsk = '';
@@ -126,39 +96,9 @@ export class BriefingPage implements OnInit, OnDestroy {
   protected readonly dirLoading = signal(false);
   protected readonly dirError = signal<string | null>(null);
 
-  protected readonly canAcceptNow = computed(() => canAccept(this.plan()?.initiativeStatus));
-
-  // ── Finalize brief (capture the conversation into the brief planning + lenses receive) ───────────
-  private static readonly FINALIZE_PROMPT =
-    'We are done discussing. Write the FINAL consolidated brief for this initiative now — a short, ' +
-    'concrete brief the planner and the validation lenses can act on. Include: Goal, Scope (in/out), ' +
-    'Constraints, and Acceptance criteria. Output only the brief (markdown), no preamble.';
-  protected readonly reviewOpen = signal(false);
-  protected readonly generatingBrief = signal(false);
-  protected readonly draftBrief = signal('');
-  private briefBaseline = 0;
-  /** When a finalize turn finishes streaming, lift Johnny's consolidated brief into the editable box. */
-  private readonly briefCaptureEffect = effect(() => {
-    const streaming = this.streaming();
-    if (streaming || !this.generatingBrief()) return;
-    const msgs = this.messages();
-    if (msgs.length <= this.briefBaseline) return;
-    const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');
-    if (lastAssistant) {
-      this.draftBrief.set(lastAssistant.content);
-      this.generatingBrief.set(false);
-    }
-  });
-
   ngOnInit(): void {
-    const id = this.route.snapshot.paramMap.get('initiativeId');
-    this.initiativeId.set(id);
-    if (id) {
-      this.loadInitiative(id);
-    } else {
-      // Create form: populate the agent dropdown from the host's detected CLIs.
-      void this.loadDetectedTools();
-    }
+    // Populate the agent dropdown from the host's detected CLIs.
+    void this.loadDetectedTools();
   }
 
   private async loadDetectedTools(): Promise<void> {
@@ -238,96 +178,12 @@ export class BriefingPage implements OnInit, OnDestroy {
     this.dirBrowserOpen.set(false);
   }
 
-  ngOnDestroy(): void {
-    this.chat.teardownSubscriptions();
-  }
-
-  private loadInitiative(id: string): void {
-    this.api.getAgentPlan(id).subscribe({
-      next: (run) => {
-        const plan = run.plan;
-        this.plan.set(plan);
-        const sessionId = plan.briefingSessionId;
-        if (!sessionId) {
-          this.loadError.set('This initiative has no briefing conversation.');
-          return;
-        }
-        this.chat.loadSession(sessionId);
-        // Seed the first turn once, only if the conversation is still empty (D2).
-        this.api.listMessages(sessionId).subscribe((rows) => {
-          if (!this.seeded && shouldSeed(rows)) {
-            this.seeded = true;
-            const refs = (plan.referencePaths ?? '')
-              .split('\n')
-              .map((line) => line.trim())
-              .filter(Boolean);
-            this.chat.sendMessage(
-              composeBriefingSeed(plan.brief ?? '', this.attachmentPaths(), refs),
-            );
-          }
-        });
-      },
-      error: (err) => this.loadError.set(String(err)),
-    });
-  }
-
-  // ── Conversation ────────────────────────────────────────────────────────────────────────────────
-  protected onSend(text: string): void {
-    this.chat.sendMessage(text);
-  }
-
-  protected onAttachmentsChanged(paths: string[]): void {
-    this.attachmentPaths.set(paths);
-  }
-
-  protected onReferencePathAdded(_path: string): void {
-    // The host already recorded it (addInitiativeReferencePath); nothing else to do here.
-  }
-
-  // ── Accept → planning (same initiative) ─────────────────────────────────────────────────────────
-  /** Step 1: ask Johnny to consolidate the whole discussion into a final brief, then open the review
-   *  box (the effect above lifts the reply in). This is what makes the CONVERSATION — not just the
-   *  original one-line ask — reach planning AND the validation lenses. */
-  protected finalizeBrief(): void {
-    if (!this.canAcceptNow() || this.accepting() || this.generatingBrief()) return;
-    this.draftBrief.set('');
-    this.generatingBrief.set(true);
-    this.reviewOpen.set(true);
-    this.briefBaseline = this.messages().length;
-    this.chat.sendMessage(BriefingPage.FINALIZE_PROMPT);
-  }
-
-  /** Step 2: send the (edited) consolidated brief as `finalBrief` so it is stored on the initiative,
-   *  written to the plan store, and handed to both the planner and the lenses. */
-  protected confirmBrief(): void {
-    const id = this.initiativeId();
-    const finalBrief = this.draftBrief().trim();
-    if (!id || !this.canAcceptNow() || this.accepting() || !finalBrief) return;
-    this.accepting.set(true);
-    this.api.acceptInitiativeBrief({ initiativeId: id, finalBrief }).subscribe({
-      next: () => {
-        this.accepting.set(false);
-        this.reviewOpen.set(false);
-        void this.router.navigate(['/initiatives'], { queryParams: { initiativeId: id } });
-      },
-      error: (err) => {
-        this.accepting.set(false);
-        this.loadError.set(String(err));
-      },
-    });
-  }
-
-  protected onKeepRefining(): void {
-    // No-op: stay in the briefing conversation (mock §07 "Keep refining").
-  }
-
-  // ── Create (briefing/new) ───────────────────────────────────────────────────────────────────────
+  // ── Create → planning ─────────────────────────────────────────────────────────────────────────
   protected createBriefing(): void {
-    if (this.creating()) return;
     const workspacePath = this.createWorkspacePath.trim();
     const brief = this.createRawAsk.trim();
     if (!workspacePath || !brief) {
-      this.createError.set('Workspace path and initial ask are required.');
+      this.createError.set('A workspace directory and a brief are both required.');
       return;
     }
     this.creating.set(true);
@@ -352,10 +208,10 @@ export class BriefingPage implements OnInit, OnDestroy {
           } catch {
             // Non-fatal — the initiative keeps the default template; user can Configure later.
           }
-          // Briefing step removed: go STRAIGHT to planning. Accept immediately (the "Initial ask" is
-          // the brief) — this flips the initiative to planning and starts the T1 planner — then land
-          // on the UNIFIED initiative console (planning/development/review/done are just statuses of
-          // the one Initiative; the legacy /planning + /development split-pages are not the target).
+          // Briefing step removed: go STRAIGHT to planning. Accept immediately (the brief IS the ask)
+          // — this flips the initiative to planning and starts the T1 planner — then land on the
+          // UNIFIED initiative console (planning/development/review/done are just statuses of the one
+          // Initiative; the legacy /planning + /development split-pages are not the target).
           try {
             await firstValueFrom(this.api.acceptInitiativeBrief({ initiativeId: run.plan.id }));
             this.creating.set(false);

@@ -1,24 +1,12 @@
 <ion-header>
   <ion-toolbar>
-    <ion-title>
-      @if (isCreate()) {
-        New initiative
-      } @else {
-        {{ plan()?.title || 'Initiative' }}
-        @if (plan()?.initiativeStatus) {
-          <span class="status-pill" [attr.data-status]="plan()?.initiativeStatus">
-            {{ plan()?.initiativeStatus }}
-          </span>
-        }
-      }
-    </ion-title>
+    <ion-title>New initiative</ion-title>
   </ion-toolbar>
 </ion-header>
 
 <ion-content>
-  @if (isCreate()) {
-    <!-- New-initiative create form. Creating goes STRAIGHT to planning (no briefing step). -->
-    <div class="create-form">
+  <!-- New-initiative create form. Creating goes STRAIGHT to planning (no briefing step). -->
+  <div class="create-form">
       <h2>New initiative</h2>
       <p class="create-hint">
         Describe what to build. J1 plans it into a task tree, then builds and validates it —
@@ -180,77 +168,4 @@
         </div>
       </ng-template>
     </ion-modal>
-  } @else if (loadError()) {
-    <div class="load-error">{{ loadError() }}</div>
-  } @else {
-    <div class="briefing-shell">
-      <johnny-chat-window
-        class="briefing-chat"
-        [messages]="messages()"
-        [isStreaming]="streaming()"
-        [showComposer]="false"
-        emptyTitle="Briefing"
-        emptyDescription="Starting the conversation…">
-        <div chat-actions class="briefing-actions">
-          @if (initiativeId(); as id) {
-            <app-briefing-composer
-              [initiativeId]="id"
-              (messageSent)="onSend($event)"
-              (attachmentsChanged)="onAttachmentsChanged($event)"
-              (referencePathAdded)="onReferencePathAdded($event)"></app-briefing-composer>
-          }
-          <div class="brief-foot">
-            <ion-button
-              class="accept"
-              [disabled]="!canAcceptNow() || accepting() || generatingBrief()"
-              (click)="finalizeBrief()">
-              ✓ Finalize brief → Planning
-            </ion-button>
-            <ion-button fill="clear" (click)="onKeepRefining()">Keep refining</ion-button>
-            <span class="hint">
-              J1 consolidates the whole discussion into a brief you review; it's what the planner
-              <b>and the validation lenses</b> receive.
-            </span>
-          </div>
-        </div>
-      </johnny-chat-window>
-    </div>
-
-    <!-- Review the consolidated brief before it goes to planning + the lenses (editable). -->
-    <ion-modal [isOpen]="reviewOpen()" (didDismiss)="reviewOpen.set(false)">
-      <ng-template>
-        <ion-header>
-          <ion-toolbar>
-            <ion-title>Review brief → Planning</ion-title>
-            <ion-buttons slot="end">
-              <ion-button (click)="reviewOpen.set(false)">Cancel</ion-button>
-            </ion-buttons>
-          </ion-toolbar>
-        </ion-header>
-        <ion-content class="brief-review-content">
-          @if (generatingBrief()) {
-            <div class="brief-generating">Johnny is consolidating the discussion into a brief…</div>
-          } @else {
-            <p class="brief-review-hint">
-              This is what the <b>planner</b> and the <b>validation lenses</b> will receive. Edit as needed.
-            </p>
-            <ion-textarea
-              class="brief-review"
-              [autoGrow]="true"
-              [ngModel]="draftBrief()"
-              (ngModelChange)="draftBrief.set($event)"
-              placeholder="The consolidated brief…"></ion-textarea>
-          }
-        </ion-content>
-        <div class="brief-review-actions">
-          <ion-button
-            expand="block"
-            [disabled]="generatingBrief() || accepting() || !draftBrief().trim()"
-            (click)="confirmBrief()">
-            {{ accepting() ? 'Accepting…' : '✓ Accept → Planning' }}
-          </ion-button>
-        </div>
-      </ng-template>
-    </ion-modal>
-  }
 </ion-content>
