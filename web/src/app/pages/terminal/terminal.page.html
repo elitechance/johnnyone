@@ -87,10 +87,16 @@
          no session tabs / New Terminal chrome. -->
     @let sh = currentSession();
     <header class="plain-shell-topbar">
-      <span class="ps-chip">{{ sh?.attached_tmux ? 'tmux' : 'shell' }}</span>
+      <span class="ps-chip">{{ briefingInitiativeId() ? 'briefing' : (sh?.attached_tmux ? 'tmux' : 'shell') }}</span>
       <span class="ps-name">{{ sh?.title || 'Shell' }}</span>
       @if (sh?.provider) {
         <span class="ps-dim">· {{ providerLabel(sh!.provider) }}</span>
+      }
+      @if (briefingInitiativeId(); as bid) {
+        <!-- Briefing on the (working) shell surface: brief the agent live, then accept → planning. -->
+        <button class="ps-accept" [disabled]="acceptingBrief()" (click)="acceptBrief(bid)">
+          {{ acceptingBrief() ? 'Accepting…' : '✓ Accept brief → Planning' }}
+        </button>
       }
       @if (sh) {
         <button class="ps-detach" (click)="closeTerminalPane(sh.id)">
