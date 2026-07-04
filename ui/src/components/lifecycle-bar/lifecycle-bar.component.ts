@@ -26,7 +26,9 @@ const STAGE_COPY: Record<string, string> = {
   planning: 'Turn the accepted brief into a task tree.',
   development: 'T1 workers build against the plan.',
   review: 'Configurable validation lenses run in parallel.',
-  done: 'Merged & promoted.',
+  // "Done" = work complete (all phases validated). J1 does not auto-merge/deploy,
+  // so the copy reflects completion, not promotion.
+  done: 'Work complete.',
 };
 
 /**

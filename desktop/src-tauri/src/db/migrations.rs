@@ -22,6 +22,7 @@ const MIGRATION_017: &str = include_str!("../../migrations/017_add_initiative_ax
 pub const BACKFILL_017: &str = include_str!("../../migrations/017_backfill_initiative_axes.sql");
 const MIGRATION_018: &str = include_str!("../../migrations/018_add_briefing_session.sql");
 const MIGRATION_019: &str = include_str!("../../migrations/019_add_validation_config.sql");
+const MIGRATION_020: &str = include_str!("../../migrations/020_complete_approved_dev_runs.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -29,6 +30,10 @@ pub fn health_from_status(status: &str) -> &'static str {
     match status {
         "blocked" => "blocked",
         "needs_attention" | "phase_needs_changes" => "needs-attention",
+        // Terminal, healthy end states: a fully-approved/complete run is DONE, not
+        // "in-progress". Without this, the HEALTH axis is stuck on in-progress forever
+        // after approval (the console reads it straight from this derivation).
+        "approved" | "done" | "complete" | "completed" | "passed" => "complete",
         _ => "in-progress",
     }
 }
@@ -77,6 +82,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (17, "017_add_initiative_axes", MIGRATION_017),
         (18, "018_add_briefing_session", MIGRATION_018),
         (19, "019_add_validation_config", MIGRATION_019),
+        (20, "020_complete_approved_dev_runs", MIGRATION_020),
     ];
 
     for (version, name, sql) in migrations {
@@ -272,6 +278,7 @@ mod tests {
         assert_eq!(health_from_status("needs_attention"), "needs-attention");
         assert_eq!(health_from_status("phase_needs_changes"), "needs-attention");
         assert_eq!(health_from_status("draft"), "in-progress");
-        assert_eq!(health_from_status("approved"), "in-progress");
+        assert_eq!(health_from_status("approved"), "complete");
+        assert_eq!(health_from_status("done"), "complete");
     }
 }
