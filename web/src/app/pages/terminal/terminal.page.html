@@ -1,7 +1,7 @@
 <!-- Overhaul P8 §02 initiative console — the global rail is the app shell (P03); this grid adds the
      initiative master-list (left), the lifecycle bar + the EXISTING pane shell (center), and the
      validation-summary/host-files column (right), collapsing to §08 single-column at container width. -->
-<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [style.grid-template-columns]="(consoleCompact() || plainShellMode()) ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
+<div #consoleRoot class="console" [class.plain-shell]="plainShellMode()" [class.has-selection]="!!selectedInitiativeId()" [style.grid-template-columns]="(consoleCompact() || plainShellMode()) ? '1fr' : consoleColumns()" [attr.data-console-pane]="mobileConsolePane()">
   <!-- P4: a plain shell / attached-tmux surface (`?surface=shell`) suppresses ALL initiative chrome
        — rail, mobile segment, lifecycle, validation/host-files, and (P5) dividers — leaving only the
        center terminal surface. -->
@@ -36,22 +36,10 @@
     </div>
   </aside>
 
-  <!-- §08 mobile segment switcher (mock 1082-1085) — a PERSISTENT sibling of the panes so it stays
-       visible in the collapsed layout while only the body beneath it swaps (container-query only). -->
-  <div class="seg console-seg" role="tablist" aria-label="Console view">
-    @for (seg of consoleSegments; track seg) {
-      <button
-        type="button"
-        class="s"
-        role="tab"
-        [class.on]="mobileConsolePane() === seg"
-        [attr.aria-selected]="mobileConsolePane() === seg"
-        (click)="setConsoleSegment(seg)"
-      >
-        {{ seg }}
-      </button>
-    }
-  </div>
+  <!-- The Console/Files/Validation mobile segment switcher was removed (confusing + ate the screen).
+       On mobile the console is now master-detail: the initiatives LIST shows until you pick one, then
+       the selected console shows with a "← Initiatives" back button (see .console.has-selection CSS).
+       Files stays reachable via the bottom nav; validation is set at creation / via Configure. -->
 
   <!-- P5: rail↔center divider (grid child between the rail and the center pane). Hidden in the
        collapsed layout via the container query. -->
@@ -67,6 +55,8 @@
   <!-- CENTER: lifecycle bar (mock 583-590) + the existing pane shell -->
   <section class="pane console-center">
     @if (selectedInitiative(); as sel) {
+      <!-- Mobile-only: back to the initiatives list (the master-detail replacement for the segment). -->
+      <button type="button" class="mobile-back" (click)="backToInitiativesList()">← Initiatives</button>
       <div class="init-top">
         <johnny-lifecycle-bar [status]="sel.initiativeStatus" [health]="sel.health"></johnny-lifecycle-bar>
         <div class="path">{{ sel.workspacePath }}</div>
@@ -79,60 +69,9 @@
   (dragover)="onWorkspaceDragOver($event)"
   (drop)="onWorkspaceDrop($event)"
 >
-  @if (!plainShellMode()) {
-  <header class="workspace-topbar">
-    <!-- Mobile navigation is the global .botnav (app.component) — no per-page
-         hamburger; the old ion-menu it toggled was removed in P8-03. -->
-    <div class="workspace-topbar-brand">
-      <div class="page-title-chip">Terminal</div>
-    </div>
-
-    @if (isCompactWorkspace()) {
-      <ion-segment
-        class="workspace-session-segment"
-        [value]="currentSession()?.id ?? ''"
-        (ionChange)="onSessionSelected($any($event.detail.value))"
-        scrollable
-        aria-label="Terminal sessions"
-      >
-        @for (session of orderedAiSessions(); track session.id) {
-          <ion-segment-button [value]="session.id" [title]="session.title || providerLabel(session.provider)">
-            <ion-label>{{ mobileSessionLabel(session) }}</ion-label>
-          </ion-segment-button>
-        }
-      </ion-segment>
-    } @else {
-      <nav class="workspace-tabs" aria-label="Terminal sessions">
-        @for (session of orderedAiSessions(); track session.id) {
-          <button
-            class="workspace-tab"
-            [class.active]="session.id === currentSession()?.id"
-            [class.dragging]="draggingTabId === session.id"
-            draggable="true"
-            (dragstart)="onTabDragStart(session.id)"
-            (dragover)="onTabDragOver($event)"
-            (drop)="onTabDrop(session.id)"
-            (dragend)="draggingTabId = null"
-            (click)="onSessionSelected(session.id)"
-            [title]="session.id"
-          >
-            <span class="tab-status" aria-hidden="true"></span>
-            <span>{{ session.title || 'Terminal' }}</span>
-          </button>
-        }
-      </nav>
-    }
-
-    <div class="workspace-actions">
-      <button class="primary-action" (click)="createNewSession()">New Terminal</button>
-      @if (currentSession()) {
-        <button class="icon-action" title="Copy session ID" (click)="copyCurrentSessionId()">
-          {{ sessionIdCopied() ? '✓' : '#' }}
-        </button>
-      }
-    </div>
-  </header>
-  }
+  <!-- The old multi-session terminal top bar (TERMINAL chip · session tabs · New Terminal) was removed:
+       standalone terminals live on /shells, and an initiative's own terminal is its Raw-terminal tab.
+       Keeping it here confusingly implied "make a new terminal" on the initiative console. -->
 
   @if (plainShellMode()) {
     <!-- P4: minimal plain-shell top bar (mock console-states State C) — chip + session name + detach,
