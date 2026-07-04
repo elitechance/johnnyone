@@ -865,6 +865,7 @@ impl AgentService {
             "create_agent_plan" => Self::rpc_create_agent_plan(&req.params, state),
             "list_agent_plans" => Self::rpc_list_agent_plans(&req.params, state),
             "get_agent_plan" => Self::rpc_get_agent_plan(&req.params, state),
+            "list_initiative_events" => Self::rpc_list_initiative_events(&req.params, state),
             "start_agent_plan" => Self::rpc_start_agent_plan(&req.params, state).await,
             "update_agent_plan_title" => Self::rpc_update_agent_plan_title(&req.params, state),
             "update_agent_plan_app_scope" => {
@@ -1194,6 +1195,20 @@ impl AgentService {
             .ok_or_else(|| "Missing 'id' parameter".to_string())?;
         let run = crate::services::agent_plans::get_plan(state, id)?;
         serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_list_initiative_events(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let initiative_id = params
+            .get("initiativeId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'initiativeId' parameter".to_string())?;
+        // Cap generously — an Initiative's two runs rarely exceed a few hundred events; the console
+        // renders the full SDLC timeline oldest-first.
+        let events = crate::services::agent_plans::list_initiative_events(state, initiative_id, 500)?;
+        serde_json::to_value(events).map_err(|e| e.to_string())
     }
 
     async fn rpc_start_agent_plan(

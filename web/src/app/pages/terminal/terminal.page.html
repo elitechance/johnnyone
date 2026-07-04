@@ -351,17 +351,39 @@
         }
       </div>
     </div>
-    <div class="rpane rpane-files">
-      <div class="pane-head rgroup-head">Host files</div>
-      <div class="filetree">
-        @for (f of consoleFiles(); track f.path) {
-          <div class="fnode touched">
-            <span class="ic">•</span>{{ f.path }}
-            <span class="badge-a">+{{ f.badge }}</span>
-            <span class="counts tnum">+{{ f.adds }} −{{ f.dels }}</span>
+    <div class="rpane rpane-events">
+      <div class="pane-head rgroup-head">
+        Events
+        @if (eventsLoading()) { <span class="ev-loading">· loading…</span> }
+      </div>
+      <!-- SDLC timeline: planning → plan approved → development → review (lens loop) → done. Newest
+           first; each row carries the stage marker, the lens/phase under review, verdict, and a full
+           date + time. `iso` is a normalized UTC instant so `| date` renders correctly per timezone. -->
+      <div class="ev-timeline">
+        @for (e of consoleTimeline(); track e.id) {
+          <div class="ev-row" [class.ev-milestone]="e.milestone" [attr.data-stage]="e.stage">
+            <span class="ev-marker" [attr.data-stage]="e.stage"></span>
+            <div class="ev-body">
+              <div class="ev-line">
+                <span class="ev-stage-chip" [attr.data-stage]="e.stage">{{ e.stage }}</span>
+                @if (e.lens) { <span class="ev-lens">{{ e.lens }}</span> }
+                @if (e.verdict) {
+                  <span class="ev-verdict" [attr.data-verdict]="e.verdict">{{ e.verdict }}</span>
+                }
+                <span class="ev-actor">{{ e.actor }}</span>
+              </div>
+              <div class="ev-title">{{ e.title }}</div>
+              @if (e.phaseLabel) { <div class="ev-phase">{{ e.phaseLabel }}</div> }
+              @if (e.reason && !e.lens) { <div class="ev-reason">{{ e.reason }}</div> }
+              <div class="ev-when tnum">
+                {{ e.iso | date: 'MMM d, y' }} · {{ e.iso | date: 'h:mm a' }}
+              </div>
+            </div>
           </div>
         } @empty {
-          <div class="fnode file-empty">No touched files.</div>
+          <div class="ev-empty">
+            @if (eventsLoading()) { Loading events… } @else { No events yet. }
+          </div>
         }
       </div>
     </div>

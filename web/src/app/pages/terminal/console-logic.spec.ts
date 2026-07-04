@@ -1,11 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import type { AgentPlan, GitDiffView } from '../../../../../ui/src/services/johnny-api.service';
+import type { AgentPlan } from '../../../../../ui/src/services/johnny-api.service';
 import {
   initiativeRows,
   lensSummary,
   lensSource,
   defaultLenses,
-  touchedFiles,
   consolePaneFor,
   CONSOLE_SEGMENTS,
 } from './console-logic';
@@ -128,33 +127,6 @@ describe('lensSource', () => {
     for (const cfg of [null, undefined, '', '[]', '   ', '{bad json', '{"not":"array"}', '42']) {
       expect(lensSource(cfg)).toBe('default');
     }
-  });
-});
-
-describe('touchedFiles', () => {
-  const view = (files: GitDiffView['files'], over: Partial<GitDiffView> = {}): GitDiffView =>
-    ({ repoRoot: '/r', branch: 'main', clean: false, files, ...over }) as GitDiffView;
-
-  it('senses new (adds only) vs edited (has deletions)', () => {
-    const rows = touchedFiles(
-      view([
-        { path: 'a.ts', additions: 10, deletions: 0, diff: '' },
-        { path: 'b.ts', additions: 4, deletions: 3, diff: '' },
-        { path: 'c.ts', additions: 0, deletions: 5, diff: '' },
-      ] as GitDiffView['files']),
-    );
-    expect(rows).toEqual([
-      { path: 'a.ts', adds: 10, dels: 0, badge: 'new' },
-      { path: 'b.ts', adds: 4, dels: 3, badge: 'edited' },
-      { path: 'c.ts', adds: 0, dels: 5, badge: 'edited' },
-    ]);
-  });
-
-  it('is empty for null / clean / no-files views', () => {
-    expect(touchedFiles(null)).toEqual([]);
-    expect(touchedFiles(undefined)).toEqual([]);
-    expect(touchedFiles(view([], { clean: true }))).toEqual([]);
-    expect(touchedFiles(view([] as GitDiffView['files']))).toEqual([]);
   });
 });
 

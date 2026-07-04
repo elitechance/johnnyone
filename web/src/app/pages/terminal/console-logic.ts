@@ -5,10 +5,7 @@
 // no color/lens logic is re-implemented here — it delegates to P2 `lifecycle-status` and P7
 // `validation-config-logic` (D5/D7). Types are imported type-only (erased at build) at the depth the
 // shipped pure siblings use, so no Angular/runtime dependency leaks into the plugin-less vitest.
-import type {
-  AgentPlan,
-  GitDiffView,
-} from '../../../../../ui/src/services/johnny-api.service';
+import type { AgentPlan } from '../../../../../ui/src/services/johnny-api.service';
 import {
   statusMeta,
   healthMeta,
@@ -101,33 +98,6 @@ export function lensSource(validationConfig: string | null | undefined): LensSou
 }
 
 export type { LensSource };
-
-/** One touched-file row (mock §02 `.filetree` `.fnode`, 674-684). */
-export interface TouchedFile {
-  path: string;
-  adds: number;
-  dels: number;
-  badge: 'edited' | 'new';
-}
-
-/**
- * Map the ALREADY-LOADED `gitDiff` view (P7 `diffs` signal — no new data call, D8) to compact
- * touched-file rows. `badge:'new'` when the file only added lines (`deletions===0 && additions>0`),
- * else `'edited'`. A null / clean / empty view → `[]` (the benign empty state P7 already produces).
- */
-export function touchedFiles(view: GitDiffView | null | undefined): TouchedFile[] {
-  if (!view || view.clean || !view.files) return [];
-  return view.files.map((f) => {
-    const adds = f.additions ?? 0;
-    const dels = f.deletions ?? 0;
-    return {
-      path: f.path,
-      adds,
-      dels,
-      badge: dels === 0 && adds > 0 ? 'new' : 'edited',
-    };
-  });
-}
 
 /** The §08 mobile segment switcher: which console COLUMN to show on a narrow screen. `console` is the
  *  center pane (Raw terminal / Plan / Diff) — renamed from the old `transcript` id after the Transcript

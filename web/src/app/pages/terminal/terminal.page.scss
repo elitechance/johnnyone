@@ -1552,7 +1552,7 @@ ion-modal.workspace-picker .picker-empty {
   }
 }
 
-/* Right: validation lens summary + host files */
+/* Right: validation lens summary + SDLC events timeline */
 .console-right {
   overflow-y: auto;
 }
@@ -1607,41 +1607,131 @@ ion-modal.workspace-picker .picker-empty {
   color: var(--jo-accent);
   text-decoration: none;
 }
-.console-right .filetree {
-  padding: 8px 6px;
-  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
-  font-size: 12px;
-  overflow-x: auto;
+/* SDLC Events timeline (replaces Host files). A left rail of stage-colored markers with the event
+   title, the lens/phase under review, verdict, and a full date + time. */
+.console-right .rpane-events .ev-loading {
+  font-weight: 400;
+  color: var(--jo-fg-faint);
+  font-size: 11px;
 }
-.console-right .fnode {
+.console-right .ev-timeline {
+  padding: 6px 12px 14px;
+  display: flex;
+  flex-direction: column;
+}
+.console-right .ev-empty {
+  padding: 14px;
+  color: var(--jo-fg-faint);
+  font-size: 12px;
+}
+.console-right .ev-row {
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 9px;
+  padding: 9px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--jo-border) 55%, transparent);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+/* Stage marker + connecting rail. */
+.console-right .ev-marker {
+  position: relative;
+  width: 9px;
+  height: 9px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--jo-fg-faint);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--jo-fg-faint) 16%, transparent);
+
+  &[data-stage='planning'] { background: var(--jo-st-planning); box-shadow: 0 0 0 3px color-mix(in srgb, var(--jo-st-planning) 20%, transparent); }
+  &[data-stage='development'] { background: var(--jo-st-development); box-shadow: 0 0 0 3px color-mix(in srgb, var(--jo-st-development) 20%, transparent); }
+  &[data-stage='review'] { background: var(--jo-st-review); box-shadow: 0 0 0 3px color-mix(in srgb, var(--jo-st-review) 20%, transparent); }
+  &[data-stage='done'] { background: var(--jo-st-done); box-shadow: 0 0 0 3px color-mix(in srgb, var(--jo-st-done) 20%, transparent); }
+}
+.console-right .ev-milestone .ev-marker {
+  width: 11px;
+  height: 11px;
+  margin-top: 3px;
+}
+.console-right .ev-milestone .ev-title {
+  font-weight: 620;
+  color: var(--jo-fg-strong);
+}
+.console-right .ev-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.console-right .ev-line {
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 3px 8px;
-  border-radius: 6px;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.console-right .ev-stage-chip {
+  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--jo-border);
   color: var(--jo-fg-muted);
-  white-space: nowrap;
 
-  .ic {
-    width: 13px;
-    text-align: center;
-    color: var(--jo-fg-faint);
-  }
-  &.touched .ic {
-    color: var(--jo-st-development);
-  }
-  .badge-a {
-    margin-left: auto;
-    font-size: 9.5px;
-    color: var(--jo-st-done);
-  }
-  .counts {
-    font-size: 9.5px;
-    color: var(--jo-fg-faint);
-  }
-  &.file-empty {
-    color: var(--jo-fg-faint);
-  }
+  &[data-stage='planning'] { color: var(--jo-st-planning); border-color: color-mix(in srgb, var(--jo-st-planning) 34%, transparent); }
+  &[data-stage='development'] { color: var(--jo-st-development); border-color: color-mix(in srgb, var(--jo-st-development) 34%, transparent); }
+  &[data-stage='review'] { color: var(--jo-st-review); border-color: color-mix(in srgb, var(--jo-st-review) 34%, transparent); }
+  &[data-stage='done'] { color: var(--jo-st-done); border-color: color-mix(in srgb, var(--jo-st-done) 34%, transparent); }
+}
+.console-right .ev-lens {
+  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--jo-bg-elevated);
+  border: 1px solid var(--jo-border);
+  color: var(--jo-fg-strong);
+}
+.console-right .ev-verdict {
+  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 5px;
+
+  &[data-verdict='PASS'] { color: var(--jo-st-done); background: color-mix(in srgb, var(--jo-st-done) 14%, transparent); }
+  &[data-verdict='NEEDS_CHANGES'] { color: var(--jo-warn); background: color-mix(in srgb, var(--jo-warn) 14%, transparent); }
+  &[data-verdict='BLOCKED'] { color: var(--jo-bad); background: color-mix(in srgb, var(--jo-bad) 14%, transparent); }
+}
+.console-right .ev-actor {
+  margin-left: auto;
+  font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 9.5px;
+  color: var(--jo-fg-faint);
+  text-transform: uppercase;
+}
+.console-right .ev-title {
+  font-size: 12.5px;
+  color: var(--jo-fg);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.console-right .ev-phase {
+  font-size: 11px;
+  color: var(--jo-fg-muted);
+}
+.console-right .ev-reason {
+  font-size: 11px;
+  color: var(--jo-fg-muted);
+  overflow-wrap: anywhere;
+}
+.console-right .ev-when {
+  font-size: 10.5px;
+  color: var(--jo-fg-faint);
 }
 
 /* The "← Initiatives" back button is mobile-only (master-detail); hidden on the widescreen 3-pane. */
