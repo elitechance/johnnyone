@@ -264,7 +264,7 @@ costs more than dev's per-phase fan-out — accepted by design.
     done), `planning_gate_result` *with verdict PASS* (plan approved),
     `agent_plan_completed` (all dev phases done).
   - **Block/attention (🔴):** `agent_phase_needs_attention`, `planning_needs_attention`,
-    `agent_blocked`, `coordinator_failed`.
+    `agent_blocked`, `agent_unblocked`, `coordinator_failed`.
   - **Silent:** all `*_started` events, and any **non-PASS** `*_gate_result` (a T2
     change-request just loops back to T1 — visible in the web lens panel, no ping).
     Routine events (worker idle, lens started) were never notified.
@@ -279,9 +279,21 @@ costs more than dev's per-phase fan-out — accepted by design.
   if it's genuinely stuck on a human decision, it states the question in its output,
   runs the blocked curl, and waits.
 - `wait_for_agent_ready_report` detects the `blocked` report → emits an
-  `agent_blocked` event (→ 🔴 Discord attention + feed) **once** and **pauses
-  nudging/escalation** (it no longer treats the idle agent as stuck — it's waiting
-  on you). It resumes normally when the `ready` report arrives.
+  `agent_blocked` event (→ 🔴 Discord attention + feed) **once**, **flips the plan
+  status to `blocked`** (see below), and **pauses nudging/escalation** (it no longer
+  treats the idle agent as stuck — it's waiting on you). It resumes normally when the
+  `ready` report arrives.
+- **Status honesty (fixed 2026-08-11).** The pause above is *unbounded*, so the run
+  must not keep a `*_running` status while it waits. On block the coordinator records
+  the pre-block status, sets the plan to `blocked` (health `blocked`, error = the
+  reason); on the `ready` report it restores the exact previous status and emits
+  `agent_unblocked`. The restore is guarded on the plan still being `blocked`, so a
+  human who stops or closes the run mid-block is never overridden.
+  *Why:* run `4187e055` reported `blocked` and then sat at `phase_worker_running` for
+  three days — the event log recorded a `None -> None` transition, and every status
+  reader (`listAgentPlans`, `getAgentPlan`, the console) said "running" while nothing
+  was happening. A Discord ping alone is best-effort: it is a no-op when no webhook is
+  configured, and it cannot be re-checked later. The status is the durable signal.
 - **Reply-to-unblock reuses the existing message bar**: the worker/planner session is
   persistent, so you open the run (via the alert deep link), read the agent's
   question in its terminal, and type the answer in the T1 message input — the agent
