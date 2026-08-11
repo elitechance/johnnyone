@@ -3160,6 +3160,66 @@ async fn wait_for_planner_ready(
     wait_for_agent_ready_report(state, session_id, plan_id, None).await
 }
 
+/// Mark a plan as `blocked` because its agent asked for a human, returning the
+/// status it had before so [`clear_plan_blocked`] can put it back.
+///
+/// Without this the run keeps its `*_running` status while the agent sits idle at a
+/// prompt, so every status reader — `listAgentPlans`, `getAgentPlan`, the console —
+/// reports "running" indefinitely. That is exactly how run `4187e055` looked busy
+/// for three days after reporting `blocked` (its `agent_blocked` event recorded a
+/// `None -> None` status transition). The status must tell the truth, not just the
+/// event log and a best-effort Discord ping.
+fn mark_plan_blocked_conn(
+    conn: &rusqlite::Connection,
+    plan_id: &str,
+    reason: &str,
+) -> rusqlite::Result<String> {
+    let previous: String = conn.query_row(
+        "SELECT status FROM agent_plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    )?;
+    update_plan_status_and_health(conn, plan_id, "blocked", Some(reason))?;
+    Ok(previous)
+}
+
+/// Restore the status [`mark_plan_blocked_conn`] replaced. Guarded on the plan still
+/// being `blocked`, so a human who stopped or closed the run while it waited is
+/// never overridden by the resuming agent.
+fn clear_plan_blocked_conn(
+    conn: &rusqlite::Connection,
+    plan_id: &str,
+    previous: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_plans SET status = ?1, health = ?2, error = NULL, updated_at = datetime('now') \
+         WHERE id = ?3 AND status = 'blocked'",
+        params![previous, health_from_status(previous), plan_id],
+    )
+}
+
+async fn mark_plan_blocked(state: &AppState, plan_id: &str, reason: &str) -> Option<String> {
+    let plan_id = plan_id.to_string();
+    let reason = reason.to_string();
+    state
+        .db
+        .with_conn(move |conn| {
+            mark_plan_blocked_conn(conn, &plan_id, &reason).map_err(|e| e.to_string())
+        })
+        .ok()
+}
+
+/// Restore the status [`mark_plan_blocked`] replaced, once the human has replied and
+/// the agent has resumed.
+async fn clear_plan_blocked(state: &AppState, plan_id: &str, previous: Option<&str>) {
+    let Some(previous) = previous else { return };
+    let plan_id = plan_id.to_string();
+    let previous = previous.to_string();
+    let _ = state.db.with_conn(move |conn| {
+        clear_plan_blocked_conn(conn, &plan_id, &previous).map_err(|e| e.to_string())
+    });
+}
+
 /// Wait for a worker/planner (T1) session to report `ready` via the
 /// `reportAgentResult` API — the sole completion signal (no marker scraping). If
 /// the session goes idle for `READY_NUDGE_IDLE_MS` without reporting, re-send the
@@ -3179,17 +3239,38 @@ async fn wait_for_agent_ready_report(
     let mut nudges_sent: u32 = 0;
     // When the agent reports it's blocked on a human, we stop nudging/escalating
     // and wait (indefinitely) for the human to reply — which resumes the agent and
-    // produces the `ready` report below.
+    // produces the `ready` report below. Because that wait is unbounded, the plan's
+    // status is flipped to `blocked` for its duration: an unbounded wait under a
+    // `*_running` status is indistinguishable from a healthy run, which is how a
+    // blocked run once sat unnoticed for three days.
     let mut blocked = false;
+    let mut status_before_block: Option<String> = None;
     loop {
         if take_agent_report_kind(state, session_id, "ready").await.is_some() {
+            if blocked {
+                // Human replied and the agent resumed — hand the status back before
+                // returning, so the caller's `status = 'phase_worker_running'`
+                // guarded transition still matches.
+                clear_plan_blocked(state, plan_id, status_before_block.as_deref()).await;
+                let _ = append_event(state, plan_id, phase_id, "agent_unblocked", json!({}));
+                tracing::info!(session_id, plan_id, "agent unblocked — resuming");
+            }
             return Ok(());
         }
         if take_agent_report_kind(state, session_id, "blocked").await.is_some() {
             if !blocked {
                 blocked = true;
                 tracing::warn!(session_id, plan_id, "agent reported blocked — needs a human");
-                let _ = append_event(state, plan_id, phase_id, "agent_blocked", json!({}));
+                status_before_block =
+                    mark_plan_blocked(state, plan_id, "agent reported blocked — needs a human")
+                        .await;
+                let _ = append_event(
+                    state,
+                    plan_id,
+                    phase_id,
+                    "agent_blocked",
+                    json!({ "statusBefore": status_before_block }),
+                );
             }
         }
 
@@ -5680,6 +5761,12 @@ fn event_status_transition(
         "agent_plan_closed" => (None, Some("closed")),
         "agent_plan_completed" | "agent_single_phase_completed" => (None, Some("approved")),
         "agent_plan_blocked" => (None, Some("blocked")),
+        // The coordinator's own block/unblock, emitted by `wait_for_agent_ready_report`.
+        // The pre-block status is dynamic (`phase_worker_running` vs
+        // `planning_planner_running`) so it cannot be a `&'static str` here; it is
+        // carried in the event payload as `statusBefore` instead.
+        "agent_blocked" => (None, Some("blocked")),
+        "agent_unblocked" => (Some("blocked"), None),
         _ => (None, None),
     }
 }
@@ -5944,6 +6031,85 @@ mod coordinator_terminal_tests {
         assert!(p("agent_lens_review_started", Some("x"), serde_json::json!({})).is_none());
         assert!(p("agent_phase_started", Some("x"), serde_json::json!({})).is_none());
         assert!(p("planning_started", None, serde_json::json!({})).is_none());
+    }
+
+    /// A blocked agent waits for a human indefinitely. While it waits the plan must
+    /// NOT keep a `*_running` status — run `4187e055` sat at `phase_worker_running`
+    /// for three days after reporting `blocked`, so every status reader said
+    /// "running" while nothing was happening.
+    #[test]
+    fn block_flips_status_and_unblock_restores_it() {
+        use crate::db::migrations::run_migrations;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+             VALUES ('P', 'development', 't', '/w', '/p', 'claude_code', 'claude_code', 'P', 'development')",
+            [],
+        )
+        .unwrap();
+        let status = |c: &rusqlite::Connection| -> (String, String) {
+            c.query_row("SELECT status, health FROM agent_plans WHERE id='P'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+
+        update_plan_status_and_health(&conn, "P", "phase_worker_running", None).unwrap();
+
+        let previous = mark_plan_blocked_conn(&conn, "P", "needs a human").unwrap();
+        assert_eq!(previous, "phase_worker_running", "must report the pre-block status");
+        assert_eq!(status(&conn).0, "blocked", "status must stop claiming it is running");
+
+        clear_plan_blocked_conn(&conn, "P", &previous).unwrap();
+        assert_eq!(
+            status(&conn),
+            ("phase_worker_running".to_string(), health_from_status("phase_worker_running").to_string()),
+            "unblock must hand the exact previous status back so the coordinator's guarded transition still matches"
+        );
+    }
+
+    /// If a human stops the run while the agent is blocked, the agent resuming must
+    /// not resurrect it.
+    #[test]
+    fn unblock_does_not_override_a_human_stop() {
+        use crate::db::migrations::run_migrations;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+             VALUES ('P', 'development', 't', '/w', '/p', 'claude_code', 'claude_code', 'P', 'development')",
+            [],
+        )
+        .unwrap();
+        update_plan_status_and_health(&conn, "P", "phase_worker_running", None).unwrap();
+        let previous = mark_plan_blocked_conn(&conn, "P", "needs a human").unwrap();
+
+        // Human stops the run while it is blocked.
+        update_plan_status_and_health(&conn, "P", "stopped", None).unwrap();
+
+        let rows = clear_plan_blocked_conn(&conn, "P", &previous).unwrap();
+        assert_eq!(rows, 0, "guard must refuse to write when the plan is no longer blocked");
+        let (s, _) = conn
+            .query_row("SELECT status, health FROM agent_plans WHERE id='P'", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap();
+        assert_eq!(s, "stopped", "a human stop must survive the agent resuming");
+    }
+
+    #[test]
+    fn blocked_and_unblocked_events_carry_a_status_transition() {
+        // The `agent_blocked` event previously recorded None -> None, so the run
+        // timeline showed a block that changed nothing.
+        assert_eq!(
+            event_status_transition("agent_blocked", &serde_json::json!({})),
+            (None, Some("blocked"))
+        );
+        assert_eq!(
+            event_status_transition("agent_unblocked", &serde_json::json!({})),
+            (Some("blocked"), None)
+        );
     }
 
     #[test]
