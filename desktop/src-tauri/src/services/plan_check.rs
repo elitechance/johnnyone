@@ -44,6 +44,9 @@ pub const RULE_UI_TASK_FORBIDDEN: &str = "ui_task_forbidden";
 /// original overview table; added so a local-small planner that emitted no
 /// `task.yml` cannot `passed=true` into the lenses (D4).
 pub const RULE_EMPTY_PLAN: &str = "empty_plan";
+/// Park because the amendment record was unreadable. Not emitted by `check_plan`;
+/// S11 labels it from the overview table ("replan amendment unreadable").
+pub const RULE_REPLAN_AMENDMENT: &str = "replan_amendment";
 
 pub const MAX_TASKS_PER_PHASE: usize = 150;
 pub const MAX_TASKS_TOTAL: usize = 800;

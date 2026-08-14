@@ -189,6 +189,11 @@ pub fn next_episode_round(existing: Option<&TaskAmendment>) -> Result<u32, ()> {
 pub fn reset_for_resume(file: &mut TaskRunFile, specs: &[TaskSpec]) {
     let existing: HashSet<String> = file.tasks.iter().map(|t| t.id.clone()).collect();
     for task in &mut file.tasks {
+        if task.status != "done" {
+            if let Some(spec) = specs.iter().find(|s| s.id == task.id) {
+                task.depends_on = spec.depends_on.clone();
+            }
+        }
         match task.status.as_str() {
             "failed" | "blocked" => {
                 task.status = "pending".to_string();
@@ -477,6 +482,26 @@ mod tests {
             file.tasks.iter().filter(|t| t.status == "pending").count(),
             3
         );
+    }
+
+    #[test]
+    fn reset_refreshes_depends_on_from_specs() {
+        let mut file = seed_from_specs(
+            "p",
+            "00-x",
+            &[spec("01-a", &[]), spec("02-b", &["01-a"])],
+        );
+        file.tasks[0].status = "done".into();
+        file.tasks[0].commit_sha = Some("sha".into());
+        file.tasks[1].status = "failed".into();
+        file.tasks[1].route = Some("planner".into());
+        let amended = [spec("01-a", &["ghost"]), spec("02-b", &[])];
+        reset_for_resume(&mut file, &amended);
+        assert!(
+            file.tasks[0].depends_on.is_empty(),
+            "done rows keep original depends_on"
+        );
+        assert!(file.tasks[1].depends_on.is_empty());
     }
 
     #[test]

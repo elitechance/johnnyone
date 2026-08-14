@@ -134,7 +134,7 @@ pub struct WorkspaceValidation {
 }
 
 #[derive(Debug, Clone)]
-struct ReviewInsights {
+pub(crate) struct ReviewInsights {
     summary: Option<String>,
     findings: Vec<String>,
     next_steps: Vec<String>,
@@ -1987,14 +1987,40 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
         return follow_kloo_outcome(state, run, &phase, outcome).await;
     }
     // COMMERCIAL PATH — persistent worker + ready-curl + three-lens review.
-    // Do not change this branch; kloo-mode is the `if` above (D2 / D5).
-    let session_id = run
-        .plan
-        .worker_session_id
-        .clone()
-        .ok_or_else(|| "Plan has no worker session".to_string())?;
+    // Recreate the T1 session if a prior replan archived it (mixed local-small
+    // plan: later prompt-only phase).
+    let session_id = ensure_dev_worker_session(state, run).await?;
     wait_for_worker_ready(state, &session_id, &run.plan.id, Some(&phase.phase_id)).await?;
     enter_phase_review(state, &run.plan.id, &phase).await
+}
+
+async fn ensure_dev_worker_session(
+    state: &AppState,
+    run: &AgentPlanRun,
+) -> Result<String, String> {
+    if let Some(id) = run.plan.worker_session_id.clone() {
+        return Ok(id);
+    }
+    let session = sessions::create_session(
+        state,
+        CreateSessionInput {
+            provider: Some(run.plan.worker_provider.clone()),
+            model: default_model_for_provider(&run.plan.worker_provider),
+            working_directory: Some(run.plan.workspace_path.clone()),
+            title: Some(format!("T1 Worker - {}", run.plan.title)),
+            kind: Some("agent".to_string()),
+            setup_commands: None,
+            tmux_session_name: None,
+        },
+    )?;
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET worker_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![session.id, run.plan.id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    Ok(session.id)
 }
 
 async fn follow_kloo_outcome(
@@ -2107,18 +2133,18 @@ async fn park_replan_cap(
     let runs_dir = replan_runs_dir(state, run, phase_id);
     let preflight_path = runs_dir.join("preflight.json");
     let last = crate::services::plan_check::load_plan_check(&preflight_path).ok();
-    let reuse_items = reason == "replan cap reached";
+    let is_cap = reason == "replan cap reached";
     let violations = last
         .as_ref()
         .map(|r| r.items.iter().filter(|i| i.blocking).count())
         .unwrap_or(0);
-    let mut report = if reuse_items {
+    let mut report = if is_cap {
         last.unwrap_or_else(crate::services::plan_check::PlanCheckReport::empty)
     } else {
         let mut r = crate::services::plan_check::PlanCheckReport::empty();
         r.items.push(crate::services::plan_check::PlanCheckItem {
             task_id: None,
-            rule: "replan_park".to_string(),
+            rule: crate::services::plan_check::RULE_REPLAN_AMENDMENT.to_string(),
             detail: error.to_string(),
             blocking: true,
         });
@@ -2126,10 +2152,16 @@ async fn park_replan_cap(
     };
     report.passed = false;
     report.check_kind = Some(crate::services::plan_check::CHECK_KIND_REPLAN_PARK.to_string());
-    report.exhausted = Some(true);
-    report.replan_round = round.or(Some(crate::services::task_replan::MAX_REPLAN_ROUNDS));
+    report.exhausted = Some(is_cap);
+    report.replan_round = if is_cap {
+        round.or(Some(crate::services::task_replan::MAX_REPLAN_ROUNDS))
+    } else {
+        round
+    };
     std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
     crate::services::plan_check::save_plan_check(&preflight_path, &report)?;
+
+    archive_replan_planner(state, &run.plan.id).await;
 
     let nn = phase_nn(Some(phase_id));
     state.db.with_conn(|conn| {
@@ -2143,12 +2175,27 @@ async fn park_replan_cap(
         "agent_phase_preflight_failed",
         json!({
             "reason": reason,
-            "exhausted": true,
+            "exhausted": is_cap,
             "round": report.replan_round,
-            "violations": if reuse_items { violations } else { 1 },
+            "violations": if is_cap { violations } else { 1 },
             "nn": nn,
         }),
     )
+}
+
+async fn archive_replan_planner(state: &AppState, plan_id: &str) {
+    if let Ok(current) = get_plan(state, plan_id) {
+        if let Some(sid) = current.plan.worker_session_id {
+            let _ = sessions::archive_session(state, sid).await;
+        }
+    }
+    let _ = state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET worker_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+            params![plan_id],
+        )
+        .map_err(|e| e.to_string())
+    });
 }
 
 fn record_replan_spawn(ctrl: &ReplanCtrl<'_>, round: u32) {
@@ -2399,7 +2446,14 @@ pub(crate) async fn run_phase_replan_arm(
         }
     }
     let capped = crate::services::task_replan::replan_cap_reached(amendment.round);
-    report.check_kind = Some(crate::services::plan_check::CHECK_KIND_POST_REPLAN.to_string());
+    report.check_kind = Some(
+        if capped && !report.passed {
+            crate::services::plan_check::CHECK_KIND_REPLAN_PARK
+        } else {
+            crate::services::plan_check::CHECK_KIND_POST_REPLAN
+        }
+        .to_string(),
+    );
     report.replan_round = Some(amendment.round);
     report.exhausted = Some(capped && !report.passed);
     let preflight_path = runs_dir.join("preflight.json");
@@ -2423,14 +2477,10 @@ pub(crate) async fn run_phase_replan_arm(
             }
         }
         crate::services::task_replan::write_skip_preflight_marker(&runs_dir)?;
-        if let Ok(current) = get_plan(state, &run.plan.id) {
-            if let Some(sid) = current.plan.worker_session_id {
-                let _ = sessions::archive_session(state, sid).await;
-            }
-        }
+        archive_replan_planner(state, &run.plan.id).await;
         state.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE agent_plans SET status = 'phase_worker_running', worker_session_id = NULL, health = ?1, error = NULL, updated_at = datetime('now') WHERE id = ?2",
+                "UPDATE agent_plans SET status = 'phase_worker_running', health = ?1, error = NULL, updated_at = datetime('now') WHERE id = ?2",
                 params![health_from_status("phase_worker_running"), run.plan.id],
             )
             .map_err(|e| e.to_string())
@@ -2454,6 +2504,7 @@ pub(crate) async fn run_phase_replan_arm(
     )?;
 
     if capped {
+        archive_replan_planner(state, &run.plan.id).await;
         state.db.with_conn(|conn| {
             update_plan_status_and_health(
                 conn,
@@ -5275,20 +5326,21 @@ async fn handle_reviewer_output(
     }
 }
 
-async fn send_reviewer_feedback_to_worker(
+pub(crate) async fn send_reviewer_feedback_to_worker(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     reviewer_output: &str,
     review: &ReviewInsights,
 ) -> Result<(), String> {
-    let worker_session_id = run
-        .plan
-        .worker_session_id
-        .clone()
-        .ok_or_else(|| "Plan has no worker session".to_string())?;
-    let prompt = append_worker_report(run, reviewer_feedback_prompt(phase, reviewer_output));
-    terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
+    let phase_path = Path::new(&run.plan.plan_path)
+        .join("phases")
+        .join(&phase.phase_id);
+    if !crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+        let worker_session_id = ensure_dev_worker_session(state, run).await?;
+        let prompt = append_worker_report(run, reviewer_feedback_prompt(phase, reviewer_output));
+        terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
+    }
     state.db.with_conn(|conn| {
         // Review requested changes → loop back to the worker: leave the `review` stage, return to
         // `development` for the same phase (the bar reverts review → development).
@@ -11208,6 +11260,19 @@ mod replan_tests {
         assert!(replan_runs_dir(&state, &after, "00-x")
             .join("preflight.json")
             .is_file());
+        assert!(
+            after.plan.worker_session_id.is_none(),
+            "cap must archive the amend planner"
+        );
+        let pf = crate::services::plan_check::load_plan_check(
+            &replan_runs_dir(&state, &after, "00-x").join("preflight.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            pf.check_kind.as_deref(),
+            Some(crate::services::plan_check::CHECK_KIND_REPLAN_PARK)
+        );
+        assert_eq!(pf.exhausted, Some(true));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11474,6 +11539,21 @@ mod replan_tests {
         let after = get_plan(&state, &run.plan.id).unwrap();
         assert_eq!(after.plan.status, "needs_attention");
         assert!(log.lock().unwrap().is_empty());
+        assert!(after.plan.worker_session_id.is_none());
+        let pf = crate::services::plan_check::load_plan_check(
+            &replan_runs_dir(&state, &after, "00-x").join("preflight.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            pf.check_kind.as_deref(),
+            Some(crate::services::plan_check::CHECK_KIND_REPLAN_PARK)
+        );
+        assert_eq!(pf.exhausted, Some(false));
+        assert!(pf.replan_round.is_none());
+        assert_eq!(
+            pf.items[0].rule,
+            crate::services::plan_check::RULE_REPLAN_AMENDMENT
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11672,5 +11752,40 @@ mod replan_tests {
             event_summary(&cap, &p2),
             "Replan cap reached — still failing"
         );
+    }
+
+    #[tokio::test]
+    async fn kloo_needs_changes_without_worker_session_reenters_loop() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET worker_session_id = NULL, status = 'phase_review_running' WHERE id = ?1",
+                    params![run.plan.id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        assert!(run.plan.worker_session_id.is_none());
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        let review = ReviewInsights {
+            summary: Some("fix it".into()),
+            findings: vec![],
+            next_steps: vec![],
+            reason: None,
+        };
+        send_reviewer_feedback_to_worker(&state, &run, phase, "VERDICT: NEEDS_CHANGES", &review)
+            .await
+            .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "phase_worker_running");
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "agent_feedback_sent_to_worker"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

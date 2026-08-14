@@ -430,7 +430,24 @@ FINDINGS:
 NEXT_STEPS:
 - <step for T1 or none>"#;
 
-pub(crate) const DEFAULT_SMALL_MODE_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+/// Shared with `DEFAULT_SMALL_MODE_PLANNER` so the 3-round amend loop
+/// does not burn a round rediscovering the checker's grammar.
+macro_rules! small_mode_task_constraints {
+    () => {
+        r#"Each task dir must contain task.yml + prompt.md. task.yml fields (only these):
+id, files, new, verify, must_contain, depends_on, ctx, cwd
+Do not invent other fields.
+
+cwd is the directory to run verify in (e.g. desktop/src-tauri). When cwd is set, every files[] and new: path is still workspace-relative and must live under that cwd (files_outside_cwd otherwise).
+
+verify must be an allowlisted AND scoped argv command: cargo test with a filter (bare `cargo test` is verify_not_allowlisted), npx vitest|jest run + a file, go test + a package that is not ./..., python -m pytest + a file, node + a test file. Do not schedule UI tasks: no .html/.scss/.css in files[]. The checker rejects UI tasks as ui_task_forbidden.
+
+No two tasks in a phase may claim the same file (file_collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward."#
+    };
+}
+
+pub(crate) const DEFAULT_SMALL_MODE_PLANNER: &str = concat!(
+r#"JOHNNYONE_RUN_ID: {{run_id}}
 ROLE: T1_PLANNER (LOCAL-SMALL)
 
 Workspace root: {{workspace_path}}
@@ -448,15 +465,8 @@ Reference paths:
 
 Emit a methodology-compliant plan that a mechanical plan-check can execute. Every phase must contain at least one task.yml dir; a plan with none is rule empty_plan.
 
-Each task dir must contain task.yml + prompt.md. task.yml fields (only these):
-id, files, new, verify, must_contain, depends_on, ctx, cwd
-Do not invent other fields.
-
-cwd is the directory to run verify in (e.g. desktop/src-tauri). When cwd is set, every files[] and new: path is still workspace-relative and must live under that cwd (files_outside_cwd otherwise).
-
-verify must be an allowlisted AND scoped argv command: cargo test with a filter (bare `cargo test` is verify_not_allowlisted), npx vitest|jest run + a file, go test + a package that is not ./..., python -m pytest + a file, node + a test file. Do not schedule UI tasks: no .html/.scss/.css in files[]. The checker rejects UI tasks as ui_task_forbidden.
-
-No two tasks in a phase may claim the same file (file_collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward.
+"#
+    , small_mode_task_constraints!(), r#"
 
 D12 sizing: at most 150 tasks per phase (MAX_TASKS_PER_PHASE) and 800 tasks total (MAX_TASKS_TOTAL). Keep each task small enough for the leaf executor. Do not write tasks.json. Do not self-claim done.
 
@@ -465,7 +475,8 @@ phase overview task table is id and one-line goal only — no files[] / verify /
 
 When the plan is ready for review, say exactly:
 
-READY_FOR_T2_PLAN_REVIEW"#;
+READY_FOR_T2_PLAN_REVIEW"#
+);
 
 pub(crate) const DEFAULT_SMALL_MODE_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
 ROLE: T2_PLAN_REVIEWER (LOCAL-SMALL)
@@ -495,7 +506,8 @@ pub(crate) const DEFAULT_SMALL_MODE_LEAF_WRAPPER: &str = r#"You are a leaf execu
 Do not touch status.yml or tasks.json. Do not rewrite the plan store.
 Stop when verify passes. Do not add extra files or drive-by refactors."#;
 
-pub(crate) const DEFAULT_SMALL_MODE_AMEND_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+pub(crate) const DEFAULT_SMALL_MODE_AMEND_PLANNER: &str = concat!(
+    r#"JOHNNYONE_RUN_ID: {{run_id}}
 ROLE: T1_PLANNER (LOCAL-SMALL AMEND)
 
 Workspace root: {{workspace_path}}
@@ -504,7 +516,12 @@ Existing plan at: {{plan_output_path}}
 This is a mid-phase replan. Read amendment.json. Fix or split failed tasks only.
 Do not rewrite done task dirs. Do not drop commits. Do not invent mock fields.
 
-When ready, say READY_FOR_T2_PLAN_REVIEW"#;
+"#,
+    small_mode_task_constraints!(),
+    r#"
+
+When ready, say READY_FOR_T2_PLAN_REVIEW"#
+);
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +569,11 @@ planning:
         assert!(p.contains("never point forward"));
         assert!(p.contains("MAX_TASKS_PER_PHASE"));
         assert!(p.contains("MAX_TASKS_TOTAL"));
+        let a = DEFAULT_SMALL_MODE_AMEND_PLANNER;
+        assert!(a.contains("file_collision"));
+        assert!(a.contains("must_contain"));
+        assert!(a.contains("verify_not_allowlisted"));
+        assert!(a.contains("ui_task_forbidden"));
         let taught = p.split("task.yml fields").nth(1).unwrap_or(p);
         assert!(
             !taught.contains("mock:"),
