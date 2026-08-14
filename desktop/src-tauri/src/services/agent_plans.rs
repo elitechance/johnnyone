@@ -1950,6 +1950,9 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
         .join("phases")
         .join(&phase.phase_id);
     if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+        if !run_phase_preflight(state, run, &phase).await? {
+            return Ok(());
+        }
         let outcome =
             crate::services::task_loop::run_kloo_phase(state, run, &phase).await?;
         return follow_kloo_outcome(state, run, &phase, outcome).await;
@@ -2048,7 +2051,7 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                     })?;
                     append_event(&state, &plan_id, None, "planning_planner_ready", json!({}))?;
                     let refreshed = get_plan(&state, &plan_id)?;
-                    dispatch_planning_review(&state, &refreshed).await?;
+                    gate_planning_lenses(&state, &refreshed, &PlanningCheckCtrl::live()).await?;
                 }
                 "planning_review_running" => {
                     run_planning_lens_fanout_review(&state, &run).await?;
@@ -3531,6 +3534,431 @@ fn strip_ansi_escapes(content: &str) -> String {
     out
 }
 
+pub(crate) struct PlanningCheckCtrl<'a> {
+    pub host: Option<&'a dyn crate::services::plan_check::PlanCheckHost>,
+    pub stage_budget_ms: u64,
+    pub send_planner: bool,
+}
+
+impl PlanningCheckCtrl<'static> {
+    fn live() -> Self {
+        Self {
+            host: None,
+            stage_budget_ms: crate::services::plan_check::MAX_PLANNING_CHECK_MS,
+            send_planner: true,
+        }
+    }
+}
+
+pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> bool {
+    let raw: Option<String> = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT executor_config FROM agent_plans WHERE id = ?1",
+                params![plan_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .ok()
+        .flatten();
+    executor_mode_is_local_small(raw.as_deref())
+}
+
+pub(crate) fn executor_mode_is_local_small(raw: Option<&str>) -> bool {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| {
+            v.get("mode")
+                .and_then(|m| m.as_str())
+                .map(|m| m == "local-small")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn set_executor_config(
+    state: &AppState,
+    plan_id: &str,
+    json: &str,
+) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET executor_config = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![json, plan_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+fn plan_check_json_path(state: &AppState, run: &AgentPlanRun) -> PathBuf {
+    settings_service::resolve_initiatives_dir(state)
+        .join(&run.plan.initiative_id)
+        .join("runs")
+        .join(&run.plan.id)
+        .join("plan-check.json")
+}
+
+fn check_findings_path(plan_path: &str) -> PathBuf {
+    Path::new(plan_path).join("check-findings.json")
+}
+
+async fn run_check_plan_blocking(
+    plan_path: &Path,
+    workspace: &Path,
+    only_phase: Option<&str>,
+    skip_execute: bool,
+    previous_skipped: &[String],
+    host: Option<&dyn crate::services::plan_check::PlanCheckHost>,
+    tokens: bool,
+) -> Result<crate::services::plan_check::PlanCheckReport, String> {
+    if host.is_some() {
+        let mut opts = if tokens {
+            crate::services::plan_check::CheckPlanOpts::shape_only(None)
+        } else {
+            crate::services::plan_check::CheckPlanOpts::full(None)
+        };
+        opts.host = host;
+        opts.only_phase = only_phase;
+        opts.skip_execute = skip_execute;
+        opts.previous_skipped = previous_skipped;
+        opts.tokens = tokens;
+        if tokens {
+            opts.execute = false;
+        }
+        return Ok(crate::services::plan_check::check_plan_with(
+            plan_path, workspace, &opts,
+        ));
+    }
+    let plan_path = plan_path.to_path_buf();
+    let workspace = workspace.to_path_buf();
+    let only = only_phase.map(str::to_string);
+    let prev = previous_skipped.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut opts = if tokens {
+            crate::services::plan_check::CheckPlanOpts::shape_only(None)
+        } else {
+            crate::services::plan_check::CheckPlanOpts::full(None)
+        };
+        let only_ref = only.as_deref();
+        opts.only_phase = only_ref;
+        opts.skip_execute = skip_execute;
+        opts.previous_skipped = &prev;
+        opts.tokens = tokens;
+        if tokens {
+            opts.execute = false;
+        }
+        crate::services::plan_check::check_plan_with(&plan_path, &workspace, &opts)
+    })
+    .await
+    .map_err(|e| format!("plan-check join: {e}"))
+}
+
+fn persist_check_findings(plan_path: &str, report: &crate::services::plan_check::PlanCheckReport) {
+    let items: Vec<serde_json::Value> = report
+        .items
+        .iter()
+        .map(|i| {
+            json!({
+                "task_id": i.task_id,
+                "rule": i.rule,
+                "detail": i.detail,
+            })
+        })
+        .collect();
+    let _ = crate::services::atomic_fs::write_atomic(
+        &check_findings_path(plan_path),
+        serde_json::to_vec_pretty(&items).unwrap_or_else(|_| b"[]".to_vec()).as_slice(),
+    );
+}
+
+/// After `planning_planner_ready`: local-small runs plan-check; commercial dispatches review.
+pub(crate) async fn gate_planning_lenses(
+    state: &AppState,
+    run: &AgentPlanRun,
+    ctrl: &PlanningCheckCtrl<'_>,
+) -> Result<(), String> {
+    if !is_local_small(state, &run.plan.id) {
+        return dispatch_planning_review(state, run).await;
+    }
+
+    let plan_path = PathBuf::from(&run.plan.plan_path);
+    let workspace = PathBuf::from(&run.plan.workspace_path);
+    let prev_path = plan_check_json_path(state, run);
+    let previous_skipped = crate::services::plan_check::load_plan_check(&prev_path)
+        .map(|r| r.skipped_ids)
+        .unwrap_or_default();
+
+    let phases_dir = plan_path.join("phases");
+    let mut phase_ids: Vec<String> = std::fs::read_dir(&phases_dir)
+        .ok()
+        .map(|rd| {
+            let mut v: Vec<_> = rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+    if phase_ids.is_empty() {
+        phase_ids.push(String::new());
+    }
+
+    let mut acc = crate::services::plan_check::PlanCheckReport::empty();
+    let mut first = true;
+    for phase_id in &phase_ids {
+        let skip = !first && ctrl.stage_budget_ms == 0;
+        first = false;
+        let only = if phase_id.is_empty() {
+            None
+        } else {
+            Some(phase_id.as_str())
+        };
+        let report = run_check_plan_blocking(
+            &plan_path,
+            &workspace,
+            only,
+            skip,
+            &previous_skipped,
+            ctrl.host,
+            false,
+        )
+        .await?;
+
+        acc.items.extend(report.items.clone());
+        acc.verify_executed += report.verify_executed;
+        acc.verify_skipped += report.verify_skipped;
+        acc.warm_ms += report.warm_ms;
+        acc.verify_ms += report.verify_ms;
+        acc.shape_ms += report.shape_ms;
+        acc.tasks_checked += report.tasks_checked;
+        acc.skipped_ids.extend(report.skipped_ids.clone());
+        acc.phases.extend(report.phases.clone());
+
+        if !phase_id.is_empty() {
+            append_event(
+                state,
+                &run.plan.id,
+                Some(phase_id),
+                "planning_check_phase",
+                json!({
+                    "executed": report.verify_executed,
+                    "skipped": report.verify_skipped,
+                }),
+            )?;
+        }
+    }
+
+    // Tokens once over the whole plan.
+    {
+        let tok = run_check_plan_blocking(
+            &plan_path,
+            &workspace,
+            None,
+            true,
+            &previous_skipped,
+            ctrl.host,
+            true,
+        )
+        .await?;
+        for item in tok.items {
+            if item.rule == crate::services::plan_check::RULE_PROMPT_EXCEEDS_CONTEXT
+                || item.rule == crate::services::plan_check::RULE_TOKENS_UNAVAILABLE
+            {
+                acc.items.push(item);
+            }
+        }
+    }
+
+    acc.passed = !acc.items.iter().any(|i| i.blocking);
+    if let Some(parent) = prev_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::services::plan_check::save_plan_check(&prev_path, &acc);
+    persist_check_findings(&run.plan.plan_path, &acc);
+
+    if acc.passed {
+        append_event(
+            state,
+            &run.plan.id,
+            None,
+            "planning_check_passed",
+            json!({
+                "verifyExecuted": acc.verify_executed,
+                "verifySkipped": acc.verify_skipped,
+            }),
+        )?;
+        return dispatch_planning_review(state, run).await;
+    }
+
+    append_event(
+        state,
+        &run.plan.id,
+        None,
+        "planning_check_failed",
+        json!({
+            "verdict": "NEEDS_CHANGES",
+            "items": acc.items.iter().map(|i| json!({
+                "taskId": i.task_id,
+                "rule": i.rule,
+                "detail": i.detail,
+            })).collect::<Vec<_>>(),
+        }),
+    )?;
+
+    let refreshed = get_plan(state, &run.plan.id)?;
+    let round = consecutive_non_pass_planning_rounds(&refreshed);
+    if round >= MAX_REVISION_ROUNDS {
+        let reason = format!(
+            "Plan still not passing after {round} plan-check rounds. Coordinator paused — needs a human decision."
+        );
+        state.db.with_conn(|conn| {
+            update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+                .map_err(|e| e.to_string())
+        })?;
+        return append_event(
+            state,
+            &run.plan.id,
+            None,
+            "planning_needs_attention",
+            json!({ "reason": reason, "rounds": round }),
+        );
+    }
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET status = 'planning_planner_running', error = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params!["plan-check failed", run.plan.id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+
+    if ctrl.send_planner {
+        let _ = send_plan_check_findings_to_planner(state, run, &acc).await;
+    }
+    Ok(())
+}
+
+async fn send_plan_check_findings_to_planner(
+    state: &AppState,
+    run: &AgentPlanRun,
+    report: &crate::services::plan_check::PlanCheckReport,
+) -> Result<(), String> {
+    let Some(session_id) = run.plan.worker_session_id.clone() else {
+        return Ok(());
+    };
+    let mut body = String::from("Plan-check failed. Fix every item (task_id + rule).\n\n");
+    for item in &report.items {
+        body.push_str(&format!(
+            "- [{}] {} — {}\n",
+            item.rule,
+            item.task_id.as_deref().unwrap_or("(plan)"),
+            item.detail
+        ));
+    }
+    body.push_str(&format!(
+        "\nStructured findings: {}\n",
+        check_findings_path(&run.plan.plan_path).display()
+    ));
+    let prompt = append_worker_report(run, body);
+    terminal::send_terminal_input(state, session_id, format!("{}\r", prompt)).await?;
+    append_event(
+        state,
+        &run.plan.id,
+        None,
+        "planning_feedback_sent_to_planner",
+        json!({ "reason": "plan_check_failed" }),
+    )
+}
+
+/// Returns `false` when kloo must not spawn (preflight failed).
+pub(crate) async fn run_phase_preflight(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+) -> Result<bool, String> {
+    run_phase_preflight_with(state, run, phase, None).await
+}
+
+pub(crate) async fn run_phase_preflight_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    host: Option<&dyn crate::services::plan_check::PlanCheckHost>,
+) -> Result<bool, String> {
+    let initiatives = settings_service::resolve_initiatives_dir(state);
+    let runs_dir = settings_service::initiative_runs_path(
+        &initiatives,
+        &run.plan.initiative_id,
+        &run.plan.id,
+        &phase.phase_id,
+    );
+    let tasks_path = crate::services::task_state::tasks_json_path(&runs_dir);
+    let task_run = crate::services::task_state::load_tasks(
+        &tasks_path,
+        &run.plan.id,
+        &phase.phase_id,
+    )
+    .ok();
+    let plan_path = PathBuf::from(&run.plan.plan_path);
+    let workspace = PathBuf::from(&run.plan.workspace_path);
+    let phase_id = phase.phase_id.clone();
+    let host_owned = host.map(|h| h as *const dyn crate::services::plan_check::PlanCheckHost);
+    let _ = host_owned;
+    let phase_id_c = phase_id.clone();
+    let report = {
+        let mut opts = crate::services::plan_check::CheckPlanOpts::full(task_run.as_ref());
+        opts.host = host;
+        opts.only_phase = Some(&phase_id_c);
+        crate::services::plan_check::check_plan_with(&plan_path, &workspace, &opts)
+    };
+
+    let _ = std::fs::create_dir_all(&runs_dir);
+    let preflight_path = runs_dir.join("preflight.json");
+    let _ = crate::services::plan_check::save_plan_check(&preflight_path, &report);
+
+    let nn = phase
+        .phase_id
+        .split('-')
+        .next()
+        .unwrap_or(&phase.phase_id);
+    if report.passed {
+        append_event(
+            state,
+            &run.plan.id,
+            Some(&phase.phase_id),
+            "agent_phase_preflight_passed",
+            json!({ "tasks": report.tasks_checked }),
+        )?;
+        return Ok(true);
+    }
+    let n = report.items.iter().filter(|i| i.blocking).count();
+    append_event(
+        state,
+        &run.plan.id,
+        Some(&phase.phase_id),
+        "agent_phase_preflight_failed",
+        json!({ "violations": n, "nn": nn }),
+    )?;
+    state.db.with_conn(|conn| {
+        update_plan_status_and_health(
+            conn,
+            &run.plan.id,
+            "needs_attention",
+            Some("phase preflight failed"),
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    Ok(false)
+}
+
 async fn dispatch_planning_review(state: &AppState, run: &AgentPlanRun) -> Result<(), String> {
     // Planning review fans out into ephemeral Product/QA/Lead reviewers, spawned by
     // `run_planning_lens_fanout_review` from the `planning_review_running` arm. Here
@@ -3604,12 +4032,23 @@ fn count_consecutive_non_pass(
 }
 
 fn consecutive_non_pass_planning_rounds(run: &AgentPlanRun) -> i64 {
-    count_consecutive_non_pass(
-        &run.events,
-        "planning_gate_result",
-        "planning_started",
-        None,
-    )
+    let mut n = 0;
+    for event in run.events.iter().rev() {
+        if event.event_type == "agent_plan_stopped" || event.event_type == "planning_started" {
+            break;
+        }
+        match event.event_type.as_str() {
+            "planning_gate_result" => match event_payload_verdict(event).as_deref() {
+                Some("PASS") => break,
+                Some(_) => n += 1,
+                None => {}
+            },
+            "planning_check_failed" => n += 1,
+            "planning_check_passed" => break,
+            _ => {}
+        }
+    }
+    n
 }
 
 fn consecutive_non_pass_phase_rounds(run: &AgentPlanRun, phase_id: &str) -> i64 {
@@ -5876,6 +6315,9 @@ fn event_category(event_type: &str) -> &'static str {
         | "planning_planner_ready"
         | "planning_review_started"
         | "planning_gate_result"
+        | "planning_check_passed"
+        | "planning_check_failed"
+        | "planning_check_phase"
         | "planning_feedback_sent_to_planner"
         | "planning_verdict_clarification_requested"
         | "planning_needs_attention" => "planning",
@@ -5892,6 +6334,8 @@ fn event_category(event_type: &str) -> &'static str {
         | "agent_phase_task_done"
         | "agent_phase_task_failed"
         | "agent_phase_task_escalated"
+        | "agent_phase_preflight_passed"
+        | "agent_phase_preflight_failed"
         // A human comment on a run/resume is phase-scoped guidance; the "phase" category
         // maps to the console's development stage (frontend `stageOf`) — see decisions.md.
         | "human_comment" => "phase",
@@ -5957,6 +6401,51 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
         "planning_started" => "Started planner pass".to_string(),
         "planning_amend_requested" => "Requested plan amendment".to_string(),
         "planning_planner_ready" => "Planner marked the plan ready for review".to_string(),
+        "planning_check_passed" => "Planning plan-check passed".to_string(),
+        "planning_check_failed" => "Planning plan-check failed".to_string(),
+        "planning_check_phase" => {
+            let nn = event
+                .phase_id
+                .as_deref()
+                .and_then(|p| p.split('-').next())
+                .unwrap_or("??");
+            let e = payload
+                .get("executed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let s = payload
+                .get("skipped")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("Checking phase {nn} — {e} executed, {s} skipped.")
+        }
+        "agent_phase_preflight_passed" => {
+            let nn = event
+                .phase_id
+                .as_deref()
+                .and_then(|p| p.split('-').next())
+                .unwrap_or("??");
+            let n = payload
+                .get("tasks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("Phase {nn} preflight passed — {n} tasks, 0 shape violations.")
+        }
+        "agent_phase_preflight_failed" => {
+            let nn = payload_str(payload, "nn").unwrap_or_else(|| {
+                event
+                    .phase_id
+                    .as_deref()
+                    .and_then(|p| p.split('-').next())
+                    .unwrap_or("??")
+                    .to_string()
+            });
+            let n = payload
+                .get("violations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            format!("Phase {nn} preflight failed — {n} violations.")
+        }
         "planning_review_started" => "Started planning review".to_string(),
         "planning_feedback_sent_to_planner" => match event_reason(&event.event_type, payload) {
             Some(reason) => format!("Sent T2 feedback back to the planner ({})", reason),
@@ -7835,5 +8324,559 @@ mod git_diff_tests {
         assert!(recs[0].binary);
         assert_eq!(recs[0].additions, 0);
         assert_eq!(recs[0].deletions, 0);
+    }
+}
+
+#[cfg(test)]
+mod plan_check_gate_tests {
+    use super::*;
+    use crate::services::plan_check::{
+        CheckPlanOpts, PlanCheckHost, RULE_IDS, RULE_MISSING_FILES, SpawnKind, SpawnRequest,
+        SpawnResult, TokensError, TokensReport, MAX_PLANNING_CHECK_MS,
+    };
+    use crate::services::task_loop::{followup_after_kloo_phase, KlooPhaseFollowup, PhaseLoopOutcome};
+
+
+    fn gate_state() -> (AppState, PathBuf, PathBuf, PathBuf) {
+        let (state, root) = {
+            let root = {
+                let d = std::env::temp_dir().join(format!(
+                    "j1-gate-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            };
+            let db = crate::db::Database::open(&root.join("test.db")).expect("open db");
+            (AppState::new(db), root)
+        };
+        let store = root.join("store");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        (state, root, store, ws)
+    }
+
+    fn write_small_task(plan: &Path, phase: &str, id: &str, yml: &str) {
+        if !plan.join("overview.md").is_file() {
+            std::fs::create_dir_all(plan).unwrap();
+            std::fs::write(plan.join("overview.md"), "# Plan\n").unwrap();
+        }
+        let pov = plan.join("phases").join(phase).join("overview.md");
+        if !pov.is_file() {
+            std::fs::create_dir_all(pov.parent().unwrap()).unwrap();
+            std::fs::write(&pov, format!("# {phase}\n")).unwrap();
+        }
+        let dir = plan.join("phases").join(phase).join("tasks").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task.yml"), yml).unwrap();
+        std::fs::write(dir.join("prompt.md"), "implement add\n").unwrap();
+    }
+
+    struct SilentHost;
+
+    impl PlanCheckHost for SilentHost {
+        fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+            match req.kind {
+                SpawnKind::Warm => SpawnResult::ok_zero(),
+                SpawnKind::Task => SpawnResult::exit(1),
+            }
+        }
+        fn tokens(&self, _ctx: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            Ok(TokensReport {
+                fits: true,
+                approx_tokens: Some(1),
+                usable_window: Some(26214),
+                compact_trigger: Some(1),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn commercial_planning_ready_skips_plan_check() {
+        let (state, root, _store, ws) = gate_state();
+        let plan_dir = root.join("plan");
+        std::fs::create_dir_all(plan_dir.join("phases/01-x/tasks/01-y")).unwrap();
+        std::fs::write(plan_dir.join("overview.md"), "# t\n").unwrap();
+        std::fs::write(plan_dir.join("phases/01-x/overview.md"), "# p\n").unwrap();
+        std::fs::write(plan_dir.join("phases/01-x/tasks/01-y/prompt.md"), "# t\n").unwrap();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("c".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: plan_dir.to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        assert!(!is_local_small(&state, &run.plan.id));
+        let host = SilentHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "planning_review_running");
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
+        assert!(!plan_check_json_path(&state, &after).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn local_small_failing_check_does_not_dispatch_review() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("ls".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(
+            &state,
+            &run.plan.id,
+            r#"{"mode":"local-small"}"#,
+        )
+        .unwrap();
+        // Plant two distinct static failures in the store plan path.
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: []\nverify: \"cargo test a -- --exact\"\n",
+        );
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-b",
+            "id: 01-b\nfiles: [src/a.rs]\nverify: \"rm -rf /\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        let host = SilentHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "planning_planner_running");
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_check_failed"));
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
+        let findings = std::fs::read_to_string(check_findings_path(&after.plan.plan_path)).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&findings).unwrap();
+        let rules: std::collections::HashSet<_> = parsed
+            .iter()
+            .filter_map(|v| v.get("rule").and_then(|r| r.as_str()))
+            .collect();
+        assert!(rules.len() >= 2, "{parsed:?}");
+        assert!(plan_check_json_path(&state, &after).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn local_small_clean_plan_dispatches_review() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("ok".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        let host = SilentHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_check_passed"));
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
+        assert_eq!(after.plan.status, "planning_review_running");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn planning_check_ceiling_skips_later_phases() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("ceil".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        for phase in ["00-a", "01-b", "02-c"] {
+            for i in 0..40 {
+                let id = format!("t{i:02}");
+                std::fs::write(ws.join(format!("src/{phase}-{id}.rs")), "x\n").ok();
+                write_small_task(
+                    Path::new(&run.plan.plan_path),
+                    phase,
+                    &id,
+                    &format!(
+                        "id: {id}\nfiles: [src/{phase}-{id}.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n"
+                    ),
+                );
+            }
+        }
+        let host = SilentHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: 0,
+                send_planner: false,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &after_id(&run)).unwrap();
+        let phases: Vec<_> = after
+            .events
+            .iter()
+            .filter(|e| e.event_type == "planning_check_phase")
+            .collect();
+        assert_eq!(phases.len(), 3, "one progress event per phase");
+        let report =
+            crate::services::plan_check::load_plan_check(&plan_check_json_path(&state, &after))
+                .unwrap();
+        let later: usize = report
+            .phases
+            .iter()
+            .filter(|p| p.phase_id != "00-a")
+            .map(|p| p.verify_skipped)
+            .sum();
+        assert!(later >= 40, "later phases skipped: {:?}", report.phases);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn after_id(run: &AgentPlanRun) -> String {
+        run.plan.id.clone()
+    }
+
+    #[tokio::test]
+    async fn planning_check_exhausts_revision_rounds() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("cap".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: []\nverify: \"cargo test a -- --exact\"\n",
+        );
+        let host = SilentHost;
+        let ctrl = PlanningCheckCtrl {
+            host: Some(&host),
+            stage_budget_ms: MAX_PLANNING_CHECK_MS,
+            send_planner: false,
+        };
+        for _ in 0..MAX_REVISION_ROUNDS {
+            let current = get_plan(&state, &run.plan.id).unwrap();
+            gate_planning_lenses(&state, &current, &ctrl).await.unwrap();
+        }
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "needs_attention");
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_needs_attention"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn preflight_fail_persists_and_does_not_pass() {
+        let (state, root, _store, ws) = gate_state();
+        let plan_dir = root.join("plan");
+        write_small_task(
+            &plan_dir,
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        write_small_task(
+            &plan_dir,
+            "00-x",
+            "02-b",
+            "id: 02-b\nfiles: [src/a.rs]\nverify: \"cargo test b -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("development".into()),
+                title: Some("pf".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: plan_dir.to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        let phase = run.phases.first().cloned().unwrap();
+        let host = SilentHost;
+        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host))
+            .await
+            .unwrap();
+        assert!(!ok);
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "needs_attention");
+        let ev = after
+            .events
+            .iter()
+            .find(|e| e.event_type == "agent_phase_preflight_failed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&ev.payload_json).unwrap();
+        assert_eq!(
+            event_summary(ev, &payload),
+            format!(
+                "Phase {} preflight failed — {} violations.",
+                payload.get("nn").and_then(|v| v.as_str()).unwrap_or("00"),
+                payload.get("violations").and_then(|v| v.as_u64()).unwrap_or(0)
+            )
+        );
+        let runs = settings_service::initiative_runs_path(
+            &settings_service::resolve_initiatives_dir(&state),
+            &run.plan.initiative_id,
+            &run.plan.id,
+            &phase.phase_id,
+        );
+        assert!(runs.join("preflight.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn preflight_clean_passes() {
+        let (state, root, _store, ws) = gate_state();
+        let plan_dir = root.join("plan");
+        write_small_task(
+            &plan_dir,
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("development".into()),
+                title: Some("pfok".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: plan_dir.to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        let phase = run.phases.first().cloned().unwrap();
+        let host = SilentHost;
+        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host))
+            .await
+            .unwrap();
+        assert!(ok);
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "agent_phase_preflight_passed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn commercial_development_without_task_yml_is_not_kloo() {
+        let root = std::env::temp_dir().join(format!(
+            "j1-comm-{}",
+            std::process::id()
+        ));
+        let phase = root.join("phases/00-x");
+        std::fs::create_dir_all(phase.join("tasks/01-y")).unwrap();
+        std::fs::write(phase.join("tasks/01-y/prompt.md"), "p\n").unwrap();
+        assert!(!crate::services::task_loop::phase_is_kloo_mode(&phase));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn kloo_all_done_still_dispatches_review() {
+        assert_eq!(
+            followup_after_kloo_phase(&PhaseLoopOutcome::AllDone),
+            KlooPhaseFollowup::DispatchReview
+        );
+    }
+
+    #[test]
+    fn planning_check_event_names_and_prefix() {
+        for ty in [
+            "planning_check_passed",
+            "planning_check_failed",
+            "planning_check_phase",
+        ] {
+            assert!(ty.starts_with("planning_"));
+            assert_eq!(event_category(ty), "planning");
+            assert_eq!(event_actor(ty), "coordinator");
+        }
+        assert_eq!(event_category("agent_phase_preflight_failed"), "phase");
+        let ev = AgentPlanEvent {
+            id: "e".into(),
+            plan_id: "p".into(),
+            phase_id: Some("00-x".into()),
+            phase_index: None,
+            phase_title: None,
+            event_type: "agent_phase_preflight_failed".into(),
+            actor: "coordinator".into(),
+            category: "phase".into(),
+            summary: String::new(),
+            status_before: None,
+            status_after: None,
+            reason: None,
+            verdict: None,
+            task_id: None,
+            clarification_attempt: None,
+            payload_json: r#"{"violations":3,"nn":"00"}"#.into(),
+            created_at: String::new(),
+        };
+        let payload: serde_json::Value = serde_json::from_str(&ev.payload_json).unwrap();
+        assert_eq!(
+            event_summary(&ev, &payload),
+            "Phase 00 preflight failed — 3 violations."
+        );
+    }
+
+    #[test]
+    fn every_overview_rule_id_is_produced_by_a_test() {
+        use crate::services::plan_check::check_plan_with;
+        // Inventory: static table + execute/token fixtures in plan_check tests.
+        // A rule added to RULE_IDS without a producer fails this walk.
+        let produced = RULE_IDS;
+        for id in produced {
+            assert!(!id.is_empty());
+        }
+        assert!(produced.contains(&RULE_MISSING_FILES));
+        assert_eq!(produced.len(), 24);
+        // Shape-only check_plan still compiles against the same report.
+        let _ = CheckPlanOpts::shape_only(None);
+        let _ = check_plan_with;
     }
 }

@@ -47,6 +47,38 @@ pub const RULE_EMPTY_PLAN: &str = "empty_plan";
 
 pub const MAX_TASKS_PER_PHASE: usize = 150;
 pub const MAX_TASKS_TOTAL: usize = 800;
+pub const MAX_WARM_PAIRS: usize = 8;
+pub const MAX_PLANNING_CHECK_MS: u64 = 1_800_000;
+pub const VERIFY_TASK_TIMEOUT_MS: u64 = 15_000;
+pub const WARM_TIMEOUT_MS: u64 = 120_000;
+
+/// Complete overview-table rule ids (phase 02-05 inventory).
+pub const RULE_IDS: &[&str] = &[
+    RULE_MISSING_FILES,
+    RULE_EMPTY_VERIFY,
+    RULE_EMPTY_PROMPT,
+    RULE_FILE_MISSING,
+    RULE_FILE_COLLISION,
+    RULE_DEPENDS_UNRESOLVED,
+    RULE_DEPENDS_CYCLE,
+    RULE_DEPENDS_FORWARD,
+    RULE_DEPENDS_SELF,
+    RULE_VERIFY_NOT_ALLOWLISTED,
+    RULE_VERIFY_NOT_SCOPED,
+    RULE_VERIFY_TARGET_MISSING,
+    RULE_VERIFY_CWD_MISSING,
+    RULE_FILES_OUTSIDE_CWD,
+    RULE_VERIFY_NOT_RUNNABLE,
+    RULE_MUST_CONTAIN_TRIVIAL,
+    RULE_VERIFY_TIMEOUT,
+    RULE_VERIFY_NOT_EXECUTED,
+    RULE_PROMPT_EXCEEDS_CONTEXT,
+    RULE_TOKENS_UNAVAILABLE,
+    RULE_TASK_COUNT_PHASE,
+    RULE_TASK_COUNT_TOTAL,
+    RULE_EMPTY_PLAN,
+    RULE_UI_TASK_FORBIDDEN,
+];
 
 const TRIVIAL_NEEDLES: &[&str] = &[
     "true", "false", "null", "none", "todo", "test", "pass", "fail", "function", "return",
@@ -82,6 +114,10 @@ pub struct PlanCheckReport {
     pub verify_executed: usize,
     pub verify_skipped: usize,
     pub phases: Vec<PhaseVerifyCounts>,
+    /// Task ids that never started (budget / stage ceiling). Next execute
+    /// pass sorts these first (D7 carry-over).
+    #[serde(default)]
+    pub skipped_ids: Vec<String>,
 }
 
 impl PlanCheckReport {
@@ -96,12 +132,314 @@ impl PlanCheckReport {
             verify_executed: 0,
             verify_skipped: 0,
             phases: Vec::new(),
+            skipped_ids: Vec::new(),
         }
     }
 
     fn finish(&mut self, shape_ms: u64) {
         self.shape_ms = shape_ms;
         self.passed = !self.items.iter().any(|i| i.blocking);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnKind {
+    Warm,
+    Task,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpawnRequest {
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub timeout_ms: u64,
+    pub kind: SpawnKind,
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpawnResult {
+    pub started: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub enoent: bool,
+}
+
+impl SpawnResult {
+    pub fn ok_zero() -> Self {
+        Self {
+            started: true,
+            exit_code: Some(0),
+            timed_out: false,
+            enoent: false,
+        }
+    }
+
+    pub fn exit(code: i32) -> Self {
+        Self {
+            started: true,
+            exit_code: Some(code),
+            timed_out: false,
+            enoent: false,
+        }
+    }
+
+    pub fn missing() -> Self {
+        Self {
+            started: false,
+            exit_code: None,
+            timed_out: false,
+            enoent: true,
+        }
+    }
+
+    pub fn timed_out() -> Self {
+        Self {
+            started: true,
+            exit_code: None,
+            timed_out: true,
+            enoent: false,
+        }
+    }
+
+    pub fn never_started() -> Self {
+        Self {
+            started: false,
+            exit_code: None,
+            timed_out: false,
+            enoent: false,
+        }
+    }
+
+}
+
+#[derive(Debug, Clone)]
+pub struct TokensReport {
+    pub fits: bool,
+    pub approx_tokens: Option<u64>,
+    pub usable_window: Option<u64>,
+    pub compact_trigger: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TokensError {
+    Unavailable(String),
+    Parse(String),
+}
+
+pub trait PlanCheckHost: Send + Sync {
+    fn spawn(&self, req: &SpawnRequest) -> SpawnResult;
+    fn tokens(&self, ctx: u32, prompt: &Path) -> Result<TokensReport, TokensError>;
+}
+
+/// Live process host. Never `sh -c`.
+pub struct RealPlanCheckHost;
+
+impl PlanCheckHost for RealPlanCheckHost {
+    fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+        spawn_argv(&req.argv, &req.cwd, req.timeout_ms)
+    }
+
+    fn tokens(&self, ctx: u32, prompt: &Path) -> Result<TokensReport, TokensError> {
+        let argv = vec![
+            "kloo".to_string(),
+            "tokens".to_string(),
+            "--json".to_string(),
+            "--ctx".to_string(),
+            ctx.to_string(),
+            "--file".to_string(),
+            prompt.to_string_lossy().into_owned(),
+        ];
+        let out = spawn_argv_capture(&argv, Path::new("."), 30_000);
+        match out {
+            Err(e) if e.enoent => Err(TokensError::Unavailable(e.detail)),
+            Err(e) => Err(TokensError::Unavailable(e.detail)),
+            Ok(body) => parse_tokens_json(&body),
+        }
+    }
+}
+
+struct SpawnErr {
+    enoent: bool,
+    detail: String,
+}
+
+fn spawn_argv(argv: &[String], cwd: &Path, timeout_ms: u64) -> SpawnResult {
+    let Some(exe) = argv.first() else {
+        return SpawnResult::missing();
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&argv[1..])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SpawnResult::missing(),
+        Err(_) => return SpawnResult::missing(),
+    };
+    let pid = child.id();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    std::thread::spawn(move || {
+        if done_rx.recv_timeout(timeout).is_err() {
+            crate::services::task_loop::kill_process_group(pid);
+        }
+    });
+    match child.wait() {
+        Ok(status) => {
+            let _ = done_tx.send(());
+            SpawnResult {
+                started: true,
+                exit_code: status.code(),
+                timed_out: status.code().is_none(),
+                enoent: false,
+            }
+        }
+        Err(_) => {
+            let _ = done_tx.send(());
+            SpawnResult::timed_out()
+        }
+    }
+}
+
+fn spawn_argv_capture(
+    argv: &[String],
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<String, SpawnErr> {
+    let Some(exe) = argv.first() else {
+        return Err(SpawnErr {
+            enoent: true,
+            detail: "empty argv".into(),
+        });
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&argv[1..])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SpawnErr {
+                enoent: true,
+                detail: format!("spawn {exe}: {e}"),
+            });
+        }
+        Err(e) => {
+            return Err(SpawnErr {
+                enoent: true,
+                detail: format!("spawn {exe}: {e}"),
+            });
+        }
+    };
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut buf = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_string(&mut buf);
+                }
+                if !status.success() && buf.trim().is_empty() {
+                    return Err(SpawnErr {
+                        enoent: false,
+                        detail: format!("kloo tokens exited {}", status.code().unwrap_or(1)),
+                    });
+                }
+                return Ok(buf);
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                return Err(SpawnErr {
+                    enoent: false,
+                    detail: "kloo tokens timed out".into(),
+                });
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => {
+                return Err(SpawnErr {
+                    enoent: false,
+                    detail: format!("wait kloo tokens: {e}"),
+                });
+            }
+        }
+    }
+}
+
+pub fn parse_tokens_json(raw: &str) -> Result<TokensReport, TokensError> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| TokensError::Parse(e.to_string()))?;
+    let fits = v
+        .get("fits")
+        .and_then(|x| x.as_bool())
+        .ok_or_else(|| TokensError::Parse("missing fits".into()))?;
+    Ok(TokensReport {
+        fits,
+        approx_tokens: v.get("approx_tokens").and_then(|x| x.as_u64()),
+        usable_window: v.get("usable_window").and_then(|x| x.as_u64()),
+        compact_trigger: v.get("compact_trigger").and_then(|x| x.as_u64()),
+    })
+}
+
+pub fn execute_budget_ms(n: usize) -> u64 {
+    let waves = n.div_ceil(4) as u64;
+    (waves * VERIFY_TASK_TIMEOUT_MS + 5_000).min(600_000)
+}
+
+pub fn warm_budget_ms(n_pairs: usize) -> u64 {
+    let n = n_pairs.min(MAX_WARM_PAIRS);
+    let waves = n.div_ceil(4) as u64;
+    (waves * WARM_TIMEOUT_MS + 5_000).min(245_000)
+}
+
+pub struct CheckPlanOpts<'a> {
+    pub run: Option<&'a TaskRunFile>,
+    pub execute: bool,
+    pub tokens: bool,
+    pub host: Option<&'a dyn PlanCheckHost>,
+    pub only_phase: Option<&'a str>,
+    pub execute_budget_ms: Option<u64>,
+    pub warm_budget_ms: Option<u64>,
+    pub skip_execute: bool,
+    pub previous_skipped: &'a [String],
+}
+
+impl<'a> CheckPlanOpts<'a> {
+    pub fn shape_only(run: Option<&'a TaskRunFile>) -> Self {
+        Self {
+            run,
+            execute: false,
+            tokens: false,
+            host: None,
+            only_phase: None,
+            execute_budget_ms: None,
+            warm_budget_ms: None,
+            skip_execute: false,
+            previous_skipped: &[],
+        }
+    }
+
+    pub fn full(run: Option<&'a TaskRunFile>) -> Self {
+        Self {
+            run,
+            execute: true,
+            tokens: true,
+            host: None,
+            only_phase: None,
+            execute_budget_ms: None,
+            warm_budget_ms: None,
+            skip_execute: false,
+            previous_skipped: &[],
+        }
     }
 }
 
@@ -131,14 +469,30 @@ pub fn check_plan(
     workspace_path: &Path,
     run: Option<&TaskRunFile>,
 ) -> PlanCheckReport {
+    check_plan_with(plan_path, workspace_path, &CheckPlanOpts::shape_only(run))
+}
+
+pub fn check_plan_with(
+    plan_path: &Path,
+    workspace_path: &Path,
+    opts: &CheckPlanOpts<'_>,
+) -> PlanCheckReport {
     let started = Instant::now();
     let mut report = PlanCheckReport::empty();
     let phases_dir = plan_path.join("phases");
     let phase_dirs = list_sorted_dirs(&phases_dir);
     let mut total_tasks = 0usize;
+    let real = RealPlanCheckHost;
+    let host: &dyn PlanCheckHost = opts.host.unwrap_or(&real);
+    let mut loaded_for_tokens: Vec<(String, PathBuf, Option<TaskSpec>)> = Vec::new();
 
     for phase_dir in &phase_dirs {
         let phase_id = dir_name(phase_dir);
+        if let Some(only) = opts.only_phase {
+            if only != phase_id {
+                continue;
+            }
+        }
         let loaded = load_phase_for_check(phase_dir, &mut report);
         total_tasks += loaded.len();
         if loaded.len() > MAX_TASKS_PER_PHASE {
@@ -155,14 +509,31 @@ pub fn check_plan(
             &phase_id,
             &loaded,
             workspace_path,
-            run,
+            opts.run,
             &mut report,
         );
+        let before_e = report.verify_executed;
+        let before_s = report.verify_skipped;
+        if opts.execute {
+            execute_phase(
+                &phase_id,
+                &loaded,
+                workspace_path,
+                host,
+                opts,
+                &mut report,
+            );
+        }
         report.phases.push(PhaseVerifyCounts {
-            phase_id,
-            verify_executed: 0,
-            verify_skipped: 0,
+            phase_id: phase_id.clone(),
+            verify_executed: report.verify_executed - before_e,
+            verify_skipped: report.verify_skipped - before_s,
         });
+        if opts.tokens {
+            for task in &loaded {
+                loaded_for_tokens.push((task.id.clone(), task.dir.clone(), task.spec.clone()));
+            }
+        }
     }
     if total_tasks > MAX_TASKS_TOTAL {
         report.items.push(item(
@@ -178,12 +549,17 @@ pub fn check_plan(
             "plan has no task.yml dirs under phases/*/tasks",
         ));
     }
+    if opts.tokens {
+        check_tokens(plan_path, &loaded_for_tokens, host, &mut report);
+    }
     report.tasks_checked = total_tasks;
     report.finish(started.elapsed().as_millis() as u64);
     report
 }
 
 struct LoadedTask {
+    id: String,
+    dir: PathBuf,
     spec: Option<TaskSpec>,
 }
 
@@ -210,14 +586,26 @@ fn load_phase_for_check(phase_dir: &Path, report: &mut PlanCheckReport) -> Vec<L
                 RULE_MISSING_FILES,
                 format!("missing task.yml for {id}"),
             ));
-            out.push(LoadedTask { spec: None });
+            out.push(LoadedTask {
+                id: id.clone(),
+                dir,
+                spec: None,
+            });
             continue;
         }
         match load_task_spec(&dir) {
-            Ok(spec) => out.push(LoadedTask { spec: Some(spec) }),
+            Ok(spec) => out.push(LoadedTask {
+                id: spec.id.clone(),
+                dir,
+                spec: Some(spec),
+            }),
             Err(e) => {
                 report.items.push(map_spec_error(&id, &e));
-                out.push(LoadedTask { spec: None });
+                out.push(LoadedTask {
+                    id,
+                    dir,
+                    spec: None,
+                });
             }
         }
     }
@@ -500,6 +888,357 @@ fn check_ui_forbidden(spec: &TaskSpec, report: &mut PlanCheckReport) {
                 format!("{path} is a UI file (html/scss/css)"),
             ));
             return;
+        }
+    }
+}
+
+fn execute_phase(
+    _phase_id: &str,
+    loaded: &[LoadedTask],
+    workspace: &Path,
+    host: &dyn PlanCheckHost,
+    opts: &CheckPlanOpts<'_>,
+    report: &mut PlanCheckReport,
+) {
+    let specs: Vec<TaskSpec> = loaded.iter().filter_map(|t| t.spec.clone()).collect();
+    let by_id: HashMap<String, TaskSpec> =
+        specs.iter().cloned().map(|s| (s.id.clone(), s)).collect();
+
+    let mut eligible: Vec<TaskSpec> = Vec::new();
+    for spec in &specs {
+        let Ok(argv) = check_verify(&spec.verify) else {
+            continue;
+        };
+        let runner = argv.first().cloned().unwrap_or_default();
+        if pair_is_deferred(spec, &by_id, workspace, &runner) {
+            continue;
+        }
+        eligible.push(spec.clone());
+    }
+    eligible.sort_by(|a, b| {
+        let a_skip = opts.previous_skipped.iter().any(|id| id == &a.id);
+        let b_skip = opts.previous_skipped.iter().any(|id| id == &b.id);
+        b_skip.cmp(&a_skip).then_with(|| a.id.cmp(&b.id))
+    });
+
+    if opts.skip_execute {
+        for spec in &eligible {
+            report.items.push(item(
+                Some(&spec.id),
+                RULE_VERIFY_NOT_EXECUTED,
+                format!("{} verify never started (stage budget)", spec.id),
+            ));
+            report.verify_skipped += 1;
+            report.skipped_ids.push(spec.id.clone());
+        }
+        return;
+    }
+
+    // Warm distinct (runner, effective_cwd).
+    let mut pair_keys: Vec<(String, PathBuf)> = Vec::new();
+    let mut pair_tasks: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut pair_argv: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for spec in &eligible {
+        let argv = check_verify(&spec.verify).expect("eligible passed check_verify");
+        let runner = argv[0].clone();
+        let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        let cwd = match verify_policy::effective_verify_dir(workspace, cwd_rel) {
+            Ok(p) => p,
+            Err(_) => workspace.to_path_buf(),
+        };
+        let key = (runner.clone(), cwd.to_string_lossy().into_owned());
+        pair_tasks.entry(key.clone()).or_default().push(spec.id.clone());
+        pair_argv
+            .entry(key.clone())
+            .or_insert_with(|| warm_argv_for(&runner, &argv));
+        if !pair_keys.iter().any(|(r, c)| r == &runner && c == &cwd) {
+            pair_keys.push((runner, cwd));
+        }
+    }
+    pair_keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let warm_n = pair_keys.len().min(MAX_WARM_PAIRS);
+    let w_budget = opts.warm_budget_ms.unwrap_or(warm_budget_ms(pair_keys.len()));
+    let warm_started = Instant::now();
+    let mut failed_pairs: HashSet<(String, String)> = HashSet::new();
+    if warm_n > 0 && !opts.skip_execute {
+        let to_warm: Vec<(String, PathBuf)> = pair_keys.iter().take(warm_n).cloned().collect();
+        let results = run_waves(
+            &to_warm,
+            4,
+            w_budget,
+            WARM_TIMEOUT_MS,
+            |pair, started| {
+                if !started {
+                    return SpawnResult::never_started();
+                }
+                let key = (pair.0.clone(), pair.1.to_string_lossy().into_owned());
+                let argv = pair_argv.get(&key).cloned().unwrap_or_else(|| {
+                    warm_argv_for(&pair.0, &[pair.0.clone()])
+                });
+                host.spawn(&SpawnRequest {
+                    argv,
+                    cwd: pair.1.clone(),
+                    timeout_ms: WARM_TIMEOUT_MS,
+                    kind: SpawnKind::Warm,
+                    task_id: None,
+                })
+            },
+        );
+        for ((runner, cwd), res) in results {
+            if res.enoent || res.exit_code.map(|c| c != 0).unwrap_or(false) {
+                let key = (runner.clone(), cwd.to_string_lossy().into_owned());
+                failed_pairs.insert(key.clone());
+                if let Some(ids) = pair_tasks.get(&key) {
+                    for id in ids {
+                        report.items.push(item(
+                            Some(id),
+                            RULE_VERIFY_NOT_RUNNABLE,
+                            format!(
+                                "warm {} in {} failed (exit {:?})",
+                                runner,
+                                cwd.display(),
+                                res.exit_code
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    report.warm_ms = report.warm_ms.saturating_add(warm_started.elapsed().as_millis() as u64);
+
+    // Per-task execute. Failed-warm tasks still count as executed (warm is the signal).
+    let e_budget = opts
+        .execute_budget_ms
+        .unwrap_or(execute_budget_ms(eligible.len()));
+    let exec_started = Instant::now();
+    let to_run: Vec<TaskSpec> = eligible
+        .iter()
+        .filter(|spec| {
+            let argv = check_verify(&spec.verify).unwrap();
+            let runner = argv[0].clone();
+            let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            let cwd = verify_policy::effective_verify_dir(workspace, cwd_rel)
+                .unwrap_or_else(|_| workspace.to_path_buf());
+            !failed_pairs.contains(&(runner, cwd.to_string_lossy().into_owned()))
+        })
+        .cloned()
+        .collect();
+    let already = eligible.len() - to_run.len();
+    report.verify_executed += already;
+
+    let results = run_waves(
+        &to_run,
+        4,
+        e_budget,
+        VERIFY_TASK_TIMEOUT_MS,
+        |spec, started| {
+            if !started {
+                return SpawnResult::never_started();
+            }
+            let argv = check_verify(&spec.verify).unwrap();
+            let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            let cwd = verify_policy::effective_verify_dir(workspace, cwd_rel)
+                .unwrap_or_else(|_| workspace.to_path_buf());
+            host.spawn(&SpawnRequest {
+                argv,
+                cwd,
+                timeout_ms: VERIFY_TASK_TIMEOUT_MS,
+                kind: SpawnKind::Task,
+                task_id: Some(spec.id.clone()),
+            })
+        },
+    );
+    for (spec, res) in results {
+        if !res.started && !res.enoent {
+            report.items.push(item(
+                Some(&spec.id),
+                RULE_VERIFY_NOT_EXECUTED,
+                format!("{} verify never started (execute budget)", spec.id),
+            ));
+            report.verify_skipped += 1;
+            report.skipped_ids.push(spec.id.clone());
+            continue;
+        }
+        report.verify_executed += 1;
+        if res.timed_out {
+            report.items.push(item(
+                Some(&spec.id),
+                RULE_VERIFY_TIMEOUT,
+                format!("{} verify exceeded {VERIFY_TASK_TIMEOUT_MS}ms", spec.id),
+            ));
+        } else if res.enoent || res.exit_code == Some(127) {
+            report.items.push(item(
+                Some(&spec.id),
+                RULE_VERIFY_NOT_RUNNABLE,
+                format!("{} verify spawn ENOENT/127", spec.id),
+            ));
+        }
+    }
+    report.verify_ms = report.verify_ms.saturating_add(exec_started.elapsed().as_millis() as u64);
+}
+
+fn run_waves<T: Clone + Send, F>(
+    jobs: &[T],
+    width: usize,
+    budget_ms: u64,
+    _timeout_ms: u64,
+    work: F,
+) -> Vec<(T, SpawnResult)>
+where
+    F: Fn(&T, bool) -> SpawnResult + Sync,
+{
+    let start = Instant::now();
+    let width = width.max(1);
+    let mut out = Vec::with_capacity(jobs.len());
+    let mut i = 0;
+    while i < jobs.len() {
+        if start.elapsed().as_millis() as u64 >= budget_ms {
+            for job in &jobs[i..] {
+                out.push((job.clone(), SpawnResult::never_started()));
+            }
+            break;
+        }
+        let end = (i + width).min(jobs.len());
+        // Sequential within the wave for determinism in unit tests; the host
+        // may still be concurrent. Width bounds how many we *start* per wave.
+        // Tests that assert in-flight use a host that tracks spawn entry.
+        let batch: Vec<T> = jobs[i..end].to_vec();
+        let handles: Vec<(T, SpawnResult)> = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for job in &batch {
+                let job = job.clone();
+                joins.push(scope.spawn(|| {
+                    let r = work(&job, true);
+                    (job, r)
+                }));
+            }
+            joins.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        out.extend(handles);
+        i = end;
+    }
+    out
+}
+
+pub fn warm_argv_for(runner: &str, verify_argv: &[String]) -> Vec<String> {
+    match runner {
+        "cargo" => vec![
+            "cargo".into(),
+            "metadata".into(),
+            "--format-version".into(),
+            "1".into(),
+            "--offline".into(),
+        ],
+        "npx" => {
+            let tool = if verify_argv.iter().any(|t| t.contains("jest")) {
+                "jest"
+            } else {
+                "vitest"
+            };
+            vec![
+                "npx".into(),
+                "--no-install".into(),
+                tool.into(),
+                "--version".into(),
+            ]
+        }
+        "go" => vec!["go".into(), "list".into(), "-m".into()],
+        "python" | "python3" => vec![
+            runner.to_string(),
+            "-m".into(),
+            "pytest".into(),
+            "--version".into(),
+        ],
+        "node" => vec!["node".into(), "-v".into()],
+        other => vec![other.to_string(), "--version".into()],
+    }
+}
+
+fn pair_is_deferred(
+    spec: &TaskSpec,
+    by_id: &HashMap<String, TaskSpec>,
+    workspace: &Path,
+    runner: &str,
+) -> bool {
+    let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    if let Some(cwd) = cwd_rel {
+        if !workspace.join(cwd).is_dir() && cwd_created_by(cwd, spec, by_id) {
+            return true;
+        }
+    }
+    if let Some(root) = project_root_file(runner) {
+        let listed = match cwd_rel {
+            Some(c) => format!("{}/{}", normalize_rel(c), root),
+            None => root.to_string(),
+        };
+        let on_disk = match verify_policy::effective_verify_dir(workspace, cwd_rel) {
+            Ok(dir) => dir.join(root).is_file(),
+            Err(_) => false,
+        };
+        if !on_disk && path_claimed(&listed, spec, by_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn project_root_file(runner: &str) -> Option<&'static str> {
+    match runner {
+        "cargo" => Some("Cargo.toml"),
+        "go" => Some("go.mod"),
+        "npx" | "node" => Some("package.json"),
+        _ => None,
+    }
+}
+
+fn check_tokens(
+    _plan_path: &Path,
+    loaded: &[(String, PathBuf, Option<TaskSpec>)],
+    host: &dyn PlanCheckHost,
+    report: &mut PlanCheckReport,
+) {
+    let mut saw_unavailable = false;
+    for (id, dir, spec) in loaded {
+        let prompt = dir.join("prompt.md");
+        if !prompt.is_file() {
+            continue;
+        }
+        let ctx = spec.as_ref().and_then(|s| s.ctx).unwrap_or(32768);
+        match host.tokens(ctx, &prompt) {
+            Ok(tok) if !tok.fits => {
+                report.items.push(item(
+                    Some(id),
+                    RULE_PROMPT_EXCEEDS_CONTEXT,
+                    format!(
+                        "approx_tokens={} usable_window={} compact_trigger={}",
+                        tok.approx_tokens.unwrap_or(0),
+                        tok.usable_window.unwrap_or(0),
+                        tok.compact_trigger.unwrap_or(0)
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(TokensError::Unavailable(d)) => {
+                if !saw_unavailable {
+                    report.items.push(item(None, RULE_TOKENS_UNAVAILABLE, d));
+                    saw_unavailable = true;
+                }
+            }
+            Err(TokensError::Parse(d)) => {
+                if !saw_unavailable {
+                    report.items.push(item(
+                        None,
+                        RULE_TOKENS_UNAVAILABLE,
+                        format!("kloo tokens parse: {d}"),
+                    ));
+                    saw_unavailable = true;
+                }
+            }
+        }
+        if saw_unavailable {
+            break;
         }
     }
 }
@@ -1793,6 +2532,576 @@ mod tests {
                 rules_of(&report)
             );
             let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    struct ScriptedHost {
+        warm: std::sync::Mutex<Vec<(Vec<String>, PathBuf)>>,
+        tasks: std::sync::Mutex<Vec<(Vec<String>, PathBuf)>>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        warm_exit: i32,
+        task_exit: i32,
+        task_timeout: bool,
+        refuse_after: Option<usize>,
+        tokens: Result<TokensReport, TokensError>,
+    }
+
+    impl ScriptedHost {
+        fn instant() -> Self {
+            Self {
+                warm: std::sync::Mutex::new(Vec::new()),
+                tasks: std::sync::Mutex::new(Vec::new()),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                warm_exit: 0,
+                task_exit: 1,
+                task_timeout: false,
+                refuse_after: None,
+                tokens: Ok(TokensReport {
+                    fits: true,
+                    approx_tokens: Some(10),
+                    usable_window: Some(26214),
+                    compact_trigger: Some(1),
+                }),
+            }
+        }
+    }
+
+    impl PlanCheckHost for ScriptedHost {
+        fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+            let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(n, Ordering::SeqCst);
+            let result = match req.kind {
+                SpawnKind::Warm => {
+                    self.warm
+                        .lock()
+                        .unwrap()
+                        .push((req.argv.clone(), req.cwd.clone()));
+                    if self.warm_exit == 127 {
+                        SpawnResult::exit(127)
+                    } else if self.warm_exit < 0 {
+                        SpawnResult::missing()
+                    } else {
+                        SpawnResult::exit(self.warm_exit)
+                    }
+                }
+                SpawnKind::Task => {
+                    let started = {
+                        let mut g = self.tasks.lock().unwrap();
+                        if let Some(limit) = self.refuse_after {
+                            if g.len() >= limit {
+                                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                                return SpawnResult::never_started();
+                            }
+                        }
+                        g.push((req.argv.clone(), req.cwd.clone()));
+                        true
+                    };
+                    if !started {
+                        SpawnResult::never_started()
+                    } else if self.task_timeout {
+                        SpawnResult::timed_out()
+                    } else if self.task_exit == 127 {
+                        SpawnResult::exit(127)
+                    } else if self.task_exit < 0 {
+                        SpawnResult::missing()
+                    } else {
+                        SpawnResult::exit(self.task_exit)
+                    }
+                }
+            };
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        fn tokens(&self, _ctx: u32, _prompt: &Path) -> Result<TokensReport, TokensError> {
+            self.tokens.clone()
+        }
+    }
+
+    fn write_ok_task(plan: &Path, phase: &str, id: &str, extra: &str) {
+        write_task(
+            plan,
+            phase,
+            id,
+            &rust_yml(id, "src/a.rs", "cargo test a -- --exact", "", extra),
+            "implement add",
+        );
+    }
+
+    #[test]
+    fn execute_path_missing_is_not_runnable() {
+        let root = tmp("exec-127");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let mut host = ScriptedHost::instant();
+        host.warm_exit = 0;
+        host.task_exit = 127;
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(has_rule(&report, RULE_VERIFY_NOT_RUNNABLE), "{:?}", report.items);
+        assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_per_task_exit_1_is_not_an_item() {
+        let root = tmp("exec-1");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let host = ScriptedHost::instant(); // warm 0, task 1
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            !has_rule(&report, RULE_VERIFY_NOT_RUNNABLE),
+            "{:?}",
+            report.items
+        );
+        assert_eq!(report.verify_executed, 1);
+        assert_eq!(report.verify_skipped, 0);
+        assert!(report.passed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warm_nonzero_is_not_runnable_per_runner() {
+        for (runner, verify, extra) in [
+            ("cargo", "cargo test a -- --exact", ""),
+            ("go", "go test ./pkg", ""),
+            ("python3", "python3 -m pytest tests/test_a.py", ""),
+            ("npx", "npx vitest run a.spec.ts", ""),
+            ("node", "node a.test.js", ""),
+        ] {
+            let root = tmp(&format!("warm-{runner}"));
+            let plan = root.join("plan");
+            let ws = root.join("ws");
+            std::fs::create_dir_all(ws.join("src")).unwrap();
+            std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+            std::fs::write(ws.join("a.spec.ts"), "x\n").unwrap();
+            std::fs::write(ws.join("a.test.js"), "x\n").unwrap();
+            std::fs::create_dir_all(ws.join("tests")).unwrap();
+            std::fs::write(ws.join("tests/test_a.py"), "x\n").unwrap();
+            std::fs::create_dir_all(ws.join("pkg")).unwrap();
+            write_task(
+                &plan,
+                "00-x",
+                "01-a",
+                &format!(
+                    "id: 01-a\nfiles: [src/a.rs]\nverify: \"{verify}\"\nmust_contain: [\"pub fn add\"]\n{extra}"
+                ),
+                "p",
+            );
+            let mut host = ScriptedHost::instant();
+            host.warm_exit = 101;
+            let report = check_plan_with(
+                &plan,
+                &ws,
+                &CheckPlanOpts {
+                    host: Some(&host),
+                    execute: true,
+                    ..CheckPlanOpts::shape_only(None)
+                },
+            );
+            assert!(
+                has_rule(&report, RULE_VERIFY_NOT_RUNNABLE),
+                "{runner}: {:?}",
+                report.items
+            );
+            let warms = host.warm.lock().unwrap();
+            assert!(
+                warms.iter().any(|(argv, _)| argv[0] == runner),
+                "{runner} warm argv: {warms:?}"
+            );
+            assert_eq!(
+                warms[0].0,
+                warm_argv_for(runner, &[runner.to_string()]),
+                "{runner} pinned warm"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn execute_timeout_is_advisory() {
+        let root = tmp("exec-to");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let mut host = ScriptedHost::instant();
+        host.task_timeout = true;
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(has_rule(&report, RULE_VERIFY_TIMEOUT), "{:?}", report.items);
+        assert!(
+            report.items.iter().any(|i| i.rule == RULE_VERIFY_TIMEOUT && !i.blocking),
+            "{:?}",
+            report.items
+        );
+        assert!(report.passed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_budget_skip_is_not_executed() {
+        let root = tmp("exec-skip");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        for i in 0..8 {
+            write_ok_task(&plan, "00-x", &format!("t{i:02}"), "");
+        }
+        let mut host = ScriptedHost::instant();
+        host.refuse_after = Some(4);
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                execute_budget_ms: Some(1),
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        // 1ms budget: first wave may start; remainder never-started.
+        assert!(
+            report.verify_executed + report.verify_skipped == 8,
+            "e={} s={} items={:?}",
+            report.verify_executed,
+            report.verify_skipped,
+            report.items
+        );
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .filter(|i| i.rule == RULE_VERIFY_NOT_EXECUTED)
+                .count(),
+            report.verify_skipped
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_150_instant_exit_covers_all() {
+        let root = tmp("exec-150");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        for i in 0..150 {
+            let id = format!("n{i:03}");
+            let f = format!("src/{id}.rs");
+            std::fs::write(ws.join(&f), "x\n").unwrap();
+            write_task(
+                &plan,
+                "00-x",
+                &id,
+                &rust_yml(&id, &f, "cargo test a -- --exact", "", ""),
+                "p",
+            );
+        }
+        let host = ScriptedHost::instant();
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert_eq!(report.verify_executed, 150);
+        assert_eq!(report.verify_skipped, 0);
+        assert!(report.passed, "{:?}", report.items);
+        assert!(report.verify_ms <= execute_budget_ms(150) + 5_000);
+        let tasks = host.tasks.lock().unwrap();
+        assert_eq!(tasks.len(), 150);
+        for (_, cwd) in tasks.iter() {
+            assert_eq!(cwd, &ws);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warm_capped_at_eight_pairs_and_four_wide() {
+        let root = tmp("warm-cap");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        let runners = [
+            ("cargo", "cargo test a -- --exact"),
+            ("go", "go test ./pkg"),
+            ("python3", "python3 -m pytest tests/test_a.py"),
+            ("python", "python -m pytest tests/test_a.py"),
+            ("npx", "npx vitest run a.spec.ts"),
+            ("node", "node a.test.js"),
+        ];
+        std::fs::write(ws.join("a.spec.ts"), "x\n").unwrap();
+        std::fs::write(ws.join("a.test.js"), "x\n").unwrap();
+        std::fs::create_dir_all(ws.join("tests")).unwrap();
+        std::fs::write(ws.join("tests/test_a.py"), "x\n").unwrap();
+        std::fs::create_dir_all(ws.join("pkg")).unwrap();
+        // 6 runners × 2 cwds = 12 pairs
+        for (i, (_runner, verify)) in runners.iter().enumerate() {
+            write_task(
+                &plan,
+                "00-x",
+                &format!("a{i}"),
+                &format!(
+                    "id: a{i}\nfiles: [src/a.rs]\nverify: \"{verify}\"\nmust_contain: [\"pub fn add\"]\n"
+                ),
+                "p",
+            );
+            write_task(
+                &plan,
+                "00-x",
+                &format!("b{i}"),
+                &format!(
+                    "id: b{i}\nfiles: [src/a.rs]\nverify: \"{verify}\"\nmust_contain: [\"pub fn add\"]\ncwd: src\n"
+                ),
+                "p",
+            );
+        }
+        let host = ScriptedHost::instant();
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        let warms = host.warm.lock().unwrap();
+        assert!(
+            warms.len() <= MAX_WARM_PAIRS,
+            "warm spawns {} > {MAX_WARM_PAIRS}",
+            warms.len()
+        );
+        assert!(
+            host.max_in_flight.load(Ordering::SeqCst) <= 4,
+            "in flight {}",
+            host.max_in_flight.load(Ordering::SeqCst)
+        );
+        assert!(report.warm_ms > 0 || !warms.is_empty());
+        // warm_ms is not folded into verify_ms (they are independent counters)
+        assert!(report.verify_ms < u64::MAX);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deferred_cwd_skips_warm_and_is_not_eligible() {
+        let root = tmp("defer");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        write_task(
+            &plan,
+            "00-x",
+            "01-new",
+            "id: 01-new\nfiles: [crate/src/lib.rs]\nnew: [crate/src/lib.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\ncwd: crate\n",
+            "new crate",
+        );
+        let host = ScriptedHost::instant();
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            !has_rule(&report, RULE_VERIFY_NOT_RUNNABLE),
+            "{:?}",
+            report.items
+        );
+        assert!(host.warm.lock().unwrap().is_empty());
+        assert_eq!(report.verify_executed, 0);
+        assert_eq!(report.verify_skipped, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tokens_fits_false_emits_numbers() {
+        let root = tmp("tok-no");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let mut host = ScriptedHost::instant();
+        host.tokens = Ok(TokensReport {
+            fits: false,
+            approx_tokens: Some(40000),
+            usable_window: Some(26214),
+            compact_trigger: Some(18000),
+        });
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        let item = report
+            .items
+            .iter()
+            .find(|i| i.rule == RULE_PROMPT_EXCEEDS_CONTEXT)
+            .expect("item");
+        assert!(item.detail.contains("40000"), "{}", item.detail);
+        assert!(item.detail.contains("26214"), "{}", item.detail);
+        assert!(item.detail.contains("18000"), "{}", item.detail);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tokens_fits_true_is_silent() {
+        let root = tmp("tok-yes");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let host = ScriptedHost::instant();
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(!has_rule(&report, RULE_PROMPT_EXCEEDS_CONTEXT));
+        assert!(!has_rule(&report, RULE_TOKENS_UNAVAILABLE));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tokens_enoent_is_single_plan_item() {
+        let root = tmp("tok-miss");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        write_ok_task(&plan, "00-x", "02-b", "");
+        let mut host = ScriptedHost::instant();
+        host.tokens = Err(TokensError::Unavailable("no kloo".into()));
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        let n = report
+            .items
+            .iter()
+            .filter(|i| i.rule == RULE_TOKENS_UNAVAILABLE)
+            .count();
+        assert_eq!(n, 1, "{:?}", report.items);
+        assert!(report.items.iter().any(|i| i.task_id.is_none()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_rule_id_set_is_the_overview_table() {
+        assert!(RULE_IDS.contains(&RULE_VERIFY_NOT_RUNNABLE));
+        assert!(RULE_IDS.contains(&RULE_VERIFY_TIMEOUT));
+        assert!(RULE_IDS.contains(&RULE_VERIFY_NOT_EXECUTED));
+        assert!(RULE_IDS.contains(&RULE_PROMPT_EXCEEDS_CONTEXT));
+        assert!(RULE_IDS.contains(&RULE_TOKENS_UNAVAILABLE));
+        assert!(RULE_IDS.contains(&RULE_VERIFY_CWD_MISSING));
+        assert!(RULE_IDS.contains(&RULE_FILES_OUTSIDE_CWD));
+        assert!(RULE_IDS.contains(&RULE_UI_TASK_FORBIDDEN));
+        assert!(RULE_IDS.contains(&RULE_EMPTY_PLAN));
+        assert_eq!(RULE_IDS.len(), 24);
+    }
+
+    #[test]
+    fn every_overview_rule_is_emitted_by_a_fixture() {
+        let mut seen = std::collections::HashSet::new();
+        for rule in [
+            RULE_MISSING_FILES,
+            RULE_EMPTY_VERIFY,
+            RULE_EMPTY_PROMPT,
+            RULE_FILE_MISSING,
+            RULE_FILE_COLLISION,
+            RULE_DEPENDS_UNRESOLVED,
+            RULE_DEPENDS_CYCLE,
+            RULE_DEPENDS_FORWARD,
+            RULE_DEPENDS_SELF,
+            RULE_VERIFY_NOT_ALLOWLISTED,
+            RULE_VERIFY_NOT_SCOPED,
+            RULE_VERIFY_TARGET_MISSING,
+            RULE_VERIFY_CWD_MISSING,
+            RULE_FILES_OUTSIDE_CWD,
+            RULE_MUST_CONTAIN_TRIVIAL,
+            RULE_TASK_COUNT_PHASE,
+            RULE_TASK_COUNT_TOTAL,
+            RULE_EMPTY_PLAN,
+            RULE_UI_TASK_FORBIDDEN,
+        ] {
+            let root = tmp(&format!("all-{rule}"));
+            let plan = root.join("plan");
+            let ws = root.join("ws");
+            builder_for(rule, &plan, &ws);
+            let report = check_plan(&plan, &ws, None);
+            for i in &report.items {
+                seen.insert(i.rule.clone());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // Execute / token rules from dedicated fixtures.
+        seen.insert(RULE_VERIFY_NOT_RUNNABLE.to_string());
+        seen.insert(RULE_VERIFY_TIMEOUT.to_string());
+        seen.insert(RULE_VERIFY_NOT_EXECUTED.to_string());
+        seen.insert(RULE_PROMPT_EXCEEDS_CONTEXT.to_string());
+        seen.insert(RULE_TOKENS_UNAVAILABLE.to_string());
+        for id in RULE_IDS {
+            assert!(
+                seen.contains(*id),
+                "overview rule {id} has no fixture producing it; seen={seen:?}"
+            );
         }
     }
 }

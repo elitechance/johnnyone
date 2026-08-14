@@ -23,6 +23,7 @@ pub const BACKFILL_017: &str = include_str!("../../migrations/017_backfill_initi
 const MIGRATION_018: &str = include_str!("../../migrations/018_add_briefing_session.sql");
 const MIGRATION_019: &str = include_str!("../../migrations/019_add_validation_config.sql");
 const MIGRATION_020: &str = include_str!("../../migrations/020_complete_approved_dev_runs.sql");
+const MIGRATION_021: &str = include_str!("../../migrations/021_add_executor_config.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -83,6 +84,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (18, "018_add_briefing_session", MIGRATION_018),
         (19, "019_add_validation_config", MIGRATION_019),
         (20, "020_complete_approved_dev_runs", MIGRATION_020),
+        (21, "021_add_executor_config", MIGRATION_021),
     ];
 
     for (version, name, sql) in migrations {
