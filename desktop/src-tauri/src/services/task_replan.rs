@@ -63,6 +63,25 @@ pub fn write_skip_preflight_marker(runs_dir: &Path) -> Result<(), String> {
 }
 
 /// Returns true once, then the marker is gone. Later entries run preflight.
+pub fn human_comment_path(runs_dir: &Path) -> PathBuf {
+    runs_dir.join("human-comment.md")
+}
+
+pub fn write_human_comment(runs_dir: &Path, text: &str) -> Result<(), String> {
+    std::fs::create_dir_all(runs_dir).map_err(|e| format!("mkdir {}: {e}", runs_dir.display()))?;
+    atomic_fs::write_atomic(human_comment_path(runs_dir).as_path(), text.as_bytes())
+}
+
+pub fn load_human_comment(runs_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(human_comment_path(runs_dir)).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 pub fn consume_skip_preflight_marker(runs_dir: &Path) -> bool {
     let path = skip_preflight_marker_path(runs_dir);
     if !path.is_file() {
@@ -558,6 +577,18 @@ mod tests {
         assert_eq!(next_episode_round(Some(&a)), Ok(2));
         a.round = 0;
         assert_eq!(next_episode_round(Some(&a)), Ok(1));
+    }
+
+    #[test]
+    fn human_comment_round_trips() {
+        let root = tmp("comment");
+        assert!(load_human_comment(&root).is_none());
+        write_human_comment(&root, "  please fix the queue  ").unwrap();
+        assert_eq!(
+            load_human_comment(&root).as_deref(),
+            Some("please fix the queue")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
