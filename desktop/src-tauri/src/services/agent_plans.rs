@@ -201,6 +201,50 @@ fn update_plan_status_and_health(
     )
 }
 
+/// Status write that refuses to overwrite a terminal run (Stop / block / approved).
+/// Returns rows affected. `0` means the run is already terminal — caller must
+/// not spawn or continue as if the write landed.
+fn update_plan_status_unless_terminal(
+    conn: &rusqlite::Connection,
+    plan_id: &str,
+    new_status: &str,
+    error: Option<&str>,
+) -> rusqlite::Result<usize> {
+    update_plan_status_unless_terminal_at(
+        conn,
+        plan_id,
+        new_status,
+        error,
+        None,
+        None,
+    )
+}
+
+fn update_plan_status_unless_terminal_at(
+    conn: &rusqlite::Connection,
+    plan_id: &str,
+    new_status: &str,
+    error: Option<&str>,
+    current_phase_id: Option<&str>,
+    current_phase_index: Option<i64>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agent_plans SET status = ?1, health = ?2, error = ?3, \
+         current_phase_id = COALESCE(?4, current_phase_id), \
+         current_phase_index = COALESCE(?5, current_phase_index), \
+         updated_at = datetime('now') \
+         WHERE id = ?6 AND status NOT IN ('approved', 'blocked', 'stopped')",
+        params![
+            new_status,
+            health_from_status(new_status),
+            error,
+            current_phase_id,
+            current_phase_index,
+            plan_id
+        ],
+    )
+}
+
 pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<AgentPlanRun, String> {
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
@@ -879,6 +923,10 @@ pub async fn run_initiative_from_phase(
     // Reject a whitespace-only comment up front (early return before any side effect).
     let comment = validate_comment(comment.as_deref())?;
     let run = get_plan(&state, &id)?;
+    // Public API: reject traversal / unknown phase ids before any write.
+    if let Some(pid) = phase_id.as_deref() {
+        require_known_phase_id(&run, pid)?;
+    }
 
     if let Some(text) = comment.as_deref() {
         // Record the comment as a timeline event, then inject it into the run's active
@@ -895,10 +943,13 @@ pub async fn run_initiative_from_phase(
         )?;
         // Persist so the next amend-planner (or a later Resume) can pick it up
         // when there is no worker pane to inject into (kloo / post-archive).
+        // Jail + known-phase check first: caller-supplied phaseId is a public
+        // API input and must not reach initiative_runs_path unvalidated.
         if let Some(pid) = phase_id
             .as_deref()
             .or(run.plan.current_phase_id.as_deref())
         {
+            let pid = require_known_phase_id(&run, pid)?;
             let _ = crate::services::task_replan::write_human_comment(
                 &replan_runs_dir(&state, &run, pid),
                 text,
@@ -2109,7 +2160,7 @@ async fn follow_kloo_outcome_with(
         }
         KlooPhaseFollowup::NeedsAttention { task_id, route } => {
             state.db.with_conn(|conn| {
-                update_plan_status_and_health(
+                update_plan_status_unless_terminal(
                     conn,
                     &run.plan.id,
                     "needs_attention",
@@ -2214,14 +2265,18 @@ async fn park_replan(
     archive_replan_planner(state, &run.plan.id).await;
 
     let nn = phase_nn(Some(phase_id));
-    state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') \
-             WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
-            params![health_from_status("needs_attention"), error, run.plan.id],
+    let n = state.db.with_conn(|conn| {
+        update_plan_status_unless_terminal(
+            conn,
+            &run.plan.id,
+            "needs_attention",
+            Some(error),
         )
         .map_err(|e| e.to_string())
     })?;
+    if n == 0 {
+        return Ok(());
+    }
     append_event(
         state,
         &run.plan.id,
@@ -2274,6 +2329,9 @@ async fn begin_phase_replan(
     route: &str,
     ctrl: &ReplanCtrl<'_>,
 ) -> Result<(), String> {
+    if replan_aborted(state, &run.plan.id) {
+        return Ok(());
+    }
     let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
     let amend_path = crate::services::task_replan::amendment_json_path(&runs_dir);
     let existing = match crate::services::task_replan::load_amendment_optional(&amend_path) {
@@ -2318,18 +2376,23 @@ async fn begin_phase_replan(
     );
     crate::services::task_replan::save_amendment(&amend_path, &amendment)?;
 
-    state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'phase_replan_running', current_phase_id = ?1, current_phase_index = ?2, health = ?3, error = NULL, updated_at = datetime('now') WHERE id = ?4",
-            params![
-                phase.phase_id,
-                phase.phase_index,
-                health_from_status("phase_replan_running"),
-                run.plan.id
-            ],
+    if replan_aborted(state, &run.plan.id) {
+        return Ok(());
+    }
+    let n = state.db.with_conn(|conn| {
+        update_plan_status_unless_terminal_at(
+            conn,
+            &run.plan.id,
+            "phase_replan_running",
+            None,
+            Some(phase.phase_id.as_str()),
+            Some(phase.phase_index),
         )
         .map_err(|e| e.to_string())
     })?;
+    if n == 0 {
+        return Ok(());
+    }
     append_event(
         state,
         &run.plan.id,
@@ -2424,7 +2487,7 @@ fn replan_planner_prompt(
         ));
     }
     let runs = replan_runs_dir(state, run, &phase.phase_id);
-    if let Some(comment) = crate::services::task_replan::load_human_comment(&runs) {
+    if let Some(comment) = crate::services::task_replan::consume_human_comment(&runs) {
         base.push_str(&format!("\nOperator guidance (queued):\n{comment}\n"));
     }
     Ok(append_worker_report(run, base))
@@ -2552,10 +2615,11 @@ pub(crate) async fn run_phase_replan_arm(
             return Ok(());
         }
         state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'phase_worker_running', health = ?1, error = NULL, updated_at = datetime('now') \
-                 WHERE id = ?2 AND status = 'phase_replan_running'",
-                params![health_from_status("phase_worker_running"), run.plan.id],
+            update_plan_status_unless_terminal(
+                conn,
+                &run.plan.id,
+                "phase_worker_running",
+                None,
             )
             .map_err(|e| e.to_string())
         })?;
@@ -2580,14 +2644,11 @@ pub(crate) async fn run_phase_replan_arm(
     if capped {
         archive_replan_planner(state, &run.plan.id).await;
         state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') \
-                 WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
-                params![
-                    health_from_status("needs_attention"),
-                    crate::services::plan_check::REPLAN_PARK_CAP,
-                    run.plan.id
-                ],
+            update_plan_status_unless_terminal(
+                conn,
+                &run.plan.id,
+                "needs_attention",
+                Some(crate::services::plan_check::REPLAN_PARK_CAP),
             )
             .map_err(|e| e.to_string())
         })?;
@@ -4239,6 +4300,16 @@ fn jail_phase_id(phase_id: &str) -> Result<&str, String> {
     }
 }
 
+/// Public-API phaseId: one path segment AND a phase the plan already knows.
+fn require_known_phase_id<'a>(run: &'a AgentPlanRun, phase_id: &'a str) -> Result<&'a str, String> {
+    let jailed = jail_phase_id(phase_id)?;
+    if run.phases.iter().any(|p| p.phase_id == jailed) {
+        Ok(jailed)
+    } else {
+        Err(format!("Phase not found: {jailed}"))
+    }
+}
+
 fn plan_initiative_id(state: &AppState, plan_id: &str) -> Result<String, String> {
     state.db.with_conn(|conn| {
         conn.query_row(
@@ -5431,10 +5502,11 @@ async fn park_kloo_review(
         .clone()
         .unwrap_or_else(|| format!("kloo phase review {verdict}"));
     state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') \
-             WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
-            params![health_from_status("needs_attention"), summary, run.plan.id],
+        update_plan_status_unless_terminal(
+            conn,
+            &run.plan.id,
+            "needs_attention",
+            Some(&summary),
         )
         .map_err(|e| e.to_string())
     })?;
@@ -7365,7 +7437,7 @@ fn event_actor(event_type: &str) -> &'static str {
     match event_type {
         // A human's run/resume guidance — a NEW actor value (the timeline renders it as
         // the "you" chip). Distinct from `user` (system-attributed lifecycle events).
-        "human_comment" => "human",
+        "human_comment" | "human_comment_queued" => "human",
         "planning_planner_ready" | "agent_phase_worker_idle" => "t1",
         "planning_gate_result" | "agent_phase_gate_result" => "t2",
         "agent_plan_created"
@@ -7411,7 +7483,8 @@ fn event_category(event_type: &str) -> &'static str {
         | "agent_phase_replan_ready"
         // A human comment on a run/resume is phase-scoped guidance; the "phase" category
         // maps to the console's development stage (frontend `stageOf`) — see decisions.md.
-        | "human_comment" => "phase",
+        | "human_comment"
+        | "human_comment_queued" => "phase",
         _ => "run",
     }
 }
@@ -7633,6 +7706,14 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             match payload_str(payload, "phaseId") {
                 Some(phase) => format!("Resume · {} + comment: {}", phase, text),
                 None => format!("Comment: {}", text),
+            }
+        }
+        "human_comment_queued" => {
+            let text = payload_str(payload, "text").unwrap_or_default();
+            if text.is_empty() {
+                "Comment queued — no worker session to inject into".to_string()
+            } else {
+                format!("Comment queued — no worker session: {text}")
             }
         }
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
@@ -8246,12 +8327,14 @@ mod coordinator_terminal_tests {
     #[test]
     fn human_comment_actor_is_human() {
         assert_eq!(event_actor("human_comment"), "human");
+        assert_eq!(event_actor("human_comment_queued"), "human");
     }
 
     #[test]
     fn human_comment_category_groups_under_development_stage() {
         // "phase" maps to the console's development stage in the frontend `stageOf`.
         assert_eq!(event_category("human_comment"), "phase");
+        assert_eq!(event_category("human_comment_queued"), "phase");
     }
 
     #[test]
@@ -8268,6 +8351,16 @@ mod coordinator_terminal_tests {
         let event = gate_event("human_comment", None, "");
         let payload = json!({ "text": "looks good" });
         assert_eq!(event_summary(&event, &payload), "Comment: looks good");
+    }
+
+    #[test]
+    fn human_comment_queued_summary_is_visible() {
+        let event = gate_event("human_comment_queued", None, "");
+        let payload = json!({ "text": "please split the queue", "reason": "no_worker_session" });
+        let summary = event_summary(&event, &payload);
+        assert!(summary.contains("queued"), "got: {summary}");
+        assert!(summary.contains("no worker session"), "got: {summary}");
+        assert!(summary.contains("please split the queue"), "got: {summary}");
     }
 
     #[test]
@@ -12013,6 +12106,207 @@ mod replan_tests {
         assert_eq!(after.plan.status, "stopped");
         assert_eq!(*log.lock().unwrap(), vec![1]);
         assert_eq!(after.plan.worker_session_id, sid_before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn mark_stopped(state: &AppState, plan_id: &str) {
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET status = 'stopped' WHERE id = ?1",
+                    params![plan_id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn guarded_status_write_leaves_stopped_untouched() {
+        use crate::db::migrations::run_migrations;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status, status) \
+             VALUES ('P', 'development', 't', '/w', '/p', 'claude_code', 'claude_code', 'P', 'development', 'stopped')",
+            [],
+        )
+        .unwrap();
+        for next in [
+            "phase_replan_running",
+            "phase_worker_running",
+            "needs_attention",
+        ] {
+            let n = update_plan_status_unless_terminal(&conn, "P", next, Some("nope")).unwrap();
+            assert_eq!(n, 0, "{next} must not overwrite stopped");
+        }
+        let status: String = conn
+            .query_row("SELECT status FROM agent_plans WHERE id='P'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "stopped");
+    }
+
+    #[tokio::test]
+    async fn stop_before_begin_phase_replan_stays_stopped() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        mark_stopped(&state, &run.plan.id);
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let ctrl = test_ctrl(&log, None, &host);
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        follow_kloo_outcome_with(&state, &run, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "stopped");
+        assert_ne!(after.plan.status, "phase_replan_running");
+        assert!(log.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stop_before_park_replan_stays_stopped() {
+        let (state, root, _store, _ws, run) = harness();
+        mark_stopped(&state, &run.plan.id);
+        park_replan(
+            &state,
+            &get_plan(&state, &run.plan.id).unwrap(),
+            "00-x",
+            crate::services::plan_check::REPLAN_PARK_UNREADABLE,
+            crate::services::plan_check::REPLAN_PARK_UNREADABLE,
+            None,
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "stopped");
+        assert_ne!(after.plan.status, "needs_attention");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stop_before_replan_cap_write_stays_stopped() {
+        let (state, root, _store, _ws, run) = harness();
+        mark_stopped(&state, &run.plan.id);
+        park_replan(
+            &state,
+            &get_plan(&state, &run.plan.id).unwrap(),
+            "00-x",
+            crate::services::plan_check::REPLAN_PARK_CAP,
+            crate::services::plan_check::REPLAN_PARK_CAP,
+            Some(MAX_REPLAN_ROUNDS),
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "stopped");
+        assert_ne!(after.plan.status, "needs_attention");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn second_replan_round_does_not_see_first_comment() {
+        let (state, root, _store, _ws, run) = harness();
+        seed_partial_run(&state, &run);
+        let runs = replan_runs_dir(&state, &run, "00-x");
+        task_replan::write_human_comment(&runs, "round-one guidance").unwrap();
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        let amend = task_replan::amendment_json_path(&runs);
+        let first = replan_planner_prompt(&state, &run, phase, &amend, None).unwrap();
+        assert!(
+            first.contains("round-one guidance"),
+            "first prompt must include the queued comment"
+        );
+        let second = replan_planner_prompt(&state, &run, phase, &amend, None).unwrap();
+        assert!(
+            !second.contains("round-one guidance"),
+            "second replan must not replay the consumed comment"
+        );
+        assert!(task_replan::load_human_comment(&runs).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resume_phase_id_must_be_a_known_phase() {
+        let (state, root, store, _ws, run) = harness();
+        let err_dot = run_initiative_from_phase(
+            state.clone(),
+            run.plan.id.clone(),
+            Some("../etc/passwd".into()),
+            None,
+            Some("please fix".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_dot.contains("phaseId") || err_dot.contains("segment"),
+            "{err_dot}"
+        );
+        let err_unknown = run_initiative_from_phase(
+            state.clone(),
+            run.plan.id.clone(),
+            Some("99-nope".into()),
+            None,
+            Some("please fix".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_unknown.contains("Phase not found") || err_unknown.contains("99-nope"),
+            "{err_unknown}"
+        );
+        let escaped = store.join("etc").join("passwd").join("human-comment.md");
+        assert!(!escaped.exists(), "traversal must not write outside runs/");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn queued_comment_without_session_is_surfaced() {
+        let (state, root, _store, _ws, run) = harness();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET worker_session_id = NULL, status = 'stopped' WHERE id = ?1",
+                    params![run.plan.id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        run_initiative_from_phase(
+            state.clone(),
+            run.plan.id.clone(),
+            Some("00-x".into()),
+            None,
+            Some("please split the queue".into()),
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(
+            after
+                .events
+                .iter()
+                .any(|e| e.event_type == "human_comment_queued"),
+            "NULL session must emit a visible queued event, not drop the comment"
+        );
+        let ev = after
+            .events
+            .iter()
+            .find(|e| e.event_type == "human_comment_queued")
+            .unwrap();
+        assert_eq!(ev.actor, "human");
+        assert_eq!(ev.category, "phase");
+        assert!(ev.summary.contains("queued"), "{}", ev.summary);
+        assert!(
+            ev.summary.contains("no worker session"),
+            "{}",
+            ev.summary
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

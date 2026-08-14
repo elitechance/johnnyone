@@ -82,6 +82,25 @@ pub fn load_human_comment(runs_dir: &Path) -> Option<String> {
     }
 }
 
+/// Read the queued comment and delete the file so a later replan cannot
+/// replay operator guidance from a previous Resume.
+pub fn consume_human_comment(runs_dir: &Path) -> Option<String> {
+    let path = human_comment_path(runs_dir);
+    if !path.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    raw.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
 pub fn consume_skip_preflight_marker(runs_dir: &Path) -> bool {
     let path = skip_preflight_marker_path(runs_dir);
     if !path.is_file() {
@@ -588,6 +607,19 @@ mod tests {
             load_human_comment(&root).as_deref(),
             Some("please fix the queue")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn human_comment_is_consumed_on_read() {
+        let root = tmp("comment-once");
+        write_human_comment(&root, "fix the queue").unwrap();
+        assert_eq!(
+            consume_human_comment(&root).as_deref(),
+            Some("fix the queue")
+        );
+        assert!(load_human_comment(&root).is_none());
+        assert!(consume_human_comment(&root).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
