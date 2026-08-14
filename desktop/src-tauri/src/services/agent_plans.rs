@@ -751,6 +751,9 @@ pub async fn start_plan(
     if matches!(run.plan.status.as_str(), "blocked" | "stopped") {
         return Ok(run);
     }
+    if run.plan.status == "needs_attention" {
+        reset_replan_budget_for_run(&state, &run);
+    }
     if run.plan.status == "approved" && phase_id.is_none() {
         return Ok(run);
     }
@@ -910,6 +913,8 @@ pub async fn run_initiative_from_phase(
             update_plan_status_and_health(conn, &id, resume_status, None)
                 .map_err(|e| e.to_string())
         })?;
+        // Human Resume restores replan capacity (task 04-04 escape hatch).
+        reset_replan_budget_for_run(&state, &run);
     }
 
     start_plan(state, id, phase_id, phase_run_mode).await
@@ -1969,12 +1974,11 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
         .join("phases")
         .join(&phase.phase_id);
     if development_arm(&phase_path) == DevArm::KlooPreflight {
-        // Replan just ran a phase-scoped check. Don't execute every verify
-        // again on the way back into the loop (Lead: double preflight).
-        let skip_preflight = crate::services::task_replan::amendment_json_path(
+        // One-shot: only the immediate replan→loop handoff skips preflight.
+        // The marker is consumed here so a later Resume/restart re-checks.
+        let skip_preflight = crate::services::task_replan::consume_skip_preflight_marker(
             &replan_runs_dir(state, run, &phase.phase_id),
-        )
-        .is_file();
+        );
         if !skip_preflight && !run_phase_preflight(state, run, &phase).await? {
             return Ok(());
         }
@@ -2071,6 +2075,18 @@ async fn follow_kloo_outcome_with(
     }
 }
 
+pub(crate) fn reset_replan_budget_for_run(state: &AppState, run: &AgentPlanRun) {
+    let Some(phase_id) = run.plan.current_phase_id.as_deref() else {
+        return;
+    };
+    let path = crate::services::task_replan::amendment_json_path(&replan_runs_dir(
+        state, run, phase_id,
+    ));
+    if let Err(e) = crate::services::task_replan::reset_replan_round(&path) {
+        tracing::warn!(plan_id = %run.plan.id, %e, "reset_replan_round failed");
+    }
+}
+
 fn replan_runs_dir(state: &AppState, run: &AgentPlanRun, phase_id: &str) -> PathBuf {
     settings_service::initiative_runs_path(
         &settings_service::resolve_initiatives_dir(state),
@@ -2082,21 +2098,56 @@ fn replan_runs_dir(state: &AppState, run: &AgentPlanRun, phase_id: &str) -> Path
 
 async fn park_replan_cap(
     state: &AppState,
-    plan_id: &str,
+    run: &AgentPlanRun,
     phase_id: &str,
     error: &str,
-    payload: serde_json::Value,
+    reason: &str,
+    round: Option<u32>,
 ) -> Result<(), String> {
+    let runs_dir = replan_runs_dir(state, run, phase_id);
+    let preflight_path = runs_dir.join("preflight.json");
+    let last = crate::services::plan_check::load_plan_check(&preflight_path).ok();
+    let reuse_items = reason == "replan cap reached";
+    let violations = last
+        .as_ref()
+        .map(|r| r.items.iter().filter(|i| i.blocking).count())
+        .unwrap_or(0);
+    let mut report = if reuse_items {
+        last.unwrap_or_else(crate::services::plan_check::PlanCheckReport::empty)
+    } else {
+        let mut r = crate::services::plan_check::PlanCheckReport::empty();
+        r.items.push(crate::services::plan_check::PlanCheckItem {
+            task_id: None,
+            rule: "replan_park".to_string(),
+            detail: error.to_string(),
+            blocking: true,
+        });
+        r
+    };
+    report.passed = false;
+    report.check_kind = Some(crate::services::plan_check::CHECK_KIND_REPLAN_PARK.to_string());
+    report.exhausted = Some(true);
+    report.replan_round = round.or(Some(crate::services::task_replan::MAX_REPLAN_ROUNDS));
+    std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
+    crate::services::plan_check::save_plan_check(&preflight_path, &report)?;
+
+    let nn = phase_nn(Some(phase_id));
     state.db.with_conn(|conn| {
-        update_plan_status_and_health(conn, plan_id, "needs_attention", Some(error))
+        update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(error))
             .map_err(|e| e.to_string())
     })?;
     append_event(
         state,
-        plan_id,
+        &run.plan.id,
         Some(phase_id),
         "agent_phase_preflight_failed",
-        payload,
+        json!({
+            "reason": reason,
+            "exhausted": true,
+            "round": report.replan_round,
+            "violations": if reuse_items { violations } else { 1 },
+            "nn": nn,
+        }),
     )
 }
 
@@ -2120,13 +2171,14 @@ async fn begin_phase_replan(
     let amend_path = crate::services::task_replan::amendment_json_path(&runs_dir);
     let existing = match crate::services::task_replan::load_amendment_optional(&amend_path) {
         Ok(v) => v,
-        Err(e) => {
+        Err(_) => {
             return park_replan_cap(
                 state,
-                &run.plan.id,
+                run,
                 &phase.phase_id,
                 "replan amendment unreadable",
-                json!({ "reason": e, "exhausted": true }),
+                "replan amendment unreadable",
+                None,
             )
             .await;
         }
@@ -2136,10 +2188,11 @@ async fn begin_phase_replan(
         Err(()) => {
             return park_replan_cap(
                 state,
-                &run.plan.id,
+                run,
                 &phase.phase_id,
                 "replan cap reached",
-                json!({ "exhausted": true, "round": crate::services::task_replan::MAX_REPLAN_ROUNDS }),
+                "replan cap reached",
+                Some(crate::services::task_replan::MAX_REPLAN_ROUNDS),
             )
             .await;
         }
@@ -2289,13 +2342,14 @@ pub(crate) async fn run_phase_replan_arm(
     let amend_path = crate::services::task_replan::amendment_json_path(&runs_dir);
     let mut amendment = match crate::services::task_replan::load_amendment(&amend_path) {
         Ok(a) => a,
-        Err(e) => {
+        Err(_) => {
             return park_replan_cap(
                 state,
-                &run.plan.id,
+                run,
                 &phase.phase_id,
                 "replan amendment unreadable",
-                json!({ "reason": e, "exhausted": true }),
+                "replan amendment unreadable",
+                None,
             )
             .await;
         }
@@ -2314,21 +2368,40 @@ pub(crate) async fn run_phase_replan_arm(
         &run.plan.id,
         &phase.phase_id,
     )?;
-    let specs = crate::services::task_loop::load_phase_specs(&phase_path)?;
-    let missing = crate::services::task_replan::missing_done_task_ids(&file, &specs);
 
-    let mut report = collect_replan_phase_check(state, run, &phase, &file, ctrl).await?;
-    for id in &missing {
-        report.items.push(crate::services::plan_check::PlanCheckItem {
-            task_id: Some(id.clone()),
-            rule: crate::services::plan_check::RULE_FILE_MISSING.to_string(),
-            detail: format!(
-                "done task {id} disappeared from the phase (planner must not drop commits)"
-            ),
-            blocking: true,
-        });
-        report.passed = false;
+    // Check first. load_phase_specs `?` used to turn a planner shape mistake
+    // into coordinator_failed and skip the 3-round loop (Lead-2).
+    let mut report = collect_replan_phase_check(run, &phase, &file, ctrl).await?;
+    let specs = match crate::services::task_loop::load_phase_specs(&phase_path) {
+        Ok(s) => s,
+        Err(e) => {
+            report.passed = false;
+            report.items.push(crate::services::plan_check::PlanCheckItem {
+                task_id: None,
+                rule: crate::services::plan_check::RULE_MISSING_FILES.to_string(),
+                detail: e,
+                blocking: true,
+            });
+            Vec::new()
+        }
+    };
+    if report.passed {
+        for id in crate::services::task_replan::missing_done_task_ids(&file, &specs) {
+            report.items.push(crate::services::plan_check::PlanCheckItem {
+                task_id: Some(id.clone()),
+                rule: crate::services::plan_check::RULE_FILE_MISSING.to_string(),
+                detail: format!(
+                    "done task {id} disappeared from the phase (planner must not drop commits)"
+                ),
+                blocking: true,
+            });
+            report.passed = false;
+        }
     }
+    let capped = crate::services::task_replan::replan_cap_reached(amendment.round);
+    report.check_kind = Some(crate::services::plan_check::CHECK_KIND_POST_REPLAN.to_string());
+    report.replan_round = Some(amendment.round);
+    report.exhausted = Some(capped && !report.passed);
     let preflight_path = runs_dir.join("preflight.json");
     std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
     crate::services::plan_check::save_plan_check(&preflight_path, &report)?;
@@ -2339,7 +2412,7 @@ pub(crate) async fn run_phase_replan_arm(
             &run.plan.id,
             Some(&phase.phase_id),
             "agent_phase_preflight_passed",
-            json!({ "tasks": report.tasks_checked }),
+            json!({ "tasks": report.tasks_checked, "round": amendment.round }),
         )?;
         crate::services::task_replan::reset_for_resume(&mut file, &specs);
         crate::services::task_state::save_tasks(&tasks_path, &mut file)?;
@@ -2349,9 +2422,15 @@ pub(crate) async fn run_phase_replan_arm(
                 let _ = crate::services::task_state::project_status_yml(&task_dir, row);
             }
         }
+        crate::services::task_replan::write_skip_preflight_marker(&runs_dir)?;
+        if let Ok(current) = get_plan(state, &run.plan.id) {
+            if let Some(sid) = current.plan.worker_session_id {
+                let _ = sessions::archive_session(state, sid).await;
+            }
+        }
         state.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE agent_plans SET status = 'phase_worker_running', health = ?1, error = NULL, updated_at = datetime('now') WHERE id = ?2",
+                "UPDATE agent_plans SET status = 'phase_worker_running', worker_session_id = NULL, health = ?1, error = NULL, updated_at = datetime('now') WHERE id = ?2",
                 params![health_from_status("phase_worker_running"), run.plan.id],
             )
             .map_err(|e| e.to_string())
@@ -2361,7 +2440,6 @@ pub(crate) async fn run_phase_replan_arm(
 
     let blocking = report.items.iter().filter(|i| i.blocking).count();
     let nn = phase_nn(Some(&phase.phase_id));
-    let capped = crate::services::task_replan::replan_cap_reached(amendment.round);
     append_event(
         state,
         &run.plan.id,
@@ -2398,7 +2476,6 @@ pub(crate) async fn run_phase_replan_arm(
 }
 
 async fn collect_replan_phase_check(
-    _state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     task_run: &crate::services::task_state::TaskRunFile,
@@ -2408,23 +2485,42 @@ async fn collect_replan_phase_check(
     let workspace = PathBuf::from(&run.plan.workspace_path);
     let leaf_wrapper = leaf_wrapper_for(run.plan.executor_config.as_deref());
     let tokens = !ctrl.skip_execute;
-    let report = run_check_plan_blocking(
+    run_check_plan_blocking(
         &plan_path,
         &workspace,
-        CheckPlanCall {
-            only_phase: Some(&phase.phase_id),
-            skip_execute: ctrl.skip_execute,
-            previous_skipped: &[],
-            host: ctrl.host,
+        phase_check_call(
+            &phase.phase_id,
+            ctrl.host,
+            ctrl.skip_execute,
             tokens,
-            tokens_only: false,
-            run: Some(task_run),
-            tokens_budget_ms: Some(crate::services::plan_check::MAX_PLANNING_CHECK_MS),
-            leaf_wrapper: leaf_wrapper.as_deref(),
-        },
+            Some(task_run),
+            Some(crate::services::plan_check::MAX_PLANNING_CHECK_MS),
+            leaf_wrapper.as_deref(),
+        ),
     )
-    .await?;
-    Ok(report)
+    .await
+}
+
+fn phase_check_call<'a>(
+    phase_id: &'a str,
+    host: Option<&'a dyn crate::services::plan_check::PlanCheckHost>,
+    skip_execute: bool,
+    tokens: bool,
+    run: Option<&'a crate::services::task_state::TaskRunFile>,
+    tokens_budget_ms: Option<u64>,
+    leaf_wrapper: Option<&'a str>,
+) -> CheckPlanCall<'a> {
+    CheckPlanCall {
+        only_phase: Some(phase_id),
+        skip_execute,
+        previous_skipped: &[],
+        host,
+        tokens,
+        tokens_only: false,
+        run,
+        tokens_budget_ms,
+        leaf_wrapper,
+    }
 }
 
 async fn enter_phase_review(
@@ -4630,13 +4726,7 @@ pub(crate) async fn run_phase_preflight_with(
     host: Option<&dyn crate::services::plan_check::PlanCheckHost>,
     tokens_budget_ms: Option<u64>,
 ) -> Result<bool, String> {
-    let initiatives = settings_service::resolve_initiatives_dir(state);
-    let runs_dir = settings_service::initiative_runs_path(
-        &initiatives,
-        &run.plan.initiative_id,
-        &run.plan.id,
-        &phase.phase_id,
-    );
+    let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
     let tasks_path = crate::services::task_state::tasks_json_path(&runs_dir);
     let task_run = crate::services::task_state::load_tasks(
         &tasks_path,
@@ -4647,24 +4737,21 @@ pub(crate) async fn run_phase_preflight_with(
     let plan_path = PathBuf::from(&run.plan.plan_path);
     let workspace = PathBuf::from(&run.plan.workspace_path);
     let leaf_wrapper = leaf_wrapper_for(run.plan.executor_config.as_deref());
-    let report = run_check_plan_blocking(
+    let mut report = run_check_plan_blocking(
         &plan_path,
         &workspace,
-        CheckPlanCall {
-            only_phase: Some(&phase.phase_id),
-            skip_execute: false,
-            previous_skipped: &[],
+        phase_check_call(
+            &phase.phase_id,
             host,
-            tokens: true,
-            tokens_only: false,
-            run: task_run.as_ref(),
-            tokens_budget_ms: Some(
-                tokens_budget_ms.unwrap_or(crate::services::plan_check::MAX_PLANNING_CHECK_MS),
-            ),
-            leaf_wrapper: leaf_wrapper.as_deref(),
-        },
+            false,
+            true,
+            task_run.as_ref(),
+            Some(tokens_budget_ms.unwrap_or(crate::services::plan_check::MAX_PLANNING_CHECK_MS)),
+            leaf_wrapper.as_deref(),
+        ),
     )
     .await?;
+    report.check_kind = Some(crate::services::plan_check::CHECK_KIND_FIRST_START.to_string());
 
     std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
     let preflight_path = runs_dir.join("preflight.json");
@@ -7244,13 +7331,21 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             format!("Phase {nn} preflight passed — {n} tasks, 0 shape violations.")
         }
         "agent_phase_preflight_failed" => {
-            let nn = payload_str(payload, "nn")
-                .unwrap_or_else(|| phase_nn(event.phase_id.as_deref()).to_string());
-            let n = payload
-                .get("violations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            format!("Phase {nn} preflight failed — {n} violations.")
+            match payload_str(payload, "reason").as_deref() {
+                Some("replan amendment unreadable") => {
+                    "Replan parked — amendment record unreadable.".to_string()
+                }
+                Some("replan cap reached") => "Replan cap reached — still failing".to_string(),
+                _ => {
+                    let nn = payload_str(payload, "nn")
+                        .unwrap_or_else(|| phase_nn(event.phase_id.as_deref()).to_string());
+                    let n = payload
+                        .get("violations")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    format!("Phase {nn} preflight failed — {n} violations.")
+                }
+            }
         }
         "agent_phase_replan_started" => {
             "Re-planning — planner is amending routed tasks".to_string()
@@ -10652,6 +10747,7 @@ mod replan_tests {
         Fail,
         SplitSibling,
         DropDone,
+        Garbage,
     }
     impl FakePlanner for RewritePlanner {
         fn apply(
@@ -10690,6 +10786,12 @@ mod replan_tests {
                 }
                 RewriteMode::DropDone => {
                     let _ = std::fs::remove_dir_all(phase_dir.join("tasks/01-a"));
+                }
+                RewriteMode::Garbage => {
+                    let dir = phase_dir.join("tasks/04-d");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("task.yml"), ":::: not yaml\n").unwrap();
+                    std::fs::write(dir.join("prompt.md"), "implement 04-d\n").unwrap();
                 }
             }
             Ok(())
@@ -10859,6 +10961,7 @@ mod replan_tests {
             .unwrap();
         let after = get_plan(&state, &run.plan.id).unwrap();
         assert_eq!(after.plan.status, "phase_replan_running");
+        assert_eq!(after.plan.health, "needs-attention");
         assert_ne!(after.plan.status, "phase_review_running");
         assert_ne!(after.plan.status, "needs_attention");
         assert!(after
@@ -11036,6 +11139,21 @@ mod replan_tests {
             .events
             .iter()
             .any(|e| e.event_type == "agent_phase_replan_ready"));
+        let pf = crate::services::plan_check::load_plan_check(
+            &replan_runs_dir(&state, &after, "00-x").join("preflight.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            pf.check_kind.as_deref(),
+            Some(crate::services::plan_check::CHECK_KIND_POST_REPLAN)
+        );
+        assert_eq!(pf.replan_round, Some(1));
+        assert!(
+            crate::services::task_replan::skip_preflight_marker_path(&replan_runs_dir(
+                &state, &after, "00-x"
+            ))
+            .is_file()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11402,5 +11520,157 @@ mod replan_tests {
             .unwrap();
         assert_eq!(status, "archived");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skip_preflight_marker_consumed_so_second_entry_checks() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let fake = RewritePlanner {
+            mode: RewriteMode::Pass,
+        };
+        let ctrl = test_ctrl(&log, Some(&fake), &host);
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        follow_kloo_outcome_with(&state, &run, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        run_phase_replan_arm(&state, &get_plan(&state, &run.plan.id).unwrap(), &ctrl)
+            .await
+            .unwrap();
+        let runs = replan_runs_dir(&state, &run, "00-x");
+        assert!(
+            crate::services::task_replan::consume_skip_preflight_marker(&runs),
+            "first worker entry after replan skips"
+        );
+        assert!(
+            !crate::services::task_replan::consume_skip_preflight_marker(&runs),
+            "second entry must run preflight"
+        );
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        let ran = run_phase_preflight_with(&state, &after, phase, Some(&host), Some(1_000))
+            .await
+            .unwrap();
+        assert!(ran);
+        let pf = crate::services::plan_check::load_plan_check(&runs.join("preflight.json")).unwrap();
+        assert_eq!(
+            pf.check_kind.as_deref(),
+            Some(crate::services::plan_check::CHECK_KIND_FIRST_START)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn human_resume_after_cap_starts_round_one() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        let path = task_replan::amendment_json_path(&replan_runs_dir(&state, &run, "00-x"));
+        let a = task_replan::TaskAmendment {
+            schema: task_replan::SCHEMA.into(),
+            plan_id: run.plan.id.clone(),
+            phase_id: "00-x".into(),
+            round: 3,
+            routed: vec![],
+        };
+        task_replan::save_amendment(&path, &a).unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some("cap"))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let parked = get_plan(&state, &run.plan.id).unwrap();
+        reset_replan_budget_for_run(&state, &parked);
+        let loaded = task_replan::load_amendment(&path).unwrap();
+        assert_eq!(loaded.round, 0);
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let ctrl = test_ctrl(&log, None, &host);
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        let current = get_plan(&state, &run.plan.id).unwrap();
+        follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "phase_replan_running");
+        let a2 = task_replan::load_amendment(&path).unwrap();
+        assert_eq!(a2.round, 1);
+        assert_eq!(*log.lock().unwrap(), vec![1]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn unparseable_task_yml_is_failed_round_not_coordinator_error() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let fake = RewritePlanner {
+            mode: RewriteMode::Garbage,
+        };
+        let ctrl = test_ctrl(&log, Some(&fake), &host);
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        follow_kloo_outcome_with(&state, &run, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        run_phase_replan_arm(&state, &get_plan(&state, &run.plan.id).unwrap(), &ctrl)
+            .await
+            .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "phase_replan_running");
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "coordinator_failed"));
+        let a = task_replan::load_amendment(&task_replan::amendment_json_path(
+            &replan_runs_dir(&state, &after, "00-x"),
+        ))
+        .unwrap();
+        assert_eq!(a.round, 2);
+        assert_eq!(*log.lock().unwrap(), vec![1, 2]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn park_event_summaries_are_reason_aware() {
+        let ev = AgentPlanEvent {
+            id: "e".into(),
+            plan_id: "p".into(),
+            phase_id: Some("00-x".into()),
+            phase_index: None,
+            phase_title: None,
+            event_type: "agent_phase_preflight_failed".into(),
+            actor: "coordinator".into(),
+            category: "phase".into(),
+            summary: String::new(),
+            status_before: None,
+            status_after: None,
+            reason: None,
+            verdict: None,
+            task_id: None,
+            clarification_attempt: None,
+            payload_json: r#"{"reason":"replan amendment unreadable","exhausted":true,"violations":1,"nn":"00"}"#.into(),
+            created_at: String::new(),
+        };
+        let payload: serde_json::Value = serde_json::from_str(&ev.payload_json).unwrap();
+        assert_eq!(
+            event_summary(&ev, &payload),
+            "Replan parked — amendment record unreadable."
+        );
+        let mut cap = ev.clone();
+        cap.payload_json = r#"{"reason":"replan cap reached","exhausted":true,"round":3,"violations":2,"nn":"00"}"#.into();
+        let p2: serde_json::Value = serde_json::from_str(&cap.payload_json).unwrap();
+        assert_eq!(
+            event_summary(&cap, &p2),
+            "Replan cap reached — still failing"
+        );
     }
 }

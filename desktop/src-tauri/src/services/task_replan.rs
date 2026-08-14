@@ -51,6 +51,37 @@ pub fn amendment_json_path(runs_dir: &Path) -> PathBuf {
     runs_dir.join("amendment.json")
 }
 
+/// One-shot: written when a replan check passes, consumed by the next
+/// `run_development_worker_phase` so we skip only that immediate re-entry.
+pub fn skip_preflight_marker_path(runs_dir: &Path) -> PathBuf {
+    runs_dir.join("replan-skip-preflight")
+}
+
+pub fn write_skip_preflight_marker(runs_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(runs_dir).map_err(|e| format!("mkdir {}: {e}", runs_dir.display()))?;
+    atomic_fs::write_atomic(&skip_preflight_marker_path(runs_dir), b"1")
+}
+
+/// Returns true once, then the marker is gone. Later entries run preflight.
+pub fn consume_skip_preflight_marker(runs_dir: &Path) -> bool {
+    let path = skip_preflight_marker_path(runs_dir);
+    if !path.is_file() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&path);
+    true
+}
+
+/// Human Resume/Amend: restore replan capacity. `round = 0` means the next
+/// episode starts at 1 (`next_episode_round`).
+pub fn reset_replan_round(path: &Path) -> Result<(), String> {
+    let Some(mut existing) = load_amendment_optional(path)? else {
+        return Ok(());
+    };
+    existing.round = 0;
+    save_amendment(path, &existing)
+}
+
 /// `shape` when the last attempt classified as shape; otherwise `exhausted`.
 pub fn amendment_rule_for(row: &TaskRow) -> &'static str {
     match row
@@ -146,6 +177,7 @@ pub fn load_amendment_optional(path: &Path) -> Result<Option<TaskAmendment>, Str
 pub fn next_episode_round(existing: Option<&TaskAmendment>) -> Result<u32, ()> {
     match existing {
         None => Ok(1),
+        Some(a) if a.round == 0 => Ok(1),
         Some(a) if replan_cap_reached(a.round) => Err(()),
         Some(a) => Ok(a.round.saturating_add(1)),
     }
@@ -499,6 +531,38 @@ mod tests {
         assert_eq!(next_episode_round(Some(&a)), Err(()));
         a.round = 1;
         assert_eq!(next_episode_round(Some(&a)), Ok(2));
+        a.round = 0;
+        assert_eq!(next_episode_round(Some(&a)), Ok(1));
+    }
+
+    #[test]
+    fn skip_preflight_marker_is_one_shot() {
+        let root = tmp("skip-once");
+        assert!(!consume_skip_preflight_marker(&root));
+        write_skip_preflight_marker(&root).unwrap();
+        assert!(consume_skip_preflight_marker(&root));
+        assert!(!consume_skip_preflight_marker(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reset_replan_round_restores_budget() {
+        let root = tmp("reset-round");
+        let path = amendment_json_path(&root);
+        let a = TaskAmendment {
+            schema: SCHEMA.into(),
+            plan_id: "p".into(),
+            phase_id: "00-x".into(),
+            round: 3,
+            routed: vec![],
+        };
+        save_amendment(&path, &a).unwrap();
+        assert_eq!(next_episode_round(Some(&a)), Err(()));
+        reset_replan_round(&path).unwrap();
+        let loaded = load_amendment(&path).unwrap();
+        assert_eq!(loaded.round, 0);
+        assert_eq!(next_episode_round(Some(&loaded)), Ok(1));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

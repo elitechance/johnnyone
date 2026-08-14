@@ -118,7 +118,20 @@ pub struct PlanCheckReport {
     /// pass sorts these first (D7 carry-over).
     #[serde(default)]
     pub skipped_ids: Vec<String>,
+    /// Post-replan episode (1..=MAX_REPLAN_ROUNDS). Absent on first-start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replan_round: Option<u32>,
+    /// True when this report is the last one after the replan cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted: Option<bool>,
+    /// `first_start` | `post_replan` | `replan_park` — S11 card selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_kind: Option<String>,
 }
+
+pub const CHECK_KIND_FIRST_START: &str = "first_start";
+pub const CHECK_KIND_POST_REPLAN: &str = "post_replan";
+pub const CHECK_KIND_REPLAN_PARK: &str = "replan_park";
 
 impl PlanCheckReport {
     pub fn empty() -> Self {
@@ -133,6 +146,9 @@ impl PlanCheckReport {
             verify_skipped: 0,
             phases: Vec::new(),
             skipped_ids: Vec::new(),
+            replan_round: None,
+            exhausted: None,
+            check_kind: None,
         }
     }
 

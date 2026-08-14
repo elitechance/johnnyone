@@ -30,7 +30,7 @@ const MIGRATION_021: &str = include_str!("../../migrations/021_add_executor_conf
 pub fn health_from_status(status: &str) -> &'static str {
     match status {
         "blocked" => "blocked",
-        "needs_attention" | "phase_needs_changes" => "needs-attention",
+        "needs_attention" | "phase_needs_changes" | "phase_replan_running" => "needs-attention",
         // Terminal, healthy end states: a fully-approved/complete run is DONE, not
         // "in-progress". Without this, the HEALTH axis is stuck on in-progress forever
         // after approval (the console reads it straight from this derivation).
@@ -279,6 +279,7 @@ mod tests {
         assert_eq!(health_from_status("blocked"), "blocked");
         assert_eq!(health_from_status("needs_attention"), "needs-attention");
         assert_eq!(health_from_status("phase_needs_changes"), "needs-attention");
+        assert_eq!(health_from_status("phase_replan_running"), "needs-attention");
         assert_eq!(health_from_status("draft"), "in-progress");
         assert_eq!(health_from_status("approved"), "complete");
         assert_eq!(health_from_status("done"), "complete");
