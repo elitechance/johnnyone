@@ -75,11 +75,24 @@ describe('taskDetail', () => {
       },
     );
     expect(v.success).toBe(false);
-    expect(v.klooCommand).toContain('cargo test');
+    expect(v.klooCommand).toBe('');
     expect(v.filesChanged).toEqual(['src/d.rs']);
     expect(v.postchecks).toBeTruthy();
     expect(v.transcriptTail).toBe('boom');
     expect(v.hasAttempt).toBe(true);
+  });
+
+  it('klooCommand is the persisted argv, not verify.command', () => {
+    const v = taskDetail(
+      { id: '04-d', status: 'failed', attempts: [{ attempt: 1 }] },
+      spec,
+      {
+        command: 'kloo --benchmark --verify cargo test d',
+        verify: { command: 'cargo test d -- --exact', passed: false },
+      },
+    );
+    expect(v.klooCommand).toContain('kloo --benchmark');
+    expect(v.klooCommand).not.toBe('cargo test d -- --exact');
   });
 
   it('done fixture: five checks pass, commit sha, no red alert', () => {

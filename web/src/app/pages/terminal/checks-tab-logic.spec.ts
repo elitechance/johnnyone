@@ -6,6 +6,8 @@ import type { AgentPlan } from '../../../../../ui/src/services/johnny-api.servic
 import { visibleConsoleTabs } from './console-tabs-logic';
 import {
   checksView,
+  checksSourceOf,
+  replanFlagsOf,
   ruleLabel,
   RULE_LABELS,
   selectRuleChip,
@@ -141,6 +143,19 @@ describe('checksView + RULE_LABELS', () => {
 
   it('null report is empty', () => {
     expect(checksView(null).state).toBe('empty');
+  });
+
+  it('checksSourceOf uses the loaded report, not initiative stage', () => {
+    const plan = { passed: false, items: SEVEN };
+    const pre = { passed: true, items: [], checkKind: 'post_replan' };
+    expect(checksSourceOf(plan, null)).toEqual({ report: plan, source: 'planning' });
+    expect(checksSourceOf(plan, pre)).toEqual({ report: pre, source: 'preflight' });
+    expect(checksSourceOf(null, null).source).toBe('planning');
+    expect(replanFlagsOf({ checkKind: 'replan_park', exhausted: false })).toEqual({
+      exhausted: false,
+      parked: true,
+    });
+    expect(replanFlagsOf({ checkKind: 'replan_park', exhausted: true }).parked).toBe(false);
   });
 
   it('preflight first-start / replan / cap / unreadable copy', () => {

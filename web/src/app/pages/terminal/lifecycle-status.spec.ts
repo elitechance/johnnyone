@@ -12,6 +12,8 @@ import {
   stageIndex,
   stageFill,
   stageDescription,
+  planningRoundOf,
+  phaseNnOf,
   LIFECYCLE_STAGES,
 } from '../../../../../ui/src/lib/lifecycle-status';
 
@@ -125,6 +127,29 @@ describe('stageFill / stageDescription', () => {
   });
   it('commercial no extras is 60%', () => {
     expect(stageFill({ active: 0, idx: 0 })).toBe('60%');
+  });
+  it('clamps planning fill at 100%', () => {
+    expect(stageFill({ active: 0, idx: 0, planningRound: 9, planningRoundMax: 6 })).toBe('100%');
+  });
+  it('planningRoundOf is consecutive non-pass, reset on PASS/start/stop', () => {
+    expect(
+      planningRoundOf([
+        { eventType: 'planning_check_failed' },
+        { eventType: 'planning_gate_result', verdict: 'NEEDS_CHANGES' },
+        { eventType: 'planning_gate_result', verdict: 'NEEDS_CHANGES' },
+      ]),
+    ).toBe(3);
+    expect(
+      planningRoundOf([
+        { eventType: 'planning_check_failed' },
+        { eventType: 'planning_gate_result', verdict: 'PASS' },
+        { eventType: 'planning_started' },
+        { eventType: 'planning_gate_result', verdict: 'NEEDS_CHANGES' },
+      ]),
+    ).toBe(1);
+    expect(planningRoundOf([{ eventType: 'planning_gate_result', verdict: 'PASS' }])).toBeNull();
+    expect(phaseNnOf('04-queue-routing')).toBe('04');
+    expect(phaseNnOf('')).toBe('');
   });
   it('replan description', () => {
     expect(stageDescription({ stage: 'development', replan: true, phaseNn: '00' })).toContain(

@@ -228,7 +228,7 @@ function parseAttempt(raw: unknown): {
   const verify = obj.verify;
   const changed = obj.files_changed ?? obj.filesChanged;
   return {
-    command: typeof obj.command === 'string' ? obj.command : typeof verify?.command === 'string' ? verify.command : '',
+    command: typeof obj.command === 'string' ? obj.command : '',
     success: typeof obj.success === 'boolean' ? obj.success : null,
     failureCode:
       typeof obj.failure_code === 'string'

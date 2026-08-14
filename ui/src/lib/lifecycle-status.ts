@@ -78,17 +78,55 @@ export interface StageFillArgs {
   devTotal?: number | null;
 }
 
+function pct(numer: number, denom: number): string {
+  if (!Number.isFinite(numer) || !Number.isFinite(denom) || denom <= 0) return '60%';
+  return `${Math.max(0, Math.min(100, Math.round((numer / denom) * 100)))}%`;
+}
+
 export function stageFill(args: StageFillArgs): string {
   const { active, idx } = args;
   if (active < 0 || idx > active) return '0%';
   if (idx < active) return '100%';
   if (idx === 0 && args.planningRound && args.planningRoundMax) {
-    return `${Math.round((args.planningRound / args.planningRoundMax) * 100)}%`;
+    return pct(args.planningRound, args.planningRoundMax);
   }
   if (idx === 1 && args.devTotal && args.devTotal > 0) {
-    return `${Math.round(((args.devDone ?? 0) / args.devTotal) * 100)}%`;
+    return pct(args.devDone ?? 0, args.devTotal);
   }
   return '60%';
+}
+
+export interface PlanningRoundEvent {
+  eventType?: string;
+  verdict?: string | null;
+}
+
+/** Mirror host `consecutive_non_pass_planning_rounds`: walk newest-first, count
+ *  `planning_check_failed` and non-PASS `planning_gate_result`, reset at PASS /
+ *  `planning_started` / `agent_plan_stopped`. */
+export function planningRoundOf(
+  events: PlanningRoundEvent[] | null | undefined,
+): number | null {
+  const all = events ?? [];
+  let n = 0;
+  for (let i = all.length - 1; i >= 0; i--) {
+    const kind = all[i].eventType ?? '';
+    if (kind === 'agent_plan_stopped' || kind === 'planning_started') break;
+    if (kind === 'planning_check_failed') {
+      n += 1;
+      continue;
+    }
+    if (kind !== 'planning_gate_result') continue;
+    const verdict = (all[i].verdict ?? '').trim().toUpperCase();
+    if (verdict === 'PASS') break;
+    if (verdict) n += 1;
+  }
+  return n > 0 ? n : null;
+}
+
+export function phaseNnOf(phaseId: string | null | undefined): string {
+  const id = (phaseId ?? '').trim();
+  return id.split('-')[0] || '';
 }
 
 export interface StageDescriptionArgs {

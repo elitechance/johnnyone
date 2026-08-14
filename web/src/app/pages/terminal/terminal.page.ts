@@ -79,6 +79,8 @@ import {
   StreamEvent,
   HostFileEntry,
   TmuxSession,
+  planningRoundOf,
+  phaseNnOf,
 } from '@johnnyone/ui';
 import {
   PaneTab,
@@ -111,7 +113,14 @@ import {
   isLocalSmall,
   resolvedPaneTab,
 } from './console-tabs-logic';
-import { checksView, selectRuleChip, type ChecksView, type PlanCheckReportLike } from './checks-tab-logic';
+import {
+  checksView,
+  checksSourceOf,
+  replanFlagsOf,
+  selectRuleChip,
+  type ChecksView,
+  type PlanCheckReportLike,
+} from './checks-tab-logic';
 import {
   taskTable,
   taskCounts,
@@ -120,10 +129,10 @@ import {
   replanBanner,
   initialSelectedId,
   selectPlaceholder,
+  failedBlockedCount,
   type TaskRunLike,
-  type TaskTableRow,
 } from './tasks-tab-logic';
-import { taskDetail, dependentsOf, type TaskDetailView } from './task-detail-logic';
+import { taskDetail, type TaskDetailView } from './task-detail-logic';
 import {
   planCounts,
   docNavModel,
@@ -548,12 +557,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       return null;
     }
   });
-  protected readonly replanFlags = computed(() => {
-    const r = this.parsedPreflight();
-    const exhausted = r?.exhausted === true;
-    const parked = (r?.checkKind ?? r?.check_kind) === 'replan_park' && !exhausted;
-    return { exhausted, parked };
-  });
+  protected readonly replanFlags = computed(() => replanFlagsOf(this.parsedPreflight()));
   protected readonly visibleTabs = computed(() =>
     visibleConsoleTabs(
       this.selectedInitiative(),
@@ -563,10 +567,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     ),
   );
   protected readonly checks = computed<ChecksView>(() => {
-    const init = this.selectedInitiative();
-    const source =
-      (init?.initiativeStatus ?? '').toLowerCase() === 'planning' ? 'planning' : 'preflight';
-    const report = source === 'planning' ? this.parsedPlanCheck() : this.parsedPreflight() || this.parsedPlanCheck();
+    const { report, source } = checksSourceOf(this.parsedPlanCheck(), this.parsedPreflight());
     return checksView(report, {
       source,
       checkKind: report?.checkKind ?? report?.check_kind,
@@ -603,13 +604,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly firstFailedId = computed(
     () => this.taskRows().find((r) => r.state === 'failed')?.id ?? null,
   );
-  protected readonly failedBlockedCount = computed(() => {
-    const id = this.firstFailedId();
-    if (!id) return 0;
-    const fromSpecs = dependentsOf(id, this.taskSpecs()).length;
-    if (fromSpecs) return fromSpecs;
-    return this.taskRows().filter((r) => r.blockedBy === id).length;
-  });
+  protected readonly failedBlockedCount = computed(() =>
+    failedBlockedCount(this.firstFailedId(), this.taskSpecs(), this.taskRows()),
+  );
   protected readonly taskDetailView = computed<TaskDetailView | null>(() => {
     const id = this.selectedTaskId();
     const run = this.taskRun();
@@ -623,15 +620,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly lifecycleReplan = computed(
     () => this.selectedInitiative()?.status === 'phase_replan_running',
   );
-  protected readonly phaseNn = computed(() => {
-    const id = this.selectedInitiative()?.currentPhaseId ?? '';
-    return id.split('-')[0] || '';
-  });
-  protected readonly planningRound = computed(() => {
-    const evs = this.initiativeEvents();
-    const n = evs.filter((e) => e.eventType === 'planning_check_failed').length;
-    return n > 0 ? n : null;
-  });
+  protected readonly phaseNn = computed(() =>
+    phaseNnOf(this.selectedInitiative()?.currentPhaseId),
+  );
+  protected readonly planningRound = computed(() =>
+    planningRoundOf(this.initiativeEvents()),
+  );
   /** Which pane the §08 mobile switcher currently shows. */
   protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
 

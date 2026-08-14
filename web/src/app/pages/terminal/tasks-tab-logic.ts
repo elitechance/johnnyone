@@ -16,7 +16,15 @@ export interface TaskRowLike {
   succeeded_tier?: string | null;
   commitSha?: string | null;
   commit_sha?: string | null;
-  attempts?: { tier?: string; endedAt?: string; startedAt?: string }[];
+  attempts?: {
+    tier?: string;
+    endedAt?: string;
+    startedAt?: string;
+    checks?: { failed?: { check: string }[] };
+    failed?: { check: string }[];
+    verify?: { passed?: boolean };
+    postchecks?: { passed?: boolean }[];
+  }[];
 }
 
 export interface TaskTableRow {
@@ -58,6 +66,44 @@ export function taskCounts(run: TaskRunLike | null | undefined): TaskCounts {
   return c;
 }
 
+export function verifyOkOf(
+  last:
+    | {
+        checks?: { failed?: { check: string }[] };
+        failed?: { check: string }[];
+        verify?: { passed?: boolean };
+        postchecks?: { passed?: boolean }[];
+      }
+    | null
+    | undefined,
+): string {
+  if (!last) return '';
+  const failed = last.checks?.failed ?? last.failed;
+  if (Array.isArray(failed)) {
+    return failed.some((f) => f.check === 'verify') ? 'fail' : 'ok';
+  }
+  if (typeof last.verify?.passed === 'boolean') {
+    return last.verify.passed ? 'ok' : 'fail';
+  }
+  if (Array.isArray(last.postchecks)) {
+    return last.postchecks.every((h) => h.passed) ? 'ok' : 'fail';
+  }
+  return '';
+}
+
+export function failedBlockedCount(
+  failedId: string | null | undefined,
+  specs: { id?: string; dependsOn?: string[]; depends_on?: string[] }[] | null | undefined,
+  rows: { blockedBy: string | null }[],
+): number {
+  if (!failedId) return 0;
+  const fromSpecs = (specs ?? []).filter((s) =>
+    (s.dependsOn ?? s.depends_on ?? []).includes(failedId),
+  ).length;
+  if (fromSpecs) return fromSpecs;
+  return rows.filter((r) => r.blockedBy === failedId).length;
+}
+
 export function tookOf(start: unknown, end: unknown): string {
   const s = Date.parse(String(start ?? ''));
   const e = Date.parse(String(end ?? ''));
@@ -76,7 +122,17 @@ export function taskTable(
   return (run?.tasks ?? []).map((t, i) => {
     const spec = specMap.get(t.id);
     const last = t.attempts?.[t.attempts.length - 1] as
-      | { tier?: string; startedAt?: string; started_at?: string; endedAt?: string; ended_at?: string }
+      | {
+          tier?: string;
+          startedAt?: string;
+          started_at?: string;
+          endedAt?: string;
+          ended_at?: string;
+          checks?: { failed?: { check: string }[] };
+          failed?: { check: string }[];
+          verify?: { passed?: boolean };
+          postchecks?: { passed?: boolean }[];
+        }
       | undefined;
     const start = last?.startedAt ?? last?.started_at;
     const end = last?.endedAt ?? last?.ended_at;
@@ -87,7 +143,7 @@ export function taskTable(
       files: (spec?.files ?? []).join(', '),
       state: t.status || 'pending',
       tier: t.succeededTier ?? t.succeeded_tier ?? last?.tier ?? '',
-      verifyOk: t.status === 'done' ? 'ok' : t.status === 'failed' ? 'fail' : '',
+      verifyOk: verifyOkOf(last),
       commit: (t.commitSha ?? t.commit_sha ?? '').slice(0, 8),
       took,
       blockedBy: t.blockedBy ?? t.blocked_by ?? null,

@@ -315,14 +315,22 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Parse last `KLOO_RESULT_JSON` and persist the attempt object. Used by the
 /// live loop and the `#[cfg(test)]` spawn helper so both share one write path.
+fn kloo_command_echo(req: &KlooRunRequest) -> Option<String> {
+    let cfg = build_config(req).ok()?;
+    let mut parts = vec![cfg.command];
+    parts.extend(cfg.args);
+    Some(parts.join(" "))
+}
+
 fn parse_and_record_attempt(
     stdout: &str,
     runs_dir: &Path,
     task_id: &str,
     attempt_n: u32,
+    command: Option<&str>,
 ) -> Result<KlooResult, String> {
     let parsed = parse_result_from_stdout(stdout)?;
-    write_attempt_json(runs_dir, task_id, attempt_n, &parsed)?;
+    write_attempt_json(runs_dir, task_id, attempt_n, &parsed, command)?;
     Ok(parsed)
 }
 
@@ -336,7 +344,14 @@ pub async fn spawn_kloo_task<S: KlooSpawner>(
 ) -> Result<(KlooResult, i32, crate::providers::CliSpawnConfig), String> {
     let cfg = build_config(req)?;
     let outcome = spawner.spawn(req).await?;
-    let parsed = parse_and_record_attempt(&outcome.stdout, runs_dir, task_id, attempt_n)?;
+    let echo = kloo_command_echo(req);
+    let parsed = parse_and_record_attempt(
+        &outcome.stdout,
+        runs_dir,
+        task_id,
+        attempt_n,
+        echo.as_deref(),
+    )?;
     Ok((parsed, outcome.exit_code, cfg))
 }
 
@@ -345,13 +360,19 @@ fn write_attempt_json(
     task_id: &str,
     attempt_n: u32,
     result: &KlooResult,
+    command: Option<&str>,
 ) -> Result<(), String> {
     let path = attempt_json_path(runs_dir, task_id, attempt_n);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(result)
+    let mut value = serde_json::to_value(result)
+        .map_err(|e| format!("serialize attempt json: {e}"))?;
+    if let (Some(cmd), Some(obj)) = (command.filter(|s| !s.is_empty()), value.as_object_mut()) {
+        obj.insert("command".into(), serde_json::Value::String(cmd.to_string()));
+    }
+    let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|e| format!("serialize attempt json: {e}"))?;
     atomic_fs::write_atomic(&path, &bytes)
 }
@@ -649,6 +670,7 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                         &ctx.runs_dir,
                         &task_id,
                         attempt_n,
+                        kloo_command_echo(&req).as_deref(),
                     ) {
                         Ok(parsed) => (parsed, outcome.exit_code, None),
                         Err(e) => (
@@ -1747,7 +1769,9 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(exit, 0);
-        assert!(runs.join("01-add").join("1.json").is_file());
+        let recorded = std::fs::read_to_string(runs.join("01-add").join("1.json")).unwrap();
+        assert!(recorded.contains("\"command\""), "{recorded}");
+        assert!(recorded.contains("kloo"), "{recorded}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

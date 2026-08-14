@@ -1631,9 +1631,9 @@ ion-modal.workspace-picker .picker-empty {
 
 .console-list .chip.kloo,
 .console .chip.kloo {
-  background: color-mix(in srgb, #9a7ef0 22%, transparent);
-  color: #cbb6ff;
-  border: 1px solid color-mix(in srgb, #9a7ef0 40%, transparent);
+  background: color-mix(in srgb, var(--jo-st-development) 22%, transparent);
+  color: var(--jo-st-development);
+  border: 1px solid var(--jo-st-development);
   border-radius: 5px;
   padding: 1px 6px;
   font-size: 11px;

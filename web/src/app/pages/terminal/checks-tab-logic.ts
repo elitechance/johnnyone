@@ -168,6 +168,24 @@ function num(...vals: (number | undefined)[]): number {
   return 0;
 }
 
+export function checksSourceOf(
+  planCheck: PlanCheckReportLike | null | undefined,
+  preflight: PlanCheckReportLike | null | undefined,
+): { report: PlanCheckReportLike | null; source: 'planning' | 'preflight' } {
+  if (preflight) return { report: preflight, source: 'preflight' };
+  if (planCheck) return { report: planCheck, source: 'planning' };
+  return { report: null, source: 'planning' };
+}
+
+export function replanFlagsOf(report: PlanCheckReportLike | null | undefined): {
+  exhausted: boolean;
+  parked: boolean;
+} {
+  const exhausted = report?.exhausted === true;
+  const kind = report?.checkKind ?? report?.check_kind;
+  return { exhausted, parked: kind === 'replan_park' && !exhausted };
+}
+
 export function checksView(
   report: PlanCheckReportLike | null | undefined,
   ctx?: ChecksCtx,

@@ -9,6 +9,8 @@ import {
   taskCounts,
   taskTable,
   tasksEmptyCopy,
+  verifyOkOf,
+  failedBlockedCount,
   windowRows,
   type TaskRowLike,
 } from './tasks-tab-logic';
@@ -77,6 +79,37 @@ describe('counts / empty / banner', () => {
   it('empty copy, not a table', () => {
     expect(tasksEmptyCopy({ tasks: [] })).toBe('No tasks in this phase yet');
     expect(tasksEmptyCopy(null, 'invalid tasks.json')).toBe("Could not read this phase's task run");
+  });
+
+  it('verify column follows last attempt checks, not row status', () => {
+    expect(verifyOkOf({ checks: { failed: [{ check: 'scope' }] } })).toBe('ok');
+    expect(verifyOkOf({ checks: { failed: [{ check: 'verify' }] } })).toBe('fail');
+    expect(verifyOkOf({ verify: { passed: true } })).toBe('ok');
+    expect(verifyOkOf(undefined)).toBe('');
+    const table = taskTable({
+      tasks: [
+        {
+          id: 't1',
+          status: 'failed',
+          attempts: [{ checks: { failed: [{ check: 'must_contain' }] } }],
+        },
+      ],
+    });
+    expect(table[0].verifyOk).toBe('ok');
+  });
+
+  it('failedBlockedCount prefers dependents, then blockedBy', () => {
+    expect(
+      failedBlockedCount('t1', [{ id: 't2', dependsOn: ['t1'] }, { id: 't3', depends_on: ['t1'] }], []),
+    ).toBe(2);
+    expect(
+      failedBlockedCount('t1', [], [
+        { blockedBy: 't1' },
+        { blockedBy: 't1' },
+        { blockedBy: 'x' },
+      ]),
+    ).toBe(2);
+    expect(failedBlockedCount(null, [], [])).toBe(0);
   });
 
   it('replan banners', () => {
