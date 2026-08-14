@@ -1251,7 +1251,13 @@ pub async fn send_feedback_to_worker(state: AppState, id: String) -> Result<Agen
 pub async fn rerun_reviewer(state: AppState, id: String) -> Result<AgentPlanRun, String> {
     let run = get_plan(&state, &id)?;
     if run.plan.run_type == "planning" {
-        dispatch_planning_review(&state, &run).await?;
+        // Local-small must re-run the plan-check. Dispatching review here
+        // would skip the gate the same way the old pre-check status write did.
+        if is_local_small(&state, &run.plan.id) {
+            gate_planning_lenses(&state, &run, &PlanningCheckCtrl::live()).await?;
+        } else {
+            dispatch_planning_review(&state, &run).await?;
+        }
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
@@ -3628,7 +3634,7 @@ async fn run_check_plan_blocking(
         opts.only_phase = call.only_phase;
         opts.skip_execute = call.skip_execute;
         opts.previous_skipped = call.previous_skipped;
-        apply_check_mode(&mut opts, call.tokens, call.tokens_only, call.skip_execute);
+        apply_check_mode(&mut opts, call.tokens, call.tokens_only);
         return Ok(crate::services::plan_check::check_plan_with(
             plan_path, workspace, &opts,
         ));
@@ -3647,7 +3653,7 @@ async fn run_check_plan_blocking(
         opts.only_phase = only_ref;
         opts.skip_execute = skip_execute;
         opts.previous_skipped = &prev;
-        apply_check_mode(&mut opts, tokens, tokens_only, skip_execute);
+        apply_check_mode(&mut opts, tokens, tokens_only);
         crate::services::plan_check::check_plan_with(&plan_path, &workspace, &opts)
     })
     .await
@@ -3658,7 +3664,6 @@ fn apply_check_mode(
     opts: &mut crate::services::plan_check::CheckPlanOpts<'_>,
     tokens: bool,
     tokens_only: bool,
-    _skip_execute: bool,
 ) {
     opts.tokens_only = tokens_only;
     if tokens_only {
@@ -3671,6 +3676,62 @@ fn apply_check_mode(
         // Always enter execute_phase so skip_execute can emit verify_not_executed.
         opts.execute = true;
         opts.tokens = false;
+    }
+}
+
+struct CheckFindingsSummary {
+    prompt: String,
+    preview: Vec<serde_json::Value>,
+    counts_by_rule: serde_json::Map<String, serde_json::Value>,
+}
+
+fn summarize_check_findings(
+    items: &[crate::services::plan_check::PlanCheckItem],
+    cap: usize,
+) -> CheckFindingsSummary {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for i in items {
+        *counts.entry(i.rule.clone()).or_default() += 1;
+    }
+    let counts_by_rule: serde_json::Map<String, serde_json::Value> = counts
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(*v)))
+        .collect();
+    let preview: Vec<serde_json::Value> = items
+        .iter()
+        .take(cap)
+        .map(|i| {
+            json!({
+                "task_id": i.task_id,
+                "rule": i.rule,
+                "detail": i.detail,
+            })
+        })
+        .collect();
+    let mut prompt = String::new();
+    prompt.push_str("Counts by rule:\n");
+    for (rule, n) in &counts {
+        prompt.push_str(&format!("- {rule}: {n}\n"));
+    }
+    prompt.push('\n');
+    for i in items.iter().take(cap) {
+        prompt.push_str(&format!(
+            "- [{}] {} — {}\n",
+            i.rule,
+            i.task_id.as_deref().unwrap_or("(plan)"),
+            i.detail
+        ));
+    }
+    if items.len() > cap {
+        prompt.push_str(&format!(
+            "… and {} more (see check-findings.json)\n",
+            items.len() - cap
+        ));
+    }
+    CheckFindingsSummary {
+        prompt,
+        preview,
+        counts_by_rule,
     }
 }
 
@@ -3838,6 +3899,7 @@ pub(crate) async fn gate_planning_lenses(
         return dispatch_planning_review(state, run).await;
     }
 
+    let summary = summarize_check_findings(&acc.items, 8);
     append_event(
         state,
         &run.plan.id,
@@ -3845,11 +3907,10 @@ pub(crate) async fn gate_planning_lenses(
         "planning_check_failed",
         json!({
             "verdict": "NEEDS_CHANGES",
-            "items": acc.items.iter().map(|i| json!({
-                "taskId": i.task_id,
-                "rule": i.rule,
-                "detail": i.detail,
-            })).collect::<Vec<_>>(),
+            "total": acc.items.len(),
+            "countsByRule": summary.counts_by_rule,
+            "items": summary.preview,
+            "findingsPath": check_findings_path(&run.plan.plan_path).display().to_string(),
         }),
     )?;
 
@@ -3881,7 +3942,7 @@ pub(crate) async fn gate_planning_lenses(
     })?;
 
     if ctrl.send_planner {
-        let _ = send_plan_check_findings_to_planner(state, run, &acc).await;
+        send_plan_check_findings_to_planner(state, run, &acc).await?;
     }
     Ok(())
 }
@@ -3892,20 +3953,15 @@ async fn send_plan_check_findings_to_planner(
     report: &crate::services::plan_check::PlanCheckReport,
 ) -> Result<(), String> {
     let Some(session_id) = run.plan.worker_session_id.clone() else {
-        return Ok(());
+        return Err("Planning run has no planner session".to_string());
     };
+    let findings_path = check_findings_path(&run.plan.plan_path);
+    let summary = summarize_check_findings(&report.items, 8);
     let mut body = String::from("Plan-check failed. Fix every item (task_id + rule).\n\n");
-    for item in &report.items {
-        body.push_str(&format!(
-            "- [{}] {} — {}\n",
-            item.rule,
-            item.task_id.as_deref().unwrap_or("(plan)"),
-            item.detail
-        ));
-    }
+    body.push_str(&summary.prompt);
     body.push_str(&format!(
-        "\nStructured findings: {}\n",
-        check_findings_path(&run.plan.plan_path).display()
+        "\nFull structured findings: {}\n",
+        findings_path.display()
     ));
     let prompt = append_worker_report(run, body);
     terminal::send_terminal_input(state, session_id, format!("{}\r", prompt)).await?;
@@ -4058,6 +4114,24 @@ fn count_consecutive_non_pass(
     start_event_type: &str,
     phase_id: Option<&str>,
 ) -> i64 {
+    count_consecutive_non_pass_kinds(
+        events,
+        gate_event_type,
+        start_event_type,
+        phase_id,
+        &[],
+        &[],
+    )
+}
+
+fn count_consecutive_non_pass_kinds(
+    events: &[AgentPlanEvent],
+    gate_event_type: &str,
+    start_event_type: &str,
+    phase_id: Option<&str>,
+    extra_fail: &[&str],
+    extra_pass: &[&str],
+) -> i64 {
     let mut n = 0;
     for event in events.iter().rev() {
         // Reset boundaries: a manual stop, or a fresh (re)start of this attempt, ends
@@ -4071,6 +4145,13 @@ fn count_consecutive_non_pass(
             && phase_id.map_or(true, |pid| event.phase_id.as_deref() == Some(pid))
         {
             break;
+        }
+        if extra_pass.contains(&event.event_type.as_str()) {
+            break;
+        }
+        if extra_fail.contains(&event.event_type.as_str()) {
+            n += 1;
+            continue;
         }
         if event.event_type != gate_event_type {
             continue;
@@ -4090,23 +4171,14 @@ fn count_consecutive_non_pass(
 }
 
 fn consecutive_non_pass_planning_rounds(run: &AgentPlanRun) -> i64 {
-    let mut n = 0;
-    for event in run.events.iter().rev() {
-        if event.event_type == "agent_plan_stopped" || event.event_type == "planning_started" {
-            break;
-        }
-        match event.event_type.as_str() {
-            "planning_gate_result" => match event_payload_verdict(event).as_deref() {
-                Some("PASS") => break,
-                Some(_) => n += 1,
-                None => {}
-            },
-            "planning_check_failed" => n += 1,
-            "planning_check_passed" => break,
-            _ => {}
-        }
-    }
-    n
+    count_consecutive_non_pass_kinds(
+        &run.events,
+        "planning_gate_result",
+        "planning_started",
+        None,
+        &["planning_check_failed"],
+        &["planning_check_passed"],
+    )
 }
 
 fn consecutive_non_pass_phase_rounds(run: &AgentPlanRun, phase_id: &str) -> i64 {
@@ -6407,7 +6479,7 @@ fn event_status_transition(
 ) -> (Option<&'static str>, Option<&'static str>) {
     match event_type {
         "planning_started" => (None, Some("planning_planner_running")),
-        "planning_planner_ready" => (Some("planning_planner_running"), Some("planning_review_running")),
+        "planning_planner_ready" => (Some("planning_planner_running"), None),
         "planning_review_started" => (Some("planning_planner_running"), Some("planning_review_running")),
         "planning_gate_result" => match payload_str(payload, "verdict").as_deref() {
             Some("PASS") => (Some("planning_review_running"), Some("approved")),
@@ -8582,6 +8654,117 @@ mod plan_check_gate_tests {
             .collect();
         assert!(rules.len() >= 2, "{parsed:?}");
         assert!(plan_check_json_path(&state, &after).exists());
+        let ev = after
+            .events
+            .iter()
+            .find(|e| e.event_type == "planning_check_failed")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&ev.payload_json).unwrap();
+        assert!(payload.get("findingsPath").is_some());
+        assert!(payload.get("countsByRule").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn empty_sibling_phase_names_the_phase() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("mix".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-ok",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        std::fs::create_dir_all(Path::new(&run.plan.plan_path).join("phases/01-empty/tasks"))
+            .unwrap();
+        std::fs::write(
+            Path::new(&run.plan.plan_path).join("phases/01-empty/overview.md"),
+            "# empty\n",
+        )
+        .unwrap();
+        let host = SilentHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+                elapsed_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
+        let findings = std::fs::read_to_string(check_findings_path(&after.plan.plan_path)).unwrap();
+        assert!(
+            findings.contains("01-empty"),
+            "empty phase named in findings: {findings}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn rerun_reviewer_local_small_does_not_skip_check() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("rerun".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: []\nverify: \"cargo test a -- --exact\"\n",
+        );
+        // Live ctrl would spawn real processes; the failing shape check
+        // does not need a host. gate via rerun_reviewer uses live() which
+        // is host-less — shape-only failure (empty files) still blocks.
+        let after = rerun_reviewer(state.clone(), run.plan.id.clone())
+            .await
+            .unwrap();
+        assert_ne!(after.plan.status, "planning_review_running");
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8959,6 +9142,18 @@ mod plan_check_gate_tests {
         assert_eq!(
             followup_after_kloo_phase(&PhaseLoopOutcome::AllDone),
             KlooPhaseFollowup::DispatchReview
+        );
+    }
+
+    #[test]
+    fn planning_planner_ready_does_not_claim_review() {
+        assert_eq!(
+            event_status_transition("planning_planner_ready", &json!({})),
+            (Some("planning_planner_running"), None)
+        );
+        assert_eq!(
+            event_status_transition("planning_review_started", &json!({})),
+            (Some("planning_planner_running"), Some("planning_review_running"))
         );
     }
 

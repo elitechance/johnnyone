@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 const RULE_NOT_ALLOWLISTED: &str = "verify_not_allowlisted";
 const RULE_NOT_SCOPED: &str = "verify_not_scoped";
 
-const ALLOWED_RUNNERS: &[&str] = &["cargo", "npx", "go", "python", "python3", "node"];
+pub(crate) const ALLOWED_RUNNERS: &[&str] = &["cargo", "npx", "go", "python", "python3", "node"];
 
 /// Documented complement of the allowlist — not a character blocklist.
 const DENIED_RUNNERS: &[&str] = &[

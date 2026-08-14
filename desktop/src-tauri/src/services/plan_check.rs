@@ -333,6 +333,11 @@ fn spawn_argv_capture(
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -348,6 +353,7 @@ fn spawn_argv_capture(
     };
     let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
     let start = Instant::now();
+    let pid = child.id();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -364,6 +370,7 @@ fn spawn_argv_capture(
                 return Ok(buf);
             }
             Ok(None) if start.elapsed() > timeout => {
+                crate::services::task_loop::kill_process_group(pid);
                 let _ = child.kill();
                 return Err(SpawnErr {
                     detail: "kloo tokens timed out".into(),
@@ -533,14 +540,7 @@ pub fn check_plan_with(
         let before_e = report.verify_executed;
         let before_s = report.verify_skipped;
         if opts.execute {
-            execute_phase(
-                &phase_id,
-                &loaded,
-                workspace_path,
-                host,
-                opts,
-                &mut report,
-            );
+            execute_phase(&loaded, workspace_path, host, opts, &mut report);
         }
         report.phases.push(PhaseVerifyCounts {
             phase_id: phase_id.clone(),
@@ -561,11 +561,12 @@ pub fn check_plan_with(
         ));
     }
     if total_tasks == 0 {
-        report.items.push(item(
-            None,
-            RULE_EMPTY_PLAN,
-            "plan has no task.yml dirs under phases/*/tasks",
-        ));
+        let detail = if let Some(phase) = opts.only_phase {
+            format!("phase {phase} has no task.yml dirs under phases/{phase}/tasks")
+        } else {
+            "plan has no task.yml dirs under phases/*/tasks".to_string()
+        };
+        report.items.push(item(None, RULE_EMPTY_PLAN, detail));
     }
     if opts.tokens {
         check_tokens(plan_path, &loaded_for_tokens, host, &mut report);
@@ -944,7 +945,6 @@ fn resolve_effective_cwd(workspace: &Path, spec: &TaskSpec) -> Result<PathBuf, S
 }
 
 fn execute_phase(
-    _phase_id: &str,
     loaded: &[LoadedTask],
     workspace: &Path,
     host: &dyn PlanCheckHost,
@@ -1072,7 +1072,8 @@ fn execute_phase(
         })
         .cloned()
         .collect();
-    report.verify_executed += eligible.len() - to_run.len();
+    // Warm-failed pairs already have verify_not_runnable. They are not
+    // n_eligible (same as deferred): do not book them as executed.
 
     let results = run_waves(&to_run, 4, e_budget, |job, started| {
         if !started {
@@ -1136,9 +1137,7 @@ where
             break;
         }
         let end = (i + width).min(jobs.len());
-        // Sequential within the wave for determinism in unit tests; the host
-        // may still be concurrent. Width bounds how many we *start* per wave.
-        // Tests that assert in-flight use a host that tracks spawn entry.
+        // Concurrent 4-wide wave. Hosts that assert in-flight track spawn entry.
         let batch: Vec<T> = jobs[i..end].to_vec();
         let handles: Vec<(T, SpawnResult)> = std::thread::scope(|scope| {
             let mut joins = Vec::new();
@@ -1859,6 +1858,44 @@ mod tests {
         let report = check_plan(&plan, &ws, None);
         assert!(has_rule(&report, RULE_EMPTY_PLAN), "{:?}", report.items);
         assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_phase_empty_names_the_phase() {
+        let root = tmp("empty-phase");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-ok", "01-a", "");
+        std::fs::create_dir_all(plan.join("phases/01-empty/tasks")).unwrap();
+        std::fs::write(plan.join("phases/01-empty/overview.md"), "# empty\n").unwrap();
+        let whole = check_plan(&plan, &ws, None);
+        assert!(
+            !has_rule(&whole, RULE_EMPTY_PLAN),
+            "populated sibling must not empty the whole plan: {:?}",
+            whole.items
+        );
+        let empty = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                only_phase: Some("01-empty"),
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        let item = empty
+            .items
+            .iter()
+            .find(|i| i.rule == RULE_EMPTY_PLAN)
+            .expect("empty phase");
+        assert!(
+            item.detail.contains("01-empty"),
+            "phase id in detail: {}",
+            item.detail
+        );
+        assert!(!empty.passed);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2696,6 +2733,33 @@ mod tests {
     }
 
     #[test]
+    fn warm_failed_pair_is_not_counted_executed() {
+        let root = tmp("warm-fail-count");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        write_ok_task(&plan, "00-x", "02-b", "");
+        let mut host = ScriptedHost::instant();
+        host.warm_exit = 101;
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(has_rule(&report, RULE_VERIFY_NOT_RUNNABLE), "{:?}", report.items);
+        assert_eq!(report.verify_executed, 0, "warm-failed is not executed");
+        assert_eq!(report.verify_skipped, 0);
+        assert!(host.tasks.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn execute_per_task_exit_1_is_not_an_item() {
         let root = tmp("exec-1");
         let plan = root.join("plan");
@@ -2887,8 +2951,10 @@ mod tests {
         assert!(report.verify_ms <= execute_budget_ms(150) + 5_000);
         let tasks = host.tasks.lock().unwrap();
         assert_eq!(tasks.len(), 150);
-        for (_, cwd) in tasks.iter() {
+        let expected = check_verify("cargo test a -- --exact").unwrap();
+        for (argv, cwd) in tasks.iter() {
             assert_eq!(cwd, &ws);
+            assert_eq!(argv, &expected, "per-task argv is check_verify, not rewritten");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3096,6 +3162,27 @@ mod tests {
         assert_eq!(n, 1, "{:?}", report.items);
         assert!(report.items.iter().any(|i| i.task_id.is_none()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warm_argv_covers_every_allowed_runner() {
+        for runner in crate::services::verify_policy::ALLOWED_RUNNERS {
+            let argv = warm_argv_for(runner, &[(*runner).to_string()]);
+            assert_eq!(argv[0], *runner, "{runner}");
+            match *runner {
+                "cargo" => assert_eq!(
+                    argv,
+                    ["cargo", "metadata", "--format-version", "1", "--offline"]
+                ),
+                "npx" => assert_eq!(argv, ["npx", "--no-install", "vitest", "--version"]),
+                "go" => assert_eq!(argv, ["go", "list", "-m"]),
+                "python" | "python3" => {
+                    assert_eq!(argv, [*runner, "-m", "pytest", "--version"]);
+                }
+                "node" => assert_eq!(argv, ["node", "-v"]),
+                other => panic!("ALLOWED_RUNNERS has {other} but warm_argv_for has no arm"),
+            }
+        }
     }
 
     #[test]
