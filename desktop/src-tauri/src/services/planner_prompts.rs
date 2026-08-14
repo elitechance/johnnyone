@@ -111,13 +111,11 @@ fn default_small_mode_amend_planner() -> String {
     DEFAULT_SMALL_MODE_AMEND_PLANNER.to_string()
 }
 
-/// The only small-mode reviewer text that planning *lenses* receive.
-/// The full `smallMode.reviewer` template (role, Judge-only scope, footer)
-/// is for the single-reviewer path; composing it into each lens overrides
-/// that lens's dimension and reporting protocol.
+/// Built-in plan-check constraint. The default `smallMode.reviewer` contains
+/// this sentence; `lens_preamble_from_reviewer` extracts it (or a tuned
+/// replacement) without the role / Judge-only / footer blocks.
 pub(crate) const PLAN_CHECK_ALREADY_VALIDATED: &str = "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules.";
 
-/// Prepend a tunable leaf wrapper to `prompt.md` in memory. Empty wrapper is a no-op.
 /// Overlay a settings update onto `current`. `small_mode: None` keeps the
 /// already-saved smallMode (merge, don't replace with built-in defaults).
 pub fn overlay_prompt_settings(
@@ -136,6 +134,46 @@ pub fn overlay_prompt_settings(
     current
 }
 
+/// Strip role header, "Judge only" scope, and PLAN/VERDICT footer so a
+/// per-lens prompt can take a tunable preamble from `smallMode.reviewer`
+/// without inheriting that template's dimension or report protocol.
+pub(crate) fn lens_preamble_from_reviewer(reviewer: &str) -> String {
+    let mut text = reviewer;
+    if let Some(i) = reviewer.find("Return this footer exactly") {
+        text = &reviewer[..i];
+    }
+    if let Some(i) = text.find("Judge only:") {
+        text = &text[..i];
+    }
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("JOHNNYONE_")
+            || t.starts_with("ROLE:")
+            || t.starts_with("Workspace")
+            || t.starts_with("App/source")
+            || t.starts_with("Docs ")
+            || t.starts_with("Plan path:")
+            || t.starts_with("Plan output")
+            || t.starts_with("Methodology:")
+            || t.starts_with("Conventions:")
+        {
+            continue;
+        }
+        kept.push(t);
+    }
+    let out = kept.join("\n");
+    if out.trim().is_empty() {
+        PLAN_CHECK_ALREADY_VALIDATED.to_string()
+    } else {
+        out
+    }
+}
+
+/// Prepend a tunable leaf wrapper to `prompt.md` in memory. Empty wrapper is a no-op.
 pub fn wrap_leaf_prompt(wrapper: &str, prompt: &str) -> String {
     let w = wrapper.trim();
     if w.is_empty() {
@@ -416,9 +454,11 @@ Do not invent other fields.
 
 cwd is the directory to run verify in (e.g. desktop/src-tauri). When cwd is set, every files[] and new: path is still workspace-relative and must live under that cwd (files_outside_cwd otherwise).
 
-verify must be an allowlisted argv command (cargo test / npx vitest|jest run / go test / python -m pytest / node). Do not schedule UI tasks: no .html/.scss/.css in files[]. The checker rejects UI tasks as ui_task_forbidden.
+verify must be an allowlisted AND scoped argv command: cargo test with a filter (bare `cargo test` is verify_not_allowlisted), npx vitest|jest run + a file, go test + a package that is not ./..., python -m pytest + a file, node + a test file. Do not schedule UI tasks: no .html/.scss/.css in files[]. The checker rejects UI tasks as ui_task_forbidden.
 
-D12 sizing: keep each task small enough for the leaf executor. Do not write tasks.json. Do not self-claim done.
+No two tasks in a phase may claim the same file (file_collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward.
+
+D12 sizing: at most 150 tasks per phase (MAX_TASKS_PER_PHASE) and 800 tasks total (MAX_TASKS_TOTAL). Keep each task small enough for the leaf executor. Do not write tasks.json. Do not self-claim done.
 
 status.md lists phases, not tasks — one row per phase (id, one-line goal, task count).
 phase overview task table is id and one-line goal only — no files[] / verify / prompt dump.
@@ -504,6 +544,14 @@ planning:
         assert!(p.contains("empty_plan"));
         assert!(p.contains("status.md lists phases, not tasks"));
         assert!(p.contains("phase overview task table is id and one-line goal only"));
+        assert!(p.contains("scoped"));
+        assert!(p.contains("bare `cargo test`"));
+        assert!(p.contains("file_collision"));
+        assert!(p.contains("non-trivial"));
+        assert!(p.contains("DAG"));
+        assert!(p.contains("never point forward"));
+        assert!(p.contains("MAX_TASKS_PER_PHASE"));
+        assert!(p.contains("MAX_TASKS_TOTAL"));
         let taught = p.split("task.yml fields").nth(1).unwrap_or(p);
         assert!(
             !taught.contains("mock:"),
@@ -536,6 +584,18 @@ planning:
         assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x0fc962193643a37b);
         assert_eq!(fnv1a64(DEFAULT_PLANNING_REVIEWER), 0x42e3b3d0e4178fe5);
         assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_WORKER), 0xbb568e9822273934);
+    }
+
+    #[test]
+    fn lens_preamble_strips_role_judge_and_footer() {
+        let from_default = lens_preamble_from_reviewer(DEFAULT_SMALL_MODE_REVIEWER);
+        assert_eq!(from_default, PLAN_CHECK_ALREADY_VALIDATED);
+        assert!(!from_default.contains("Judge only:"));
+        assert!(!from_default.contains("Return this footer"));
+        assert_eq!(
+            lens_preamble_from_reviewer("SENTINEL-REVIEWER-XYZ"),
+            "SENTINEL-REVIEWER-XYZ"
+        );
     }
 
     #[test]

@@ -2992,7 +2992,7 @@ fn planning_lens_reviewer_prompt(
 }
 
 fn planning_lens_reviewer_prompt_from(
-    _settings: Option<&planner_prompts::PlannerPromptSettings>,
+    settings: Option<&planner_prompts::PlannerPromptSettings>,
     state: &AppState,
     run: &AgentPlanRun,
     lens: &ValidationLens,
@@ -3021,13 +3021,14 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
         report = lens_report_instruction(session_id, lens_name),
     );
     if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
-        // Only the plan-check constraint — not role/Judge-only/footer from
-        // smallMode.reviewer, which would override each lens's dimension
-        // and report protocol. See 03-03 decisions.md (T2 r2).
-        body = format!(
-            "{}\n\n{body}",
-            planner_prompts::PLAN_CHECK_ALREADY_VALIDATED
-        );
+        // Preamble is sourced from settings.small_mode.reviewer (tunable)
+        // after stripping role / Judge-only / footer. See 03-03 decisions.md.
+        let raw = settings
+            .map(|s| s.small_mode.reviewer.as_str())
+            .unwrap_or(planner_prompts::DEFAULT_SMALL_MODE_REVIEWER);
+        let preamble = planner_prompts::lens_preamble_from_reviewer(raw);
+        let extra = planner_prompts::render_template(&preamble, &values);
+        body = format!("{extra}\n\n{body}");
     }
     body
 }
@@ -4509,11 +4510,8 @@ async fn handle_planning_reviewer_output(
     }
 }
 
-/// Continuous SDLC: when a planning run PASSes review, create the development stage-run from the
-/// approved plan and start it — the initiative flows planning → development → review → done with no
-/// manual step. Best-effort: any failure (most likely the plan is off-spec and `parse_plan` finds no
-/// `overview.md`/`phases/`) is recorded as an event and leaves the initiative at planning-approved for
-/// a human to resolve, rather than breaking the coordinator.
+/// Copy validation_config and executor_config from the planning row onto the
+/// newly created development row (`create_plan` seeds both NULL).
 fn copy_initiative_json_fields(state: &AppState, from: &AgentPlan, to_id: &str) {
     if let Some(cfg) = from.validation_config.clone() {
         let _ = state.db.with_conn(|conn| {
@@ -4535,6 +4533,11 @@ fn copy_initiative_json_fields(state: &AppState, from: &AgentPlan, to_id: &str) 
     }
 }
 
+/// Continuous SDLC: when a planning run PASSes review, create the development stage-run from the
+/// approved plan and start it — the initiative flows planning → development → review → done with no
+/// manual step. Best-effort: any failure (most likely the plan is off-spec and `parse_plan` finds no
+/// `overview.md`/`phases/`) is recorded as an event and leaves the initiative at planning-approved for
+/// a human to resolve, rather than breaking the coordinator.
 fn auto_start_development<'a>(
     state: &'a AppState,
     planning: &'a AgentPlanRun,
@@ -10069,8 +10072,8 @@ mod small_mode_tests {
             "sess",
         );
         assert!(
-            live.contains(crate::services::planner_prompts::PLAN_CHECK_ALREADY_VALIDATED),
-            "live lens must get the plan-check constraint: {live}"
+            live.contains("SENTINEL-REVIEWER-XYZ"),
+            "tuned smallMode.reviewer preamble must reach the live lens: {live}"
         );
         assert!(
             !live.contains("Judge only:"),
@@ -10080,10 +10083,16 @@ mod small_mode_tests {
             !live.contains("Return this footer exactly"),
             "reviewer footer must not fight lens_report_instruction: {live}"
         );
-        assert!(
-            !live.contains("SENTINEL-REVIEWER-XYZ"),
-            "tuned whole-reviewer text stays off the lens path: {live}"
+        let live_default = planning_lens_reviewer_prompt_from(
+            Some(&PlannerPromptSettings::default()),
+            &state,
+            &small,
+            &lens,
+            "sess",
         );
+        assert!(live_default.contains(
+            crate::services::planner_prompts::PLAN_CHECK_ALREADY_VALIDATED
+        ));
         let live_comm = planning_lens_reviewer_prompt_from(
             Some(&settings),
             &state,

@@ -721,24 +721,4 @@ struct PlannerPlanningPromptsInput {
     reviewer: String,
 }
 
-impl From<PlannerPromptSettingsInput> for PlannerPromptSettings {
-    fn from(value: PlannerPromptSettingsInput) -> Self {
-        // Build a default so we have the up-to-date amend templates; then
-        // overlay the input's worker/reviewer/planner/reviewer onto it. This
-        // lets older clients that don't know about amend_planner/amend_reviewer
-        // still update prompts without losing the defaults.
-        let mut prompts = PlannerPromptSettings::default();
-        prompts.schema = String::new();
-        prompts.development.worker = value.development.worker;
-        prompts.development.reviewer = value.development.reviewer;
-        prompts.planning.planner = value.planning.planner;
-        prompts.planning.reviewer = value.planning.reviewer;
-        if let Some(sm) = value.small_mode {
-            prompts.small_mode.planner = sm.planner;
-            prompts.small_mode.reviewer = sm.reviewer;
-            prompts.small_mode.leaf_wrapper = sm.leaf_wrapper;
-            prompts.small_mode.amend_planner = sm.amend_planner;
-        }
-        prompts
-    }
-}
+
