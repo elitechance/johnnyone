@@ -4,6 +4,7 @@ pub mod chat_host;
 pub mod coordinator_flight;
 pub mod git_history;
 pub mod host_files;
+pub mod plan_check;
 pub mod planner_prompts;
 pub mod providers;
 pub mod relay;
