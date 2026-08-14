@@ -136,6 +136,7 @@ impl PlanCheckReport {
         }
     }
 
+    #[cfg(test)]
     fn finish(&mut self, shape_ms: u64) {
         self.shape_ms = shape_ms;
         self.passed = !self.items.iter().any(|i| i.blocking);
@@ -210,7 +211,6 @@ impl SpawnResult {
             enoent: false,
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +252,6 @@ impl PlanCheckHost for RealPlanCheckHost {
         ];
         let out = spawn_argv_capture(&argv, Path::new("."), 30_000);
         match out {
-            Err(e) if e.enoent => Err(TokensError::Unavailable(e.detail)),
             Err(e) => Err(TokensError::Unavailable(e.detail)),
             Ok(body) => parse_tokens_json(&body),
         }
@@ -260,7 +259,6 @@ impl PlanCheckHost for RealPlanCheckHost {
 }
 
 struct SpawnErr {
-    enoent: bool,
     detail: String,
 }
 
@@ -286,24 +284,36 @@ fn spawn_argv(argv: &[String], cwd: &Path, timeout_ms: u64) -> SpawnResult {
     let pid = child.id();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = timed_out.clone();
     std::thread::spawn(move || {
         if done_rx.recv_timeout(timeout).is_err() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
             crate::services::task_loop::kill_process_group(pid);
         }
     });
     match child.wait() {
         Ok(status) => {
             let _ = done_tx.send(());
+            if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                return SpawnResult::timed_out();
+            }
+            // Our watchdog did not fire. A signal death (SIGSEGV, external
+            // SIGKILL) is a failure, not a timeout — surface it as exit 1.
             SpawnResult {
                 started: true,
-                exit_code: status.code(),
-                timed_out: status.code().is_none(),
+                exit_code: status.code().or(Some(1)),
+                timed_out: false,
                 enoent: false,
             }
         }
         Err(_) => {
             let _ = done_tx.send(());
-            SpawnResult::timed_out()
+            if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                SpawnResult::timed_out()
+            } else {
+                SpawnResult::exit(1)
+            }
         }
     }
 }
@@ -315,7 +325,6 @@ fn spawn_argv_capture(
 ) -> Result<String, SpawnErr> {
     let Some(exe) = argv.first() else {
         return Err(SpawnErr {
-            enoent: true,
             detail: "empty argv".into(),
         });
     };
@@ -328,13 +337,11 @@ fn spawn_argv_capture(
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(SpawnErr {
-                enoent: true,
                 detail: format!("spawn {exe}: {e}"),
             });
         }
         Err(e) => {
             return Err(SpawnErr {
-                enoent: true,
                 detail: format!("spawn {exe}: {e}"),
             });
         }
@@ -351,7 +358,6 @@ fn spawn_argv_capture(
                 }
                 if !status.success() && buf.trim().is_empty() {
                     return Err(SpawnErr {
-                        enoent: false,
                         detail: format!("kloo tokens exited {}", status.code().unwrap_or(1)),
                     });
                 }
@@ -360,14 +366,12 @@ fn spawn_argv_capture(
             Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
                 return Err(SpawnErr {
-                    enoent: false,
                     detail: "kloo tokens timed out".into(),
                 });
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Err(e) => {
                 return Err(SpawnErr {
-                    enoent: false,
                     detail: format!("wait kloo tokens: {e}"),
                 });
             }
@@ -411,6 +415,8 @@ pub struct CheckPlanOpts<'a> {
     pub warm_budget_ms: Option<u64>,
     pub skip_execute: bool,
     pub previous_skipped: &'a [String],
+    /// Skip shape + execute; only walk task dirs for `kloo tokens`.
+    pub tokens_only: bool,
 }
 
 impl<'a> CheckPlanOpts<'a> {
@@ -425,6 +431,7 @@ impl<'a> CheckPlanOpts<'a> {
             warm_budget_ms: None,
             skip_execute: false,
             previous_skipped: &[],
+            tokens_only: false,
         }
     }
 
@@ -439,6 +446,7 @@ impl<'a> CheckPlanOpts<'a> {
             warm_budget_ms: None,
             skip_execute: false,
             previous_skipped: &[],
+            tokens_only: false,
         }
     }
 }
@@ -477,7 +485,6 @@ pub fn check_plan_with(
     workspace_path: &Path,
     opts: &CheckPlanOpts<'_>,
 ) -> PlanCheckReport {
-    let started = Instant::now();
     let mut report = PlanCheckReport::empty();
     let phases_dir = plan_path.join("phases");
     let phase_dirs = list_sorted_dirs(&phases_dir);
@@ -486,6 +493,13 @@ pub fn check_plan_with(
     let host: &dyn PlanCheckHost = opts.host.unwrap_or(&real);
     let mut loaded_for_tokens: Vec<(String, PathBuf, Option<TaskSpec>)> = Vec::new();
 
+    if opts.tokens_only {
+        collect_token_targets(plan_path, opts.only_phase, &mut loaded_for_tokens);
+        check_tokens(plan_path, &loaded_for_tokens, host, &mut report);
+        report.passed = !report.items.iter().any(|i| i.blocking);
+        return report;
+    }
+
     for phase_dir in &phase_dirs {
         let phase_id = dir_name(phase_dir);
         if let Some(only) = opts.only_phase {
@@ -493,6 +507,7 @@ pub fn check_plan_with(
                 continue;
             }
         }
+        let shape_started = Instant::now();
         let loaded = load_phase_for_check(phase_dir, &mut report);
         total_tasks += loaded.len();
         if loaded.len() > MAX_TASKS_PER_PHASE {
@@ -512,6 +527,9 @@ pub fn check_plan_with(
             opts.run,
             &mut report,
         );
+        report.shape_ms = report
+            .shape_ms
+            .saturating_add(shape_started.elapsed().as_millis() as u64);
         let before_e = report.verify_executed;
         let before_s = report.verify_skipped;
         if opts.execute {
@@ -553,8 +571,28 @@ pub fn check_plan_with(
         check_tokens(plan_path, &loaded_for_tokens, host, &mut report);
     }
     report.tasks_checked = total_tasks;
-    report.finish(started.elapsed().as_millis() as u64);
+    report.passed = !report.items.iter().any(|i| i.blocking);
     report
+}
+
+fn collect_token_targets(
+    plan_path: &Path,
+    only_phase: Option<&str>,
+    out: &mut Vec<(String, PathBuf, Option<TaskSpec>)>,
+) {
+    for phase_dir in list_sorted_dirs(&plan_path.join("phases")) {
+        let phase_id = dir_name(&phase_dir);
+        if let Some(only) = only_phase {
+            if only != phase_id {
+                continue;
+            }
+        }
+        for dir in list_sorted_dirs(&phase_dir.join("tasks")) {
+            let id = dir_name(&dir);
+            let spec = load_task_spec(&dir).ok();
+            out.push((id, dir, spec));
+        }
+    }
 }
 
 struct LoadedTask {
@@ -892,6 +930,19 @@ fn check_ui_forbidden(spec: &TaskSpec, report: &mut PlanCheckReport) {
     }
 }
 
+#[derive(Clone)]
+struct EligibleJob {
+    id: String,
+    argv: Vec<String>,
+    runner: String,
+    cwd: PathBuf,
+}
+
+fn resolve_effective_cwd(workspace: &Path, spec: &TaskSpec) -> Result<PathBuf, String> {
+    let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    verify_policy::effective_verify_dir(workspace, cwd_rel).map_err(|e| e.detail)
+}
+
 fn execute_phase(
     _phase_id: &str,
     loaded: &[LoadedTask],
@@ -904,7 +955,7 @@ fn execute_phase(
     let by_id: HashMap<String, TaskSpec> =
         specs.iter().cloned().map(|s| (s.id.clone(), s)).collect();
 
-    let mut eligible: Vec<TaskSpec> = Vec::new();
+    let mut eligible: Vec<EligibleJob> = Vec::new();
     for spec in &specs {
         let Ok(argv) = check_verify(&spec.verify) else {
             continue;
@@ -913,7 +964,17 @@ fn execute_phase(
         if pair_is_deferred(spec, &by_id, workspace, &runner) {
             continue;
         }
-        eligible.push(spec.clone());
+        let Ok(cwd) = resolve_effective_cwd(workspace, spec) else {
+            // Jail/escape already emitted verify_cwd_missing in shape; do not
+            // rewrite cwd to the workspace root and spawn there.
+            continue;
+        };
+        eligible.push(EligibleJob {
+            id: spec.id.clone(),
+            argv,
+            runner,
+            cwd,
+        });
     }
     eligible.sort_by(|a, b| {
         let a_skip = opts.previous_skipped.iter().any(|id| id == &a.id);
@@ -922,37 +983,32 @@ fn execute_phase(
     });
 
     if opts.skip_execute {
-        for spec in &eligible {
+        for job in &eligible {
             report.items.push(item(
-                Some(&spec.id),
+                Some(&job.id),
                 RULE_VERIFY_NOT_EXECUTED,
-                format!("{} verify never started (stage budget)", spec.id),
+                format!("{} verify never started (stage budget)", job.id),
             ));
             report.verify_skipped += 1;
-            report.skipped_ids.push(spec.id.clone());
+            report.skipped_ids.push(job.id.clone());
         }
         return;
     }
 
-    // Warm distinct (runner, effective_cwd).
     let mut pair_keys: Vec<(String, PathBuf)> = Vec::new();
     let mut pair_tasks: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut pair_argv: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for spec in &eligible {
-        let argv = check_verify(&spec.verify).expect("eligible passed check_verify");
-        let runner = argv[0].clone();
-        let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
-        let cwd = match verify_policy::effective_verify_dir(workspace, cwd_rel) {
-            Ok(p) => p,
-            Err(_) => workspace.to_path_buf(),
-        };
-        let key = (runner.clone(), cwd.to_string_lossy().into_owned());
-        pair_tasks.entry(key.clone()).or_default().push(spec.id.clone());
+    for job in &eligible {
+        let key = (job.runner.clone(), job.cwd.to_string_lossy().into_owned());
+        pair_tasks.entry(key.clone()).or_default().push(job.id.clone());
         pair_argv
-            .entry(key.clone())
-            .or_insert_with(|| warm_argv_for(&runner, &argv));
-        if !pair_keys.iter().any(|(r, c)| r == &runner && c == &cwd) {
-            pair_keys.push((runner, cwd));
+            .entry(key)
+            .or_insert_with(|| warm_argv_for(&job.runner, &job.argv));
+        if !pair_keys
+            .iter()
+            .any(|(r, c)| r == &job.runner && c == &job.cwd)
+        {
+            pair_keys.push((job.runner.clone(), job.cwd.clone()));
         }
     }
     pair_keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -961,32 +1017,28 @@ fn execute_phase(
     let w_budget = opts.warm_budget_ms.unwrap_or(warm_budget_ms(pair_keys.len()));
     let warm_started = Instant::now();
     let mut failed_pairs: HashSet<(String, String)> = HashSet::new();
-    if warm_n > 0 && !opts.skip_execute {
+    if warm_n > 0 {
         let to_warm: Vec<(String, PathBuf)> = pair_keys.iter().take(warm_n).cloned().collect();
-        let results = run_waves(
-            &to_warm,
-            4,
-            w_budget,
-            WARM_TIMEOUT_MS,
-            |pair, started| {
-                if !started {
-                    return SpawnResult::never_started();
-                }
-                let key = (pair.0.clone(), pair.1.to_string_lossy().into_owned());
-                let argv = pair_argv.get(&key).cloned().unwrap_or_else(|| {
-                    warm_argv_for(&pair.0, &[pair.0.clone()])
-                });
-                host.spawn(&SpawnRequest {
-                    argv,
-                    cwd: pair.1.clone(),
-                    timeout_ms: WARM_TIMEOUT_MS,
-                    kind: SpawnKind::Warm,
-                    task_id: None,
-                })
-            },
-        );
+        let results = run_waves(&to_warm, 4, w_budget, |pair, started| {
+            if !started {
+                return SpawnResult::never_started();
+            }
+            let key = (pair.0.clone(), pair.1.to_string_lossy().into_owned());
+            let argv = pair_argv
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| warm_argv_for(&pair.0, &[pair.0.clone()]));
+            host.spawn(&SpawnRequest {
+                argv,
+                cwd: pair.1.clone(),
+                timeout_ms: WARM_TIMEOUT_MS,
+                kind: SpawnKind::Warm,
+                task_id: None,
+            })
+        });
         for ((runner, cwd), res) in results {
-            if res.enoent || res.exit_code.map(|c| c != 0).unwrap_or(false) {
+            // Warm timeout / ENOENT / any non-zero: runner is not usable.
+            if res.enoent || res.timed_out || res.exit_code.map(|c| c != 0).unwrap_or(false) {
                 let key = (runner.clone(), cwd.to_string_lossy().into_owned());
                 failed_pairs.insert(key.clone());
                 if let Some(ids) = pair_tasks.get(&key) {
@@ -995,10 +1047,11 @@ fn execute_phase(
                             Some(id),
                             RULE_VERIFY_NOT_RUNNABLE,
                             format!(
-                                "warm {} in {} failed (exit {:?})",
+                                "warm {} in {} failed (exit {:?}, timed_out={})",
                                 runner,
                                 cwd.display(),
-                                res.exit_code
+                                res.exit_code,
+                                res.timed_out
                             ),
                         ));
                     }
@@ -1008,71 +1061,54 @@ fn execute_phase(
     }
     report.warm_ms = report.warm_ms.saturating_add(warm_started.elapsed().as_millis() as u64);
 
-    // Per-task execute. Failed-warm tasks still count as executed (warm is the signal).
     let e_budget = opts
         .execute_budget_ms
         .unwrap_or(execute_budget_ms(eligible.len()));
     let exec_started = Instant::now();
-    let to_run: Vec<TaskSpec> = eligible
+    let to_run: Vec<EligibleJob> = eligible
         .iter()
-        .filter(|spec| {
-            let argv = check_verify(&spec.verify).unwrap();
-            let runner = argv[0].clone();
-            let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
-            let cwd = verify_policy::effective_verify_dir(workspace, cwd_rel)
-                .unwrap_or_else(|_| workspace.to_path_buf());
-            !failed_pairs.contains(&(runner, cwd.to_string_lossy().into_owned()))
+        .filter(|job| {
+            !failed_pairs.contains(&(job.runner.clone(), job.cwd.to_string_lossy().into_owned()))
         })
         .cloned()
         .collect();
-    let already = eligible.len() - to_run.len();
-    report.verify_executed += already;
+    report.verify_executed += eligible.len() - to_run.len();
 
-    let results = run_waves(
-        &to_run,
-        4,
-        e_budget,
-        VERIFY_TASK_TIMEOUT_MS,
-        |spec, started| {
-            if !started {
-                return SpawnResult::never_started();
-            }
-            let argv = check_verify(&spec.verify).unwrap();
-            let cwd_rel = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
-            let cwd = verify_policy::effective_verify_dir(workspace, cwd_rel)
-                .unwrap_or_else(|_| workspace.to_path_buf());
-            host.spawn(&SpawnRequest {
-                argv,
-                cwd,
-                timeout_ms: VERIFY_TASK_TIMEOUT_MS,
-                kind: SpawnKind::Task,
-                task_id: Some(spec.id.clone()),
-            })
-        },
-    );
-    for (spec, res) in results {
+    let results = run_waves(&to_run, 4, e_budget, |job, started| {
+        if !started {
+            return SpawnResult::never_started();
+        }
+        host.spawn(&SpawnRequest {
+            argv: job.argv.clone(),
+            cwd: job.cwd.clone(),
+            timeout_ms: VERIFY_TASK_TIMEOUT_MS,
+            kind: SpawnKind::Task,
+            task_id: Some(job.id.clone()),
+        })
+    });
+    for (job, res) in results {
         if !res.started && !res.enoent {
             report.items.push(item(
-                Some(&spec.id),
+                Some(&job.id),
                 RULE_VERIFY_NOT_EXECUTED,
-                format!("{} verify never started (execute budget)", spec.id),
+                format!("{} verify never started (execute budget)", job.id),
             ));
             report.verify_skipped += 1;
-            report.skipped_ids.push(spec.id.clone());
+            report.skipped_ids.push(job.id.clone());
             continue;
         }
         report.verify_executed += 1;
         if res.timed_out {
             report.items.push(item(
-                Some(&spec.id),
+                Some(&job.id),
                 RULE_VERIFY_TIMEOUT,
-                format!("{} verify exceeded {VERIFY_TASK_TIMEOUT_MS}ms", spec.id),
+                format!("{} verify exceeded {VERIFY_TASK_TIMEOUT_MS}ms", job.id),
             ));
         } else if res.enoent || res.exit_code == Some(127) {
             report.items.push(item(
-                Some(&spec.id),
+                Some(&job.id),
                 RULE_VERIFY_NOT_RUNNABLE,
-                format!("{} verify spawn ENOENT/127", spec.id),
+                format!("{} verify spawn ENOENT/127", job.id),
             ));
         }
     }
@@ -1083,7 +1119,6 @@ fn run_waves<T: Clone + Send, F>(
     jobs: &[T],
     width: usize,
     budget_ms: u64,
-    _timeout_ms: u64,
     work: F,
 ) -> Vec<(T, SpawnResult)>
 where
@@ -1152,7 +1187,7 @@ pub fn warm_argv_for(runner: &str, verify_argv: &[String]) -> Vec<String> {
             "--version".into(),
         ],
         "node" => vec!["node".into(), "-v".into()],
-        other => vec![other.to_string(), "--version".into()],
+        other => unreachable!("check_verify already allowlisted argv[0]={other}"),
     }
 }
 
@@ -2544,6 +2579,7 @@ mod tests {
         task_exit: i32,
         task_timeout: bool,
         refuse_after: Option<usize>,
+        warm_sleep_ms: u64,
         tokens: Result<TokensReport, TokensError>,
     }
 
@@ -2558,6 +2594,7 @@ mod tests {
                 task_exit: 1,
                 task_timeout: false,
                 refuse_after: None,
+                warm_sleep_ms: 0,
                 tokens: Ok(TokensReport {
                     fits: true,
                     approx_tokens: Some(10),
@@ -2574,6 +2611,9 @@ mod tests {
             self.max_in_flight.fetch_max(n, Ordering::SeqCst);
             let result = match req.kind {
                 SpawnKind::Warm => {
+                    if self.warm_sleep_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(self.warm_sleep_ms));
+                    }
                     self.warm
                         .lock()
                         .unwrap()
@@ -2894,7 +2934,8 @@ mod tests {
                 "p",
             );
         }
-        let host = ScriptedHost::instant();
+        let mut host = ScriptedHost::instant();
+        host.warm_sleep_ms = 3;
         let report = check_plan_with(
             &plan,
             &ws,
@@ -2915,9 +2956,23 @@ mod tests {
             "in flight {}",
             host.max_in_flight.load(Ordering::SeqCst)
         );
-        assert!(report.warm_ms > 0 || !warms.is_empty());
-        // warm_ms is not folded into verify_ms (they are independent counters)
-        assert!(report.verify_ms < u64::MAX);
+        assert!(
+            report.warm_ms > 0,
+            "warm_ms must record the warm stage (got {})",
+            report.warm_ms
+        );
+        assert!(
+            report.verify_ms < report.warm_ms,
+            "warm_ms is not folded into verify_ms (warm={} verify={})",
+            report.warm_ms,
+            report.verify_ms
+        );
+        assert!(
+            report.shape_ms < report.warm_ms,
+            "shape_ms is static only, not total time (shape={} warm={})",
+            report.shape_ms,
+            report.warm_ms
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3054,7 +3109,52 @@ mod tests {
         assert!(RULE_IDS.contains(&RULE_FILES_OUTSIDE_CWD));
         assert!(RULE_IDS.contains(&RULE_UI_TASK_FORBIDDEN));
         assert!(RULE_IDS.contains(&RULE_EMPTY_PLAN));
-        assert_eq!(RULE_IDS.len(), 24);
+    }
+
+    fn report_for_execute_rule(rule: &str) -> (PathBuf, PlanCheckReport) {
+        let root = tmp(&format!("xrule-{rule}"));
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let mut host = ScriptedHost::instant();
+        let mut execute = true;
+        let mut tokens = false;
+        let mut skip_execute = false;
+        match rule {
+            RULE_VERIFY_NOT_RUNNABLE => host.task_exit = 127,
+            RULE_VERIFY_TIMEOUT => host.task_timeout = true,
+            RULE_VERIFY_NOT_EXECUTED => skip_execute = true,
+            RULE_PROMPT_EXCEEDS_CONTEXT => {
+                execute = false;
+                tokens = true;
+                host.tokens = Ok(TokensReport {
+                    fits: false,
+                    approx_tokens: Some(9),
+                    usable_window: Some(1),
+                    compact_trigger: Some(1),
+                });
+            }
+            RULE_TOKENS_UNAVAILABLE => {
+                execute = false;
+                tokens = true;
+                host.tokens = Err(TokensError::Unavailable("no kloo".into()));
+            }
+            other => panic!("no execute fixture for {other}"),
+        }
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute,
+                tokens,
+                skip_execute,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        (root, report)
     }
 
     #[test]
@@ -3091,12 +3191,24 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&root);
         }
-        // Execute / token rules from dedicated fixtures.
-        seen.insert(RULE_VERIFY_NOT_RUNNABLE.to_string());
-        seen.insert(RULE_VERIFY_TIMEOUT.to_string());
-        seen.insert(RULE_VERIFY_NOT_EXECUTED.to_string());
-        seen.insert(RULE_PROMPT_EXCEEDS_CONTEXT.to_string());
-        seen.insert(RULE_TOKENS_UNAVAILABLE.to_string());
+        for rule in [
+            RULE_VERIFY_NOT_RUNNABLE,
+            RULE_VERIFY_TIMEOUT,
+            RULE_VERIFY_NOT_EXECUTED,
+            RULE_PROMPT_EXCEEDS_CONTEXT,
+            RULE_TOKENS_UNAVAILABLE,
+        ] {
+            let (root, report) = report_for_execute_rule(rule);
+            assert!(
+                has_rule(&report, rule),
+                "execute/token fixture {rule} emitted {:?}",
+                rules_of(&report)
+            );
+            for i in &report.items {
+                seen.insert(i.rule.clone());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
         for id in RULE_IDS {
             assert!(
                 seen.contains(*id),

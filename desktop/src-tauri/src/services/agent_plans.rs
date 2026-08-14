@@ -1949,7 +1949,7 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
-    if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+    if development_arm(&phase_path) == DevArm::KlooPreflight {
         if !run_phase_preflight(state, run, &phase).await? {
             return Ok(());
         }
@@ -2042,13 +2042,9 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                         .clone()
                         .ok_or_else(|| "Planning run has no planner session".to_string())?;
                     wait_for_planner_ready(&state, &session_id, &plan_id).await?;
-                    state.db.with_conn(|conn| {
-                        conn.execute(
-                            "UPDATE agent_plans SET status = 'planning_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'planning_planner_running'",
-                            params![plan_id],
-                        )
-                        .map_err(|e| e.to_string())
-                    })?;
+                    // Stay on planning_planner_running until the check passes.
+                    // Writing planning_review_running here used to let a
+                    // restart mid-check fan out lenses on an unchecked plan.
                     append_event(&state, &plan_id, None, "planning_planner_ready", json!({}))?;
                     let refreshed = get_plan(&state, &plan_id)?;
                     gate_planning_lenses(&state, &refreshed, &PlanningCheckCtrl::live()).await?;
@@ -3538,6 +3534,8 @@ pub(crate) struct PlanningCheckCtrl<'a> {
     pub host: Option<&'a dyn crate::services::plan_check::PlanCheckHost>,
     pub stage_budget_ms: u64,
     pub send_planner: bool,
+    /// Injected elapsed-ms clock for the stage ceiling. `None` uses wall Instant.
+    pub elapsed_ms: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl PlanningCheckCtrl<'static> {
@@ -3546,6 +3544,7 @@ impl PlanningCheckCtrl<'static> {
             host: None,
             stage_budget_ms: crate::services::plan_check::MAX_PLANNING_CHECK_MS,
             send_planner: true,
+            elapsed_ms: None,
         }
     }
 }
@@ -3608,55 +3607,71 @@ fn check_findings_path(plan_path: &str) -> PathBuf {
     Path::new(plan_path).join("check-findings.json")
 }
 
+struct CheckPlanCall<'a> {
+    only_phase: Option<&'a str>,
+    skip_execute: bool,
+    previous_skipped: &'a [String],
+    host: Option<&'a dyn crate::services::plan_check::PlanCheckHost>,
+    tokens: bool,
+    tokens_only: bool,
+    run: Option<&'a crate::services::task_state::TaskRunFile>,
+}
+
 async fn run_check_plan_blocking(
     plan_path: &Path,
     workspace: &Path,
-    only_phase: Option<&str>,
-    skip_execute: bool,
-    previous_skipped: &[String],
-    host: Option<&dyn crate::services::plan_check::PlanCheckHost>,
-    tokens: bool,
+    call: CheckPlanCall<'_>,
 ) -> Result<crate::services::plan_check::PlanCheckReport, String> {
-    if host.is_some() {
-        let mut opts = if tokens {
-            crate::services::plan_check::CheckPlanOpts::shape_only(None)
-        } else {
-            crate::services::plan_check::CheckPlanOpts::full(None)
-        };
-        opts.host = host;
-        opts.only_phase = only_phase;
-        opts.skip_execute = skip_execute;
-        opts.previous_skipped = previous_skipped;
-        opts.tokens = tokens;
-        if tokens {
-            opts.execute = false;
-        }
+    if call.host.is_some() {
+        let mut opts = crate::services::plan_check::CheckPlanOpts::shape_only(call.run);
+        opts.host = call.host;
+        opts.only_phase = call.only_phase;
+        opts.skip_execute = call.skip_execute;
+        opts.previous_skipped = call.previous_skipped;
+        apply_check_mode(&mut opts, call.tokens, call.tokens_only, call.skip_execute);
         return Ok(crate::services::plan_check::check_plan_with(
             plan_path, workspace, &opts,
         ));
     }
     let plan_path = plan_path.to_path_buf();
     let workspace = workspace.to_path_buf();
-    let only = only_phase.map(str::to_string);
-    let prev = previous_skipped.to_vec();
+    let only = call.only_phase.map(str::to_string);
+    let prev = call.previous_skipped.to_vec();
+    let tokens = call.tokens;
+    let tokens_only = call.tokens_only;
+    let skip_execute = call.skip_execute;
+    let run_owned = call.run.cloned();
     tokio::task::spawn_blocking(move || {
-        let mut opts = if tokens {
-            crate::services::plan_check::CheckPlanOpts::shape_only(None)
-        } else {
-            crate::services::plan_check::CheckPlanOpts::full(None)
-        };
+        let mut opts = crate::services::plan_check::CheckPlanOpts::shape_only(run_owned.as_ref());
         let only_ref = only.as_deref();
         opts.only_phase = only_ref;
         opts.skip_execute = skip_execute;
         opts.previous_skipped = &prev;
-        opts.tokens = tokens;
-        if tokens {
-            opts.execute = false;
-        }
+        apply_check_mode(&mut opts, tokens, tokens_only, skip_execute);
         crate::services::plan_check::check_plan_with(&plan_path, &workspace, &opts)
     })
     .await
     .map_err(|e| format!("plan-check join: {e}"))
+}
+
+fn apply_check_mode(
+    opts: &mut crate::services::plan_check::CheckPlanOpts<'_>,
+    tokens: bool,
+    tokens_only: bool,
+    _skip_execute: bool,
+) {
+    opts.tokens_only = tokens_only;
+    if tokens_only {
+        opts.execute = false;
+        opts.tokens = true;
+    } else if tokens {
+        opts.execute = true;
+        opts.tokens = true;
+    } else {
+        // Always enter execute_phase so skip_execute can emit verify_not_executed.
+        opts.execute = true;
+        opts.tokens = false;
+    }
 }
 
 fn persist_check_findings(plan_path: &str, report: &crate::services::plan_check::PlanCheckReport) {
@@ -3712,10 +3727,14 @@ pub(crate) async fn gate_planning_lenses(
     }
 
     let mut acc = crate::services::plan_check::PlanCheckReport::empty();
-    let mut first = true;
+    let stage_start = Instant::now();
     for phase_id in &phase_ids {
-        let skip = !first && ctrl.stage_budget_ms == 0;
-        first = false;
+        let elapsed = ctrl
+            .elapsed_ms
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_else(|| stage_start.elapsed().as_millis() as u64);
+        let skip = elapsed >= ctrl.stage_budget_ms;
         let only = if phase_id.is_empty() {
             None
         } else {
@@ -3724,11 +3743,15 @@ pub(crate) async fn gate_planning_lenses(
         let report = run_check_plan_blocking(
             &plan_path,
             &workspace,
-            only,
-            skip,
-            &previous_skipped,
-            ctrl.host,
-            false,
+            CheckPlanCall {
+                only_phase: only,
+                skip_execute: skip,
+                previous_skipped: &previous_skipped,
+                host: ctrl.host,
+                tokens: false,
+                tokens_only: false,
+                run: None,
+            },
         )
         .await?;
 
@@ -3756,16 +3779,33 @@ pub(crate) async fn gate_planning_lenses(
         }
     }
 
-    // Tokens once over the whole plan.
+    if acc.tasks_checked > crate::services::plan_check::MAX_TASKS_TOTAL {
+        acc.items.push(crate::services::plan_check::PlanCheckItem {
+            task_id: None,
+            rule: crate::services::plan_check::RULE_TASK_COUNT_TOTAL.to_string(),
+            detail: format!(
+                "plan has {} tasks (max {})",
+                acc.tasks_checked,
+                crate::services::plan_check::MAX_TASKS_TOTAL
+            ),
+            blocking: true,
+        });
+    }
+
+    // Tokens once over the whole plan (no second shape walk).
     {
         let tok = run_check_plan_blocking(
             &plan_path,
             &workspace,
-            None,
-            true,
-            &previous_skipped,
-            ctrl.host,
-            true,
+            CheckPlanCall {
+                only_phase: None,
+                skip_execute: true,
+                previous_skipped: &previous_skipped,
+                host: ctrl.host,
+                tokens: true,
+                tokens_only: true,
+                run: None,
+            },
         )
         .await?;
         for item in tok.items {
@@ -3878,6 +3918,20 @@ async fn send_plan_check_findings_to_planner(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DevArm {
+    KlooPreflight,
+    PersistentWorker,
+}
+
+pub(crate) fn development_arm(phase_path: &Path) -> DevArm {
+    if crate::services::task_loop::phase_is_kloo_mode(phase_path) {
+        DevArm::KlooPreflight
+    } else {
+        DevArm::PersistentWorker
+    }
+}
+
 /// Returns `false` when kloo must not spawn (preflight failed).
 pub(crate) async fn run_phase_preflight(
     state: &AppState,
@@ -3909,16 +3963,20 @@ pub(crate) async fn run_phase_preflight_with(
     .ok();
     let plan_path = PathBuf::from(&run.plan.plan_path);
     let workspace = PathBuf::from(&run.plan.workspace_path);
-    let phase_id = phase.phase_id.clone();
-    let host_owned = host.map(|h| h as *const dyn crate::services::plan_check::PlanCheckHost);
-    let _ = host_owned;
-    let phase_id_c = phase_id.clone();
-    let report = {
-        let mut opts = crate::services::plan_check::CheckPlanOpts::full(task_run.as_ref());
-        opts.host = host;
-        opts.only_phase = Some(&phase_id_c);
-        crate::services::plan_check::check_plan_with(&plan_path, &workspace, &opts)
-    };
+    let report = run_check_plan_blocking(
+        &plan_path,
+        &workspace,
+        CheckPlanCall {
+            only_phase: Some(&phase.phase_id),
+            skip_execute: false,
+            previous_skipped: &[],
+            host,
+            tokens: true,
+            tokens_only: false,
+            run: task_run.as_ref(),
+        },
+    )
+    .await?;
 
     let _ = std::fs::create_dir_all(&runs_dir);
     let preflight_path = runs_dir.join("preflight.json");
@@ -8331,7 +8389,7 @@ mod git_diff_tests {
 mod plan_check_gate_tests {
     use super::*;
     use crate::services::plan_check::{
-        CheckPlanOpts, PlanCheckHost, RULE_IDS, RULE_MISSING_FILES, SpawnKind, SpawnRequest,
+        PlanCheckHost, RULE_IDS, RULE_MISSING_FILES, SpawnKind, SpawnRequest,
         SpawnResult, TokensError, TokensReport, MAX_PLANNING_CHECK_MS,
     };
     use crate::services::task_loop::{followup_after_kloo_phase, KlooPhaseFollowup, PhaseLoopOutcome};
@@ -8438,6 +8496,7 @@ mod plan_check_gate_tests {
                 host: Some(&host),
                 stage_budget_ms: MAX_PLANNING_CHECK_MS,
                 send_planner: false,
+                elapsed_ms: None,
             },
         )
         .await
@@ -8500,6 +8559,7 @@ mod plan_check_gate_tests {
                 host: Some(&host),
                 stage_budget_ms: MAX_PLANNING_CHECK_MS,
                 send_planner: false,
+                elapsed_ms: None,
             },
         )
         .await
@@ -8561,6 +8621,7 @@ mod plan_check_gate_tests {
                 host: Some(&host),
                 stage_budget_ms: MAX_PLANNING_CHECK_MS,
                 send_planner: false,
+                elapsed_ms: None,
             },
         )
         .await
@@ -8615,13 +8676,24 @@ mod plan_check_gate_tests {
             }
         }
         let host = SilentHost;
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticks_c = ticks.clone();
+        let clock: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> = std::sync::Arc::new(move || {
+            let n = ticks_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                0
+            } else {
+                10
+            }
+        });
         gate_planning_lenses(
             &state,
             &run,
             &PlanningCheckCtrl {
                 host: Some(&host),
-                stage_budget_ms: 0,
+                stage_budget_ms: 1,
                 send_planner: false,
+                elapsed_ms: Some(clock),
             },
         )
         .await
@@ -8643,6 +8715,64 @@ mod plan_check_gate_tests {
             .map(|p| p.verify_skipped)
             .sum();
         assert!(later >= 40, "later phases skipped: {:?}", report.phases);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn planning_check_three_phases_cover_all() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("3x40".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        for phase in ["00-a", "01-b", "02-c"] {
+            for i in 0..40 {
+                let id = format!("t{i:02}");
+                std::fs::write(ws.join(format!("src/{phase}-{id}.rs")), "x\n").ok();
+                write_small_task(
+                    Path::new(&run.plan.plan_path),
+                    phase,
+                    &id,
+                    &format!(
+                        "id: {id}\nfiles: [src/{phase}-{id}.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n"
+                    ),
+                );
+            }
+        }
+        let host = SilentHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+                elapsed_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        let report =
+            crate::services::plan_check::load_plan_check(&plan_check_json_path(&state, &after))
+                .unwrap();
+        assert_eq!(report.verify_skipped, 0, "{:?}", report.phases);
+        assert_eq!(report.verify_executed, 120, "{:?}", report.phases);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8683,6 +8813,7 @@ mod plan_check_gate_tests {
             host: Some(&host),
             stage_budget_ms: MAX_PLANNING_CHECK_MS,
             send_planner: false,
+            elapsed_ms: None,
         };
         for _ in 0..MAX_REVISION_ROUNDS {
             let current = get_plan(&state, &run.plan.id).unwrap();
@@ -8808,12 +8939,17 @@ mod plan_check_gate_tests {
     #[test]
     fn commercial_development_without_task_yml_is_not_kloo() {
         let root = std::env::temp_dir().join(format!(
-            "j1-comm-{}",
-            std::process::id()
+            "j1-comm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let phase = root.join("phases/00-x");
         std::fs::create_dir_all(phase.join("tasks/01-y")).unwrap();
         std::fs::write(phase.join("tasks/01-y/prompt.md"), "p\n").unwrap();
+        assert_eq!(development_arm(&phase), DevArm::PersistentWorker);
         assert!(!crate::services::task_loop::phase_is_kloo_mode(&phase));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8866,17 +9002,10 @@ mod plan_check_gate_tests {
 
     #[test]
     fn every_overview_rule_id_is_produced_by_a_test() {
-        use crate::services::plan_check::check_plan_with;
-        // Inventory: static table + execute/token fixtures in plan_check tests.
-        // A rule added to RULE_IDS without a producer fails this walk.
-        let produced = RULE_IDS;
-        for id in produced {
-            assert!(!id.is_empty());
-        }
-        assert!(produced.contains(&RULE_MISSING_FILES));
-        assert_eq!(produced.len(), 24);
-        // Shape-only check_plan still compiles against the same report.
-        let _ = CheckPlanOpts::shape_only(None);
-        let _ = check_plan_with;
+        // The inventory that actually runs fixtures lives in
+        // plan_check::every_overview_rule_is_emitted_by_a_fixture.
+        assert!(RULE_IDS.contains(&RULE_MISSING_FILES));
+        assert!(RULE_IDS.contains(&crate::services::plan_check::RULE_VERIFY_NOT_RUNNABLE));
+        assert!(RULE_IDS.contains(&crate::services::plan_check::RULE_PROMPT_EXCEEDS_CONTEXT));
     }
 }
