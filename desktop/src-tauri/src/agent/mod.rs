@@ -1901,9 +1901,38 @@ impl AgentService {
             .get("input")
             .cloned()
             .ok_or_else(|| "Missing 'input' parameter".to_string())?;
-        let settings: crate::services::planner_prompts::PlannerPromptSettings =
-            serde_json::from_value(input).map_err(|e| e.to_string())?;
-        let saved = crate::services::planner_prompts::save_prompt_settings(settings)?;
+        let current = crate::services::planner_prompts::load_prompt_settings()?;
+        let development: crate::services::planner_prompts::PlannerDevelopmentPrompts =
+            serde_json::from_value(
+                input
+                    .get("development")
+                    .cloned()
+                    .ok_or_else(|| "Missing development prompts".to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        let planning = input
+            .get("planning")
+            .ok_or_else(|| "Missing planning prompts".to_string())?;
+        let planner = planning
+            .get("planner")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing planning.planner".to_string())?
+            .to_string();
+        let reviewer = planning
+            .get("reviewer")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing planning.reviewer".to_string())?
+            .to_string();
+        let small_mode = match input.get("smallMode") {
+            Some(v) if !v.is_null() => Some(
+                serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
+            ),
+            _ => None,
+        };
+        let merged = crate::services::planner_prompts::overlay_prompt_settings(
+            current, development, planner, reviewer, small_mode,
+        );
+        let saved = crate::services::planner_prompts::save_prompt_settings(merged)?;
         serde_json::to_value(saved).map_err(|e| e.to_string())
     }
 

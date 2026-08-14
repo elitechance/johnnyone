@@ -475,15 +475,10 @@ pub async fn run_kloo_phase_ex(
         workspace: PathBuf::from(&run.plan.workspace_path),
         runs_dir,
         kloo_cli,
-        leaf_wrapper: if crate::services::agent_plans::executor_mode_is_local_small(
+        leaf_wrapper: crate::services::agent_plans::leaf_wrapper_for(
             run.plan.executor_config.as_deref(),
-        ) {
-            crate::services::planner_prompts::load_prompt_settings()
-                .map(|s| s.small_mode.leaf_wrapper)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        },
+        )
+        .unwrap_or_default(),
     };
     let mut host = RealHost {
         state: state.clone(),

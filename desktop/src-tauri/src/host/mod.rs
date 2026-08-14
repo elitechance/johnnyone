@@ -309,7 +309,24 @@ impl MutationRoot {
         &self,
         input: PlannerPromptSettingsInput,
     ) -> async_graphql::Result<GqlPlannerPromptSettings> {
-        Ok(planner_prompt_service::save_prompt_settings(input.into())?.into())
+        let current = planner_prompt_service::load_prompt_settings()?;
+        let small_mode = input.small_mode.map(|sm| planner_prompt_service::SmallModePrompts {
+            planner: sm.planner,
+            reviewer: sm.reviewer,
+            leaf_wrapper: sm.leaf_wrapper,
+            amend_planner: sm.amend_planner,
+        });
+        let merged = planner_prompt_service::overlay_prompt_settings(
+            current,
+            planner_prompt_service::PlannerDevelopmentPrompts {
+                worker: input.development.worker,
+                reviewer: input.development.reviewer,
+            },
+            input.planning.planner,
+            input.planning.reviewer,
+            small_mode,
+        );
+        Ok(planner_prompt_service::save_prompt_settings(merged)?.into())
     }
 
     async fn connect_relay(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {

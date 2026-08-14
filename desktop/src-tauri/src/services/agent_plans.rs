@@ -2992,7 +2992,7 @@ fn planning_lens_reviewer_prompt(
 }
 
 fn planning_lens_reviewer_prompt_from(
-    settings: Option<&planner_prompts::PlannerPromptSettings>,
+    _settings: Option<&planner_prompts::PlannerPromptSettings>,
     state: &AppState,
     run: &AgentPlanRun,
     lens: &ValidationLens,
@@ -3021,11 +3021,13 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
         report = lens_report_instruction(session_id, lens_name),
     );
     if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
-        let reviewer = settings
-            .map(|s| s.small_mode.reviewer.as_str())
-            .unwrap_or(planner_prompts::DEFAULT_SMALL_MODE_REVIEWER);
-        let extra = planner_prompts::render_template(reviewer, &values);
-        body = format!("{extra}\n\n{body}");
+        // Only the plan-check constraint — not role/Judge-only/footer from
+        // smallMode.reviewer, which would override each lens's dimension
+        // and report protocol. See 03-03 decisions.md (T2 r2).
+        body = format!(
+            "{}\n\n{body}",
+            planner_prompts::PLAN_CHECK_ALREADY_VALIDATED
+        );
     }
     body
 }
@@ -3599,17 +3601,26 @@ fn jail_phase_id(phase_id: &str) -> Result<&str, String> {
     }
 }
 
+fn plan_initiative_id(state: &AppState, plan_id: &str) -> Result<String, String> {
+    state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT initiative_id FROM agent_plans WHERE id = ?1",
+            params![plan_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Agent plan not found: {e}"))
+    })
+}
+
 fn jailed_phase_runs_dir(
     state: &AppState,
-    run: &AgentPlanRun,
+    initiative_id: &str,
+    plan_id: &str,
     phase_id: &str,
 ) -> Result<PathBuf, String> {
     let phase = jail_phase_id(phase_id)?;
     let initiatives = settings_service::resolve_initiatives_dir(state);
-    let parent = initiatives
-        .join(&run.plan.initiative_id)
-        .join("runs")
-        .join(&run.plan.id);
+    let parent = initiatives.join(initiative_id).join("runs").join(plan_id);
     settings_service::resolve_within_root(&parent, phase)
 }
 
@@ -3618,10 +3629,16 @@ pub fn get_plan_check_json(
     plan_id: &str,
     phase_id: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let run = get_plan(state, plan_id)?;
+    let initiative_id = plan_initiative_id(state, plan_id)?;
     let path = match phase_id.map(str::trim).filter(|s| !s.is_empty()) {
-        None => plan_check_json_path(state, &run),
-        Some(phase) => jailed_phase_runs_dir(state, &run, phase)?.join("preflight.json"),
+        None => settings_service::resolve_initiatives_dir(state)
+            .join(&initiative_id)
+            .join("runs")
+            .join(plan_id)
+            .join("plan-check.json"),
+        Some(phase) => {
+            jailed_phase_runs_dir(state, &initiative_id, plan_id, phase)?.join("preflight.json")
+        }
     };
     if !path.is_file() {
         return Ok(None);
@@ -3636,9 +3653,12 @@ pub fn get_task_run_json(
     plan_id: &str,
     phase_id: &str,
 ) -> Result<Option<String>, String> {
-    let run = get_plan(state, plan_id)?;
+    let initiative_id = plan_initiative_id(state, plan_id)?;
     let path = crate::services::task_state::tasks_json_path(&jailed_phase_runs_dir(
-        state, &run, phase_id,
+        state,
+        &initiative_id,
+        plan_id,
+        phase_id,
     )?);
     if !path.is_file() {
         return Ok(None);
@@ -3682,6 +3702,22 @@ pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> Result<bool, St
         .map_err(|e| format!("read executor_config: {e}"))
     })?;
     Ok(executor_mode_is_local_small(raw.as_deref()))
+}
+
+/// Settings-driven leaf wrapper for a local-small run. `None` if commercial
+/// or the configured wrapper is empty.
+pub(crate) fn leaf_wrapper_for(executor_config: Option<&str>) -> Option<String> {
+    if !executor_mode_is_local_small(executor_config) {
+        return None;
+    }
+    let w = planner_prompts::load_prompt_settings()
+        .map(|s| s.small_mode.leaf_wrapper)
+        .unwrap_or_default();
+    if w.trim().is_empty() {
+        None
+    } else {
+        Some(w)
+    }
 }
 
 pub(crate) fn executor_mode_is_local_small(raw: Option<&str>) -> bool {
@@ -3936,18 +3972,8 @@ pub(crate) async fn gate_planning_lenses(
         phase_ids.push(String::new());
     }
 
-    let leaf_wrapper = if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
-        planner_prompts::load_prompt_settings()
-            .map(|s| s.small_mode.leaf_wrapper)
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let wrapper_ref = if leaf_wrapper.trim().is_empty() {
-        None
-    } else {
-        Some(leaf_wrapper.as_str())
-    };
+    let leaf_wrapper = leaf_wrapper_for(run.plan.executor_config.as_deref());
+    let wrapper_ref = leaf_wrapper.as_deref();
     let mut acc = crate::services::plan_check::PlanCheckReport::empty();
     let stage_start = Instant::now();
     for phase_id in &phase_ids {
@@ -4210,13 +4236,7 @@ pub(crate) async fn run_phase_preflight_with(
     .ok();
     let plan_path = PathBuf::from(&run.plan.plan_path);
     let workspace = PathBuf::from(&run.plan.workspace_path);
-    let leaf_wrapper = if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
-        planner_prompts::load_prompt_settings()
-            .map(|s| s.small_mode.leaf_wrapper)
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let leaf_wrapper = leaf_wrapper_for(run.plan.executor_config.as_deref());
     let report = run_check_plan_blocking(
         &plan_path,
         &workspace,
@@ -4231,11 +4251,7 @@ pub(crate) async fn run_phase_preflight_with(
             tokens_budget_ms: Some(
                 tokens_budget_ms.unwrap_or(crate::services::plan_check::MAX_PLANNING_CHECK_MS),
             ),
-            leaf_wrapper: if leaf_wrapper.trim().is_empty() {
-                None
-            } else {
-                Some(leaf_wrapper.as_str())
-            },
+            leaf_wrapper: leaf_wrapper.as_deref(),
         },
     )
     .await?;
@@ -10053,19 +10069,21 @@ mod small_mode_tests {
             "sess",
         );
         assert!(
-            live.contains("SENTINEL-REVIEWER-XYZ"),
-            "live lens fan-out must render tuned smallMode.reviewer: {live}"
+            live.contains(crate::services::planner_prompts::PLAN_CHECK_ALREADY_VALIDATED),
+            "live lens must get the plan-check constraint: {live}"
         );
-        let live_default = planning_lens_reviewer_prompt_from(
-            Some(&PlannerPromptSettings::default()),
-            &state,
-            &small,
-            &lens,
-            "sess",
+        assert!(
+            !live.contains("Judge only:"),
+            "full smallMode.reviewer must not override the lens dimension: {live}"
         );
-        assert!(live_default.contains(
-            "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules."
-        ));
+        assert!(
+            !live.contains("Return this footer exactly"),
+            "reviewer footer must not fight lens_report_instruction: {live}"
+        );
+        assert!(
+            !live.contains("SENTINEL-REVIEWER-XYZ"),
+            "tuned whole-reviewer text stays off the lens path: {live}"
+        );
         let live_comm = planning_lens_reviewer_prompt_from(
             Some(&settings),
             &state,
@@ -10073,7 +10091,9 @@ mod small_mode_tests {
             &lens,
             "sess",
         );
-        assert!(!live_comm.contains("SENTINEL-REVIEWER-XYZ"));
+        assert!(!live_comm.contains(
+            crate::services::planner_prompts::PLAN_CHECK_ALREADY_VALIDATED
+        ));
 
         let mut amend_settings = PlannerPromptSettings::default();
         amend_settings.small_mode.amend_planner = "SENTINEL-AMEND-XYZ".into();

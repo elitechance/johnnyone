@@ -249,24 +249,38 @@ impl PlanCheckHost for RealPlanCheckHost {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::create_dir(&dir).map_err(|e| {
-            TokensError::Unavailable(format!("create tokens temp dir: {e}"))
-        })?;
+        if let Err(e) = std::fs::create_dir(&dir) {
+            return Err(TokensError::Unavailable(format!("create tokens temp dir: {e}")));
+        }
+        let cleanup = |dir: &Path| {
+            let _ = std::fs::remove_dir_all(dir);
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                cleanup(&dir);
+                return Err(TokensError::Unavailable(format!("chmod tokens temp dir: {e}")));
+            }
         }
         let path = dir.join("prompt.md");
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
+            let mut f = match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
-                .map_err(|e| TokensError::Unavailable(format!("create tokens temp: {e}")))?;
-            f.write_all(prompt_text.as_bytes())
-                .map_err(|e| TokensError::Unavailable(format!("write tokens temp: {e}")))?;
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    cleanup(&dir);
+                    return Err(TokensError::Unavailable(format!("create tokens temp: {e}")));
+                }
+            };
+            if let Err(e) = f.write_all(prompt_text.as_bytes()) {
+                cleanup(&dir);
+                return Err(TokensError::Unavailable(format!("write tokens temp: {e}")));
+            }
         }
         let argv = vec![
             "kloo".to_string(),

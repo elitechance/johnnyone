@@ -111,7 +111,31 @@ fn default_small_mode_amend_planner() -> String {
     DEFAULT_SMALL_MODE_AMEND_PLANNER.to_string()
 }
 
+/// The only small-mode reviewer text that planning *lenses* receive.
+/// The full `smallMode.reviewer` template (role, Judge-only scope, footer)
+/// is for the single-reviewer path; composing it into each lens overrides
+/// that lens's dimension and reporting protocol.
+pub(crate) const PLAN_CHECK_ALREADY_VALIDATED: &str = "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules.";
+
 /// Prepend a tunable leaf wrapper to `prompt.md` in memory. Empty wrapper is a no-op.
+/// Overlay a settings update onto `current`. `small_mode: None` keeps the
+/// already-saved smallMode (merge, don't replace with built-in defaults).
+pub fn overlay_prompt_settings(
+    mut current: PlannerPromptSettings,
+    development: PlannerDevelopmentPrompts,
+    planning_planner: String,
+    planning_reviewer: String,
+    small_mode: Option<SmallModePrompts>,
+) -> PlannerPromptSettings {
+    current.development = development;
+    current.planning.planner = planning_planner;
+    current.planning.reviewer = planning_reviewer;
+    if let Some(sm) = small_mode {
+        current.small_mode = sm;
+    }
+    current
+}
+
 pub fn wrap_leaf_prompt(wrapper: &str, prompt: &str) -> String {
     let w = wrapper.trim();
     if w.is_empty() {
@@ -468,9 +492,7 @@ planning:
 
     #[test]
     fn default_reviewer_contains_plan_check_sentence() {
-        assert!(DEFAULT_SMALL_MODE_REVIEWER.contains(
-            "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules."
-        ));
+        assert!(DEFAULT_SMALL_MODE_REVIEWER.contains(PLAN_CHECK_ALREADY_VALIDATED));
     }
 
     #[test]
@@ -514,6 +536,27 @@ planning:
         assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x0fc962193643a37b);
         assert_eq!(fnv1a64(DEFAULT_PLANNING_REVIEWER), 0x42e3b3d0e4178fe5);
         assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_WORKER), 0xbb568e9822273934);
+    }
+
+    #[test]
+    fn overlay_without_small_mode_keeps_tuned_strings() {
+        let mut current = PlannerPromptSettings::default();
+        current.small_mode.planner = "TUNED-PLANNER".into();
+        current.small_mode.reviewer = "TUNED-REVIEWER".into();
+        let merged = overlay_prompt_settings(
+            current,
+            PlannerDevelopmentPrompts {
+                worker: "W".into(),
+                reviewer: "R".into(),
+            },
+            "P".into(),
+            "V".into(),
+            None,
+        );
+        assert_eq!(merged.development.worker, "W");
+        assert_eq!(merged.planning.planner, "P");
+        assert_eq!(merged.small_mode.planner, "TUNED-PLANNER");
+        assert_eq!(merged.small_mode.reviewer, "TUNED-REVIEWER");
     }
 
     #[test]
