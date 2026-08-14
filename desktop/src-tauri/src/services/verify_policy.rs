@@ -174,10 +174,18 @@ fn quote_posix(s: &str) -> String {
 }
 
 /// Effective child working directory: `workspace.join(cwd)` or `workspace`.
-pub fn effective_verify_dir(workspace: &Path, cwd: Option<&str>) -> PathBuf {
+/// `cwd` is jailed here so callers that do not go through `TaskSpec` cannot
+/// chdir outside the workspace (`/etc`, `../..`, absolute paths).
+pub fn effective_verify_dir(
+    workspace: &Path,
+    cwd: Option<&str>,
+) -> Result<PathBuf, VerifyPolicyError> {
     match cwd.map(str::trim).filter(|c| !c.is_empty() && *c != ".") {
-        Some(rel) => workspace.join(rel),
-        None => workspace.to_path_buf(),
+        Some(rel) => {
+            jail_rel_path(rel).map_err(VerifyPolicyError::not_allowlisted)?;
+            Ok(workspace.join(rel))
+        }
+        None => Ok(workspace.to_path_buf()),
     }
 }
 
@@ -224,48 +232,32 @@ fn validate_cargo(argv: &[String]) -> Result<(), VerifyPolicyError> {
             "cargo: only `test` is allowed",
         ));
     }
-    let rest = &argv[2..];
-    let mut i = 0;
+    let mut i = 2;
     let mut has_filter = false;
-    while i < rest.len() {
-        let t = rest[i].as_str();
+    while i < argv.len() {
+        let t = argv[i].as_str();
         if t == "--" {
+            i += 1;
+            validate_libtest_args(&argv[i..])?;
             break;
         }
-        if is_cargo_chdir_flag(t) {
-            return Err(VerifyPolicyError::not_allowlisted(
-                "cargo test -C is not allowed; use --manifest-path",
-            ));
+        if let Some(val) = eq_value(t, "--manifest-path") {
+            jail_token(val)?;
+            i += 1;
+            continue;
         }
         if t == "--manifest-path" {
-            let val = rest.get(i + 1).ok_or_else(|| {
-                VerifyPolicyError::not_allowlisted("cargo --manifest-path missing value")
-            })?;
+            let val = take_flag_value(argv, i, "--manifest-path")?;
             jail_token(val)?;
             i += 2;
             continue;
         }
-        if let Some(val) = t.strip_prefix("--manifest-path=") {
-            jail_token(val)?;
-            i += 1;
-            continue;
-        }
         if t.starts_with('-') {
-            if let Some(next) = rest.get(i + 1) {
-                if !next.starts_with('-') && cargo_flag_takes_value(t) {
-                    if is_path_like(next) {
-                        jail_token(next)?;
-                    }
-                    i += 2;
-                    continue;
-                }
-            }
-            i += 1;
-            continue;
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "cargo flag {t:?} is not allowed; only --manifest-path <rel>"
+            )));
         }
-        if is_path_like(t) {
-            jail_token(t)?;
-        }
+        jail_if_path_like(t)?;
         has_filter = true;
         i += 1;
     }
@@ -277,36 +269,52 @@ fn validate_cargo(argv: &[String]) -> Result<(), VerifyPolicyError> {
     Ok(())
 }
 
-fn is_cargo_chdir_flag(t: &str) -> bool {
-    t == "-C" || (t.starts_with("-C") && !t.starts_with("--"))
-}
+/// Closed libtest flag set after cargo's `--`. `--logfile=` and other
+/// filesystem destinations are not in the set (Amendment 5 / L4).
+const LIBTEST_BOOL_FLAGS: &[&str] = &[
+    "--exact",
+    "--nocapture",
+    "--quiet",
+    "--ignored",
+    "--include-ignored",
+];
+const LIBTEST_VALUE_FLAGS: &[&str] = &["--test-threads", "--skip", "--color"];
 
-fn cargo_flag_takes_value(t: &str) -> bool {
-    matches!(
-        t,
-        "--features"
-            | "--package"
-            | "-p"
-            | "--target"
-            | "--target-dir"
-            | "--color"
-            | "--jobs"
-            | "-j"
-            | "--exclude"
-            | "--profile"
-            | "--config"
-            | "--message-format"
-            | "--test"
-            | "--bin"
-            | "--example"
-            | "--bench"
-    )
+fn validate_libtest_args(args: &[String]) -> Result<(), VerifyPolicyError> {
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i].as_str();
+        if let Some((flag, val)) = split_eq_flag(t) {
+            if !LIBTEST_VALUE_FLAGS.contains(&flag) {
+                return Err(VerifyPolicyError::not_allowlisted(format!(
+                    "libtest flag {flag:?} is not allowed"
+                )));
+            }
+            jail_if_path_like(val)?;
+            i += 1;
+            continue;
+        }
+        if LIBTEST_BOOL_FLAGS.contains(&t) {
+            i += 1;
+            continue;
+        }
+        if LIBTEST_VALUE_FLAGS.contains(&t) {
+            let val = take_flag_value(args, i, t)?;
+            jail_if_path_like(val)?;
+            i += 2;
+            continue;
+        }
+        return Err(VerifyPolicyError::not_allowlisted(format!(
+            "libtest token {t:?} is not allowed"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
     let mut runner = None;
     let mut has_run = false;
-    let mut file = None;
+    let mut files = 0usize;
     let mut i = 1;
     while i < argv.len() {
         let t = argv[i].as_str();
@@ -314,25 +322,28 @@ fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
             i += 1;
             continue;
         }
+        if let Some(val) = eq_value(t, "--prefix").or_else(|| eq_value(t, "--config")) {
+            jail_token(val)?;
+            i += 1;
+            continue;
+        }
         if t == "--prefix" || t == "--config" {
-            let val = argv.get(i + 1).ok_or_else(|| {
-                VerifyPolicyError::not_allowlisted(format!("npx {t} missing value"))
-            })?;
+            let val = take_flag_value(argv, i, t)?;
             jail_token(val)?;
             i += 2;
             continue;
         }
-        if let Some(val) = t.strip_prefix("--prefix=") {
-            jail_token(val)?;
-            i += 1;
-            continue;
+        if t.starts_with('-') {
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "npx flag {t:?} is not allowed"
+            )));
         }
-        if let Some(val) = t.strip_prefix("--config=") {
-            jail_token(val)?;
-            i += 1;
-            continue;
-        }
-        if t == "vitest" || t == "jest" {
+        if runner.is_none() {
+            if t != "vitest" && t != "jest" {
+                return Err(VerifyPolicyError::not_allowlisted(format!(
+                    "npx package must be vitest or jest, got {t:?}"
+                )));
+            }
             runner = Some(t);
             i += 1;
             continue;
@@ -342,39 +353,16 @@ fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
             i += 1;
             continue;
         }
-        if t.starts_with('-') {
-            if let Some(next) = argv.get(i + 1) {
-                if !next.starts_with('-') && (t == "--config" || t == "--prefix") {
-                    jail_token(next)?;
-                    i += 2;
-                    continue;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if file.is_none() {
-            file = Some(t);
-        }
-        if is_path_like(t) {
-            jail_token(t)?;
-        }
+        jail_token(t)?;
+        files += 1;
         i += 1;
     }
-    match runner {
-        Some("vitest") | Some("jest") => {}
-        Some(other) => {
-            return Err(VerifyPolicyError::not_allowlisted(format!(
-                "npx package {other:?} is not vitest or jest"
-            )));
-        }
-        None => {
-            return Err(VerifyPolicyError::not_allowlisted(
-                "npx must invoke vitest or jest",
-            ));
-        }
+    if runner.is_none() {
+        return Err(VerifyPolicyError::not_allowlisted(
+            "npx must invoke vitest or jest",
+        ));
     }
-    if !has_run || file.is_none() {
+    if !has_run || files == 0 {
         return Err(VerifyPolicyError::not_scoped(
             "npx vitest/jest must include `run` and a file-like argument",
         ));
@@ -388,78 +376,54 @@ fn validate_go(argv: &[String]) -> Result<(), VerifyPolicyError> {
             "go: only `test` is allowed",
         ));
     }
-    for (idx, t) in argv.iter().enumerate() {
-        if t == "-C" || (t.starts_with("-C") && !t.starts_with("--") && t != "-C") {
-            if idx != 2 {
-                return Err(VerifyPolicyError::not_allowlisted(
-                    "go -C is only allowed immediately after `test`",
-                ));
-            }
-        }
-        if t == "-C" && idx != 2 {
-            return Err(VerifyPolicyError::not_allowlisted(
-                "go -C is only allowed immediately after `test`",
-            ));
-        }
-    }
     let mut i = 2;
     if argv.get(i).map(String::as_str) == Some("-C") {
-        let dir = argv.get(i + 1).ok_or_else(|| {
-            VerifyPolicyError::not_allowlisted("go test -C missing directory")
-        })?;
+        let dir = take_flag_value(argv, i, "-C")?;
         jail_token(dir)?;
         i += 2;
-    } else if argv
-        .get(i)
-        .map(|t| t.starts_with("-C") && t != "-C" && !t.starts_with("--"))
-        .unwrap_or(false)
-    {
+    } else if argv.get(i).map(|t| t.starts_with("-C")).unwrap_or(false) {
         return Err(VerifyPolicyError::not_allowlisted(
-            "go -C value must be a separate argument",
+            "go -C value must be a separate argument immediately after `test`",
         ));
     }
     let mut pkg = None;
     while i < argv.len() {
         let t = argv[i].as_str();
-        if t == "-C" || (t.starts_with("-C") && !t.starts_with("--")) {
+        if t == "-C" || t.starts_with("-C") {
             return Err(VerifyPolicyError::not_allowlisted(
                 "go -C is only allowed immediately after `test`",
             ));
         }
-        if t.starts_with('-') {
-            if let Some(next) = argv.get(i + 1) {
-                if !next.starts_with('-') {
-                    if is_path_like(next) {
-                        jail_token(next)?;
-                    }
-                    i += 2;
-                    continue;
-                }
-            }
+        if let Some(val) = eq_value(t, "-run") {
+            jail_if_path_like(val)?;
             i += 1;
             continue;
         }
-        if pkg.is_none() {
-            pkg = Some(t);
+        if t == "-run" {
+            let val = take_flag_value(argv, i, "-run")?;
+            jail_if_path_like(val)?;
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "go flag {t:?} is not allowed"
+            )));
         }
         if is_go_all_packages(t) {
             return Err(VerifyPolicyError::not_scoped(
                 "go test ./... is a whole-suite verify",
             ));
         }
-        if is_path_like(t) {
-            jail_token(t)?;
+        jail_if_path_like(t)?;
+        if pkg.is_none() {
+            pkg = Some(t);
         }
         i += 1;
     }
-    let Some(pkg) = pkg else {
+    if pkg.is_none() {
         return Err(VerifyPolicyError::not_scoped(
             "go test requires a package path",
-        ));
-    };
-    if is_go_all_packages(pkg) {
-        return Err(VerifyPolicyError::not_scoped(
-            "go test ./... is a whole-suite verify",
         ));
     }
     Ok(())
@@ -478,80 +442,105 @@ fn validate_python(argv: &[String]) -> Result<(), VerifyPolicyError> {
         ));
     }
     let mut file = None;
-    let mut i = 3;
-    while i < argv.len() {
-        let t = argv[i].as_str();
+    for t in argv.iter().skip(3) {
         if t.starts_with('-') {
-            if let Some(next) = argv.get(i + 1) {
-                if !next.starts_with('-') {
-                    if is_path_like(next) {
-                        jail_token(next)?;
-                    }
-                    i += 2;
-                    continue;
-                }
-            }
-            i += 1;
-            continue;
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "python/pytest flag {t:?} is not allowed"
+            )));
         }
-        if file.is_none() {
-            file = Some(t);
+        if !is_path_like(t) {
+            return Err(VerifyPolicyError::not_scoped(
+                "python -m pytest requires a file-like path",
+            ));
         }
-        if is_path_like(t) {
-            jail_token(t)?;
-        } else {
-            // pytest target without a slash still has to stay in-jail if it looks like a path later
-        }
-        i += 1;
+        jail_token(t)?;
+        file = Some(t.as_str());
     }
-    let Some(file) = file else {
+    if file.is_none() {
         return Err(VerifyPolicyError::not_scoped(
             "python -m pytest requires a file path",
         ));
-    };
-    if is_path_like(file) {
-        jail_token(file)?;
-    } else {
-        // bare module name — still require a file-like token
-        return Err(VerifyPolicyError::not_scoped(
-            "python -m pytest requires a file-like path",
-        ));
     }
     Ok(())
 }
 
+const NODE_BOOL_FLAGS: &[&str] = &["--test", "--test-only"];
+const NODE_VALUE_FLAGS: &[&str] = &["--test-name-pattern"];
+
 fn validate_node(argv: &[String]) -> Result<(), VerifyPolicyError> {
-    for t in argv.iter().skip(1) {
-        if is_node_code_flag(t) {
-            return Err(VerifyPolicyError::not_allowlisted(
-                "node -e/-p/-c is not allowed",
-            ));
-        }
-    }
     let mut file = None;
-    for t in argv.iter().skip(1) {
-        if t.starts_with('-') {
+    let mut i = 1;
+    while i < argv.len() {
+        let t = argv[i].as_str();
+        if let Some((flag, val)) = split_eq_flag(t) {
+            if !NODE_VALUE_FLAGS.contains(&flag) {
+                return Err(VerifyPolicyError::not_allowlisted(format!(
+                    "node flag {flag:?} is not allowed"
+                )));
+            }
+            jail_if_path_like(val)?;
+            i += 1;
             continue;
         }
-        file = Some(t.as_str());
-        break;
+        if NODE_BOOL_FLAGS.contains(&t) {
+            i += 1;
+            continue;
+        }
+        if NODE_VALUE_FLAGS.contains(&t) {
+            let val = take_flag_value(argv, i, t)?;
+            jail_if_path_like(val)?;
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "node flag {t:?} is not allowed"
+            )));
+        }
+        if file.is_some() {
+            return Err(VerifyPolicyError::not_allowlisted(
+                "node accepts a single relative test-file path",
+            ));
+        }
+        jail_token(t)?;
+        file = Some(t);
+        i += 1;
     }
-    let Some(file) = file else {
+    if file.is_none() {
         return Err(VerifyPolicyError::not_scoped(
             "node requires a relative test-file path",
         ));
-    };
-    jail_token(file)?;
+    }
     Ok(())
 }
 
-fn is_node_code_flag(t: &str) -> bool {
-    t == "-e"
-        || t == "-p"
-        || t == "-c"
-        || (t.starts_with("-e") && !t.starts_with("--"))
-        || (t.starts_with("-p") && !t.starts_with("--"))
-        || (t.starts_with("-c") && !t.starts_with("--"))
+fn eq_value<'a>(token: &'a str, flag: &str) -> Option<&'a str> {
+    token
+        .strip_prefix(flag)
+        .and_then(|rest| rest.strip_prefix('='))
+}
+
+fn split_eq_flag(token: &str) -> Option<(&str, &str)> {
+    if !token.starts_with('-') {
+        return None;
+    }
+    token.split_once('=')
+}
+
+fn take_flag_value<'a>(
+    argv: &'a [String],
+    flag_idx: usize,
+    flag: &str,
+) -> Result<&'a str, VerifyPolicyError> {
+    let val = argv.get(flag_idx + 1).ok_or_else(|| {
+        VerifyPolicyError::not_allowlisted(format!("{flag} missing value"))
+    })?;
+    if val.starts_with('-') {
+        return Err(VerifyPolicyError::not_allowlisted(format!(
+            "{flag} missing value"
+        )));
+    }
+    Ok(val)
 }
 
 fn is_path_like(token: &str) -> bool {
@@ -569,6 +558,13 @@ fn jail_token(token: &str) -> Result<(), VerifyPolicyError> {
     jail_rel_path(token).map_err(|e| VerifyPolicyError::not_allowlisted(e))
 }
 
+fn jail_if_path_like(token: &str) -> Result<(), VerifyPolicyError> {
+    if is_path_like(token) {
+        jail_token(token)?;
+    }
+    Ok(())
+}
+
 /// Planned verify spawn: authorised argv + effective cwd. No process.
 pub fn plan_task_verify(
     workspace: &Path,
@@ -578,7 +574,7 @@ pub fn plan_task_verify(
     let argv = check_verify(verify)?;
     Ok(PlannedVerify {
         argv,
-        current_dir: effective_verify_dir(workspace, cwd),
+        current_dir: effective_verify_dir(workspace, cwd)?,
     })
 }
 
@@ -833,6 +829,29 @@ mod tests {
                 r#"node -e "require('fs').writeFileSync('{}','x')""#,
                 pwned.display()
             ),
+            // Allowlisted argv[0] + hostile flag — the class the literal list missed.
+            format!(
+                r#"node --eval "require('fs').writeFileSync('{}','x')""#,
+                pwned.display()
+            ),
+            format!(
+                r#"node --print "require('fs').writeFileSync('{}','x')""#,
+                pwned.display()
+            ),
+            "node --require=/tmp/evil.js test/foo.test.js".to_string(),
+            "node --import=file:///tmp/evil.mjs test/foo.test.js".to_string(),
+            "cargo test mul --config target.x86_64-unknown-linux-gnu.runner=/tmp/evil.sh".to_string(),
+            "cargo test mul --config build.rustc-wrapper=/tmp/evil.sh".to_string(),
+            "cargo test mul --config=build.rustc-wrapper=/usr/bin/id".to_string(),
+            "cargo test mul --target-dir=/tmp/evil".to_string(),
+            "go test -exec ./evil.sh ./pkg ./pkg2".to_string(),
+            "go test -toolexec ./evil.sh ./pkg ./pkg2".to_string(),
+            "go test -exec=/tmp/evil.sh ./a ./b".to_string(),
+            "npx evil-pkg vitest run x.spec.ts".to_string(),
+            "npx --package=evil-pkg vitest run x.spec.ts".to_string(),
+            "cargo test mul -- --logfile=/tmp/pwn".to_string(),
+            "cargo test mul -- --logfile=../../pwn".to_string(),
+            format!("cargo test mul -- --logfile={}", pwned.display()),
         ];
         for raw in &cases {
             let err = check_verify(raw).expect_err(raw);
@@ -845,6 +864,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "safe");
         assert!(!pwned.exists(), "sh/node payload must not have run");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deny_by_default_rejects_unknown_flags_and_equals_escapes() {
+        assert_eq!(
+            check_verify("cargo test mul --config build.rustc-wrapper=/tmp/evil.sh")
+                .unwrap_err()
+                .rule,
+            RULE_NOT_ALLOWLISTED
+        );
+        assert_eq!(
+            check_verify("go test -exec id ./pkg").unwrap_err().rule,
+            RULE_NOT_ALLOWLISTED
+        );
+        assert_eq!(
+            check_verify("node --eval code test/foo.test.js")
+                .unwrap_err()
+                .rule,
+            RULE_NOT_ALLOWLISTED
+        );
+        assert_eq!(
+            check_verify("npx evil-pkg vitest run x.spec.ts")
+                .unwrap_err()
+                .rule,
+            RULE_NOT_ALLOWLISTED
+        );
+        let argv = check_verify("go test -run TestAdd ./foo").unwrap();
+        assert_eq!(argv, s(&["go", "test", "-run", "TestAdd", "./foo"]));
+        let argv = check_verify("node --test src/foo.test.js").unwrap();
+        assert_eq!(argv, s(&["node", "--test", "src/foo.test.js"]));
+        assert_eq!(
+            check_verify("cargo test mul -- --logfile=/tmp/pwn")
+                .unwrap_err()
+                .rule,
+            RULE_NOT_ALLOWLISTED
+        );
+        assert_eq!(
+            check_verify("cargo test mul -- --logfile=../../pwn")
+                .unwrap_err()
+                .rule,
+            RULE_NOT_ALLOWLISTED
+        );
+    }
+
+    #[test]
+    fn plan_task_verify_jails_cwd() {
+        let ws = Path::new("/tmp/ws");
+        let err = plan_task_verify(ws, "cargo test mul -- --exact", Some("/etc")).unwrap_err();
+        assert_eq!(err.rule, RULE_NOT_ALLOWLISTED);
+        assert!(err.detail.contains("relative") || err.detail.contains("/etc"), "{err}");
+        let err = plan_task_verify(ws, "cargo test mul -- --exact", Some("../..")).unwrap_err();
+        assert_eq!(err.rule, RULE_NOT_ALLOWLISTED);
+        assert!(err.detail.contains(".."), "{err}");
+        let plan = plan_task_verify(ws, "cargo test mul -- --exact", Some("pkg")).unwrap();
+        assert!(plan.current_dir.ends_with("pkg"), "{:?}", plan.current_dir);
+        let plan = plan_task_verify(ws, "cargo test mul -- --exact", None).unwrap();
+        assert_eq!(plan.current_dir, ws);
     }
 
     #[test]

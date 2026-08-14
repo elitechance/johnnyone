@@ -116,6 +116,7 @@ pub fn build_config(req: &KlooRunRequest) -> Result<CliSpawnConfig, String> {
             std::path::Path::new(&req.workspace),
             req.cwd.as_deref(),
         )
+        .map_err(|e| format!("shape: {e}"))?
         .to_string_lossy()
         .into_owned(),
         env_vars: vec![],
