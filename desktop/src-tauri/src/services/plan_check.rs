@@ -283,7 +283,18 @@ fn check_dag(specs: &[TaskSpec], report: &mut PlanCheckReport) {
             }
         }
     }
-    if let Err(DagError::Cycle { nodes }) = task_spec::topo_sort(specs) {
+    // Drop unknown/self edges so topo_sort can still see a cycle in the
+    // resolvable subgraph (it otherwise returns the first UnknownDep/SelfDep).
+    let resolvable: Vec<TaskSpec> = specs
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.depends_on
+                .retain(|d| d != &s.id && ids.contains(d.as_str()));
+            s
+        })
+        .collect();
+    if let Err(DagError::Cycle { nodes }) = task_spec::topo_sort(&resolvable) {
         let tid = nodes.first().map(String::as_str);
         report.items.push(item(
             tid,
@@ -376,7 +387,14 @@ fn check_cwd(
         }
     }
     if let Err(e) = verify_policy::effective_verify_dir(workspace, Some(cwd)) {
-        report.items.push(item(Some(&spec.id), RULE_VERIFY_NOT_ALLOWLISTED, e.detail));
+        // Do not propagate e.rule — effective_verify_dir uses the argv
+        // constructor (verify_not_allowlisted). A jail/escape cwd is a
+        // cwd-field fault; the planner/Checks API for that is this id.
+        report.items.push(item(
+            Some(&spec.id),
+            RULE_VERIFY_CWD_MISSING,
+            e.detail,
+        ));
         return;
     }
     if workspace.join(cwd).is_dir() {
@@ -1170,6 +1188,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Isolated plan: a real 01-a ↔ 02-b cycle plus an unrelated 03-c → zz-nope.
+    /// Must emit both `depends_cycle` and `depends_unresolved` in one pass.
+    #[test]
+    fn depends_cycle_and_unresolved_in_same_phase() {
+        let root = tmp("dag-mix");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_task(
+            &plan,
+            "00-mix",
+            "01-a",
+            &rust_yml("01-a", "src/a.rs", "cargo test a -- --exact", "02-b", ""),
+            "cycle+unknown a",
+        );
+        write_task(
+            &plan,
+            "00-mix",
+            "02-b",
+            &rust_yml("02-b", "src/a.rs", "cargo test b -- --exact", "01-a", ""),
+            "cycle+unknown b",
+        );
+        write_task(
+            &plan,
+            "00-mix",
+            "03-c",
+            &rust_yml("03-c", "src/a.rs", "cargo test c -- --exact", "zz-nope", ""),
+            "unrelated unknown",
+        );
+        let report = check_plan(&plan, &ws, None);
+        assert!(
+            has_rule(&report, RULE_DEPENDS_CYCLE),
+            "cycle must still emit when an unknown dep exists in the same phase: {:?}",
+            report.items
+        );
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_DEPENDS_UNRESOLVED && i.task_id.as_deref() == Some("03-c")
+            }),
+            "unknown dep in the same phase: {:?}",
+            report.items
+        );
+        assert!(
+            !report.items.iter().any(|i| i.rule == RULE_DEPENDS_SELF),
+            "{:?}",
+            report.items
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn verify_and_misc_rules() {
         let root = tmp("verify");
@@ -1444,12 +1513,14 @@ mod tests {
         let report = check_plan(&plan, &ws, None);
         assert!(
             report.items.iter().any(|i| {
-                i.task_id.as_deref() == Some("01-a")
-                    && (i.rule == RULE_VERIFY_NOT_ALLOWLISTED
-                        || i.rule == RULE_VERIFY_CWD_MISSING
-                        || i.rule == RULE_FILES_OUTSIDE_CWD)
+                i.task_id.as_deref() == Some("01-a") && i.rule == RULE_VERIFY_CWD_MISSING
             }),
-            "symlink cwd must not pass shape: {:?}",
+            "symlink cwd must be verify_cwd_missing, not verify_not_allowlisted: {:?}",
+            report.items
+        );
+        assert!(
+            !report.items.iter().any(|i| i.rule == RULE_VERIFY_NOT_ALLOWLISTED),
+            "cwd jail/escape is not an argv allowlist miss: {:?}",
             report.items
         );
         assert!(!report.passed);
