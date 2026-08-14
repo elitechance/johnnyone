@@ -35,6 +35,12 @@ pub struct RoutedTask {
     pub blocked_dependents: Vec<String>,
     #[serde(default)]
     pub attempts: Vec<AttemptSnap>,
+    /// Routing / last-attempt code so the amend planner sees why without
+    /// decoding an empty attempts array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,18 +127,47 @@ pub fn reset_replan_round(path: &Path) -> Result<(), String> {
     save_amendment(path, &existing)
 }
 
-/// `shape` when the last attempt classified as shape; otherwise `exhausted`.
+fn is_shape_failure_code(code: &str) -> bool {
+    matches!(code, "missing_file" | "missing_prompt")
+}
+
+/// `shape` when the last attempt classified as shape, the routing code is a
+/// pre-spawn shape failure, or a planner-routed row never spawned. Else
+/// `exhausted`.
 pub fn amendment_rule_for(row: &TaskRow) -> &'static str {
-    match row
-        .attempts
-        .last()
+    let last = row.attempts.last();
+    if last
         .and_then(|a| a.class.as_deref())
-        .map(|c| c.to_ascii_lowercase())
-        .as_deref()
+        .is_some_and(|c| c.eq_ignore_ascii_case("shape"))
     {
-        Some("shape") => "shape",
-        _ => "exhausted",
+        return "shape";
     }
+    if last
+        .and_then(|a| a.failure_code.as_deref())
+        .is_some_and(is_shape_failure_code)
+    {
+        return "shape";
+    }
+    if row.route.as_deref() == Some("planner") && row.attempts.is_empty() {
+        return "shape";
+    }
+    "exhausted"
+}
+
+fn row_routing_failure_code(row: &TaskRow) -> Option<String> {
+    row.attempts
+        .last()
+        .and_then(|a| a.failure_code.clone())
+}
+
+fn row_routing_detail(row: &TaskRow) -> Option<String> {
+    row.attempts.last().and_then(|a| {
+        a.checks
+            .as_ref()
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
 }
 
 fn snap_attempts(row: &TaskRow) -> Vec<AttemptSnap> {
@@ -174,6 +209,8 @@ pub fn build_amendment(
             rule: amendment_rule_for(t).to_string(),
             blocked_dependents: blocked_dependents_of(file, &t.id),
             attempts: snap_attempts(t),
+            failure_code: row_routing_failure_code(t),
+            detail: row_routing_detail(t),
         })
         .collect();
     routed.sort_by(|a, b| a.task_id.cmp(&b.task_id));
@@ -438,6 +475,49 @@ mod tests {
         file.tasks = vec![failed_planner("01-a", "shape", "missing_file")];
         let a = build_amendment("plan", "00-x", 1, &file);
         assert_eq!(a.routed[0].rule, "shape");
+    }
+
+    #[test]
+    fn empty_attempts_planner_route_is_shape() {
+        let mut file = empty_run("plan", "00-x");
+        file.tasks = vec![TaskRow {
+            id: "01-a".into(),
+            status: "failed".into(),
+            depends_on: vec![],
+            attempts: vec![],
+            succeeded_tier: None,
+            commit_sha: None,
+            blocked_by: None,
+            route: Some("planner".into()),
+        }];
+        let a = build_amendment("plan", "00-x", 1, &file);
+        assert_eq!(a.routed[0].rule, "shape");
+        assert!(a.routed[0].attempts.is_empty());
+    }
+
+    #[test]
+    fn missing_file_code_is_shape_and_carries_detail() {
+        let mut file = empty_run("plan", "00-x");
+        let mut row = failed_planner("01-a", "shape", "missing_file");
+        row.attempts[0].checks =
+            Some(serde_json::json!({ "reason": "shape: required file 'src/x.rs' missing" }));
+        file.tasks = vec![row];
+        let a = build_amendment("plan", "00-x", 1, &file);
+        assert_eq!(a.routed[0].rule, "shape");
+        assert_eq!(a.routed[0].failure_code.as_deref(), Some("missing_file"));
+        assert_eq!(
+            a.routed[0].detail.as_deref(),
+            Some("shape: required file 'src/x.rs' missing")
+        );
+    }
+
+    #[test]
+    fn missing_prompt_code_is_shape() {
+        let mut file = empty_run("plan", "00-x");
+        file.tasks = vec![failed_planner("01-a", "model", "missing_prompt")];
+        let a = build_amendment("plan", "00-x", 1, &file);
+        assert_eq!(a.routed[0].rule, "shape");
+        assert_eq!(a.routed[0].failure_code.as_deref(), Some("missing_prompt"));
     }
 
     #[test]

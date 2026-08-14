@@ -1134,6 +1134,34 @@ fn fail_task<H: LoopHost>(
         let row = row_mut(file, task_id)?;
         row.status = "failed".into();
         row.route = Some(route.into());
+        if row.attempts.is_empty() {
+            let class = if failure_code.is_some_and(|c| {
+                matches!(c, "missing_file" | "missing_prompt")
+            }) || route == "planner"
+            {
+                Some("shape".into())
+            } else {
+                None
+            };
+            row.attempts.push(crate::services::task_state::AttemptRecord {
+                tier: "route".into(),
+                model: String::new(),
+                attempt: 0,
+                started_at: None,
+                ended_at: None,
+                failure_code: failure_code.map(str::to_string),
+                exit_code: None,
+                class,
+                checks: detail.map(|d| serde_json::json!({ "reason": d })),
+            });
+        } else if let Some(last) = row.attempts.last_mut() {
+            if last.failure_code.is_none() {
+                last.failure_code = failure_code.map(str::to_string);
+            }
+            if last.checks.is_none() {
+                last.checks = detail.map(|d| serde_json::json!({ "reason": d }));
+            }
+        }
         attempt_n = row.attempts.len() as u32;
         tier = row.attempts.last().map(|a| a.tier.clone());
     }
@@ -1966,6 +1994,29 @@ mod tests {
         assert!(host.spawned_files.is_empty(), "A missing file is preflight, spawn 0");
         let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
         assert!(file.tasks.iter().find(|t| t.id == "02-b").unwrap().attempts.is_empty());
+        let a_row = file.tasks.iter().find(|t| t.id == "01-a").unwrap();
+        assert_eq!(a_row.route.as_deref(), Some("planner"));
+        assert_eq!(
+            a_row.attempts.last().and_then(|r| r.failure_code.as_deref()),
+            Some("missing_file")
+        );
+        let amend = crate::services::task_replan::build_amendment(
+            &ctx.plan_id,
+            &ctx.phase_id,
+            1,
+            &file,
+        );
+        assert_eq!(amend.routed.len(), 1);
+        assert_eq!(amend.routed[0].rule, "shape");
+        assert_eq!(amend.routed[0].failure_code.as_deref(), Some("missing_file"));
+        assert!(
+            amend.routed[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("missing.rs")),
+            "{:?}",
+            amend.routed[0].detail
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
