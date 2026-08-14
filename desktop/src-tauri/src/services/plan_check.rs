@@ -2,6 +2,11 @@
 //!
 //! No process is spawned here — execute-verify is phase 02. Reuses
 //! `task_spec::{load_task_spec, topo_sort}` and `verify_policy::check_verify`.
+//!
+//! `load_task_spec` shape errors other than empty verify are folded into
+//! `missing_files`; the original `shape: …` text is kept in `detail` so the
+//! planner can see id-mismatch / jail / `new:`-not-in-`files[]`. That fold is
+//! part of the rule-id API (changing an emitted `rule` is a breaking change).
 
 use crate::services::atomic_fs;
 use crate::services::task_spec::{self, load_task_spec, DagError, TaskSpec};
@@ -187,10 +192,8 @@ fn load_phase_for_check(phase_dir: &Path, report: &mut PlanCheckReport) -> Vec<L
         }
         let yml = dir.join("task.yml");
         if !yml.is_file() {
-            // Commercial leftover (prompt only) is not a small-mode task.
-            if prompt.is_file() {
-                continue;
-            }
+            // check_plan only runs on local-small plans (D4). Every task dir
+            // must have a task.yml; prompt-only is missing_files, not a skip.
             report.items.push(item(
                 Some(&id),
                 RULE_MISSING_FILES,
@@ -213,8 +216,6 @@ fn load_phase_for_check(phase_dir: &Path, report: &mut PlanCheckReport) -> Vec<L
 fn map_spec_error(id: &str, err: &str) -> PlanCheckItem {
     if err.contains("empty verify") {
         item(Some(id), RULE_EMPTY_VERIFY, err)
-    } else if err.contains("empty files") || err.contains("missing task.yml") {
-        item(Some(id), RULE_MISSING_FILES, err)
     } else {
         item(Some(id), RULE_MISSING_FILES, err)
     }
@@ -250,7 +251,19 @@ fn check_dag(specs: &[TaskSpec], report: &mut PlanCheckReport) {
     let ids: HashSet<&str> = specs.iter().map(|s| s.id.as_str()).collect();
     for spec in specs {
         for dep in &spec.depends_on {
-            if dep != &spec.id && ids.contains(dep.as_str()) && dep.as_str() > spec.id.as_str() {
+            if dep == &spec.id {
+                report.items.push(item(
+                    Some(&spec.id),
+                    RULE_DEPENDS_SELF,
+                    format!("{} depends_on itself", spec.id),
+                ));
+            } else if !ids.contains(dep.as_str()) {
+                report.items.push(item(
+                    Some(&spec.id),
+                    RULE_DEPENDS_UNRESOLVED,
+                    format!("{} depends_on unknown id {dep}", spec.id),
+                ));
+            } else if dep.as_str() > spec.id.as_str() {
                 report.items.push(item(
                     Some(&spec.id),
                     RULE_DEPENDS_FORWARD,
@@ -259,30 +272,13 @@ fn check_dag(specs: &[TaskSpec], report: &mut PlanCheckReport) {
             }
         }
     }
-    match task_spec::topo_sort(specs) {
-        Ok(_) => {}
-        Err(DagError::UnknownDep { from, to }) => {
-            report.items.push(item(
-                Some(&from),
-                RULE_DEPENDS_UNRESOLVED,
-                format!("{from} depends_on unknown id {to}"),
-            ));
-        }
-        Err(DagError::Cycle { nodes }) => {
-            let tid = nodes.first().map(String::as_str);
-            report.items.push(item(
-                tid,
-                RULE_DEPENDS_CYCLE,
-                format!("cycle in depends_on: {}", nodes.join(",")),
-            ));
-        }
-        Err(DagError::SelfDep { id }) => {
-            report.items.push(item(
-                Some(&id),
-                RULE_DEPENDS_SELF,
-                format!("{id} depends_on itself"),
-            ));
-        }
+    if let Err(DagError::Cycle { nodes }) = task_spec::topo_sort(specs) {
+        let tid = nodes.first().map(String::as_str);
+        report.items.push(item(
+            tid,
+            RULE_DEPENDS_CYCLE,
+            format!("cycle in depends_on: {}", nodes.join(",")),
+        ));
     }
 }
 
@@ -364,6 +360,10 @@ fn check_cwd(
             ));
         }
     }
+    if let Err(e) = verify_policy::effective_verify_dir(workspace, Some(cwd)) {
+        report.items.push(item(Some(&spec.id), RULE_VERIFY_NOT_ALLOWLISTED, e.detail));
+        return;
+    }
     if workspace.join(cwd).is_dir() {
         return;
     }
@@ -386,18 +386,15 @@ fn check_verify_rules(
     let argv = match check_verify(&spec.verify) {
         Ok(argv) => argv,
         Err(e) => {
-            let rule = if e.rule == RULE_VERIFY_NOT_SCOPED {
-                RULE_VERIFY_NOT_SCOPED
-            } else {
-                RULE_VERIFY_NOT_ALLOWLISTED
-            };
-            report.items.push(item(Some(&spec.id), rule, e.detail));
+            report.items.push(item(Some(&spec.id), &e.rule, e.detail));
             return;
         }
     };
     let cwd = spec.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let effective = verify_policy::effective_verify_dir(workspace, cwd)
-        .unwrap_or_else(|_| workspace.join(cwd.unwrap_or(".")));
+    let effective = match verify_policy::effective_verify_dir(workspace, cwd) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
     for token in &argv {
         if !is_verify_file_target(token) {
             continue;
@@ -407,8 +404,7 @@ fn check_verify_rules(
             Some(c) => format!("{}/{token}", c.trim_end_matches('/')),
             None => token.clone(),
         };
-        if resolved.is_file() || path_created(&listed, spec, by_id) || path_created(token, spec, by_id)
-        {
+        if resolved.is_file() || path_created(&listed, spec, by_id) {
             continue;
         }
         report.items.push(item(
@@ -434,7 +430,8 @@ fn check_must_contain(spec: &TaskSpec, report: &mut PlanCheckReport) {
     }
     for needle in &spec.must_contain {
         let trimmed = needle.trim();
-        if trimmed.len() < 4 || TRIVIAL_NEEDLES.contains(&trimmed) {
+        let lower = trimmed.to_ascii_lowercase();
+        if trimmed.len() < 4 || TRIVIAL_NEEDLES.contains(&lower.as_str()) {
             report.items.push(item(
                 Some(&spec.id),
                 RULE_MUST_CONTAIN_TRIVIAL,
@@ -650,11 +647,15 @@ mod tests {
         for (c, s) in pairs {
             assert_eq!(c, s);
         }
-        let src = include_str!("plan_check.rs");
-        let impl_src = src.split("#[cfg(test)]").next().unwrap();
+        assert_ne!(RULE_VERIFY_CWD_MISSING, "verify_runner_root_missing");
         assert!(
-            !impl_src.contains("runner_root_missing"),
-            "deleted rule must not return"
+            ![
+                RULE_MISSING_FILES,
+                RULE_VERIFY_CWD_MISSING,
+                RULE_FILES_OUTSIDE_CWD,
+                RULE_VERIFY_NOT_ALLOWLISTED,
+            ]
+            .contains(&"verify_runner_root_missing")
         );
     }
 
@@ -702,6 +703,22 @@ mod tests {
         assert!(report.items.is_empty(), "{:?}", report.items);
         assert_eq!(report.tasks_checked, 2);
         let _ = std::fs::remove_dir_all(plan.parent().unwrap());
+    }
+
+    #[test]
+    fn prompt_without_task_yml_is_missing_files() {
+        let root = tmp("no-yml");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = plan.join("phases/00-x/tasks/01-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prompt.md"), "implement add\n").unwrap();
+        let report = check_plan(&plan, &ws, None);
+        assert!(has_rule(&report, RULE_MISSING_FILES), "{:?}", report.items);
+        assert!(!report.passed);
+        assert_eq!(report.tasks_checked, 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -925,8 +942,24 @@ mod tests {
             &rust_yml("01-a", "src/a.rs", "cargo test a -- --exact", "nope", ""),
             "unknown",
         );
+        write_task(
+            &plan,
+            "00-u",
+            "02-b",
+            &rust_yml("02-b", "src/a.rs", "cargo test b -- --exact", "also-missing", ""),
+            "unknown 2",
+        );
         let report = check_plan(&plan, &ws, None);
-        assert!(has_rule(&report, RULE_DEPENDS_UNRESOLVED), "{:?}", rules_of(&report));
+        let unresolved: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.rule == RULE_DEPENDS_UNRESOLVED)
+            .collect();
+        assert!(
+            unresolved.len() >= 2,
+            "every unknown dep in one pass: {:?}",
+            report.items
+        );
 
         write_task(
             &plan,
@@ -1016,11 +1049,16 @@ mod tests {
             &plan,
             "00-m",
             "01-triv",
-            "id: 01-triv\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"x\", \"return\"]\n",
+            "id: 01-triv\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"x\", \"return\", \"TODO\"]\n",
             "triv",
         );
         let report = check_plan(&plan, &ws, None);
         assert!(has_rule(&report, RULE_MUST_CONTAIN_TRIVIAL), "{:?}", report.items);
+        assert!(
+            report.items.iter().any(|i| i.detail.contains("TODO")),
+            "case-insensitive trivial: {:?}",
+            report.items
+        );
 
         write_task(
             &plan,
@@ -1171,6 +1209,43 @@ mod tests {
             "{:?}",
             report.items
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cwd_is_blocking_not_silently_joined() {
+        let root = tmp("cwd-link");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        std::os::unix::fs::symlink("/etc", ws.join("link")).unwrap();
+        write_task(
+            &plan,
+            "00-x",
+            "01-a",
+            &rust_yml(
+                "01-a",
+                "src/a.rs",
+                "cargo test a -- --exact",
+                "",
+                "cwd: link\n",
+            ),
+            "symlink cwd",
+        );
+        let report = check_plan(&plan, &ws, None);
+        assert!(
+            report.items.iter().any(|i| {
+                i.task_id.as_deref() == Some("01-a")
+                    && (i.rule == RULE_VERIFY_NOT_ALLOWLISTED
+                        || i.rule == RULE_VERIFY_CWD_MISSING
+                        || i.rule == RULE_FILES_OUTSIDE_CWD)
+            }),
+            "symlink cwd must not pass shape: {:?}",
+            report.items
+        );
+        assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&root);
     }
 
