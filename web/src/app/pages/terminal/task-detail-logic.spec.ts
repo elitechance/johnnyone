@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
-import { clearSelectedId, taskDetail } from './task-detail-logic';
+import { taskDetail } from './task-detail-logic';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -110,9 +110,6 @@ describe('taskDetail', () => {
     expect(v.checks).toEqual([]);
   });
 
-  it('back action is selectedId null', () => {
-    expect(clearSelectedId()).toBeNull();
-  });
 });
 
 describe('wiring — task detail', () => {
@@ -120,7 +117,7 @@ describe('wiring — task detail', () => {
   const ts = readFileSync(resolve(here, 'terminal.page.ts'), 'utf8');
   it('mentions taskDetail and back-to-table', () => {
     expect(html + ts).toMatch(/taskDetail/);
-    expect(html).toMatch(/back|clearSelected|selectedTaskId/i);
+    expect(html).toMatch(/back|onBackToTasks|selectedTaskId/i);
     expect(html).toMatch(/hasAttempt/);
     expect(html).toMatch(/c\.label/);
     expect(html).toMatch(/c\.meaning/);

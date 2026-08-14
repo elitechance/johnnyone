@@ -119,11 +119,10 @@ import {
   replanBanner,
   initialSelectedId,
   selectPlaceholder,
-  jumpToFailed,
   type TaskRunLike,
   type TaskTableRow,
 } from './tasks-tab-logic';
-import { taskDetail, clearSelectedId, dependentsOf, type TaskDetailView } from './task-detail-logic';
+import { taskDetail, dependentsOf, type TaskDetailView } from './task-detail-logic';
 import {
   planCounts,
   docNavModel,
@@ -521,6 +520,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly taskRunJson = signal<string | null>(null);
   protected readonly taskSpecs = signal<{ id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]>([]);
   protected readonly lastAttemptJson = signal<unknown>(null);
+  protected readonly taskRunError = signal<string | null>(null);
   protected readonly selectedTaskId = signal<string | null>(null);
   protected readonly selectedCheckId = signal<string | null>(null);
   protected readonly selectedCheckRule = signal<string | null>(null);
@@ -586,7 +586,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     windowRows(this.taskRows(), this.selectedTaskId()),
   );
   protected readonly taskCountView = computed(() => taskCounts(this.taskRun()));
-  protected readonly tasksEmpty = computed(() => tasksEmptyCopy(this.taskRun() ?? { tasks: [] }));
+  protected readonly tasksEmpty = computed(() =>
+    tasksEmptyCopy(this.taskRun(), this.taskRunError()),
+  );
   protected readonly replanBannerText = computed(() =>
     replanBanner(this.selectedInitiative()?.status, {
       replanExhausted: this.replanFlags().exhausted,
@@ -1941,16 +1943,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   protected onTaskPlaceholder(ph?: { from: number; to: number; firstId?: string }): void {
-    const range = ph ?? this.taskWindow().placeholder;
-    if (!range) return;
-    this.selectedTaskId.set(selectPlaceholder(this.taskRows(), range));
+    if (!ph) return;
+    const id = selectPlaceholder(this.taskRows(), ph);
+    if (id) this.onSelectTask(id);
   }
 
   protected onJumpFailed(id: string): void {
-    this.selectedTaskId.set(jumpToFailed(id));
+    this.onSelectTask(id);
   }
 
   protected onSelectTask(id: string): void {
+    this.lastAttemptJson.set(null);
     this.selectedTaskId.set(id);
     void this.loadLastAttempt(id);
   }
@@ -1980,7 +1983,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   protected onBackToTasks(): void {
-    this.selectedTaskId.set(clearSelectedId());
+    this.lastAttemptJson.set(null);
+    this.selectedTaskId.set(null);
   }
 
   protected tabLabel(tab: PaneTab): string {
@@ -2153,6 +2157,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (changedInitiative || stamp !== this.eventsStamp) {
       this.eventsStamp = stamp ?? null;
       void this.loadInitiativeEvents(initiativeId, changedInitiative);
+      void this.loadConsoleArtifacts(initiativeId);
     }
     if (isLive) {
       this.startEventsPoll(initiativeId);
@@ -2171,7 +2176,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       if (this.eventsInitiativeId === initiativeId) {
         this.initiativeEvents.set(events ?? []);
       }
-      await this.loadConsoleArtifacts(initiativeId);
     } catch {
       // keep prior events
     } finally {
@@ -2179,15 +2183,19 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  private specsCacheKey: string | null = null;
+
   private clearConsoleArtifacts(): void {
     this.planCheckJson.set(null);
     this.preflightJson.set(null);
     this.taskRunJson.set(null);
     this.taskSpecs.set([]);
+    this.taskRunError.set(null);
     this.selectedTaskId.set(null);
     this.lastAttemptJson.set(null);
     this.selectedCheckId.set(null);
     this.selectedCheckRule.set(null);
+    this.specsCacheKey = null;
   }
 
   private async loadConsoleArtifacts(initiativeId: string): Promise<void> {
@@ -2216,39 +2224,43 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       try {
         const bundle = await firstValueFrom(this.api.getTaskRun(planId, phaseId));
         if (this.eventsInitiativeId !== initiativeId) return;
+        const cacheKey = `${planId}:${phaseId}`;
         if (!bundle) {
           this.taskRunJson.set(null);
-          this.taskSpecs.set([]);
+          this.taskRunError.set(null);
+          if (this.specsCacheKey !== cacheKey) this.taskSpecs.set([]);
           return;
         }
         this.taskRunJson.set(bundle);
+        this.taskRunError.set(null);
         try {
           const parsed = JSON.parse(bundle) as {
             run?: TaskRunLike;
             specs?: { id: string }[];
             tasks?: TaskRunLike['tasks'];
           };
-          if (Array.isArray(parsed.specs)) {
+          if (Array.isArray(parsed.specs) && (parsed.specs.length || this.specsCacheKey !== cacheKey)) {
             this.taskSpecs.set(parsed.specs as { id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]);
+            this.specsCacheKey = cacheKey;
           }
           const run = parsed.run ?? (parsed.tasks ? (parsed as TaskRunLike) : null);
           if (!this.selectedTaskId() && run) {
             const id = initialSelectedId(taskTable(run, this.taskSpecs()));
-            this.selectedTaskId.set(id);
-            if (id) void this.loadLastAttempt(id);
+            if (id) this.onSelectTask(id);
           }
         } catch {
-          this.taskSpecs.set([]);
+          if (this.specsCacheKey !== cacheKey) this.taskSpecs.set([]);
         }
-      } catch {
+      } catch (e) {
         if (this.eventsInitiativeId === initiativeId) {
           this.taskRunJson.set(null);
-          this.taskSpecs.set([]);
+          this.taskRunError.set(e instanceof Error ? e.message : "Could not read this phase's task run");
         }
       }
     } else if (this.eventsInitiativeId === initiativeId) {
       this.preflightJson.set(null);
       this.taskRunJson.set(null);
+      this.taskRunError.set(null);
       this.taskSpecs.set([]);
     }
   }

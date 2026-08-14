@@ -17,6 +17,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
@@ -4422,14 +4423,41 @@ pub fn get_task_run_json(
         return Ok(None);
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("read tasks.json: {e}"))?;
-    let run: serde_json::Value =
-        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let run: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid tasks.json: {e}"))?;
     let plan = get_plan(state, plan_id)?;
-    let specs = crate::services::task_loop::load_phase_specs(
+    let specs_json = cached_phase_specs_json(
+        plan_id,
+        phase_id,
         &Path::new(&plan.plan.plan_path).join("phases").join(phase_id),
-    )
-    .unwrap_or_default();
-    let specs_json: Vec<serde_json::Value> = specs
+    );
+    serde_json::to_string(&json!({ "run": run, "specs": specs_json }))
+        .map(Some)
+        .map_err(|e| format!("serialize task-run bundle: {e}"))
+}
+
+fn cached_phase_specs_json(
+    plan_id: &str,
+    phase_id: &str,
+    phase_dir: &Path,
+) -> Vec<serde_json::Value> {
+    type Key = (String, String);
+    type Entry = (Option<std::time::SystemTime>, Vec<serde_json::Value>);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Entry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mtime = std::fs::metadata(phase_dir.join("tasks"))
+        .and_then(|m| m.modified())
+        .ok();
+    let key = (plan_id.to_string(), phase_id.to_string());
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_mtime, specs)) = guard.get(&key) {
+            if *cached_mtime == mtime {
+                return specs.clone();
+            }
+        }
+    }
+    let loaded = crate::services::task_loop::load_phase_specs(phase_dir).unwrap_or_default();
+    let specs_json: Vec<serde_json::Value> = loaded
         .iter()
         .map(|s| {
             json!({
@@ -4441,9 +4469,10 @@ pub fn get_task_run_json(
             })
         })
         .collect();
-    serde_json::to_string(&json!({ "run": run, "specs": specs_json }))
-        .map(Some)
-        .map_err(|e| format!("serialize task-run bundle: {e}"))
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, (mtime, specs_json.clone()));
+    }
+    specs_json
 }
 
 fn spawn_kloo_json(args: &[&str], timeout_ms: u64) -> String {
@@ -11080,6 +11109,20 @@ mod small_mode_tests {
         assert!(
             err_abs_task.contains("phaseId") || err_abs_task.contains("segment"),
             "{err_abs_task}"
+        );
+        let runs = store
+            .join(&run.plan.initiative_id)
+            .join("runs")
+            .join(&run.plan.id)
+            .join("00-a");
+        std::fs::create_dir_all(&runs).unwrap();
+        let missing = get_task_run_json(&state, &run.plan.id, "00-a", None).unwrap();
+        assert!(missing.is_none(), "{missing:?}");
+        std::fs::write(runs.join("tasks.json"), "not-json{").unwrap();
+        let corrupt = get_task_run_json(&state, &run.plan.id, "00-a", None).unwrap_err();
+        assert!(
+            corrupt.contains("invalid tasks.json"),
+            "{corrupt}"
         );
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&store);

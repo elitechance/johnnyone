@@ -14,7 +14,7 @@ import {
   stageDescription,
   LIFECYCLE_STAGES,
 } from '../../../../../ui/src/lib/lifecycle-status';
-import { isBusyStatus, PAUSED_STATUSES } from './run-resume-logic';
+
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -136,11 +136,6 @@ describe('stageFill / stageDescription', () => {
     expect(
       stageDescription({ stage: 'development', replanParked: true, phaseNn: '00' }),
     ).toContain('replan parked');
-  });
-  it('isBusyStatus true for phase_replan_running and not paused', () => {
-    expect(isBusyStatus('phase_replan_running')).toBe(true);
-    expect(PAUSED_STATUSES.has('phase-replan-running')).toBe(false);
-    expect(PAUSED_STATUSES.has('phase_replan_running')).toBe(false);
   });
 });
 

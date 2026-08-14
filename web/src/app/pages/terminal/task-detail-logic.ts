@@ -259,6 +259,3 @@ function offScopeOf(v: unknown): string[] {
   return [];
 }
 
-export function clearSelectedId(): null {
-  return null;
-}

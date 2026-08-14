@@ -4,7 +4,6 @@ import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import {
   initialSelectedId,
-  jumpToFailed,
   replanBanner,
   selectPlaceholder,
   taskCounts,
@@ -53,8 +52,8 @@ describe('windowRows + default selection', () => {
   it('selectPlaceholder jumps into the tail range', () => {
     const table = taskTable({ tasks: rows(120) });
     const w = windowRows(table, 't000');
-    expect(w.placeholder).toBeTruthy();
-    const id = selectPlaceholder(table, w.placeholder!);
+    expect(w.placeholders.length).toBeGreaterThan(0);
+    const id = selectPlaceholder(table, w.placeholders[w.placeholders.length - 1]);
     expect(id).toBeTruthy();
     const w2 = windowRows(table, id);
     expect(w2.rows.some((r) => r.id === id)).toBe(true);
@@ -77,6 +76,7 @@ describe('counts / empty / banner', () => {
 
   it('empty copy, not a table', () => {
     expect(tasksEmptyCopy({ tasks: [] })).toBe('No tasks in this phase yet');
+    expect(tasksEmptyCopy(null, 'invalid tasks.json')).toBe("Could not read this phase's task run");
   });
 
   it('replan banners', () => {
@@ -87,7 +87,6 @@ describe('counts / empty / banner', () => {
       'Replan cap reached — still failing',
     );
     expect(replanBanner('phase_worker_running')).toBeNull();
-    expect(jumpToFailed('t060')).toBe('t060');
   });
 });
 
@@ -99,5 +98,8 @@ describe('wiring — tasks tab', () => {
     expect(html).toMatch(/tasks/);
     expect(html).toMatch(/onTaskPlaceholder/);
     expect(html).toMatch(/failedBlockedCount/);
+    expect(ts).toMatch(/onTaskPlaceholder[\s\S]*onSelectTask/);
+    expect(ts).toMatch(/onJumpFailed[\s\S]*onSelectTask/);
+    expect(ts).toMatch(/lastAttemptJson\.set\(null\)/);
   });
 });

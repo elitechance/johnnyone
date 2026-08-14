@@ -29,15 +29,13 @@ export function isBusyStatus(status: string | null | undefined): boolean {
   return BUSY_STATUSES.has(normStatus(status));
 }
 
-export { PAUSED_STATUSES };
-
 /** True when the run is paused (needs_attention/blocked) — drives Resume vs Run, the banner, and the
  *  pre-selected paused phase. Busy status wins over health so a replan in flight is not Resume. */
 export function isPausedRun(run: AgentPlanRun | null | undefined): boolean {
   const plan = run?.plan;
   if (!plan) return false;
   const status = normStatus(plan.status);
-  if (BUSY_STATUSES.has(status)) return false;
+  if (isBusyStatus(plan.status)) return false;
   return PAUSED_STATUSES.has(status) || PAUSED_STATUSES.has(normStatus(plan.health));
 }
 

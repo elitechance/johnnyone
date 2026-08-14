@@ -115,8 +115,8 @@ export function windowRows(
   rows: TaskTableRow[],
   selected: string | null | undefined,
   radius = 25,
-): { rows: TaskTableRow[]; placeholder: WindowPlaceholder | null; placeholders: WindowPlaceholder[] } {
-  if (rows.length === 0) return { rows: [], placeholder: null, placeholders: [] };
+): { rows: TaskTableRow[]; placeholders: WindowPlaceholder[] } {
+  if (rows.length === 0) return { rows: [], placeholders: [] };
   const selId = selected || initialSelectedId(rows);
   const idx = Math.max(0, rows.findIndex((r) => r.id === selId));
   const start = Math.max(0, idx - radius);
@@ -129,7 +129,7 @@ export function windowRows(
   if (end < rows.length) {
     placeholders.push({ from: end + 1, to: rows.length, firstId: rows[end].id });
   }
-  return { rows: slice, placeholder: placeholders[placeholders.length - 1] ?? null, placeholders };
+  return { rows: slice, placeholders };
 }
 
 export function selectPlaceholder(
@@ -141,11 +141,11 @@ export function selectPlaceholder(
   return at?.id ?? rows[0]?.id ?? null;
 }
 
-export function jumpToFailed(id: string): string {
-  return id;
-}
-
-export function tasksEmptyCopy(run: TaskRunLike | null | undefined): string | null {
+export function tasksEmptyCopy(
+  run: TaskRunLike | null | undefined,
+  error?: string | null,
+): string | null {
+  if (error) return "Could not read this phase's task run";
   if (!run || (run.tasks?.length ?? 0) === 0) return 'No tasks in this phase yet';
   return null;
 }

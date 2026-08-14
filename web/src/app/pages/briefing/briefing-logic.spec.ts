@@ -38,6 +38,8 @@ describe('createPayload', () => {
     expect(exec.provider).toBe(FALLBACK_EXECUTOR.provider);
     expect(exec.model).toBe(FALLBACK_EXECUTOR.model);
     expect(exec.ctx).toBe(FALLBACK_EXECUTOR.ctx);
+    expect(exec.profile).toBeUndefined();
+    expect(p.executorConfig).not.toContain('/home/creepy');
   });
 
   it('commercial payload has no executorConfig', () => {

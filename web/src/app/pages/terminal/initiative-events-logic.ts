@@ -156,7 +156,7 @@ export function initiativeTimeline(events: AgentPlanEvent[] | null | undefined):
   });
 }
 
-/** Latest 80 milestones + latest 80 non-milestones, hard cap 160, original order. */
+/** Latest 80 milestones + latest 80 non-milestones (≤160 by construction), original order. */
 export function windowTimeline(rows: TimelineEvent[] | null | undefined): TimelineEvent[] {
   const all = rows ?? [];
   const milestones = all.filter((r) => r.milestone);
@@ -164,6 +164,5 @@ export function windowTimeline(rows: TimelineEvent[] | null | undefined): Timeli
   const keep = new Set(
     [...milestones.slice(-80), ...rest.slice(-80)].map((r) => r.id),
   );
-  const filtered = all.filter((r) => keep.has(r.id));
-  return filtered.length > 160 ? filtered.slice(-160) : filtered;
+  return all.filter((r) => keep.has(r.id));
 }

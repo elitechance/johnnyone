@@ -6,7 +6,6 @@ export const FALLBACK_EXECUTOR = {
   provider: 'openrouter',
   model: 'qwen/qwen3-coder',
   ctx: 32768,
-  profile: '/home/creepy/etc/kloo.json',
 };
 
 export const ESCALATION_COPY = 'qwen3-coder ×2 → claude ×1 → opus ×1';
@@ -89,22 +88,25 @@ function firstCommercial(detected: { provider: string; found?: boolean }[] | nul
   return hit?.provider || 'claude_code';
 }
 
-export function profilePathOf(profile: DoctorSnapshot['profile']): string {
+export function profilePathOf(profile: DoctorSnapshot['profile']): string | undefined {
   if (typeof profile === 'string' && profile.trim()) return profile.trim();
   if (profile && typeof profile === 'object' && typeof profile.path === 'string' && profile.path.trim()) {
     return profile.path.trim();
   }
-  return FALLBACK_EXECUTOR.profile;
+  return undefined;
 }
 
-export function executorFromDoctor(doctor?: DoctorSnapshot | null): typeof FALLBACK_EXECUTOR {
+export type ExecutorSnapshot = typeof FALLBACK_EXECUTOR & { profile?: string };
+
+export function executorFromDoctor(doctor?: DoctorSnapshot | null): ExecutorSnapshot {
   if (!doctor) return { ...FALLBACK_EXECUTOR };
+  const profile = profilePathOf(doctor.profile);
   return {
     mode: 'local-small',
     provider: doctor.provider || FALLBACK_EXECUTOR.provider,
     model: doctor.model || FALLBACK_EXECUTOR.model,
     ctx: typeof doctor.ctx === 'number' ? doctor.ctx : FALLBACK_EXECUTOR.ctx,
-    profile: profilePathOf(doctor.profile),
+    ...(profile ? { profile } : {}),
   };
 }
 

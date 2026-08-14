@@ -8,6 +8,7 @@ import {
   panelVisible,
   bannerModel,
   runButtonLabel,
+  isBusyStatus,
   isPausedRun,
   pausedPhaseId,
   defaultSelectedPhaseId,
@@ -90,6 +91,9 @@ describe('isPausedRun / bannerModel / runButtonLabel', () => {
     expect(isPausedRun(run({ status: 'phase_worker_running', health: 'needs-attention' }, THREE_PHASES))).toBe(false);
     expect(isPausedRun(run({ status: 'phase_replan_running', health: 'needs-attention' }, THREE_PHASES))).toBe(false);
     expect(isPausedRun(run({ status: 'approved' }, THREE_PHASES))).toBe(false);
+    expect(isBusyStatus('phase_replan_running')).toBe(true);
+    expect(isBusyStatus('phase_worker_running')).toBe(true);
+    expect(isBusyStatus('needs_attention')).toBe(false);
   });
 
   it('bannerModel shows the error reason when paused, hidden otherwise', () => {
