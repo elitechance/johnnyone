@@ -153,8 +153,12 @@ describe('wiring — lifecycle bar + modeChip', () => {
     expect(bar).toContain('stageFill');
     expect(bar).toContain('stageDescription');
   });
-  it('terminal list mentions modeChip', () => {
+  it('terminal list mentions modeChip and bar denominators', () => {
     const html = readFileSync(resolve(here, 'terminal.page.html'), 'utf8');
     expect(html).toContain('modeChip');
+    expect(html).toContain('planningRound');
+    expect(html).toContain('devDone');
+    expect(html).toContain('devTotal');
+    expect(html).toContain('phaseNn');
   });
 });

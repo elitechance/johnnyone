@@ -45,12 +45,16 @@ export function visibleConsoleTabs(
   hasPlanCheck: boolean,
   hasPreflight: boolean,
 ): PaneTab[] {
-  const base: PaneTab[] = ['raw', 'plan', 'diff'];
-  if (!isLocalSmall(init?.executorConfig)) return base;
+  const base: PaneTab[] = ['raw', 'plan'];
+  if (!isLocalSmall(init?.executorConfig)) {
+    base.push('diff');
+    return base;
+  }
   const stage = (init?.initiativeStatus ?? init?.runType ?? '').toLowerCase();
   const planning = stage === 'planning';
   if (planning || hasPlanCheck || hasPreflight) base.push('checks');
   if (hasTaskRun) base.push('tasks');
+  base.push('diff');
   return base;
 }
 

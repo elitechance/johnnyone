@@ -160,6 +160,15 @@ describe('windowCheckRows + ruleCounts', () => {
     expect(id).toBeTruthy();
     const w = windowCheckRows(many, id);
     expect(w.rows.some((r) => r.rule === 'file_collision')).toBe(true);
+    const tail = Array.from({ length: 300 }, (_, i) => ({
+      rule: i < 260 ? 'file_missing' : 'verify_not_scoped',
+      blocking: true,
+      taskId: `z${i}`,
+    }));
+    const sid = selectRuleChip(tail, 'verify_not_scoped', null);
+    const v2 = checksView({ passed: false, items: tail }, { selectedId: sid });
+    expect(v2.rows.some((r) => r.rule === 'verify_not_scoped')).toBe(true);
+    expect(v2.stats.affected).toBeGreaterThan(0);
   });
 });
 

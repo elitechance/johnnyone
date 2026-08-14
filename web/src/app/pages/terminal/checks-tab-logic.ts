@@ -64,6 +64,7 @@ export interface ChecksCtx {
   replanCap?: number;
   exhausted?: boolean;
   checkKind?: string;
+  selectedId?: string | null;
 }
 
 export interface RuleCount {
@@ -87,6 +88,7 @@ export interface ChecksView {
   stats: {
     tasks: number;
     violations: number;
+    affected: number;
     executed: number;
     skipped: number;
   };
@@ -163,7 +165,7 @@ export function checksView(
     return {
       state: 'empty',
       card: 'No plan-check yet',
-      stats: { tasks: 0, violations: 0, executed: 0, skipped: 0 },
+      stats: { tasks: 0, violations: 0, affected: 0, executed: 0, skipped: 0 },
       alerts: [],
       rows: [],
       advisories: [],
@@ -188,7 +190,8 @@ export function checksView(
   const executed = num(report.verifyExecuted, report.verify_executed);
   const skipped = num(report.verifySkipped, report.verify_skipped);
   const tasks = num(report.tasksChecked, report.tasks_checked, items.length);
-  const win = windowCheckRows(blocking, null);
+  const affected = new Set(blocking.map((i) => String(i.taskId ?? i.task_id ?? '')).filter(Boolean)).size;
+  const win = windowCheckRows(blocking, ctx?.selectedId);
   const counts = ruleCountsOf(blocking);
   const passed = report.passed === true || blocking.length === 0;
   const source = ctx?.source ?? 'planning';
@@ -230,7 +233,7 @@ export function checksView(
   return {
     state,
     card,
-    stats: { tasks, violations: blocking.length, executed, skipped },
+    stats: { tasks, violations: blocking.length, affected, executed, skipped },
     alerts: [card],
     rows: win.rows,
     advisories,

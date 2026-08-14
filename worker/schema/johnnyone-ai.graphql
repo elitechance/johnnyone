@@ -495,7 +495,7 @@ type Query {
   getSetting(key: String!): String!
   getPlannerPromptSettings: PlannerPromptSettings!
   getPlanCheck(planId: ID!, phaseId: String): String
-  getTaskRun(planId: ID!, phaseId: String!): String
+  getTaskRun(planId: ID!, phaseId: String!, taskId: String): String
   getKlooDoctor: String!
   getKlooProbe: String!
   listAgentPlans(status: String, runType: String, onlyExisting: Boolean): [AgentPlan!]!

@@ -6,6 +6,7 @@
 // `validation-config-logic` (D5/D7). Types are imported type-only (erased at build) at the depth the
 // shipped pure siblings use, so no Angular/runtime dependency leaks into the plugin-less vitest.
 import type { AgentPlan } from '../../../../../ui/src/services/johnny-api.service';
+import { isLocalSmall } from './console-tabs-logic';
 import {
   statusMeta,
   healthMeta,
@@ -122,13 +123,7 @@ export { defaultLenses };
 
 /** S10: purple kloo chip only for local-small. */
 export function modeChip(executorConfig: string | null | undefined): 'kloo' | null {
-  if (!executorConfig) return null;
-  try {
-    const parsed = JSON.parse(executorConfig) as { mode?: string };
-    return parsed?.mode === 'local-small' ? 'kloo' : null;
-  } catch {
-    return null;
-  }
+  return isLocalSmall(executorConfig) ? 'kloo' : null;
 }
 
 /**

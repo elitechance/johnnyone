@@ -839,13 +839,13 @@ export class JohnnyApiService {
       .pipe(map((data) => data.getPlanCheck));
   }
 
-  getTaskRun(planId: string, phaseId: string): Observable<string | null> {
+  getTaskRun(planId: string, phaseId: string, taskId?: string): Observable<string | null> {
     return this.gql
       .query<{ getTaskRun: string | null }>(
-        `query GetTaskRun($planId: ID!, $phaseId: String!) {
-          getTaskRun(planId: $planId, phaseId: $phaseId)
+        `query GetTaskRun($planId: ID!, $phaseId: String!, $taskId: String) {
+          getTaskRun(planId: $planId, phaseId: $phaseId, taskId: $taskId)
         }`,
-        { planId, phaseId }
+        { planId, phaseId, taskId: taskId ?? null }
       )
       .pipe(map((data) => data.getTaskRun));
   }

@@ -59,6 +59,14 @@ describe('windowRows + default selection', () => {
     const w2 = windowRows(table, id);
     expect(w2.rows.some((r) => r.id === id)).toBe(true);
   });
+
+  it('emits head and tail placeholders when the window is mid-list', () => {
+    const table = taskTable({ tasks: rows(120, (i) => (i === 60 ? { status: 'failed' } : {})) });
+    const w = windowRows(table, undefined);
+    expect(w.placeholders.length).toBe(2);
+    expect(w.placeholders[0].from).toBe(1);
+    expect(w.placeholders[1].to).toBe(120);
+  });
 });
 
 describe('counts / empty / banner', () => {

@@ -1874,7 +1874,8 @@ impl AgentService {
             .get("phaseId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'phaseId' parameter".to_string())?;
-        match crate::services::agent_plans::get_task_run_json(state, plan_id, phase_id)? {
+        let task_id = params.get("taskId").and_then(|v| v.as_str());
+        match crate::services::agent_plans::get_task_run_json(state, plan_id, phase_id, task_id)? {
             Some(raw) => Ok(serde_json::Value::String(raw)),
             None => Ok(serde_json::Value::Null),
         }

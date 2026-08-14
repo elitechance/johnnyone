@@ -40,6 +40,8 @@ import {
   createPayload,
   parseDoctorJson,
   parseProbeJson,
+  jsonRpcError,
+  firstCommercial,
   preflightView,
   COMMIT_COPY,
   ESCALATION_COPY,
@@ -238,23 +240,25 @@ export class BriefingPage implements OnInit {
     this.preflightState.set('running');
     try {
       const doctorRaw = await firstValueFrom(this.api.getKlooDoctor());
-      const doctor = parseDoctorJson(doctorRaw);
-      this.doctor.set(doctor);
-      let probe = null;
-      try {
-        const probeRaw = await firstValueFrom(this.api.getKlooProbe());
-        probe = parseProbeJson(probeRaw);
-      } catch (err) {
-        this.preflightState.set({
-          error: err instanceof Error ? err.message : String(err),
-        });
+      const doctorErr = jsonRpcError(doctorRaw);
+      if (doctorErr) {
+        this.doctor.set(null);
+        this.preflightState.set({ error: doctorErr });
         return;
       }
+      const doctor = parseDoctorJson(doctorRaw);
+      this.doctor.set(doctor);
       if (!doctor) {
         this.preflightState.set({ error: 'kloo not found' });
         return;
       }
-      this.preflightState.set({ doctor, probe });
+      const probeRaw = await firstValueFrom(this.api.getKlooProbe());
+      const probeErr = jsonRpcError(probeRaw);
+      if (probeErr) {
+        this.preflightState.set({ error: probeErr });
+        return;
+      }
+      this.preflightState.set({ doctor, probe: parseProbeJson(probeRaw) });
     } catch (err) {
       this.preflightState.set({
         error: err instanceof Error ? err.message : String(err),
@@ -272,7 +276,7 @@ export class BriefingPage implements OnInit {
     }
     this.creating.set(true);
     this.createError.set(null);
-    const commercial = this.providerChoices().find((p) => p !== 'kloo') || 'claude_code';
+    const commercial = firstCommercial(this.detectedTools());
     const payload = createPayload(
       this.createProvider,
       commercial,

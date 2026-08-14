@@ -66,7 +66,18 @@ export function taskTable(
   const specMap = new Map((specs ?? []).map((s) => [s.id, s]));
   return (run?.tasks ?? []).map((t, i) => {
     const spec = specMap.get(t.id);
-    const last = t.attempts?.[t.attempts.length - 1];
+    const last = t.attempts?.[t.attempts.length - 1] as
+      | { tier?: string; startedAt?: string; started_at?: string; endedAt?: string; ended_at?: string }
+      | undefined;
+    const start = last?.startedAt ?? last?.started_at;
+    const end = last?.endedAt ?? last?.ended_at;
+    let took = '';
+    const s = Date.parse(String(start ?? ''));
+    const e = Date.parse(String(end ?? ''));
+    if (Number.isFinite(s) && Number.isFinite(e) && e >= s) {
+      const ms = e - s;
+      took = ms < 1000 ? `${ms}ms` : ms < 60_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 60_000)}m`;
+    }
     return {
       index: i + 1,
       id: t.id,
@@ -75,7 +86,7 @@ export function taskTable(
       tier: t.succeededTier ?? t.succeeded_tier ?? last?.tier ?? '',
       verifyOk: t.status === 'done' ? 'ok' : t.status === 'failed' ? 'fail' : '',
       commit: (t.commitSha ?? t.commit_sha ?? '').slice(0, 8),
-      took: '',
+      took,
       blockedBy: t.blockedBy ?? t.blocked_by ?? null,
     };
   });
@@ -91,25 +102,31 @@ export function initialSelectedId(rows: { id: string; state: string }[]): string
   return rows[0]?.id ?? null;
 }
 
+export interface WindowPlaceholder {
+  from: number;
+  to: number;
+  firstId: string;
+}
+
 export function windowRows(
   rows: TaskTableRow[],
   selected: string | null | undefined,
   radius = 25,
-): { rows: TaskTableRow[]; placeholder: { from: number; to: number; firstId: string } | null } {
-  if (rows.length === 0) return { rows: [], placeholder: null };
+): { rows: TaskTableRow[]; placeholder: WindowPlaceholder | null; placeholders: WindowPlaceholder[] } {
+  if (rows.length === 0) return { rows: [], placeholder: null, placeholders: [] };
   const selId = selected || initialSelectedId(rows);
   const idx = Math.max(0, rows.findIndex((r) => r.id === selId));
   const start = Math.max(0, idx - radius);
   const end = Math.min(rows.length, start + 51);
   const slice = rows.slice(start, end);
-  const restFrom = end + 1;
-  const placeholder =
-    end < rows.length
-      ? { from: restFrom, to: rows.length, firstId: rows[end].id }
-      : start > 0
-        ? { from: 1, to: start, firstId: rows[0].id }
-        : null;
-  return { rows: slice, placeholder };
+  const placeholders: WindowPlaceholder[] = [];
+  if (start > 0) {
+    placeholders.push({ from: 1, to: start, firstId: rows[0].id });
+  }
+  if (end < rows.length) {
+    placeholders.push({ from: end + 1, to: rows.length, firstId: rows[end].id });
+  }
+  return { rows: slice, placeholder: placeholders[placeholders.length - 1] ?? null, placeholders };
 }
 
 export function selectPlaceholder(

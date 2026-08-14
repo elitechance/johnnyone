@@ -4387,20 +4387,63 @@ pub fn get_task_run_json(
     state: &AppState,
     plan_id: &str,
     phase_id: &str,
+    task_id: Option<&str>,
 ) -> Result<Option<String>, String> {
     let initiative_id = plan_initiative_id(state, plan_id)?;
-    let path = crate::services::task_state::tasks_json_path(&jailed_phase_runs_dir(
-        state,
-        &initiative_id,
-        plan_id,
-        phase_id,
-    )?);
+    let runs = jailed_phase_runs_dir(state, &initiative_id, plan_id, phase_id)?;
+    if let Some(tid) = task_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let tid = jail_phase_id(tid)?;
+        let file = crate::services::task_state::load_tasks(
+            &crate::services::task_state::tasks_json_path(&runs),
+            plan_id,
+            phase_id,
+        )?;
+        let n = file
+            .tasks
+            .iter()
+            .find(|t| t.id == tid)
+            .and_then(|t| t.attempts.last())
+            .map(|a| a.attempt)
+            .filter(|n| *n > 0)
+            .unwrap_or(0);
+        if n == 0 {
+            return Ok(None);
+        }
+        let path = crate::services::task_state::attempt_json_path(&runs, tid, n);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        return std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| format!("read attempt json: {e}"));
+    }
+    let path = crate::services::task_state::tasks_json_path(&runs);
     if !path.is_file() {
         return Ok(None);
     }
-    std::fs::read_to_string(&path)
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read tasks.json: {e}"))?;
+    let run: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let plan = get_plan(state, plan_id)?;
+    let specs = crate::services::task_loop::load_phase_specs(
+        &Path::new(&plan.plan.plan_path).join("phases").join(phase_id),
+    )
+    .unwrap_or_default();
+    let specs_json: Vec<serde_json::Value> = specs
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "files": s.files,
+                "verify": s.verify,
+                "mustContain": s.must_contain,
+                "dependsOn": s.depends_on,
+            })
+        })
+        .collect();
+    serde_json::to_string(&json!({ "run": run, "specs": specs_json }))
         .map(Some)
-        .map_err(|e| format!("read tasks.json: {e}"))
+        .map_err(|e| format!("serialize task-run bundle: {e}"))
 }
 
 fn spawn_kloo_json(args: &[&str], timeout_ms: u64) -> String {
@@ -11001,9 +11044,9 @@ mod small_mode_tests {
         assert!(err_dot.contains("phaseId") || err_dot.contains(".."), "{err_dot}");
         let err_abs = get_plan_check_json(&state, &run.plan.id, Some("/etc")).unwrap_err();
         assert!(err_abs.contains("phaseId") || err_abs.contains("segment"), "{err_abs}");
-        let err_task = get_task_run_json(&state, &run.plan.id, "../x").unwrap_err();
+        let err_task = get_task_run_json(&state, &run.plan.id, "../x", None).unwrap_err();
         assert!(err_task.contains("phaseId") || err_task.contains(".."), "{err_task}");
-        let err_abs_task = get_task_run_json(&state, &run.plan.id, "/etc").unwrap_err();
+        let err_abs_task = get_task_run_json(&state, &run.plan.id, "/etc", None).unwrap_err();
         assert!(
             err_abs_task.contains("phaseId") || err_abs_task.contains("segment"),
             "{err_abs_task}"

@@ -121,7 +121,7 @@ export function stageDescription(args: StageDescriptionArgs): string {
     if (args.replanExhausted) return `Phase ${nn} · replan cap reached`;
     if (args.replanParked) return `Phase ${nn} · replan parked`;
     if (args.devTotal != null && args.devTotal > 0) {
-      return `Phase · ${args.devDone ?? 0} of ${args.devTotal} tasks done`;
+      return `Phase ${nn} · ${args.devDone ?? 0} of ${args.devTotal} tasks done`;
     }
   }
   return STAGE_COPY[args.stage] ?? '';

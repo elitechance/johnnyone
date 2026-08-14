@@ -16,12 +16,13 @@ interface WorkerEnv {
 
 export default async function getTaskRun(
   _parent: unknown,
-  args: { planId: string; phaseId: string },
+  args: { planId: string; phaseId: string; taskId?: string | null },
   ctx: ResolverContext,
 ) {
   await authorizeForAltToken(ctx, 'plans:read');
   return desktopRpc<unknown>(ctx, 'get_task_run', {
     planId: args.planId,
     phaseId: args.phaseId,
+    taskId: args.taskId ?? null,
   });
 }

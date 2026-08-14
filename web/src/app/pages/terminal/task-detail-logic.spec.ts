@@ -15,23 +15,29 @@ const spec = {
 };
 
 describe('taskDetail', () => {
-  it('failed attempt marks exit and verify fail', () => {
-    const v = taskDetail(
-      { id: '04-d', status: 'failed', attempts: [{}], route: 'planner' },
-      spec,
-      {
-        success: false,
-        failure_code: 'verify_failed',
-        files_changed: ['src/d.rs'],
-        off_scope_edits: [],
-        rail_fires: [],
-        postchecks: {},
-        transcript_tail: 'boom',
+  it('failed AttemptRecord (camelCase checks.failed) marks exit and verify fail', () => {
+    const attempt = {
+      tier: 'qwen3-coder',
+      model: 'qwen/qwen3-coder',
+      attempt: 1,
+      startedAt: '2026-08-14T12:00:00Z',
+      endedAt: '2026-08-14T12:00:02Z',
+      failureCode: 'verify_failed',
+      class: 'model',
+      checks: {
+        passed: false,
         failed: [
           { check: 'exit', reason: 'exit_code=1' },
           { check: 'verify', reason: 'verify failed' },
         ],
       },
+    };
+    const v = taskDetail(
+      { id: '04-d', status: 'failed', attempts: [attempt], route: 'planner' },
+      spec,
+      attempt,
+      undefined,
+      [spec, { id: '05-e', dependsOn: ['04-d'] }],
     );
     const by = Object.fromEntries(v.checks.map((c) => [c.check, c]));
     expect(by.exit.ok).toBe(false);
@@ -40,8 +46,31 @@ describe('taskDetail', () => {
     expect(by.changed.ok).toBe(true);
     expect(by.must_contain.ok).toBe(true);
     expect(v.failureCode).toBe('verify_failed');
-    expect(v.filesChanged).toEqual(['src/d.rs']);
     expect(v.ruleAlert).toBeTruthy();
+    expect(v.blocks).toEqual(['05-e']);
+    expect(v.attemptRows).toHaveLength(1);
+    expect(v.attemptRows[0].tier).toBe('qwen3-coder');
+  });
+
+  it('KLOO_RESULT_JSON attempt file populates machine fields', () => {
+    const v = taskDetail(
+      { id: '04-d', status: 'failed', attempts: [{ attempt: 1 }] },
+      spec,
+      {
+        success: false,
+        failure_code: 'verify_failed',
+        files_changed: { count: 1, paths: ['src/d.rs'] },
+        off_scope_edits: 0,
+        rail_fires: [{ rail: 'x' }],
+        postchecks: [{ command: 'c', passed: true }],
+        verify: { command: 'cargo test d -- --exact', passed: false },
+        transcript_tail: 'boom',
+      },
+    );
+    expect(v.success).toBe(false);
+    expect(v.klooCommand).toContain('cargo test');
+    expect(v.filesChanged).toEqual(['src/d.rs']);
+    expect(v.postchecks).toBeTruthy();
   });
 
   it('done fixture: five checks pass, commit sha, no red alert', () => {

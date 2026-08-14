@@ -96,7 +96,7 @@ describe('visibleConsoleTabs', () => {
         false,
         false,
       ),
-    ).toEqual(['raw', 'plan', 'diff', 'checks']);
+    ).toEqual(['raw', 'plan', 'checks', 'diff']);
   });
   it('local-small development + preflight no task-run is checks only extra', () => {
     expect(
@@ -106,7 +106,7 @@ describe('visibleConsoleTabs', () => {
         false,
         true,
       ),
-    ).toEqual(['raw', 'plan', 'diff', 'checks']);
+    ).toEqual(['raw', 'plan', 'checks', 'diff']);
   });
   it('local-small development with task-run adds tasks and optional checks', () => {
     expect(
@@ -116,7 +116,7 @@ describe('visibleConsoleTabs', () => {
         false,
         true,
       ),
-    ).toEqual(['raw', 'plan', 'diff', 'checks', 'tasks']);
+    ).toEqual(['raw', 'plan', 'checks', 'tasks', 'diff']);
   });
 });
 

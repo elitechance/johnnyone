@@ -196,8 +196,18 @@ export function preflightView(state: PreflightState): PreflightView {
   return { phase: 'ok', lines, alerts, buttonDisabled: false };
 }
 
-export function parseDoctorJson(raw: string | null | undefined): DoctorSnapshot | null {
+export function jsonRpcError(raw: string | null | undefined): string | null {
   if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as { error?: unknown };
+    return typeof v?.error === 'string' && v.error.trim() ? v.error.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseDoctorJson(raw: string | null | undefined): DoctorSnapshot | null {
+  if (!raw || jsonRpcError(raw)) return null;
   try {
     const v = JSON.parse(raw) as DoctorSnapshot;
     return v && typeof v === 'object' ? v : null;
@@ -207,7 +217,7 @@ export function parseDoctorJson(raw: string | null | undefined): DoctorSnapshot 
 }
 
 export function parseProbeJson(raw: string | null | undefined): ProbeSnapshot | null {
-  if (!raw) return null;
+  if (!raw || jsonRpcError(raw)) return null;
   try {
     const v = JSON.parse(raw) as ProbeSnapshot;
     return v && typeof v === 'object' ? v : null;

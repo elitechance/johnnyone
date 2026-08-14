@@ -65,8 +65,13 @@
           [status]="sel.initiativeStatus"
           [health]="sel.health"
           [replan]="lifecycleReplan()"
-          [replanExhausted]="!!replanBannerText()?.includes('cap reached')"
-          [replanParked]="!!replanBannerText()?.includes('unreadable')"
+          [replanExhausted]="replanFlags().exhausted"
+          [replanParked]="replanFlags().parked"
+          [planningRound]="planningRound()"
+          [planningRoundMax]="6"
+          [devDone]="taskCountView().done"
+          [devTotal]="taskRows().length"
+          [phaseNn]="phaseNn()"
         ></johnny-lifecycle-bar>
         <div class="init-top-row">
           <div class="path">{{ sel.workspacePath }}</div>
@@ -364,6 +369,7 @@
               </ion-card>
               <div class="check-stats">
                 {{ checks().stats.tasks }} tasks checked · {{ checks().stats.violations }} violations
+                · {{ checks().stats.affected }} tasks affected
                 @if (checks().stats.executed || checks().stats.skipped) {
                   · {{ checks().stats.executed }} executed · {{ checks().stats.skipped }} skipped
                 }
@@ -374,7 +380,7 @@
                     <button
                       type="button"
                       class="rule-chip"
-                      [class.on]="selectedCheckId() === c.rule"
+                      [class.on]="selectedCheckRule() === c.rule"
                       (click)="selectCheckChip(c.rule)"
                     >
                       {{ c.label }} · {{ c.count }}
@@ -384,14 +390,12 @@
               }
               <div class="check-table">
                 @for (r of checks().rows; track r.id) {
-                  @if (!selectedCheckId() || r.rule === selectedCheckId()) {
-                    <ion-item>
-                      <ion-label>
-                        <h3>{{ r.label }}</h3>
-                        <p>{{ r.taskId }} · {{ r.detail }}</p>
-                      </ion-label>
-                    </ion-item>
-                  }
+                  <ion-item>
+                    <ion-label>
+                      <h3>{{ r.label }}</h3>
+                      <p>{{ r.taskId }} · {{ r.detail }}</p>
+                    </ion-label>
+                  </ion-item>
                 }
               </div>
               @if (checks().moreCount) {
@@ -420,36 +424,49 @@
                 {{ taskCountView().failed }} failed · {{ taskCountView().blocked }} blocked ·
                 {{ taskCountView().pending }} pending
               </div>
-              @if (taskCountView().failed) {
-                <button type="button" class="failed-alert" (click)="onJumpFailed(taskRows().find(r => r.state === 'failed')?.id || '')">
-                  Task failed; {{ taskCountView().blocked }} tasks are blocked behind it
+              <div class="stack-bar" aria-hidden="true">
+                <span class="seg done" [style.flex]="taskCountView().done || 0.0001"></span>
+                <span class="seg running" [style.flex]="taskCountView().running || 0.0001"></span>
+                <span class="seg failed" [style.flex]="taskCountView().failed || 0.0001"></span>
+                <span class="seg blocked" [style.flex]="taskCountView().blocked || 0.0001"></span>
+                <span class="seg pending" [style.flex]="taskCountView().pending || 0.0001"></span>
+              </div>
+              @if (firstFailedId(); as fid) {
+                <button type="button" class="failed-alert" (click)="onJumpFailed(fid)">
+                  Task {{ fid }} failed; {{ taskCountView().blocked }} tasks are blocked behind it
                 </button>
               }
-              <div class="tw" style="overflow-x:auto">
+              @for (ph of taskWindow().placeholders; track ph.from) {
+                <button type="button" class="more-placeholder" (click)="selectedTaskId.set(ph.firstId)">
+                  {{ ph.from }}–{{ ph.to }} more
+                </button>
+              }
+              <div class="tw">
                 <table class="task-table">
                   <thead>
-                    <tr><th>#</th><th>task</th><th>files</th><th>state</th><th>tier</th><th>verify</th><th>commit</th></tr>
+                    <tr><th>#</th><th>task</th><th>files</th><th>state</th><th>tier</th><th>verify</th><th>commit</th><th>took</th></tr>
                   </thead>
                   <tbody>
                     @for (r of taskWindow().rows; track r.id) {
                       <tr [class.sel]="selectedTaskId() === r.id" (click)="onSelectTask(r.id)">
                         <td>{{ r.index }}</td>
-                        <td>{{ r.id }}</td>
+                        <td>
+                          {{ r.id }}
+                          @if (r.blockedBy) {
+                            <div class="blocked-by">depends on {{ r.blockedBy }}</div>
+                          }
+                        </td>
                         <td>{{ r.files }}</td>
-                        <td>{{ r.state }}</td>
+                        <td><span class="state-chip" [attr.data-state]="r.state">{{ r.state }}</span></td>
                         <td>{{ r.tier }}</td>
                         <td>{{ r.verifyOk }}</td>
                         <td>{{ r.commit }}</td>
+                        <td>{{ r.took }}</td>
                       </tr>
                     }
                   </tbody>
                 </table>
               </div>
-              @if (taskWindow().placeholder; as ph) {
-                <button type="button" class="more-placeholder" (click)="onTaskPlaceholder()">
-                  {{ ph.from }}–{{ ph.to }} more
-                </button>
-              }
               @if (taskDetailView(); as d) {
                 <ion-card class="task-detail">
                   <ion-card-header>
@@ -457,20 +474,52 @@
                     <ion-card-title>{{ selectedTaskId() }}</ion-card-title>
                   </ion-card-header>
                   <ion-card-content>
-                    <p>files: {{ d.files.join(', ') }}</p>
-                    <p>verify: {{ d.verify }}</p>
+                    <section class="asked">
+                      <h4>What was asked</h4>
+                      <p>files allowed: {{ d.files.join(', ') }}</p>
+                      <p>verify: {{ d.verify }}</p>
+                      <p>must_contain: {{ d.mustContain.join(', ') }}</p>
+                      <p>depends_on: {{ d.dependsOn.join(', ') }}</p>
+                      <p>blocks: {{ d.blocks.join(' · ') }}</p>
+                    </section>
                     @if (d.attemptsCopy) { <p>{{ d.attemptsCopy }}</p> }
+                    @if (d.attemptRows.length) {
+                      <table class="attempts">
+                        <thead><tr><th>#</th><th>tier</th><th>outcome</th><th>took</th></tr></thead>
+                        <tbody>
+                          @for (a of d.attemptRows; track a.n) {
+                            <tr>
+                              <td>{{ a.n }}</td><td>{{ a.tier }}</td><td>{{ a.outcome }}</td><td>{{ a.took }}</td>
+                            </tr>
+                          }
+                        </tbody>
+                      </table>
+                    }
                     @if (d.ruleAlert) { <p class="rule-alert">{{ d.ruleAlert }}</p> }
                     @if (d.commitSha) { <p>commit {{ d.commitSha }}</p> }
                     @if (d.checks.length) {
-                      <ul>
+                      <ul class="five-checks">
                         @for (c of d.checks; track c.check) {
-                          <li>{{ c.check }} {{ c.ok ? '✓' : '✕' }} {{ c.reason }}</li>
+                          <li [class.bad]="!c.ok">{{ c.check }} {{ c.ok ? '✓' : '✕' }} {{ c.reason }}</li>
                         }
                       </ul>
                     }
-                    @if (d.failureCode) { <p>failure_code: {{ d.failureCode }}</p> }
-                    @if (d.transcriptTail) { <pre>{{ d.transcriptTail }}</pre> }
+                    <section class="machine">
+                      <h4>Last run — machine output</h4>
+                      <p>kloo: {{ d.klooCommand || '—' }}</p>
+                      <p>success: {{ d.success }}</p>
+                      <p>failure_code: {{ d.failureCode }}</p>
+                      <p>files_changed: {{ d.filesChanged.join(', ') }}</p>
+                      <p>off_scope_edits: {{ d.offScopeEdits.join(', ') }}</p>
+                      <p>rail_fires: {{ d.railFires | json }}</p>
+                      <p>postchecks: {{ d.postchecks | json }}</p>
+                    </section>
+                    @if (d.transcriptTail) {
+                      <section class="transcript">
+                        <h4>Transcript tail</h4>
+                        <pre>{{ d.transcriptTail }}</pre>
+                      </section>
+                    }
                   </ion-card-content>
                 </ion-card>
               }

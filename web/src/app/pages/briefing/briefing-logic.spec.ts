@@ -161,4 +161,11 @@ describe('parseDoctorJson', () => {
     expect(parseDoctorJson('nope')).toBeNull();
     expect(parseDoctorJson(null)).toBeNull();
   });
+  it('treats {"error":"kloo not found"} as missing, not a doctor', () => {
+    expect(parseDoctorJson('{"error":"kloo not found"}')).toBeNull();
+    expect(preflightView({ error: 'kloo not found' }).alerts[0]).toEqual({
+      kind: 'danger',
+      text: 'kloo not found',
+    });
+  });
 });

@@ -108,8 +108,9 @@ import {
   initiativeTabOf,
   rawAttachNeeded,
   visibleConsoleTabs,
+  isLocalSmall,
 } from './console-tabs-logic';
-import { checksView, type ChecksView, type PlanCheckReportLike } from './checks-tab-logic';
+import { checksView, selectRuleChip, type ChecksView, type PlanCheckReportLike } from './checks-tab-logic';
 import {
   taskTable,
   taskCounts,
@@ -518,9 +519,36 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly planCheckJson = signal<string | null>(null);
   protected readonly preflightJson = signal<string | null>(null);
   protected readonly taskRunJson = signal<string | null>(null);
+  protected readonly taskSpecs = signal<{ id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]>([]);
+  protected readonly lastAttemptJson = signal<unknown>(null);
   protected readonly selectedTaskId = signal<string | null>(null);
   protected readonly selectedCheckId = signal<string | null>(null);
+  protected readonly selectedCheckRule = signal<string | null>(null);
   protected readonly modeChip = modeChip;
+  protected readonly parsedPreflight = computed<PlanCheckReportLike | null>(() => {
+    const raw = this.preflightJson();
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as PlanCheckReportLike;
+    } catch {
+      return null;
+    }
+  });
+  protected readonly parsedPlanCheck = computed<PlanCheckReportLike | null>(() => {
+    const raw = this.planCheckJson();
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as PlanCheckReportLike;
+    } catch {
+      return null;
+    }
+  });
+  protected readonly replanFlags = computed(() => {
+    const r = this.parsedPreflight();
+    const exhausted = r?.exhausted === true;
+    const parked = (r?.checkKind ?? r?.check_kind) === 'replan_park' && !exhausted;
+    return { exhausted, parked };
+  });
   protected readonly visibleTabs = computed(() =>
     visibleConsoleTabs(
       this.selectedInitiative(),
@@ -531,70 +559,64 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   );
   protected readonly checks = computed<ChecksView>(() => {
     const init = this.selectedInitiative();
-    const raw =
-      (init?.initiativeStatus ?? '').toLowerCase() === 'planning'
-        ? this.planCheckJson()
-        : this.preflightJson() || this.planCheckJson();
-    let report: PlanCheckReportLike | null = null;
-    if (raw) {
-      try {
-        report = JSON.parse(raw) as PlanCheckReportLike;
-      } catch {
-        report = null;
-      }
-    }
     const source =
       (init?.initiativeStatus ?? '').toLowerCase() === 'planning' ? 'planning' : 'preflight';
+    const report = source === 'planning' ? this.parsedPlanCheck() : this.parsedPreflight() || this.parsedPlanCheck();
     return checksView(report, {
       source,
       checkKind: report?.checkKind ?? report?.check_kind,
       exhausted: report?.exhausted,
       replanRound: report?.replanRound ?? report?.replan_round,
+      selectedId: this.selectedCheckId(),
     });
   });
   protected readonly taskRun = computed<TaskRunLike | null>(() => {
     const raw = this.taskRunJson();
     if (!raw) return null;
     try {
-      return JSON.parse(raw) as TaskRunLike;
+      const parsed = JSON.parse(raw) as TaskRunLike & { run?: TaskRunLike; specs?: unknown };
+      return parsed.run ?? parsed;
     } catch {
       return null;
     }
   });
-  protected readonly taskRows = computed(() => taskTable(this.taskRun()));
+  protected readonly taskRows = computed(() => taskTable(this.taskRun(), this.taskSpecs()));
   protected readonly taskWindow = computed(() =>
     windowRows(this.taskRows(), this.selectedTaskId()),
   );
   protected readonly taskCountView = computed(() => taskCounts(this.taskRun()));
   protected readonly tasksEmpty = computed(() => tasksEmptyCopy(this.taskRun() ?? { tasks: [] }));
-  protected readonly replanBannerText = computed(() => {
-    const init = this.selectedInitiative();
-    const pf = this.preflightJson();
-    let exhausted = false;
-    let parked = false;
-    if (pf) {
-      try {
-        const r = JSON.parse(pf) as PlanCheckReportLike;
-        exhausted = r.exhausted === true;
-        parked = (r.checkKind ?? r.check_kind) === 'replan_park' && !exhausted;
-      } catch {
-        /* ignore */
-      }
-    }
-    return replanBanner(init?.status, { replanExhausted: exhausted, replanParked: parked });
-  });
+  protected readonly replanBannerText = computed(() =>
+    replanBanner(this.selectedInitiative()?.status, {
+      replanExhausted: this.replanFlags().exhausted,
+      replanParked: this.replanFlags().parked,
+    }),
+  );
+  protected readonly firstFailedId = computed(
+    () => this.taskRows().find((r) => r.state === 'failed')?.id ?? null,
+  );
   protected readonly taskDetailView = computed<TaskDetailView | null>(() => {
     const id = this.selectedTaskId();
     const run = this.taskRun();
     if (!id || !run) return null;
     const row = (run.tasks ?? []).find((t) => t.id === id);
     if (!row) return null;
-    const last = row.attempts?.[row.attempts.length - 1] ?? null;
-    return taskDetail(row, { id }, last);
+    const spec = this.taskSpecs().find((s) => s.id === id) ?? { id };
+    const last = this.lastAttemptJson() ?? row.attempts?.[row.attempts.length - 1] ?? null;
+    return taskDetail(row, spec, last, null, this.taskSpecs());
   });
   protected readonly lifecycleReplan = computed(
     () => this.selectedInitiative()?.status === 'phase_replan_running',
   );
+  protected readonly phaseNn = computed(() => {
+    const id = this.selectedInitiative()?.currentPhaseId ?? '';
+    return id.split('-')[0] || '';
+  });
+  protected readonly planningRound = computed(() => {
+    const evs = this.initiativeEvents();
+    const n = evs.filter((e) => e.eventType === 'planning_check_failed').length;
+    return n > 0 ? n : null;
+  });
   /** Which pane the §08 mobile switcher currently shows. */
   protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
 
@@ -1903,10 +1925,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   protected selectCheckChip(rule: string): void {
-    const active = this.selectedCheckId();
-    const items = this.checks().ruleCounts;
-    this.selectedCheckId.set(active === rule ? null : rule);
-    void items;
+    const report = this.parsedPreflight() || this.parsedPlanCheck();
+    const items = report?.items ?? [];
+    const next = selectRuleChip(items, rule, this.selectedCheckRule());
+    this.selectedCheckRule.set(next ? rule : null);
+    this.selectedCheckId.set(next);
   }
 
   protected onTaskPlaceholder(): void {
@@ -1921,6 +1944,31 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   protected onSelectTask(id: string): void {
     this.selectedTaskId.set(id);
+    void this.loadLastAttempt(id);
+  }
+
+  private async loadLastAttempt(taskId: string): Promise<void> {
+    const init = this.selectedInitiative();
+    const phaseId = init?.currentPhaseId;
+    if (!init || !phaseId) {
+      this.lastAttemptJson.set(null);
+      return;
+    }
+    try {
+      const raw = await firstValueFrom(this.api.getTaskRun(init.id, phaseId, taskId));
+      if (this.selectedTaskId() !== taskId) return;
+      if (!raw) {
+        this.lastAttemptJson.set(null);
+        return;
+      }
+      try {
+        this.lastAttemptJson.set(JSON.parse(raw));
+      } catch {
+        this.lastAttemptJson.set(raw);
+      }
+    } catch {
+      if (this.selectedTaskId() === taskId) this.lastAttemptJson.set(null);
+    }
   }
 
   protected onBackToTasks(): void {
@@ -2114,7 +2162,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       if (this.eventsInitiativeId === initiativeId) {
         this.initiativeEvents.set(events ?? []);
       }
-      await this.loadConsoleArtifacts();
+      await this.loadConsoleArtifacts(initiativeId);
     } catch {
       // keep prior events
     } finally {
@@ -2122,40 +2170,66 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  private async loadConsoleArtifacts(): Promise<void> {
+  private async loadConsoleArtifacts(initiativeId: string): Promise<void> {
     const init = this.selectedInitiative();
-    if (!init) return;
+    if (!init || !isLocalSmall(init.executorConfig)) return;
+    if ((init.initiativeId || init.id) !== initiativeId && init.id !== initiativeId) {
+      // still allow when the selected run id matches
+    }
     const phaseId = init.currentPhaseId;
+    const planId = init.id;
     try {
-      const check = await firstValueFrom(this.api.getPlanCheck(init.id));
+      const check = await firstValueFrom(this.api.getPlanCheck(planId));
+      if (this.eventsInitiativeId !== initiativeId) return;
       this.planCheckJson.set(check);
     } catch {
-      this.planCheckJson.set(null);
+      if (this.eventsInitiativeId === initiativeId) this.planCheckJson.set(null);
     }
     if (phaseId) {
       try {
-        const pf = await firstValueFrom(this.api.getPlanCheck(init.id, phaseId));
+        const pf = await firstValueFrom(this.api.getPlanCheck(planId, phaseId));
+        if (this.eventsInitiativeId !== initiativeId) return;
         this.preflightJson.set(pf);
       } catch {
-        this.preflightJson.set(null);
+        if (this.eventsInitiativeId === initiativeId) this.preflightJson.set(null);
       }
       try {
-        const run = await firstValueFrom(this.api.getTaskRun(init.id, phaseId));
-        this.taskRunJson.set(run);
-        if (!this.selectedTaskId() && run) {
-          try {
-            const parsed = JSON.parse(run) as TaskRunLike;
-            this.selectedTaskId.set(initialSelectedId(taskTable(parsed)));
-          } catch {
-            /* ignore */
+        const bundle = await firstValueFrom(this.api.getTaskRun(planId, phaseId));
+        if (this.eventsInitiativeId !== initiativeId) return;
+        if (!bundle) {
+          this.taskRunJson.set(null);
+          this.taskSpecs.set([]);
+          return;
+        }
+        this.taskRunJson.set(bundle);
+        try {
+          const parsed = JSON.parse(bundle) as {
+            run?: TaskRunLike;
+            specs?: { id: string }[];
+            tasks?: TaskRunLike['tasks'];
+          };
+          if (Array.isArray(parsed.specs)) {
+            this.taskSpecs.set(parsed.specs as { id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]);
           }
+          const run = parsed.run ?? (parsed.tasks ? (parsed as TaskRunLike) : null);
+          if (!this.selectedTaskId() && run) {
+            const id = initialSelectedId(taskTable(run, this.taskSpecs()));
+            this.selectedTaskId.set(id);
+            if (id) void this.loadLastAttempt(id);
+          }
+        } catch {
+          this.taskSpecs.set([]);
         }
       } catch {
-        this.taskRunJson.set(null);
+        if (this.eventsInitiativeId === initiativeId) {
+          this.taskRunJson.set(null);
+          this.taskSpecs.set([]);
+        }
       }
-    } else {
+    } else if (this.eventsInitiativeId === initiativeId) {
       this.preflightJson.set(null);
       this.taskRunJson.set(null);
+      this.taskSpecs.set([]);
     }
   }
 
