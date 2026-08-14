@@ -916,8 +916,8 @@ impl AgentService {
             "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
             "get_plan_check" => Self::rpc_get_plan_check(&req.params, state),
             "get_task_run" => Self::rpc_get_task_run(&req.params, state),
-            "get_kloo_doctor" => Self::rpc_get_kloo_doctor(),
-            "get_kloo_probe" => Self::rpc_get_kloo_probe(),
+            "get_kloo_doctor" => Self::rpc_get_kloo_doctor().await,
+            "get_kloo_probe" => Self::rpc_get_kloo_probe().await,
             "update_planner_prompt_settings" => {
                 Self::rpc_update_planner_prompt_settings(&req.params)
             }
@@ -1880,16 +1880,18 @@ impl AgentService {
         }
     }
 
-    fn rpc_get_kloo_doctor() -> Result<serde_json::Value, String> {
-        Ok(serde_json::Value::String(
-            crate::services::agent_plans::get_kloo_doctor_json(),
-        ))
+    async fn rpc_get_kloo_doctor() -> Result<serde_json::Value, String> {
+        tokio::task::spawn_blocking(crate::services::agent_plans::get_kloo_doctor_json)
+            .await
+            .map(serde_json::Value::String)
+            .map_err(|e| format!("kloo doctor join: {e}"))
     }
 
-    fn rpc_get_kloo_probe() -> Result<serde_json::Value, String> {
-        Ok(serde_json::Value::String(
-            crate::services::agent_plans::get_kloo_probe_json(),
-        ))
+    async fn rpc_get_kloo_probe() -> Result<serde_json::Value, String> {
+        tokio::task::spawn_blocking(crate::services::agent_plans::get_kloo_probe_json)
+            .await
+            .map(serde_json::Value::String)
+            .map_err(|e| format!("kloo probe join: {e}"))
     }
 
     fn rpc_update_planner_prompt_settings(

@@ -417,6 +417,9 @@ pub async fn create_briefing_run(
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
     let parsed_exec = parse_executor_config(input.executor_config.as_deref())?;
+    // Belt-and-braces: reject_oneshot already errors on kloo, so this arm is
+    // unreachable today. Keep it so a later change to oneshot policy cannot
+    // pair local-small with worker_provider=kloo.
     if parsed_exec
         .as_ref()
         .map(|c| c.mode == "local-small")
@@ -2984,6 +2987,17 @@ fn planning_lens_reviewer_prompt(
     lens: &ValidationLens,
     session_id: &str,
 ) -> String {
+    let settings = planner_prompts::load_prompt_settings().ok();
+    planning_lens_reviewer_prompt_from(settings.as_ref(), state, run, lens, session_id)
+}
+
+fn planning_lens_reviewer_prompt_from(
+    settings: Option<&planner_prompts::PlannerPromptSettings>,
+    state: &AppState,
+    run: &AgentPlanRun,
+    lens: &ValidationLens,
+    session_id: &str,
+) -> String {
     let lens_name = lens.name.as_str();
     let values = planning_template_values(state, run);
     let get = |k: &str| {
@@ -2994,7 +3008,7 @@ fn planning_lens_reviewer_prompt(
             .unwrap_or_default()
     };
     let brief_path = Path::new(&run.plan.plan_path).join("brief.md");
-    format!(
+    let mut body = format!(
         "You are the {name} reviewer for a PLAN (planning run). Run ONLY the {name} lens — do not run the other lenses.\n\n\
 Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — the plan must not narrow, drift from, or exceed it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the planning-review {name} checklist); then read the plan at {plan_output}. Judge whether the PLAN itself is ready along the {name} dimension AND faithful to the brief (e.g. Product: clear scope, mocks, and a screens-to-verify inventory; QA: testable acceptance criteria per phase, not narrower than the brief; Lead: a sound, reuse-aware, secure approach with phases sized right).\n\n\
 Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
@@ -3005,7 +3019,15 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
         plan_output = get("plan_output_path"),
         extras = lens_prompt_extras(lens),
         report = lens_report_instruction(session_id, lens_name),
-    )
+    );
+    if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
+        let reviewer = settings
+            .map(|s| s.small_mode.reviewer.as_str())
+            .unwrap_or(planner_prompts::DEFAULT_SMALL_MODE_REVIEWER);
+        let extra = planner_prompts::render_template(reviewer, &values);
+        body = format!("{extra}\n\n{body}");
+    }
+    body
 }
 
 /// Planning review via lens fan-out (overhaul P7, D2): one ephemeral reviewer per **configured**
@@ -3565,6 +3587,32 @@ impl PlanningCheckCtrl<'static> {
     }
 }
 
+fn jail_phase_id(phase_id: &str) -> Result<&str, String> {
+    let p = Path::new(phase_id);
+    let mut comps = p.components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(seg)), None) => seg
+            .to_str()
+            .filter(|s| !s.is_empty() && *s != "." && !s.contains('\0'))
+            .ok_or_else(|| "phaseId must be a single path segment".into()),
+        _ => Err("phaseId must be a single path segment".into()),
+    }
+}
+
+fn jailed_phase_runs_dir(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase_id: &str,
+) -> Result<PathBuf, String> {
+    let phase = jail_phase_id(phase_id)?;
+    let initiatives = settings_service::resolve_initiatives_dir(state);
+    let parent = initiatives
+        .join(&run.plan.initiative_id)
+        .join("runs")
+        .join(&run.plan.id);
+    settings_service::resolve_within_root(&parent, phase)
+}
+
 pub fn get_plan_check_json(
     state: &AppState,
     plan_id: &str,
@@ -3573,16 +3621,7 @@ pub fn get_plan_check_json(
     let run = get_plan(state, plan_id)?;
     let path = match phase_id.map(str::trim).filter(|s| !s.is_empty()) {
         None => plan_check_json_path(state, &run),
-        Some(phase) => {
-            let initiatives = settings_service::resolve_initiatives_dir(state);
-            settings_service::initiative_runs_path(
-                &initiatives,
-                &run.plan.initiative_id,
-                &run.plan.id,
-                phase,
-            )
-            .join("preflight.json")
-        }
+        Some(phase) => jailed_phase_runs_dir(state, &run, phase)?.join("preflight.json"),
     };
     if !path.is_file() {
         return Ok(None);
@@ -3598,13 +3637,9 @@ pub fn get_task_run_json(
     phase_id: &str,
 ) -> Result<Option<String>, String> {
     let run = get_plan(state, plan_id)?;
-    let initiatives = settings_service::resolve_initiatives_dir(state);
-    let path = crate::services::task_state::tasks_json_path(&settings_service::initiative_runs_path(
-        &initiatives,
-        &run.plan.initiative_id,
-        &run.plan.id,
-        phase_id,
-    ));
+    let path = crate::services::task_state::tasks_json_path(&jailed_phase_runs_dir(
+        state, &run, phase_id,
+    )?);
     if !path.is_file() {
         return Ok(None);
     }
@@ -3613,54 +3648,28 @@ pub fn get_task_run_json(
         .map_err(|e| format!("read tasks.json: {e}"))
 }
 
-fn spawn_kloo_json(args: &[&str], timeout_ms: u64) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("kloo");
-    cmd.args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            r#"{"error":"kloo not found"}"#.to_string()
-        } else {
-            format!(r#"{{"error":"spawn kloo: {e}"}}"#)
-        }
-    })?;
-    let start = Instant::now();
-    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_string(&mut buf);
-                }
-                if buf.trim().is_empty() && !status.success() {
-                    return Ok(format!(
-                        r#"{{"error":"kloo exited {}"}}"#,
-                        status.code().unwrap_or(1)
-                    ));
-                }
-                return Ok(buf);
+fn spawn_kloo_json(args: &[&str], timeout_ms: u64) -> String {
+    let mut argv = vec!["kloo".to_string()];
+    argv.extend(args.iter().map(|s| (*s).to_string()));
+    match crate::services::plan_check::spawn_argv_capture(&argv, Path::new("."), timeout_ms) {
+        Ok(body) => body,
+        Err(e) => {
+            let detail = e.detail.to_ascii_lowercase();
+            if detail.contains("not found") || detail.contains("no such file") {
+                r#"{"error":"kloo not found"}"#.into()
+            } else {
+                format!(r#"{{"error":{}}}"#, serde_json::to_string(&e.detail).unwrap_or_else(|_| "\"spawn failed\"".into()))
             }
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                return Ok(r#"{"error":"kloo timed out"}"#.into());
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(e) => return Ok(format!(r#"{{"error":"wait kloo: {e}"}}"#)),
         }
     }
 }
 
 pub fn get_kloo_doctor_json() -> String {
     spawn_kloo_json(&["doctor", "--json"], 15_000)
-        .unwrap_or_else(|e| e)
 }
 
 pub fn get_kloo_probe_json() -> String {
     spawn_kloo_json(&["probe", "--json"], 60_000)
-        .unwrap_or_else(|e| e)
 }
 
 pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> Result<bool, String> {
@@ -9863,6 +9872,7 @@ mod plan_check_gate_tests {
 #[cfg(test)]
 mod small_mode_tests {
     use super::*;
+    use crate::db::models::ValidationLens;
     use crate::services::planner_prompts::{
         PlannerPromptSettings, DEFAULT_PLANNING_PLANNER, DEFAULT_SMALL_MODE_PLANNER,
         DEFAULT_SMALL_MODE_REVIEWER,
@@ -10027,6 +10037,53 @@ mod small_mode_tests {
         assert!(small_r.contains("SENTINEL-REVIEWER-XYZ"));
         assert!(!small_r.contains("The plan-check script has already validated"));
 
+        let lens = ValidationLens {
+            name: "qa".into(),
+            provider: "claude_code".into(),
+            model: None,
+            prompt: None,
+            vision: false,
+            blocking: true,
+        };
+        let live = planning_lens_reviewer_prompt_from(
+            Some(&settings),
+            &state,
+            &small,
+            &lens,
+            "sess",
+        );
+        assert!(
+            live.contains("SENTINEL-REVIEWER-XYZ"),
+            "live lens fan-out must render tuned smallMode.reviewer: {live}"
+        );
+        let live_default = planning_lens_reviewer_prompt_from(
+            Some(&PlannerPromptSettings::default()),
+            &state,
+            &small,
+            &lens,
+            "sess",
+        );
+        assert!(live_default.contains(
+            "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules."
+        ));
+        let live_comm = planning_lens_reviewer_prompt_from(
+            Some(&settings),
+            &state,
+            &comm,
+            &lens,
+            "sess",
+        );
+        assert!(!live_comm.contains("SENTINEL-REVIEWER-XYZ"));
+
+        let mut amend_settings = PlannerPromptSettings::default();
+        amend_settings.small_mode.amend_planner = "SENTINEL-AMEND-XYZ".into();
+        amend_settings.planning.amend_planner = "COMMERCIAL-AMEND-XYZ".into();
+        let mut amending = run_with_exec(Some(r#"{"mode":"local-small"}"#));
+        amending.plan.amend_brief = Some("please change the plan".into());
+        let amend_p = planning_planner_prompt_from(&amend_settings, &state, &amending).unwrap();
+        assert!(amend_p.contains("SENTINEL-AMEND-XYZ"), "{amend_p}");
+        assert!(!amend_p.contains("COMMERCIAL-AMEND-XYZ"), "{amend_p}");
+
         let default_small = planning_planner_prompt_from(
             &PlannerPromptSettings::default(),
             &state,
@@ -10048,6 +10105,47 @@ mod small_mode_tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = DEFAULT_SMALL_MODE_PLANNER;
+    }
+
+    #[tokio::test]
+    async fn phase_id_traversal_is_rejected() {
+        let (state, root) = test_state();
+        let workspace = tmp("ws-jail");
+        let store = tmp("store-jail");
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        let run = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("j".into()),
+                workspace_path: workspace.to_string_lossy().into(),
+                brief: Some("b".into()),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                model: None,
+                executor_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        let err_dot = get_plan_check_json(&state, &run.plan.id, Some("../x")).unwrap_err();
+        assert!(err_dot.contains("phaseId") || err_dot.contains(".."), "{err_dot}");
+        let err_abs = get_plan_check_json(&state, &run.plan.id, Some("/etc")).unwrap_err();
+        assert!(err_abs.contains("phaseId") || err_abs.contains("segment"), "{err_abs}");
+        let err_task = get_task_run_json(&state, &run.plan.id, "../x").unwrap_err();
+        assert!(err_task.contains("phaseId") || err_task.contains(".."), "{err_task}");
+        let err_abs_task = get_task_run_json(&state, &run.plan.id, "/etc").unwrap_err();
+        assert!(
+            err_abs_task.contains("phaseId") || err_abs_task.contains("segment"),
+            "{err_abs_task}"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

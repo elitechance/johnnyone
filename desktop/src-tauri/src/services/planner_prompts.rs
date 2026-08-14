@@ -489,12 +489,31 @@ planning:
         );
     }
 
+    fn fnv1a64(s: &str) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     #[test]
     fn commercial_defaults_are_byte_for_byte() {
         let d = PlannerPromptSettings::default();
         assert_eq!(d.planning.planner, DEFAULT_PLANNING_PLANNER);
         assert_eq!(d.planning.reviewer, DEFAULT_PLANNING_REVIEWER);
         assert_eq!(d.development.worker, DEFAULT_DEVELOPMENT_WORKER);
+    }
+
+    /// Pinned fingerprints so editing DEFAULT_PLANNING_* does not silently
+    /// move both sides of the equality above. Update the constants only when
+    /// a commercial-prompt change is intentional.
+    #[test]
+    fn commercial_templates_match_pinned_fingerprints() {
+        assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x0fc962193643a37b);
+        assert_eq!(fnv1a64(DEFAULT_PLANNING_REVIEWER), 0x42e3b3d0e4178fe5);
+        assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_WORKER), 0xbb568e9822273934);
     }
 
     #[test]

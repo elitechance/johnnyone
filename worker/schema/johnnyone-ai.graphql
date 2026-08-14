@@ -327,7 +327,8 @@ type PlannerPromptSettings {
   schema: String!
   development: PlannerDevelopmentPrompts!
   planning: PlannerPlanningPrompts!
-  smallMode: PlannerSmallModePrompts!
+  # Nullable for deploy-skew: a worker against a pre-cutover desktop has no smallMode key.
+  smallMode: PlannerSmallModePrompts
 }
 
 type PlannerSmallModePrompts {

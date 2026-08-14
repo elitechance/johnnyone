@@ -512,7 +512,7 @@ struct GqlPlannerPromptSettings {
     schema: String,
     development: GqlPlannerDevelopmentPrompts,
     planning: GqlPlannerPlanningPrompts,
-    small_mode: GqlPlannerSmallModePrompts,
+    small_mode: Option<GqlPlannerSmallModePrompts>,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -550,12 +550,12 @@ impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
                 planner: value.planning.planner,
                 reviewer: value.planning.reviewer,
             },
-            small_mode: GqlPlannerSmallModePrompts {
+            small_mode: Some(GqlPlannerSmallModePrompts {
                 planner: value.small_mode.planner,
                 reviewer: value.small_mode.reviewer,
                 leaf_wrapper: value.small_mode.leaf_wrapper,
                 amend_planner: value.small_mode.amend_planner,
-            },
+            }),
         }
     }
 }

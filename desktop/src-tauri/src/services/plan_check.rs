@@ -241,19 +241,33 @@ impl PlanCheckHost for RealPlanCheckHost {
     }
 
     fn tokens(&self, ctx: u32, prompt_text: &str) -> Result<TokensReport, TokensError> {
-        let dir = std::env::temp_dir().join("johnnyone-tokens");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!(
-            "prompt-{}-{}.md",
+        let dir = std::env::temp_dir().join(format!(
+            "j1-tokens-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::write(&path, prompt_text).map_err(|e| {
-            TokensError::Unavailable(format!("write tokens temp: {e}"))
+        std::fs::create_dir(&dir).map_err(|e| {
+            TokensError::Unavailable(format!("create tokens temp dir: {e}"))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = dir.join("prompt.md");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| TokensError::Unavailable(format!("create tokens temp: {e}")))?;
+            f.write_all(prompt_text.as_bytes())
+                .map_err(|e| TokensError::Unavailable(format!("write tokens temp: {e}")))?;
+        }
         let argv = vec![
             "kloo".to_string(),
             "tokens".to_string(),
@@ -264,7 +278,7 @@ impl PlanCheckHost for RealPlanCheckHost {
             path.to_string_lossy().into_owned(),
         ];
         let out = spawn_argv_capture(&argv, Path::new("."), 30_000);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
         match out {
             Err(e) => Err(TokensError::Unavailable(e.detail)),
             Ok(body) => parse_tokens_json(&body),
@@ -272,8 +286,8 @@ impl PlanCheckHost for RealPlanCheckHost {
     }
 }
 
-struct SpawnErr {
-    detail: String,
+pub(crate) struct SpawnErr {
+    pub detail: String,
 }
 
 fn spawn_argv(argv: &[String], cwd: &Path, timeout_ms: u64) -> SpawnResult {
@@ -339,7 +353,7 @@ fn spawn_argv(argv: &[String], cwd: &Path, timeout_ms: u64) -> SpawnResult {
     }
 }
 
-fn spawn_argv_capture(
+pub(crate) fn spawn_argv_capture(
     argv: &[String],
     cwd: &Path,
     timeout_ms: u64,
@@ -390,7 +404,7 @@ fn spawn_argv_capture(
                 let buf = reader.join().unwrap_or_default();
                 if !status.success() && buf.trim().is_empty() {
                     return Err(SpawnErr {
-                        detail: format!("kloo tokens exited {}", status.code().unwrap_or(1)),
+                        detail: format!("{exe} exited {}", status.code().unwrap_or(1)),
                     });
                 }
                 return Ok(buf);
@@ -400,14 +414,14 @@ fn spawn_argv_capture(
                 let _ = child.kill();
                 let _ = reader.join();
                 return Err(SpawnErr {
-                    detail: "kloo tokens timed out".into(),
+                    detail: format!("{exe} timed out"),
                 });
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Err(e) => {
                 let _ = reader.join();
                 return Err(SpawnErr {
-                    detail: format!("wait kloo tokens: {e}"),
+                    detail: format!("wait {exe}: {e}"),
                 });
             }
         }
@@ -1348,9 +1362,6 @@ fn check_tokens(
     let mut saw_unavailable = false;
     for (id, dir, spec) in loaded {
         let prompt = dir.join("prompt.md");
-        if !prompt.is_file() {
-            continue;
-        }
         if let Some(b) = budget_ms {
             if started.elapsed().as_millis() as u64 >= b {
                 report.items.push(item(
@@ -1364,7 +1375,15 @@ fn check_tokens(
         let ctx = spec.as_ref().and_then(|s| s.ctx).unwrap_or(32768);
         let body = match std::fs::read_to_string(&prompt) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                report.items.push(PlanCheckItem {
+                    task_id: Some(id.clone()),
+                    rule: RULE_TOKENS_UNAVAILABLE.to_string(),
+                    detail: format!("could not read prompt.md: {e}"),
+                    blocking: false,
+                });
+                continue;
+            }
         };
         let measured = crate::services::planner_prompts::wrap_leaf_prompt(
             opts_wrapper.unwrap_or(""),
@@ -3204,6 +3223,38 @@ mod tests {
         assert!(host.warm.lock().unwrap().is_empty());
         assert_eq!(report.verify_executed, 0);
         assert_eq!(report.verify_skipped, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tokens_missing_prompt_is_advisory() {
+        let root = tmp("tok-miss");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        std::fs::remove_file(plan.join("phases/00-x/tasks/01-a/prompt.md")).unwrap();
+        let host = ScriptedHost::instant();
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                tokens_only: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_TOKENS_UNAVAILABLE
+                    && !i.blocking
+                    && i.detail.contains("could not read prompt.md")
+            }),
+            "{:?}",
+            report.items
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
