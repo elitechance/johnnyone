@@ -2418,6 +2418,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_exhausted_row_dispatches_kloo() {
+        let root = tmp("reset-spawn");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "01-a",
+        );
+        write_task(
+            &ctx.phase_dir,
+            "02-b",
+            Some(&yml("02-b", "b.rs", "cargo test spec -- --exact", "01-a", Some("b.rs"), "fn b")),
+            "02-b",
+        );
+        write_task(
+            &ctx.phase_dir,
+            "03-c",
+            Some(&yml("03-c", "c.rs", "cargo test spec -- --exact", "02-b", Some("c.rs"), "fn c")),
+            "03-c",
+        );
+        let specs = load_phase_specs(&ctx.phase_dir).unwrap();
+        let mut file = seed_from_specs(&ctx.plan_id, &ctx.phase_id, &specs);
+        file.tasks[0].status = "done".into();
+        file.tasks[0].commit_sha = Some("sha-a".into());
+        file.tasks[1].status = "failed".into();
+        file.tasks[1].route = Some("planner".into());
+        file.tasks[1].attempts = ["qwen3-coder", "qwen3-coder", "claude", "opus"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tier)| AttemptRecord {
+                tier: tier.into(),
+                model: tier.into(),
+                attempt: (i as u32) + 1,
+                started_at: Some("t".into()),
+                ended_at: Some("t".into()),
+                failure_code: Some("verify_failed".into()),
+                exit_code: Some(1),
+                class: Some("model".into()),
+                checks: None,
+            })
+            .collect();
+        file.tasks[2].status = "blocked".into();
+        file.tasks[2].blocked_by = Some("02-b".into());
+        crate::services::task_replan::reset_for_resume(&mut file, &specs);
+        save_tasks(&tasks_json_path(&ctx.runs_dir), &mut file).unwrap();
+
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.index
+            .insert(("00-x".into(), "01-a".into()), "sha-a".into());
+        host.push_pass("b.rs", "fn b() {}\n");
+        host.push_pass("c.rs", "fn c() {}\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+        assert_eq!(
+            host.spawned_files,
+            vec![vec![String::from("b.rs")], vec![String::from("c.rs")]]
+        );
+        let loaded = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id)
+            .unwrap();
+        assert_eq!(loaded.tasks[1].status, "done");
+        assert_eq!(loaded.tasks[2].status, "done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn residue_policy_error_fails_task_as_planner_not_phase() {
         let root = tmp("residue-policy");
         let (ctx, _) = ctx_for(&root, "00-x");

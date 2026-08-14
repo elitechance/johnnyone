@@ -131,6 +131,26 @@ pub fn load_amendment(path: &Path) -> Result<TaskAmendment, String> {
     serde_json::from_slice(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
+/// `Ok(None)` only when the file is absent (first episode). A present but
+/// unreadable file is `Err` — the cap must not reset to 1 by deleting/corrupting
+/// the file the planner was pointed at.
+pub fn load_amendment_optional(path: &Path) -> Result<Option<TaskAmendment>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_amendment(path).map(Some)
+}
+
+/// Next episode round from a persisted amendment. `Err` when the phase has
+/// already spent `MAX_REPLAN_ROUNDS` (pass → resume → re-route still counts).
+pub fn next_episode_round(existing: Option<&TaskAmendment>) -> Result<u32, ()> {
+    match existing {
+        None => Ok(1),
+        Some(a) if replan_cap_reached(a.round) => Err(()),
+        Some(a) => Ok(a.round.saturating_add(1)),
+    }
+}
+
 /// After a passing post-replan check: keep `done` (+ sha); flip failed/blocked
 /// to pending; seed any new sibling dirs the planner added. Never deletes
 /// commits or done rows.
@@ -142,6 +162,11 @@ pub fn reset_for_resume(file: &mut TaskRunFile, specs: &[TaskSpec]) {
                 task.status = "pending".to_string();
                 task.route = None;
                 task.blocked_by = None;
+                // The loop rebuilds the ladder from attempts. A routed
+                // exhausted row that kept its 4 slots would hit
+                // Step::Exhausted and never spawn kloo (QA-1 / Lead).
+                task.attempts.clear();
+                task.succeeded_tier = None;
             }
             _ => {}
         }
@@ -223,6 +248,24 @@ mod tests {
             new: None,
             cwd: None,
         }
+    }
+
+    fn exhausted_ladder() -> Vec<AttemptRecord> {
+        ["qwen3-coder", "qwen3-coder", "claude", "opus"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tier)| AttemptRecord {
+                tier: tier.into(),
+                model: tier.into(),
+                attempt: (i as u32) + 1,
+                started_at: Some("t".into()),
+                ended_at: Some("t".into()),
+                failure_code: Some("verify_failed".into()),
+                exit_code: Some(1),
+                class: Some("model".into()),
+                checks: None,
+            })
+            .collect()
     }
 
     fn failed_planner(id: &str, class: &str, code: &str) -> TaskRow {
@@ -370,6 +413,8 @@ mod tests {
         file.tasks[2].commit_sha = Some("sha-c".into());
         file.tasks[3].status = "failed".into();
         file.tasks[3].route = Some("planner".into());
+        file.tasks[3].succeeded_tier = Some("opus".into());
+        file.tasks[3].attempts = exhausted_ladder();
         file.tasks[4].status = "blocked".into();
         file.tasks[4].blocked_by = Some("04-d".into());
         file.tasks[5].status = "blocked".into();
@@ -385,6 +430,12 @@ mod tests {
             assert_eq!(file.tasks[i].status, "pending", "{}", file.tasks[i].id);
             assert!(file.tasks[i].route.is_none());
             assert!(file.tasks[i].blocked_by.is_none());
+            assert!(
+                file.tasks[i].attempts.is_empty(),
+                "{} must re-enter the ladder",
+                file.tasks[i].id
+            );
+            assert!(file.tasks[i].succeeded_tier.is_none());
         }
         assert_eq!(
             file.tasks.iter().filter(|t| t.status == "done").count(),
@@ -444,6 +495,54 @@ mod tests {
         assert_eq!(increment_replan_round(&mut a), Ok(3));
         assert_eq!(increment_replan_round(&mut a), Err(()));
         assert_eq!(a.round, 3);
+        assert_eq!(next_episode_round(None), Ok(1));
+        assert_eq!(next_episode_round(Some(&a)), Err(()));
+        a.round = 1;
+        assert_eq!(next_episode_round(Some(&a)), Ok(2));
+    }
+
+    #[test]
+    fn reset_exhausted_row_reenters_ladder_at_slot_one() {
+        use crate::services::task_check::{next_attempt, Step};
+        let mut file = seed_from_specs("p", "00-x", &[spec("04-d", &[])]);
+        file.tasks[0].status = "failed".into();
+        file.tasks[0].route = Some("planner".into());
+        file.tasks[0].attempts = exhausted_ladder();
+        let before = crate::services::task_check::Attempt {
+            label: "opus".into(),
+            model: "opus".into(),
+            class: Some(crate::services::task_check::FailureClass::Model),
+            infra_retry: false,
+        };
+        // Sanity: a kept full ladder is exhausted (the bug).
+        let kept: Vec<_> = file.tasks[0]
+            .attempts
+            .iter()
+            .map(|r| crate::services::task_check::Attempt {
+                label: r.tier.clone(),
+                model: r.model.clone(),
+                class: Some(crate::services::task_check::FailureClass::Model),
+                infra_retry: false,
+            })
+            .collect();
+        assert_eq!(next_attempt(&kept, None), Step::Exhausted);
+        let _ = before;
+        reset_for_resume(&mut file, &[]);
+        assert!(file.tasks[0].attempts.is_empty());
+        match next_attempt(&[], None) {
+            Step::Run { label, .. } => assert_eq!(label, "qwen3-coder"),
+            other => panic!("expected first slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_amendment_is_none_corrupt_is_err() {
+        let root = tmp("amend-opt");
+        let path = root.join("amendment.json");
+        assert!(load_amendment_optional(&path).unwrap().is_none());
+        std::fs::write(&path, "{not-json").unwrap();
+        assert!(load_amendment_optional(&path).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

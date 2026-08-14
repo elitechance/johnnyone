@@ -1969,7 +1969,13 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
         .join("phases")
         .join(&phase.phase_id);
     if development_arm(&phase_path) == DevArm::KlooPreflight {
-        if !run_phase_preflight(state, run, &phase).await? {
+        // Replan just ran a phase-scoped check. Don't execute every verify
+        // again on the way back into the loop (Lead: double preflight).
+        let skip_preflight = crate::services::task_replan::amendment_json_path(
+            &replan_runs_dir(state, run, &phase.phase_id),
+        )
+        .is_file();
+        if !skip_preflight && !run_phase_preflight(state, run, &phase).await? {
             return Ok(());
         }
         let outcome =
@@ -2040,7 +2046,7 @@ async fn follow_kloo_outcome_with(
             enter_phase_review(state, &run.plan.id, phase).await
         }
         KlooPhaseFollowup::Replan { task_id, route } => {
-            begin_phase_replan(state, run, phase, 1, &task_id, &route, ctrl).await
+            begin_phase_replan(state, run, phase, &task_id, &route, ctrl).await
         }
         KlooPhaseFollowup::NeedsAttention { task_id, route } => {
             state.db.with_conn(|conn| {
@@ -2074,6 +2080,26 @@ fn replan_runs_dir(state: &AppState, run: &AgentPlanRun, phase_id: &str) -> Path
     )
 }
 
+async fn park_replan_cap(
+    state: &AppState,
+    plan_id: &str,
+    phase_id: &str,
+    error: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        update_plan_status_and_health(conn, plan_id, "needs_attention", Some(error))
+            .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        state,
+        plan_id,
+        Some(phase_id),
+        "agent_phase_preflight_failed",
+        payload,
+    )
+}
+
 fn record_replan_spawn(ctrl: &ReplanCtrl<'_>, round: u32) {
     if let Some(log) = ctrl.spawn_log {
         if let Ok(mut g) = log.lock() {
@@ -2086,12 +2112,38 @@ async fn begin_phase_replan(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
-    round: u32,
     task_id: &str,
     route: &str,
     ctrl: &ReplanCtrl<'_>,
 ) -> Result<(), String> {
     let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
+    let amend_path = crate::services::task_replan::amendment_json_path(&runs_dir);
+    let existing = match crate::services::task_replan::load_amendment_optional(&amend_path) {
+        Ok(v) => v,
+        Err(e) => {
+            return park_replan_cap(
+                state,
+                &run.plan.id,
+                &phase.phase_id,
+                "replan amendment unreadable",
+                json!({ "reason": e, "exhausted": true }),
+            )
+            .await;
+        }
+    };
+    let round = match crate::services::task_replan::next_episode_round(existing.as_ref()) {
+        Ok(r) => r,
+        Err(()) => {
+            return park_replan_cap(
+                state,
+                &run.plan.id,
+                &phase.phase_id,
+                "replan cap reached",
+                json!({ "exhausted": true, "round": crate::services::task_replan::MAX_REPLAN_ROUNDS }),
+            )
+            .await;
+        }
+    };
     let tasks_path = crate::services::task_state::tasks_json_path(&runs_dir);
     let file = crate::services::task_state::load_tasks(
         &tasks_path,
@@ -2104,7 +2156,6 @@ async fn begin_phase_replan(
         round,
         &file,
     );
-    let amend_path = crate::services::task_replan::amendment_json_path(&runs_dir);
     crate::services::task_replan::save_amendment(&amend_path, &amendment)?;
 
     state.db.with_conn(|conn| {
@@ -2138,6 +2189,14 @@ async fn spawn_replan_planner(
     preflight_path: Option<&Path>,
     ctrl: &ReplanCtrl<'_>,
 ) -> Result<(), String> {
+    // Reload so a retry in this arm sees the session we just wrote, not the
+    // stale `run` snapshot. Archive that prior session before replacing it
+    // (QA-4 / Lead): stop_plan only knows the latest worker_session_id.
+    if let Ok(current) = get_plan(state, &run.plan.id) {
+        if let Some(old) = current.plan.worker_session_id {
+            let _ = sessions::archive_session(state, old).await;
+        }
+    }
     let session = sessions::create_session(
         state,
         CreateSessionInput {
@@ -2228,17 +2287,19 @@ pub(crate) async fn run_phase_replan_arm(
 
     let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
     let amend_path = crate::services::task_replan::amendment_json_path(&runs_dir);
-    let mut amendment = crate::services::task_replan::load_amendment(&amend_path).unwrap_or_else(
-        |_| {
-            crate::services::task_replan::TaskAmendment {
-                schema: crate::services::task_replan::SCHEMA.to_string(),
-                plan_id: run.plan.id.clone(),
-                phase_id: phase.phase_id.clone(),
-                round: 1,
-                routed: vec![],
-            }
-        },
-    );
+    let mut amendment = match crate::services::task_replan::load_amendment(&amend_path) {
+        Ok(a) => a,
+        Err(e) => {
+            return park_replan_cap(
+                state,
+                &run.plan.id,
+                &phase.phase_id,
+                "replan amendment unreadable",
+                json!({ "reason": e, "exhausted": true }),
+            )
+            .await;
+        }
+    };
 
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
@@ -2256,12 +2317,30 @@ pub(crate) async fn run_phase_replan_arm(
     let specs = crate::services::task_loop::load_phase_specs(&phase_path)?;
     let missing = crate::services::task_replan::missing_done_task_ids(&file, &specs);
 
-    let report = collect_replan_phase_check(state, run, &phase, &file, ctrl).await?;
+    let mut report = collect_replan_phase_check(state, run, &phase, &file, ctrl).await?;
+    for id in &missing {
+        report.items.push(crate::services::plan_check::PlanCheckItem {
+            task_id: Some(id.clone()),
+            rule: crate::services::plan_check::RULE_FILE_MISSING.to_string(),
+            detail: format!(
+                "done task {id} disappeared from the phase (planner must not drop commits)"
+            ),
+            blocking: true,
+        });
+        report.passed = false;
+    }
     let preflight_path = runs_dir.join("preflight.json");
-    let done_missing_blocks = !missing.is_empty();
-    let passed = report.passed && !done_missing_blocks;
+    std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
+    crate::services::plan_check::save_plan_check(&preflight_path, &report)?;
 
-    if passed {
+    if report.passed {
+        append_event(
+            state,
+            &run.plan.id,
+            Some(&phase.phase_id),
+            "agent_phase_preflight_passed",
+            json!({ "tasks": report.tasks_checked }),
+        )?;
         crate::services::task_replan::reset_for_resume(&mut file, &specs);
         crate::services::task_state::save_tasks(&tasks_path, &mut file)?;
         for row in &file.tasks {
@@ -2280,22 +2359,7 @@ pub(crate) async fn run_phase_replan_arm(
         return Ok(());
     }
 
-    let mut blocking = report.items.iter().filter(|i| i.blocking).count();
-    if done_missing_blocks {
-        blocking = blocking.saturating_add(missing.len());
-        let mut extra = report.clone();
-        for id in &missing {
-            extra.items.push(crate::services::plan_check::PlanCheckItem {
-                task_id: Some(id.clone()),
-                rule: crate::services::plan_check::RULE_FILE_MISSING.to_string(),
-                detail: format!("done task {id} disappeared from the phase (planner must not drop commits)"),
-                blocking: true,
-            });
-        }
-        extra.passed = false;
-        crate::services::plan_check::save_plan_check(&preflight_path, &extra)?;
-    }
-
+    let blocking = report.items.iter().filter(|i| i.blocking).count();
     let nn = phase_nn(Some(&phase.phase_id));
     let capped = crate::services::task_replan::replan_cap_reached(amendment.round);
     append_event(
@@ -2325,14 +2389,16 @@ pub(crate) async fn run_phase_replan_arm(
     }
 
     let next = crate::services::task_replan::increment_replan_round(&mut amendment)
-        .unwrap_or(amendment.round);
+        .map_err(|()| {
+            "replan increment after cap guard — MAX_REPLAN_ROUNDS already reached".to_string()
+        })?;
     crate::services::task_replan::save_amendment(&amend_path, &amendment)?;
     record_replan_spawn(ctrl, next);
     spawn_replan_planner(state, run, &phase, &amend_path, Some(&preflight_path), ctrl).await
 }
 
 async fn collect_replan_phase_check(
-    state: &AppState,
+    _state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     task_run: &crate::services::task_state::TaskRunFile,
@@ -2358,18 +2424,6 @@ async fn collect_replan_phase_check(
         },
     )
     .await?;
-    let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
-    std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
-    crate::services::plan_check::save_plan_check(&runs_dir.join("preflight.json"), &report)?;
-    if report.passed {
-        append_event(
-            state,
-            &run.plan.id,
-            Some(&phase.phase_id),
-            "agent_phase_preflight_passed",
-            json!({ "tasks": report.tasks_checked }),
-        )?;
-    }
     Ok(report)
 }
 
@@ -10974,6 +11028,10 @@ mod replan_tests {
             file.tasks.iter().filter(|t| t.status == "pending").count(),
             3
         );
+        assert!(
+            file.tasks[3].attempts.is_empty(),
+            "reset routed row must clear the ladder"
+        );
         assert!(after
             .events
             .iter()
@@ -11131,6 +11189,18 @@ mod replan_tests {
         assert_eq!(file.tasks[0].status, "done");
         assert_eq!(file.tasks[0].commit_sha.as_deref(), Some("sha-a"));
         assert_eq!(file.tasks[3].status, "failed");
+        let passed = after
+            .events
+            .iter()
+            .filter(|e| e.event_type == "agent_phase_preflight_passed")
+            .count();
+        let failed = after
+            .events
+            .iter()
+            .filter(|e| e.event_type == "agent_phase_preflight_failed")
+            .count();
+        assert_eq!(passed, 0, "missing-done must not emit passed then failed");
+        assert_eq!(failed, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11199,6 +11269,138 @@ mod replan_tests {
             "D8: pending sibling may claim a done file: {:?}",
             with_run.items
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pass_then_reroute_counts_toward_cap() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let pass = RewritePlanner {
+            mode: RewriteMode::Pass,
+        };
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        let ctrl = test_ctrl(&log, Some(&pass), &host);
+        follow_kloo_outcome_with(&state, &run, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        let mut current = get_plan(&state, &run.plan.id).unwrap();
+        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
+        current = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(current.plan.status, "phase_worker_running");
+        let a1 = task_replan::load_amendment(&task_replan::amendment_json_path(
+            &replan_runs_dir(&state, &current, "00-x"),
+        ))
+        .unwrap();
+        assert_eq!(a1.round, 1);
+
+        seed_partial_run(&state, &current);
+        follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        current = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(current.plan.status, "phase_replan_running");
+        let a2 = task_replan::load_amendment(&task_replan::amendment_json_path(
+            &replan_runs_dir(&state, &current, "00-x"),
+        ))
+        .unwrap();
+        assert_eq!(a2.round, 2, "re-route must increment the persisted round");
+
+        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
+        current = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &current);
+        follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        current = get_plan(&state, &run.plan.id).unwrap();
+        let a3 = task_replan::load_amendment(&task_replan::amendment_json_path(
+            &replan_runs_dir(&state, &current, "00-x"),
+        ))
+        .unwrap();
+        assert_eq!(a3.round, 3);
+
+        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
+        current = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &current);
+        follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "needs_attention");
+        let spawned = log.lock().unwrap().clone();
+        assert_eq!(spawned, vec![1, 2, 3]);
+        assert!(!spawned.contains(&4));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn corrupt_amendment_parks_instead_of_resetting_round() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        let path = task_replan::amendment_json_path(&replan_runs_dir(&state, &run, "00-x"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not-json").unwrap();
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let ctrl = test_ctrl(&log, None, &host);
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        follow_kloo_outcome_with(&state, &run, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "needs_attention");
+        assert!(log.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retry_archives_prior_replan_session() {
+        let (state, root, _store, _ws, run) = harness();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        seed_partial_run(&state, &run);
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        let fake = RewritePlanner {
+            mode: RewriteMode::Fail,
+        };
+        let ctrl = test_ctrl(&log, Some(&fake), &host);
+        let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
+        follow_kloo_outcome_with(&state, &run, phase, partial_planner(), &ctrl)
+            .await
+            .unwrap();
+        let first = get_plan(&state, &run.plan.id)
+            .unwrap()
+            .plan
+            .worker_session_id
+            .unwrap();
+        run_phase_replan_arm(&state, &get_plan(&state, &run.plan.id).unwrap(), &ctrl)
+            .await
+            .unwrap();
+        let second = get_plan(&state, &run.plan.id)
+            .unwrap()
+            .plan
+            .worker_session_id
+            .unwrap();
+        assert_ne!(first, second);
+        let status: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status FROM sessions WHERE id = ?1",
+                    params![first],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(status, "archived");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
