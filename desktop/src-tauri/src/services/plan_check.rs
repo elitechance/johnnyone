@@ -361,14 +361,19 @@ fn spawn_argv_capture(
     let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
     let start = Instant::now();
     let pid = child.id();
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_string(&mut buf);
+        }
+        buf
+    });
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_string(&mut buf);
-                }
+                let buf = reader.join().unwrap_or_default();
                 if !status.success() && buf.trim().is_empty() {
                     return Err(SpawnErr {
                         detail: format!("kloo tokens exited {}", status.code().unwrap_or(1)),
@@ -379,12 +384,14 @@ fn spawn_argv_capture(
             Ok(None) if start.elapsed() > timeout => {
                 crate::services::task_loop::kill_process_group(pid);
                 let _ = child.kill();
+                let _ = reader.join();
                 return Err(SpawnErr {
                     detail: "kloo tokens timed out".into(),
                 });
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Err(e) => {
+                let _ = reader.join();
                 return Err(SpawnErr {
                     detail: format!("wait kloo tokens: {e}"),
                 });
@@ -1022,46 +1029,49 @@ fn execute_phase(
         return;
     }
 
-    let mut pair_keys: Vec<(String, PathBuf)> = Vec::new();
+    #[derive(Clone)]
+    struct WarmPair {
+        id: String,
+        cwd: PathBuf,
+        argv: Vec<String>,
+    }
+    let mut pair_keys: Vec<WarmPair> = Vec::new();
     let mut pair_tasks: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut pair_argv: HashMap<(String, String), Vec<String>> = HashMap::new();
     for job in &eligible {
         let pid = pair_id(&job.runner, &job.argv);
         let key = (pid.clone(), job.cwd.to_string_lossy().into_owned());
-        pair_tasks.entry(key.clone()).or_default().push(job.id.clone());
-        pair_argv
-            .entry(key)
-            .or_insert_with(|| warm_argv_for(&job.runner, &job.argv));
-        if !pair_keys.iter().any(|(r, c)| r == &pid && c == &job.cwd) {
-            pair_keys.push((pid, job.cwd.clone()));
+        pair_tasks.entry(key).or_default().push(job.id.clone());
+        if !pair_keys.iter().any(|p| p.id == pid && p.cwd == job.cwd) {
+            pair_keys.push(WarmPair {
+                id: pid,
+                cwd: job.cwd.clone(),
+                argv: warm_argv_for(&job.runner, &job.argv),
+            });
         }
     }
-    pair_keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    pair_keys.sort_by(|a, b| a.id.cmp(&b.id).then(a.cwd.cmp(&b.cwd)));
 
     let warm_n = pair_keys.len().min(MAX_WARM_PAIRS);
     let w_budget = opts.warm_budget_ms.unwrap_or(warm_budget_ms(pair_keys.len()));
     let warm_started = Instant::now();
     let mut failed_pairs: HashSet<(String, String)> = HashSet::new();
     if warm_n > 0 {
-        let to_warm: Vec<(String, PathBuf)> = pair_keys.iter().take(warm_n).cloned().collect();
+        let to_warm: Vec<WarmPair> = pair_keys.iter().take(warm_n).cloned().collect();
         let results = run_waves(&to_warm, 4, w_budget, |pair, started| {
             if !started {
                 return SpawnResult::never_started();
             }
-            let key = (pair.0.clone(), pair.1.to_string_lossy().into_owned());
-            let argv = pair_argv.get(&key).cloned().unwrap_or_else(|| {
-                let runner = pair.0.split(':').next().unwrap_or(pair.0.as_str());
-                warm_argv_for(runner, &[runner.to_string()])
-            });
             host.spawn(&SpawnRequest {
-                argv,
-                cwd: pair.1.clone(),
+                argv: pair.argv.clone(),
+                cwd: pair.cwd.clone(),
                 timeout_ms: WARM_TIMEOUT_MS,
                 kind: SpawnKind::Warm,
                 task_id: None,
             })
         });
-        for ((pid, cwd), res) in results {
+        for (pair, res) in results {
+            let pid = pair.id;
+            let cwd = pair.cwd;
             // Warm timeout / ENOENT / any non-zero: runner is not usable.
             if res.enoent || res.timed_out || res.exit_code.map(|c| c != 0).unwrap_or(false) {
                 let key = (pid.clone(), cwd.to_string_lossy().into_owned());
@@ -1184,14 +1194,36 @@ where
     out
 }
 
+/// First non-flag token after `npx` (skips `--no-install` and `--prefix`/`--config`).
+/// Same token `validate_npx` already accepted as the package name.
+pub(crate) fn npx_package_token(argv: &[String]) -> Option<&str> {
+    let mut i = 1;
+    while i < argv.len() {
+        let t = argv[i].as_str();
+        if t == "--no-install" {
+            i += 1;
+            continue;
+        }
+        if t.starts_with("--prefix=") || t.starts_with("--config=") {
+            i += 1;
+            continue;
+        }
+        if t == "--prefix" || t == "--config" {
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(t);
+    }
+    None
+}
+
 fn pair_id(runner: &str, argv: &[String]) -> String {
     if runner == "npx" {
-        let tool = if argv.iter().any(|t| t.contains("jest")) {
-            "jest"
-        } else {
-            "vitest"
-        };
-        format!("npx:{tool}")
+        format!("npx:{}", npx_package_token(argv).unwrap_or("invalid"))
     } else {
         runner.to_string()
     }
@@ -1207,11 +1239,7 @@ pub fn warm_argv_for(runner: &str, verify_argv: &[String]) -> Vec<String> {
             "--offline".into(),
         ],
         "npx" => {
-            let tool = if verify_argv.iter().any(|t| t.contains("jest")) {
-                "jest"
-            } else {
-                "vitest"
-            };
+            let tool = npx_package_token(verify_argv).unwrap_or("invalid");
             vec![
                 "npx".into(),
                 "--no-install".into(),
@@ -2898,9 +2926,10 @@ mod tests {
                 warms.iter().any(|(argv, _)| argv[0] == runner),
                 "{runner} warm argv: {warms:?}"
             );
+            let probe: Vec<String> = verify.split_whitespace().map(String::from).collect();
             assert_eq!(
                 warms[0].0,
-                warm_argv_for(runner, &[runner.to_string()]),
+                warm_argv_for(runner, &probe),
                 "{runner} pinned warm"
             );
             let _ = std::fs::remove_dir_all(&root);
@@ -3296,6 +3325,149 @@ mod tests {
     }
 
     #[test]
+    fn npx_tool_follows_package_token_not_path() {
+        let vitest_on_jest_path: Vec<String> = [
+            "npx",
+            "vitest",
+            "run",
+            "src/jest-compat.spec.ts",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let jest_on_vitest_path: Vec<String> = [
+            "npx",
+            "jest",
+            "run",
+            "src/vitest-compat.test.js",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let vitest_prefixed: Vec<String> = [
+            "npx",
+            "--no-install",
+            "vitest",
+            "run",
+            "src/jest-compat.spec.ts",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        assert_eq!(npx_package_token(&vitest_on_jest_path), Some("vitest"));
+        assert_eq!(pair_id("npx", &vitest_on_jest_path), "npx:vitest");
+        assert_eq!(
+            warm_argv_for("npx", &vitest_on_jest_path),
+            ["npx", "--no-install", "vitest", "--version"]
+        );
+
+        assert_eq!(npx_package_token(&jest_on_vitest_path), Some("jest"));
+        assert_eq!(pair_id("npx", &jest_on_vitest_path), "npx:jest");
+        assert_eq!(
+            warm_argv_for("npx", &jest_on_vitest_path),
+            ["npx", "--no-install", "jest", "--version"]
+        );
+
+        assert_eq!(npx_package_token(&vitest_prefixed), Some("vitest"));
+        assert_eq!(pair_id("npx", &vitest_prefixed), "npx:vitest");
+        assert_eq!(
+            warm_argv_for("npx", &vitest_prefixed),
+            ["npx", "--no-install", "vitest", "--version"]
+        );
+    }
+
+    #[test]
+    fn npx_path_containing_other_tool_does_not_cross_warm() {
+        let root = tmp("npx-path-collide");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/jest-compat.spec.ts"), "x\n").unwrap();
+        std::fs::write(ws.join("src/vitest-compat.test.js"), "x\n").unwrap();
+        write_task(
+            &plan,
+            "00-x",
+            "01-jest",
+            "id: 01-jest\nfiles: [src/vitest-compat.test.js]\nverify: \"npx jest run src/vitest-compat.test.js\"\nmust_contain: [\"pub fn add\"]\n",
+            "jest",
+        );
+        write_task(
+            &plan,
+            "00-x",
+            "02-vitest",
+            "id: 02-vitest\nfiles: [src/jest-compat.spec.ts]\nverify: \"npx vitest run src/jest-compat.spec.ts\"\nmust_contain: [\"pub fn add\"]\n",
+            "vitest",
+        );
+        struct SplitCollideNpx {
+            warm: std::sync::Mutex<Vec<Vec<String>>>,
+        }
+        impl PlanCheckHost for SplitCollideNpx {
+            fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+                if req.kind == SpawnKind::Warm {
+                    self.warm.lock().unwrap().push(req.argv.clone());
+                    if req.argv.iter().any(|t| t == "jest") {
+                        return SpawnResult::exit(101);
+                    }
+                    return SpawnResult::ok_zero();
+                }
+                SpawnResult::exit(1)
+            }
+            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+                Ok(TokensReport {
+                    fits: true,
+                    approx_tokens: Some(1),
+                    usable_window: Some(1),
+                    compact_trigger: Some(1),
+                })
+            }
+        }
+        let host = SplitCollideNpx {
+            warm: std::sync::Mutex::new(Vec::new()),
+        };
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_VERIFY_NOT_RUNNABLE && i.task_id.as_deref() == Some("01-jest")
+            }),
+            "{:?}",
+            report.items
+        );
+        assert!(
+            !report.items.iter().any(|i| {
+                i.rule == RULE_VERIFY_NOT_RUNNABLE && i.task_id.as_deref() == Some("02-vitest")
+            }),
+            "vitest must not inherit jest warm failure when the vitest path contains 'jest': {:?}",
+            report.items
+        );
+        let mut warmed = host.warm.lock().unwrap().clone();
+        warmed.sort();
+        let expected: Vec<Vec<String>> = vec![
+            ["npx", "--no-install", "jest", "--version"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ["npx", "--no-install", "vitest", "--version"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        ];
+        assert_eq!(
+            warmed, expected,
+            "warm argv must follow the package token, not a path substring"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tokens_budget_zero_skips_without_host_calls() {
         let root = tmp("tok-budget");
         let plan = root.join("plan");
@@ -3331,7 +3503,11 @@ mod tests {
     #[test]
     fn warm_argv_covers_every_allowed_runner() {
         for runner in crate::services::verify_policy::ALLOWED_RUNNERS {
-            let argv = warm_argv_for(runner, &[(*runner).to_string()]);
+            let probe: Vec<String> = match *runner {
+                "npx" => vec!["npx".into(), "vitest".into()],
+                other => vec![other.to_string()],
+            };
+            let argv = warm_argv_for(runner, &probe);
             assert_eq!(argv[0], *runner, "{runner}");
             match *runner {
                 "cargo" => assert_eq!(
