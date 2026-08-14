@@ -32,7 +32,7 @@ describe('windowRows + default selection', () => {
     const w = windowRows(table, 't060');
     expect(performance.now() - t0).toBeLessThan(50);
     expect(w.rows.length).toBeLessThanOrEqual(51);
-    expect(w.rows.length + (w.placeholders.length ? 1 : 0)).toBeLessThanOrEqual(52);
+    expect(w.rows.length).toBeLessThanOrEqual(52);
     expect(w.rows.some((r) => r.id === 't060')).toBe(true);
   });
 

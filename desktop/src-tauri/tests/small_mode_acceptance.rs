@@ -62,15 +62,36 @@ fn collect_yml(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "j1-smacc-{}-{}-{}",
-        tag,
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(tag: &str) -> Self {
+        let d = std::env::temp_dir().join(format!(
+            "j1-smacc-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        Self(d)
+    }
+}
+
+impl std::ops::Deref for TempRoot {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tmp(tag: &str) -> TempRoot {
+    TempRoot::new(tag)
 }
 
 fn sh_quote(s: &str) -> String {
@@ -292,7 +313,7 @@ fn dummy_run_for(
     }
 }
 
-fn setup(tag: &str) -> (PathBuf, PathBuf, PathBuf, AppState, PathBuf) {
+fn setup(tag: &str) -> (TempRoot, PathBuf, PathBuf, AppState, PathBuf) {
     let root = tmp(tag);
     let ws = root.join("ws");
     let plan = root.join("plan");
@@ -355,7 +376,6 @@ fn fake_planner_writes_allowlisted_specs() {
     assert!(overview.contains("01-add"));
     assert!(!overview.contains("src/add.rs"), "{overview}");
     assert!(!overview.contains("cargo test"), "{overview}");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -387,7 +407,6 @@ async fn emitted_plan_loop_completes() {
             t.id
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 fn commit_expected_file(ws: &Path, id: &str, rel: &str) -> String {
@@ -502,7 +521,6 @@ async fn routed_task_amendment_reaches_done_and_alldone() {
         Some(&sha_sub),
         "git log rewritten 02-sub: {indexed:?}"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -528,7 +546,6 @@ fn done_sibling_sha_unchanged() {
         indexed.get(&(PHASE.to_string(), "01-add".into())),
         Some(&sha_add)
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 fn first_phase_id(plan: &Path) -> String {
@@ -596,9 +613,14 @@ async fn live_small_mode_planner_emits_and_loop() {
     collect_yml(&plan, &mut pre);
     assert!(pre.is_empty(), "scratch plan already had task.yml: {pre:?}");
 
-    let template = johnnyone_desktop_lib::services::planner_prompts::small_mode_planner_template();
+    let settings = johnnyone_desktop_lib::services::planner_prompts::load_prompt_settings()
+        .unwrap_or_else(|_| {
+            johnnyone_desktop_lib::services::planner_prompts::PlannerPromptSettings::default()
+        });
+    let template = settings.small_mode.planner;
+    let user_brief = "Plan ONE phase 00-calc for this rust crate. Implement the five stub functions add, sub, mul, div, and clamp under src/ — one task per file, each independently verifiable with that file's existing unit test. Do not implement saturate, gcd, lcm, min, or max. Write overview.md, status.md (phases not tasks), a phase overview (id + one-line goal only), and each task.yml + prompt.md. Then say READY_FOR_T2_PLAN_REVIEW.".to_string();
     let prompt = johnnyone_desktop_lib::services::planner_prompts::render_template(
-        template,
+        &template,
         &[
             ("run_id", "live-a4".into()),
             ("workspace_path", ws.to_string_lossy().into_owned()),
@@ -607,10 +629,7 @@ async fn live_small_mode_planner_emits_and_loop() {
             ("plan_output_path", plan.to_string_lossy().into_owned()),
             ("methodology_path", String::new()),
             ("conventions_path", String::new()),
-            (
-                "user_brief",
-                "Plan ONE phase 00-calc for this rust crate. Implement the five stub functions add, sub, mul, div, and clamp under src/ — one task per file, each independently verifiable with that file's existing unit test. Do not implement saturate, gcd, lcm, min, or max. Write overview.md, status.md (phases not tasks), a phase overview (id + one-line goal only), and each task.yml + prompt.md. Then say READY_FOR_T2_PLAN_REVIEW.".into(),
-            ),
+            ("user_brief", user_brief.clone()),
             ("reference_paths", String::new()),
         ],
     );
@@ -753,7 +772,8 @@ async fn live_small_mode_planner_emits_and_loop() {
         ));
     }
     body.push_str("\n## user_brief (intent only — no per-task field dictation)\n");
-    body.push_str("Plan ONE phase 00-calc. Implement the five stub functions add, sub, mul, div, and clamp under src/ — one task per file, each independently verifiable with that file's existing unit test.\n");
+    body.push_str(&user_brief);
+    body.push('\n');
     body.push_str("\n## git log\n");
     body.push_str(&log_text);
     if !sample.is_empty() {
@@ -762,6 +782,5 @@ async fn live_small_mode_planner_emits_and_loop() {
         body.push_str("```\n");
     }
     std::fs::write(artifact_dir.join("live-planner-run.md"), body).unwrap();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
