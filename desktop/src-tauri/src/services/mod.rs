@@ -12,6 +12,7 @@ pub mod sessions;
 pub mod settings;
 pub mod task_check;
 pub mod task_loop;
+pub mod task_replan;
 pub mod task_spec;
 pub mod task_state;
 pub mod verify_policy;

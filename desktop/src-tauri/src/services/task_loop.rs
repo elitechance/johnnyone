@@ -54,23 +54,38 @@ pub enum PhaseLoopOutcome {
 pub enum KlooPhaseFollowup {
     DispatchReview,
     NeedsAttention { task_id: String, route: String },
+    /// Local-small only: a `route: planner` Partial starts a commercial
+    /// amend-planner on the development run (`phase_replan_running`).
+    Replan { task_id: String, route: String },
     /// Leave `stopped` / `blocked` as `stop_plan` already wrote it.
     LeaveAsIs,
 }
 
-
-
+/// Commercial / unknown-mode default (no executorConfig ⇒ NeedsAttention).
 pub fn followup_after_kloo_phase(outcome: &PhaseLoopOutcome) -> KlooPhaseFollowup {
+    followup_after_kloo_phase_for(outcome, false)
+}
+
+/// Local-small + `route == planner` → `Replan`; everyone else unchanged.
+pub fn followup_after_kloo_phase_for(
+    outcome: &PhaseLoopOutcome,
+    local_small: bool,
+) -> KlooPhaseFollowup {
     match outcome {
         PhaseLoopOutcome::AllDone => KlooPhaseFollowup::DispatchReview,
         PhaseLoopOutcome::Partial {
             first_task_id,
             first_route,
             ..
-        } => KlooPhaseFollowup::NeedsAttention {
-            task_id: first_task_id.clone().unwrap_or_default(),
-            route: first_route.clone().unwrap_or_else(|| "planner".into()),
-        },
+        } => {
+            let task_id = first_task_id.clone().unwrap_or_default();
+            let route = first_route.clone().unwrap_or_else(|| "planner".into());
+            if local_small && route == "planner" {
+                KlooPhaseFollowup::Replan { task_id, route }
+            } else {
+                KlooPhaseFollowup::NeedsAttention { task_id, route }
+            }
+        }
         PhaseLoopOutcome::Cancelled => KlooPhaseFollowup::LeaveAsIs,
     }
 }
@@ -2386,6 +2401,20 @@ mod tests {
             followup_after_kloo_phase(&PhaseLoopOutcome::AllDone),
             KlooPhaseFollowup::DispatchReview
         );
+        let partial = PhaseLoopOutcome::Partial {
+            failed: vec!["01-a".into()],
+            blocked: vec!["02-b".into()],
+            first_route: Some("planner".into()),
+            first_task_id: Some("01-a".into()),
+        };
+        assert!(matches!(
+            followup_after_kloo_phase_for(&partial, true),
+            KlooPhaseFollowup::Replan { .. }
+        ));
+        assert!(matches!(
+            followup_after_kloo_phase_for(&partial, false),
+            KlooPhaseFollowup::NeedsAttention { .. }
+        ));
     }
 
     #[tokio::test]
