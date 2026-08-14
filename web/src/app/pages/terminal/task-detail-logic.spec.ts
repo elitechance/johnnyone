@@ -41,10 +41,17 @@ describe('taskDetail', () => {
     );
     const by = Object.fromEntries(v.checks.map((c) => [c.check, c]));
     expect(by.exit.ok).toBe(false);
+    expect(by.exit.label).toBe('exit clean');
+    expect(by.exit.meaning).toBeTruthy();
     expect(by.verify.ok).toBe(false);
+    expect(by.verify.label).toBe('postcheck passed');
     expect(by.scope.ok).toBe(true);
+    expect(by.scope.label).toBe('changed subset-of allowed');
     expect(by.changed.ok).toBe(true);
+    expect(by.changed.label).toBe('files actually changed');
     expect(by.must_contain.ok).toBe(true);
+    expect(by.must_contain.label).toBe('must_contain present');
+    expect(v.hasAttempt).toBe(true);
     expect(v.failureCode).toBe('verify_failed');
     expect(v.ruleAlert).toBeTruthy();
     expect(v.blocks).toEqual(['05-e']);
@@ -71,6 +78,8 @@ describe('taskDetail', () => {
     expect(v.klooCommand).toContain('cargo test');
     expect(v.filesChanged).toEqual(['src/d.rs']);
     expect(v.postchecks).toBeTruthy();
+    expect(v.transcriptTail).toBe('boom');
+    expect(v.hasAttempt).toBe(true);
   });
 
   it('done fixture: five checks pass, commit sha, no red alert', () => {
@@ -90,6 +99,7 @@ describe('taskDetail', () => {
     expect(v.files).toEqual(['src/d.rs']);
     expect(v.verify).toContain('cargo test');
     expect(v.attemptsCopy).toBe('No attempt yet');
+    expect(v.hasAttempt).toBe(false);
     expect(v.checks).toEqual([]);
     expect(v.success).toBeNull();
   });
@@ -111,5 +121,8 @@ describe('wiring — task detail', () => {
   it('mentions taskDetail and back-to-table', () => {
     expect(html + ts).toMatch(/taskDetail/);
     expect(html).toMatch(/back|clearSelected|selectedTaskId/i);
+    expect(html).toMatch(/hasAttempt/);
+    expect(html).toMatch(/c\.label/);
+    expect(html).toMatch(/c\.meaning/);
   });
 });

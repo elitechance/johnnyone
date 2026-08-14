@@ -58,10 +58,19 @@ export function taskCounts(run: TaskRunLike | null | undefined): TaskCounts {
   return c;
 }
 
+export function tookOf(start: unknown, end: unknown): string {
+  const s = Date.parse(String(start ?? ''));
+  const e = Date.parse(String(end ?? ''));
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e < s) return '';
+  const ms = e - s;
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms / 60_000)}m`;
+}
+
 export function taskTable(
   run: TaskRunLike | null | undefined,
   specs?: SpecLike[] | null,
-  _selectedId?: string | null,
 ): TaskTableRow[] {
   const specMap = new Map((specs ?? []).map((s) => [s.id, s]));
   return (run?.tasks ?? []).map((t, i) => {
@@ -71,13 +80,7 @@ export function taskTable(
       | undefined;
     const start = last?.startedAt ?? last?.started_at;
     const end = last?.endedAt ?? last?.ended_at;
-    let took = '';
-    const s = Date.parse(String(start ?? ''));
-    const e = Date.parse(String(end ?? ''));
-    if (Number.isFinite(s) && Number.isFinite(e) && e >= s) {
-      const ms = e - s;
-      took = ms < 1000 ? `${ms}ms` : ms < 60_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 60_000)}m`;
-    }
+    const took = tookOf(start, end);
     return {
       index: i + 1,
       id: t.id,

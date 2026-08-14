@@ -46,6 +46,18 @@ describe('createPayload', () => {
     expect(p.executorConfig).toBeUndefined();
   });
 
+  it('normalizes doctor.profile object to a path string', () => {
+    const p = createPayload('kloo', 'claude_code', fields, {
+      provider: 'openrouter',
+      model: 'qwen/qwen3-coder',
+      ctx: 32768,
+      profile: { path: '/home/creepy/.config/kloo/profiles.json', exists: true },
+    });
+    const exec = JSON.parse(p.executorConfig!);
+    expect(typeof exec.profile).toBe('string');
+    expect(exec.profile).toBe('/home/creepy/.config/kloo/profiles.json');
+  });
+
   it('doctor-derived values win over fallback literals', () => {
     const p = createPayload('kloo', 'grok', fields, {
       provider: 'other',
@@ -86,13 +98,14 @@ describe('preflightView', () => {
     tool_call: true,
     file_edit: true,
     json_only: true,
-    context: { advertised: 32768, source: 'advertised' },
+    context: { configured: 32768, advertised: 32768, source: 'advertised' },
   };
 
   it('ok fixture → probe passed and shows doctor model not the fallback', () => {
     const v = preflightView({ doctor: okDoctor, probe: okProbe });
     expect(v.phase).toBe('ok');
     expect(v.alerts.some((a) => a.kind === 'ok' && a.text === 'probe passed')).toBe(true);
+    expect(v.lines.some((l) => l.includes('context.configured'))).toBe(true);
     expect(v.lines.some((l) => l.includes('other/model'))).toBe(true);
     expect(v.lines.some((l) => l.includes('qwen/qwen3-coder'))).toBe(false);
   });
@@ -167,5 +180,15 @@ describe('parseDoctorJson', () => {
       kind: 'danger',
       text: 'kloo not found',
     });
+  });
+  it('keeps the real kloo doctor profile object so executorFromDoctor can normalize it', () => {
+    const d = parseDoctorJson(
+      '{"provider":"openrouter","model":"qwen/qwen3-coder","ctx":32768,"profile":{"path":"/home/creepy/.config/kloo/profiles.json","exists":true},"api_key":{"set":true}}',
+    );
+    expect(d?.profile).toEqual({
+      path: '/home/creepy/.config/kloo/profiles.json',
+      exists: true,
+    });
+    expect(executorFromDoctor(d).profile).toBe('/home/creepy/.config/kloo/profiles.json');
   });
 });

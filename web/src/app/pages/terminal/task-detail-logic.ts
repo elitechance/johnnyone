@@ -1,5 +1,7 @@
 // Pure inline task-detail seam (S5). Angular/Ionic/DOM-free.
 
+import { tookOf } from './tasks-tab-logic';
+
 export interface DetailSpec {
   id?: string;
   files?: string[];
@@ -21,6 +23,8 @@ export interface DetailRow {
 
 export interface CheckCell {
   check: string;
+  label: string;
+  meaning: string;
   ok: boolean;
   reason: string;
 }
@@ -41,6 +45,7 @@ export interface TaskDetailView {
   attempts: unknown[];
   attemptRows: AttemptRow[];
   attemptsCopy: string | null;
+  hasAttempt: boolean;
   klooCommand: string;
   success: boolean | null;
   failureCode: string | null;
@@ -55,6 +60,40 @@ export interface TaskDetailView {
 }
 
 const FIVE = ['exit', 'scope', 'changed', 'must_contain', 'verify'] as const;
+
+export const CHECK_COPY: Record<(typeof FIVE)[number], { label: string; meaning: string }> = {
+  exit: { label: 'exit clean', meaning: 'process exited 0 and reported success' },
+  scope: { label: 'changed subset-of allowed', meaning: 'edits stayed inside files[]' },
+  changed: { label: 'files actually changed', meaning: 'at least one allowed file was written' },
+  must_contain: { label: 'must_contain present', meaning: 'required needles exist in the files' },
+  verify: { label: 'postcheck passed', meaning: 'the task verify command passed' },
+};
+
+interface LooseAttempt {
+  attempt?: number;
+  tier?: string;
+  failureCode?: string;
+  failure_code?: string;
+  class?: string;
+  startedAt?: string;
+  started_at?: string;
+  endedAt?: string;
+  ended_at?: string;
+  checks?: { failed?: { check: string; reason?: string }[] };
+  failed?: { check: string; reason?: string }[];
+  verify?: { command?: string };
+  command?: string;
+  success?: boolean;
+  files_changed?: unknown;
+  filesChanged?: unknown;
+  off_scope_edits?: unknown;
+  offScopeEdits?: unknown;
+  rail_fires?: unknown;
+  railFires?: unknown;
+  postchecks?: unknown;
+  transcript_tail?: string;
+  transcriptTail?: string;
+}
 
 export function dependentsOf(
   id: string,
@@ -90,8 +129,11 @@ export function taskDetail(
     }
     for (const name of FIVE) {
       const reason = failed.get(name);
+      const copy = CHECK_COPY[name];
       checkCells.push({
         check: name,
+        label: copy.label,
+        meaning: copy.meaning,
         ok: reason === undefined,
         reason: reason ?? '',
       });
@@ -112,6 +154,7 @@ export function taskDetail(
     attempts,
     attemptRows: attemptRowsOf(attempts),
     attemptsCopy: noAttempt ? 'No attempt yet' : null,
+    hasAttempt: !noAttempt,
     klooCommand: parsed.command || fromRow.command,
     success: parsed.success,
     failureCode: parsed.failureCode || fromRow.failureCode,
@@ -128,7 +171,7 @@ export function taskDetail(
 
 export function attemptRowsOf(attempts: unknown[]): AttemptRow[] {
   return attempts.map((raw, i) => {
-    const a = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+    const a = asAttempt(raw);
     const n = typeof a.attempt === 'number' ? a.attempt : i + 1;
     const tier = String(a.tier ?? '');
     const code = String(a.failureCode ?? a.failure_code ?? '');
@@ -137,14 +180,11 @@ export function attemptRowsOf(attempts: unknown[]): AttemptRow[] {
   });
 }
 
-export function tookOf(start: unknown, end: unknown): string {
-  const s = Date.parse(String(start ?? ''));
-  const e = Date.parse(String(end ?? ''));
-  if (!Number.isFinite(s) || !Number.isFinite(e) || e < s) return '';
-  const ms = e - s;
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.round(ms / 60_000)}m`;
+export { tookOf };
+
+function asAttempt(raw: unknown): LooseAttempt {
+  if (raw && typeof raw === 'object') return raw as LooseAttempt;
+  return {};
 }
 
 function parseAttempt(raw: unknown): {
@@ -170,32 +210,25 @@ function parseAttempt(raw: unknown): {
     failedChecks: [] as { check: string; reason?: string }[],
   };
   if (raw == null) return empty;
-  let obj: Record<string, unknown>;
+  let obj: LooseAttempt;
   if (typeof raw === 'string') {
     try {
-      obj = JSON.parse(raw) as Record<string, unknown>;
+      obj = JSON.parse(raw) as LooseAttempt;
     } catch {
       return empty;
     }
   } else if (typeof raw === 'object') {
-    obj = raw as Record<string, unknown>;
+    obj = raw as LooseAttempt;
   } else {
     return empty;
   }
-  const nested = obj.checks && typeof obj.checks === 'object' ? (obj.checks as Record<string, unknown>) : null;
+  const nested = obj.checks;
   const failedRaw = nested?.failed ?? obj.failed;
-  const failed = Array.isArray(failedRaw)
-    ? (failedRaw as { check: string; reason?: string }[])
-    : [];
-  const verify = obj.verify && typeof obj.verify === 'object' ? (obj.verify as Record<string, unknown>) : null;
+  const failed = Array.isArray(failedRaw) ? failedRaw : [];
+  const verify = obj.verify;
   const changed = obj.files_changed ?? obj.filesChanged;
   return {
-    command:
-      typeof obj.command === 'string'
-        ? obj.command
-        : typeof verify?.command === 'string'
-          ? verify.command
-          : '',
+    command: typeof obj.command === 'string' ? obj.command : typeof verify?.command === 'string' ? verify.command : '',
     success: typeof obj.success === 'boolean' ? obj.success : null,
     failureCode:
       typeof obj.failure_code === 'string'

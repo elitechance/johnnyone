@@ -374,6 +374,13 @@
                   · {{ checks().stats.executed }} executed · {{ checks().stats.skipped }} skipped
                 }
               </div>
+              @if (checks().phaseStats.length) {
+                <div class="phase-stats">
+                  @for (p of checks().phaseStats; track p.phaseId) {
+                    <div>{{ p.phaseId }} — {{ p.executed }} executed · {{ p.skipped }} skipped</div>
+                  }
+                </div>
+              }
               @if (checks().ruleCounts.length) {
                 <div class="rule-chips">
                   @for (c of checks().ruleCounts; track c.rule) {
@@ -433,11 +440,11 @@
               </div>
               @if (firstFailedId(); as fid) {
                 <button type="button" class="failed-alert" (click)="onJumpFailed(fid)">
-                  Task {{ fid }} failed; {{ taskCountView().blocked }} tasks are blocked behind it
+                  Task {{ fid }} failed; {{ failedBlockedCount() }} tasks are blocked behind it
                 </button>
               }
               @for (ph of taskWindow().placeholders; track ph.from) {
-                <button type="button" class="more-placeholder" (click)="selectedTaskId.set(ph.firstId)">
+                <button type="button" class="more-placeholder" (click)="onTaskPlaceholder(ph)">
                   {{ ph.from }}–{{ ph.to }} more
                 </button>
               }
@@ -498,27 +505,36 @@
                     @if (d.ruleAlert) { <p class="rule-alert">{{ d.ruleAlert }}</p> }
                     @if (d.commitSha) { <p>commit {{ d.commitSha }}</p> }
                     @if (d.checks.length) {
-                      <ul class="five-checks">
-                        @for (c of d.checks; track c.check) {
-                          <li [class.bad]="!c.ok">{{ c.check }} {{ c.ok ? '✓' : '✕' }} {{ c.reason }}</li>
-                        }
-                      </ul>
+                      <table class="five-checks">
+                        <thead><tr><th>check</th><th></th><th>meaning</th></tr></thead>
+                        <tbody>
+                          @for (c of d.checks; track c.check) {
+                            <tr [class.bad]="!c.ok">
+                              <td>{{ c.label }}</td>
+                              <td>{{ c.ok ? '✓' : '✕' }}</td>
+                              <td>{{ c.meaning }}@if (c.reason) { — {{ c.reason }} }</td>
+                            </tr>
+                          }
+                        </tbody>
+                      </table>
                     }
-                    <section class="machine">
-                      <h4>Last run — machine output</h4>
-                      <p>kloo: {{ d.klooCommand || '—' }}</p>
-                      <p>success: {{ d.success }}</p>
-                      <p>failure_code: {{ d.failureCode }}</p>
-                      <p>files_changed: {{ d.filesChanged.join(', ') }}</p>
-                      <p>off_scope_edits: {{ d.offScopeEdits.join(', ') }}</p>
-                      <p>rail_fires: {{ d.railFires | json }}</p>
-                      <p>postchecks: {{ d.postchecks | json }}</p>
-                    </section>
-                    @if (d.transcriptTail) {
-                      <section class="transcript">
-                        <h4>Transcript tail</h4>
-                        <pre>{{ d.transcriptTail }}</pre>
+                    @if (d.hasAttempt) {
+                      <section class="machine">
+                        <h4>Last run — machine output</h4>
+                        <p>kloo: {{ d.klooCommand || '—' }}</p>
+                        <p>success: {{ d.success }}</p>
+                        <p>failure_code: {{ d.failureCode }}</p>
+                        <p>files_changed: {{ d.filesChanged.join(', ') }}</p>
+                        <p>off_scope_edits: {{ d.offScopeEdits.join(', ') }}</p>
+                        <p>rail_fires: {{ d.railFires | json }}</p>
+                        <p>postchecks: {{ d.postchecks | json }}</p>
                       </section>
+                      @if (d.transcriptTail) {
+                        <section class="transcript">
+                          <h4>Transcript tail</h4>
+                          <pre>{{ d.transcriptTail }}</pre>
+                        </section>
+                      }
                     }
                   </ion-card-content>
                 </ion-card>

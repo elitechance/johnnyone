@@ -4508,7 +4508,7 @@ pub(crate) fn executor_mode_is_local_small(raw: Option<&str>) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutorConfig {
     pub mode: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_profile")]
     pub profile: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
@@ -4516,6 +4516,27 @@ pub struct ExecutorConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub ctx: Option<u32>,
+}
+
+fn deserialize_profile<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        }
+        Some(serde_json::Value::Object(m)) => m
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        Some(_) => None,
+    })
 }
 
 /// Empty/null → commercial (`Ok(None)`). Unknown mode is an error (write path).
@@ -10832,6 +10853,15 @@ mod small_mode_tests {
     fn parse_executor_config_rejects_unknown_mode() {
         assert!(parse_executor_config(None).unwrap().is_none());
         assert!(parse_executor_config(Some("")).unwrap().is_none());
+        let obj = parse_executor_config(Some(
+            r#"{"mode":"local-small","profile":{"path":"/home/creepy/.config/kloo/profiles.json","exists":true}}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            obj.profile.as_deref(),
+            Some("/home/creepy/.config/kloo/profiles.json")
+        );
         assert_eq!(
             parse_executor_config(Some(r#"{"mode":"local-small"}"#))
                 .unwrap()

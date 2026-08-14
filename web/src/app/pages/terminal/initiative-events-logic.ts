@@ -157,10 +157,7 @@ export function initiativeTimeline(events: AgentPlanEvent[] | null | undefined):
 }
 
 /** Latest 80 milestones + latest 80 non-milestones, hard cap 160, original order. */
-export function windowTimeline(
-  rows: TimelineEvent[] | null | undefined,
-  _opts?: unknown,
-): TimelineEvent[] {
+export function windowTimeline(rows: TimelineEvent[] | null | undefined): TimelineEvent[] {
   const all = rows ?? [];
   const milestones = all.filter((r) => r.milestone);
   const rest = all.filter((r) => !r.milestone);

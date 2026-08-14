@@ -24,7 +24,7 @@ export interface DoctorSnapshot {
   provider?: string;
   model?: string;
   ctx?: number;
-  profile?: string;
+  profile?: string | { path?: string; exists?: boolean };
   endpoint?: string;
   api_key?: { set?: boolean } | boolean;
   verify?: { source?: string };
@@ -89,6 +89,14 @@ function firstCommercial(detected: { provider: string; found?: boolean }[] | nul
   return hit?.provider || 'claude_code';
 }
 
+export function profilePathOf(profile: DoctorSnapshot['profile']): string {
+  if (typeof profile === 'string' && profile.trim()) return profile.trim();
+  if (profile && typeof profile === 'object' && typeof profile.path === 'string' && profile.path.trim()) {
+    return profile.path.trim();
+  }
+  return FALLBACK_EXECUTOR.profile;
+}
+
 export function executorFromDoctor(doctor?: DoctorSnapshot | null): typeof FALLBACK_EXECUTOR {
   if (!doctor) return { ...FALLBACK_EXECUTOR };
   return {
@@ -96,7 +104,7 @@ export function executorFromDoctor(doctor?: DoctorSnapshot | null): typeof FALLB
     provider: doctor.provider || FALLBACK_EXECUTOR.provider,
     model: doctor.model || FALLBACK_EXECUTOR.model,
     ctx: typeof doctor.ctx === 'number' ? doctor.ctx : FALLBACK_EXECUTOR.ctx,
-    profile: doctor.profile || FALLBACK_EXECUTOR.profile,
+    profile: profilePathOf(doctor.profile),
   };
 }
 
@@ -166,6 +174,9 @@ export function preflightView(state: PreflightState): PreflightView {
     if (probe.tool_call !== undefined) lines.push(`tool_call: ${probe.tool_call}`);
     if (probe.file_edit !== undefined) lines.push(`file_edit: ${probe.file_edit}`);
     if (probe.json_only !== undefined) lines.push(`json_only: ${probe.json_only}`);
+    if (probe.context?.configured !== undefined) {
+      lines.push(`context.configured: ${probe.context.configured}`);
+    }
     if (probe.context?.advertised !== undefined) {
       lines.push(`context.advertised: ${probe.context.advertised}`);
     }

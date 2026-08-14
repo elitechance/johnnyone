@@ -123,7 +123,7 @@ import {
   type TaskRunLike,
   type TaskTableRow,
 } from './tasks-tab-logic';
-import { taskDetail, clearSelectedId, type TaskDetailView } from './task-detail-logic';
+import { taskDetail, clearSelectedId, dependentsOf, type TaskDetailView } from './task-detail-logic';
 import {
   planCounts,
   docNavModel,
@@ -567,6 +567,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       checkKind: report?.checkKind ?? report?.check_kind,
       exhausted: report?.exhausted,
       replanRound: report?.replanRound ?? report?.replan_round,
+      selectedRule: this.selectedCheckRule(),
       selectedId: this.selectedCheckId(),
     });
   });
@@ -595,6 +596,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly firstFailedId = computed(
     () => this.taskRows().find((r) => r.state === 'failed')?.id ?? null,
   );
+  protected readonly failedBlockedCount = computed(() => {
+    const id = this.firstFailedId();
+    if (!id) return 0;
+    const fromSpecs = dependentsOf(id, this.taskSpecs()).length;
+    if (fromSpecs) return fromSpecs;
+    return this.taskRows().filter((r) => r.blockedBy === id).length;
+  });
   protected readonly taskDetailView = computed<TaskDetailView | null>(() => {
     const id = this.selectedTaskId();
     const run = this.taskRun();
@@ -1932,10 +1940,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.selectedCheckId.set(next);
   }
 
-  protected onTaskPlaceholder(): void {
-    const ph = this.taskWindow().placeholder;
-    if (!ph) return;
-    this.selectedTaskId.set(selectPlaceholder(this.taskRows(), ph));
+  protected onTaskPlaceholder(ph?: { from: number; to: number; firstId?: string }): void {
+    const range = ph ?? this.taskWindow().placeholder;
+    if (!range) return;
+    this.selectedTaskId.set(selectPlaceholder(this.taskRows(), range));
   }
 
   protected onJumpFailed(id: string): void {
@@ -2137,6 +2145,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (changedInitiative) {
       this.eventsInitiativeId = initiativeId;
       this.initiativeEvents.set([]);
+      this.clearConsoleArtifacts();
       this.stopEventsPoll();
     }
     if (!initiativeId) return;
@@ -2170,11 +2179,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  private clearConsoleArtifacts(): void {
+    this.planCheckJson.set(null);
+    this.preflightJson.set(null);
+    this.taskRunJson.set(null);
+    this.taskSpecs.set([]);
+    this.selectedTaskId.set(null);
+    this.lastAttemptJson.set(null);
+    this.selectedCheckId.set(null);
+    this.selectedCheckRule.set(null);
+  }
+
   private async loadConsoleArtifacts(initiativeId: string): Promise<void> {
     const init = this.selectedInitiative();
-    if (!init || !isLocalSmall(init.executorConfig)) return;
-    if ((init.initiativeId || init.id) !== initiativeId && init.id !== initiativeId) {
-      // still allow when the selected run id matches
+    if (!init || !isLocalSmall(init.executorConfig)) {
+      this.clearConsoleArtifacts();
+      return;
     }
     const phaseId = init.currentPhaseId;
     const planId = init.id;

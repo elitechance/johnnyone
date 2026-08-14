@@ -122,7 +122,7 @@ export class BriefingPage implements OnInit {
     const d = this.doctor();
     return {
       endpoint: d?.endpoint || 'openrouter',
-      keySet: d?.api_key && typeof d.api_key === 'object' ? !!d.api_key.set : true,
+      keySet: d?.api_key && typeof d.api_key === 'object' ? !!d.api_key.set : false,
       model: d?.model || FALLBACK_EXECUTOR.model,
       ctx: typeof d?.ctx === 'number' ? d.ctx : FALLBACK_EXECUTOR.ctx,
     };

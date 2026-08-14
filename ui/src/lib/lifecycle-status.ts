@@ -76,7 +76,6 @@ export interface StageFillArgs {
   planningRoundMax?: number | null;
   devDone?: number | null;
   devTotal?: number | null;
-  replan?: boolean;
 }
 
 export function stageFill(args: StageFillArgs): string {

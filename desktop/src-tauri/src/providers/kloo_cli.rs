@@ -177,6 +177,8 @@ pub struct KlooResult {
     pub postchecks: Option<Vec<HookResult>>,
     pub verify: Option<VerifyResult>,
     pub failure_detail: Option<serde_json::Value>,
+    #[serde(default)]
+    pub transcript_tail: Option<String>,
 }
 
 /// Parse a `--status-file` body (raw JSON, no prefix).
@@ -448,6 +450,16 @@ KLOO_RESULT_JSON {\"success\":true,\"files_changed\":{\"count\":1,\"paths\":[\"s
         let r = parse_result_from_stdout(stdout).unwrap();
         assert!(r.success);
         assert_eq!(r.files_changed.paths, vec!["src/add.rs"]);
+    }
+
+    #[test]
+    fn parse_result_keeps_transcript_tail_from_real_kloo_line() {
+        // Fixture copied from kloo docs/configuration.md (KLOO_RESULT_JSON example).
+        let stdout = r#"KLOO_RESULT_JSON {"model":"...","endpoint":"...","ctx":8000,"reason":"...","success":false,"steps":1,"tokens":123,"elapsed_seconds":1.23,"tokens_per_sec":100,"compactions":0,"verify":{"command":"npm run build","passed":false,"exit_code":1},"failure_code":"verify_failed","failure_detail":{"source":"verify","reason":"answered","class":"verify_failed","message":"FAIL"},"tool_counters":{"invalid_tool_calls":0,"repeated_read_file":0,"repeated_edits":0,"failed_edits":0,"no_op_edits":0,"verify_attempts":1,"tool_errors":0},"error":"...","transcript_tail":"..."}"#;
+        let r = parse_result_from_stdout(stdout).unwrap();
+        assert!(!r.success);
+        assert_eq!(r.failure_code.as_deref(), Some("verify_failed"));
+        assert_eq!(r.transcript_tail.as_deref(), Some("..."));
     }
 
     #[test]

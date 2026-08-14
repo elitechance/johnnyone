@@ -82,6 +82,31 @@ describe('checksView + RULE_LABELS', () => {
     expect(ruleLabel('file_missing')).toBe('file does not exist');
     expect(RULE_LABELS.ui_task_forbidden).toBe('UI task forbidden');
     expect(RULE_LABELS.replan_amendment).toBe('replan amendment unreadable');
+    expect(ruleLabel('missing_files')).toBe('files missing from the task');
+  });
+
+  it('chip click filters the table to that rule', () => {
+    const v = checksView({ passed: false, items: SEVEN }, { selectedRule: 'file_missing' });
+    expect(v.rows.every((r) => r.rule === 'file_missing')).toBe(true);
+    expect(v.rows.length).toBe(1);
+    expect(selectRuleChip(SEVEN, 'file_missing', 'file_missing')).toBeNull();
+    const cleared = checksView({ passed: false, items: SEVEN }, { selectedRule: null });
+    expect(cleared.rows).toHaveLength(7);
+  });
+
+  it('passed card lists per-phase executed/skipped', () => {
+    const v = checksView({
+      passed: true,
+      items: [],
+      phases: [
+        { phaseId: '00-a', verifyExecuted: 4, verifySkipped: 0 },
+        { phaseId: '01-b', verifyExecuted: 0, verifySkipped: 8 },
+      ],
+    });
+    expect(v.phaseStats).toEqual([
+      { phaseId: '00-a', executed: 4, skipped: 0 },
+      { phaseId: '01-b', executed: 0, skipped: 8 },
+    ]);
   });
 
   it('passed empty items is passed with green copy', () => {
@@ -178,5 +203,7 @@ describe('wiring — checks tab', () => {
   it('template mentions checksView and checks tab', () => {
     expect(html + ts).toMatch(/checksView/);
     expect(html).toMatch(/checks/);
+    expect(html).toMatch(/phaseStats/);
+    expect(html + ts).toMatch(/selectCheckChip|selectedRule/);
   });
 });

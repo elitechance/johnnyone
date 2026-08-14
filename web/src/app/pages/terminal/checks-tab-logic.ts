@@ -2,6 +2,7 @@
 
 export const RULE_LABELS: Record<string, string> = {
   file_missing: 'file does not exist',
+  missing_files: 'files missing from the task',
   empty_verify: 'empty verify',
   empty_prompt: 'empty prompt',
   file_collision: 'two tasks claim one file',
@@ -50,7 +51,16 @@ export interface PlanCheckReportLike {
   verify_executed?: number;
   verifySkipped?: number;
   verify_skipped?: number;
-  phases?: { executed?: number; skipped?: number }[];
+  phases?: {
+    phaseId?: string;
+    phase_id?: string;
+    executed?: number;
+    skipped?: number;
+    verifyExecuted?: number;
+    verify_executed?: number;
+    verifySkipped?: number;
+    verify_skipped?: number;
+  }[];
   checkKind?: string;
   check_kind?: string;
   replanRound?: number;
@@ -65,6 +75,7 @@ export interface ChecksCtx {
   exhausted?: boolean;
   checkKind?: string;
   selectedId?: string | null;
+  selectedRule?: string | null;
 }
 
 export interface RuleCount {
@@ -97,6 +108,7 @@ export interface ChecksView {
   advisories: { rule: string; label: string; detail: string }[];
   moreCount: number;
   ruleCounts: RuleCount[];
+  phaseStats: { phaseId: string; executed: number; skipped: number }[];
 }
 
 export function windowCheckRows(
@@ -171,6 +183,7 @@ export function checksView(
       advisories: [],
       moreCount: 0,
       ruleCounts: [],
+      phaseStats: [],
     };
   }
   const items = report.items ?? [];
@@ -191,7 +204,14 @@ export function checksView(
   const skipped = num(report.verifySkipped, report.verify_skipped);
   const tasks = num(report.tasksChecked, report.tasks_checked, items.length);
   const affected = new Set(blocking.map((i) => String(i.taskId ?? i.task_id ?? '')).filter(Boolean)).size;
-  const win = windowCheckRows(blocking, ctx?.selectedId);
+  const selectedRule = ctx?.selectedRule ?? null;
+  const visible = selectedRule ? blocking.filter((i) => i.rule === selectedRule) : blocking;
+  const win = windowCheckRows(visible, ctx?.selectedId);
+  const phaseStats = (report.phases ?? []).map((p) => ({
+    phaseId: String(p.phaseId ?? p.phase_id ?? ''),
+    executed: num(p.verifyExecuted, p.verify_executed, p.executed),
+    skipped: num(p.verifySkipped, p.verify_skipped, p.skipped),
+  }));
   const counts = ruleCountsOf(blocking);
   const passed = report.passed === true || blocking.length === 0;
   const source = ctx?.source ?? 'planning';
@@ -239,5 +259,6 @@ export function checksView(
     advisories,
     moreCount: win.moreCount,
     ruleCounts: passed ? [] : counts,
+    phaseStats,
   };
 }

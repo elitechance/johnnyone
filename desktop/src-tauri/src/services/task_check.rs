@@ -426,6 +426,7 @@ mod tests {
                 exit_code: Some(0),
             }),
             failure_detail: None,
+            transcript_tail: None,
         }
     }
 

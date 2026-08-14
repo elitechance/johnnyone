@@ -60,7 +60,6 @@ export class LifecycleBarComponent {
         planningRoundMax: this.planningRoundMax,
         devDone: this.devDone,
         devTotal: this.devTotal,
-        replan: this.replan,
       });
       return {
         key: stage,

@@ -97,5 +97,7 @@ describe('wiring — tasks tab', () => {
   it('mentions taskTable / windowRows / tasks tab', () => {
     expect(html + ts).toMatch(/taskTable|windowRows/);
     expect(html).toMatch(/tasks/);
+    expect(html).toMatch(/onTaskPlaceholder/);
+    expect(html).toMatch(/failedBlockedCount/);
   });
 });
