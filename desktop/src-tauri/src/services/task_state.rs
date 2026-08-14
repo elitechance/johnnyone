@@ -264,7 +264,8 @@ pub fn project_status_yml(task_dir: &Path, row: &TaskRow) -> Result<(), String> 
     atomic_fs::write_atomic(&task_dir.join("status.yml"), raw.as_bytes())
 }
 
-/// Compact phase `status.md`: counts + failed/blocked/running ids only.
+/// Compact live task-run projection. Written to `run-status.md` so it never
+/// overwrites planner/reviewer `status.md` (`## Phase Validation`).
 pub fn project_phase_status_md(phase_dir: &Path, file: &TaskRunFile) -> Result<(), String> {
     let mut done = 0u32;
     let mut running = 0u32;
@@ -306,7 +307,7 @@ pub fn project_phase_status_md(phase_dir: &Path, file: &TaskRunFile) -> Result<(
     );
     std::fs::create_dir_all(phase_dir)
         .map_err(|e| format!("mkdir {}: {e}", phase_dir.display()))?;
-    atomic_fs::write_atomic(&phase_dir.join("status.md"), md.as_bytes())
+    atomic_fs::write_atomic(&phase_dir.join("run-status.md"), md.as_bytes())
 }
 
 #[cfg(test)]
@@ -398,12 +399,18 @@ mod tests {
         for t in file.tasks.iter_mut().skip(3).take(10) {
             t.status = "done".into();
         }
+        std::fs::write(dir.join("status.md"), "## Phase Validation\nPASS\n").unwrap();
         project_phase_status_md(&dir, &file).unwrap();
-        let md = std::fs::read_to_string(dir.join("status.md")).unwrap();
+        let md = std::fs::read_to_string(dir.join("run-status.md")).unwrap();
         assert!(md.lines().count() < 80, "{}", md.lines().count());
         assert!(md.contains("000"));
         assert!(md.contains("failed"));
         assert!(!md.contains("119"), "must not list every pending id");
+        let review = std::fs::read_to_string(dir.join("status.md")).unwrap();
+        assert!(
+            review.contains("Phase Validation"),
+            "must not overwrite reviewer status.md: {review}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

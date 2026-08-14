@@ -109,6 +109,7 @@ import {
   rawAttachNeeded,
   visibleConsoleTabs,
   isLocalSmall,
+  resolvedPaneTab,
 } from './console-tabs-logic';
 import { checksView, selectRuleChip, type ChecksView, type PlanCheckReportLike } from './checks-tab-logic';
 import {
@@ -432,7 +433,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   });
   /** Active console tab for the selected initiative; defaults to Transcript. */
   protected readonly activeTab = computed<PaneTab>(() =>
-    initiativeTabOf(this.initiativeTabs(), this.selectedInitiativeId() ?? ''),
+    resolvedPaneTab(
+      initiativeTabOf(this.initiativeTabs(), this.selectedInitiativeId() ?? ''),
+      this.visibleTabs(),
+    ),
   );
 
   // P5: resizable console divider widths, seeded from localStorage (clamped on read) and persisted on
@@ -521,6 +525,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly taskSpecs = signal<{ id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]>([]);
   protected readonly lastAttemptJson = signal<unknown>(null);
   protected readonly taskRunError = signal<string | null>(null);
+  protected readonly taskSpecsError = signal<string | null>(null);
   protected readonly selectedTaskId = signal<string | null>(null);
   protected readonly selectedCheckId = signal<string | null>(null);
   protected readonly selectedCheckRule = signal<string | null>(null);
@@ -2191,6 +2196,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.taskRunJson.set(null);
     this.taskSpecs.set([]);
     this.taskRunError.set(null);
+    this.taskSpecsError.set(null);
     this.selectedTaskId.set(null);
     this.lastAttemptJson.set(null);
     this.selectedCheckId.set(null);
@@ -2228,6 +2234,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         if (!bundle) {
           this.taskRunJson.set(null);
           this.taskRunError.set(null);
+          this.taskSpecsError.set(null);
           if (this.specsCacheKey !== cacheKey) this.taskSpecs.set([]);
           return;
         }
@@ -2237,11 +2244,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
           const parsed = JSON.parse(bundle) as {
             run?: TaskRunLike;
             specs?: { id: string }[];
+            specsError?: string | null;
             tasks?: TaskRunLike['tasks'];
           };
-          if (Array.isArray(parsed.specs) && (parsed.specs.length || this.specsCacheKey !== cacheKey)) {
-            this.taskSpecs.set(parsed.specs as { id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]);
-            this.specsCacheKey = cacheKey;
+          if (parsed.specsError) {
+            this.taskSpecsError.set(parsed.specsError);
+          } else {
+            this.taskSpecsError.set(null);
+            if (Array.isArray(parsed.specs)) {
+              this.taskSpecs.set(parsed.specs as { id: string; files?: string[]; verify?: string; mustContain?: string[]; dependsOn?: string[] }[]);
+              this.specsCacheKey = cacheKey;
+            }
           }
           const run = parsed.run ?? (parsed.tasks ? (parsed as TaskRunLike) : null);
           if (!this.selectedTaskId() && run) {

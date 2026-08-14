@@ -5,7 +5,7 @@
 // deliberately does not define a second tab type. Types are `import type` only (erased at build), so
 // no `@johnnyone/ui` / Angular runtime dependency leaks into the plugin-less vitest.
 import type { AgentPlan } from '../../../../../ui/src/services/johnny-api.service';
-import { paneTabOf, type PaneTab } from './terminal-transcript-tab';
+import { DEFAULT_PANE_TAB, paneTabOf, type PaneTab } from './terminal-transcript-tab';
 
 export { DEFAULT_PANE_TAB, type PaneTab } from './terminal-transcript-tab';
 
@@ -26,6 +26,11 @@ export function resolvePrimarySessionId(init: AgentPlan | null | undefined): str
  */
 export function initiativeTabOf(tabs: Record<string, PaneTab>, initiativeId: string): PaneTab {
   return paneTabOf(tabs, initiativeId);
+}
+
+/** Persist may remember `tasks`/`checks` after a failed bundle — show a visible tab. */
+export function resolvedPaneTab(active: PaneTab, visible: readonly PaneTab[]): PaneTab {
+  return visible.includes(active) ? active : DEFAULT_PANE_TAB;
 }
 
 export function isLocalSmall(executorConfig: string | null | undefined): boolean {

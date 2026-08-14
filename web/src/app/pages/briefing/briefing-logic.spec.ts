@@ -7,6 +7,7 @@ import {
   agentChoices,
   createPayload,
   executorFromDoctor,
+  executorRows,
   FALLBACK_EXECUTOR,
   parseDoctorJson,
   preflightView,
@@ -78,6 +79,25 @@ describe('createPayload', () => {
   it('doctor null uses fallback literals', () => {
     const exec = executorFromDoctor(null);
     expect(exec).toEqual(FALLBACK_EXECUTOR);
+  });
+});
+
+describe('executorRows', () => {
+  it('treats api_key boolean as set and does not invent an endpoint', () => {
+    expect(executorRows(null)).toEqual({
+      endpoint: '',
+      keySet: false,
+      model: FALLBACK_EXECUTOR.model,
+      ctx: FALLBACK_EXECUTOR.ctx,
+    });
+    expect(executorRows({ api_key: true, endpoint: 'https://openrouter.ai' })).toEqual({
+      endpoint: 'https://openrouter.ai',
+      keySet: true,
+      model: FALLBACK_EXECUTOR.model,
+      ctx: FALLBACK_EXECUTOR.ctx,
+    });
+    expect(executorRows({ api_key: { set: false } }).keySet).toBe(false);
+    expect(executorRows({ api_key: { set: true } }).keySet).toBe(true);
   });
 });
 
@@ -168,6 +188,7 @@ describe('wiring — briefing page uses the seam', () => {
     expect(html).toMatch(/executor|kloo|preflight/i);
     expect(ts).toMatch(/preflightView|runPreflight/);
     expect(html).toMatch(/runPreflight|preflightView/);
+    expect(ts).toMatch(/executorRowsOf|executorRows/);
   });
 });
 

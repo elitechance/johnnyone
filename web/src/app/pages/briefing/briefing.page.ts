@@ -43,9 +43,9 @@ import {
   jsonRpcError,
   firstCommercial,
   preflightView,
+  executorRows as executorRowsOf,
   COMMIT_COPY,
   ESCALATION_COPY,
-  FALLBACK_EXECUTOR,
   type DoctorSnapshot,
   type PreflightState,
   type PreflightView,
@@ -118,15 +118,7 @@ export class BriefingPage implements OnInit {
   protected readonly preflight = computed<PreflightView>(() => preflightView(this.preflightState()));
   protected readonly escalationCopy = ESCALATION_COPY;
   protected readonly commitCopy = COMMIT_COPY;
-  protected readonly executorRows = computed(() => {
-    const d = this.doctor();
-    return {
-      endpoint: d?.endpoint || 'openrouter',
-      keySet: d?.api_key && typeof d.api_key === 'object' ? !!d.api_key.set : false,
-      model: d?.model || FALLBACK_EXECUTOR.model,
-      ctx: typeof d?.ctx === 'number' ? d.ctx : FALLBACK_EXECUTOR.ctx,
-    };
-  });
+  protected readonly executorRows = computed(() => executorRowsOf(this.doctor()));
 
   // Per-initiative validation lenses, editable AT creation (seeded from the default triad). Saved to
   // the new initiative right after it is created, so each initiative owns its own config from birth.

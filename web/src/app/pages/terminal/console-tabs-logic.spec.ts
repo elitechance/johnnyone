@@ -8,6 +8,7 @@ import {
   resolvePrimarySessionId,
   initiativeTabOf,
   rawAttachNeeded,
+  resolvedPaneTab,
   visibleConsoleTabs,
 } from './console-tabs-logic';
 
@@ -62,6 +63,11 @@ describe('initiativeTabOf', () => {
     expect(initiativeTabOf({}, 'nope')).toBe('raw');
     expect(initiativeTabOf({ i1: 'plan' }, 'other')).toBe(DEFAULT_PANE_TAB);
     expect(DEFAULT_PANE_TAB).toBe('raw');
+  });
+
+  it('resolvedPaneTab falls back when the stored tab is hidden', () => {
+    expect(resolvedPaneTab('tasks', ['raw', 'plan', 'diff'])).toBe(DEFAULT_PANE_TAB);
+    expect(resolvedPaneTab('tasks', ['raw', 'plan', 'tasks', 'diff'])).toBe('tasks');
   });
 });
 

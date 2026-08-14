@@ -133,11 +133,30 @@ export function createPayload(
   };
 }
 
-function apiKeySet(doctor: DoctorSnapshot): boolean | undefined {
-  const k = doctor.api_key;
+export function apiKeySet(doctor: DoctorSnapshot | null | undefined): boolean | undefined {
+  const k = doctor?.api_key;
   if (typeof k === 'boolean') return k;
   if (k && typeof k === 'object') return k.set;
   return undefined;
+}
+
+export interface ExecutorRows {
+  endpoint: string;
+  keySet: boolean;
+  model: string;
+  ctx: number;
+  profile?: string;
+}
+
+export function executorRows(doctor?: DoctorSnapshot | null): ExecutorRows {
+  const profile = profilePathOf(doctor?.profile);
+  return {
+    endpoint: (doctor?.endpoint || '').trim(),
+    keySet: apiKeySet(doctor) === true,
+    model: doctor?.model || FALLBACK_EXECUTOR.model,
+    ctx: typeof doctor?.ctx === 'number' ? doctor.ctx : FALLBACK_EXECUTOR.ctx,
+    ...(profile ? { profile } : {}),
+  };
 }
 
 export function preflightView(state: PreflightState): PreflightView {

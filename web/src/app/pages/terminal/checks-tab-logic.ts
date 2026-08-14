@@ -103,7 +103,6 @@ export interface ChecksView {
     executed: number;
     skipped: number;
   };
-  alerts: string[];
   rows: CheckRow[];
   advisories: { rule: string; label: string; detail: string }[];
   moreCount: number;
@@ -178,7 +177,6 @@ export function checksView(
       state: 'empty',
       card: 'No plan-check yet',
       stats: { tasks: 0, violations: 0, affected: 0, executed: 0, skipped: 0 },
-      alerts: [],
       rows: [],
       advisories: [],
       moreCount: 0,
@@ -254,7 +252,6 @@ export function checksView(
     state,
     card,
     stats: { tasks, violations: blocking.length, affected, executed, skipped },
-    alerts: [card],
     rows: win.rows,
     advisories,
     moreCount: win.moreCount,

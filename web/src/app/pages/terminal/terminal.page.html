@@ -423,6 +423,9 @@
             @if (replanBannerText()) {
               <div class="replan-banner" role="status">{{ replanBannerText() }}</div>
             }
+            @if (taskSpecsError()) {
+              <div class="replan-banner" role="status">Could not load task specs: {{ taskSpecsError() }}</div>
+            }
             @if (tasksEmpty()) {
               <div class="pane-empty">{{ tasksEmpty() }}</div>
             } @else {
