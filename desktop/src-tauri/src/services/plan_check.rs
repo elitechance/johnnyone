@@ -305,14 +305,18 @@ fn check_collisions(
             continue;
         }
         for path in &spec.files {
-            if let Some(other) = claimed.get(path) {
+            let key = normalize_rel(path);
+            if let Some(other) = claimed.get(&key) {
+                if other == &spec.id {
+                    continue;
+                }
                 report.items.push(item(
                     Some(&spec.id),
                     RULE_FILE_COLLISION,
                     format!("{other} and {} both claim {path}", spec.id),
                 ));
             } else {
-                claimed.insert(path.clone(), spec.id.clone());
+                claimed.insert(key, spec.id.clone());
             }
         }
     }
@@ -873,6 +877,60 @@ mod tests {
             preflight.items
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_collision_normalizes_dot_slash_and_skips_self_dup() {
+        let root = tmp("collide-norm");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_task(
+            &plan,
+            "00-y",
+            "01-a",
+            &rust_yml("01-a", "src/a.rs", "cargo test a -- --exact", "", ""),
+            "a",
+        );
+        write_task(
+            &plan,
+            "00-y",
+            "02-b",
+            &rust_yml("02-b", "./src/a.rs", "cargo test b -- --exact", "", ""),
+            "b dotted",
+        );
+        let report = check_plan(&plan, &ws, None);
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_FILE_COLLISION
+                    && i.detail.contains("01-a")
+                    && i.detail.contains("02-b")
+            }),
+            "normalized collision ./src/a.rs vs src/a.rs: {:?}",
+            report.items
+        );
+
+        let root2 = tmp("collide-self");
+        let plan2 = root2.join("plan");
+        let ws2 = root2.join("ws");
+        std::fs::create_dir_all(ws2.join("src")).unwrap();
+        std::fs::write(ws2.join("src/a.rs"), "x\n").unwrap();
+        write_task(
+            &plan2,
+            "00-z",
+            "01-dup",
+            &rust_yml("01-dup", "src/a.rs, src/a.rs", "cargo test a -- --exact", "", ""),
+            "self dup",
+        );
+        let report = check_plan(&plan2, &ws2, None);
+        assert!(
+            !has_rule(&report, RULE_FILE_COLLISION),
+            "same-task duplicate files[] is not a two-task collision: {:?}",
+            report.items
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
     }
 
     #[test]
