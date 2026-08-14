@@ -3683,38 +3683,42 @@ struct CheckFindingsSummary {
     prompt: String,
     preview: Vec<serde_json::Value>,
     counts_by_rule: serde_json::Map<String, serde_json::Value>,
+    blocking_total: usize,
+    advisory_total: usize,
+}
+
+fn check_item_json(i: &crate::services::plan_check::PlanCheckItem) -> serde_json::Value {
+    json!({
+        "task_id": i.task_id,
+        "rule": i.rule,
+        "detail": i.detail,
+        "blocking": i.blocking,
+    })
 }
 
 fn summarize_check_findings(
     items: &[crate::services::plan_check::PlanCheckItem],
     cap: usize,
 ) -> CheckFindingsSummary {
+    let blocking: Vec<&crate::services::plan_check::PlanCheckItem> =
+        items.iter().filter(|i| i.blocking).collect();
+    let advisory_total = items.iter().filter(|i| !i.blocking).count();
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for i in items {
+    for i in &blocking {
         *counts.entry(i.rule.clone()).or_default() += 1;
     }
     let counts_by_rule: serde_json::Map<String, serde_json::Value> = counts
         .iter()
         .map(|(k, v)| (k.clone(), json!(*v)))
         .collect();
-    let preview: Vec<serde_json::Value> = items
-        .iter()
-        .take(cap)
-        .map(|i| {
-            json!({
-                "task_id": i.task_id,
-                "rule": i.rule,
-                "detail": i.detail,
-            })
-        })
-        .collect();
+    let preview: Vec<serde_json::Value> = blocking.iter().take(cap).map(|i| check_item_json(i)).collect();
     let mut prompt = String::new();
-    prompt.push_str("Counts by rule:\n");
+    prompt.push_str("Counts by rule (blocking):\n");
     for (rule, n) in &counts {
         prompt.push_str(&format!("- {rule}: {n}\n"));
     }
     prompt.push('\n');
-    for i in items.iter().take(cap) {
+    for i in blocking.iter().take(cap) {
         prompt.push_str(&format!(
             "- [{}] {} — {}\n",
             i.rule,
@@ -3722,16 +3726,23 @@ fn summarize_check_findings(
             i.detail
         ));
     }
-    if items.len() > cap {
+    if blocking.len() > cap {
         prompt.push_str(&format!(
             "… and {} more (see check-findings.json)\n",
-            items.len() - cap
+            blocking.len() - cap
+        ));
+    }
+    if advisory_total > 0 {
+        prompt.push_str(&format!(
+            "\n{advisory_total} advisory item(s) recorded in check-findings.json (not planner-fixable).\n"
         ));
     }
     CheckFindingsSummary {
         prompt,
         preview,
         counts_by_rule,
+        blocking_total: blocking.len(),
+        advisory_total,
     }
 }
 
@@ -3739,17 +3750,7 @@ fn persist_check_findings(
     plan_path: &str,
     report: &crate::services::plan_check::PlanCheckReport,
 ) -> Result<(), String> {
-    let items: Vec<serde_json::Value> = report
-        .items
-        .iter()
-        .map(|i| {
-            json!({
-                "task_id": i.task_id,
-                "rule": i.rule,
-                "detail": i.detail,
-            })
-        })
-        .collect();
+    let items: Vec<serde_json::Value> = report.items.iter().map(check_item_json).collect();
     let bytes = serde_json::to_vec_pretty(&items).map_err(|e| format!("serialize findings: {e}"))?;
     crate::services::atomic_fs::write_atomic(&check_findings_path(plan_path), &bytes)
 }
@@ -3939,7 +3940,8 @@ pub(crate) async fn gate_planning_lenses(
         "planning_check_failed",
         json!({
             "verdict": "NEEDS_CHANGES",
-            "total": acc.items.len(),
+            "total": summary.blocking_total,
+            "advisory": summary.advisory_total,
             "countsByRule": summary.counts_by_rule,
             "items": summary.preview,
             "findingsPath": check_findings_path(&run.plan.plan_path).display().to_string(),
@@ -3989,7 +3991,9 @@ async fn send_plan_check_findings_to_planner(
     };
     let findings_path = check_findings_path(&run.plan.plan_path);
     let summary = summarize_check_findings(&report.items, 8);
-    let mut body = String::from("Plan-check failed. Fix every item (task_id + rule).\n\n");
+    let mut body = String::from(
+        "Plan-check failed. Fix every blocking item (task_id + rule). Advisory items are not planner-fixable.\n\n",
+    );
     body.push_str(&summary.prompt);
     body.push_str(&format!(
         "\nFull structured findings: {}\n",
@@ -4086,12 +4090,13 @@ pub(crate) async fn run_phase_preflight_with(
         return Ok(true);
     }
     let n = report.items.iter().filter(|i| i.blocking).count();
+    let advisory = report.items.iter().filter(|i| !i.blocking).count();
     append_event(
         state,
         &run.plan.id,
         Some(&phase.phase_id),
         "agent_phase_preflight_failed",
-        json!({ "violations": n, "nn": nn }),
+        json!({ "violations": n, "advisory": advisory, "nn": nn }),
     )?;
     state.db.with_conn(|conn| {
         update_plan_status_and_health(
@@ -8646,7 +8651,30 @@ mod plan_check_gate_tests {
             "01-b",
             "id: 01-b\nfiles: [src/a.rs]\nverify: \"rm -rf /\"\nmust_contain: [\"pub fn add\"]\n",
         );
-        let host = SilentHost;
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-c",
+            "id: 01-c\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        struct TimeoutHost;
+        impl PlanCheckHost for TimeoutHost {
+            fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+                match req.kind {
+                    SpawnKind::Warm => SpawnResult::ok_zero(),
+                    SpawnKind::Task => SpawnResult::timed_out(),
+                }
+            }
+            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+                Ok(TokensReport {
+                    fits: true,
+                    approx_tokens: Some(1),
+                    usable_window: Some(26214),
+                    compact_trigger: Some(1),
+                })
+            }
+        }
+        let host = TimeoutHost;
         gate_planning_lenses(
             &state,
             &run,
@@ -8676,6 +8704,10 @@ mod plan_check_gate_tests {
             .filter_map(|v| v.get("rule").and_then(|r| r.as_str()))
             .collect();
         assert!(rules.len() >= 2, "{parsed:?}");
+        assert!(
+            parsed.iter().all(|v| v.get("blocking").and_then(|b| b.as_bool()).is_some()),
+            "blocking is first-class on every persisted item: {parsed:?}"
+        );
         assert!(plan_check_json_path(&state, &after).exists());
         let ev = after
             .events
@@ -8685,6 +8717,26 @@ mod plan_check_gate_tests {
         let payload: serde_json::Value = serde_json::from_str(&ev.payload_json).unwrap();
         assert!(payload.get("findingsPath").is_some());
         assert!(payload.get("countsByRule").is_some());
+        let blocking_n = parsed
+            .iter()
+            .filter(|v| v.get("blocking") == Some(&json!(true)))
+            .count();
+        let advisory_n = parsed
+            .iter()
+            .filter(|v| v.get("blocking") == Some(&json!(false)))
+            .count();
+        assert!(advisory_n >= 1, "timeout on the clean task is advisory: {parsed:?}");
+        assert_eq!(payload.get("total"), Some(&json!(blocking_n)));
+        assert_eq!(payload.get("advisory"), Some(&json!(advisory_n)));
+        assert!(
+            payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().all(|i| i.get("blocking") == Some(&json!(true))))
+                .unwrap_or(false),
+            "failed-event preview is blocking-only: {:?}",
+            payload.get("items")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8788,6 +8840,99 @@ mod plan_check_gate_tests {
             .events
             .iter()
             .any(|e| e.event_type == "planning_review_started"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn planning_advisory_only_is_not_a_failure() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("adv".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        struct TimeoutHost;
+        impl PlanCheckHost for TimeoutHost {
+            fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+                match req.kind {
+                    SpawnKind::Warm => SpawnResult::ok_zero(),
+                    SpawnKind::Task => SpawnResult::timed_out(),
+                }
+            }
+            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+                Ok(TokensReport {
+                    fits: true,
+                    approx_tokens: Some(1),
+                    usable_window: Some(26214),
+                    compact_trigger: Some(1),
+                })
+            }
+        }
+        let host = TimeoutHost;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+                elapsed_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(
+            after
+                .events
+                .iter()
+                .any(|e| e.event_type == "planning_check_passed"),
+            "{:?}",
+            after.events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        );
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_check_failed"));
+        assert_eq!(after.plan.status, "planning_review_running");
+        let findings = std::fs::read_to_string(check_findings_path(&after.plan.plan_path)).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&findings).unwrap();
+        assert!(
+            parsed.iter().any(|v| {
+                v.get("rule").and_then(|r| r.as_str())
+                    == Some(crate::services::plan_check::RULE_VERIFY_TIMEOUT)
+                    && v.get("blocking") == Some(&json!(false))
+            }),
+            "{parsed:?}"
+        );
+        assert!(
+            parsed
+                .iter()
+                .filter(|v| v.get("blocking") == Some(&json!(true)))
+                .count()
+                == 0,
+            "{parsed:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9296,6 +9441,69 @@ mod plan_check_gate_tests {
             .events
             .iter()
             .any(|e| e.event_type == "planning_needs_attention"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn preflight_advisory_only_is_not_a_failure() {
+        let (state, root, _store, ws) = gate_state();
+        let plan_dir = root.join("plan");
+        write_small_task(
+            &plan_dir,
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("development".into()),
+                title: Some("pfadv".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: plan_dir.to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        let phase = run.phases.first().cloned().unwrap();
+        struct TimeoutHost;
+        impl PlanCheckHost for TimeoutHost {
+            fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+                match req.kind {
+                    SpawnKind::Warm => SpawnResult::ok_zero(),
+                    SpawnKind::Task => SpawnResult::timed_out(),
+                }
+            }
+            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+                Ok(TokensReport {
+                    fits: true,
+                    approx_tokens: Some(1),
+                    usable_window: Some(26214),
+                    compact_trigger: Some(1),
+                })
+            }
+        }
+        let host = TimeoutHost;
+        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host), None)
+            .await
+            .unwrap();
+        assert!(ok, "advisory-only verify_timeout must not fail preflight");
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "agent_phase_preflight_passed"));
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "agent_phase_preflight_failed"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
