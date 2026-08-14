@@ -3735,7 +3735,10 @@ fn summarize_check_findings(
     }
 }
 
-fn persist_check_findings(plan_path: &str, report: &crate::services::plan_check::PlanCheckReport) {
+fn persist_check_findings(
+    plan_path: &str,
+    report: &crate::services::plan_check::PlanCheckReport,
+) -> Result<(), String> {
     let items: Vec<serde_json::Value> = report
         .items
         .iter()
@@ -3747,10 +3750,17 @@ fn persist_check_findings(plan_path: &str, report: &crate::services::plan_check:
             })
         })
         .collect();
-    let _ = crate::services::atomic_fs::write_atomic(
-        &check_findings_path(plan_path),
-        serde_json::to_vec_pretty(&items).unwrap_or_else(|_| b"[]".to_vec()).as_slice(),
-    );
+    let bytes = serde_json::to_vec_pretty(&items).map_err(|e| format!("serialize findings: {e}"))?;
+    crate::services::atomic_fs::write_atomic(&check_findings_path(plan_path), &bytes)
+}
+
+fn blocking_items_are_only_env_tokens(report: &crate::services::plan_check::PlanCheckReport) -> bool {
+    let blocking: Vec<_> = report.items.iter().filter(|i| i.blocking).collect();
+    !blocking.is_empty()
+        && blocking.iter().all(|i| {
+            i.rule == crate::services::plan_check::RULE_TOKENS_UNAVAILABLE
+                && !crate::services::plan_check::is_tokens_budget_skip(&i.rule, &i.detail)
+        })
 }
 
 /// After `planning_planner_ready`: local-small runs plan-check; commercial dispatches review.
@@ -3886,10 +3896,11 @@ pub(crate) async fn gate_planning_lenses(
 
     acc.passed = !acc.items.iter().any(|i| i.blocking);
     if let Some(parent) = prev_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create plan-check dir: {e}"))?;
     }
-    let _ = crate::services::plan_check::save_plan_check(&prev_path, &acc);
-    persist_check_findings(&run.plan.plan_path, &acc);
+    crate::services::plan_check::save_plan_check(&prev_path, &acc)?;
+    persist_check_findings(&run.plan.plan_path, &acc)?;
 
     if acc.passed {
         append_event(
@@ -3903,6 +3914,21 @@ pub(crate) async fn gate_planning_lenses(
             }),
         )?;
         return dispatch_planning_review(state, run).await;
+    }
+
+    if blocking_items_are_only_env_tokens(&acc) {
+        let reason = "kloo tokens is unavailable — environment, not a plan defect".to_string();
+        state.db.with_conn(|conn| {
+            update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+                .map_err(|e| e.to_string())
+        })?;
+        return append_event(
+            state,
+            &run.plan.id,
+            None,
+            "planning_needs_attention",
+            json!({ "reason": reason }),
+        );
     }
 
     let summary = summarize_check_findings(&acc.items, 8);
@@ -4000,7 +4026,7 @@ pub(crate) async fn run_phase_preflight(
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
 ) -> Result<bool, String> {
-    run_phase_preflight_with(state, run, phase, None).await
+    run_phase_preflight_with(state, run, phase, None, None).await
 }
 
 pub(crate) async fn run_phase_preflight_with(
@@ -4008,6 +4034,7 @@ pub(crate) async fn run_phase_preflight_with(
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     host: Option<&dyn crate::services::plan_check::PlanCheckHost>,
+    tokens_budget_ms: Option<u64>,
 ) -> Result<bool, String> {
     let initiatives = settings_service::resolve_initiatives_dir(state);
     let runs_dir = settings_service::initiative_runs_path(
@@ -4036,20 +4063,18 @@ pub(crate) async fn run_phase_preflight_with(
             tokens: true,
             tokens_only: false,
             run: task_run.as_ref(),
-            tokens_budget_ms: None,
+            tokens_budget_ms: Some(
+                tokens_budget_ms.unwrap_or(crate::services::plan_check::MAX_PLANNING_CHECK_MS),
+            ),
         },
     )
     .await?;
 
-    let _ = std::fs::create_dir_all(&runs_dir);
+    std::fs::create_dir_all(&runs_dir).map_err(|e| format!("create preflight dir: {e}"))?;
     let preflight_path = runs_dir.join("preflight.json");
-    let _ = crate::services::plan_check::save_plan_check(&preflight_path, &report);
+    crate::services::plan_check::save_plan_check(&preflight_path, &report)?;
 
-    let nn = phase
-        .phase_id
-        .split('-')
-        .next()
-        .unwrap_or(&phase.phase_id);
+    let nn = phase_nn(Some(&phase.phase_id));
     if report.passed {
         append_event(
             state,
@@ -6520,6 +6545,12 @@ fn event_status_transition(
     }
 }
 
+fn phase_nn(phase_id: Option<&str>) -> &str {
+    phase_id
+        .and_then(|p| p.split('-').next())
+        .unwrap_or("??")
+}
+
 fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String {
     match event.event_type.as_str() {
         "agent_plan_created" => "Created run".to_string(),
@@ -6541,11 +6572,7 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
         "planning_check_passed" => "Planning plan-check passed".to_string(),
         "planning_check_failed" => "Planning plan-check failed".to_string(),
         "planning_check_phase" => {
-            let nn = event
-                .phase_id
-                .as_deref()
-                .and_then(|p| p.split('-').next())
-                .unwrap_or("??");
+            let nn = phase_nn(event.phase_id.as_deref());
             let e = payload
                 .get("executed")
                 .and_then(|v| v.as_u64())
@@ -6557,11 +6584,7 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             format!("Checking phase {nn} — {e} executed, {s} skipped.")
         }
         "agent_phase_preflight_passed" => {
-            let nn = event
-                .phase_id
-                .as_deref()
-                .and_then(|p| p.split('-').next())
-                .unwrap_or("??");
+            let nn = phase_nn(event.phase_id.as_deref());
             let n = payload
                 .get("tasks")
                 .and_then(|v| v.as_u64())
@@ -6569,14 +6592,8 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             format!("Phase {nn} preflight passed — {n} tasks, 0 shape violations.")
         }
         "agent_phase_preflight_failed" => {
-            let nn = payload_str(payload, "nn").unwrap_or_else(|| {
-                event
-                    .phase_id
-                    .as_deref()
-                    .and_then(|p| p.split('-').next())
-                    .unwrap_or("??")
-                    .to_string()
-            });
+            let nn = payload_str(payload, "nn")
+                .unwrap_or_else(|| phase_nn(event.phase_id.as_deref()).to_string());
             let n = payload
                 .get("violations")
                 .and_then(|v| v.as_u64())
@@ -8909,10 +8926,21 @@ mod plan_check_gate_tests {
                 .items
                 .iter()
                 .any(|i| i.rule == crate::services::plan_check::RULE_TOKENS_UNAVAILABLE
-                    && i.detail.contains("stage budget")),
-            "tokens skipped when stage ceiling already spent: {:?}",
+                    && i.detail.contains("stage budget")
+                    && !i.blocking),
+            "tokens skip is advisory: {:?}",
             report.items
         );
+        assert!(report.passed, "ceiling-only must not fail the plan: {:?}", report.items);
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_check_passed"));
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
+        assert_eq!(after.plan.status, "planning_review_running");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9137,7 +9165,7 @@ mod plan_check_gate_tests {
         .unwrap();
         let phase = run.phases.first().cloned().unwrap();
         let host = SilentHost;
-        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host))
+        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host), None)
             .await
             .unwrap();
         assert!(!ok);
@@ -9193,7 +9221,7 @@ mod plan_check_gate_tests {
         .unwrap();
         let phase = run.phases.first().cloned().unwrap();
         let host = SilentHost;
-        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host))
+        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host), None)
             .await
             .unwrap();
         assert!(ok);
@@ -9202,6 +9230,128 @@ mod plan_check_gate_tests {
             .events
             .iter()
             .any(|e| e.event_type == "agent_phase_preflight_passed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn missing_kloo_tokens_is_environment_not_planner() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("nokloo".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        struct NoKloo;
+        impl PlanCheckHost for NoKloo {
+            fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+                match req.kind {
+                    SpawnKind::Warm => SpawnResult::ok_zero(),
+                    SpawnKind::Task => SpawnResult::exit(1),
+                }
+            }
+            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+                Err(TokensError::Unavailable("no kloo on PATH".into()))
+            }
+        }
+        let host = NoKloo;
+        gate_planning_lenses(
+            &state,
+            &run,
+            &PlanningCheckCtrl {
+                host: Some(&host),
+                stage_budget_ms: MAX_PLANNING_CHECK_MS,
+                send_planner: false,
+                elapsed_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "needs_attention");
+        assert!(!after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_review_started"));
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_needs_attention"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn preflight_tokens_budget_is_advisory() {
+        let (state, root, _store, ws) = gate_state();
+        let plan_dir = root.join("plan");
+        write_small_task(
+            &plan_dir,
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("development".into()),
+                title: Some("pftok".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: plan_dir.to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        let phase = run.phases.first().cloned().unwrap();
+        let host = SilentHost;
+        let ok = run_phase_preflight_with(&state, &run, &phase, Some(&host), Some(0))
+            .await
+            .unwrap();
+        assert!(ok, "budget-skip tokens must not fail preflight");
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "agent_phase_preflight_passed"));
+        let runs = settings_service::initiative_runs_path(
+            &settings_service::resolve_initiatives_dir(&state),
+            &run.plan.initiative_id,
+            &run.plan.id,
+            &phase.phase_id,
+        );
+        let pf = crate::services::plan_check::load_plan_check(&runs.join("preflight.json")).unwrap();
+        assert!(
+            pf.items.iter().any(|i| {
+                i.rule == crate::services::plan_check::RULE_TOKENS_UNAVAILABLE && !i.blocking
+            }),
+            "{:?}",
+            pf.items
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

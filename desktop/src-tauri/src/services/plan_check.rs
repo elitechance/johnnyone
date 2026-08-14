@@ -279,7 +279,14 @@ fn spawn_argv(argv: &[String], cwd: &Path, timeout_ms: u64) -> SpawnResult {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SpawnResult::missing(),
-        Err(_) => return SpawnResult::missing(),
+        Err(_) => {
+            return SpawnResult {
+                started: true,
+                exit_code: Some(1),
+                timed_out: false,
+                enoent: false,
+            };
+        }
     };
     let pid = child.id();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -463,12 +470,20 @@ impl<'a> CheckPlanOpts<'a> {
 }
 
 pub(crate) fn item(task_id: Option<&str>, rule: &str, detail: impl Into<String>) -> PlanCheckItem {
+    let detail = detail.into();
+    let blocking = rule != RULE_VERIFY_TIMEOUT
+        && rule != RULE_VERIFY_NOT_EXECUTED
+        && !is_tokens_budget_skip(rule, &detail);
     PlanCheckItem {
         task_id: task_id.map(str::to_string),
         rule: rule.to_string(),
-        detail: detail.into(),
-        blocking: rule != RULE_VERIFY_TIMEOUT && rule != RULE_VERIFY_NOT_EXECUTED,
+        detail,
+        blocking,
     }
+}
+
+pub(crate) fn is_tokens_budget_skip(rule: &str, detail: &str) -> bool {
+    rule == RULE_TOKENS_UNAVAILABLE && detail.contains("stage budget")
 }
 
 pub(crate) fn task_count_total_item(n: usize) -> PlanCheckItem {
@@ -3302,11 +3317,14 @@ mod tests {
         );
         assert!(
             report.items.iter().any(|i| {
-                i.rule == RULE_TOKENS_UNAVAILABLE && i.detail.contains("stage budget")
+                i.rule == RULE_TOKENS_UNAVAILABLE
+                    && i.detail.contains("stage budget")
+                    && !i.blocking
             }),
             "{:?}",
             report.items
         );
+        assert!(report.passed, "{:?}", report.items);
         let _ = std::fs::remove_dir_all(&root);
     }
 
