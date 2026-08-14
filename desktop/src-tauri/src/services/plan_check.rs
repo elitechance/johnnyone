@@ -14,7 +14,7 @@ use crate::services::task_state::TaskRunFile;
 use crate::services::verify_policy::{self, check_verify};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 pub const RULE_MISSING_FILES: &str = "missing_files";
@@ -40,6 +40,10 @@ pub const RULE_TOKENS_UNAVAILABLE: &str = "tokens_unavailable";
 pub const RULE_TASK_COUNT_PHASE: &str = "task_count_phase";
 pub const RULE_TASK_COUNT_TOTAL: &str = "task_count_total";
 pub const RULE_UI_TASK_FORBIDDEN: &str = "ui_task_forbidden";
+/// Plan-level: zero task dirs under `phases/*/tasks`. Blocking. Not in the
+/// original overview table; added so a local-small planner that emitted no
+/// `task.yml` cannot `passed=true` into the lenses (D4).
+pub const RULE_EMPTY_PLAN: &str = "empty_plan";
 
 pub const MAX_TASKS_PER_PHASE: usize = 150;
 pub const MAX_TASKS_TOTAL: usize = 800;
@@ -165,6 +169,13 @@ pub fn check_plan(
             None,
             RULE_TASK_COUNT_TOTAL,
             format!("plan has {total_tasks} tasks (max {MAX_TASKS_TOTAL})"),
+        ));
+    }
+    if total_tasks == 0 {
+        report.items.push(item(
+            None,
+            RULE_EMPTY_PLAN,
+            "plan has no task.yml dirs under phases/*/tasks",
         ));
     }
     report.tasks_checked = total_tasks;
@@ -401,10 +412,18 @@ fn check_verify_rules(
         }
         let resolved = effective.join(token);
         let listed = match cwd {
-            Some(c) => format!("{}/{token}", c.trim_end_matches('/')),
-            None => token.clone(),
+            Some(c) => {
+                let c = normalize_rel(c);
+                let t = normalize_rel(token);
+                if c.is_empty() {
+                    t
+                } else {
+                    format!("{c}/{t}")
+                }
+            }
+            None => normalize_rel(token),
         };
-        if resolved.is_file() || path_created(&listed, spec, by_id) {
+        if resolved.is_file() || path_claimed(&listed, spec, by_id) {
             continue;
         }
         report.items.push(item(
@@ -431,7 +450,7 @@ fn check_must_contain(spec: &TaskSpec, report: &mut PlanCheckReport) {
     for needle in &spec.must_contain {
         let trimmed = needle.trim();
         let lower = trimmed.to_ascii_lowercase();
-        if trimmed.len() < 4 || TRIVIAL_NEEDLES.contains(&lower.as_str()) {
+        if trimmed.chars().count() < 4 || TRIVIAL_NEEDLES.contains(&lower.as_str()) {
             report.items.push(item(
                 Some(&spec.id),
                 RULE_MUST_CONTAIN_TRIVIAL,
@@ -463,11 +482,24 @@ fn check_ui_forbidden(spec: &TaskSpec, report: &mut PlanCheckReport) {
     }
 }
 
+fn rel_eq(a: &str, b: &str) -> bool {
+    normalize_rel(a) == normalize_rel(b)
+}
+
+/// Workspace-relative path claimed on this task (`files[]` or `new:`) or an
+/// ancestor `new:`. Used by verify_target_missing (prompt 01-04).
+fn path_claimed(path: &str, spec: &TaskSpec, by_id: &HashMap<String, TaskSpec>) -> bool {
+    if spec.files.iter().any(|f| rel_eq(f, path)) {
+        return true;
+    }
+    path_created(path, spec, by_id)
+}
+
 fn path_created(path: &str, spec: &TaskSpec, by_id: &HashMap<String, TaskSpec>) -> bool {
     if spec
         .new
         .as_ref()
-        .map(|n| n.iter().any(|p| p == path))
+        .map(|n| n.iter().any(|p| rel_eq(p, path)))
         .unwrap_or(false)
     {
         return true;
@@ -484,7 +516,7 @@ fn path_created(path: &str, spec: &TaskSpec, by_id: &HashMap<String, TaskSpec>) 
         if anc
             .new
             .as_ref()
-            .map(|n| n.iter().any(|p| p == path))
+            .map(|n| n.iter().any(|p| rel_eq(p, path)))
             .unwrap_or(false)
         {
             return true;
@@ -511,8 +543,25 @@ fn cwd_created_by(cwd: &str, spec: &TaskSpec, by_id: &HashMap<String, TaskSpec>)
     paths.iter().any(|p| path_under_cwd(p, cwd))
 }
 
+fn normalize_rel(path: &str) -> String {
+    let mut parts = Vec::new();
+    for c in Path::new(path.trim()).components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            Component::ParentDir => parts.push("..".to_string()),
+            Component::Prefix(_) | Component::RootDir => {}
+        }
+    }
+    parts.join("/")
+}
+
 fn path_under_cwd(path: &str, cwd: &str) -> bool {
-    let cwd = cwd.trim_end_matches('/');
+    let path = normalize_rel(path);
+    let cwd = normalize_rel(cwd);
+    if cwd.is_empty() {
+        return true;
+    }
     path == cwd || path.starts_with(&format!("{cwd}/"))
 }
 
@@ -643,6 +692,7 @@ mod tests {
             (RULE_TASK_COUNT_PHASE, "task_count_phase"),
             (RULE_TASK_COUNT_TOTAL, "task_count_total"),
             (RULE_UI_TASK_FORBIDDEN, "ui_task_forbidden"),
+            (RULE_EMPTY_PLAN, "empty_plan"),
         ];
         for (c, s) in pairs {
             assert_eq!(c, s);
@@ -904,6 +954,61 @@ mod tests {
             "{:?}",
             report.items
         );
+
+        write_task(
+            &plan,
+            "00-dot",
+            "01-dotcwd",
+            &rust_yml(
+                "01-dotcwd",
+                "web/src/app/x.ts",
+                "cargo test d -- --exact",
+                "",
+                "cwd: ./web\n",
+            ),
+            "dot cwd",
+        );
+        write_task(
+            &plan,
+            "00-dot",
+            "02-dotfile",
+            &rust_yml(
+                "02-dotfile",
+                "./web/src/app/x.ts",
+                "cargo test e -- --exact",
+                "",
+                "cwd: web\n",
+            ),
+            "dot file",
+        );
+        let report = check_plan(&plan, &ws, None);
+        assert!(
+            !report.items.iter().any(|i| {
+                i.rule == RULE_FILES_OUTSIDE_CWD
+                    && matches!(i.task_id.as_deref(), Some("01-dotcwd") | Some("02-dotfile"))
+            }),
+            "./web vs web must resolve the same: {:?}",
+            report.items
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_plan_or_empty_phase_is_blocking() {
+        let root = tmp("empty");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(plan.join("phases")).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let report = check_plan(&plan, &ws, None);
+        assert!(has_rule(&report, RULE_EMPTY_PLAN), "{:?}", report.items);
+        assert!(!report.passed);
+        assert_eq!(report.tasks_checked, 0);
+
+        std::fs::create_dir_all(plan.join("phases/00-x/tasks")).unwrap();
+        let report = check_plan(&plan, &ws, None);
+        assert!(has_rule(&report, RULE_EMPTY_PLAN), "{:?}", report.items);
+        assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1047,6 +1152,35 @@ mod tests {
 
         write_task(
             &plan,
+            "00-listed",
+            "01-listed",
+            &rust_yml(
+                "01-listed",
+                "src/claimed.spec.ts",
+                "npx vitest run src/claimed.spec.ts",
+                "",
+                "",
+            ),
+            "listed in files[] but not on disk",
+        );
+        let report = check_plan(&plan, &ws, None);
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_FILE_MISSING && i.task_id.as_deref() == Some("01-listed")
+            }),
+            "{:?}",
+            report.items
+        );
+        assert!(
+            !report.items.iter().any(|i| {
+                i.rule == RULE_VERIFY_TARGET_MISSING && i.task_id.as_deref() == Some("01-listed")
+            }),
+            "files[] listing satisfies verify target: {:?}",
+            report.items
+        );
+
+        write_task(
+            &plan,
             "00-m",
             "01-triv",
             "id: 01-triv\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"x\", \"return\", \"TODO\"]\n",
@@ -1057,6 +1191,21 @@ mod tests {
         assert!(
             report.items.iter().any(|i| i.detail.contains("TODO")),
             "case-insensitive trivial: {:?}",
+            report.items
+        );
+        write_task(
+            &plan,
+            "00-jp",
+            "01-jp",
+            "id: 01-jp\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"日本語\"]\n",
+            "three chars is trivial even if nine bytes",
+        );
+        let report = check_plan(&plan, &ws, None);
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_MUST_CONTAIN_TRIVIAL && i.task_id.as_deref() == Some("01-jp")
+            }),
+            "3 unicode chars is < 4 chars: {:?}",
             report.items
         );
 
@@ -1460,6 +1609,9 @@ mod tests {
                     }
                 }
             }
+            RULE_EMPTY_PLAN => {
+                std::fs::create_dir_all(plan.join("phases")).unwrap();
+            }
             RULE_UI_TASK_FORBIDDEN => write_task(
                 plan,
                 "00-x",
@@ -1497,6 +1649,7 @@ mod tests {
             RULE_MUST_CONTAIN_TRIVIAL,
             RULE_TASK_COUNT_PHASE,
             RULE_TASK_COUNT_TOTAL,
+            RULE_EMPTY_PLAN,
             RULE_UI_TASK_FORBIDDEN,
         ];
         for rule in static_rules {
