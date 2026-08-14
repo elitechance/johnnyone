@@ -85,6 +85,7 @@ pub const RULE_IDS: &[&str] = &[
     RULE_TASK_COUNT_TOTAL,
     RULE_EMPTY_PLAN,
     RULE_UI_TASK_FORBIDDEN,
+    RULE_REPLAN_AMENDMENT,
 ];
 
 const TRIVIAL_NEEDLES: &[&str] = &[
@@ -3825,10 +3826,15 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
         for id in RULE_IDS {
+            if *id == RULE_REPLAN_AMENDMENT {
+                // Park-only; not emitted by check_plan (overview table notes this).
+                continue;
+            }
             assert!(
                 seen.contains(*id),
                 "overview rule {id} has no fixture producing it; seen={seen:?}"
             );
         }
+        assert!(RULE_IDS.contains(&RULE_REPLAN_AMENDMENT));
     }
 }

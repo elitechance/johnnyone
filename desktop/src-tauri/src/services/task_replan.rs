@@ -62,7 +62,6 @@ pub fn write_skip_preflight_marker(runs_dir: &Path) -> Result<(), String> {
     atomic_fs::write_atomic(&skip_preflight_marker_path(runs_dir), b"1")
 }
 
-/// Returns true once, then the marker is gone. Later entries run preflight.
 pub fn human_comment_path(runs_dir: &Path) -> PathBuf {
     runs_dir.join("human-comment.md")
 }
@@ -72,6 +71,7 @@ pub fn write_human_comment(runs_dir: &Path, text: &str) -> Result<(), String> {
     atomic_fs::write_atomic(human_comment_path(runs_dir).as_path(), text.as_bytes())
 }
 
+#[cfg(test)]
 pub fn load_human_comment(runs_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(human_comment_path(runs_dir)).ok()?;
     let t = raw.trim();
@@ -101,6 +101,7 @@ pub fn consume_human_comment(runs_dir: &Path) -> Option<String> {
     })
 }
 
+/// Returns true once, then the marker is gone. Later entries run preflight.
 pub fn consume_skip_preflight_marker(runs_dir: &Path) -> bool {
     let path = skip_preflight_marker_path(runs_dir);
     if !path.is_file() {
@@ -222,9 +223,15 @@ pub fn next_episode_round(existing: Option<&TaskAmendment>) -> Result<u32, ()> {
 }
 
 /// After a passing post-replan check: keep `done` (+ sha); flip failed/blocked
-/// to pending; seed any new sibling dirs the planner added. Never deletes
+/// to pending; seed any new sibling dirs the planner added. Drop non-done
+/// rows whose task dir the planner removed (split/replace). Never deletes
 /// commits or done rows.
 pub fn reset_for_resume(file: &mut TaskRunFile, specs: &[TaskSpec]) {
+    if !specs.is_empty() {
+        let spec_ids: HashSet<String> = specs.iter().map(|s| s.id.clone()).collect();
+        file.tasks
+            .retain(|t| t.status == "done" || spec_ids.contains(&t.id));
+    }
     let existing: HashSet<String> = file.tasks.iter().map(|t| t.id.clone()).collect();
     for task in &mut file.tasks {
         if task.status != "done" {
@@ -554,6 +561,26 @@ mod tests {
         assert_eq!(file.tasks[1].id, "02-new");
         assert_eq!(file.tasks[1].status, "pending");
         assert_eq!(file.tasks[1].depends_on, vec![String::from("01-a")]);
+    }
+
+    #[test]
+    fn reset_drops_removed_non_done_row() {
+        let mut file = seed_from_specs(
+            "p",
+            "00-x",
+            &[spec("04-d", &[]), spec("05-e", &["04-d"])],
+        );
+        file.tasks[0].status = "failed".into();
+        file.tasks[0].route = Some("planner".into());
+        file.tasks[1].status = "blocked".into();
+        file.tasks[1].blocked_by = Some("04-d".into());
+        let specs = [spec("04-d1", &[]), spec("04-d2", &["04-d1"])];
+        reset_for_resume(&mut file, &specs);
+        let ids: Vec<_> = file.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["04-d1", "04-d2"]);
+        assert!(file.tasks.iter().all(|t| t.status == "pending"));
+        assert!(!ids.contains(&"04-d"));
+        assert!(!ids.contains(&"05-e"));
     }
 
     #[test]

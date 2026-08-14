@@ -796,7 +796,7 @@ pub async fn start_plan(
         return Ok(run);
     }
     if run.plan.status == "needs_attention" {
-        reset_replan_budget_for_run(&state, &run);
+        reset_replan_budget_for_run(&state, &run, phase_id.as_deref());
     }
     if run.plan.status == "approved" && phase_id.is_none() {
         return Ok(run);
@@ -989,7 +989,7 @@ pub async fn run_initiative_from_phase(
                 .map_err(|e| e.to_string())
         })?;
         // Human Resume restores replan capacity (task 04-04 escape hatch).
-        reset_replan_budget_for_run(&state, &run);
+        reset_replan_budget_for_run(&state, &run, phase_id.as_deref());
     }
 
     start_plan(state, id, phase_id, phase_run_mode).await
@@ -2181,12 +2181,19 @@ async fn follow_kloo_outcome_with(
     }
 }
 
-pub(crate) fn reset_replan_budget_for_run(state: &AppState, run: &AgentPlanRun) {
-    let Some(phase_id) = run.plan.current_phase_id.as_deref() else {
+pub(crate) fn reset_replan_budget_for_run(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase_id: Option<&str>,
+) {
+    let Some(raw) = phase_id.or(run.plan.current_phase_id.as_deref()) else {
+        return;
+    };
+    let Ok(pid) = require_known_phase_id(run, raw) else {
         return;
     };
     let path = crate::services::task_replan::amendment_json_path(&replan_runs_dir(
-        state, run, phase_id,
+        state, run, pid,
     ));
     if let Err(e) = crate::services::task_replan::reset_replan_round(&path) {
         tracing::warn!(plan_id = %run.plan.id, %e, "reset_replan_round failed");
@@ -2206,7 +2213,6 @@ async fn park_replan(
     state: &AppState,
     run: &AgentPlanRun,
     phase_id: &str,
-    error: &str,
     reason: &str,
     round: Option<u32>,
 ) -> Result<(), String> {
@@ -2221,7 +2227,7 @@ async fn park_replan(
         r.items.push(crate::services::plan_check::PlanCheckItem {
             task_id: None,
             rule: crate::services::plan_check::RULE_REPLAN_AMENDMENT.to_string(),
-            detail: error.to_string(),
+            detail: reason.to_string(),
             blocking: true,
         });
         r
@@ -2270,7 +2276,7 @@ async fn park_replan(
             conn,
             &run.plan.id,
             "needs_attention",
-            Some(error),
+            Some(reason),
         )
         .map_err(|e| e.to_string())
     })?;
@@ -2293,16 +2299,35 @@ async fn park_replan(
 }
 
 fn replan_aborted(state: &AppState, plan_id: &str) -> bool {
-    get_plan(state, plan_id)
-        .map(|r| matches!(r.plan.status.as_str(), "stopped" | "blocked"))
+    state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT status FROM agent_plans WHERE id = ?1",
+                params![plan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map(|s| matches!(s.as_str(), "stopped" | "blocked"))
         .unwrap_or(false)
 }
 
 async fn archive_replan_planner(state: &AppState, plan_id: &str) {
-    if let Ok(current) = get_plan(state, plan_id) {
-        if let Some(sid) = current.plan.worker_session_id {
-            let _ = sessions::archive_session(state, sid).await;
-        }
+    let sid = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT worker_session_id FROM agent_plans WHERE id = ?1",
+                params![plan_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .ok()
+        .flatten();
+    if let Some(sid) = sid {
+        let _ = sessions::archive_session(state, sid).await;
     }
     let _ = state.db.with_conn(|conn| {
         conn.execute(
@@ -2342,7 +2367,6 @@ async fn begin_phase_replan(
                 run,
                 &phase.phase_id,
                 crate::services::plan_check::REPLAN_PARK_UNREADABLE,
-                crate::services::plan_check::REPLAN_PARK_UNREADABLE,
                 None,
             )
             .await;
@@ -2355,7 +2379,6 @@ async fn begin_phase_replan(
                 state,
                 run,
                 &phase.phase_id,
-                crate::services::plan_check::REPLAN_PARK_CAP,
                 crate::services::plan_check::REPLAN_PARK_CAP,
                 Some(crate::services::task_replan::MAX_REPLAN_ROUNDS),
             )
@@ -2508,7 +2531,7 @@ pub(crate) async fn run_phase_replan_arm(
             .worker_session_id
             .clone()
             .ok_or_else(|| "Replan run has no planner session".to_string())?;
-        wait_for_planner_ready(state, &session_id, &run.plan.id).await?;
+        wait_for_worker_ready(state, &session_id, &run.plan.id, Some(&phase.phase_id)).await?;
     }
     append_event(
         state,
@@ -2527,7 +2550,6 @@ pub(crate) async fn run_phase_replan_arm(
                 state,
                 run,
                 &phase.phase_id,
-                crate::services::plan_check::REPLAN_PARK_UNREADABLE,
                 crate::services::plan_check::REPLAN_PARK_UNREADABLE,
                 None,
             )
@@ -4022,6 +4044,13 @@ async fn wait_for_planner_ready(
     wait_for_agent_ready_report(state, session_id, plan_id, None).await
 }
 
+fn ready_timeout_event(phase_id: Option<&str>) -> (&'static str, &'static str) {
+    match phase_id {
+        Some(_) => ("agent_phase_needs_attention", "worker_no_report"),
+        None => ("planning_needs_attention", "planner_no_report"),
+    }
+}
+
 /// Mark a plan as `blocked` because its agent asked for a human, returning the
 /// status it had before so [`clear_plan_blocked`] can put it back.
 ///
@@ -4150,10 +4179,7 @@ async fn wait_for_agent_ready_report(
                 // Record an explaining event before escalating, so the timeout shows
                 // up in the event log instead of a silent status flip (the generic
                 // coordinator catch sets `needs_attention` but writes no event).
-                let (event_type, reason) = match phase_id {
-                    Some(_) => ("agent_phase_needs_attention", "worker_no_report"),
-                    None => ("planning_needs_attention", "planner_no_report"),
-                };
+                let (event_type, reason) = ready_timeout_event(phase_id);
                 let _ = append_event(
                     state,
                     plan_id,
@@ -11908,7 +11934,7 @@ mod replan_tests {
             })
             .unwrap();
         let parked = get_plan(&state, &run.plan.id).unwrap();
-        reset_replan_budget_for_run(&state, &parked);
+        reset_replan_budget_for_run(&state, &parked, None);
         let loaded = task_replan::load_amendment(&path).unwrap();
         assert_eq!(loaded.round, 0);
         let log = Mutex::new(Vec::new());
@@ -12177,7 +12203,6 @@ mod replan_tests {
             &get_plan(&state, &run.plan.id).unwrap(),
             "00-x",
             crate::services::plan_check::REPLAN_PARK_UNREADABLE,
-            crate::services::plan_check::REPLAN_PARK_UNREADABLE,
             None,
         )
         .await
@@ -12196,7 +12221,6 @@ mod replan_tests {
             &state,
             &get_plan(&state, &run.plan.id).unwrap(),
             "00-x",
-            crate::services::plan_check::REPLAN_PARK_CAP,
             crate::services::plan_check::REPLAN_PARK_CAP,
             Some(MAX_REPLAN_ROUNDS),
         )
@@ -12306,6 +12330,66 @@ mod replan_tests {
             ev.summary.contains("no worker session"),
             "{}",
             ev.summary
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replan_ready_timeout_is_phase_not_planning() {
+        assert_eq!(
+            ready_timeout_event(Some("00-x")),
+            ("agent_phase_needs_attention", "worker_no_report")
+        );
+        assert_eq!(
+            ready_timeout_event(None),
+            ("planning_needs_attention", "planner_no_report")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_capped_non_current_phase_resets_round() {
+        let (state, root, _store, _ws, run) = harness();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status) \
+                     VALUES (?1, ?2, '01-y', 'Y', 1, 'planned')",
+                    params![Uuid::new_v4().to_string(), run.plan.id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET current_phase_id = '00-x' WHERE id = ?1",
+                    params![run.plan.id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        let path = task_replan::amendment_json_path(&replan_runs_dir(&state, &run, "01-y"));
+        task_replan::save_amendment(
+            &path,
+            &task_replan::TaskAmendment {
+                schema: task_replan::SCHEMA.into(),
+                plan_id: run.plan.id.clone(),
+                phase_id: "01-y".into(),
+                round: 3,
+                routed: vec![],
+            },
+        )
+        .unwrap();
+        reset_replan_budget_for_run(&state, &run, Some("01-y"));
+        let loaded = task_replan::load_amendment(&path).unwrap();
+        assert_eq!(loaded.round, 0);
+        let current_path = task_replan::amendment_json_path(&replan_runs_dir(&state, &run, "00-x"));
+        assert!(
+            !current_path.is_file(),
+            "must not reset the current phase's amendment"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
