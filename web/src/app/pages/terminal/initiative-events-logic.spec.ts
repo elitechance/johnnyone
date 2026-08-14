@@ -86,6 +86,28 @@ describe('stageOf', () => {
     expect(stageOf('human_comment', 'phase')).toBe('development');
     expect(stageOf('human_comment', 'planning')).toBe('planning');
   });
+
+  it('maps agent_phase_task_* to development even when category is run', () => {
+    expect(stageOf('agent_phase_task_done', 'phase')).toBe('development');
+    expect(stageOf('agent_phase_task_failed', 'phase')).toBe('development');
+    expect(stageOf('agent_phase_task_escalated', 'phase')).toBe('development');
+    expect(stageOf('agent_phase_task_failed', 'run')).toBe('development');
+  });
+});
+
+describe('initiativeTimeline — kloo task events (S1–S2)', () => {
+  it('marks task_failed as a milestone and task_done as not', () => {
+    const [failed] = initiativeTimeline([
+      ev({ id: 'f', eventType: 'agent_phase_task_failed', category: 'phase', summary: 'Task 01-add failed (x)' }),
+    ]);
+    const [done] = initiativeTimeline([
+      ev({ id: 'd', eventType: 'agent_phase_task_done', category: 'phase', summary: 'Task 01-add passed (qwen3-coder)' }),
+    ]);
+    expect(failed.milestone).toBe(true);
+    expect(failed.stage).toBe('development');
+    expect(done.milestone).toBe(false);
+    expect(done.stage).toBe('development');
+  });
 });
 
 describe('actorLabel', () => {

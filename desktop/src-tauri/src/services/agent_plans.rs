@@ -202,6 +202,8 @@ fn update_plan_status_and_health(
 }
 
 pub fn create_plan(state: &AppState, input: CreateAgentPlanInput) -> Result<AgentPlanRun, String> {
+    reject_oneshot_plan_provider(&input.worker_provider)?;
+    reject_oneshot_plan_provider(&input.reviewer_provider)?;
     let run_type = input
         .run_type
         .clone()
@@ -317,6 +319,8 @@ fn create_planning_run(
     state: &AppState,
     input: CreateAgentPlanInput,
 ) -> Result<AgentPlanRun, String> {
+    reject_oneshot_plan_provider(&input.worker_provider)?;
+    reject_oneshot_plan_provider(&input.reviewer_provider)?;
     let workspace = normalize_path(Path::new(&input.workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
@@ -410,6 +414,8 @@ pub async fn create_briefing_run(
     state: &AppState,
     input: CreateBriefingInput,
 ) -> Result<AgentPlanRun, String> {
+    reject_oneshot_plan_provider(&input.worker_provider)?;
+    reject_oneshot_plan_provider(&input.reviewer_provider)?;
     let workspace = normalize_path(Path::new(&input.workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
@@ -630,7 +636,7 @@ pub async fn accept_brief(
     // initiative can read it from disk — the planner, and crucially the development validation lenses
     // (their prompt points here). The DB `brief` column drives the planner prompt; this file is the
     // durable, agent-readable source of the original intent for planning AND review.
-    if let Err(e) = std::fs::write(plan_dir.join("brief.md"), &composed) {
+    if let Err(e) = write_brief_md(&plan_dir, &composed) {
         tracing::warn!(%id, error=%e, "Failed to write brief.md (non-fatal)");
     }
     let planner_session = sessions::create_session(
@@ -752,6 +758,34 @@ pub async fn start_plan(
         Some("single") => "single",
         _ => "continue",
     };
+    let phase_path = Path::new(&run.plan.plan_path)
+        .join("phases")
+        .join(&phase.phase_id);
+    if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+        // Kloo-mode: no persistent T1, no worker_phase_prompt, no ready-curl.
+        // Coordinator re-enters run_kloo_phase which reconciles first (D5).
+        state.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agent_plans SET status = 'phase_worker_running', current_phase_id = ?1, current_phase_index = ?2, phase_run_mode = ?3, updated_at = datetime('now') WHERE id = ?4",
+                params![phase.phase_id, phase.phase_index, phase_run_mode, id],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE agent_plan_phases SET status = 'worker_running', worker_started_at = COALESCE(worker_started_at, datetime('now')), updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2",
+                params![id, phase.phase_id],
+            )
+            .map_err(|e| e.to_string())
+        })?;
+        append_event(
+            &state,
+            &id,
+            Some(&phase.phase_id),
+            "agent_phase_started",
+            json!({}),
+        )?;
+        spawn_coordinator_loop(state.clone(), id.clone()).await;
+        return get_plan(&state, &id);
+    }
     let worker_session_id = run
         .plan
         .worker_session_id
@@ -965,6 +999,16 @@ pub async fn amend_plan(
 
 pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, String> {
     let run = get_plan(state, &id)?;
+    // Write `stopped` before killing kloo so the loop's post-wait cancel
+    // check cannot record Stop as a model failure (T2).
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET status = 'stopped', updated_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    crate::services::task_loop::kill_registered_kloo_child(state, &id);
     if let Some(session_id) = &run.plan.worker_session_id {
         let _ = terminal::kill_terminal_session(state, session_id).await;
         let _ = sessions::archive_session(state, session_id.clone()).await;
@@ -973,15 +1017,7 @@ pub async fn stop_plan(state: &AppState, id: String) -> Result<AgentPlanRun, Str
         let _ = terminal::kill_terminal_session(state, session_id).await;
         let _ = sessions::archive_session(state, session_id.clone()).await;
     }
-    // Tear down any in-flight ephemeral lens/docs agents too (previously leaked).
     dispose_plan_review_sessions(state, &id).await;
-    state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'stopped', updated_at = datetime('now') WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|e| e.to_string())
-    })?;
     append_event(state, &id, None, "agent_plan_stopped", json!({}))?;
     get_plan(state, &id)
 }
@@ -1033,12 +1069,7 @@ pub fn update_plan_validation_config(
         let lenses: Vec<ValidationLens> = serde_json::from_str(json)
             .map_err(|e| format!("Invalid validation config JSON: {}", e))?;
         for lens in &lenses {
-            if CliProvider::from_str(&lens.provider).is_none() {
-                return Err(format!(
-                    "Unknown provider '{}' for lens '{}'",
-                    lens.provider, lens.name
-                ));
-            }
+            reject_non_review_lens(&lens.provider, &lens.name)?;
         }
     }
     // Ensure the plan exists (clear error if not) before writing.
@@ -1872,30 +1903,128 @@ pub fn git_diff(state: &AppState, path: String) -> Result<GitDiffView, String> {
     })
 }
 
+/// J1-owned write of the accepted brief. Thin wrapper so accept stays
+/// non-fatal-on-error while tests can exercise the atomic path directly.
+fn write_brief_md(plan_dir: &Path, contents: &str) -> Result<(), String> {
+    crate::services::atomic_fs::write_atomic(&plan_dir.join("brief.md"), contents.as_bytes())
+}
+
 async fn spawn_coordinator_loop(state: AppState, plan_id: String) {
-    tokio::spawn(async move {
-        if let Err(error) = coordinator_loop(state.clone(), plan_id.clone()).await {
-            let _ = state.db.with_conn(|conn| {
-                // Kept inline (not via update_plan_status_and_health) to preserve the
-                // `status NOT IN (...)` guard; health is still derived via health_from_status so
-                // the status+health pairing can't drift (documented in decisions.md D-inline).
-                conn.execute(
-                    "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
-                    params![health_from_status("needs_attention"), error, plan_id],
-                )
-                .map_err(|e| e.to_string())
-            });
-            // Emit an event so the failure shows in the feed AND fires the Discord
-            // alert (append_event is the single notification chokepoint).
-            let _ = append_event(
-                &state,
-                &plan_id,
-                None,
-                "coordinator_failed",
-                json!({ "reason": error }),
-            );
+    let slots = state.coordinator_loops.clone();
+    let id = plan_id.clone();
+    let _ = crate::services::coordinator_flight::spawn_if_idle(&slots, id.clone(), move || {
+        let state = state;
+        let plan_id = id;
+        async move {
+            if let Err(error) = coordinator_loop(state.clone(), plan_id.clone()).await {
+                let _ = state.db.with_conn(|conn| {
+                    // Kept inline (not via update_plan_status_and_health) to preserve the
+                    // `status NOT IN (...)` guard; health is still derived via health_from_status so
+                    // the status+health pairing can't drift (documented in decisions.md D-inline).
+                    conn.execute(
+                        "UPDATE agent_plans SET status = 'needs_attention', health = ?1, error = ?2, updated_at = datetime('now') WHERE id = ?3 AND status NOT IN ('approved', 'blocked', 'stopped')",
+                        params![health_from_status("needs_attention"), error, plan_id],
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                // Emit an event so the failure shows in the feed AND fires the Discord
+                // alert (append_event is the single notification chokepoint).
+                let _ = append_event(
+                    &state,
+                    &plan_id,
+                    None,
+                    "coordinator_failed",
+                    json!({ "reason": error }),
+                );
+            }
         }
     });
+}
+
+/// Development `phase_worker_running` arm. Kloo-mode runs the per-task loop;
+/// the `else` is the **commercial** persistent-worker + ready-curl path and
+/// must stay (D2 / acceptance 7).
+async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> Result<(), String> {
+    let phase = current_phase(run)?;
+    let phase_path = Path::new(&run.plan.plan_path)
+        .join("phases")
+        .join(&phase.phase_id);
+    if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+        let outcome =
+            crate::services::task_loop::run_kloo_phase(state, run, &phase).await?;
+        return follow_kloo_outcome(state, run, &phase, outcome).await;
+    }
+    // COMMERCIAL PATH — persistent worker + ready-curl + three-lens review.
+    // Do not change this branch; kloo-mode is the `if` above (D2 / D5).
+    let session_id = run
+        .plan
+        .worker_session_id
+        .clone()
+        .ok_or_else(|| "Plan has no worker session".to_string())?;
+    wait_for_worker_ready(state, &session_id, &run.plan.id, Some(&phase.phase_id)).await?;
+    enter_phase_review(state, &run.plan.id, &phase).await
+}
+
+async fn follow_kloo_outcome(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    outcome: crate::services::task_loop::PhaseLoopOutcome,
+) -> Result<(), String> {
+    use crate::services::task_loop::{followup_after_kloo_phase, KlooPhaseFollowup};
+    match followup_after_kloo_phase(&outcome) {
+        KlooPhaseFollowup::DispatchReview => {
+            enter_phase_review(state, &run.plan.id, phase).await
+        }
+        KlooPhaseFollowup::NeedsAttention { task_id, route } => {
+            state.db.with_conn(|conn| {
+                update_plan_status_and_health(
+                    conn,
+                    &run.plan.id,
+                    "needs_attention",
+                    Some("task_failed"),
+                )
+                .map_err(|e| e.to_string())
+            })?;
+            append_event(
+                state,
+                &run.plan.id,
+                Some(&phase.phase_id),
+                "agent_phase_needs_attention",
+                json!({ "reason": "task_failed", "taskId": task_id, "route": route }),
+            )?;
+            Ok(())
+        }
+        KlooPhaseFollowup::LeaveAsIs => Ok(()),
+    }
+}
+
+async fn enter_phase_review(
+    state: &AppState,
+    plan_id: &str,
+    phase: &AgentPlanPhase,
+) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET status = 'phase_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'phase_worker_running'",
+            params![plan_id],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE agent_plan_phases SET status = 'worker_idle', worker_idle_at = datetime('now'), updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2",
+            params![plan_id, phase.phase_id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    append_event(
+        state,
+        plan_id,
+        Some(&phase.phase_id),
+        "agent_phase_worker_idle",
+        json!({}),
+    )?;
+    let refreshed = get_plan(state, plan_id)?;
+    dispatch_review(state, &refreshed, phase).await
 }
 
 async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String> {
@@ -1932,34 +2061,7 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
         }
         match run.plan.status.as_str() {
             "phase_worker_running" => {
-                let phase = current_phase(&run)?;
-                let session_id = run
-                    .plan
-                    .worker_session_id
-                    .clone()
-                    .ok_or_else(|| "Plan has no worker session".to_string())?;
-                wait_for_worker_ready(&state, &session_id, &plan_id, Some(&phase.phase_id)).await?;
-                state.db.with_conn(|conn| {
-                    conn.execute(
-                        "UPDATE agent_plans SET status = 'phase_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'phase_worker_running'",
-                        params![plan_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    conn.execute(
-                        "UPDATE agent_plan_phases SET status = 'worker_idle', worker_idle_at = datetime('now'), updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2",
-                        params![plan_id, phase.phase_id],
-                    )
-                    .map_err(|e| e.to_string())
-                })?;
-                append_event(
-                    &state,
-                    &plan_id,
-                    Some(&phase.phase_id),
-                    "agent_phase_worker_idle",
-                    json!({}),
-                )?;
-                let refreshed = get_plan(&state, &plan_id)?;
-                dispatch_review(&state, &refreshed, &phase).await?;
+                run_development_worker_phase(&state, &run).await?;
             }
             "phase_review_running" => {
                 // Development review fans out into three ephemeral lens reviewers
@@ -2483,15 +2585,37 @@ fn lens_spawn_descriptors(lenses: &[ValidationLens]) -> Result<Vec<LensSpawnDesc
     lenses
         .iter()
         .map(|lens| {
-            if CliProvider::from_str(&lens.provider).is_none() {
-                return Err(format!(
-                    "Unknown provider '{}' for lens '{}'",
-                    lens.provider, lens.name
-                ));
-            }
+            reject_non_review_lens(&lens.provider, &lens.name)?;
             Ok(lens_spawn_descriptor(lens))
         })
         .collect()
+}
+
+/// Kloo/Shell cannot be a planner, worker, or reviewer on a commercial plan.
+fn reject_oneshot_plan_provider(provider: &str) -> Result<(), String> {
+    match CliProvider::from_str(provider) {
+        Some(CliProvider::Kloo) | Some(CliProvider::Shell) => Err(format!(
+            "Provider '{}' is a oneshot executor, not a chat provider",
+            provider
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Unknown names keep the D13 "Unknown provider" error. Kloo/Shell parse as
+/// known providers but cannot run a chat-style review lens.
+fn reject_non_review_lens(provider: &str, lens_name: &str) -> Result<(), String> {
+    match CliProvider::from_str(provider) {
+        Some(CliProvider::Kloo) | Some(CliProvider::Shell) => Err(format!(
+            "Provider '{}' is a oneshot executor, not a review lens",
+            provider
+        )),
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "Unknown provider '{}' for lens '{}'",
+            provider, lens_name
+        )),
+    }
 }
 
 /// The lens-specific tail appended to a reviewer prompt (after the standard lens instructions,
@@ -4019,14 +4143,19 @@ async fn pass_phase(
 
     if should_continue {
         if let Some(next) = next_phase {
-        let refreshed = get_plan(state, plan_id)?;
-        let worker_session_id = refreshed
-            .plan
-            .worker_session_id
-            .clone()
-            .ok_or_else(|| "Plan has no worker session".to_string())?;
-        let prompt = worker_phase_prompt(state, &refreshed, &next)?;
-        terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
+        let next_path = Path::new(&run.plan.plan_path)
+            .join("phases")
+            .join(&next.phase_id);
+        if !crate::services::task_loop::phase_is_kloo_mode(&next_path) {
+            let refreshed = get_plan(state, plan_id)?;
+            let worker_session_id = refreshed
+                .plan
+                .worker_session_id
+                .clone()
+                .ok_or_else(|| "Plan has no worker session".to_string())?;
+            let prompt = worker_phase_prompt(state, &refreshed, &next)?;
+            terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
+        }
         append_event(
             state,
             plan_id,
@@ -4201,7 +4330,7 @@ fn task_status_from_markdown(content: &str) -> Option<String> {
     })
 }
 
-fn normalize_task_status(status: &str) -> String {
+pub(crate) fn normalize_task_status(status: &str) -> String {
     let normalized = status.trim().to_ascii_lowercase().replace('_', "-");
     match normalized.as_str() {
         "not started" | "not-started" => "not-started".to_string(),
@@ -5072,6 +5201,42 @@ fn append_event(
     Ok(())
 }
 
+/// Emit a kloo-mode task event with the contracted payload fields.
+pub(crate) fn emit_task_event(
+    state: &AppState,
+    plan_id: &str,
+    event_type: &str,
+    task_id: &str,
+    phase_id: &str,
+    tier: Option<&str>,
+    attempt: Option<u32>,
+    failure_code: Option<&str>,
+    commit_sha: Option<&str>,
+    route: Option<&str>,
+    checks: Option<serde_json::Value>,
+) -> Result<(), String> {
+    debug_assert!(
+        event_type.starts_with("agent_phase_task_"),
+        "task events must use the agent_phase_ prefix"
+    );
+    append_event(
+        state,
+        plan_id,
+        Some(phase_id),
+        event_type,
+        serde_json::json!({
+            "taskId": task_id,
+            "phaseId": phase_id,
+            "tier": tier,
+            "attempt": attempt,
+            "failureCode": failure_code,
+            "commitSha": commit_sha,
+            "route": route,
+            "checks": checks,
+        }),
+    )
+}
+
 fn publish_plan_update(state: &AppState, plan_id: &str) {
     let run = get_plan(state, plan_id)
         .ok()
@@ -5150,7 +5315,7 @@ fn all_workspace_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, Strin
     Ok(entries)
 }
 
-fn git_changed_files(workspace_path: &str, path_filter: Option<&str>) -> Result<Vec<HostFileEntry>, String> {
+pub(crate) fn git_changed_files(workspace_path: &str, path_filter: Option<&str>) -> Result<Vec<HostFileEntry>, String> {
     let root_output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(workspace_path)
@@ -5724,6 +5889,9 @@ fn event_category(event_type: &str) -> &'static str {
         | "agent_phase_needs_attention"
         | "agent_phase_unlocked"
         | "agent_single_phase_completed"
+        | "agent_phase_task_done"
+        | "agent_phase_task_failed"
+        | "agent_phase_task_escalated"
         // A human comment on a run/resume is phase-scoped guidance; the "phase" category
         // maps to the console's development stage (frontend `stageOf`) — see decisions.md.
         | "human_comment" => "phase",
@@ -5862,6 +6030,23 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             },
             _ => "Phase review returned a verdict".to_string(),
         },
+        "agent_phase_task_done" => {
+            let id = payload_str(payload, "taskId").unwrap_or_else(|| "?".into());
+            let tier = payload_str(payload, "tier").unwrap_or_else(|| "unknown".into());
+            format!("Task {id} passed ({tier})")
+        }
+        "agent_phase_task_failed" => {
+            let id = payload_str(payload, "taskId").unwrap_or_else(|| "?".into());
+            let rule = payload_str(payload, "failureCode")
+                .or_else(|| payload_str(payload, "route"))
+                .unwrap_or_else(|| "failed".into());
+            format!("Task {id} failed ({rule})")
+        }
+        "agent_phase_task_escalated" => {
+            let id = payload_str(payload, "taskId").unwrap_or_else(|| "?".into());
+            let tier = payload_str(payload, "tier").unwrap_or_else(|| "next".into());
+            format!("Task {id} escalated to {tier}")
+        }
         "agent_phase_unlocked" => "Unlocked the next phase".to_string(),
         "agent_plan_completed" => "Completed the full run".to_string(),
         "agent_docs_commit_started" => "Docs agent — updating app-repo docs".to_string(),
@@ -5984,6 +6169,60 @@ mod coordinator_terminal_tests {
         let output = "PHASE: 04-validation VERDICT: PASS SUMMARY: Re-validation confirms phase 04 \
             still meets done criteria; 9/9 E2E green, worker 185/185. FINDINGS: none NEXT_STEPS: none";
         assert_eq!(parse_verdict(output).as_deref(), Some("PASS"));
+    }
+
+    #[test]
+    fn agent_phase_task_events_are_phase_scoped() {
+        for ty in [
+            "agent_phase_task_done",
+            "agent_phase_task_failed",
+            "agent_phase_task_escalated",
+        ] {
+            assert!(ty.starts_with("agent_phase_"));
+            assert_eq!(event_category(ty), "phase");
+            assert_eq!(event_actor(ty), "coordinator");
+            assert_eq!(event_status_transition(ty, &serde_json::json!({})), (None, None));
+        }
+        let ev = |ty: &str| AgentPlanEvent {
+            id: "e".into(),
+            plan_id: "p".into(),
+            phase_id: Some("00-x".into()),
+            phase_index: None,
+            phase_title: None,
+            event_type: ty.into(),
+            actor: "coordinator".into(),
+            category: "phase".into(),
+            summary: String::new(),
+            status_before: None,
+            status_after: None,
+            reason: None,
+            verdict: None,
+            task_id: Some("01-add".into()),
+            clarification_attempt: None,
+            payload_json: "{}".into(),
+            created_at: String::new(),
+        };
+        assert_eq!(
+            event_summary(
+                &ev("agent_phase_task_done"),
+                &serde_json::json!({ "taskId": "01-add", "tier": "qwen3-coder" })
+            ),
+            "Task 01-add passed (qwen3-coder)"
+        );
+        assert_eq!(
+            event_summary(
+                &ev("agent_phase_task_failed"),
+                &serde_json::json!({ "taskId": "01-add", "failureCode": "off_scope_edit" })
+            ),
+            "Task 01-add failed (off_scope_edit)"
+        );
+        assert_eq!(
+            event_summary(
+                &ev("agent_phase_task_escalated"),
+                &serde_json::json!({ "taskId": "01-add", "tier": "claude" })
+            ),
+            "Task 01-add escalated to claude"
+        );
     }
 
     #[test]
@@ -6198,8 +6437,24 @@ mod coordinator_terminal_tests {
 
     #[test]
     fn lens_spawn_descriptors_reject_unknown_provider() {
-        let cfg = vec![lens("bad", "kloo", true)];
-        assert!(lens_spawn_descriptors(&cfg).is_err());
+        let cfg = vec![lens("bad", "claude_cod", true)];
+        let err = lens_spawn_descriptors(&cfg).unwrap_err();
+        assert!(
+            err.contains("Unknown provider") && err.contains("claude_cod"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn lens_config_rejects_oneshot_providers() {
+        for provider in ["kloo", "shell"] {
+            let err = lens_spawn_descriptors(&[lens("x", provider, true)]).unwrap_err();
+            assert!(
+                err.contains("oneshot executor") && err.contains(provider),
+                "{err}"
+            );
+            assert!(!err.contains("Unknown provider"), "{err}");
+        }
     }
 
     // A3v — vision clause + custom rubric appear only when set (pure half of the prompt builders).
@@ -6594,6 +6849,41 @@ mod store_tests {
     }
 
     #[test]
+    fn initiative_runs_path_is_phase_keyed() {
+        let path = settings_service::initiative_runs_path(
+            Path::new("/store"),
+            "init-1",
+            "plan-1",
+            "00-atomic-plan-store",
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/store/init-1/runs/plan-1/00-atomic-plan-store")
+        );
+        assert!(
+            !path.to_string_lossy().contains("snapshots"),
+            "runs path must not include a snapshots segment"
+        );
+    }
+
+    #[test]
+    fn write_brief_md_leaves_full_composed_bytes() {
+        let dir = tmp_dir("brief");
+        let composed = "# Accepted brief\n\nfull composed contents\n";
+        write_brief_md(&dir, composed).unwrap();
+        let landed = std::fs::read_to_string(dir.join("brief.md")).unwrap();
+        assert_eq!(landed, composed);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".j1tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp sibling: {:?}", leftovers);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resolve_initiatives_dir_defaults_then_overrides() {
         let (state, root) = test_state();
         assert_eq!(
@@ -6706,7 +6996,56 @@ mod store_tests {
         assert!(e.is_none(), "approve must clear error");
     }
 
-    // ── Test 6: create_planning_run writes to the store (end-to-end wiring) ───────────
+    #[test]
+    fn create_plan_rejects_oneshot_providers() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        for (worker, reviewer) in [
+            ("kloo", "claude_code"),
+            ("claude_code", "kloo"),
+            ("shell", "claude_code"),
+            ("claude_code", "shell"),
+        ] {
+            let mut inp = input(
+                Some("planning"),
+                workspace.to_string_lossy().as_ref(),
+                "docs/plans/whatever",
+            );
+            inp.worker_provider = worker.to_string();
+            inp.reviewer_provider = reviewer.to_string();
+            let err = create_plan(&state, inp).unwrap_err();
+            assert!(
+                err.contains("oneshot executor")
+                    && (err.contains(worker) || err.contains(reviewer)),
+                "{err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn create_briefing_run_rejects_oneshot_providers() {
+        let (state, root) = test_state();
+        let workspace = tmp_dir("ws");
+        let err = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("x".into()),
+                workspace_path: workspace.to_string_lossy().to_string(),
+                brief: None,
+                worker_provider: "kloo".into(),
+                reviewer_provider: "claude_code".into(),
+                model: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("oneshot") && err.contains("kloo"), "{err}");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn create_planning_run_writes_under_store() {
         let (state, root) = test_state();
@@ -7049,9 +7388,26 @@ mod store_tests {
         // Malformed JSON is rejected (not silently written).
         assert!(update_plan_validation_config(&state, plan.id.clone(), Some("{not json".into())).is_err());
 
-        // A lens with an unknown provider is rejected (D13).
-        let bad = r#"[{"name":"x","provider":"kloo","blocking":true}]"#;
-        assert!(update_plan_validation_config(&state, plan.id.clone(), Some(bad.to_string())).is_err());
+        // A lens with an unknown/typo provider is rejected (D13).
+        let bad = r#"[{"name":"x","provider":"claude_cod","blocking":true}]"#;
+        let err = update_plan_validation_config(&state, plan.id.clone(), Some(bad.to_string()))
+            .unwrap_err();
+        assert!(
+            err.contains("Unknown provider") && err.contains("claude_cod"),
+            "{err}"
+        );
+
+        for provider in ["kloo", "shell"] {
+            let json = format!(
+                r#"[{{"name":"x","provider":"{}","blocking":true}}]"#,
+                provider
+            );
+            let err = update_plan_validation_config(&state, plan.id.clone(), Some(json)).unwrap_err();
+            assert!(
+                err.contains("oneshot executor") && err.contains(provider),
+                "{err}"
+            );
+        }
 
         // The column is still cleared (the two rejected writes never touched it).
         let reloaded = get_plan(&state, &plan.id).unwrap();

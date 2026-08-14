@@ -1,0 +1,6 @@
+id: 06-saturate
+files: [src/saturate.rs]
+verify: "cargo test saturate_works -- --exact"
+must_contain: ["pub fn saturate(x: i32, lo: i32, hi: i32) -> i32"]
+depends_on: [05-clamp]
+ctx: 32768

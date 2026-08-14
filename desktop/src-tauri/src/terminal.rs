@@ -868,6 +868,11 @@ fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
         // Plain shell — no args. tmux will run it as the pane's command and
         // the user types whatever they want.
         CliProvider::Shell => (command, Vec::new()),
+        // Catch-all (Ollama with empty model, Cline, Kloo): no extra pane args.
+        // kloo oneshot never uses this command (phase 03 spawn_kloo_task goes
+        // through cli_runner with a full argv). Empty args would start the
+        // interactive TUI if someone attached a kloo session — acceptable only
+        // because the task loop does not call provider_command.
         _ => (command, Vec::new()),
     }
 }

@@ -6,7 +6,7 @@ use crate::events::{
 use crate::providers::cli_runner::CliProcess;
 use crate::tools::tool_schema::ToolExecutionRecord;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -121,6 +121,13 @@ pub struct AppState {
     /// Handle to the running relay connection loop. Aborted + respawned by
     /// `relay::reconnect` when connection settings change (reconnect-on-save).
     pub relay_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Plan IDs that currently have a live `coordinator_loop`. Inserted before
+    /// spawn and removed when the loop returns or panics (std Mutex so Drop
+    /// can release the slot). A second spawn for a live id is a no-op.
+    pub coordinator_loops: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// OS pids of in-flight kloo `--benchmark` children, keyed by plan id.
+    /// `stop_plan` kills these (kloo has no tmux pane).
+    pub kloo_pids: Arc<std::sync::Mutex<HashMap<String, u32>>>,
 }
 
 impl AppState {
@@ -167,6 +174,8 @@ impl AppState {
             worker_relay_config: Arc::new(Mutex::new(None)),
             agent_reports: Arc::new(Mutex::new(HashMap::new())),
             relay_task: Arc::new(Mutex::new(None)),
+            coordinator_loops: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -205,6 +214,8 @@ impl AppState {
             worker_relay_config: Arc::new(Mutex::new(None)),
             agent_reports: Arc::new(Mutex::new(HashMap::new())),
             relay_task: Arc::new(Mutex::new(None)),
+            coordinator_loops: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

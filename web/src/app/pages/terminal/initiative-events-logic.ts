@@ -43,6 +43,7 @@ const MILESTONE_TYPES = new Set<string>([
   'agent_phase_review_started',
   'agent_plan_completed',
   'agent_single_phase_completed',
+  'agent_phase_task_failed',
 ]);
 
 /** Map an event_type → the SDLC stage its row belongs under. */

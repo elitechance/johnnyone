@@ -1,0 +1,6 @@
+id: 08-lcm
+files: [src/lcm.rs]
+verify: "cargo test lcm_works -- --exact"
+must_contain: ["pub fn lcm(a: i32, b: i32) -> i32"]
+depends_on: [07-gcd]
+ctx: 32768

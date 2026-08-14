@@ -114,13 +114,9 @@ fn sidecar(target: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Write `bytes` to `target` atomically (temp sibling + rename).
+/// Call-through to the single crate-wide helper — do not fork a second copy.
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = sidecar(target, ".j1tmp");
-    fs::write(&tmp, bytes).map_err(|e| format!("Failed to write file: {}", e))?;
-    fs::rename(&tmp, target).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to finalize file: {}", e)
-    })
+    crate::services::atomic_fs::write_atomic(target, bytes)
 }
 
 // ── Operations (all rooted at files_root, guarded per-path) ───────────────────────────────────────

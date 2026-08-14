@@ -2103,6 +2103,9 @@ impl AgentService {
                 "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
             );
         }
+        if matches!(provider, CliProvider::Kloo) {
+            return Err("kloo is a oneshot executor, not a chat provider".to_string());
+        }
 
         let config = match provider {
             CliProvider::ClaudeCode => claude_code::build_config(
@@ -2133,6 +2136,7 @@ impl AgentService {
                 ollama_cli::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }
             CliProvider::Shell => unreachable!("shell provider already rejected"),
+            CliProvider::Kloo => unreachable!("kloo provider already rejected"),
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -2142,6 +2146,7 @@ impl AgentService {
             CliProvider::Cline => cline::parse_line,
             CliProvider::Ollama => ollama_cli::parse_line,
             CliProvider::Shell => unreachable!("shell provider already rejected"),
+            CliProvider::Kloo => unreachable!("kloo provider already rejected"),
         };
 
         let (_process, mut rx) =

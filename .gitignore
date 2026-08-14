@@ -9,6 +9,7 @@ out-tsc/
 
 # Tauri
 desktop/src-tauri/target/
+desktop/src-tauri/tests/fixtures/**/target/
 
 # Angular
 .angular/
