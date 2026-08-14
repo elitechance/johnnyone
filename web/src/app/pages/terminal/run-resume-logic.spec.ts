@@ -87,7 +87,8 @@ describe('isPausedRun / bannerModel / runButtonLabel', () => {
   it('treats needs_attention and blocked as paused (status or health)', () => {
     expect(isPausedRun(run({ status: 'needs_attention' }, THREE_PHASES))).toBe(true);
     expect(isPausedRun(run({ status: 'blocked' }, THREE_PHASES))).toBe(true);
-    expect(isPausedRun(run({ status: 'phase_worker_running', health: 'needs-attention' }, THREE_PHASES))).toBe(true);
+    expect(isPausedRun(run({ status: 'phase_worker_running', health: 'needs-attention' }, THREE_PHASES))).toBe(false);
+    expect(isPausedRun(run({ status: 'phase_replan_running', health: 'needs-attention' }, THREE_PHASES))).toBe(false);
     expect(isPausedRun(run({ status: 'approved' }, THREE_PHASES))).toBe(false);
   });
 

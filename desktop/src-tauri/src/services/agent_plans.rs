@@ -757,9 +757,16 @@ pub async fn start_plan(
     if run.plan.status == "approved" && phase_id.is_none() {
         return Ok(run);
     }
+    // Replan is busy regardless of the console's phaseId (it always sends
+    // currentPhaseId). Falling through would start a kloo worker on top of
+    // the live amend planner (T2 r4 / 04-02).
+    if run.plan.status == "phase_replan_running" {
+        spawn_coordinator_loop(state.clone(), id.clone()).await;
+        return get_plan(&state, &id);
+    }
     if matches!(
         run.plan.status.as_str(),
-        "phase_worker_running" | "phase_review_running" | "phase_replan_running"
+        "phase_worker_running" | "phase_review_running"
     ) && phase_id.is_none()
     {
         spawn_coordinator_loop(state.clone(), id.clone()).await;
@@ -802,11 +809,7 @@ pub async fn start_plan(
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
-    let worker_session_id = run
-        .plan
-        .worker_session_id
-        .clone()
-        .ok_or_else(|| "Plan has no worker session".to_string())?;
+    let worker_session_id = ensure_dev_worker_session(&state, &run).await?;
 
     terminal::attach_terminal_headless(&state, worker_session_id.clone(), 120, 36).await?;
     // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
@@ -890,12 +893,12 @@ pub async fn run_initiative_from_phase(
             "human_comment",
             json!({ "text": text, "phaseId": phase_id.clone(), "mode": phase_run_mode.clone() }),
         )?;
-        let session_id = run
-            .plan
-            .worker_session_id
-            .clone()
-            .ok_or_else(|| "Run has no active session".to_string())?;
-        terminal::send_terminal_input(&state, session_id, format!("{}\r", text)).await?;
+        // During replan the pointer is the amend planner — do not inject into it.
+        if run.plan.status != "phase_replan_running" {
+            if let Some(session_id) = run.plan.worker_session_id.clone() {
+                terminal::send_terminal_input(&state, session_id, format!("{}\r", text)).await?;
+            }
+        }
     }
 
     // Clear a paused run before delegating: start_plan early-returns for `blocked`
@@ -1236,13 +1239,14 @@ pub async fn send_feedback_to_worker(state: AppState, id: String) -> Result<Agen
         return get_plan(&state, &id);
     }
     let phase = current_phase(&run)?;
-    let worker_session_id = run
-        .plan
-        .worker_session_id
-        .clone()
-        .ok_or_else(|| "Plan has no worker session".to_string())?;
-    let prompt = feedback_prompt(&phase);
-    terminal::send_terminal_input(&state, worker_session_id, format!("{}\r", prompt)).await?;
+    let phase_path = Path::new(&run.plan.plan_path)
+        .join("phases")
+        .join(&phase.phase_id);
+    if !crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+        let worker_session_id = ensure_dev_worker_session(&state, &run).await?;
+        let prompt = feedback_prompt(&phase);
+        terminal::send_terminal_input(&state, worker_session_id, format!("{}\r", prompt)).await?;
+    }
     state.db.with_conn(|conn| {
         conn.execute(
             "UPDATE agent_plans SET status = 'phase_worker_running', updated_at = datetime('now') WHERE id = ?1",
@@ -2020,6 +2024,10 @@ async fn ensure_dev_worker_session(
         )
         .map_err(|e| e.to_string())
     })?;
+    // Brand-new pane can swallow the first prompt without this wait
+    // (every other send path in this file sleeps after attach).
+    terminal::attach_terminal_headless(state, session.id.clone(), 120, 36).await?;
+    sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
     Ok(session.id)
 }
 
@@ -2122,7 +2130,7 @@ fn replan_runs_dir(state: &AppState, run: &AgentPlanRun, phase_id: &str) -> Path
     )
 }
 
-async fn park_replan_cap(
+async fn park_replan(
     state: &AppState,
     run: &AgentPlanRun,
     phase_id: &str,
@@ -2133,11 +2141,7 @@ async fn park_replan_cap(
     let runs_dir = replan_runs_dir(state, run, phase_id);
     let preflight_path = runs_dir.join("preflight.json");
     let last = crate::services::plan_check::load_plan_check(&preflight_path).ok();
-    let is_cap = reason == "replan cap reached";
-    let violations = last
-        .as_ref()
-        .map(|r| r.items.iter().filter(|i| i.blocking).count())
-        .unwrap_or(0);
+    let is_cap = reason == crate::services::plan_check::REPLAN_PARK_CAP;
     let mut report = if is_cap {
         last.unwrap_or_else(crate::services::plan_check::PlanCheckReport::empty)
     } else {
@@ -2150,6 +2154,31 @@ async fn park_replan_cap(
         });
         r
     };
+    if is_cap && !report.items.iter().any(|i| i.blocking) {
+        let routed = crate::services::task_replan::load_amendment_optional(
+            &crate::services::task_replan::amendment_json_path(&runs_dir),
+        )
+        .ok()
+        .flatten()
+        .map(|a| {
+            a.routed
+                .into_iter()
+                .map(|r| r.task_id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "routed tasks".to_string());
+        report.items.push(crate::services::plan_check::PlanCheckItem {
+            task_id: None,
+            rule: crate::services::plan_check::RULE_REPLAN_AMENDMENT.to_string(),
+            detail: format!(
+                "replan cap reached — {routed} still failing execution (not the plan-check)"
+            ),
+            blocking: true,
+        });
+    }
+    let violations = report.items.iter().filter(|i| i.blocking).count();
     report.passed = false;
     report.check_kind = Some(crate::services::plan_check::CHECK_KIND_REPLAN_PARK.to_string());
     report.exhausted = Some(is_cap);
@@ -2219,12 +2248,12 @@ async fn begin_phase_replan(
     let existing = match crate::services::task_replan::load_amendment_optional(&amend_path) {
         Ok(v) => v,
         Err(_) => {
-            return park_replan_cap(
+            return park_replan(
                 state,
                 run,
                 &phase.phase_id,
-                "replan amendment unreadable",
-                "replan amendment unreadable",
+                crate::services::plan_check::REPLAN_PARK_UNREADABLE,
+                crate::services::plan_check::REPLAN_PARK_UNREADABLE,
                 None,
             )
             .await;
@@ -2233,12 +2262,12 @@ async fn begin_phase_replan(
     let round = match crate::services::task_replan::next_episode_round(existing.as_ref()) {
         Ok(r) => r,
         Err(()) => {
-            return park_replan_cap(
+            return park_replan(
                 state,
                 run,
                 &phase.phase_id,
-                "replan cap reached",
-                "replan cap reached",
+                crate::services::plan_check::REPLAN_PARK_CAP,
+                crate::services::plan_check::REPLAN_PARK_CAP,
                 Some(crate::services::task_replan::MAX_REPLAN_ROUNDS),
             )
             .await;
@@ -2390,12 +2419,12 @@ pub(crate) async fn run_phase_replan_arm(
     let mut amendment = match crate::services::task_replan::load_amendment(&amend_path) {
         Ok(a) => a,
         Err(_) => {
-            return park_replan_cap(
+            return park_replan(
                 state,
                 run,
                 &phase.phase_id,
-                "replan amendment unreadable",
-                "replan amendment unreadable",
+                crate::services::plan_check::REPLAN_PARK_UNREADABLE,
+                crate::services::plan_check::REPLAN_PARK_UNREADABLE,
                 None,
             )
             .await;
@@ -2510,7 +2539,7 @@ pub(crate) async fn run_phase_replan_arm(
                 conn,
                 &run.plan.id,
                 "needs_attention",
-                Some("replan cap reached"),
+                Some(crate::services::plan_check::REPLAN_PARK_CAP),
             )
             .map_err(|e| e.to_string())
         })?;
@@ -5500,11 +5529,7 @@ async fn pass_phase(
             .join(&next.phase_id);
         if !crate::services::task_loop::phase_is_kloo_mode(&next_path) {
             let refreshed = get_plan(state, plan_id)?;
-            let worker_session_id = refreshed
-                .plan
-                .worker_session_id
-                .clone()
-                .ok_or_else(|| "Plan has no worker session".to_string())?;
+            let worker_session_id = ensure_dev_worker_session(state, &refreshed).await?;
             let prompt = worker_phase_prompt(state, &refreshed, &next)?;
             terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
         }
@@ -7384,10 +7409,12 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
         }
         "agent_phase_preflight_failed" => {
             match payload_str(payload, "reason").as_deref() {
-                Some("replan amendment unreadable") => {
+                Some(crate::services::plan_check::REPLAN_PARK_UNREADABLE) => {
                     "Replan parked — amendment record unreadable.".to_string()
                 }
-                Some("replan cap reached") => "Replan cap reached — still failing".to_string(),
+                Some(crate::services::plan_check::REPLAN_PARK_CAP) => {
+                    "Replan cap reached — still failing".to_string()
+                }
                 _ => {
                     let nn = payload_str(payload, "nn")
                         .unwrap_or_else(|| phase_nn(event.phase_id.as_deref()).to_string());
@@ -11146,6 +11173,18 @@ mod replan_tests {
             .unwrap();
         assert_eq!(after.plan.status, "phase_replan_running");
         assert_ne!(after.plan.status, "phase_worker_running");
+        let with_phase = start_plan(
+            state.clone(),
+            run.plan.id.clone(),
+            Some("00-x".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            with_phase.plan.status, "phase_replan_running",
+            "console always sends phaseId; must not start a phase worker"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11517,6 +11556,19 @@ mod replan_tests {
         let spawned = log.lock().unwrap().clone();
         assert_eq!(spawned, vec![1, 2, 3]);
         assert!(!spawned.contains(&4));
+        let pf = crate::services::plan_check::load_plan_check(
+            &replan_runs_dir(&state, &after, "00-x").join("preflight.json"),
+        )
+        .unwrap();
+        assert!(
+            pf.items.iter().any(|i| i.blocking),
+            "cap-on-reroute must persist items, not the previous passing check: {:?}",
+            pf.items
+        );
+        assert_eq!(
+            pf.check_kind.as_deref(),
+            Some(crate::services::plan_check::CHECK_KIND_REPLAN_PARK)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -597,12 +597,6 @@ mod tests {
         file.tasks[0].status = "failed".into();
         file.tasks[0].route = Some("planner".into());
         file.tasks[0].attempts = exhausted_ladder();
-        let before = crate::services::task_check::Attempt {
-            label: "opus".into(),
-            model: "opus".into(),
-            class: Some(crate::services::task_check::FailureClass::Model),
-            infra_retry: false,
-        };
         // Sanity: a kept full ladder is exhausted (the bug).
         let kept: Vec<_> = file.tasks[0]
             .attempts
@@ -615,7 +609,6 @@ mod tests {
             })
             .collect();
         assert_eq!(next_attempt(&kept, None), Step::Exhausted);
-        let _ = before;
         reset_for_resume(&mut file, &[]);
         assert!(file.tasks[0].attempts.is_empty());
         match next_attempt(&[], None) {

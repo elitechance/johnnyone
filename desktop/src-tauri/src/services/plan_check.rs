@@ -47,6 +47,10 @@ pub const RULE_EMPTY_PLAN: &str = "empty_plan";
 /// Park because the amendment record was unreadable. Not emitted by `check_plan`;
 /// S11 labels it from the overview table ("replan amendment unreadable").
 pub const RULE_REPLAN_AMENDMENT: &str = "replan_amendment";
+/// `park_replan` / event_summary reason tokens. A typo in a raw string
+/// would silently change both preflight.json and the S9 copy.
+pub const REPLAN_PARK_CAP: &str = "replan cap reached";
+pub const REPLAN_PARK_UNREADABLE: &str = "replan amendment unreadable";
 
 pub const MAX_TASKS_PER_PHASE: usize = 150;
 pub const MAX_TASKS_TOTAL: usize = 800;
