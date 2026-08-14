@@ -11453,6 +11453,14 @@ mod replan_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn commercial_partial_still_needs_attention() {
+        assert!(matches!(
+            crate::services::task_loop::followup_after_kloo_phase_for(&partial_planner(), false),
+            crate::services::task_loop::KlooPhaseFollowup::NeedsAttention { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn commercial_partial_still_parks() {
         let (state, root, _store, _ws, run) = harness();

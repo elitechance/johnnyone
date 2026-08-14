@@ -32,7 +32,14 @@ describe('windowRows + default selection', () => {
     const w = windowRows(table, 't060');
     expect(performance.now() - t0).toBeLessThan(50);
     expect(w.rows.length).toBeLessThanOrEqual(51);
+    expect(w.rows.length + (w.placeholders.length ? 1 : 0)).toBeLessThanOrEqual(52);
     expect(w.rows.some((r) => r.id === 't060')).toBe(true);
+  });
+
+  it('selection 0 and 119 stay in the 120-row window', () => {
+    const table = taskTable({ tasks: rows(120) });
+    expect(windowRows(table, 't000').rows.some((r) => r.id === 't000')).toBe(true);
+    expect(windowRows(table, 't119').rows.some((r) => r.id === 't119')).toBe(true);
   });
 
   it('failed at 60 + 3 blocked is the default window', () => {

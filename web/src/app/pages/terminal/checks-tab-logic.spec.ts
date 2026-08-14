@@ -188,6 +188,28 @@ describe('windowCheckRows + ruleCounts', () => {
     expect(w.rows.some((r) => r.taskId === 't150')).toBe(true);
   });
 
+  it('120-task / 300-item report stays windowed with phase stats', () => {
+    const t0 = performance.now();
+    const v = checksView({
+      passed: false,
+      tasks_checked: 120,
+      items: many,
+      phases: [
+        { phaseId: '00-a', verifyExecuted: 4, verifySkipped: 0 },
+        { phaseId: '01-b', verifyExecuted: 0, verifySkipped: 8 },
+      ],
+    });
+    expect(performance.now() - t0).toBeLessThan(50);
+    expect(v.rows.length).toBeLessThanOrEqual(52);
+    expect(v.moreCount).toBeGreaterThan(0);
+    expect(v.ruleCounts.reduce((s, c) => s + c.count, 0)).toBe(300);
+    expect(v.phaseStats).toEqual([
+      { phaseId: '00-a', executed: 4, skipped: 0 },
+      { phaseId: '01-b', executed: 0, skipped: 8 },
+    ]);
+    expect(v.stats.tasks).toBe(120);
+  });
+
   it('ruleCounts sum to 300 and chip click filters', () => {
     const v = checksView({ passed: false, items: many });
     expect(v.ruleCounts.length).toBeGreaterThanOrEqual(3);

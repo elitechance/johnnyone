@@ -74,6 +74,13 @@ case "$first_allow" in
   *) task_id=$(basename "${first_allow:-unknown}" .rs) ;;
 esac
 
+if [ -n "${J1_FAKE_KLOO_ID_MAP:-}" ] && [ -f "$J1_FAKE_KLOO_ID_MAP" ]; then
+  mapped=$(awk -F= -v p="$first_allow" '$1==p { print $2; exit }' "$J1_FAKE_KLOO_ID_MAP")
+  if [ -n "$mapped" ]; then
+    task_id="$mapped"
+  fi
+fi
+
 if [ -n "$MODEL_LOG" ]; then
   printf '%s\t%s\n' "$task_id" "$model" >> "$MODEL_LOG"
 fi

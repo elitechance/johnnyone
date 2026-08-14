@@ -161,8 +161,6 @@ export function windowTimeline(rows: TimelineEvent[] | null | undefined): Timeli
   const all = rows ?? [];
   const milestones = all.filter((r) => r.milestone);
   const rest = all.filter((r) => !r.milestone);
-  const keep = new Set(
-    [...milestones.slice(-80), ...rest.slice(-80)].map((r) => r.id),
-  );
+  const keep = new Set([...milestones.slice(-80), ...rest.slice(-80)].map((r) => r.id));
   return all.filter((r) => keep.has(r.id));
 }

@@ -434,9 +434,21 @@ NEXT_STEPS:
 /// does not burn a round rediscovering the checker's grammar.
 macro_rules! small_mode_task_constraints {
     () => {
-        r#"Each task dir must contain task.yml + prompt.md. task.yml fields (only these):
+        r#"Each task dir must contain task.yml + prompt.md. Write them at exactly phases/<phase-id>/tasks/<task-id>/ — the tasks/ segment is required. Plan-check only walks that path; a task.yml at phases/<phase-id>/<task-id>/ is empty_plan.
+
+task.yml fields (only these):
 id, files, new, verify, must_contain, depends_on, ctx, cwd
 Do not invent other fields.
+
+Field types (serde will reject anything else):
+- id: string matching the task directory name
+- files: YAML list of workspace-relative paths
+- new: optional YAML list of new file paths (subset of files). Omit if none. Never a boolean.
+- verify: a SINGLE quoted string, e.g. verify: "cargo test add_works -- --exact". Not a YAML list.
+- must_contain: YAML list of strings
+- depends_on: YAML list of task ids
+- ctx: integer token budget such as 32768. Never prose.
+- cwd: optional relative directory
 
 cwd is the directory to run verify in (e.g. desktop/src-tauri). When cwd is set, every files[] and new: path is still workspace-relative and must live under that cwd (files_outside_cwd otherwise).
 
@@ -444,6 +456,10 @@ verify must be an allowlisted AND scoped argv command: cargo test with a filter 
 
 No two tasks in a phase may claim the same file (file_collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward."#
     };
+}
+
+pub fn small_mode_planner_template() -> &'static str {
+    DEFAULT_SMALL_MODE_PLANNER
 }
 
 pub(crate) const DEFAULT_SMALL_MODE_PLANNER: &str = concat!(
@@ -569,6 +585,9 @@ planning:
         assert!(p.contains("never point forward"));
         assert!(p.contains("MAX_TASKS_PER_PHASE"));
         assert!(p.contains("MAX_TASKS_TOTAL"));
+        assert!(p.contains("phases/<phase-id>/tasks/<task-id>/"));
+        assert!(p.contains("SINGLE quoted string"));
+        assert!(p.contains("integer token budget"));
         let a = DEFAULT_SMALL_MODE_AMEND_PLANNER;
         assert!(a.contains("file_collision"));
         assert!(a.contains("must_contain"));

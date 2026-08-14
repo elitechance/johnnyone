@@ -246,6 +246,36 @@ describe('windowTimeline', () => {
     expect(rows.length).toBeLessThanOrEqual(160);
     expect(rows.some((r) => r.id === 'f119')).toBe(true);
   });
+
+  it('windowTimeline field access is O(n) with K=4', () => {
+    const events = Array.from({ length: 500 }, (_, i) =>
+      ev({ id: `e${i}`, eventType: i === 499 ? 'agent_phase_task_failed' : 'agent_phase_task_done' }),
+    );
+    const plain = initiativeTimeline(events);
+    let calls = 0;
+    const instrumented = plain.map((row) => {
+      const obj = { ...row };
+      Object.defineProperty(obj, 'milestone', {
+        enumerable: true,
+        get() {
+          calls += 1;
+          return row.milestone;
+        },
+      });
+      Object.defineProperty(obj, 'id', {
+        enumerable: true,
+        get() {
+          calls += 1;
+          return row.id;
+        },
+      });
+      return obj;
+    });
+    windowTimeline(instrumented);
+    // Input getters fire once per pass that reads milestone/id. A quadratic
+    // last-pass (`keep.find(k => k.id === r.id)`) would exceed 500*K.
+    expect(calls).toBeLessThanOrEqual(500 * 4);
+  });
 });
 
 describe('wiring — events rail', () => {
