@@ -6745,7 +6745,7 @@ pub fn list_initiative_events(
             .prepare(
                 "SELECT e.id, e.plan_id, e.phase_id, e.type, e.payload_json, e.created_at \
                  FROM agent_plan_events e JOIN agent_plans p ON e.plan_id = p.id \
-                 WHERE p.initiative_id = ?1 ORDER BY e.created_at ASC, e.rowid ASC LIMIT ?2",
+                 WHERE p.initiative_id = ?1 ORDER BY e.created_at DESC, e.rowid DESC LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
         let mut rows: Vec<AgentPlanEvent> = stmt
@@ -6777,6 +6777,7 @@ pub fn list_initiative_events(
         for event in &mut rows {
             enrich_agent_plan_event(event, &phase_meta);
         }
+        rows.reverse();
         Ok(rows)
     })
 }
@@ -8490,6 +8491,34 @@ mod store_tests {
     fn appstate_harness_constructs() {
         let (state, root) = test_state();
         assert!(state.db.with_conn(|_c| Ok(())).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_initiative_events_keeps_newest_of_600() {
+        let (state, root) = test_state();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+                     VALUES ('P', 'development', 't', '/w', '/p', 'claude_code', 'claude_code', 'P', 'development')",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                for i in 0..600 {
+                    conn.execute(
+                        "INSERT INTO agent_plan_events (id, plan_id, type, payload_json) VALUES (?1, 'P', ?2, '{}')",
+                        params![format!("e{i}"), format!("ev-{i}")],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let evs = list_initiative_events(&state, "P", 2000).unwrap();
+        assert_eq!(evs.len(), 600);
+        assert_eq!(evs.last().unwrap().event_type, "ev-599");
         let _ = std::fs::remove_dir_all(&root);
     }
 

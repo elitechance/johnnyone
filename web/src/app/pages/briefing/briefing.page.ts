@@ -19,6 +19,11 @@ import {
   IonSelectOption,
   IonToggle,
   IonModal,
+  IonCard,
+  IonCardHeader,
+  IonCardTitle,
+  IonCardContent,
+  IonSpinner,
 } from '@ionic/angular/standalone';
 import { JohnnyApiService, DetectedCliTool, DirListing } from '@johnnyone/ui';
 import { firstValueFrom } from 'rxjs';
@@ -30,6 +35,19 @@ import {
   toConfigJson,
   providerOptions,
 } from '../validation-config/validation-config-logic';
+import {
+  agentChoices,
+  createPayload,
+  parseDoctorJson,
+  parseProbeJson,
+  preflightView,
+  COMMIT_COPY,
+  ESCALATION_COPY,
+  FALLBACK_EXECUTOR,
+  type DoctorSnapshot,
+  type PreflightState,
+  type PreflightView,
+} from './briefing-logic';
 
 /**
  * New-initiative create form (overhaul P4, briefing step removed). Creating provisions the initiative
@@ -59,6 +77,11 @@ import {
     IonSelectOption,
     IonToggle,
     IonModal,
+    IonCard,
+    IonCardHeader,
+    IonCardTitle,
+    IonCardContent,
+    IonSpinner,
   ],
   templateUrl: './briefing.page.html',
   styleUrls: ['./briefing.page.scss'],
@@ -81,9 +104,26 @@ export class BriefingPage implements OnInit {
       .filter((t) => t.found)
       .map((t) => t.provider)
       .filter((p) => p !== 'shell');
-    // Union the detected providers with the known reviewer-capable set, de-duped, detected first.
     const known = providerOptions();
     return [...new Set([...found, ...known])];
+  });
+  protected readonly agentChoiceList = computed(() =>
+    agentChoices(this.detectedTools(), providerOptions()),
+  );
+  protected readonly klooSelected = computed(() => this.createProvider === 'kloo');
+  protected readonly doctor = signal<DoctorSnapshot | null>(null);
+  protected readonly preflightState = signal<PreflightState>('idle');
+  protected readonly preflight = computed<PreflightView>(() => preflightView(this.preflightState()));
+  protected readonly escalationCopy = ESCALATION_COPY;
+  protected readonly commitCopy = COMMIT_COPY;
+  protected readonly executorRows = computed(() => {
+    const d = this.doctor();
+    return {
+      endpoint: d?.endpoint || 'openrouter',
+      keySet: d?.api_key && typeof d.api_key === 'object' ? !!d.api_key.set : true,
+      model: d?.model || FALLBACK_EXECUTOR.model,
+      ctx: typeof d?.ctx === 'number' ? d.ctx : FALLBACK_EXECUTOR.ctx,
+    };
   });
 
   // Per-initiative validation lenses, editable AT creation (seeded from the default triad). Saved to
@@ -178,6 +218,50 @@ export class BriefingPage implements OnInit {
     this.dirBrowserOpen.set(false);
   }
 
+  protected async onAgentChange(value: string): Promise<void> {
+    this.createProvider = value;
+    if (value === 'kloo') {
+      await this.refreshDoctor();
+    }
+  }
+
+  private async refreshDoctor(): Promise<void> {
+    try {
+      const raw = await firstValueFrom(this.api.getKlooDoctor());
+      this.doctor.set(parseDoctorJson(raw));
+    } catch {
+      this.doctor.set(null);
+    }
+  }
+
+  protected async runPreflight(): Promise<void> {
+    this.preflightState.set('running');
+    try {
+      const doctorRaw = await firstValueFrom(this.api.getKlooDoctor());
+      const doctor = parseDoctorJson(doctorRaw);
+      this.doctor.set(doctor);
+      let probe = null;
+      try {
+        const probeRaw = await firstValueFrom(this.api.getKlooProbe());
+        probe = parseProbeJson(probeRaw);
+      } catch (err) {
+        this.preflightState.set({
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      if (!doctor) {
+        this.preflightState.set({ error: 'kloo not found' });
+        return;
+      }
+      this.preflightState.set({ doctor, probe });
+    } catch (err) {
+      this.preflightState.set({
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // ── Create → planning ─────────────────────────────────────────────────────────────────────────
   protected createBriefing(): void {
     const workspacePath = this.createWorkspacePath.trim();
@@ -188,13 +272,21 @@ export class BriefingPage implements OnInit {
     }
     this.creating.set(true);
     this.createError.set(null);
+    const commercial = this.providerChoices().find((p) => p !== 'kloo') || 'claude_code';
+    const payload = createPayload(
+      this.createProvider,
+      commercial,
+      { title: this.createTitle.trim() || undefined, workspacePath, brief },
+      this.doctor(),
+    );
     this.api
       .createBriefingInitiative({
-        title: this.createTitle.trim() || undefined,
-        workspacePath,
-        brief,
-        workerProvider: this.createProvider,
-        reviewerProvider: this.createProvider,
+        title: payload.title,
+        workspacePath: payload.workspacePath,
+        brief: payload.brief,
+        workerProvider: payload.workerProvider,
+        reviewerProvider: payload.reviewerProvider,
+        executorConfig: payload.executorConfig,
       })
       .subscribe({
         next: async (run) => {

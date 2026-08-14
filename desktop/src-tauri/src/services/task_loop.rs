@@ -20,7 +20,8 @@ use crate::services::task_check::{
 use crate::services::task_spec::{self, load_task_spec, TaskSpec};
 use crate::services::verify_policy::{plan_task_verify, PlannedVerify, VerifyPolicyError};
 use crate::services::task_state::{
-    attempt_json_path, block_dependents, load_tasks, project_status_yml, reconcile,
+    attempt_json_path, block_dependents, load_tasks, project_phase_status_md, project_status_yml,
+    reconcile,
     save_tasks, seed_from_specs, tasks_json_path, AttemptRecord, TaskRow, TaskRunFile,
 };
 use crate::services::workspace_git;
@@ -883,6 +884,7 @@ fn save_and_project(ctx: &KlooPhaseCtx, file: &mut TaskRunFile) -> Result<(), St
             project_status_yml(&dir, row)?;
         }
     }
+    let _ = project_phase_status_md(&ctx.phase_dir, file);
     Ok(())
 }
 

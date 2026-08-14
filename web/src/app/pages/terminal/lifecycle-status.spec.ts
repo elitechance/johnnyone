@@ -3,12 +3,20 @@ import { describe, it, expect } from 'vitest';
 // Deep path into the ui library — the pure module is barrel-exported from `@johnnyone/ui`, but the
 // web vitest config has no tsconfig-paths plugin (mirrors diff-parse.spec.ts). The pure module
 // carries no Angular import, so it loads cleanly in jsdom.
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   statusMeta,
   healthMeta,
   stageIndex,
+  stageFill,
+  stageDescription,
   LIFECYCLE_STAGES,
 } from '../../../../../ui/src/lib/lifecycle-status';
+import { isBusyStatus, PAUSED_STATUSES } from './run-resume-logic';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 describe('statusMeta', () => {
   it('maps every lifecycle stage to its token/label/class', () => {
@@ -108,5 +116,45 @@ describe('stageIndex / LIFECYCLE_STAGES', () => {
     expect(stageIndex('nope')).toBe(-1);
     expect(stageIndex('')).toBe(-1);
     expect(stageIndex(null)).toBe(-1);
+  });
+});
+
+describe('stageFill / stageDescription', () => {
+  it('round 2/6 fills ~33%', () => {
+    expect(stageFill({ active: 0, idx: 0, planningRound: 2, planningRoundMax: 6 })).toBe('33%');
+  });
+  it('commercial no extras is 60%', () => {
+    expect(stageFill({ active: 0, idx: 0 })).toBe('60%');
+  });
+  it('replan description', () => {
+    expect(stageDescription({ stage: 'development', replan: true, phaseNn: '00' })).toContain(
+      're-planning',
+    );
+    expect(
+      stageDescription({ stage: 'development', replanExhausted: true, phaseNn: '00' }),
+    ).toContain('replan cap reached');
+    expect(
+      stageDescription({ stage: 'development', replanParked: true, phaseNn: '00' }),
+    ).toContain('replan parked');
+  });
+  it('isBusyStatus true for phase_replan_running and not paused', () => {
+    expect(isBusyStatus('phase_replan_running')).toBe(true);
+    expect(PAUSED_STATUSES.has('phase-replan-running')).toBe(false);
+    expect(PAUSED_STATUSES.has('phase_replan_running')).toBe(false);
+  });
+});
+
+describe('wiring — lifecycle bar + modeChip', () => {
+  it('lifecycle-bar uses stageFill/stageDescription', () => {
+    const bar = readFileSync(
+      resolve(here, '../../../../../ui/src/components/lifecycle-bar/lifecycle-bar.component.ts'),
+      'utf8',
+    );
+    expect(bar).toContain('stageFill');
+    expect(bar).toContain('stageDescription');
+  });
+  it('terminal list mentions modeChip', () => {
+    const html = readFileSync(resolve(here, 'terminal.page.html'), 'utf8');
+    expect(html).toContain('modeChip');
   });
 });

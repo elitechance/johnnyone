@@ -5,6 +5,8 @@ import {
   LIFECYCLE_STAGES,
   statusMeta,
   stageIndex,
+  stageFill,
+  stageDescription,
 } from '../../lib/lifecycle-status';
 
 /** One lifecycle-bar cell, precomputed for the template. */
@@ -19,16 +21,6 @@ interface StageCell {
   /** Progress-bar fill width: complete stages `100%`, the active stage a partial, later stages `0%`. */
   fill: string;
 }
-
-/** Static per-stage copy mirroring mock §01 (`.stage .d`). */
-const STAGE_COPY: Record<string, string> = {
-  planning: 'Turn the brief into a task tree.',
-  development: 'T1 workers build against the plan.',
-  review: 'Configurable validation lenses run in parallel.',
-  // "Done" = work complete (all phases validated). J1 does not auto-merge/deploy,
-  // so the copy reflects completion, not promotion.
-  done: 'Work complete.',
-};
 
 /**
  * Presentational initiative lifecycle bar (Overhaul P8 / phase 02, mock §01 lines
@@ -48,19 +40,45 @@ const STAGE_COPY: Record<string, string> = {
 export class LifecycleBarComponent {
   @Input() status = '';
   @Input() health = '';
+  @Input() planningRound: number | null = null;
+  @Input() planningRoundMax: number | null = 6;
+  @Input() devDone: number | null = null;
+  @Input() devTotal: number | null = null;
+  @Input() replan = false;
+  @Input() replanExhausted = false;
+  @Input() replanParked = false;
+  @Input() phaseNn = '';
 
   get stages(): StageCell[] {
     const active = stageIndex(this.status);
     return LIFECYCLE_STAGES.map((stage, idx) => {
       const meta = statusMeta(stage);
-      const fill = active < 0 || idx > active ? '0%' : idx < active ? '100%' : '60%';
+      const fill = stageFill({
+        active,
+        idx,
+        planningRound: this.planningRound,
+        planningRoundMax: this.planningRoundMax,
+        devDone: this.devDone,
+        devTotal: this.devTotal,
+        replan: this.replan,
+      });
       return {
         key: stage,
         num: String(idx).padStart(2, '0'),
         label: meta.label,
         className: meta.className,
         sc: `var(${meta.cssVar})`,
-        description: STAGE_COPY[stage] ?? '',
+        description: stageDescription({
+          stage,
+          planningRound: this.planningRound,
+          planningRoundMax: this.planningRoundMax,
+          devDone: this.devDone,
+          devTotal: this.devTotal,
+          replan: this.replan,
+          replanExhausted: this.replanExhausted,
+          replanParked: this.replanParked,
+          phaseNn: this.phaseNn || undefined,
+        }),
         on: idx === active,
         fill,
       };

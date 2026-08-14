@@ -68,3 +68,61 @@ export function healthMeta(health: string | null | undefined): StatusMeta {
 export function stageIndex(status: string | null | undefined): number {
   return (LIFECYCLE_STAGES as readonly string[]).indexOf(key(status));
 }
+
+export interface StageFillArgs {
+  active: number;
+  idx: number;
+  planningRound?: number | null;
+  planningRoundMax?: number | null;
+  devDone?: number | null;
+  devTotal?: number | null;
+  replan?: boolean;
+}
+
+export function stageFill(args: StageFillArgs): string {
+  const { active, idx } = args;
+  if (active < 0 || idx > active) return '0%';
+  if (idx < active) return '100%';
+  if (idx === 0 && args.planningRound && args.planningRoundMax) {
+    return `${Math.round((args.planningRound / args.planningRoundMax) * 100)}%`;
+  }
+  if (idx === 1 && args.devTotal && args.devTotal > 0) {
+    return `${Math.round(((args.devDone ?? 0) / args.devTotal) * 100)}%`;
+  }
+  return '60%';
+}
+
+export interface StageDescriptionArgs {
+  stage: string;
+  planningRound?: number | null;
+  planningRoundMax?: number | null;
+  devDone?: number | null;
+  devTotal?: number | null;
+  replan?: boolean;
+  replanExhausted?: boolean;
+  replanParked?: boolean;
+  phaseNn?: string;
+}
+
+const STAGE_COPY: Record<string, string> = {
+  planning: 'Turn the brief into a task tree.',
+  development: 'T1 workers build against the plan.',
+  review: 'Configurable validation lenses run in parallel.',
+  done: 'Work complete.',
+};
+
+export function stageDescription(args: StageDescriptionArgs): string {
+  const nn = args.phaseNn ?? 'NN';
+  if (args.stage === 'planning' && args.planningRound && args.planningRoundMax) {
+    return `Review round ${args.planningRound} of ${args.planningRoundMax}`;
+  }
+  if (args.stage === 'development') {
+    if (args.replan) return `Phase ${nn} · re-planning`;
+    if (args.replanExhausted) return `Phase ${nn} · replan cap reached`;
+    if (args.replanParked) return `Phase ${nn} · replan parked`;
+    if (args.devTotal != null && args.devTotal > 0) {
+      return `Phase · ${args.devDone ?? 0} of ${args.devTotal} tasks done`;
+    }
+  }
+  return STAGE_COPY[args.stage] ?? '';
+}

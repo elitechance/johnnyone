@@ -35,6 +35,7 @@ export interface InitiativeRow {
   /** Relative "updated … ago" string (deterministic — `nowIso` injected). */
   ago: string;
   selected: boolean;
+  executorConfig?: string | null;
 }
 
 /** Lifecycle progression rank; unknown/blank sorts LEAST advanced (-1). */
@@ -89,6 +90,7 @@ export function initiativeRows(
       showHealth: !!health && health !== 'in-progress',
       ago: formatRelTime(rep.updatedAt, nowIso),
       selected: key === selectedId || group.some((p) => p.id === selectedId),
+      executorConfig: rep.executorConfig,
     };
   });
 }
@@ -117,6 +119,17 @@ export function lensSummary(validationConfig: string | null | undefined): LensCh
 
 /** Re-export so a caller can assert the reused default triad without importing the P7 module directly. */
 export { defaultLenses };
+
+/** S10: purple kloo chip only for local-small. */
+export function modeChip(executorConfig: string | null | undefined): 'kloo' | null {
+  if (!executorConfig) return null;
+  try {
+    const parsed = JSON.parse(executorConfig) as { mode?: string };
+    return parsed?.mode === 'local-small' ? 'kloo' : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Whether the selected initiative's validation lenses come from its OWN saved config (`'custom'`) or

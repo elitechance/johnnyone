@@ -44,6 +44,8 @@ const MILESTONE_TYPES = new Set<string>([
   'agent_plan_completed',
   'agent_single_phase_completed',
   'agent_phase_task_failed',
+  'planning_check_failed',
+  'agent_phase_preflight_failed',
 ]);
 
 /** Map an event_type → the SDLC stage its row belongs under. */
@@ -152,4 +154,19 @@ export function initiativeTimeline(events: AgentPlanEvent[] | null | undefined):
       milestone: MILESTONE_TYPES.has(ev.eventType) || isGatePass(ev),
     };
   });
+}
+
+/** Latest 80 milestones + latest 80 non-milestones, hard cap 160, original order. */
+export function windowTimeline(
+  rows: TimelineEvent[] | null | undefined,
+  _opts?: unknown,
+): TimelineEvent[] {
+  const all = rows ?? [];
+  const milestones = all.filter((r) => r.milestone);
+  const rest = all.filter((r) => !r.milestone);
+  const keep = new Set(
+    [...milestones.slice(-80), ...rest.slice(-80)].map((r) => r.id),
+  );
+  const filtered = all.filter((r) => keep.has(r.id));
+  return filtered.length > 160 ? filtered.slice(-160) : filtered;
 }

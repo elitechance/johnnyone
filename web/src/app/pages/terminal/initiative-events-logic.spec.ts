@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import type { AgentPlanEvent } from '../../../../../ui/src/services/johnny-api.service';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   initiativeTimeline,
   normalizeEventIso,
@@ -7,7 +10,10 @@ import {
   phaseLabelOf,
   stageOf,
   actorLabel,
+  windowTimeline,
 } from './initiative-events-logic';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 /** Minimal AgentPlanEvent factory — only the fields the timeline reads. */
 function ev(over: Partial<AgentPlanEvent>): AgentPlanEvent {
@@ -85,6 +91,13 @@ describe('stageOf', () => {
   it('maps human_comment to development (or planning per category), never "other"', () => {
     expect(stageOf('human_comment', 'phase')).toBe('development');
     expect(stageOf('human_comment', 'planning')).toBe('planning');
+  });
+
+  it('prefix-buckets check/replan events, never other', () => {
+    expect(stageOf('planning_check_failed', 'run')).toBe('planning');
+    expect(stageOf('planning_check_phase', 'run')).toBe('planning');
+    expect(stageOf('agent_phase_replan_started', 'run')).toBe('development');
+    expect(stageOf('agent_phase_preflight_failed', 'phase')).toBe('development');
   });
 
   it('maps agent_phase_task_* to development even when category is run', () => {
@@ -189,5 +202,56 @@ describe('initiativeTimeline', () => {
   it('is total for null/empty', () => {
     expect(initiativeTimeline(null)).toEqual([]);
     expect(initiativeTimeline([])).toEqual([]);
+  });
+
+  it('prefers summary over raw type for preflight_failed', () => {
+    const [row] = initiativeTimeline([
+      ev({
+        eventType: 'agent_phase_preflight_failed',
+        summary: 'Phase 04 preflight failed — 4 violations.',
+      }),
+    ]);
+    expect(row.title).toBe('Phase 04 preflight failed — 4 violations.');
+    expect(row.title).not.toBe('agent_phase_preflight_failed');
+  });
+});
+
+describe('windowTimeline', () => {
+  it('500 task-done + 1 failed stays ≤160 and keeps the failed id', () => {
+    const events = [
+      ...Array.from({ length: 500 }, (_, i) =>
+        ev({ id: `d${i}`, eventType: 'agent_phase_task_done', summary: `done ${i}` }),
+      ),
+      ev({ id: 'fail-new', eventType: 'agent_phase_task_failed', summary: 'boom' }),
+    ];
+    const t0 = performance.now();
+    const rows = windowTimeline(initiativeTimeline(events));
+    expect(performance.now() - t0).toBeLessThan(100);
+    expect(rows.length).toBeLessThanOrEqual(160);
+    expect(rows.some((r) => r.id === 'fail-new')).toBe(true);
+  });
+
+  it('milestone-heavy 120 failures caps at 160 and keeps the latest failed', () => {
+    const events = [
+      ...Array.from({ length: 120 }, (_, i) =>
+        ev({ id: `f${i}`, eventType: 'agent_phase_task_failed', summary: `fail ${i}` }),
+      ),
+      ev({ id: 'c1', eventType: 'planning_check_failed', category: 'planning' }),
+      ev({ id: 'p1', eventType: 'agent_phase_preflight_failed' }),
+      ...Array.from({ length: 378 }, (_, i) =>
+        ev({ id: `o${i}`, eventType: 'agent_phase_task_done' }),
+      ),
+    ];
+    const rows = windowTimeline(initiativeTimeline(events));
+    expect(rows.length).toBeLessThanOrEqual(160);
+    expect(rows.some((r) => r.id === 'f119')).toBe(true);
+  });
+});
+
+describe('wiring — events rail', () => {
+  it('page uses windowTimeline', () => {
+    const html = readFileSync(resolve(here, 'terminal.page.html'), 'utf8');
+    const ts = readFileSync(resolve(here, 'terminal.page.ts'), 'utf8');
+    expect(html + ts).toMatch(/windowTimeline/);
   });
 });

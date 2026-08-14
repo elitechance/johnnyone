@@ -42,13 +42,71 @@
             label="Agent"
             labelPlacement="stacked"
             interface="popover"
-            [(ngModel)]="createProvider">
-            @for (p of providerChoices(); track p) {
-              <ion-select-option [value]="p">{{ p }}</ion-select-option>
+            [ngModel]="createProvider"
+            (ngModelChange)="onAgentChange($event)">
+            @for (c of agentChoiceList(); track c.value) {
+              <ion-select-option [value]="c.value">{{ c.label }}</ion-select-option>
             }
           </ion-select>
         </ion-item>
       </ion-list>
+
+      @if (klooSelected()) {
+        <ion-card class="executor-card">
+          <ion-card-header>
+            <ion-card-title>Executor (kloo)</ion-card-title>
+          </ion-card-header>
+          <ion-card-content>
+            <ion-list>
+              <ion-item>
+                <ion-label>Endpoint</ion-label>
+                <ion-note slot="end">{{ executorRows().endpoint }}</ion-note>
+              </ion-item>
+              <ion-item>
+                <ion-label>Key</ion-label>
+                <ion-note slot="end">{{ executorRows().keySet ? 'set' : 'not set' }}</ion-note>
+              </ion-item>
+              <ion-item>
+                <ion-label>Model</ion-label>
+                <ion-note slot="end">{{ executorRows().model }}</ion-note>
+              </ion-item>
+              <ion-item>
+                <ion-label>ctx</ion-label>
+                <ion-note slot="end">{{ executorRows().ctx }}</ion-note>
+              </ion-item>
+              <ion-item>
+                <ion-label>Escalation</ion-label>
+                <ion-note slot="end">{{ escalationCopy }}</ion-note>
+              </ion-item>
+              <ion-item>
+                <ion-label>Commit</ion-label>
+                <ion-note slot="end">{{ commitCopy }}</ion-note>
+              </ion-item>
+            </ion-list>
+            <ion-button
+              size="small"
+              fill="outline"
+              [disabled]="preflight().buttonDisabled"
+              (click)="runPreflight()">
+              Run preflight
+            </ion-button>
+            @if (preflight().phase === 'running') {
+              <div class="preflight-running">
+                <ion-spinner name="dots"></ion-spinner>
+                {{ preflight().cardCopy }}
+              </div>
+            }
+            @if (preflight().lines.length) {
+              <pre class="preflight-json">{{ preflight().lines.join('\n') }}</pre>
+            }
+            @for (a of preflight().alerts; track a.text) {
+              <ion-note [color]="a.kind === 'ok' ? 'success' : a.kind === 'danger' ? 'danger' : a.kind === 'warn' ? 'warning' : 'medium'">
+                {{ a.text }}
+              </ion-note>
+            }
+          </ion-card-content>
+        </ion-card>
+      }
 
       <!-- Per-initiative validation lenses, set AT creation (was global-only via the Configure page). -->
       <div class="lens-config">

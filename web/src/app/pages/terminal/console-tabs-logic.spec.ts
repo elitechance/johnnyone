@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import type { AgentPlan } from '../../../../../ui/src/services/johnny-api.service';
 import { DEFAULT_PANE_TAB, type PaneTab } from './terminal-transcript-tab';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   resolvePrimarySessionId,
   initiativeTabOf,
   rawAttachNeeded,
+  visibleConsoleTabs,
 } from './console-tabs-logic';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 // Pure spec (no Angular/Ionic/DOM) — runs under the plugin-less web/vitest.config.ts. Pins the
 // per-initiative tab shell's primary-session resolution, tab default/lookup, and Raw-attach predicate
@@ -73,5 +79,51 @@ describe('rawAttachNeeded', () => {
 
   it('is false when both a primary session and an attached screen exist', () => {
     expect(rawAttachNeeded('s1', true)).toBe(false);
+  });
+});
+
+describe('visibleConsoleTabs', () => {
+  it('commercial planning is raw|plan|diff', () => {
+    expect(
+      visibleConsoleTabs(plan({ initiativeStatus: 'planning' }), false, false, false),
+    ).toEqual(['raw', 'plan', 'diff']);
+  });
+  it('local-small planning adds checks', () => {
+    expect(
+      visibleConsoleTabs(
+        plan({ initiativeStatus: 'planning', executorConfig: '{"mode":"local-small"}' }),
+        false,
+        false,
+        false,
+      ),
+    ).toEqual(['raw', 'plan', 'diff', 'checks']);
+  });
+  it('local-small development + preflight no task-run is checks only extra', () => {
+    expect(
+      visibleConsoleTabs(
+        plan({ initiativeStatus: 'development', executorConfig: '{"mode":"local-small"}' }),
+        false,
+        false,
+        true,
+      ),
+    ).toEqual(['raw', 'plan', 'diff', 'checks']);
+  });
+  it('local-small development with task-run adds tasks and optional checks', () => {
+    expect(
+      visibleConsoleTabs(
+        plan({ initiativeStatus: 'development', executorConfig: '{"mode":"local-small"}' }),
+        true,
+        false,
+        true,
+      ),
+    ).toEqual(['raw', 'plan', 'diff', 'checks', 'tasks']);
+  });
+});
+
+describe('wiring — visibleConsoleTabs', () => {
+  it('terminal page mentions visibleConsoleTabs', () => {
+    const html = readFileSync(resolve(here, 'terminal.page.html'), 'utf8');
+    const ts = readFileSync(resolve(here, 'terminal.page.ts'), 'utf8');
+    expect(html + ts).toMatch(/visibleConsoleTabs/);
   });
 });

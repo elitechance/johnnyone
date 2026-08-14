@@ -36,6 +36,10 @@ import {
   IonRadioGroup,
   IonRadio,
   IonTextarea,
+  IonCard,
+  IonCardHeader,
+  IonCardTitle,
+  IonCardContent,
   AlertController,
   ToastController,
 } from '@ionic/angular/standalone';
@@ -96,13 +100,29 @@ import {
   LensChip,
   ConsoleSegment,
   LensSource,
+  modeChip,
 } from './console-logic';
-import { initiativeTimeline, TimelineEvent } from './initiative-events-logic';
+import { initiativeTimeline, windowTimeline, TimelineEvent } from './initiative-events-logic';
 import {
   resolvePrimarySessionId,
   initiativeTabOf,
   rawAttachNeeded,
+  visibleConsoleTabs,
 } from './console-tabs-logic';
+import { checksView, type ChecksView, type PlanCheckReportLike } from './checks-tab-logic';
+import {
+  taskTable,
+  taskCounts,
+  windowRows,
+  tasksEmptyCopy,
+  replanBanner,
+  initialSelectedId,
+  selectPlaceholder,
+  jumpToFailed,
+  type TaskRunLike,
+  type TaskTableRow,
+} from './tasks-tab-logic';
+import { taskDetail, clearSelectedId, type TaskDetailView } from './task-detail-logic';
 import {
   planCounts,
   docNavModel,
@@ -217,6 +237,10 @@ addIcons({
     IonRadioGroup,
     IonRadio,
     IonTextarea,
+    IonCard,
+    IonCardHeader,
+    IonCardTitle,
+    IonCardContent,
   ],
   templateUrl: './terminal.page.html',
   styleUrls: ['./terminal.page.scss'],
@@ -489,7 +513,87 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly eventsLoading = signal(false);
   /** Projected timeline rows (stage/lens/verdict/normalized-ISO) — reverse to newest-first for display. */
   protected readonly consoleTimeline = computed<TimelineEvent[]>(() =>
-    [...initiativeTimeline(this.initiativeEvents())].reverse(),
+    [...windowTimeline(initiativeTimeline(this.initiativeEvents()))].reverse(),
+  );
+  protected readonly planCheckJson = signal<string | null>(null);
+  protected readonly preflightJson = signal<string | null>(null);
+  protected readonly taskRunJson = signal<string | null>(null);
+  protected readonly selectedTaskId = signal<string | null>(null);
+  protected readonly selectedCheckId = signal<string | null>(null);
+  protected readonly modeChip = modeChip;
+  protected readonly visibleTabs = computed(() =>
+    visibleConsoleTabs(
+      this.selectedInitiative(),
+      !!this.taskRunJson(),
+      !!this.planCheckJson(),
+      !!this.preflightJson(),
+    ),
+  );
+  protected readonly checks = computed<ChecksView>(() => {
+    const init = this.selectedInitiative();
+    const raw =
+      (init?.initiativeStatus ?? '').toLowerCase() === 'planning'
+        ? this.planCheckJson()
+        : this.preflightJson() || this.planCheckJson();
+    let report: PlanCheckReportLike | null = null;
+    if (raw) {
+      try {
+        report = JSON.parse(raw) as PlanCheckReportLike;
+      } catch {
+        report = null;
+      }
+    }
+    const source =
+      (init?.initiativeStatus ?? '').toLowerCase() === 'planning' ? 'planning' : 'preflight';
+    return checksView(report, {
+      source,
+      checkKind: report?.checkKind ?? report?.check_kind,
+      exhausted: report?.exhausted,
+      replanRound: report?.replanRound ?? report?.replan_round,
+    });
+  });
+  protected readonly taskRun = computed<TaskRunLike | null>(() => {
+    const raw = this.taskRunJson();
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as TaskRunLike;
+    } catch {
+      return null;
+    }
+  });
+  protected readonly taskRows = computed(() => taskTable(this.taskRun()));
+  protected readonly taskWindow = computed(() =>
+    windowRows(this.taskRows(), this.selectedTaskId()),
+  );
+  protected readonly taskCountView = computed(() => taskCounts(this.taskRun()));
+  protected readonly tasksEmpty = computed(() => tasksEmptyCopy(this.taskRun() ?? { tasks: [] }));
+  protected readonly replanBannerText = computed(() => {
+    const init = this.selectedInitiative();
+    const pf = this.preflightJson();
+    let exhausted = false;
+    let parked = false;
+    if (pf) {
+      try {
+        const r = JSON.parse(pf) as PlanCheckReportLike;
+        exhausted = r.exhausted === true;
+        parked = (r.checkKind ?? r.check_kind) === 'replan_park' && !exhausted;
+      } catch {
+        /* ignore */
+      }
+    }
+    return replanBanner(init?.status, { replanExhausted: exhausted, replanParked: parked });
+  });
+  protected readonly taskDetailView = computed<TaskDetailView | null>(() => {
+    const id = this.selectedTaskId();
+    const run = this.taskRun();
+    if (!id || !run) return null;
+    const row = (run.tasks ?? []).find((t) => t.id === id);
+    if (!row) return null;
+    const last = row.attempts?.[row.attempts.length - 1] ?? null;
+    return taskDetail(row, { id }, last);
+  });
+  protected readonly lifecycleReplan = computed(
+    () => this.selectedInitiative()?.status === 'phase_replan_running',
   );
   /** Which pane the §08 mobile switcher currently shows. */
   protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
@@ -1789,7 +1893,53 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private isPaneTab(value: string | null): value is PaneTab {
-    return value === 'raw' || value === 'plan' || value === 'diff';
+    return (
+      value === 'raw' ||
+      value === 'plan' ||
+      value === 'diff' ||
+      value === 'checks' ||
+      value === 'tasks'
+    );
+  }
+
+  protected selectCheckChip(rule: string): void {
+    const active = this.selectedCheckId();
+    const items = this.checks().ruleCounts;
+    this.selectedCheckId.set(active === rule ? null : rule);
+    void items;
+  }
+
+  protected onTaskPlaceholder(): void {
+    const ph = this.taskWindow().placeholder;
+    if (!ph) return;
+    this.selectedTaskId.set(selectPlaceholder(this.taskRows(), ph));
+  }
+
+  protected onJumpFailed(id: string): void {
+    this.selectedTaskId.set(jumpToFailed(id));
+  }
+
+  protected onSelectTask(id: string): void {
+    this.selectedTaskId.set(id);
+  }
+
+  protected onBackToTasks(): void {
+    this.selectedTaskId.set(clearSelectedId());
+  }
+
+  protected tabLabel(tab: PaneTab): string {
+    switch (tab) {
+      case 'raw':
+        return 'Raw terminal';
+      case 'plan':
+        return 'Plan';
+      case 'diff':
+        return 'Diff';
+      case 'checks':
+        return 'Checks';
+      case 'tasks':
+        return 'Tasks';
+    }
   }
 
   /** Template wrapper for the pure predicate — the Raw tab shows the inline attach card when true. */
@@ -1964,10 +2114,48 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       if (this.eventsInitiativeId === initiativeId) {
         this.initiativeEvents.set(events ?? []);
       }
+      await this.loadConsoleArtifacts();
     } catch {
       // keep prior events
     } finally {
       if (showSpinner) this.eventsLoading.set(false);
+    }
+  }
+
+  private async loadConsoleArtifacts(): Promise<void> {
+    const init = this.selectedInitiative();
+    if (!init) return;
+    const phaseId = init.currentPhaseId;
+    try {
+      const check = await firstValueFrom(this.api.getPlanCheck(init.id));
+      this.planCheckJson.set(check);
+    } catch {
+      this.planCheckJson.set(null);
+    }
+    if (phaseId) {
+      try {
+        const pf = await firstValueFrom(this.api.getPlanCheck(init.id, phaseId));
+        this.preflightJson.set(pf);
+      } catch {
+        this.preflightJson.set(null);
+      }
+      try {
+        const run = await firstValueFrom(this.api.getTaskRun(init.id, phaseId));
+        this.taskRunJson.set(run);
+        if (!this.selectedTaskId() && run) {
+          try {
+            const parsed = JSON.parse(run) as TaskRunLike;
+            this.selectedTaskId.set(initialSelectedId(taskTable(parsed)));
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch {
+        this.taskRunJson.set(null);
+      }
+    } else {
+      this.preflightJson.set(null);
+      this.taskRunJson.set(null);
     }
   }
 

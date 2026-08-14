@@ -264,6 +264,51 @@ pub fn project_status_yml(task_dir: &Path, row: &TaskRow) -> Result<(), String> 
     atomic_fs::write_atomic(&task_dir.join("status.yml"), raw.as_bytes())
 }
 
+/// Compact phase `status.md`: counts + failed/blocked/running ids only.
+pub fn project_phase_status_md(phase_dir: &Path, file: &TaskRunFile) -> Result<(), String> {
+    let mut done = 0u32;
+    let mut running = 0u32;
+    let mut pending = 0u32;
+    let mut failed = Vec::new();
+    let mut blocked = Vec::new();
+    let mut running_ids = Vec::new();
+    for t in &file.tasks {
+        match t.status.as_str() {
+            "done" => done += 1,
+            "running" => {
+                running += 1;
+                running_ids.push(t.id.as_str());
+            }
+            "failed" => failed.push(t.id.as_str()),
+            "blocked" => blocked.push(t.id.as_str()),
+            _ => pending += 1,
+        }
+    }
+    let md = format!(
+        "# Status\n\n| state | n |\n|---|---|\n| done | {done} |\n| running | {running} |\n| failed | {} |\n| blocked | {} |\n| pending | {pending} |\n\n## failed\n{}\n\n## blocked\n{}\n\n## running\n{}\n",
+        failed.len(),
+        blocked.len(),
+        if failed.is_empty() {
+            "_none_".into()
+        } else {
+            failed.iter().map(|id| format!("- `{id}`")).collect::<Vec<_>>().join("\n")
+        },
+        if blocked.is_empty() {
+            "_none_".into()
+        } else {
+            blocked.iter().map(|id| format!("- `{id}`")).collect::<Vec<_>>().join("\n")
+        },
+        if running_ids.is_empty() {
+            "_none_".into()
+        } else {
+            running_ids.iter().map(|id| format!("- `{id}`")).collect::<Vec<_>>().join("\n")
+        },
+    );
+    std::fs::create_dir_all(phase_dir)
+        .map_err(|e| format!("mkdir {}: {e}", phase_dir.display()))?;
+    atomic_fs::write_atomic(&phase_dir.join("status.md"), md.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +380,31 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_phase_status_md_is_compact() {
+        let dir = tmp("phase-md");
+        let mut file = seed_from_specs(
+            "p",
+            "00-x",
+            &(0..120)
+                .map(|i| spec(&format!("{i:03}"), &[]))
+                .collect::<Vec<_>>(),
+        );
+        file.tasks[0].status = "failed".into();
+        file.tasks[1].status = "blocked".into();
+        file.tasks[2].status = "running".into();
+        for t in file.tasks.iter_mut().skip(3).take(10) {
+            t.status = "done".into();
+        }
+        project_phase_status_md(&dir, &file).unwrap();
+        let md = std::fs::read_to_string(dir.join("status.md")).unwrap();
+        assert!(md.lines().count() < 80, "{}", md.lines().count());
+        assert!(md.contains("000"));
+        assert!(md.contains("failed"));
+        assert!(!md.contains("119"), "must not list every pending id");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

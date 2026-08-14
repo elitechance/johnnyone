@@ -1219,7 +1219,7 @@ impl AgentService {
             .ok_or_else(|| "Missing 'initiativeId' parameter".to_string())?;
         // Cap generously — an Initiative's two runs rarely exceed a few hundred events; the console
         // renders the full SDLC timeline oldest-first.
-        let events = crate::services::agent_plans::list_initiative_events(state, initiative_id, 500)?;
+        let events = crate::services::agent_plans::list_initiative_events(state, initiative_id, 2000)?;
         serde_json::to_value(events).map_err(|e| e.to_string())
     }
 

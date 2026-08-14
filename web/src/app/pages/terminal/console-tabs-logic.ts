@@ -28,6 +28,32 @@ export function initiativeTabOf(tabs: Record<string, PaneTab>, initiativeId: str
   return paneTabOf(tabs, initiativeId);
 }
 
+export function isLocalSmall(executorConfig: string | null | undefined): boolean {
+  if (!executorConfig) return false;
+  try {
+    const parsed = JSON.parse(executorConfig) as { mode?: string };
+    return parsed?.mode === 'local-small';
+  } catch {
+    return false;
+  }
+}
+
+/** Single function the tab strip uses (05-08). */
+export function visibleConsoleTabs(
+  init: AgentPlan | null | undefined,
+  hasTaskRun: boolean,
+  hasPlanCheck: boolean,
+  hasPreflight: boolean,
+): PaneTab[] {
+  const base: PaneTab[] = ['raw', 'plan', 'diff'];
+  if (!isLocalSmall(init?.executorConfig)) return base;
+  const stage = (init?.initiativeStatus ?? init?.runType ?? '').toLowerCase();
+  const planning = stage === 'planning';
+  if (planning || hasPlanCheck || hasPreflight) base.push('checks');
+  if (hasTaskRun) base.push('tasks');
+  return base;
+}
+
 /**
  * Whether the Raw tab should render the inline attach affordance instead of a live terminal screen:
  * true when the initiative has no primary session yet, or it has one but no attached screen for it.

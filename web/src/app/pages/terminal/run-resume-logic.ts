@@ -25,6 +25,12 @@ const BUSY_STATUSES = new Set([
   'phase-review-running',
 ]);
 
+export function isBusyStatus(status: string | null | undefined): boolean {
+  return BUSY_STATUSES.has(normStatus(status));
+}
+
+export { PAUSED_STATUSES };
+
 /** True when the run is paused (needs_attention/blocked) — drives Resume vs Run, the banner, and the
  *  pre-selected paused phase. Busy status wins over health so a replan in flight is not Resume. */
 export function isPausedRun(run: AgentPlanRun | null | undefined): boolean {

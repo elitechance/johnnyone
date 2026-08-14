@@ -22,6 +22,9 @@
               @if (row.showHealth) {
                 <johnny-status-pill kind="health" [value]="row.health"></johnny-status-pill>
               }
+              @if (modeChip(row.executorConfig); as chip) {
+                <span class="chip kloo">{{ chip }}</span>
+              }
             </div>
             <div class="ago">updated {{ row.ago }}</div>
           </button>
@@ -58,7 +61,13 @@
       <!-- Mobile-only: back to the initiatives list (the master-detail replacement for the segment). -->
       <button type="button" class="mobile-back" (click)="backToInitiativesList()">← Initiatives</button>
       <div class="init-top">
-        <johnny-lifecycle-bar [status]="sel.initiativeStatus" [health]="sel.health"></johnny-lifecycle-bar>
+        <johnny-lifecycle-bar
+          [status]="sel.initiativeStatus"
+          [health]="sel.health"
+          [replan]="lifecycleReplan()"
+          [replanExhausted]="!!replanBannerText()?.includes('cap reached')"
+          [replanParked]="!!replanBannerText()?.includes('unreadable')"
+        ></johnny-lifecycle-bar>
         <div class="init-top-row">
           <div class="path">{{ sel.workspacePath }}</div>
           <!-- Run controls, folded from the legacy /planning + /development pages: the console is now
@@ -139,33 +148,17 @@
            is attached; the Raw tab carries the inline attach affordance when none is (S1/S2). -->
       <section class="console-tabshell">
         <div class="pane-tabs" role="tablist" aria-label="Initiative console">
-          <button
-            class="pane-tab"
-            role="tab"
-            [class.on]="activeTab() === 'raw'"
-            [attr.aria-selected]="activeTab() === 'raw'"
-            (click)="setInitiativeTab(sel.id, 'raw')"
-          >
-            Raw terminal
-          </button>
-          <button
-            class="pane-tab"
-            role="tab"
-            [class.on]="activeTab() === 'plan'"
-            [attr.aria-selected]="activeTab() === 'plan'"
-            (click)="setInitiativeTab(sel.id, 'plan')"
-          >
-            Plan
-          </button>
-          <button
-            class="pane-tab"
-            role="tab"
-            [class.on]="activeTab() === 'diff'"
-            [attr.aria-selected]="activeTab() === 'diff'"
-            (click)="setInitiativeTab(sel.id, 'diff'); openInitiativeDiff()"
-          >
-            Diff
-          </button>
+          @for (tab of visibleTabs(); track tab) {
+            <button
+              class="pane-tab"
+              role="tab"
+              [class.on]="activeTab() === tab"
+              [attr.aria-selected]="activeTab() === tab"
+              (click)="setInitiativeTab(sel.id, tab); tab === 'diff' ? openInitiativeDiff() : null"
+            >
+              {{ tabLabel(tab) }}
+            </button>
+          }
         </div>
 
         @if (activeTab() === 'diff') {
@@ -359,6 +352,128 @@
                 <div class="empty-title">No plan to show</div>
                 <div class="empty-copy">This initiative has no readable plan document yet.</div>
               </div>
+            }
+          </section>
+        } @else if (activeTab() === 'checks') {
+          <section class="terminal-surface checks-surface">
+            @if (checks().state === 'empty') {
+              <div class="pane-empty">{{ checks().card }}</div>
+            } @else {
+              <ion-card [color]="checks().state === 'passed' ? 'success' : 'danger'">
+                <ion-card-content>{{ checks().card }}</ion-card-content>
+              </ion-card>
+              <div class="check-stats">
+                {{ checks().stats.tasks }} tasks checked · {{ checks().stats.violations }} violations
+                @if (checks().stats.executed || checks().stats.skipped) {
+                  · {{ checks().stats.executed }} executed · {{ checks().stats.skipped }} skipped
+                }
+              </div>
+              @if (checks().ruleCounts.length) {
+                <div class="rule-chips">
+                  @for (c of checks().ruleCounts; track c.rule) {
+                    <button
+                      type="button"
+                      class="rule-chip"
+                      [class.on]="selectedCheckId() === c.rule"
+                      (click)="selectCheckChip(c.rule)"
+                    >
+                      {{ c.label }} · {{ c.count }}
+                    </button>
+                  }
+                </div>
+              }
+              <div class="check-table">
+                @for (r of checks().rows; track r.id) {
+                  @if (!selectedCheckId() || r.rule === selectedCheckId()) {
+                    <ion-item>
+                      <ion-label>
+                        <h3>{{ r.label }}</h3>
+                        <p>{{ r.taskId }} · {{ r.detail }}</p>
+                      </ion-label>
+                    </ion-item>
+                  }
+                }
+              </div>
+              @if (checks().moreCount) {
+                <div class="more-placeholder">{{ checks().moreCount }} more violations</div>
+              }
+              @if (checks().advisories.length) {
+                <div class="advisories">
+                  <h4>Advisories</h4>
+                  @for (a of checks().advisories; track a.rule) {
+                    <p>{{ a.label }} — {{ a.detail }}</p>
+                  }
+                </div>
+              }
+            }
+          </section>
+        } @else if (activeTab() === 'tasks') {
+          <section class="terminal-surface tasks-surface">
+            @if (replanBannerText()) {
+              <div class="replan-banner" role="status">{{ replanBannerText() }}</div>
+            }
+            @if (tasksEmpty()) {
+              <div class="pane-empty">{{ tasksEmpty() }}</div>
+            } @else {
+              <div class="task-counts">
+                {{ taskCountView().done }} done · {{ taskCountView().running }} running ·
+                {{ taskCountView().failed }} failed · {{ taskCountView().blocked }} blocked ·
+                {{ taskCountView().pending }} pending
+              </div>
+              @if (taskCountView().failed) {
+                <button type="button" class="failed-alert" (click)="onJumpFailed(taskRows().find(r => r.state === 'failed')?.id || '')">
+                  Task failed; {{ taskCountView().blocked }} tasks are blocked behind it
+                </button>
+              }
+              <div class="tw" style="overflow-x:auto">
+                <table class="task-table">
+                  <thead>
+                    <tr><th>#</th><th>task</th><th>files</th><th>state</th><th>tier</th><th>verify</th><th>commit</th></tr>
+                  </thead>
+                  <tbody>
+                    @for (r of taskWindow().rows; track r.id) {
+                      <tr [class.sel]="selectedTaskId() === r.id" (click)="onSelectTask(r.id)">
+                        <td>{{ r.index }}</td>
+                        <td>{{ r.id }}</td>
+                        <td>{{ r.files }}</td>
+                        <td>{{ r.state }}</td>
+                        <td>{{ r.tier }}</td>
+                        <td>{{ r.verifyOk }}</td>
+                        <td>{{ r.commit }}</td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+              @if (taskWindow().placeholder; as ph) {
+                <button type="button" class="more-placeholder" (click)="onTaskPlaceholder()">
+                  {{ ph.from }}–{{ ph.to }} more
+                </button>
+              }
+              @if (taskDetailView(); as d) {
+                <ion-card class="task-detail">
+                  <ion-card-header>
+                    <ion-button fill="clear" size="small" (click)="onBackToTasks()">← back to table</ion-button>
+                    <ion-card-title>{{ selectedTaskId() }}</ion-card-title>
+                  </ion-card-header>
+                  <ion-card-content>
+                    <p>files: {{ d.files.join(', ') }}</p>
+                    <p>verify: {{ d.verify }}</p>
+                    @if (d.attemptsCopy) { <p>{{ d.attemptsCopy }}</p> }
+                    @if (d.ruleAlert) { <p class="rule-alert">{{ d.ruleAlert }}</p> }
+                    @if (d.commitSha) { <p>commit {{ d.commitSha }}</p> }
+                    @if (d.checks.length) {
+                      <ul>
+                        @for (c of d.checks; track c.check) {
+                          <li>{{ c.check }} {{ c.ok ? '✓' : '✕' }} {{ c.reason }}</li>
+                        }
+                      </ul>
+                    }
+                    @if (d.failureCode) { <p>failure_code: {{ d.failureCode }}</p> }
+                    @if (d.transcriptTail) { <pre>{{ d.transcriptTail }}</pre> }
+                  </ion-card-content>
+                </ion-card>
+              }
             }
           </section>
         } @else {
