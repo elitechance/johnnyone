@@ -25,7 +25,8 @@ export interface CheckCell {
   check: string;
   label: string;
   meaning: string;
-  ok: boolean;
+  /** true/false only when the attempt recorded the five J1 checks. null = unknown — never infer pass. */
+  ok: boolean | null;
   reason: string;
 }
 
@@ -79,7 +80,7 @@ interface LooseAttempt {
   started_at?: string;
   endedAt?: string;
   ended_at?: string;
-  checks?: { failed?: { check: string; reason?: string }[] };
+  checks?: { failed?: { check: string; reason?: string }[]; reason?: string };
   failed?: { check: string; reason?: string }[];
   verify?: { command?: string };
   command?: string;
@@ -120,30 +121,52 @@ export function taskDetail(
   const noAttempt = attempts.length === 0 && !lastAttemptJson;
   const parsed = parseAttempt(lastAttemptJson);
   const fromRow = parseAttempt(attempts[attempts.length - 1] ?? null);
-  const failedList = checks ?? (parsed.failedChecks.length ? parsed.failedChecks : fromRow.failedChecks);
+  const recorded = checks
+    ? { kind: 'recorded' as const, failed: checks, reason: '' }
+    : parsed.recorded.kind === 'recorded'
+      ? parsed.recorded
+      : fromRow.recorded;
   const checkCells: CheckCell[] = [];
   if (!noAttempt) {
     const failed = new Map<string, string>();
-    for (const c of failedList) {
-      failed.set(c.check, c.reason ?? '');
+    if (recorded.kind === 'recorded') {
+      for (const c of recorded.failed) {
+        failed.set(c.check, c.reason ?? '');
+      }
     }
+    const shapeReason = recorded.kind === 'unknown' ? recorded.reason : '';
     for (const name of FIVE) {
-      const reason = failed.get(name);
       const copy = CHECK_COPY[name];
-      checkCells.push({
-        check: name,
-        label: copy.label,
-        meaning: copy.meaning,
-        ok: reason === undefined,
-        reason: reason ?? '',
-      });
+      if (recorded.kind === 'unknown') {
+        checkCells.push({
+          check: name,
+          label: copy.label,
+          meaning: copy.meaning,
+          ok: null,
+          reason: shapeReason,
+        });
+      } else {
+        const reason = failed.get(name);
+        checkCells.push({
+          check: name,
+          label: copy.label,
+          meaning: copy.meaning,
+          ok: reason === undefined,
+          reason: reason ?? '',
+        });
+      }
     }
   }
   const status = (row?.status ?? '').toLowerCase();
   const commitSha = row?.commitSha ?? row?.commit_sha ?? null;
   let ruleAlert: string | null = null;
   if (status === 'failed') {
-    ruleAlert = parsed.failureCode || fromRow.failureCode || row?.route || 'failed';
+    ruleAlert =
+      (recorded.kind === 'unknown' ? recorded.reason : '') ||
+      parsed.failureCode ||
+      fromRow.failureCode ||
+      row?.route ||
+      'failed';
   }
   return {
     files,
@@ -196,7 +219,7 @@ function parseAttempt(raw: unknown): {
   railFires: unknown;
   postchecks: unknown;
   transcriptTail: string;
-  failedChecks: { check: string; reason?: string }[];
+  recorded: { kind: 'recorded'; failed: { check: string; reason?: string }[]; reason: string } | { kind: 'unknown'; failed: { check: string; reason?: string }[]; reason: string };
 } {
   const empty = {
     command: '',
@@ -207,7 +230,7 @@ function parseAttempt(raw: unknown): {
     railFires: null,
     postchecks: null,
     transcriptTail: '',
-    failedChecks: [] as { check: string; reason?: string }[],
+    recorded: { kind: 'unknown' as const, failed: [] as { check: string; reason?: string }[], reason: '' },
   };
   if (raw == null) return empty;
   let obj: LooseAttempt;
@@ -224,8 +247,13 @@ function parseAttempt(raw: unknown): {
   }
   const nested = obj.checks;
   const failedRaw = nested?.failed ?? obj.failed;
-  const failed = Array.isArray(failedRaw) ? failedRaw : [];
-  const verify = obj.verify;
+  const recorded = Array.isArray(failedRaw)
+    ? { kind: 'recorded' as const, failed: failedRaw, reason: '' }
+    : {
+        kind: 'unknown' as const,
+        failed: [] as { check: string; reason?: string }[],
+        reason: typeof nested?.reason === 'string' ? nested.reason : '',
+      };
   const changed = obj.files_changed ?? obj.filesChanged;
   return {
     command: typeof obj.command === 'string' ? obj.command : '',
@@ -241,7 +269,7 @@ function parseAttempt(raw: unknown): {
     railFires: obj.rail_fires ?? obj.railFires ?? null,
     postchecks: obj.postchecks ?? null,
     transcriptTail: String(obj.transcript_tail ?? obj.transcriptTail ?? ''),
-    failedChecks: failed,
+    recorded,
   };
 }
 

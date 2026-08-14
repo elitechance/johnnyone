@@ -86,6 +86,7 @@ describe('counts / empty / banner', () => {
     expect(verifyOkOf({ checks: { failed: [{ check: 'verify' }] } })).toBe('fail');
     expect(verifyOkOf({ verify: { passed: true } })).toBe('ok');
     expect(verifyOkOf(undefined)).toBe('');
+    expect(verifyOkOf({ checks: { reason: 'missing task.yml' } })).toBe('');
     const table = taskTable({
       tasks: [
         {

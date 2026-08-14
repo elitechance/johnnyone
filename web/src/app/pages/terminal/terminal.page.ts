@@ -79,7 +79,6 @@ import {
   StreamEvent,
   HostFileEntry,
   TmuxSession,
-  planningRoundOf,
   phaseNnOf,
 } from '@johnnyone/ui';
 import {
@@ -623,9 +622,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly phaseNn = computed(() =>
     phaseNnOf(this.selectedInitiative()?.currentPhaseId),
   );
-  protected readonly planningRound = computed(() =>
-    planningRoundOf(this.initiativeEvents()),
-  );
+  protected readonly planningRound = computed(() => {
+    const n = this.selectedInitiative()?.consecutiveNonPassPlanningRounds;
+    return typeof n === 'number' && n > 0 ? n : null;
+  });
   /** Which pane the §08 mobile switcher currently shows. */
   protected readonly mobileConsolePane = computed(() => consolePaneFor(this.consoleSegment()));
 

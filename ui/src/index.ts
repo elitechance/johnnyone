@@ -103,7 +103,6 @@ export {
   stageIndex,
   stageFill,
   stageDescription,
-  planningRoundOf,
   phaseNnOf,
   STATUS_META,
   HEALTH_META,

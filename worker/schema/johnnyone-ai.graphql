@@ -153,6 +153,8 @@ type AgentPlan {
   briefingSessionId: String
   # Local-small executor mode JSON. NULL/empty = commercial. Deploy-skew nullable like validationConfig.
   executorConfig: String
+  # Host consecutive_non_pass_planning_rounds for the initiative. Nullable for deploy-skew.
+  consecutiveNonPassPlanningRounds: Int
   createdAt: String!
   updatedAt: String!
 }

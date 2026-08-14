@@ -165,6 +165,7 @@ fn dummy_run(ws: &Path, plan: &Path, plan_id: &str, initiative: &str) -> AgentPl
             updated_at: now,
             validation_config: None,
             executor_config: None,
+            consecutive_non_pass_planning_rounds: None,
         },
         phases: vec![phase],
         tasks: vec![],

@@ -96,34 +96,6 @@ export function stageFill(args: StageFillArgs): string {
   return '60%';
 }
 
-export interface PlanningRoundEvent {
-  eventType?: string;
-  verdict?: string | null;
-}
-
-/** Mirror host `consecutive_non_pass_planning_rounds`: walk newest-first, count
- *  `planning_check_failed` and non-PASS `planning_gate_result`, reset at PASS /
- *  `planning_started` / `agent_plan_stopped`. */
-export function planningRoundOf(
-  events: PlanningRoundEvent[] | null | undefined,
-): number | null {
-  const all = events ?? [];
-  let n = 0;
-  for (let i = all.length - 1; i >= 0; i--) {
-    const kind = all[i].eventType ?? '';
-    if (kind === 'agent_plan_stopped' || kind === 'planning_started') break;
-    if (kind === 'planning_check_failed') {
-      n += 1;
-      continue;
-    }
-    if (kind !== 'planning_gate_result') continue;
-    const verdict = (all[i].verdict ?? '').trim().toUpperCase();
-    if (verdict === 'PASS') break;
-    if (verdict) n += 1;
-  }
-  return n > 0 ? n : null;
-}
-
 export function phaseNnOf(phaseId: string | null | undefined): string {
   const id = (phaseId ?? '').trim();
   return id.split('-')[0] || '';

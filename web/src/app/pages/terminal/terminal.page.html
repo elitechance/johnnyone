@@ -512,9 +512,9 @@
                         <thead><tr><th>check</th><th></th><th>meaning</th></tr></thead>
                         <tbody>
                           @for (c of d.checks; track c.check) {
-                            <tr [class.bad]="!c.ok">
+                            <tr [class.bad]="c.ok === false">
                               <td>{{ c.label }}</td>
-                              <td>{{ c.ok ? '✓' : '✕' }}</td>
+                              <td>{{ c.ok === true ? '✓' : c.ok === false ? '✕' : '—' }}</td>
                               <td>{{ c.meaning }}@if (c.reason) { — {{ c.reason }} }</td>
                             </tr>
                           }

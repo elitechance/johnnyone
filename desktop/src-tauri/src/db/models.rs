@@ -173,6 +173,10 @@ pub struct AgentPlan {
     /// Nullable JSON `{mode, profile?, provider?, model?, ctx?}`. NULL/empty = commercial.
     /// Same deploy-skew pattern as `validation_config` (migration 021).
     pub executor_config: Option<String>,
+    /// Host `consecutive_non_pass_planning_rounds` for this initiative. Not a DB
+    /// column — filled on list/get. `None` until attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_non_pass_planning_rounds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +330,7 @@ mod tests {
             updated_at: "".into(),
             validation_config: Some("[]".into()),
             executor_config: None,
+            consecutive_non_pass_planning_rounds: None,
         }
     }
 

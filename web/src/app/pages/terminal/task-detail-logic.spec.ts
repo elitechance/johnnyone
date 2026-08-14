@@ -82,6 +82,24 @@ describe('taskDetail', () => {
     expect(v.hasAttempt).toBe(true);
   });
 
+  it('shape route attempt with checks.reason is UNKNOWN, never all-green', () => {
+    const attempt = {
+      tier: 'route',
+      attempt: 0,
+      class: 'shape',
+      checks: { reason: 'missing task.yml for 01-a' },
+    };
+    const v = taskDetail(
+      { id: '01-a', status: 'failed', attempts: [attempt], route: 'planner' },
+      spec,
+      attempt,
+    );
+    expect(v.checks).toHaveLength(5);
+    expect(v.checks.every((c) => c.ok === null)).toBe(true);
+    expect(v.checks.every((c) => c.reason === 'missing task.yml for 01-a')).toBe(true);
+    expect(v.ruleAlert).toContain('missing task.yml');
+  });
+
   it('klooCommand is the persisted argv, not verify.command', () => {
     const v = taskDetail(
       { id: '04-d', status: 'failed', attempts: [{ attempt: 1 }] },

@@ -18,7 +18,9 @@ use crate::services::task_check::{
     SpawnFailure, Step,
 };
 use crate::services::task_spec::{self, load_task_spec, TaskSpec};
-use crate::services::verify_policy::{plan_task_verify, PlannedVerify, VerifyPolicyError};
+use crate::services::verify_policy::{
+    plan_task_verify, quote_argv_for_shell, PlannedVerify, VerifyPolicyError,
+};
 use crate::services::task_state::{
     attempt_json_path, block_dependents, load_tasks, project_phase_status_md, project_status_yml,
     reconcile,
@@ -317,9 +319,13 @@ fn pid_is_alive(pid: u32) -> bool {
 /// live loop and the `#[cfg(test)]` spawn helper so both share one write path.
 fn kloo_command_echo(req: &KlooRunRequest) -> Option<String> {
     let cfg = build_config(req).ok()?;
+    let mut args = cfg.args;
+    if let Some(i) = args.iter().rposition(|a| a == "--") {
+        args.truncate(i);
+    }
     let mut parts = vec![cfg.command];
-    parts.extend(cfg.args);
-    Some(parts.join(" "))
+    parts.extend(args);
+    Some(quote_argv_for_shell(&parts))
 }
 
 fn parse_and_record_attempt(
@@ -1771,7 +1777,11 @@ mod tests {
         assert_eq!(exit, 0);
         let recorded = std::fs::read_to_string(runs.join("01-add").join("1.json")).unwrap();
         assert!(recorded.contains("\"command\""), "{recorded}");
-        assert!(recorded.contains("kloo"), "{recorded}");
+        assert!(recorded.contains("'kloo'"), "{recorded}");
+        assert!(
+            !recorded.contains("do it"),
+            "prompt must not be in the echo: {recorded}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

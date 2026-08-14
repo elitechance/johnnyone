@@ -12,7 +12,6 @@ import {
   stageIndex,
   stageFill,
   stageDescription,
-  planningRoundOf,
   phaseNnOf,
   LIFECYCLE_STAGES,
 } from '../../../../../ui/src/lib/lifecycle-status';
@@ -131,23 +130,7 @@ describe('stageFill / stageDescription', () => {
   it('clamps planning fill at 100%', () => {
     expect(stageFill({ active: 0, idx: 0, planningRound: 9, planningRoundMax: 6 })).toBe('100%');
   });
-  it('planningRoundOf is consecutive non-pass, reset on PASS/start/stop', () => {
-    expect(
-      planningRoundOf([
-        { eventType: 'planning_check_failed' },
-        { eventType: 'planning_gate_result', verdict: 'NEEDS_CHANGES' },
-        { eventType: 'planning_gate_result', verdict: 'NEEDS_CHANGES' },
-      ]),
-    ).toBe(3);
-    expect(
-      planningRoundOf([
-        { eventType: 'planning_check_failed' },
-        { eventType: 'planning_gate_result', verdict: 'PASS' },
-        { eventType: 'planning_started' },
-        { eventType: 'planning_gate_result', verdict: 'NEEDS_CHANGES' },
-      ]),
-    ).toBe(1);
-    expect(planningRoundOf([{ eventType: 'planning_gate_result', verdict: 'PASS' }])).toBeNull();
+  it('phaseNnOf takes the leading segment', () => {
     expect(phaseNnOf('04-queue-routing')).toBe('04');
     expect(phaseNnOf('')).toBe('');
   });

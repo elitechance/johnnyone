@@ -135,6 +135,8 @@ export interface AgentPlan {
   briefingSessionId?: string;
   /** Local-small executor JSON. Null/empty = commercial. */
   executorConfig?: string | null;
+  /** Host consecutive non-pass planning rounds for this initiative. */
+  consecutiveNonPassPlanningRounds?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -352,6 +354,7 @@ export class JohnnyApiService {
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
       brief appScope docsScope referencePaths amendBrief validationConfig executorConfig phaseRunMode
       initiativeId initiativeStatus health briefingSessionId
+      consecutiveNonPassPlanningRounds
       createdAt updatedAt
     }
     phases {
@@ -807,6 +810,7 @@ export class JohnnyApiService {
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
             brief appScope docsScope referencePaths
             initiativeId initiativeStatus health validationConfig executorConfig briefingSessionId
+            consecutiveNonPassPlanningRounds
             createdAt updatedAt
           }
         }`,

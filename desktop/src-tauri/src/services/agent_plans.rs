@@ -737,7 +737,7 @@ pub fn list_plans(
     run_type: Option<String>,
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
-    state.db.with_conn(|conn| {
+    let mut rows = state.db.with_conn(|conn| {
         let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
@@ -753,7 +753,9 @@ pub fn list_plans(
             rows.retain(|plan| plan.status != "closed");
         }
         Ok(rows)
-    })
+    })?;
+    attach_planning_rounds(state, &mut rows)?;
+    Ok(rows)
 }
 
 pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
@@ -769,12 +771,16 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     let phases = list_phases(state, id)?;
     let tasks = list_tasks(state, id)?;
     let events = list_events(state, id, 80)?;
-    Ok(AgentPlanRun {
+    let mut run = AgentPlanRun {
         plan,
         phases,
         tasks,
         events,
-    })
+    };
+    run.plan.consecutive_non_pass_planning_rounds = Some(
+        consecutive_non_pass_planning_rounds_for_initiative(state, &run.plan.initiative_id)?,
+    );
+    Ok(run)
 }
 
 pub async fn start_plan(
@@ -5189,14 +5195,40 @@ fn count_consecutive_non_pass_kinds(
 }
 
 fn consecutive_non_pass_planning_rounds(run: &AgentPlanRun) -> i64 {
+    consecutive_non_pass_planning_rounds_from_events(&run.events)
+}
+
+fn consecutive_non_pass_planning_rounds_from_events(events: &[AgentPlanEvent]) -> i64 {
     count_consecutive_non_pass_kinds(
-        &run.events,
+        events,
         "planning_gate_result",
         "planning_started",
         None,
         &["planning_check_failed"],
         &[],
     )
+}
+
+fn consecutive_non_pass_planning_rounds_for_initiative(
+    state: &AppState,
+    initiative_id: &str,
+) -> Result<i64, String> {
+    let events = list_initiative_events(state, initiative_id, 2000)?;
+    Ok(consecutive_non_pass_planning_rounds_from_events(&events))
+}
+
+fn attach_planning_rounds(state: &AppState, plans: &mut [AgentPlan]) -> Result<(), String> {
+    let mut cache: HashMap<String, i64> = HashMap::new();
+    for plan in plans.iter_mut() {
+        if let Some(&n) = cache.get(&plan.initiative_id) {
+            plan.consecutive_non_pass_planning_rounds = Some(n);
+            continue;
+        }
+        let n = consecutive_non_pass_planning_rounds_for_initiative(state, &plan.initiative_id)?;
+        cache.insert(plan.initiative_id.clone(), n);
+        plan.consecutive_non_pass_planning_rounds = Some(n);
+    }
+    Ok(())
 }
 
 fn consecutive_non_pass_phase_rounds(run: &AgentPlanRun, phase_id: &str) -> i64 {
@@ -7444,6 +7476,7 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         // feeding this mapper ends with validation_config, executor_config.
         validation_config: row.get(25)?,
         executor_config: row.get(26)?,
+        consecutive_non_pass_planning_rounds: None,
     })
 }
 
@@ -9244,6 +9277,7 @@ mod store_tests {
                 updated_at: "".into(),
                 validation_config: None,
                 executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -9355,6 +9389,7 @@ mod validation_lens_tests {
                 updated_at: "".into(),
                 validation_config: validation_config.map(|s| s.to_string()),
                 executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -10837,6 +10872,7 @@ mod small_mode_tests {
                 updated_at: "".into(),
                 validation_config: None,
                 executor_config: executor_config.map(str::to_string),
+                consecutive_non_pass_planning_rounds: None,
             },
             phases: vec![],
             tasks: vec![],
