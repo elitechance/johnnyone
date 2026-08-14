@@ -170,6 +170,9 @@ pub struct AgentPlan {
     /// and every SELECT (order is load-bearing); nullable for deploy-skew safety like the
     /// initiative axes.
     pub validation_config: Option<String>,
+    /// Nullable JSON `{mode, profile?, provider?, model?, ctx?}`. NULL/empty = commercial.
+    /// Same deploy-skew pattern as `validation_config` (migration 021).
+    pub executor_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +273,9 @@ pub struct CreateBriefingInput {
     pub reviewer_provider: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional JSON executor config. NULL/absent = commercial.
+    #[serde(default)]
+    pub executor_config: Option<String>,
 }
 
 // ── Usage Log ────────────────────────────────────────────────────────────────
@@ -319,6 +325,7 @@ mod tests {
             created_at: "".into(),
             updated_at: "".into(),
             validation_config: Some("[]".into()),
+            executor_config: None,
         }
     }
 
@@ -345,6 +352,8 @@ mod tests {
             Some("[]")
         );
         assert!(v.get("validation_config").is_none());
+        assert!(v.as_object().unwrap().contains_key("executorConfig"));
+        assert!(v.get("executor_config").is_none());
         // …and the snake_case forms are absent (guards against a missing rename_all).
         assert!(v.get("initiative_id").is_none());
         assert!(v.get("initiative_status").is_none());

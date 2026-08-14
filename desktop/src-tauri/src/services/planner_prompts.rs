@@ -11,6 +11,32 @@ pub struct PlannerPromptSettings {
     pub schema: String,
     pub development: PlannerDevelopmentPrompts,
     pub planning: PlannerPlanningPrompts,
+    #[serde(default)]
+    pub small_mode: SmallModePrompts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmallModePrompts {
+    #[serde(default = "default_small_mode_planner")]
+    pub planner: String,
+    #[serde(default = "default_small_mode_reviewer")]
+    pub reviewer: String,
+    #[serde(default = "default_small_mode_leaf_wrapper")]
+    pub leaf_wrapper: String,
+    #[serde(default = "default_small_mode_amend_planner")]
+    pub amend_planner: String,
+}
+
+impl Default for SmallModePrompts {
+    fn default() -> Self {
+        Self {
+            planner: DEFAULT_SMALL_MODE_PLANNER.to_string(),
+            reviewer: DEFAULT_SMALL_MODE_REVIEWER.to_string(),
+            leaf_wrapper: DEFAULT_SMALL_MODE_LEAF_WRAPPER.to_string(),
+            amend_planner: DEFAULT_SMALL_MODE_AMEND_PLANNER.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +78,7 @@ impl Default for PlannerPromptSettings {
                 amend_planner: DEFAULT_AMEND_PLANNING_PLANNER.to_string(),
                 amend_reviewer: DEFAULT_AMEND_PLANNING_REVIEWER.to_string(),
             },
+            small_mode: SmallModePrompts::default(),
         }
     }
 }
@@ -66,6 +93,32 @@ fn default_amend_planning_reviewer() -> String {
 
 fn default_schema() -> String {
     SCHEMA.to_string()
+}
+
+fn default_small_mode_planner() -> String {
+    DEFAULT_SMALL_MODE_PLANNER.to_string()
+}
+
+fn default_small_mode_reviewer() -> String {
+    DEFAULT_SMALL_MODE_REVIEWER.to_string()
+}
+
+fn default_small_mode_leaf_wrapper() -> String {
+    DEFAULT_SMALL_MODE_LEAF_WRAPPER.to_string()
+}
+
+fn default_small_mode_amend_planner() -> String {
+    DEFAULT_SMALL_MODE_AMEND_PLANNER.to_string()
+}
+
+/// Prepend a tunable leaf wrapper to `prompt.md` in memory. Empty wrapper is a no-op.
+pub fn wrap_leaf_prompt(wrapper: &str, prompt: &str) -> String {
+    let w = wrapper.trim();
+    if w.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{w}\n\n{prompt}")
+    }
 }
 
 pub fn load_prompt_settings() -> Result<PlannerPromptSettings, String> {
@@ -119,7 +172,7 @@ pub fn render_template(template: &str, values: &[(&str, String)]) -> String {
     rendered
 }
 
-const DEFAULT_DEVELOPMENT_WORKER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+pub(crate) const DEFAULT_DEVELOPMENT_WORKER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
 JOHNNYONE_PHASE_ID: {{phase_id}}
 ROLE: T1_WORKER
 
@@ -180,7 +233,7 @@ FINDINGS:
 NEXT_STEPS:
 - <step for T1 or none>"#;
 
-const DEFAULT_PLANNING_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+pub(crate) const DEFAULT_PLANNING_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
 ROLE: T1_PLANNER
 
 Workspace root: {{workspace_path}}
@@ -209,7 +262,7 @@ When the plan is ready for review, say exactly:
 
 READY_FOR_T2_PLAN_REVIEW"#;
 
-const DEFAULT_PLANNING_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+pub(crate) const DEFAULT_PLANNING_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
 ROLE: T2_PLAN_REVIEWER
 
 Workspace root: {{workspace_path}}
@@ -314,3 +367,145 @@ FINDINGS:
 - <finding or none>
 NEXT_STEPS:
 - <step for T1 or none>"#;
+
+pub(crate) const DEFAULT_SMALL_MODE_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+ROLE: T1_PLANNER (LOCAL-SMALL)
+
+Workspace root: {{workspace_path}}
+App/source scope: {{app_scope}}
+Docs scope: {{docs_scope}}
+Plan output path: {{plan_output_path}}
+Methodology: {{methodology_path}}
+Conventions: {{conventions_path}}
+
+User brief:
+{{user_brief}}
+
+Reference paths:
+{{reference_paths}}
+
+Emit a methodology-compliant plan that a mechanical plan-check can execute. Every phase must contain at least one task.yml dir; a plan with none is rule empty_plan.
+
+Each task dir must contain task.yml + prompt.md. task.yml fields (only these):
+id, files, new, verify, must_contain, depends_on, ctx, cwd
+Do not invent other fields.
+
+cwd is the directory to run verify in (e.g. desktop/src-tauri). When cwd is set, every files[] and new: path is still workspace-relative and must live under that cwd (files_outside_cwd otherwise).
+
+verify must be an allowlisted argv command (cargo test / npx vitest|jest run / go test / python -m pytest / node). Do not schedule UI tasks: no .html/.scss/.css in files[]. The checker rejects UI tasks as ui_task_forbidden.
+
+D12 sizing: keep each task small enough for the leaf executor. Do not write tasks.json. Do not self-claim done.
+
+status.md lists phases, not tasks — one row per phase (id, one-line goal, task count).
+phase overview task table is id and one-line goal only — no files[] / verify / prompt dump.
+
+When the plan is ready for review, say exactly:
+
+READY_FOR_T2_PLAN_REVIEW"#;
+
+pub(crate) const DEFAULT_SMALL_MODE_REVIEWER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+ROLE: T2_PLAN_REVIEWER (LOCAL-SMALL)
+
+Workspace root: {{workspace_path}}
+App/source scope: {{app_scope}}
+Docs scope: {{docs_scope}}
+Plan path: {{plan_output_path}}
+Methodology: {{methodology_path}}
+Conventions: {{conventions_path}}
+
+The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules.
+
+Judge only: brief coverage, decomposition, phase ordering, and whether each phase's tasks add up to that phase's goal.
+
+Return this footer exactly:
+
+PLAN: {{plan_output_path}}
+VERDICT: PASS | NEEDS_CHANGES | BLOCKED
+SUMMARY: <one paragraph>
+FINDINGS:
+- <finding or none>
+NEXT_STEPS:
+- <step for T1 or none>"#;
+
+pub(crate) const DEFAULT_SMALL_MODE_LEAF_WRAPPER: &str = r#"You are a leaf executor. Edit only the files listed in files[].
+Do not touch status.yml or tasks.json. Do not rewrite the plan store.
+Stop when verify passes. Do not add extra files or drive-by refactors."#;
+
+pub(crate) const DEFAULT_SMALL_MODE_AMEND_PLANNER: &str = r#"JOHNNYONE_RUN_ID: {{run_id}}
+ROLE: T1_PLANNER (LOCAL-SMALL AMEND)
+
+Workspace root: {{workspace_path}}
+Existing plan at: {{plan_output_path}}
+
+This is a mid-phase replan. Read amendment.json. Fix or split failed tasks only.
+Do not rewrite done task dirs. Do not drop commits. Do not invent mock fields.
+
+When ready, say READY_FOR_T2_PLAN_REVIEW"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_yaml_without_small_mode_still_deserializes() {
+        let raw = r#"
+schema: johnnyone-planner-prompts/v1
+development:
+  worker: W
+  reviewer: R
+planning:
+  planner: P
+  reviewer: V
+"#;
+        let s: PlannerPromptSettings = serde_yaml::from_str(raw).unwrap();
+        assert_eq!(s.development.worker, "W");
+        assert_eq!(s.planning.planner, "P");
+        assert_eq!(s.small_mode.planner, DEFAULT_SMALL_MODE_PLANNER);
+        assert_eq!(s.small_mode.reviewer, DEFAULT_SMALL_MODE_REVIEWER);
+        assert_eq!(s.small_mode.leaf_wrapper, DEFAULT_SMALL_MODE_LEAF_WRAPPER);
+        assert_eq!(s.small_mode.amend_planner, DEFAULT_SMALL_MODE_AMEND_PLANNER);
+    }
+
+    #[test]
+    fn default_reviewer_contains_plan_check_sentence() {
+        assert!(DEFAULT_SMALL_MODE_REVIEWER.contains(
+            "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules."
+        ));
+    }
+
+    #[test]
+    fn default_planner_teaches_required_fields_and_rollup() {
+        let p = DEFAULT_SMALL_MODE_PLANNER;
+        assert!(p.contains("task.yml"));
+        assert!(p.contains("must_contain"));
+        assert!(p.contains("cwd"));
+        assert!(p.contains("empty_plan"));
+        assert!(p.contains("status.md lists phases, not tasks"));
+        assert!(p.contains("phase overview task table is id and one-line goal only"));
+        let taught = p.split("task.yml fields").nth(1).unwrap_or(p);
+        assert!(
+            !taught.contains("mock:"),
+            "taught-fields section must not include mock:: {taught}"
+        );
+    }
+
+    #[test]
+    fn commercial_defaults_are_byte_for_byte() {
+        let d = PlannerPromptSettings::default();
+        assert_eq!(d.planning.planner, DEFAULT_PLANNING_PLANNER);
+        assert_eq!(d.planning.reviewer, DEFAULT_PLANNING_REVIEWER);
+        assert_eq!(d.development.worker, DEFAULT_DEVELOPMENT_WORKER);
+    }
+
+    #[test]
+    fn wrap_leaf_prompt_empty_is_identity() {
+        assert_eq!(wrap_leaf_prompt("", "body"), "body");
+        assert_eq!(wrap_leaf_prompt("  \n", "body"), "body");
+        assert_eq!(wrap_leaf_prompt("WRAP", "body"), "WRAP\n\nbody");
+    }
+
+    #[test]
+    fn leaf_wrapper_is_short() {
+        assert!(DEFAULT_SMALL_MODE_LEAF_WRAPPER.lines().count() <= 30);
+    }
+}

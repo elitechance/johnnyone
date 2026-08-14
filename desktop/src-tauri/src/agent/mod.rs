@@ -914,6 +914,10 @@ impl AgentService {
                 Self::rpc_add_initiative_reference_path(&req.params, state)
             }
             "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
+            "get_plan_check" => Self::rpc_get_plan_check(&req.params, state),
+            "get_task_run" => Self::rpc_get_task_run(&req.params, state),
+            "get_kloo_doctor" => Self::rpc_get_kloo_doctor(),
+            "get_kloo_probe" => Self::rpc_get_kloo_probe(),
             "update_planner_prompt_settings" => {
                 Self::rpc_update_planner_prompt_settings(&req.params)
             }
@@ -1841,6 +1845,51 @@ impl AgentService {
     fn rpc_get_planner_prompt_settings() -> Result<serde_json::Value, String> {
         let settings = crate::services::planner_prompts::load_prompt_settings()?;
         serde_json::to_value(settings).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_plan_check(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let plan_id = params
+            .get("planId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'planId' parameter".to_string())?;
+        let phase_id = params.get("phaseId").and_then(|v| v.as_str());
+        match crate::services::agent_plans::get_plan_check_json(state, plan_id, phase_id)? {
+            Some(raw) => Ok(serde_json::Value::String(raw)),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
+    fn rpc_get_task_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let plan_id = params
+            .get("planId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'planId' parameter".to_string())?;
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'phaseId' parameter".to_string())?;
+        match crate::services::agent_plans::get_task_run_json(state, plan_id, phase_id)? {
+            Some(raw) => Ok(serde_json::Value::String(raw)),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
+    fn rpc_get_kloo_doctor() -> Result<serde_json::Value, String> {
+        Ok(serde_json::Value::String(
+            crate::services::agent_plans::get_kloo_doctor_json(),
+        ))
+    }
+
+    fn rpc_get_kloo_probe() -> Result<serde_json::Value, String> {
+        Ok(serde_json::Value::String(
+            crate::services::agent_plans::get_kloo_probe_json(),
+        ))
     }
 
     fn rpc_update_planner_prompt_settings(

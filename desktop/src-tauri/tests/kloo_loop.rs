@@ -164,6 +164,7 @@ fn dummy_run(ws: &Path, plan: &Path, plan_id: &str, initiative: &str) -> AgentPl
             created_at: now.clone(),
             updated_at: now,
             validation_config: None,
+            executor_config: None,
         },
         phases: vec![phase],
         tasks: vec![],

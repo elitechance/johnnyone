@@ -512,6 +512,16 @@ struct GqlPlannerPromptSettings {
     schema: String,
     development: GqlPlannerDevelopmentPrompts,
     planning: GqlPlannerPlanningPrompts,
+    small_mode: GqlPlannerSmallModePrompts,
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "PlannerSmallModePrompts", rename_fields = "camelCase")]
+struct GqlPlannerSmallModePrompts {
+    planner: String,
+    reviewer: String,
+    leaf_wrapper: String,
+    amend_planner: String,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -539,6 +549,12 @@ impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
             planning: GqlPlannerPlanningPrompts {
                 planner: value.planning.planner,
                 reviewer: value.planning.reviewer,
+            },
+            small_mode: GqlPlannerSmallModePrompts {
+                planner: value.small_mode.planner,
+                reviewer: value.small_mode.reviewer,
+                leaf_wrapper: value.small_mode.leaf_wrapper,
+                amend_planner: value.small_mode.amend_planner,
             },
         }
     }
@@ -662,6 +678,16 @@ impl From<UpsertProviderConfigInputGql> for UpsertProviderConfigInput {
 struct PlannerPromptSettingsInput {
     development: PlannerDevelopmentPromptsInput,
     planning: PlannerPlanningPromptsInput,
+    small_mode: Option<PlannerSmallModePromptsInput>,
+}
+
+#[derive(InputObject)]
+#[graphql(name = "PlannerSmallModePromptsInput", rename_fields = "camelCase")]
+struct PlannerSmallModePromptsInput {
+    planner: String,
+    reviewer: String,
+    leaf_wrapper: String,
+    amend_planner: String,
 }
 
 #[derive(InputObject)]
@@ -690,6 +716,12 @@ impl From<PlannerPromptSettingsInput> for PlannerPromptSettings {
         prompts.development.reviewer = value.development.reviewer;
         prompts.planning.planner = value.planning.planner;
         prompts.planning.reviewer = value.planning.reviewer;
+        if let Some(sm) = value.small_mode {
+            prompts.small_mode.planner = sm.planner;
+            prompts.small_mode.reviewer = sm.reviewer;
+            prompts.small_mode.leaf_wrapper = sm.leaf_wrapper;
+            prompts.small_mode.amend_planner = sm.amend_planner;
+        }
         prompts
     }
 }

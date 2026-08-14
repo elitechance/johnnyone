@@ -151,6 +151,8 @@ type AgentPlan {
   # initiative axes above: a worker deploy against a not-yet-rebuilt (pre-migration 018) desktop
   # returns JSON without this key; nullable degrades to null. Non-null only on a briefing Initiative.
   briefingSessionId: String
+  # Local-small executor mode JSON. NULL/empty = commercial. Deploy-skew nullable like validationConfig.
+  executorConfig: String
   createdAt: String!
   updatedAt: String!
 }
@@ -325,6 +327,14 @@ type PlannerPromptSettings {
   schema: String!
   development: PlannerDevelopmentPrompts!
   planning: PlannerPlanningPrompts!
+  smallMode: PlannerSmallModePrompts!
+}
+
+type PlannerSmallModePrompts {
+  planner: String!
+  reviewer: String!
+  leafWrapper: String!
+  amendPlanner: String!
 }
 
 type PlannerDevelopmentPrompts {
@@ -437,6 +447,7 @@ input CreateBriefingInput {
   workerProvider: String!
   reviewerProvider: String!
   model: String
+  executorConfig: String
 }
 
 # Accept a briefing brief (overhaul P4, D1/D4): flips the same Initiative briefing→planning.
@@ -448,6 +459,14 @@ input AcceptBriefInput {
 input PlannerPromptSettingsInput {
   development: PlannerDevelopmentPromptsInput!
   planning: PlannerPlanningPromptsInput!
+  smallMode: PlannerSmallModePromptsInput
+}
+
+input PlannerSmallModePromptsInput {
+  planner: String!
+  reviewer: String!
+  leafWrapper: String!
+  amendPlanner: String!
 }
 
 input PlannerDevelopmentPromptsInput {
@@ -474,6 +493,10 @@ type Query {
   listDetectedCliTools: [DetectedTool!]!
   getSetting(key: String!): String!
   getPlannerPromptSettings: PlannerPromptSettings!
+  getPlanCheck(planId: ID!, phaseId: String): String
+  getTaskRun(planId: ID!, phaseId: String!): String
+  getKlooDoctor: String!
+  getKlooProbe: String!
   listAgentPlans(status: String, runType: String, onlyExisting: Boolean): [AgentPlan!]!
   getAgentPlan(id: ID!): AgentPlanRun!
   "Full SDLC event timeline for one Initiative — the union of every plan-run's events (planning + development share one initiativeId), oldest-first."

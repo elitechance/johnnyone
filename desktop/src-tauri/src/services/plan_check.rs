@@ -229,7 +229,7 @@ pub enum TokensError {
 
 pub trait PlanCheckHost: Send + Sync {
     fn spawn(&self, req: &SpawnRequest) -> SpawnResult;
-    fn tokens(&self, ctx: u32, prompt: &Path) -> Result<TokensReport, TokensError>;
+    fn tokens(&self, ctx: u32, prompt_text: &str) -> Result<TokensReport, TokensError>;
 }
 
 /// Live process host. Never `sh -c`.
@@ -240,7 +240,20 @@ impl PlanCheckHost for RealPlanCheckHost {
         spawn_argv(&req.argv, &req.cwd, req.timeout_ms)
     }
 
-    fn tokens(&self, ctx: u32, prompt: &Path) -> Result<TokensReport, TokensError> {
+    fn tokens(&self, ctx: u32, prompt_text: &str) -> Result<TokensReport, TokensError> {
+        let dir = std::env::temp_dir().join("johnnyone-tokens");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!(
+            "prompt-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, prompt_text).map_err(|e| {
+            TokensError::Unavailable(format!("write tokens temp: {e}"))
+        })?;
         let argv = vec![
             "kloo".to_string(),
             "tokens".to_string(),
@@ -248,9 +261,10 @@ impl PlanCheckHost for RealPlanCheckHost {
             "--ctx".to_string(),
             ctx.to_string(),
             "--file".to_string(),
-            prompt.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
         ];
         let out = spawn_argv_capture(&argv, Path::new("."), 30_000);
+        let _ = std::fs::remove_file(&path);
         match out {
             Err(e) => Err(TokensError::Unavailable(e.detail)),
             Ok(body) => parse_tokens_json(&body),
@@ -440,6 +454,8 @@ pub struct CheckPlanOpts<'a> {
     pub tokens_only: bool,
     /// Remaining stage budget for the tokens walk. `Some(0)` skips immediately.
     pub tokens_budget_ms: Option<u64>,
+    /// Leaf wrapper prepended in memory for tokens (task 03-04). Empty/None = prompt.md alone.
+    pub leaf_wrapper: Option<&'a str>,
 }
 
 impl<'a> CheckPlanOpts<'a> {
@@ -456,6 +472,7 @@ impl<'a> CheckPlanOpts<'a> {
             previous_skipped: &[],
             tokens_only: false,
             tokens_budget_ms: None,
+            leaf_wrapper: None,
         }
     }
 
@@ -472,6 +489,7 @@ impl<'a> CheckPlanOpts<'a> {
             previous_skipped: &[],
             tokens_only: false,
             tokens_budget_ms: None,
+            leaf_wrapper: None,
         }
     }
 }
@@ -536,7 +554,14 @@ pub fn check_plan_with(
 
     if opts.tokens_only {
         collect_token_targets(plan_path, opts.only_phase, &mut loaded_for_tokens);
-        check_tokens(plan_path, &loaded_for_tokens, host, &mut report, opts.tokens_budget_ms);
+        check_tokens(
+            plan_path,
+            &loaded_for_tokens,
+            host,
+            &mut report,
+            opts.tokens_budget_ms,
+            opts.leaf_wrapper,
+        );
         report.passed = !report.items.iter().any(|i| i.blocking);
         return report;
     }
@@ -603,7 +628,14 @@ pub fn check_plan_with(
         report.items.push(item(None, RULE_EMPTY_PLAN, detail));
     }
     if opts.tokens {
-        check_tokens(plan_path, &loaded_for_tokens, host, &mut report, opts.tokens_budget_ms);
+        check_tokens(
+            plan_path,
+            &loaded_for_tokens,
+            host,
+            &mut report,
+            opts.tokens_budget_ms,
+            opts.leaf_wrapper,
+        );
     }
     report.tasks_checked = total_tasks;
     report.passed = !report.items.iter().any(|i| i.blocking);
@@ -1302,6 +1334,7 @@ fn check_tokens(
     host: &dyn PlanCheckHost,
     report: &mut PlanCheckReport,
     budget_ms: Option<u64>,
+    opts_wrapper: Option<&str>,
 ) {
     if budget_ms == Some(0) {
         report.items.push(item(
@@ -1329,7 +1362,15 @@ fn check_tokens(
             }
         }
         let ctx = spec.as_ref().and_then(|s| s.ctx).unwrap_or(32768);
-        match host.tokens(ctx, &prompt) {
+        let body = match std::fs::read_to_string(&prompt) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let measured = crate::services::planner_prompts::wrap_leaf_prompt(
+            opts_wrapper.unwrap_or(""),
+            &body,
+        );
+        match host.tokens(ctx, &measured) {
             Ok(tok) if !tok.fits => {
                 report.items.push(item(
                     Some(id),
@@ -2781,7 +2822,7 @@ mod tests {
             result
         }
 
-        fn tokens(&self, _ctx: u32, _prompt: &Path) -> Result<TokensReport, TokensError> {
+        fn tokens(&self, _ctx: u32, _prompt: &str) -> Result<TokensReport, TokensError> {
             self.tokens.clone()
         }
     }
@@ -3167,6 +3208,65 @@ mod tests {
     }
 
     #[test]
+    fn tokens_measure_wrapper_plus_prompt() {
+        let root = tmp("tok-wrap");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        struct WrapHost;
+        impl PlanCheckHost for WrapHost {
+            fn spawn(&self, _req: &SpawnRequest) -> SpawnResult {
+                SpawnResult::ok_zero()
+            }
+            fn tokens(&self, _c: u32, text: &str) -> Result<TokensReport, TokensError> {
+                let fits = !text.contains("WRAP-SENTINEL");
+                Ok(TokensReport {
+                    fits,
+                    approx_tokens: Some(if fits { 1 } else { 9 }),
+                    usable_window: Some(1),
+                    compact_trigger: Some(1),
+                })
+            }
+        }
+        let host = WrapHost;
+        let alone = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            !alone.items.iter().any(|i| i.rule == RULE_PROMPT_EXCEEDS_CONTEXT),
+            "{:?}",
+            alone.items
+        );
+        let wrapped = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                leaf_wrapper: Some("WRAP-SENTINEL"),
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            wrapped
+                .items
+                .iter()
+                .any(|i| i.rule == RULE_PROMPT_EXCEEDS_CONTEXT),
+            "{:?}",
+            wrapped.items
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn tokens_fits_false_emits_numbers() {
         let root = tmp("tok-no");
         let plan = root.join("plan");
@@ -3288,7 +3388,7 @@ mod tests {
                 }
                 SpawnResult::exit(1)
             }
-            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            fn tokens(&self, _c: u32, _p: &str) -> Result<TokensReport, TokensError> {
                 Ok(TokensReport {
                     fits: true,
                     approx_tokens: Some(1),
@@ -3413,7 +3513,7 @@ mod tests {
                 }
                 SpawnResult::exit(1)
             }
-            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            fn tokens(&self, _c: u32, _p: &str) -> Result<TokensReport, TokensError> {
                 Ok(TokensReport {
                     fits: true,
                     approx_tokens: Some(1),

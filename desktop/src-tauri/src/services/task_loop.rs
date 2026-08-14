@@ -203,6 +203,8 @@ pub struct KlooPhaseCtx {
     /// wrapper so they never mutate process-global `PATH` / `J1_FAKE_KLOO_*`.
     /// Production leaves this `None` and resolves `kloo` from PATH.
     pub kloo_cli: Option<String>,
+    /// In-memory leaf wrapper prepended to prompt.md at spawn. Empty = no wrap.
+    pub leaf_wrapper: String,
 }
 
 pub fn register_kloo_pid(state: &AppState, plan_id: &str, pid: u32) {
@@ -473,6 +475,15 @@ pub async fn run_kloo_phase_ex(
         workspace: PathBuf::from(&run.plan.workspace_path),
         runs_dir,
         kloo_cli,
+        leaf_wrapper: if crate::services::agent_plans::executor_mode_is_local_small(
+            run.plan.executor_config.as_deref(),
+        ) {
+            crate::services::planner_prompts::load_prompt_settings()
+                .map(|s| s.small_mode.leaf_wrapper)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
     };
     let mut host = RealHost {
         state: state.clone(),
@@ -594,9 +605,13 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
 
             let attempt_n = row_ref(&file, &task_id)?.attempts.len() as u32 + 1;
             let started = Utc::now().to_rfc3339();
+            let wrapped = crate::services::planner_prompts::wrap_leaf_prompt(
+                &ctx.leaf_wrapper,
+                &prompt,
+            );
             let req = KlooRunRequest {
                 workspace: ctx.workspace.to_string_lossy().into_owned(),
-                prompt: prompt.clone(),
+                prompt: wrapped,
                 files: spec.files.clone(),
                 verify: spec.verify.clone(),
                 cwd: spec.cwd.clone(),
@@ -1414,6 +1429,7 @@ mod tests {
         status: Arc<Mutex<String>>,
         spawn_scripts: VecDeque<Box<dyn FnMut(&KlooRunRequest) -> Result<SpawnOutcome, String> + Send>>,
         spawned_files: Vec<Vec<String>>,
+        spawned_prompts: Vec<String>,
         spawned_models: Vec<String>,
         commits: Vec<String>,
         events: Vec<String>,
@@ -1430,6 +1446,7 @@ mod tests {
                 status: Arc::new(Mutex::new("phase_worker_running".into())),
                 spawn_scripts: VecDeque::new(),
                 spawned_files: vec![],
+                spawned_prompts: vec![],
                 spawned_models: vec![],
                 commits: vec![],
                 events: vec![],
@@ -1490,6 +1507,7 @@ mod tests {
             req: &'a KlooRunRequest,
         ) -> Pin<Box<dyn Future<Output = Result<SpawnOutcome, String>> + Send + 'a>> {
             self.spawned_files.push(req.files.clone());
+            self.spawned_prompts.push(req.prompt.clone());
             self.spawned_models.push(req.model.clone());
             let next = self
                 .spawn_scripts
@@ -1591,6 +1609,7 @@ mod tests {
                 workspace,
                 runs_dir,
                 kloo_cli: None,
+                leaf_wrapper: String::new(),
             },
             root.to_path_buf(),
         )
@@ -1859,6 +1878,47 @@ mod tests {
             file.tasks.iter().all(|t| t.attempts.last().and_then(|a| a.class.as_deref()).is_none()),
             "passing attempts must not be labelled infra"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn leaf_wrapper_is_prepended_and_disk_prompt_unchanged() {
+        let root = tmp("wrap");
+        let (mut ctx, _) = ctx_for(&root, "00-x");
+        ctx.leaf_wrapper = "WRAP-SENTINEL".into();
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "BODY",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_pass("a.rs", "fn a() {}\n");
+        let _ = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert!(
+            host.spawned_prompts.iter().any(|p| p.starts_with("WRAP-SENTINEL\n\nBODY")),
+            "{:?}",
+            host.spawned_prompts
+        );
+        let on_disk = std::fs::read_to_string(ctx.phase_dir.join("tasks/01-a/prompt.md")).unwrap();
+        assert_eq!(on_disk, "BODY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn empty_leaf_wrapper_is_exact_prompt() {
+        let root = tmp("nowrap");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "BODY",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_pass("a.rs", "fn a() {}\n");
+        let _ = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(host.spawned_prompts, vec!["BODY".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

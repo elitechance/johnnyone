@@ -416,6 +416,15 @@ pub async fn create_briefing_run(
 ) -> Result<AgentPlanRun, String> {
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
+    let parsed_exec = parse_executor_config(input.executor_config.as_deref())?;
+    if parsed_exec
+        .as_ref()
+        .map(|c| c.mode == "local-small")
+        .unwrap_or(false)
+        && input.worker_provider == "kloo"
+    {
+        return Err("mode=local-small cannot be combined with worker_provider=kloo".into());
+    }
     let workspace = normalize_path(Path::new(&input.workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
@@ -468,8 +477,8 @@ pub async fn create_briefing_run(
             // Fresh briefing Initiative: id == initiative_id (?1); plan_path (?4) is the store path;
             // initiative_status='briefing', worker/reviewer sessions NULL (no planner yet),
             // briefing_session_id (?7) links the chat session, health seeded 'in-progress'.
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, initiative_id, initiative_status, health, briefing_session_id, validation_config)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', NULL, NULL, ?5, ?6, 0, ?8, ?1, 'briefing', 'in-progress', ?7, NULL)",
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, initiative_id, initiative_status, health, briefing_session_id, validation_config, executor_config)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', NULL, NULL, ?5, ?6, 0, ?8, ?1, 'briefing', 'in-progress', ?7, NULL, ?9)",
             params![
                 plan_id,
                 title,
@@ -479,6 +488,7 @@ pub async fn create_briefing_run(
                 input.reviewer_provider,
                 chat_session.id,
                 input.brief.clone().unwrap_or_default(),
+                input.executor_config.clone(),
             ],
         )
         .map_err(|e| format!("Failed to create briefing run: {}", e))
@@ -680,7 +690,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -702,7 +712,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -3555,6 +3565,104 @@ impl PlanningCheckCtrl<'static> {
     }
 }
 
+pub fn get_plan_check_json(
+    state: &AppState,
+    plan_id: &str,
+    phase_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let run = get_plan(state, plan_id)?;
+    let path = match phase_id.map(str::trim).filter(|s| !s.is_empty()) {
+        None => plan_check_json_path(state, &run),
+        Some(phase) => {
+            let initiatives = settings_service::resolve_initiatives_dir(state);
+            settings_service::initiative_runs_path(
+                &initiatives,
+                &run.plan.initiative_id,
+                &run.plan.id,
+                phase,
+            )
+            .join("preflight.json")
+        }
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| format!("read plan-check: {e}"))
+}
+
+pub fn get_task_run_json(
+    state: &AppState,
+    plan_id: &str,
+    phase_id: &str,
+) -> Result<Option<String>, String> {
+    let run = get_plan(state, plan_id)?;
+    let initiatives = settings_service::resolve_initiatives_dir(state);
+    let path = crate::services::task_state::tasks_json_path(&settings_service::initiative_runs_path(
+        &initiatives,
+        &run.plan.initiative_id,
+        &run.plan.id,
+        phase_id,
+    ));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| format!("read tasks.json: {e}"))
+}
+
+fn spawn_kloo_json(args: &[&str], timeout_ms: u64) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("kloo");
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            r#"{"error":"kloo not found"}"#.to_string()
+        } else {
+            format!(r#"{{"error":"spawn kloo: {e}"}}"#)
+        }
+    })?;
+    let start = Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut buf = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_string(&mut buf);
+                }
+                if buf.trim().is_empty() && !status.success() {
+                    return Ok(format!(
+                        r#"{{"error":"kloo exited {}"}}"#,
+                        status.code().unwrap_or(1)
+                    ));
+                }
+                return Ok(buf);
+            }
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                return Ok(r#"{"error":"kloo timed out"}"#.into());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Ok(format!(r#"{{"error":"wait kloo: {e}"}}"#)),
+        }
+    }
+}
+
+pub fn get_kloo_doctor_json() -> String {
+    spawn_kloo_json(&["doctor", "--json"], 15_000)
+        .unwrap_or_else(|e| e)
+}
+
+pub fn get_kloo_probe_json() -> String {
+    spawn_kloo_json(&["probe", "--json"], 60_000)
+        .unwrap_or_else(|e| e)
+}
+
 pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> Result<bool, String> {
     let raw: Option<String> = state.db.with_conn(|conn| {
         conn.query_row(
@@ -3568,17 +3676,36 @@ pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> Result<bool, St
 }
 
 pub(crate) fn executor_mode_is_local_small(raw: Option<&str>) -> bool {
+    matches!(
+        parse_executor_config(raw),
+        Ok(Some(cfg)) if cfg.mode == "local-small"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutorConfig {
+    pub mode: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub ctx: Option<u32>,
+}
+
+/// Empty/null → commercial (`Ok(None)`). Unknown mode is an error (write path).
+pub fn parse_executor_config(raw: Option<&str>) -> Result<Option<ExecutorConfig>, String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return false;
+        return Ok(None);
     };
-    serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
-        .and_then(|v| {
-            v.get("mode")
-                .and_then(|m| m.as_str())
-                .map(|m| m == "local-small")
-        })
-        .unwrap_or(false)
+    let cfg: ExecutorConfig = serde_json::from_str(raw)
+        .map_err(|e| format!("invalid executorConfig: {e}"))?;
+    match cfg.mode.as_str() {
+        "local-small" | "commercial" => Ok(Some(cfg)),
+        other => Err(format!("unknown executorConfig.mode {other:?}")),
+    }
 }
 
 #[cfg(test)]
@@ -3618,6 +3745,7 @@ struct CheckPlanCall<'a> {
     tokens_only: bool,
     run: Option<&'a crate::services::task_state::TaskRunFile>,
     tokens_budget_ms: Option<u64>,
+    leaf_wrapper: Option<&'a str>,
 }
 
 async fn run_check_plan_blocking(
@@ -3633,6 +3761,7 @@ async fn run_check_plan_blocking(
         opts.previous_skipped = call.previous_skipped;
         apply_check_mode(&mut opts, call.tokens, call.tokens_only);
         opts.tokens_budget_ms = call.tokens_budget_ms;
+        opts.leaf_wrapper = call.leaf_wrapper;
         return Ok(crate::services::plan_check::check_plan_with(
             plan_path, workspace, &opts,
         ));
@@ -3645,6 +3774,7 @@ async fn run_check_plan_blocking(
     let tokens_only = call.tokens_only;
     let skip_execute = call.skip_execute;
     let tokens_budget_ms = call.tokens_budget_ms;
+    let wrapper_owned = call.leaf_wrapper.map(str::to_string);
     let run_owned = call.run.cloned();
     tokio::task::spawn_blocking(move || {
         let mut opts = crate::services::plan_check::CheckPlanOpts::shape_only(run_owned.as_ref());
@@ -3653,6 +3783,7 @@ async fn run_check_plan_blocking(
         opts.tokens_budget_ms = tokens_budget_ms;
         opts.skip_execute = skip_execute;
         opts.previous_skipped = &prev;
+        opts.leaf_wrapper = wrapper_owned.as_deref();
         apply_check_mode(&mut opts, tokens, tokens_only);
         crate::services::plan_check::check_plan_with(&plan_path, &workspace, &opts)
     })
@@ -3796,6 +3927,18 @@ pub(crate) async fn gate_planning_lenses(
         phase_ids.push(String::new());
     }
 
+    let leaf_wrapper = if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
+        planner_prompts::load_prompt_settings()
+            .map(|s| s.small_mode.leaf_wrapper)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let wrapper_ref = if leaf_wrapper.trim().is_empty() {
+        None
+    } else {
+        Some(leaf_wrapper.as_str())
+    };
     let mut acc = crate::services::plan_check::PlanCheckReport::empty();
     let stage_start = Instant::now();
     for phase_id in &phase_ids {
@@ -3822,6 +3965,7 @@ pub(crate) async fn gate_planning_lenses(
                 tokens_only: false,
                 run: None,
                 tokens_budget_ms: None,
+                leaf_wrapper: wrapper_ref,
             },
         )
         .await?;
@@ -3882,6 +4026,7 @@ pub(crate) async fn gate_planning_lenses(
                 tokens_only: true,
                 run: None,
                 tokens_budget_ms: Some(ctrl.stage_budget_ms.saturating_sub(elapsed)),
+                leaf_wrapper: wrapper_ref,
             },
         )
         .await?;
@@ -4056,6 +4201,13 @@ pub(crate) async fn run_phase_preflight_with(
     .ok();
     let plan_path = PathBuf::from(&run.plan.plan_path);
     let workspace = PathBuf::from(&run.plan.workspace_path);
+    let leaf_wrapper = if executor_mode_is_local_small(run.plan.executor_config.as_deref()) {
+        planner_prompts::load_prompt_settings()
+            .map(|s| s.small_mode.leaf_wrapper)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let report = run_check_plan_blocking(
         &plan_path,
         &workspace,
@@ -4070,6 +4222,11 @@ pub(crate) async fn run_phase_preflight_with(
             tokens_budget_ms: Some(
                 tokens_budget_ms.unwrap_or(crate::services::plan_check::MAX_PLANNING_CHECK_MS),
             ),
+            leaf_wrapper: if leaf_wrapper.trim().is_empty() {
+                None
+            } else {
+                Some(leaf_wrapper.as_str())
+            },
         },
     )
     .await?;
@@ -4332,6 +4489,27 @@ async fn handle_planning_reviewer_output(
 /// manual step. Best-effort: any failure (most likely the plan is off-spec and `parse_plan` finds no
 /// `overview.md`/`phases/`) is recorded as an event and leaves the initiative at planning-approved for
 /// a human to resolve, rather than breaking the coordinator.
+fn copy_initiative_json_fields(state: &AppState, from: &AgentPlan, to_id: &str) {
+    if let Some(cfg) = from.validation_config.clone() {
+        let _ = state.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agent_plans SET validation_config = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![cfg, to_id],
+            )
+            .map_err(|e| e.to_string())
+        });
+    }
+    if let Some(cfg) = from.executor_config.clone() {
+        let _ = state.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agent_plans SET executor_config = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![cfg, to_id],
+            )
+            .map_err(|e| e.to_string())
+        });
+    }
+}
+
 fn auto_start_development<'a>(
     state: &'a AppState,
     planning: &'a AgentPlanRun,
@@ -4377,15 +4555,7 @@ fn auto_start_development<'a>(
     // Carry the initiative's configured validation lenses onto the development run — `create_plan`
     // seeds validation_config NULL, so without this the review fan-out would fall back to the default
     // template instead of the lenses the user set at creation.
-    if let Some(cfg) = planning.plan.validation_config.clone() {
-        let _ = state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET validation_config = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![cfg, dev.plan.id],
-            )
-            .map_err(|e| e.to_string())
-        });
-    }
+    copy_initiative_json_fields(state, &planning.plan, &dev.plan.id);
     let _ = append_event(
         state,
         &dev.plan.id,
@@ -5196,43 +5366,78 @@ fn planning_continue_prompt(run: &AgentPlanRun) -> String {
     )
 }
 
-fn planning_planner_prompt(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
-    let settings = planner_prompts::load_prompt_settings()?;
-    // Pick the template variant based on whether an amend cycle is in flight.
-    // The `amend_planner` / `amend_reviewer` templates instruct T1 to edit in
-    // place + T2 to validate the diff, rather than treating the plan as a
-    // greenfield creation.
-    let amending = run
-        .plan
+fn planning_is_amending(run: &AgentPlanRun) -> bool {
+    run.plan
         .amend_brief
         .as_deref()
         .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let template = if amending {
+        .unwrap_or(false)
+}
+
+pub(crate) fn select_planning_planner<'a>(
+    settings: &'a planner_prompts::PlannerPromptSettings,
+    local_small: bool,
+    amending: bool,
+) -> &'a str {
+    if local_small {
+        if amending {
+            &settings.small_mode.amend_planner
+        } else {
+            &settings.small_mode.planner
+        }
+    } else if amending {
         &settings.planning.amend_planner
     } else {
         &settings.planning.planner
-    };
+    }
+}
+
+pub(crate) fn select_planning_reviewer<'a>(
+    settings: &'a planner_prompts::PlannerPromptSettings,
+    local_small: bool,
+    amending: bool,
+) -> &'a str {
+    if local_small {
+        &settings.small_mode.reviewer
+    } else if amending {
+        &settings.planning.amend_reviewer
+    } else {
+        &settings.planning.reviewer
+    }
+}
+
+fn planning_planner_prompt(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
+    let settings = planner_prompts::load_prompt_settings()?;
+    planning_planner_prompt_from(&settings, state, run)
+}
+
+fn planning_planner_prompt_from(
+    settings: &planner_prompts::PlannerPromptSettings,
+    state: &AppState,
+    run: &AgentPlanRun,
+) -> Result<String, String> {
+    let local_small = executor_mode_is_local_small(run.plan.executor_config.as_deref());
+    let template = select_planning_planner(settings, local_small, planning_is_amending(run));
     let base = planner_prompts::render_template(template, &planning_template_values(state, run));
     Ok(append_worker_report(run, base))
 }
 
 // Superseded by `planning_lens_reviewer_prompt` (3-lens fan-out); retained as the
-// reference single-reviewer planning prompt.
+// reference single-reviewer planning prompt. Local-small still selects here so
+// settings overrides are testable (Amendment 4 / Q3).
 #[allow(dead_code)]
 fn planning_reviewer_prompt(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
     let settings = planner_prompts::load_prompt_settings()?;
-    let amending = run
-        .plan
-        .amend_brief
-        .as_deref()
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let template = if amending {
-        &settings.planning.amend_reviewer
-    } else {
-        &settings.planning.reviewer
-    };
+    planning_reviewer_prompt_from(&settings, state, run)
+}
+
+fn planning_reviewer_prompt_from(
+    settings: &planner_prompts::PlannerPromptSettings,
+    state: &AppState,
+    run: &AgentPlanRun,
+) -> Result<String, String> {
+    let local_small = executor_mode_is_local_small(run.plan.executor_config.as_deref());
+    let template = select_planning_reviewer(settings, local_small, planning_is_amending(run));
     let base = planner_prompts::render_template(template, &planning_template_values(state, run));
     Ok(append_reviewer_report(run, base))
 }
@@ -6365,9 +6570,10 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         briefing_session_id: row.get(22)?,
         created_at: row.get(23)?,
         updated_at: row.get(24)?,
-        // Appended last (P7, D3) — order is load-bearing; every SELECT feeding this mapper
-        // ends with validation_config.
+        // Appended last (P7, D3 / phase 03) — order is load-bearing; every SELECT
+        // feeding this mapper ends with validation_config, executor_config.
         validation_config: row.get(25)?,
+        executor_config: row.get(26)?,
     })
 }
 
@@ -7581,7 +7787,7 @@ mod store_tests {
 
         let plan = conn
             .query_row(
-                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans WHERE id='B'",
+                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config FROM agent_plans WHERE id='B'",
                 [],
                 agent_plan_from_row,
             )
@@ -7685,6 +7891,7 @@ mod store_tests {
                 worker_provider: "kloo".into(),
                 reviewer_provider: "claude_code".into(),
                 model: None,
+                executor_config: None,
             },
         )
         .await
@@ -7754,6 +7961,7 @@ mod store_tests {
                 worker_provider: "claude_code".to_string(),
                 reviewer_provider: "claude_code".to_string(),
                 model: None,
+                executor_config: None,
             },
         )
         .await
@@ -7885,6 +8093,7 @@ mod store_tests {
                 worker_provider: "claude_code".to_string(),
                 reviewer_provider: "claude_code".to_string(),
                 model: None,
+                executor_config: None,
             },
         )
         .await
@@ -8097,6 +8306,7 @@ mod store_tests {
                 created_at: "".into(),
                 updated_at: "".into(),
                 validation_config: None,
+                executor_config: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -8207,6 +8417,7 @@ mod validation_lens_tests {
                 created_at: "".into(),
                 updated_at: "".into(),
                 validation_config: validation_config.map(|s| s.to_string()),
+                executor_config: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -8551,7 +8762,7 @@ mod plan_check_gate_tests {
                 SpawnKind::Task => SpawnResult::exit(1),
             }
         }
-        fn tokens(&self, _ctx: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+        fn tokens(&self, _ctx: u32, _p: &str) -> Result<TokensReport, TokensError> {
             Ok(TokensReport {
                 fits: true,
                 approx_tokens: Some(1),
@@ -8665,7 +8876,7 @@ mod plan_check_gate_tests {
                     SpawnKind::Task => SpawnResult::timed_out(),
                 }
             }
-            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            fn tokens(&self, _c: u32, _p: &str) -> Result<TokensReport, TokensError> {
                 Ok(TokensReport {
                     fits: true,
                     approx_tokens: Some(1),
@@ -8879,7 +9090,7 @@ mod plan_check_gate_tests {
                     SpawnKind::Task => SpawnResult::timed_out(),
                 }
             }
-            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            fn tokens(&self, _c: u32, _p: &str) -> Result<TokensReport, TokensError> {
                 Ok(TokensReport {
                     fits: true,
                     approx_tokens: Some(1),
@@ -9414,7 +9625,7 @@ mod plan_check_gate_tests {
                     SpawnKind::Task => SpawnResult::exit(1),
                 }
             }
-            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            fn tokens(&self, _c: u32, _p: &str) -> Result<TokensReport, TokensError> {
                 Err(TokensError::Unavailable("no kloo on PATH".into()))
             }
         }
@@ -9481,7 +9692,7 @@ mod plan_check_gate_tests {
                     SpawnKind::Task => SpawnResult::timed_out(),
                 }
             }
-            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+            fn tokens(&self, _c: u32, _p: &str) -> Result<TokensReport, TokensError> {
                 Ok(TokensReport {
                     fits: true,
                     approx_tokens: Some(1),
@@ -9646,5 +9857,210 @@ mod plan_check_gate_tests {
         assert!(RULE_IDS.contains(&RULE_MISSING_FILES));
         assert!(RULE_IDS.contains(&crate::services::plan_check::RULE_VERIFY_NOT_RUNNABLE));
         assert!(RULE_IDS.contains(&crate::services::plan_check::RULE_PROMPT_EXCEEDS_CONTEXT));
+    }
+}
+
+#[cfg(test)]
+mod small_mode_tests {
+    use super::*;
+    use crate::services::planner_prompts::{
+        PlannerPromptSettings, DEFAULT_PLANNING_PLANNER, DEFAULT_SMALL_MODE_PLANNER,
+        DEFAULT_SMALL_MODE_REVIEWER,
+    };
+    use crate::test_support::test_state;
+
+    fn run_with_exec(executor_config: Option<&str>) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "PLAN".into(),
+                run_type: "planning".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: "/p".into(),
+                status: "draft".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: Some("brief".into()),
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "planning".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                executor_config: executor_config.map(str::to_string),
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "j1-sm-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn parse_executor_config_rejects_unknown_mode() {
+        assert!(parse_executor_config(None).unwrap().is_none());
+        assert!(parse_executor_config(Some("")).unwrap().is_none());
+        assert_eq!(
+            parse_executor_config(Some(r#"{"mode":"local-small"}"#))
+                .unwrap()
+                .unwrap()
+                .mode,
+            "local-small"
+        );
+        assert!(parse_executor_config(Some(r#"{"mode":"weird"}"#)).is_err());
+    }
+
+    #[tokio::test]
+    async fn create_briefing_stores_local_small_and_commercial_null() {
+        let (state, root) = test_state();
+        let workspace = tmp("ws");
+        let store = tmp("store");
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        let comm = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("c".into()),
+                workspace_path: workspace.to_string_lossy().into(),
+                brief: Some("b".into()),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                model: None,
+                executor_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(comm.plan.executor_config.is_none());
+
+        let small = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("s".into()),
+                workspace_path: workspace.to_string_lossy().into(),
+                brief: Some("b".into()),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                model: None,
+                executor_config: Some(r#"{"mode":"local-small","ctx":32768}"#.into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            small
+                .plan
+                .executor_config
+                .as_deref()
+                .unwrap()
+                .contains("local-small")
+        );
+
+        let copy_to = create_briefing_run(
+            &state,
+            CreateBriefingInput {
+                title: Some("d".into()),
+                workspace_path: workspace.to_string_lossy().into(),
+                brief: Some("b".into()),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                model: None,
+                executor_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        copy_initiative_json_fields(&state, &small.plan, &copy_to.plan.id);
+        let after = get_plan(&state, &copy_to.plan.id).unwrap();
+        assert_eq!(after.plan.executor_config, small.plan.executor_config);
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_selection_is_mode_and_settings() {
+        let (state, root) = test_state();
+        let mut settings = PlannerPromptSettings::default();
+        settings.small_mode.planner = "SENTINEL-PLANNER-XYZ".into();
+        settings.small_mode.reviewer = "SENTINEL-REVIEWER-XYZ".into();
+        let comm = run_with_exec(None);
+        let comm_p = planning_planner_prompt_from(&settings, &state, &comm).unwrap();
+        assert!(comm_p.contains("ROLE: T1_PLANNER"));
+        assert!(!comm_p.contains("SENTINEL-PLANNER-XYZ"));
+        assert!(comm_p.contains("Create or update a methodology-compliant plan"));
+
+        let small = run_with_exec(Some(r#"{"mode":"local-small"}"#));
+        let small_p = planning_planner_prompt_from(&settings, &state, &small).unwrap();
+        assert!(small_p.contains("SENTINEL-PLANNER-XYZ"));
+        assert!(!small_p.contains("status.md lists phases, not tasks"));
+        let small_r = planning_reviewer_prompt_from(&settings, &state, &small).unwrap();
+        assert!(small_r.contains("SENTINEL-REVIEWER-XYZ"));
+        assert!(!small_r.contains("The plan-check script has already validated"));
+
+        let default_small = planning_planner_prompt_from(
+            &PlannerPromptSettings::default(),
+            &state,
+            &small,
+        )
+        .unwrap();
+        assert!(default_small.contains("task.yml"));
+        assert_ne!(
+            select_planning_planner(&PlannerPromptSettings::default(), false, false),
+            select_planning_planner(&PlannerPromptSettings::default(), true, false)
+        );
+        assert_eq!(
+            select_planning_planner(&PlannerPromptSettings::default(), false, false),
+            DEFAULT_PLANNING_PLANNER
+        );
+        assert_eq!(
+            select_planning_reviewer(&PlannerPromptSettings::default(), true, false),
+            DEFAULT_SMALL_MODE_REVIEWER
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = DEFAULT_SMALL_MODE_PLANNER;
+    }
+
+    #[test]
+    fn detect_cli_tools_still_hides_kloo() {
+        let (state, root) = test_state();
+        let tools = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(crate::services::providers::detect_cli_tools(&state))
+            .unwrap();
+        assert!(
+            tools.iter().all(|t| t.provider != "kloo"),
+            "{tools:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
