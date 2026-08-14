@@ -1253,7 +1253,7 @@ pub async fn rerun_reviewer(state: AppState, id: String) -> Result<AgentPlanRun,
     if run.plan.run_type == "planning" {
         // Local-small must re-run the plan-check. Dispatching review here
         // would skip the gate the same way the old pre-check status write did.
-        if is_local_small(&state, &run.plan.id) {
+        if is_local_small(&state, &run.plan.id)? {
             gate_planning_lenses(&state, &run, &PlanningCheckCtrl::live()).await?;
         } else {
             dispatch_planning_review(&state, &run).await?;
@@ -3555,20 +3555,16 @@ impl PlanningCheckCtrl<'static> {
     }
 }
 
-pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> bool {
-    let raw: Option<String> = state
-        .db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT executor_config FROM agent_plans WHERE id = ?1",
-                params![plan_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|e| e.to_string())
-        })
-        .ok()
-        .flatten();
-    executor_mode_is_local_small(raw.as_deref())
+pub(crate) fn is_local_small(state: &AppState, plan_id: &str) -> Result<bool, String> {
+    let raw: Option<String> = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT executor_config FROM agent_plans WHERE id = ?1",
+            params![plan_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map_err(|e| format!("read executor_config: {e}"))
+    })?;
+    Ok(executor_mode_is_local_small(raw.as_deref()))
 }
 
 pub(crate) fn executor_mode_is_local_small(raw: Option<&str>) -> bool {
@@ -3621,6 +3617,7 @@ struct CheckPlanCall<'a> {
     tokens: bool,
     tokens_only: bool,
     run: Option<&'a crate::services::task_state::TaskRunFile>,
+    tokens_budget_ms: Option<u64>,
 }
 
 async fn run_check_plan_blocking(
@@ -3635,6 +3632,7 @@ async fn run_check_plan_blocking(
         opts.skip_execute = call.skip_execute;
         opts.previous_skipped = call.previous_skipped;
         apply_check_mode(&mut opts, call.tokens, call.tokens_only);
+        opts.tokens_budget_ms = call.tokens_budget_ms;
         return Ok(crate::services::plan_check::check_plan_with(
             plan_path, workspace, &opts,
         ));
@@ -3646,11 +3644,13 @@ async fn run_check_plan_blocking(
     let tokens = call.tokens;
     let tokens_only = call.tokens_only;
     let skip_execute = call.skip_execute;
+    let tokens_budget_ms = call.tokens_budget_ms;
     let run_owned = call.run.cloned();
     tokio::task::spawn_blocking(move || {
         let mut opts = crate::services::plan_check::CheckPlanOpts::shape_only(run_owned.as_ref());
         let only_ref = only.as_deref();
         opts.only_phase = only_ref;
+        opts.tokens_budget_ms = tokens_budget_ms;
         opts.skip_execute = skip_execute;
         opts.previous_skipped = &prev;
         apply_check_mode(&mut opts, tokens, tokens_only);
@@ -3759,7 +3759,7 @@ pub(crate) async fn gate_planning_lenses(
     run: &AgentPlanRun,
     ctrl: &PlanningCheckCtrl<'_>,
 ) -> Result<(), String> {
-    if !is_local_small(state, &run.plan.id) {
+    if !is_local_small(state, &run.plan.id)? {
         return dispatch_planning_review(state, run).await;
     }
 
@@ -3770,19 +3770,17 @@ pub(crate) async fn gate_planning_lenses(
         .map(|r| r.skipped_ids)
         .unwrap_or_default();
 
-    let phases_dir = plan_path.join("phases");
-    let mut phase_ids: Vec<String> = std::fs::read_dir(&phases_dir)
-        .ok()
-        .map(|rd| {
-            let mut v: Vec<_> = rd
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            v.sort();
-            v
-        })
-        .unwrap_or_default();
+    let mut phase_ids: Vec<String> = crate::services::plan_check::list_sorted_dirs(
+        &plan_path.join("phases"),
+    )
+    .into_iter()
+    .map(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    })
+    .collect();
     if phase_ids.is_empty() {
         phase_ids.push(String::new());
     }
@@ -3812,6 +3810,7 @@ pub(crate) async fn gate_planning_lenses(
                 tokens: false,
                 tokens_only: false,
                 run: None,
+                tokens_budget_ms: None,
             },
         )
         .await?;
@@ -3841,20 +3840,25 @@ pub(crate) async fn gate_planning_lenses(
     }
 
     if acc.tasks_checked > crate::services::plan_check::MAX_TASKS_TOTAL {
-        acc.items.push(crate::services::plan_check::PlanCheckItem {
-            task_id: None,
-            rule: crate::services::plan_check::RULE_TASK_COUNT_TOTAL.to_string(),
-            detail: format!(
-                "plan has {} tasks (max {})",
-                acc.tasks_checked,
-                crate::services::plan_check::MAX_TASKS_TOTAL
-            ),
-            blocking: true,
-        });
+        acc.items.push(crate::services::plan_check::task_count_total_item(
+            acc.tasks_checked,
+        ));
     }
 
-    // Tokens once over the whole plan (no second shape walk).
+    // Tokens once over the whole plan (no second shape walk). Same stage ceiling.
     {
+        let elapsed = ctrl
+            .elapsed_ms
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_else(|| stage_start.elapsed().as_millis() as u64);
+        if elapsed >= ctrl.stage_budget_ms {
+            acc.items.push(crate::services::plan_check::item(
+                None,
+                crate::services::plan_check::RULE_TOKENS_UNAVAILABLE,
+                "stage budget exhausted before tokens",
+            ));
+        } else {
         let tok = run_check_plan_blocking(
             &plan_path,
             &workspace,
@@ -3866,6 +3870,7 @@ pub(crate) async fn gate_planning_lenses(
                 tokens: true,
                 tokens_only: true,
                 run: None,
+                tokens_budget_ms: Some(ctrl.stage_budget_ms.saturating_sub(elapsed)),
             },
         )
         .await?;
@@ -3875,6 +3880,7 @@ pub(crate) async fn gate_planning_lenses(
             {
                 acc.items.push(item);
             }
+        }
         }
     }
 
@@ -4030,6 +4036,7 @@ pub(crate) async fn run_phase_preflight_with(
             tokens: true,
             tokens_only: false,
             run: task_run.as_ref(),
+            tokens_budget_ms: None,
         },
     )
     .await?;
@@ -4177,7 +4184,7 @@ fn consecutive_non_pass_planning_rounds(run: &AgentPlanRun) -> i64 {
         "planning_started",
         None,
         &["planning_check_failed"],
-        &["planning_check_passed"],
+        &[],
     )
 }
 
@@ -8466,7 +8473,6 @@ mod plan_check_gate_tests {
     };
     use crate::services::task_loop::{followup_after_kloo_phase, KlooPhaseFollowup, PhaseLoopOutcome};
 
-
     fn gate_state() -> (AppState, PathBuf, PathBuf, PathBuf) {
         let (state, root) = {
             let root = {
@@ -8559,7 +8565,7 @@ mod plan_check_gate_tests {
             },
         )
         .unwrap();
-        assert!(!is_local_small(&state, &run.plan.id));
+        assert!(!is_local_small(&state, &run.plan.id).unwrap());
         let host = SilentHost;
         gate_planning_lenses(
             &state,
@@ -8881,7 +8887,7 @@ mod plan_check_gate_tests {
         )
         .await
         .unwrap();
-        let after = get_plan(&state, &after_id(&run)).unwrap();
+        let after = get_plan(&state, &run.plan.id).unwrap();
         let phases: Vec<_> = after
             .events
             .iter()
@@ -8898,6 +8904,15 @@ mod plan_check_gate_tests {
             .map(|p| p.verify_skipped)
             .sum();
         assert!(later >= 40, "later phases skipped: {:?}", report.phases);
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.rule == crate::services::plan_check::RULE_TOKENS_UNAVAILABLE
+                    && i.detail.contains("stage budget")),
+            "tokens skipped when stage ceiling already spent: {:?}",
+            report.items
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8959,10 +8974,6 @@ mod plan_check_gate_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn after_id(run: &AgentPlanRun) -> String {
-        run.plan.id.clone()
-    }
-
     #[tokio::test]
     async fn planning_check_exhausts_revision_rounds() {
         let (state, root, _store, ws) = gate_state();
@@ -9002,6 +9013,85 @@ mod plan_check_gate_tests {
             let current = get_plan(&state, &run.plan.id).unwrap();
             gate_planning_lenses(&state, &current, &ctrl).await.unwrap();
         }
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "needs_attention");
+        assert!(after
+            .events
+            .iter()
+            .any(|e| e.event_type == "planning_needs_attention"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn lens_needs_changes_after_check_pass_climbs_to_cap() {
+        let (state, root, _store, ws) = gate_state();
+        let run = create_plan(
+            &state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("mix-cap".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+            },
+        )
+        .unwrap();
+        set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
+        write_small_task(
+            Path::new(&run.plan.plan_path),
+            "00-x",
+            "01-a",
+            "id: 01-a\nfiles: [src/a.rs]\nverify: \"cargo test a -- --exact\"\nmust_contain: [\"pub fn add\"]\n",
+        );
+        // Five (check-pass + lens NEEDS_CHANGES) pairs. A check-pass must not
+        // reset the lens counter (that was the r2 hole).
+        for i in 1..=5 {
+            append_event(
+                &state,
+                &run.plan.id,
+                None,
+                "planning_check_passed",
+                json!({}),
+            )
+            .unwrap();
+            append_event(
+                &state,
+                &run.plan.id,
+                None,
+                "planning_gate_result",
+                json!({ "verdict": "NEEDS_CHANGES" }),
+            )
+            .unwrap();
+            let current = get_plan(&state, &run.plan.id).unwrap();
+            assert_eq!(
+                consecutive_non_pass_planning_rounds(&current),
+                i,
+                "round should climb, not reset at check-pass"
+            );
+        }
+        append_event(
+            &state,
+            &run.plan.id,
+            None,
+            "planning_check_passed",
+            json!({}),
+        )
+        .unwrap();
+        let current = get_plan(&state, &run.plan.id).unwrap();
+        handle_planning_reviewer_output(
+            &state,
+            &current,
+            "VERDICT: NEEDS_CHANGES\nSUMMARY: still failing\nFINDINGS: x\n",
+        )
+        .await
+        .unwrap();
         let after = get_plan(&state, &run.plan.id).unwrap();
         assert_eq!(after.plan.status, "needs_attention");
         assert!(after
@@ -9061,11 +9151,7 @@ mod plan_check_gate_tests {
         let payload: serde_json::Value = serde_json::from_str(&ev.payload_json).unwrap();
         assert_eq!(
             event_summary(ev, &payload),
-            format!(
-                "Phase {} preflight failed — {} violations.",
-                payload.get("nn").and_then(|v| v.as_str()).unwrap_or("00"),
-                payload.get("violations").and_then(|v| v.as_u64()).unwrap_or(0)
-            )
+            "Phase 00 preflight failed — 1 violations."
         );
         let runs = settings_service::initiative_runs_path(
             &settings_service::resolve_initiatives_dir(&state),

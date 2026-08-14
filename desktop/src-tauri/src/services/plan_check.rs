@@ -424,6 +424,8 @@ pub struct CheckPlanOpts<'a> {
     pub previous_skipped: &'a [String],
     /// Skip shape + execute; only walk task dirs for `kloo tokens`.
     pub tokens_only: bool,
+    /// Remaining stage budget for the tokens walk. `Some(0)` skips immediately.
+    pub tokens_budget_ms: Option<u64>,
 }
 
 impl<'a> CheckPlanOpts<'a> {
@@ -439,6 +441,7 @@ impl<'a> CheckPlanOpts<'a> {
             skip_execute: false,
             previous_skipped: &[],
             tokens_only: false,
+            tokens_budget_ms: None,
         }
     }
 
@@ -454,17 +457,26 @@ impl<'a> CheckPlanOpts<'a> {
             skip_execute: false,
             previous_skipped: &[],
             tokens_only: false,
+            tokens_budget_ms: None,
         }
     }
 }
 
-fn item(task_id: Option<&str>, rule: &str, detail: impl Into<String>) -> PlanCheckItem {
+pub(crate) fn item(task_id: Option<&str>, rule: &str, detail: impl Into<String>) -> PlanCheckItem {
     PlanCheckItem {
         task_id: task_id.map(str::to_string),
         rule: rule.to_string(),
         detail: detail.into(),
         blocking: rule != RULE_VERIFY_TIMEOUT && rule != RULE_VERIFY_NOT_EXECUTED,
     }
+}
+
+pub(crate) fn task_count_total_item(n: usize) -> PlanCheckItem {
+    item(
+        None,
+        RULE_TASK_COUNT_TOTAL,
+        format!("plan has {n} tasks (max {MAX_TASKS_TOTAL})"),
+    )
 }
 
 pub fn save_plan_check(path: &Path, report: &PlanCheckReport) -> Result<(), String> {
@@ -502,7 +514,7 @@ pub fn check_plan_with(
 
     if opts.tokens_only {
         collect_token_targets(plan_path, opts.only_phase, &mut loaded_for_tokens);
-        check_tokens(plan_path, &loaded_for_tokens, host, &mut report);
+        check_tokens(plan_path, &loaded_for_tokens, host, &mut report, opts.tokens_budget_ms);
         report.passed = !report.items.iter().any(|i| i.blocking);
         return report;
     }
@@ -569,7 +581,7 @@ pub fn check_plan_with(
         report.items.push(item(None, RULE_EMPTY_PLAN, detail));
     }
     if opts.tokens {
-        check_tokens(plan_path, &loaded_for_tokens, host, &mut report);
+        check_tokens(plan_path, &loaded_for_tokens, host, &mut report, opts.tokens_budget_ms);
     }
     report.tasks_checked = total_tasks;
     report.passed = !report.items.iter().any(|i| i.blocking);
@@ -999,16 +1011,14 @@ fn execute_phase(
     let mut pair_tasks: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut pair_argv: HashMap<(String, String), Vec<String>> = HashMap::new();
     for job in &eligible {
-        let key = (job.runner.clone(), job.cwd.to_string_lossy().into_owned());
+        let pid = pair_id(&job.runner, &job.argv);
+        let key = (pid.clone(), job.cwd.to_string_lossy().into_owned());
         pair_tasks.entry(key.clone()).or_default().push(job.id.clone());
         pair_argv
             .entry(key)
             .or_insert_with(|| warm_argv_for(&job.runner, &job.argv));
-        if !pair_keys
-            .iter()
-            .any(|(r, c)| r == &job.runner && c == &job.cwd)
-        {
-            pair_keys.push((job.runner.clone(), job.cwd.clone()));
+        if !pair_keys.iter().any(|(r, c)| r == &pid && c == &job.cwd) {
+            pair_keys.push((pid, job.cwd.clone()));
         }
     }
     pair_keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1024,10 +1034,10 @@ fn execute_phase(
                 return SpawnResult::never_started();
             }
             let key = (pair.0.clone(), pair.1.to_string_lossy().into_owned());
-            let argv = pair_argv
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| warm_argv_for(&pair.0, &[pair.0.clone()]));
+            let argv = pair_argv.get(&key).cloned().unwrap_or_else(|| {
+                let runner = pair.0.split(':').next().unwrap_or(pair.0.as_str());
+                warm_argv_for(runner, &[runner.to_string()])
+            });
             host.spawn(&SpawnRequest {
                 argv,
                 cwd: pair.1.clone(),
@@ -1036,10 +1046,10 @@ fn execute_phase(
                 task_id: None,
             })
         });
-        for ((runner, cwd), res) in results {
+        for ((pid, cwd), res) in results {
             // Warm timeout / ENOENT / any non-zero: runner is not usable.
             if res.enoent || res.timed_out || res.exit_code.map(|c| c != 0).unwrap_or(false) {
-                let key = (runner.clone(), cwd.to_string_lossy().into_owned());
+                let key = (pid.clone(), cwd.to_string_lossy().into_owned());
                 failed_pairs.insert(key.clone());
                 if let Some(ids) = pair_tasks.get(&key) {
                     for id in ids {
@@ -1048,7 +1058,7 @@ fn execute_phase(
                             RULE_VERIFY_NOT_RUNNABLE,
                             format!(
                                 "warm {} in {} failed (exit {:?}, timed_out={})",
-                                runner,
+                                pid,
                                 cwd.display(),
                                 res.exit_code,
                                 res.timed_out
@@ -1068,7 +1078,10 @@ fn execute_phase(
     let to_run: Vec<EligibleJob> = eligible
         .iter()
         .filter(|job| {
-            !failed_pairs.contains(&(job.runner.clone(), job.cwd.to_string_lossy().into_owned()))
+            !failed_pairs.contains(&(
+                pair_id(&job.runner, &job.argv),
+                job.cwd.to_string_lossy().into_owned(),
+            ))
         })
         .cloned()
         .collect();
@@ -1156,6 +1169,19 @@ where
     out
 }
 
+fn pair_id(runner: &str, argv: &[String]) -> String {
+    if runner == "npx" {
+        let tool = if argv.iter().any(|t| t.contains("jest")) {
+            "jest"
+        } else {
+            "vitest"
+        };
+        format!("npx:{tool}")
+    } else {
+        runner.to_string()
+    }
+}
+
 pub fn warm_argv_for(runner: &str, verify_argv: &[String]) -> Vec<String> {
     match runner {
         "cargo" => vec![
@@ -1232,12 +1258,32 @@ fn check_tokens(
     loaded: &[(String, PathBuf, Option<TaskSpec>)],
     host: &dyn PlanCheckHost,
     report: &mut PlanCheckReport,
+    budget_ms: Option<u64>,
 ) {
+    if budget_ms == Some(0) {
+        report.items.push(item(
+            None,
+            RULE_TOKENS_UNAVAILABLE,
+            "stage budget exhausted before tokens",
+        ));
+        return;
+    }
+    let started = Instant::now();
     let mut saw_unavailable = false;
     for (id, dir, spec) in loaded {
         let prompt = dir.join("prompt.md");
         if !prompt.is_file() {
             continue;
+        }
+        if let Some(b) = budget_ms {
+            if started.elapsed().as_millis() as u64 >= b {
+                report.items.push(item(
+                    None,
+                    RULE_TOKENS_UNAVAILABLE,
+                    "stage budget exhausted during tokens",
+                ));
+                break;
+            }
         }
         let ctx = spec.as_ref().and_then(|s| s.ctx).unwrap_or(32768);
         match host.tokens(ctx, &prompt) {
@@ -1373,7 +1419,7 @@ fn is_verify_file_target(token: &str) -> bool {
         || t.ends_with(".py")
 }
 
-fn list_sorted_dirs(path: &Path) -> Vec<PathBuf> {
+pub(crate) fn list_sorted_dirs(path: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(path) else {
         return Vec::new();
     };
@@ -3161,6 +3207,106 @@ mod tests {
             .count();
         assert_eq!(n, 1, "{:?}", report.items);
         assert!(report.items.iter().any(|i| i.task_id.is_none()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn npx_jest_and_vitest_are_distinct_warm_pairs() {
+        let root = tmp("npx-split");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        std::fs::write(ws.join("a.spec.ts"), "x\n").unwrap();
+        std::fs::write(ws.join("a.test.js"), "x\n").unwrap();
+        write_task(
+            &plan,
+            "00-x",
+            "01-jest",
+            "id: 01-jest\nfiles: [a.test.js]\nverify: \"npx jest run a.test.js\"\nmust_contain: [\"pub fn add\"]\n",
+            "jest",
+        );
+        write_task(
+            &plan,
+            "00-x",
+            "02-vitest",
+            "id: 02-vitest\nfiles: [a.spec.ts]\nverify: \"npx vitest run a.spec.ts\"\nmust_contain: [\"pub fn add\"]\n",
+            "vitest",
+        );
+        struct SplitNpx;
+        impl PlanCheckHost for SplitNpx {
+            fn spawn(&self, req: &SpawnRequest) -> SpawnResult {
+                if req.kind == SpawnKind::Warm && req.argv.iter().any(|t| t == "jest") {
+                    return SpawnResult::exit(101);
+                }
+                if req.kind == SpawnKind::Warm {
+                    return SpawnResult::ok_zero();
+                }
+                SpawnResult::exit(1)
+            }
+            fn tokens(&self, _c: u32, _p: &Path) -> Result<TokensReport, TokensError> {
+                Ok(TokensReport {
+                    fits: true,
+                    approx_tokens: Some(1),
+                    usable_window: Some(1),
+                    compact_trigger: Some(1),
+                })
+            }
+        }
+        let host = SplitNpx;
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                execute: true,
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_VERIFY_NOT_RUNNABLE && i.task_id.as_deref() == Some("01-jest")
+            }),
+            "{:?}",
+            report.items
+        );
+        assert!(
+            !report.items.iter().any(|i| {
+                i.rule == RULE_VERIFY_NOT_RUNNABLE && i.task_id.as_deref() == Some("02-vitest")
+            }),
+            "vitest must not inherit jest warm failure: {:?}",
+            report.items
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tokens_budget_zero_skips_without_host_calls() {
+        let root = tmp("tok-budget");
+        let plan = root.join("plan");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "x\n").unwrap();
+        write_ok_task(&plan, "00-x", "01-a", "");
+        let host = ScriptedHost::instant();
+        let report = check_plan_with(
+            &plan,
+            &ws,
+            &CheckPlanOpts {
+                host: Some(&host),
+                tokens: true,
+                tokens_only: true,
+                tokens_budget_ms: Some(0),
+                ..CheckPlanOpts::shape_only(None)
+            },
+        );
+        assert!(
+            report.items.iter().any(|i| {
+                i.rule == RULE_TOKENS_UNAVAILABLE && i.detail.contains("stage budget")
+            }),
+            "{:?}",
+            report.items
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
