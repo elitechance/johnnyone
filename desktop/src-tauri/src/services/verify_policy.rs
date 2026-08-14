@@ -39,6 +39,11 @@ impl VerifyPolicyError {
             detail: detail.into(),
         }
     }
+
+    /// True when a spawn/residue error string came from this policy.
+    pub fn message_is_policy(msg: &str) -> bool {
+        msg.contains(RULE_NOT_ALLOWLISTED) || msg.contains(RULE_NOT_SCOPED)
+    }
 }
 
 impl std::fmt::Display for VerifyPolicyError {
@@ -183,7 +188,17 @@ pub fn effective_verify_dir(
     match cwd.map(str::trim).filter(|c| !c.is_empty() && *c != ".") {
         Some(rel) => {
             jail_rel_path(rel).map_err(VerifyPolicyError::not_allowlisted)?;
-            Ok(workspace.join(rel))
+            let joined = workspace.join(rel);
+            // When the path exists, follow symlinks. A workspace-relative
+            // `link` that points at `/etc` must not become the child cwd.
+            if let (Ok(ws), Ok(dir)) = (workspace.canonicalize(), joined.canonicalize()) {
+                if !dir.starts_with(&ws) {
+                    return Err(VerifyPolicyError::not_allowlisted(format!(
+                        "cwd {rel:?} escapes the workspace"
+                    )));
+                }
+            }
+            Ok(joined)
         }
         None => Ok(workspace.to_path_buf()),
     }
@@ -192,9 +207,7 @@ pub fn effective_verify_dir(
 /// Parse then validate. The only argv mutation is prepending `npx --no-install`.
 pub fn check_verify(raw: &str) -> Result<Vec<String>, VerifyPolicyError> {
     let mut argv = parse_verify(raw)?;
-    if argv.first().map(String::as_str) == Some("npx")
-        && !argv.iter().any(|a| a == "--no-install")
-    {
+    if argv.first().map(String::as_str) == Some("npx") && !npx_prefix_has_no_install(&argv) {
         argv.insert(1, "--no-install".to_string());
     }
     validate_argv(&argv)?;
@@ -206,6 +219,8 @@ pub fn validate_argv(argv: &[String]) -> Result<(), VerifyPolicyError> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| VerifyPolicyError::not_allowlisted("empty argv"))?;
+    // Documented complement of ALLOWED_RUNNERS; unreachable once the
+    // allowlist check below rejects the same names. Kept as an explicit deny.
     if DENIED_RUNNERS.contains(&first) {
         return Err(VerifyPolicyError::not_allowlisted(format!(
             "denied runner {first:?}"
@@ -311,6 +326,19 @@ fn validate_libtest_args(args: &[String]) -> Result<(), VerifyPolicyError> {
     Ok(())
 }
 
+/// `--no-install` only guards npx when it appears before the package name.
+fn npx_prefix_has_no_install(argv: &[String]) -> bool {
+    for a in argv.iter().skip(1) {
+        if !a.starts_with('-') {
+            return false;
+        }
+        if a == "--no-install" {
+            return true;
+        }
+    }
+    false
+}
+
 fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
     let mut runner = None;
     let mut has_run = false;
@@ -318,27 +346,27 @@ fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
     let mut i = 1;
     while i < argv.len() {
         let t = argv[i].as_str();
-        if t == "--no-install" {
-            i += 1;
-            continue;
-        }
-        if let Some(val) = eq_value(t, "--prefix").or_else(|| eq_value(t, "--config")) {
-            jail_token(val)?;
-            i += 1;
-            continue;
-        }
-        if t == "--prefix" || t == "--config" {
-            let val = take_flag_value(argv, i, t)?;
-            jail_token(val)?;
-            i += 2;
-            continue;
-        }
-        if t.starts_with('-') {
-            return Err(VerifyPolicyError::not_allowlisted(format!(
-                "npx flag {t:?} is not allowed"
-            )));
-        }
         if runner.is_none() {
+            if t == "--no-install" {
+                i += 1;
+                continue;
+            }
+            if let Some(val) = eq_value(t, "--prefix").or_else(|| eq_value(t, "--config")) {
+                jail_token(val)?;
+                i += 1;
+                continue;
+            }
+            if t == "--prefix" || t == "--config" {
+                let val = take_flag_value(argv, i, t)?;
+                jail_token(val)?;
+                i += 2;
+                continue;
+            }
+            if t.starts_with('-') {
+                return Err(VerifyPolicyError::not_allowlisted(format!(
+                    "npx flag {t:?} is not allowed"
+                )));
+            }
             if t != "vitest" && t != "jest" {
                 return Err(VerifyPolicyError::not_allowlisted(format!(
                     "npx package must be vitest or jest, got {t:?}"
@@ -347,6 +375,16 @@ fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
             runner = Some(t);
             i += 1;
             continue;
+        }
+        if t == "--no-install" {
+            return Err(VerifyPolicyError::not_allowlisted(
+                "--no-install after the npx package does not guard npx",
+            ));
+        }
+        if t.starts_with('-') {
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "npx/runner flag {t:?} is not allowed after the package name"
+            )));
         }
         if t == "run" {
             has_run = true;
@@ -849,6 +887,7 @@ mod tests {
             "go test -exec=/tmp/evil.sh ./a ./b".to_string(),
             "npx evil-pkg vitest run x.spec.ts".to_string(),
             "npx --package=evil-pkg vitest run x.spec.ts".to_string(),
+            "npx vitest run x.spec.ts --no-install".to_string(),
             "cargo test mul -- --logfile=/tmp/pwn".to_string(),
             "cargo test mul -- --logfile=../../pwn".to_string(),
             format!("cargo test mul -- --logfile={}", pwned.display()),
@@ -890,6 +929,17 @@ mod tests {
                 .rule,
             RULE_NOT_ALLOWLISTED
         );
+        // Trailing --no-install is not an npx guard (it is forwarded to vitest).
+        let trailing = check_verify("npx vitest run x.spec.ts --no-install").unwrap_err();
+        assert_eq!(trailing.rule, RULE_NOT_ALLOWLISTED);
+        let guarded = check_verify("npx vitest run x.spec.ts").unwrap();
+        assert_eq!(guarded[1], "--no-install");
+        assert_eq!(guarded[2], "vitest");
+        assert!(
+            check_verify("npx --no-install vitest run x.spec.ts --prefix foo")
+                .is_err(),
+            "post-package --prefix is not an npx flag"
+        );
         let argv = check_verify("go test -run TestAdd ./foo").unwrap();
         assert_eq!(argv, s(&["go", "test", "-run", "TestAdd", "./foo"]));
         let argv = check_verify("node --test src/foo.test.js").unwrap();
@@ -921,6 +971,30 @@ mod tests {
         assert!(plan.current_dir.ends_with("pkg"), "{:?}", plan.current_dir);
         let plan = plan_task_verify(ws, "cargo test mul -- --exact", None).unwrap();
         assert_eq!(plan.current_dir, ws);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_verify_dir_rejects_symlink_escape() {
+        let ws = std::env::temp_dir().join(format!(
+            "j1-cwd-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        let link = ws.join("link");
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        let err = plan_task_verify(&ws, "cargo test mul -- --exact", Some("link")).unwrap_err();
+        assert_eq!(err.rule, RULE_NOT_ALLOWLISTED);
+        assert!(err.detail.contains("escapes"), "{err}");
+        let inside = ws.join("pkg");
+        std::fs::create_dir_all(&inside).unwrap();
+        let plan = plan_task_verify(&ws, "cargo test mul -- --exact", Some("pkg")).unwrap();
+        assert!(plan.current_dir.ends_with("pkg"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

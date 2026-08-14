@@ -18,7 +18,7 @@ use crate::services::task_check::{
     SpawnFailure, Step,
 };
 use crate::services::task_spec::{self, load_task_spec, TaskSpec};
-use crate::services::verify_policy::{plan_task_verify, PlannedVerify};
+use crate::services::verify_policy::{plan_task_verify, PlannedVerify, VerifyPolicyError};
 use crate::services::task_state::{
     attempt_json_path, block_dependents, load_tasks, project_status_yml, reconcile,
     save_tasks, seed_from_specs, tasks_json_path, AttemptRecord, TaskRow, TaskRunFile,
@@ -635,6 +635,8 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                 Err(e) => {
                     let fail = if is_missing_binary(&e) {
                         SpawnFailure::MissingBinary
+                    } else if VerifyPolicyError::message_is_policy(&e) {
+                        SpawnFailure::Policy(e)
                     } else {
                         SpawnFailure::Other(e)
                     };
@@ -1022,7 +1024,22 @@ async fn residue_commits<H: LoopHost>(
     file: &mut TaskRunFile,
     spec: &TaskSpec,
 ) -> Result<bool, String> {
-    let exit = host.run_task_verify(&ctx.workspace, &spec.verify, spec.cwd.as_deref())?;
+    let exit = match host.run_task_verify(&ctx.workspace, &spec.verify, spec.cwd.as_deref()) {
+        Ok(code) => code,
+        Err(e) if VerifyPolicyError::message_is_policy(&e) => {
+            fail_task(
+                ctx,
+                host,
+                file,
+                &spec.id,
+                "planner",
+                Some("verify_not_allowlisted"),
+                Some(&e),
+            )?;
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+    };
     if exit == 127 {
         fail_task(
             ctx,
@@ -1403,6 +1420,7 @@ mod tests {
         index: HashMap<(String, String), String>,
         stop_after_commits: Option<usize>,
         commit_returns_none: bool,
+        verify_err: Option<String>,
     }
 
     impl ScriptedHost {
@@ -1418,6 +1436,7 @@ mod tests {
                 index: HashMap::new(),
                 stop_after_commits: None,
                 commit_returns_none: false,
+                verify_err: None,
             }
         }
 
@@ -1532,8 +1551,9 @@ mod tests {
             _cmd: &str,
             _cwd: Option<&str>,
         ) -> Result<i32, String> {
-            // Scripted loop tests cover residue / spawn orchestration, not the
-            // policy spawn. Real `run_task_verify` is exercised directly below.
+            if let Some(e) = &self.verify_err {
+                return Err(e.clone());
+            }
             Ok(0)
         }
 
@@ -2311,6 +2331,77 @@ mod tests {
             followup_after_kloo_phase(&PhaseLoopOutcome::AllDone),
             KlooPhaseFollowup::DispatchReview
         );
+    }
+
+    #[tokio::test]
+    async fn residue_policy_error_fails_task_as_planner_not_phase() {
+        let root = tmp("residue-policy");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", None, "pub fn add")),
+            "01-a",
+        );
+        std::fs::write(ctx.workspace.join("a.rs"), "pub fn add() {}\n").unwrap();
+        let mut file = seed_from_specs(
+            &ctx.plan_id,
+            &ctx.phase_id,
+            &load_phase_specs(&ctx.phase_dir).unwrap(),
+        );
+        file.tasks[0].status = "running".into();
+        file.tasks[0].attempts.push(AttemptRecord {
+            tier: "qwen3-coder".into(),
+            model: "qwen/qwen3-coder".into(),
+            attempt: 1,
+            started_at: Some("t".into()),
+            ended_at: None,
+            failure_code: None,
+            exit_code: None,
+            class: None,
+            checks: None,
+        });
+        save_tasks(&tasks_json_path(&ctx.runs_dir), &mut file).unwrap();
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.verify_err = Some("shape: verify_not_allowlisted: denied runner".into());
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        match out {
+            PhaseLoopOutcome::Partial { failed, first_route, .. } => {
+                assert_eq!(failed, vec!["01-a"]);
+                assert_eq!(first_route.as_deref(), Some("planner"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let loaded = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        assert_eq!(loaded.tasks[0].route.as_deref(), Some("planner"));
+        assert!(host.spawned_files.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn kloo_policy_spawn_error_is_shape_not_escalated() {
+        let root = tmp("spawn-policy");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "01-a",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.spawn_scripts.push_back(Box::new(|_| {
+            Err("shape: verify_not_allowlisted: node --eval".into())
+        }));
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        match out {
+            PhaseLoopOutcome::Partial { failed, first_route, .. } => {
+                assert_eq!(failed, vec!["01-a"]);
+                assert_eq!(first_route.as_deref(), Some("planner"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(host.spawned_models.len(), 1, "must not climb the ladder");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

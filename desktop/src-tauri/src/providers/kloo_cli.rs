@@ -469,6 +469,27 @@ KLOO_RESULT_JSON {\"success\":true,\"files_changed\":{\"count\":1,\"paths\":[\"s
         assert!(r.success);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn build_config_rejects_symlink_cwd_escape() {
+        let ws = std::env::temp_dir().join(format!(
+            "j1-kloo-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::os::unix::fs::symlink("/etc", ws.join("link")).unwrap();
+        let mut req = sample_req();
+        req.workspace = ws.to_string_lossy().into_owned();
+        req.cwd = Some("link".into());
+        let err = build_config(&req).unwrap_err();
+        assert!(err.contains("escapes") || err.contains("verify_not_allowlisted"), "{err}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[test]
     fn parse_line_is_text_not_stderr() {
         let chunk = parse_line(r#"KLOO_RESULT_JSON {"success":true}"#).unwrap();

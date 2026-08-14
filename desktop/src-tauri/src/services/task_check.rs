@@ -179,6 +179,8 @@ pub enum FailureClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnFailure {
     MissingBinary,
+    /// `check_verify` / cwd jail rejected the request. Shape, not infra.
+    Policy(String),
     Other(String),
 }
 
@@ -226,6 +228,9 @@ pub fn classify(
     }
     if matches!(spawn, Some(SpawnFailure::MissingBinary)) {
         return FailureClass::Infra;
+    }
+    if matches!(spawn, Some(SpawnFailure::Policy(_))) {
+        return FailureClass::Shape;
     }
 
     let code = result.and_then(|r| r.failure_code.as_deref());
@@ -971,6 +976,22 @@ mod tests {
                 None
             ),
             FailureClass::Infra
+        );
+    }
+
+    #[test]
+    fn classify_policy_spawn_is_shape() {
+        assert_eq!(
+            class_for(
+                None,
+                None,
+                Some(&SpawnFailure::Policy(
+                    "shape: verify_not_allowlisted: denied runner".into()
+                )),
+                Some(1),
+                None
+            ),
+            FailureClass::Shape
         );
     }
 
