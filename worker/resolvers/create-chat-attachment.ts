@@ -1,3 +1,5 @@
+import { requireIdentity } from '../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -24,6 +26,7 @@ export default async function createChatAttachment(
   args: { input: ChatAttachmentInput },
   ctx: ResolverContext,
 ) {
+  const idn = await requireIdentity(ctx as any);
   const originalName = sanitizeOriginalName(args.input.originalName);
   const contentType = args.input.contentType.trim().toLowerCase();
   if (!ALLOWED_IMAGE_TYPES.has(contentType)) {
@@ -40,14 +43,14 @@ export default async function createChatAttachment(
 
   const id = crypto.randomUUID();
   const ext = extensionFor(contentType, originalName);
-  const r2Key = `tmp/johnnyone-attachments/${ctx.auth.tenantId}/${ctx.auth.userId}/${id}/${originalName || `image${ext}`}`;
+  const r2Key = `tmp/johnnyone-attachments/${idn.tenantId}/${idn.userId}/${id}/${originalName || `image${ext}`}`;
 
   await ctx.env.R2_ASSETS.put(r2Key, bytes, {
     httpMetadata: { contentType },
     customMetadata: {
       attachmentId: id,
-      tenantId: ctx.auth.tenantId,
-      userId: ctx.auth.userId,
+      tenantId: idn.tenantId,
+      userId: idn.userId,
       originalName,
     },
   });
@@ -60,8 +63,8 @@ export default async function createChatAttachment(
     )
     .bind(
       id,
-      ctx.auth.tenantId,
-      ctx.auth.userId,
+      idn.tenantId,
+      idn.userId,
       args.input.sessionId ?? null,
       originalName,
       contentType,

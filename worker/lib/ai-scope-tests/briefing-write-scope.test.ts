@@ -1,16 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
 import * as apiKeyMod from '../../lib/auth/api-key';
+import { authedCtx } from '../auth/test-authed-ctx';
 
 // Overhaul P4 (Phase 03): the four briefing mutations are thin desktopRpc pass-throughs to the
 // Phase 01/02 host methods. These assertions pin each resolver's mapped host method + required
 // auth scope (mirrors agent-plan-write-scope.test.ts). Behavior itself is tested on the host.
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 describe('Briefing WRITE scope (overhaul P4 relay resolvers)', () => {
   beforeEach(() => {

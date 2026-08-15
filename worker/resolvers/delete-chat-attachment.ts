@@ -1,3 +1,5 @@
+import { requireIdentity } from '../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -31,13 +33,14 @@ export default async function deleteChatAttachment(
   args: { input: MarkChatAttachmentDeliveredInput },
   ctx: ResolverContext,
 ) {
+  const idn = await requireIdentity(ctx as any);
   const row = await ctx.db
     .prepare(
       `SELECT id, session_id, original_name, content_type, size, r2_key, status, uploaded_at, local_path
        FROM chat_attachments
        WHERE id = ? AND tenant_id = ? AND user_id = ?`,
     )
-    .bind(args.input.id, ctx.auth.tenantId, ctx.auth.userId)
+    .bind(args.input.id, idn.tenantId, idn.userId)
     .first<ChatAttachmentRow>();
 
   if (!row) {
@@ -54,7 +57,7 @@ export default async function deleteChatAttachment(
        SET status = 'deleted', local_path = ?, local_saved_at = datetime('now'), deleted_at = datetime('now')
        WHERE id = ? AND tenant_id = ? AND user_id = ?`,
     )
-    .bind(args.input.localPath, args.input.id, ctx.auth.tenantId, ctx.auth.userId)
+    .bind(args.input.localPath, args.input.id, idn.tenantId, idn.userId)
     .run();
 
   return {

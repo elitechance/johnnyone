@@ -155,6 +155,12 @@ For the web relay to actually route to a running binary, the logged-in user's
 JWT subject must match `JOHNNYONE_USER_ID` — otherwise the worker resolves a
 different (or no) `desktop_node` and RPC/terminal calls never reach it.
 
+After initiative 4 (fail-closed GraphQL auth), `registerDesktopNode` and
+other worker GraphQL calls require `Authorization: Bearer`. Rebuild the
+desktop **before or with** that worker. **Do not deploy** the auth
+worker from an agent. Full L1–L7 / D12 procedure:
+`/home/creepy/Documents/Workspace/.johnnyone/initiatives/a53df1e5-4dd6-4226-9506-83698bcbd643/plan/phases/03-acceptance/artifacts/human-cutover.md`.
+
 ## Providers (CLI TUIs)
 
 Terminal-mode providers run the CLI in a tmux pane (`desktop/src-tauri/src/
@@ -199,9 +205,9 @@ lokal cf db status --env prod           # see applied vs pending migrations
 lokal cf worker secrets list --env prod # verify JWT_SECRET is set
 ```
 
-`npm run deploy:web` is the convenience wrapper for the web app — it runs
-`nx build web --skip-nx-cache && lokal cf pages deploy --env prod` (the
-`--skip-nx-cache` guarantees a fresh build, never a cache-replayed stale one).
+`npm run deploy:web` is the D12-safe wrapper: it runs
+`nx build web --skip-nx-cache && lokal cf worker deploy --env prod && lokal cf pages deploy --env prod`
+(`package.json` `deploy:web`). Worker-only is `npm run deploy:worker`.
 Related build-only scripts: `npm run build:web` (fast, cached) and
 `npm run build:web:fresh` (clean, no cache). The raw
 `PATH="$PWD/node_modules/.bin:$PATH" lokal cf pages deploy --env prod` still works

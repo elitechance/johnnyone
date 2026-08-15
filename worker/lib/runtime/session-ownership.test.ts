@@ -1,12 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { verifySessionOwnership, invalidateSessionOwnership } from './session-ownership';
 import * as relayRpcMod from './relay-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 describe('verifySessionOwnership (task 01)', () => {
   beforeEach(() => {
@@ -34,7 +31,7 @@ describe('verifySessionOwnership (task 01)', () => {
 
   it('tenant-scoping: same sessionId but different tenant/user → false', async () => {
     vi.spyOn(relayRpcMod, 'relayRpc').mockRejectedValueOnce(new Error('not yours'));
-    const otherCtx = { ...mockCtx, auth: { tenantId: 'other-t', userId: 'other-u' } };
+    const otherCtx = authedCtx({ tenantId: 'other-t', userId: 'other-u' });
     const ok = await verifySessionOwnership(otherCtx as any, 's1');
     expect(ok).toBe(false);
   });
@@ -67,7 +64,7 @@ describe('verifySessionOwnership (task 01)', () => {
   it('cache per (tenant,user,session)', async () => {
     const spy = vi.spyOn(relayRpcMod, 'relayRpc').mockResolvedValue({} as any);
     await verifySessionOwnership(mockCtx as any, 's-per-tenant');
-    const other = { ...mockCtx, auth: { tenantId: 't2', userId: 'u2' } } as any;
+    const other = authedCtx({ tenantId: 't2', userId: 'u2' });
     await verifySessionOwnership(other, 's-per-tenant');
     expect(spy).toHaveBeenCalledTimes(2); // different keys, separate lookups
   });

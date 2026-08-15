@@ -178,6 +178,12 @@ pub async fn refresh_access_token(state: &AppState) -> Result<bool, String> {
 
     settings::set_setting(state, settings::KEY_ACCESS_TOKEN.to_string(), new_access.to_string())?;
     settings::set_setting(state, settings::KEY_REFRESH_TOKEN.to_string(), new_refresh.to_string())?;
+    {
+        let mut guard = state.worker_relay_config.lock().await;
+        if let Some(cfg) = guard.as_mut() {
+            cfg.access_token = new_access.to_string();
+        }
+    }
     tracing::info!("Relay access token refreshed");
     Ok(true)
 }

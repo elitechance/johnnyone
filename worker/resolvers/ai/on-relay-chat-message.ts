@@ -1,3 +1,5 @@
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   auth: { userId: string; tenantId: string };
   pubsub: {
@@ -6,7 +8,9 @@ interface ResolverContext {
 }
 
 export default {
-  subscribe: (_parent: unknown, args: { sessionId: string }, ctx: ResolverContext) =>
-    ctx.pubsub.subscribe(`relay-chat-message:${ctx.auth.userId}:${args.sessionId}`),
+  subscribe: async (_parent: unknown, args: { sessionId: string }, ctx: ResolverContext) => {
+    const id = await requireIdentity(ctx as any);
+    return ctx.pubsub.subscribe(`relay-chat-message:${id.userId}:${args.sessionId}`);
+  },
   resolve: (payload: unknown) => payload,
 };

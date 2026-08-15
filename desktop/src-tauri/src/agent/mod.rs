@@ -58,13 +58,64 @@ impl AgentService {
             "Registering desktop node"
         );
 
-        let registered = registration::register_node(
-            &config.worker_url,
-            &config.user_id,
-            &config.tenant_id,
-            &hostname,
-        )
-        .await?;
+        // Re-resolve the credential on every start (D10). Do not rely only on
+        // the spawn-time AgentConfig clone in relay.rs.
+        let resolved = settings_service::RelayConfig::resolve(&*state);
+        let worker_url = resolved
+            .as_ref()
+            .map(|c| c.worker_url.clone())
+            .unwrap_or_else(|| config.worker_url.clone());
+        let user_id = resolved
+            .as_ref()
+            .map(|c| c.user_id.clone())
+            .unwrap_or_else(|| config.user_id.clone());
+        let tenant_id = resolved
+            .as_ref()
+            .map(|c| c.tenant_id.clone())
+            .unwrap_or_else(|| config.tenant_id.clone());
+        let token = registration::access_token_for_attempt(
+            resolved.as_ref().map(|c| c.access_token.as_str()),
+            &config.access_token,
+        );
+
+        let registered = {
+            let state_for_io = Arc::clone(&state);
+            let fallback_token = config.access_token.clone();
+            registration::register_with_optional_refresh(
+                &token,
+                |tok| {
+                    let wu = worker_url.clone();
+                    let uid = user_id.clone();
+                    let tid = tenant_id.clone();
+                    let hn = hostname.clone();
+                    let tok = tok.to_string();
+                    async move {
+                        registration::register_node(&wu, &uid, &tid, &hn, &tok).await
+                    }
+                },
+                {
+                    let st = Arc::clone(&state_for_io);
+                    move || {
+                        let st = Arc::clone(&st);
+                        async move { crate::services::relay::refresh_access_token(&st).await }
+                    }
+                },
+                {
+                    let st = Arc::clone(&state_for_io);
+                    move || {
+                        let st = Arc::clone(&st);
+                        let fallback = fallback_token.clone();
+                        async move {
+                            settings_service::RelayConfig::resolve(&st)
+                                .map(|c| c.access_token)
+                                .filter(|t| !t.trim().is_empty())
+                                .unwrap_or(fallback)
+                        }
+                    }
+                },
+            )
+            .await?
+        };
 
         let node_id = registered.id;
         tracing::info!(
@@ -697,7 +748,7 @@ impl AgentService {
             message: String,
         }
 
-        let worker_config = state
+        let snapshot = state
             .worker_relay_config
             .lock()
             .await
@@ -723,15 +774,37 @@ impl AgentService {
             .map_err(|e| format!("Failed to create attachment directory: {}", e))?;
 
         let client = reqwest::Client::new();
-        let graphql_url = format!("{}/graphql", worker_config.worker_url.trim_end_matches('/'));
         let mut saved_paths = Vec::new();
 
         for attachment in &command.attachments {
-            let response = client
-                .post(&graphql_url)
-                .header("Content-Type", "application/json")
-                .header("x-tenant-id", &worker_config.tenant_id)
-                .header("x-user-id", &worker_config.user_id)
+            // Resolve at call time — same credential the WS loop uses.
+            // Do not send the spawn-time WorkerRelayConfig snapshot token.
+            let resolved = settings_service::RelayConfig::resolve(state);
+            let tenant_id = resolved
+                .as_ref()
+                .map(|c| c.tenant_id.as_str())
+                .unwrap_or(snapshot.tenant_id.as_str());
+            let user_id = resolved
+                .as_ref()
+                .map(|c| c.user_id.as_str())
+                .unwrap_or(snapshot.user_id.as_str());
+            let worker_url = resolved
+                .as_ref()
+                .map(|c| c.worker_url.as_str())
+                .unwrap_or(snapshot.worker_url.as_str());
+            let graphql_url = format!("{}/graphql", worker_url.trim_end_matches('/'));
+            let auth_headers = registration::attachment_graphql_headers(
+                tenant_id,
+                user_id,
+                resolved.as_ref().map(|c| c.access_token.as_str()),
+                snapshot.access_token.as_str(),
+            );
+            let response = registration::apply_headers(
+                client
+                    .post(&graphql_url)
+                    .header("Content-Type", "application/json"),
+                &auth_headers,
+            )
                 .json(&serde_json::json!({
                     "query": "query GetChatAttachment($id: ID!) { getChatAttachment(id: $id) { id originalName contentType size dataBase64 } }",
                     "variables": { "id": attachment.id }
@@ -785,11 +858,12 @@ impl AgentService {
             let display_path = Self::display_workspace_path(&workspace_path, &local_path);
             saved_paths.push(display_path.clone());
 
-            let _ = client
-                .post(&graphql_url)
-                .header("Content-Type", "application/json")
-                .header("x-tenant-id", &worker_config.tenant_id)
-                .header("x-user-id", &worker_config.user_id)
+            let _ = registration::apply_headers(
+                client
+                    .post(&graphql_url)
+                    .header("Content-Type", "application/json"),
+                &auth_headers,
+            )
                 .json(&serde_json::json!({
                     "query": "mutation DeleteChatAttachment($input: MarkChatAttachmentDeliveredInput!) { deleteChatAttachment(input: $input) { id status localPath } }",
                     "variables": { "input": { "id": content.id, "localPath": display_path } }
