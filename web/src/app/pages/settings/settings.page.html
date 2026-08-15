@@ -1,0 +1,252 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Settings</ion-title>
+  </ion-toolbar>
+</ion-header>
+<ion-content class="ion-padding">
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Connection</ion-card-title>
+      <ion-card-subtitle>Where this client talks to the worker</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="none">
+        <ion-item>
+          <ion-label>
+            <h3>Worker GraphQL URL</h3>
+            <p>{{ apiUrl }}</p>
+          </ion-label>
+        </ion-item>
+        <ion-item>
+          <ion-label>
+            <h3>Tenant ID</h3>
+            <p>{{ tenantId() || '—' }}</p>
+          </ion-label>
+        </ion-item>
+      </ion-list>
+      <ion-text color="medium">
+        <p>
+          <em>
+            Worker URL is fixed at build time per Master plan §Decisions #3. Per-user host
+            registration UI ships in Phase 3 (installer control panel).
+          </em>
+        </p>
+      </ion-text>
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Alerts</ion-card-title>
+      <ion-card-subtitle>Ping a Discord channel when a run needs your attention</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-list lines="none">
+        <ion-item>
+          <ion-input
+            label="Discord webhook URL"
+            labelPlacement="stacked"
+            type="url"
+            autocomplete="off"
+            placeholder="https://discord.com/api/webhooks/…"
+            [(ngModel)]="discordWebhook"
+          ></ion-input>
+        </ion-item>
+      </ion-list>
+      <ion-button expand="block" (click)="saveDiscordWebhook()" [disabled]="savingDiscord()">
+        {{ savingDiscord() ? 'Saving…' : 'Save webhook' }}
+      </ion-button>
+      @if (discordSaved()) {
+        <ion-text color="success"><p>Saved.</p></ion-text>
+      }
+      <ion-text color="medium">
+        <p>
+          <em>
+            Fires only on attention (a run is blocked / needs a human decision) — never on
+            routine review changes. Leave blank to disable. Stored on the host.
+          </em>
+        </p>
+      </ion-text>
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card class="planner-prompts-card">
+    <ion-card-header>
+      <ion-card-title>Planner prompts</ion-card-title>
+      <ion-card-subtitle>
+        These strings are what the next planner / reviewer / leaf sees.
+      </ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-note color="warning" class="next-run">
+        A saved prompt takes effect on the next run, not the current one.
+      </ion-note>
+
+      @if (promptLoadState() === 'load-error') {
+        <ion-text color="danger">
+          <p>Could not load planner prompts.</p>
+        </ion-text>
+        <ion-button fill="outline" (click)="loadPrompts()">Retry</ion-button>
+      }
+
+      @if (promptLoadState() === 'loading' || promptLoadState() === 'idle') {
+        <div class="prompt-loading" aria-busy="true">
+          <ion-spinner name="crescent"></ion-spinner>
+          <ion-text color="medium"><p>Loading planner prompts…</p></ion-text>
+        </div>
+      }
+
+      @if (promptLoadState() === 'ready') {
+        <h3 class="prompt-group">Commercial</h3>
+        <ion-accordion-group>
+          @for (row of commercialRows; track row.key) {
+            <ion-accordion [value]="row.key">
+              <div slot="header" class="prompt-head">
+                <span class="name">{{ row.name }}</span>
+                <span class="path">{{ row.key }}</span>
+                @if (!row.persistOnly && !isUnsupported(row.key)) {
+                  <ion-badge class="badge" [color]="differsFromDefault(row.key, draft()[row.key]) ? 'warning' : 'medium'">
+                    {{ differsFromDefault(row.key, draft()[row.key]) ? 'Custom' : 'Default' }}
+                  </ion-badge>
+                }
+              </div>
+              <div slot="content" class="prompt-body">
+                @if (row.persistOnly) {
+                  <ion-note color="medium">
+                    Stored for a future release; not yet read by the coordinator.
+                  </ion-note>
+                }
+                @if (isUnsupported(row.key)) {
+                  <ion-note color="warning">This desktop does not support this prompt yet.</ion-note>
+                }
+                <ion-textarea
+                  [ngModel]="draft()[row.key] ?? ''"
+                  (ngModelChange)="setPrompt(row.key, $event)"
+                  [readonly]="row.persistOnly || isUnsupported(row.key)"
+                  [disabled]="row.persistOnly || isUnsupported(row.key)"
+                  [autoGrow]="false"
+                  [rows]="16"
+                  [spellcheck]="false"
+                  class="prompt-textarea"
+                ></ion-textarea>
+                @if (!row.persistOnly && !isUnsupported(row.key)) {
+                  <ion-button
+                    fill="outline"
+                    (click)="resetPrompt(row.key)"
+                    [disabled]="savingPrompts() || !differsFromDefault(row.key, draft()[row.key])"
+                  >
+                    Reset to default
+                  </ion-button>
+                }
+              </div>
+            </ion-accordion>
+          }
+        </ion-accordion-group>
+
+        <h3 class="prompt-group">Small mode</h3>
+        @if (!smallModeSupported()) {
+          <ion-note color="warning" class="sm-banner">
+            This desktop does not support small mode yet.
+          </ion-note>
+        }
+        <ion-accordion-group [class.sm-disabled]="!smallModeSupported()">
+          @for (row of smallModeRows; track row.key) {
+            <ion-accordion [value]="row.key" [disabled]="!smallModeSupported()">
+              <div slot="header" class="prompt-head">
+                <span class="name">{{ row.name }}</span>
+                <span class="path">{{ row.key }}</span>
+                @if (smallModeSupported()) {
+                  <ion-badge class="badge" [color]="differsFromDefault(row.key, draft()[row.key]) ? 'warning' : 'medium'">
+                    {{ differsFromDefault(row.key, draft()[row.key]) ? 'Custom' : 'Default' }}
+                  </ion-badge>
+                }
+              </div>
+              <div slot="content" class="prompt-body">
+                <ion-textarea
+                  [ngModel]="draft()[row.key] ?? ''"
+                  (ngModelChange)="setPrompt(row.key, $event)"
+                  [disabled]="!smallModeSupported()"
+                  [autoGrow]="false"
+                  [rows]="16"
+                  [spellcheck]="false"
+                  class="prompt-textarea"
+                ></ion-textarea>
+                <ion-button
+                  fill="outline"
+                  (click)="resetPrompt(row.key)"
+                  [disabled]="!smallModeSupported() || savingPrompts() || !differsFromDefault(row.key, draft()[row.key])"
+                >
+                  Reset to default
+                </ion-button>
+              </div>
+            </ion-accordion>
+          }
+        </ion-accordion-group>
+
+        <div class="prompt-footer">
+          <ion-button
+            expand="block"
+            (click)="savePrompts()"
+            [disabled]="savingPrompts() || !isDirty(draft(), lastSaved())"
+          >
+            {{ savingPrompts() ? 'Saving…' : 'Save prompts' }}
+          </ion-button>
+          @if (savingPrompts()) {
+            <ion-text color="medium"><p>Saving…</p></ion-text>
+          }
+          @if (promptsSaved() && !saveError()) {
+            <ion-text color="success"><p>Saved.</p></ion-text>
+          }
+          @if (saveError()) {
+            <ion-text color="danger"><p>Could not save planner prompts.</p></ion-text>
+            <ion-button fill="outline" (click)="savePrompts()">Retry</ion-button>
+          }
+        </div>
+      }
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Workspace tools</ion-card-title>
+      <ion-card-subtitle>Surfaces the P8 nav rail does not list — folding into Work (P8 D13)</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-button expand="block" fill="outline" routerLink="/developer">
+        Developer API console
+      </ion-button>
+      <ion-text color="medium">
+        <p>
+          <em>
+            Planning &amp; development are now stages of an Initiative in the Work console — run
+            them there. The legacy /planning &amp; /development pages were removed.
+          </em>
+        </p>
+      </ion-text>
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Account</ion-card-title>
+    </ion-card-header>
+    <ion-card-content>
+      <ion-button expand="block" color="medium" (click)="logout()">Sign out</ion-button>
+    </ion-card-content>
+  </ion-card>
+
+  <ion-card>
+    <ion-card-header>
+      <ion-card-title>Provider configs</ion-card-title>
+      <ion-card-subtitle>Coming after Phase 2</ion-card-subtitle>
+    </ion-card-header>
+    <ion-card-content>
+      <p>
+        Provider CRUD (Claude Code, Codex, Cline, Ollama) routes through the host via
+        relay-RPC — full wiring lands once Phase 2 task 08 migrates
+        <code>listProviderConfigs</code>, <code>upsertProviderConfig</code>, and
+        <code>deleteProviderConfig</code> off the legacy forward path.
+      </p>
+    </ion-card-content>
+  </ion-card>
+</ion-content>

@@ -326,10 +326,13 @@ export interface PlannerPromptSettings {
   development: {
     worker: string;
     reviewer: string;
+    workerNudge?: string | null;
   };
   planning: {
     planner: string;
     reviewer: string;
+    amendPlanner?: string | null;
+    amendReviewer?: string | null;
   };
   smallMode?: PlannerSmallModePrompts;
 }
@@ -769,8 +772,8 @@ export class JohnnyApiService {
         `query GetPlannerPromptSettings {
           getPlannerPromptSettings {
             schema
-            development { worker reviewer }
-            planning { planner reviewer }
+            development { worker reviewer workerNudge }
+            planning { planner reviewer amendPlanner amendReviewer }
             smallMode { planner reviewer leafWrapper amendPlanner }
           }
         }`
@@ -789,8 +792,8 @@ export class JohnnyApiService {
         `mutation UpdatePlannerPromptSettings($input: PlannerPromptSettingsInput!) {
           updatePlannerPromptSettings(input: $input) {
             schema
-            development { worker reviewer }
-            planning { planner reviewer }
+            development { worker reviewer workerNudge }
+            planning { planner reviewer amendPlanner amendReviewer }
             smallMode { planner reviewer leafWrapper amendPlanner }
           }
         }`,

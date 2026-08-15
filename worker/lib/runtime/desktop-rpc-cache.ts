@@ -13,7 +13,6 @@ const CACHE_TTL_MS: Record<string, number> = {
   detect_cli_tools: 30_000,
   get_agent_plan: 3_000,
   list_agent_plans: 5_000,
-  get_planner_prompt_settings: 30_000,
 };
 
 export function isReadRpcCacheable(method: string): boolean {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 const SCHEMA: &str = "johnnyone-planner-prompts/v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannerPromptSettings {
     #[serde(default = "default_schema")]
@@ -15,7 +15,7 @@ pub struct PlannerPromptSettings {
     pub small_mode: SmallModePrompts,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmallModePrompts {
     #[serde(default = "default_small_mode_planner")]
@@ -39,14 +39,30 @@ impl Default for SmallModePrompts {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannerDevelopmentPrompts {
     pub worker: String,
     pub reviewer: String,
+    /// Operator-authored persist-only key. No shipped default. Absent stays
+    /// absent; present is preserved verbatim (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_nudge: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// RPC / host overlay input. Additive `worker_nudge` is `Option`: `None` (key
+/// omitted) keeps `current`; `Some` writes. Do **not** deserialize this into
+/// `PlannerDevelopmentPrompts` as a substitute — that type is the stored shape.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannerDevelopmentOverlay {
+    pub worker: String,
+    pub reviewer: String,
+    #[serde(default)]
+    pub worker_nudge: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannerPlanningPrompts {
     pub planner: String,
@@ -64,6 +80,20 @@ pub struct PlannerPlanningPrompts {
     pub amend_reviewer: String,
 }
 
+/// RPC / host overlay input. Additive amend fields are `Option`: `None` keeps
+/// `current` (no `DEFAULT_AMEND_*` fill). Stored YAML may still serde-default
+/// those keys onto `PlannerPlanningPrompts`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannerPlanningOverlay {
+    pub planner: String,
+    pub reviewer: String,
+    #[serde(default)]
+    pub amend_planner: Option<String>,
+    #[serde(default)]
+    pub amend_reviewer: Option<String>,
+}
+
 impl Default for PlannerPromptSettings {
     fn default() -> Self {
         Self {
@@ -71,6 +101,7 @@ impl Default for PlannerPromptSettings {
             development: PlannerDevelopmentPrompts {
                 worker: DEFAULT_DEVELOPMENT_WORKER.to_string(),
                 reviewer: DEFAULT_DEVELOPMENT_REVIEWER.to_string(),
+                worker_nudge: None,
             },
             planning: PlannerPlanningPrompts {
                 planner: DEFAULT_PLANNING_PLANNER.to_string(),
@@ -116,18 +147,32 @@ fn default_small_mode_amend_planner() -> String {
 /// replacement) without the role / Judge-only / footer blocks.
 pub(crate) const PLAN_CHECK_ALREADY_VALIDATED: &str = "The plan-check script has already validated shape, files, DAG, scoped verify, must_contain, bounds, and the UI-task rule. Do not re-count files or re-check those rules.";
 
-/// Overlay a settings update onto `current`. `small_mode: None` keeps the
-/// already-saved smallMode (merge, don't replace with built-in defaults).
+/// Overlay a settings update onto `current`.
+///
+/// Required fields (`worker`, `reviewer`, `planning.planner`, `planning.reviewer`)
+/// always write. Additive fields (`worker_nudge`, `amend_planner`, `amend_reviewer`)
+/// are `Option` on the input: `Some(s)` writes, `None` keeps `current.*`.
+/// `small_mode: None` keeps the already-saved smallMode (do not replace with
+/// built-in defaults).
 pub fn overlay_prompt_settings(
     mut current: PlannerPromptSettings,
-    development: PlannerDevelopmentPrompts,
-    planning_planner: String,
-    planning_reviewer: String,
+    development: PlannerDevelopmentOverlay,
+    planning: PlannerPlanningOverlay,
     small_mode: Option<SmallModePrompts>,
 ) -> PlannerPromptSettings {
-    current.development = development;
-    current.planning.planner = planning_planner;
-    current.planning.reviewer = planning_reviewer;
+    current.development.worker = development.worker;
+    current.development.reviewer = development.reviewer;
+    if let Some(nudge) = development.worker_nudge {
+        current.development.worker_nudge = Some(nudge);
+    }
+    current.planning.planner = planning.planner;
+    current.planning.reviewer = planning.reviewer;
+    if let Some(amend_planner) = planning.amend_planner {
+        current.planning.amend_planner = amend_planner;
+    }
+    if let Some(amend_reviewer) = planning.amend_reviewer {
+        current.planning.amend_reviewer = amend_reviewer;
+    }
     if let Some(sm) = small_mode {
         current.small_mode = sm;
     }
@@ -622,9 +667,17 @@ planning:
     /// a commercial-prompt change is intentional.
     #[test]
     fn commercial_templates_match_pinned_fingerprints() {
+        // Ten shipped DEFAULT_* strings. Not workerNudge (no shipped default).
         assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x0fc962193643a37b);
         assert_eq!(fnv1a64(DEFAULT_PLANNING_REVIEWER), 0x42e3b3d0e4178fe5);
         assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_WORKER), 0xbb568e9822273934);
+        assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_REVIEWER), 0x882713aa907d5d7f);
+        assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_PLANNER), 0x7f841cf263c8c761);
+        assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_REVIEWER), 0xea96c82d6fcfac66);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_PLANNER), 0xf4d9e4c41b8ee5e3);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_REVIEWER), 0x37ef8923327e716d);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_LEAF_WRAPPER), 0x464e7f9226edda96);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_AMEND_PLANNER), 0x9f3c6a26c7cfc32d);
     }
 
     #[test]
@@ -646,12 +699,17 @@ planning:
         current.small_mode.reviewer = "TUNED-REVIEWER".into();
         let merged = overlay_prompt_settings(
             current,
-            PlannerDevelopmentPrompts {
+            PlannerDevelopmentOverlay {
                 worker: "W".into(),
                 reviewer: "R".into(),
+                worker_nudge: None,
             },
-            "P".into(),
-            "V".into(),
+            PlannerPlanningOverlay {
+                planner: "P".into(),
+                reviewer: "V".into(),
+                amend_planner: None,
+                amend_reviewer: None,
+            },
             None,
         );
         assert_eq!(merged.development.worker, "W");
@@ -670,5 +728,181 @@ planning:
     #[test]
     fn leaf_wrapper_is_short() {
         assert!(DEFAULT_SMALL_MODE_LEAF_WRAPPER.lines().count() <= 30);
+    }
+
+    #[test]
+    fn overlay_partial_planning_json_does_not_clobber_amend() {
+        let mut current = PlannerPromptSettings::default();
+        current.planning.amend_planner = "TUNED-AMEND-P".into();
+        current.planning.amend_reviewer = "TUNED-AMEND-R".into();
+        current.development.worker_nudge = Some("TUNED-NUDGE".into());
+        let planning: PlannerPlanningOverlay = serde_json::from_value(serde_json::json!({
+            "planner": "P",
+            "reviewer": "V"
+        }))
+        .unwrap();
+        let development: PlannerDevelopmentOverlay = serde_json::from_value(serde_json::json!({
+            "worker": "W",
+            "reviewer": "R"
+        }))
+        .unwrap();
+        assert!(planning.amend_planner.is_none());
+        assert!(planning.amend_reviewer.is_none());
+        assert!(development.worker_nudge.is_none());
+        let merged = overlay_prompt_settings(current, development, planning, None);
+        assert_eq!(merged.planning.planner, "P");
+        assert_eq!(merged.planning.reviewer, "V");
+        assert_eq!(merged.planning.amend_planner, "TUNED-AMEND-P");
+        assert_eq!(merged.planning.amend_reviewer, "TUNED-AMEND-R");
+        assert_eq!(merged.development.worker_nudge.as_deref(), Some("TUNED-NUDGE"));
+    }
+
+    #[test]
+    fn overlay_omitted_worker_nudge_keeps_none() {
+        let current = PlannerPromptSettings::default();
+        assert!(current.development.worker_nudge.is_none());
+        let development: PlannerDevelopmentOverlay = serde_json::from_value(serde_json::json!({
+            "worker": "W",
+            "reviewer": "R"
+        }))
+        .unwrap();
+        let planning: PlannerPlanningOverlay = serde_json::from_value(serde_json::json!({
+            "planner": "P",
+            "reviewer": "V"
+        }))
+        .unwrap();
+        let merged = overlay_prompt_settings(current, development, planning, None);
+        assert!(merged.development.worker_nudge.is_none());
+    }
+
+    #[test]
+    fn yaml_worker_nudge_present_round_trips() {
+        let raw = r#"
+schema: johnnyone-planner-prompts/v1
+development:
+  worker: W
+  reviewer: R
+  workerNudge: CUSTOM-NUDGE
+planning:
+  planner: P
+  reviewer: V
+"#;
+        let s: PlannerPromptSettings = serde_yaml::from_str(raw).unwrap();
+        assert_eq!(s.development.worker_nudge.as_deref(), Some("CUSTOM-NUDGE"));
+        let out = serde_yaml::to_string(&s).unwrap();
+        assert!(out.contains("workerNudge"));
+        let again: PlannerPromptSettings = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(again.development.worker_nudge.as_deref(), Some("CUSTOM-NUDGE"));
+    }
+
+    #[test]
+    fn yaml_without_worker_nudge_omits_the_key() {
+        let s = PlannerPromptSettings::default();
+        assert!(s.development.worker_nudge.is_none());
+        let out = serde_yaml::to_string(&s).unwrap();
+        assert!(
+            !out.contains("workerNudge"),
+            "absent worker_nudge must skip_serializing_if: {out}"
+        );
+    }
+
+    fn sentinel_settings() -> PlannerPromptSettings {
+        PlannerPromptSettings {
+            schema: "johnnyone-planner-prompts/v1".into(),
+            development: PlannerDevelopmentPrompts {
+                worker: "W".into(),
+                reviewer: "R".into(),
+                worker_nudge: Some("WNUDGE".into()),
+            },
+            planning: PlannerPlanningPrompts {
+                planner: "P".into(),
+                reviewer: "V".into(),
+                amend_planner: "AMEND-P".into(),
+                amend_reviewer: "AMEND-R".into(),
+            },
+            small_mode: SmallModePrompts {
+                planner: "SM-P".into(),
+                reviewer: "SM-R".into(),
+                leaf_wrapper: "SM-L".into(),
+                amend_planner: "SM-AMEND-P".into(),
+            },
+        }
+    }
+
+    /// Amendment 1: load → write unmodified through the same Option input types
+    /// as host/RPC → every field including the three extras is identical.
+    /// Does not touch ~/.johnnyone/planner-prompts.yml.
+    #[test]
+    fn prompt_settings_round_trip_is_byte_identical() {
+        let loaded = sentinel_settings();
+        // Complete write: Some(sentinel) for every additive field (not the
+        // stored String structs — that path stays green even if None→keep
+        // regresses).
+        let development = PlannerDevelopmentOverlay {
+            worker: loaded.development.worker.clone(),
+            reviewer: loaded.development.reviewer.clone(),
+            worker_nudge: loaded.development.worker_nudge.clone(),
+        };
+        let planning = PlannerPlanningOverlay {
+            planner: loaded.planning.planner.clone(),
+            reviewer: loaded.planning.reviewer.clone(),
+            amend_planner: Some(loaded.planning.amend_planner.clone()),
+            amend_reviewer: Some(loaded.planning.amend_reviewer.clone()),
+        };
+        let small_mode = Some(loaded.small_mode.clone());
+        let written = overlay_prompt_settings(
+            PlannerPromptSettings::default(),
+            development,
+            planning,
+            small_mode,
+        );
+        assert_eq!(written.development.worker, "W");
+        assert_eq!(written.development.reviewer, "R");
+        assert_eq!(written.development.worker_nudge.as_deref(), Some("WNUDGE"));
+        assert_eq!(written.planning.planner, "P");
+        assert_eq!(written.planning.reviewer, "V");
+        assert_eq!(written.planning.amend_planner, "AMEND-P");
+        assert_eq!(written.planning.amend_reviewer, "AMEND-R");
+        assert_eq!(written.small_mode.planner, "SM-P");
+        assert_eq!(written.small_mode.reviewer, "SM-R");
+        assert_eq!(written.small_mode.leaf_wrapper, "SM-L");
+        assert_eq!(written.small_mode.amend_planner, "SM-AMEND-P");
+        assert_ne!(written.planning.amend_planner, DEFAULT_AMEND_PLANNING_PLANNER);
+        assert_ne!(written.planning.amend_reviewer, DEFAULT_AMEND_PLANNING_REVIEWER);
+        assert_eq!(written, loaded);
+
+        // Serialize path used by save_prompt_settings — a present worker_nudge
+        // must not be dropped. No operator-home write.
+        let yaml = serde_yaml::to_string(&written).unwrap();
+        assert!(yaml.contains("workerNudge"));
+        assert!(yaml.contains("WNUDGE"));
+        let deserialized: PlannerPromptSettings = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.development.worker_nudge.as_deref(), Some("WNUDGE"));
+        assert_eq!(deserialized, loaded);
+
+        // Reverse-skew: omitted additive keys on the input types keep current.
+        let mut current = sentinel_settings();
+        current.development.worker_nudge = Some("TUNED-NUDGE".into());
+        current.planning.amend_planner = "TUNED-AMEND-P".into();
+        current.planning.amend_reviewer = "TUNED-AMEND-R".into();
+        let partial_dev: PlannerDevelopmentOverlay = serde_json::from_value(serde_json::json!({
+            "worker": "W2",
+            "reviewer": "R2"
+        }))
+        .unwrap();
+        let partial_plan: PlannerPlanningOverlay = serde_json::from_value(serde_json::json!({
+            "planner": "P2",
+            "reviewer": "V2"
+        }))
+        .unwrap();
+        let kept = overlay_prompt_settings(current.clone(), partial_dev, partial_plan, None);
+        assert_eq!(kept.development.worker, "W2");
+        assert_eq!(kept.development.reviewer, "R2");
+        assert_eq!(kept.development.worker_nudge.as_deref(), Some("TUNED-NUDGE"));
+        assert_eq!(kept.planning.planner, "P2");
+        assert_eq!(kept.planning.reviewer, "V2");
+        assert_eq!(kept.planning.amend_planner, "TUNED-AMEND-P");
+        assert_eq!(kept.planning.amend_reviewer, "TUNED-AMEND-R");
+        assert_eq!(kept.small_mode, current.small_mode);
     }
 }

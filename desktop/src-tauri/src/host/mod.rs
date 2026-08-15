@@ -318,12 +318,17 @@ impl MutationRoot {
         });
         let merged = planner_prompt_service::overlay_prompt_settings(
             current,
-            planner_prompt_service::PlannerDevelopmentPrompts {
+            planner_prompt_service::PlannerDevelopmentOverlay {
                 worker: input.development.worker,
                 reviewer: input.development.reviewer,
+                worker_nudge: input.development.worker_nudge,
             },
-            input.planning.planner,
-            input.planning.reviewer,
+            planner_prompt_service::PlannerPlanningOverlay {
+                planner: input.planning.planner,
+                reviewer: input.planning.reviewer,
+                amend_planner: input.planning.amend_planner,
+                amend_reviewer: input.planning.amend_reviewer,
+            },
             small_mode,
         );
         Ok(planner_prompt_service::save_prompt_settings(merged)?.into())
@@ -546,6 +551,7 @@ struct GqlPlannerSmallModePrompts {
 struct GqlPlannerDevelopmentPrompts {
     worker: String,
     reviewer: String,
+    worker_nudge: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -553,6 +559,8 @@ struct GqlPlannerDevelopmentPrompts {
 struct GqlPlannerPlanningPrompts {
     planner: String,
     reviewer: String,
+    amend_planner: Option<String>,
+    amend_reviewer: Option<String>,
 }
 
 impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
@@ -562,10 +570,13 @@ impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
             development: GqlPlannerDevelopmentPrompts {
                 worker: value.development.worker,
                 reviewer: value.development.reviewer,
+                worker_nudge: value.development.worker_nudge,
             },
             planning: GqlPlannerPlanningPrompts {
                 planner: value.planning.planner,
                 reviewer: value.planning.reviewer,
+                amend_planner: Some(value.planning.amend_planner),
+                amend_reviewer: Some(value.planning.amend_reviewer),
             },
             small_mode: Some(GqlPlannerSmallModePrompts {
                 planner: value.small_mode.planner,
@@ -712,6 +723,7 @@ struct PlannerSmallModePromptsInput {
 struct PlannerDevelopmentPromptsInput {
     worker: String,
     reviewer: String,
+    worker_nudge: Option<String>,
 }
 
 #[derive(InputObject)]
@@ -719,6 +731,8 @@ struct PlannerDevelopmentPromptsInput {
 struct PlannerPlanningPromptsInput {
     planner: String,
     reviewer: String,
+    amend_planner: Option<String>,
+    amend_reviewer: Option<String>,
 }
 
 

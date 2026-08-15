@@ -343,11 +343,16 @@ type PlannerSmallModePrompts {
 type PlannerDevelopmentPrompts {
   worker: String!
   reviewer: String!
+  # Nullable: pre-cutover desktop RPC omits the key. Null = desktop too old.
+  workerNudge: String
 }
 
 type PlannerPlanningPrompts {
   planner: String!
   reviewer: String!
+  # Nullable: pre-cutover desktop omits them. Null = desktop too old.
+  amendPlanner: String
+  amendReviewer: String
 }
 
 # --- Inputs ---
@@ -475,11 +480,15 @@ input PlannerSmallModePromptsInput {
 input PlannerDevelopmentPromptsInput {
   worker: String!
   reviewer: String!
+  # Omit/null keeps current (reverse-skew safe).
+  workerNudge: String
 }
 
 input PlannerPlanningPromptsInput {
   planner: String!
   reviewer: String!
+  amendPlanner: String
+  amendReviewer: String
 }
 
 # --- Queries ---
