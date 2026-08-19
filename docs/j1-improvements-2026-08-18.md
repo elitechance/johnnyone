@@ -276,3 +276,53 @@ read.
 **Fix options:** restrict the directory to coordinator-owned mode 0700; sign or namespace messages by
 session id and have the agent ignore anything that does not match its own; prune consumed messages;
 and at minimum keep `.johnnyone/inbox/` out of version control.
+
+---
+
+## J1-09 — J1 cannot safely dogfood changes to its own coordinator
+
+**Severity:** structural · **Status:** noted, drives the plan below
+
+The coordinator runs **inside** the desktop binary. Improving it means editing
+`desktop/src-tauri/src/...`, rebuilding, and restarting the process — which kills the coordinator
+loop that is running the very initiative doing the work. A run cannot survive replacing its own host.
+
+Confirmed in practice this session: every fix (J1-05, J1-06, J1-07) required
+`npm run build:desktop` + kill + relaunch. Any in-flight initiative dies with it, and planning runs
+land in `needs_attention`, which is terminal by design — so it would not even auto-resume.
+
+This splits J1's own backlog into two categories, and the split decides how each item gets built:
+
+| Lives in | Can J1 build it while running? | Items |
+|---|---|---|
+| `desktop/src-tauri` (coordinator, relay, migrations) | **No** — rebuild kills the run | J1-01, J1-02, J1-07 follow-up, verify-before-ready, J1-08 |
+| `web/`, `ui/`, `worker/` | **Yes** — deployed separately, coordinator untouched | J1-04 console surfacing |
+
+**Worth fixing structurally:** if the coordinator could hand off or persist its loop across a binary
+swap — or run out-of-process — J1 could improve itself without dropping work. Today "improve J1" and
+"run an initiative" are mutually exclusive activities.
+
+---
+
+## Plan for the J1 improvement pass (after Caseroom completes)
+
+Decision on dogfood vs hand-coding, per J1-09 rather than by preference:
+
+**Hand-code — desktop internals.** Rebuilding kills any run, so these cannot be done by a live J1
+initiative. They are also small and surgical, and each already has a written fix in this log:
+- **J1-01** Discord deep link → `{base}/initiatives?initiativeId={id}` (one line)
+- **J1-02** check `response.status().is_success()`; honour 429 `Retry-After`
+- **Verify-before-ready** — the important one. The coordinator accepts `ready` on trust; it should
+  confirm the deliverable exists (planning: `overview.md` + `phases/` in the plan store) and feed a
+  ready-with-no-output back to the agent instead of promoting it to review. This would have caught
+  J1-07 independently of the nudge wording, and is the single highest-value item on the list.
+- **J1-08** inbox hardening: 0700, session-scoped message filenames the agent validates, prune on
+  consume, and drop `.johnnyone/inbox/` from version control (354 stale files since June).
+
+**Dogfood — web console.** `web/` deploys independently of the desktop binary, so a J1 initiative can
+build it without killing itself. This is the honest test of the loop, on a real feature:
+- **J1-04** surface stuck runs on the initiatives console — a count badge for runs sitting in
+  `needs_attention`, with age. Self-contained, testable, no coordinator involvement.
+
+Running the dogfood item second also means it exercises a coordinator that already carries the
+hand-coded fixes, which is the more useful test.
