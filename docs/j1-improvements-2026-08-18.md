@@ -124,6 +124,29 @@ message is missed the run is effectively lost.
 **Fix options:** an age-based re-ping for runs stuck in `needs_attention` past a threshold; or a
 count badge on the initiatives console; or a daily digest. Cheapest is the badge.
 
+**Updated 2026-08-19 — it is worse than first recorded.** A full listing now shows **seven** stuck
+Oculus runs, not four, and they have aged six days:
+
+| Run | Type | Status | Stuck since |
+|---|---|---|---|
+| 26b372fc | planning | blocked | 2026-08-13 15:43 |
+| b0464a9c | development | blocked | 2026-08-13 15:42 |
+| 76fce06d | development | needs_attention | 2026-08-13 15:27 |
+| 1fe3bc39 | development | needs_attention | 2026-08-13 15:25 |
+| 032954f9 | development | needs_attention | 2026-08-13 15:05 |
+| f51b98fa | development | needs_attention | 2026-08-13 14:42 |
+| 0aa44024 | development | blocked | 2026-08-13 14:35 |
+
+`blocked` is as invisible as `needs_attention` — an agent that reported `blocked` is explicitly
+asking a human a question, and nothing carries that question anywhere a human will see it. Four of
+these are the same initiative retried repeatedly, which suggests someone did notice at the time and
+had no way to resume, so they started over.
+
+This also compounded the J1-12 damage: an approved plan re-stamped `needs_attention` sits in the
+list looking identical to a genuinely stuck run, and the console gives no way to tell "finished, then
+corrupted by a straggler loop" from "waiting on you since Tuesday". **The list needs age, and it
+needs to distinguish a status that was reached from one that was overwritten.**
+
 ---
 
 ## J1-05 — Migration versions are a shared namespace with no collision detection
@@ -458,3 +481,45 @@ path (clean finish and error alike), or a plan could never be resumed for the li
 **Also worth doing:** put the `status NOT IN ('approved','blocked','stopped')` guard on the
 round-cap escalation UPDATE too. Defence in depth — no writer should be able to move a plan out of a
 terminal state.
+
+
+---
+
+## J1-13 — Console cannot distinguish a reached status from an overwritten one
+
+**Severity:** medium · operational trust · **Status:** open
+
+Fallout from J1-12, but it outlives that fix.
+
+When the straggler loop wrote `needs_attention` over an approved plan, the initiatives list showed
+it exactly as it shows a run that genuinely stalled. The product owner saw it and reasonably asked
+whether the thing they had been waiting on had failed. Nothing on the row said the plan had already
+passed all three lenses, handed off, and had a development run building from it.
+
+The information exists — the event feed holds `planning_gate_result`, the approval, the
+`development_autostarted`, and the later rounds. It is simply not surfaced on the row.
+
+**Fix:** show the initiative's furthest-reached stage alongside its current status ("approved →
+development" beside a `needs_attention` planning row), and mark a status written after a terminal
+one as suspect. Cheap, and it turns a confusing row into a self-explaining one.
+
+---
+
+## Operational note — the development agent improved on the plan, and that is fine
+
+Not a defect; recorded because it is evidence about how the loop behaves.
+
+Phase 00 told the developer to **narrow** `BreakpointService` to its non-layout consumers. Grok
+**deleted it entirely** — file and spec. On inspection that was the better call: once the layout
+stops branching on breakpoint, the consumers that read it were rewritten in the same phase, leaving
+the service with no importers. Verified: `grep` finds no remaining reference and `tsc --noEmit`
+passes.
+
+Worth noting for two reasons:
+
+1. A developer agent deviating from an explicit plan instruction is exactly what the validation lens
+   exists to catch, and the deviation here was an improvement. The plan should probably say *"narrow
+   or remove, whichever the consumer sweep leaves"* rather than pinning the outcome.
+2. It argues against over-specifying implementation in the plan. The acceptance criteria that made
+   this checkable were the greppable ones (`grep -rn "auxExistsFor"` shows one definition and three
+   consumers), not the prose telling the developer which of two equivalent end-states to reach.
