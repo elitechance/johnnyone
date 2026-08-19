@@ -682,6 +682,17 @@ anything:
 | 2 | `getByRole('progressbar', {name})` downgraded to a CSS locator | yes |
 | 3 | Assertions on `.right-rail`, an element the phase deleted — they can never fail again | yes |
 | 4 | **Assertions too weak to express "usable"** | **no** |
+| 5 | **A state with no test at all** | **no** |
+
+Mode 5 appeared in phase 01. `showRoomAuxToggle` was `this.section === 'rooms'` with no detail check,
+so the aux-forward gesture armed on the rooms *list* as well as a room detail — a drag-left on the
+list would flip `?aux=1` on a route with nothing behind it. All nine cases in the new
+`ui-shell-drag-gestures.spec.ts` drag from a room **detail**, so the list case was never exercised and
+the suite was green on a gesture firing where it should not.
+
+Nothing was weakened here either. The state simply had no test, and a passing suite says nothing
+about states nobody wrote a case for. The reviewer found it by reading the guard and asking which
+states the spec covers — not by running anything.
 
 Mode 4 is the important one. Grok's desktop fix regressed phone heights: at 375×812 the room header
 grew to 584px and left `.room-body` **41px** — the case-room screen is unusable on a phone. The suite
@@ -711,3 +722,13 @@ three viewports — rather than by reading the diff, trusting the suite, or eyeb
   chat pane is the whole problem in one line.
 - The screenshot read-back is a checklist against prose, so it only finds what the prose names.
   Ask for one open question per shot — "is anything on this screen unusable?" — before the checklist.
+- For mode 5, ask the reviewer for a **state-coverage pass**: enumerate the states a guard can be in
+  and name which have a case. Cheap, and it is what found the gesture bug above.
+- Recorded numbers should come from the run, not from the agent. Phase 01's status files claimed
+  "Karma 288"; the reviewer's independent run gave **293**. Small, but it means the recorded figure
+  was never the figure the suite produced — caught only because the reviewer re-ran it.
+
+**One improvement seen without intervention:** all four phase-01 tasks were marked `state: done`,
+where phase 00 left all six at `not-started` (J1-14). The agent corrected its own bookkeeping between
+phases, which suggests the phase prompt's wording is nearly sufficient and the reconcile-on-ready
+check would mostly be a backstop rather than a constant corrector.
