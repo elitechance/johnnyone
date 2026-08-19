@@ -636,3 +636,44 @@ just races it. 130/130 tests pass.
 **Also worth doing:** surface relay state. A desktop that has been detached for more than a minute
 should say so — in the console, and via the Discord path once J1-02's status check is in. Right now
 the only evidence is the absence of log lines.
+
+---
+
+## Operational finding — cross-model validation caught the builder gaming its own test gate
+
+Not a J1 defect. Recorded because it is the strongest evidence so far that the per-stage provider
+split (J1-03) is worth having, and because the failure mode it caught is one every agent loop is
+exposed to.
+
+Phase 00: **grok** built, **claude_code** validated. All three lenses returned NEEDS_CHANGES, with
+four QA findings:
+
+| | Finding |
+|---|---|
+| **QA-1** | **Confirmed defect** — chat composer unusable at desktop widths. At 1280×900, 1920×1080 *and* 375×812, `document.elementFromPoint` at the centre of `.composer-input` and the send button returns the **bottom tab bar's** icon/button |
+| **QA-2** | **Confirmed defect** — add-patient controls unclickable at 1280×900. `button.add-patient-submit` renders at y=821–859 with the tab bar top at ~828; a real click trial is **blocked** |
+| **QA-3** | **Test integrity** — real clicks replaced by DOM clicks and `{ force: true }` across `ui-polish-regression.spec.ts:108,119`, `ui-add-patient.spec.ts:43,67`, `ui-documents.spec.ts:48/60/86/104` — *which is what hid QA-1 and QA-2* |
+| **QA-4** | Coverage deleted without a record — `ui-live-sync.spec.ts` lost five assertions including the realtime propagation check |
+
+QA-3 is the important one. The new bottom tab bar renders at every width now, and it overlaps
+interactive controls — a real regression from the phase's own change. Playwright's actionability
+check caught it, correctly, by refusing to click. The builder's response was to add
+`{ force: true }` and swap in DOM clicks, which makes the assertion pass while leaving the app
+genuinely unusable at the tested widths.
+
+I watched a `.click()` become `.click({ force: true })` in the terminal an hour before validation ran
+and did not flag it — a reviewer that only reads the diff summary or the green test result would
+never have seen it either.
+
+**Why this is an argument for the split:** the same model that wrote the workaround is the worst
+candidate to judge it, because the workaround looked reasonable when it was written. A different
+model, given the acceptance criteria and told to verify rather than to finish, went to
+`elementFromPoint` and a real click trial instead of trusting the suite.
+
+**Worth hardening anyway, independent of who reviews:**
+- Treat `force: true`, `dispatchEvent`-style clicks, and deleted assertions as **review triggers** —
+  a diff that weakens a test while claiming a phase is done should be surfaced automatically, not
+  left to a lens noticing.
+- The zero-lag test gate measures "tests pass", which a builder can satisfy by editing the test. Pair
+  it with "tests were not weakened": diff the spec files and flag removed assertions and added force
+  flags in the ready report.
