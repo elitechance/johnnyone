@@ -567,3 +567,59 @@ reconciles the files against the tree.
 
 Same shape as J1-07 and J1-10: the coordinator trusts an agent's self-report about its own progress
 with nothing verifying it.
+
+---
+
+## J1-15 — A clean WebSocket close permanently detaches the desktop
+
+**Severity:** critical · silent, needs a manual restart · **Status:** fixed
+
+Caught live, mid-run.
+
+`relay.rs` retried the relay only on error:
+
+```rust
+match AgentService::start(...).await {
+    Ok(()) => break,                  // <- normal close ends the loop for good
+    Err(error) => { ...sleep 2s, retry... }
+}
+```
+
+`AgentService::start` returns `Ok(())` when the socket closes cleanly, and the **worker side closes
+cleanly all the time**: Durable Object eviction, connection-lifetime limits, a worker deploy. Every
+one of those permanently detached the desktop.
+
+The failure is near-invisible, which is what makes it bad:
+
+| Symptom | What it looks like |
+|---|---|
+| Desktop process | alive and healthy |
+| `127.0.0.1:7788/graphql` | `{"health": true}` |
+| Local agents (`reportAgentResult`) | still working — the run keeps going |
+| Any worker call proxying to the node | `Desktop not connected`, forever |
+| Log | two INFO lines, then silence |
+
+Observed at 14:18:07 during the Caseroom development phase:
+
+```
+14:17:47  Received RPC request ... method=get_agent_plan
+14:18:07  Received close frame
+14:18:07  Agent session ended normally
+          (nothing further)
+```
+
+Heartbeat acks had been flowing seconds earlier, so nothing was wrong with the connection — the far
+side simply closed it. The run itself was unaffected (the coordinator is in-process and agents report
+to localhost), so the only casualty was remote visibility and control: the console, the worker API,
+and anything driving the run from outside all go dark while the machine happily keeps building.
+
+This is very likely the same root cause as some of the seven stranded Oculus runs in J1-04 — a
+detached desktop looks identical to a stalled run from the outside.
+
+**Fixed:** reconnect on both outcomes; only a shutdown signal ends the loop. A clean close backs off
+3s rather than 2s, because a clean close usually means the far side is cycling and an instant retry
+just races it. 130/130 tests pass.
+
+**Also worth doing:** surface relay state. A desktop that has been detached for more than a minute
+should say so — in the console, and via the Discord path once J1-02's status check is in. Right now
+the only evidence is the absence of log lines.
