@@ -326,3 +326,50 @@ build it without killing itself. This is the honest test of the loop, on a real 
 
 Running the dogfood item second also means it exercises a coordinator that already carries the
 hand-coded fixes, which is the more useful test.
+
+---
+
+## J1-10 — Plan output location is ambiguous: app docs dir vs initiative store
+
+**Severity:** high · wastes a full review cycle · **Status:** open
+
+Hit on the second Caseroom run. The planner worked 45 minutes and produced a genuine plan —
+`overview.md` (23KB), 11 phase directories, `status.md`. It reported ready correctly. Review then
+started against a directory containing only `brief.md`, and the run looked identical to the J1-07
+false-ready failure.
+
+The plan was not missing. It was in the **other** plan directory.
+
+Two locations are in play and nothing reconciles them:
+
+| Path | Who uses it |
+|---|---|
+| `lokal/docs/apps/caseroom/plans/<name>/` | the app's own plan convention; where prior plans live; where my brief told the planner to write |
+| `~/Documents/Workspace/.johnnyone/initiatives/<id>/plan/` | the **initiative store** — what `parse_plan` reads, what the coordinator seeds `brief.md` into, and what every reviewer-lens prompt names as "the plan" |
+
+The reviewer prompt says, verbatim: *"then read the plan at
+/home/creepy/Documents/Workspace/.johnnyone/initiatives/<id>/plan"*. The planner prompt does not
+pin the output location with the same force, so a brief that names the app docs dir wins — and the
+two halves of the run disagree about where the artifact lives.
+
+**Mitigated for this run** by copying the plan into the store; the lenses are now reviewing the real
+plan.
+
+**Why it matters beyond my brief's wording:** the store is what `parse_plan` reads when the
+development stage is created. A plan that exists only in the docs dir would fail
+`auto_start_development` with "the plan may not follow the methodology's overview.md + phases/
+structure" — the initiative would stall at planning-approved with a misleading error pointing at plan
+*structure* rather than plan *location*.
+
+**Fix options, cheapest first:**
+1. **Verify-before-ready** (already the top recommendation from J1-07) catches this exactly: on a
+   planning `ready`, confirm `overview.md` + `phases/` are in the store; if absent, tell the planner
+   where the plan must be and let it move the files. One check covers both failure modes.
+2. Make the planner prompt state the store path as the required output with the same emphasis the
+   reviewer prompt uses, and say explicitly that any app-repo docs copy is a mirror, not the
+   deliverable.
+3. Or make the store a symlink to the app docs plan dir at initiative creation, so the two are the
+   same directory and cannot diverge.
+
+**Note for future briefs:** do not specify a plan output path. J1 owns that. My brief did, and it
+cost a review cycle.
