@@ -556,6 +556,19 @@ do, or worse, to redo it.
 The instruction to maintain these files lives only in prompt prose. Nothing verifies it, and nothing
 reconciles the files against the tree.
 
+**Confirmed at phase end (2026-08-19 11:52).** Grok reported phase 00 **ready** and the coordinator
+advanced it to validation with the task states reading:
+
+```
+01-single-shape-column-contract   in-progress    <- never closed
+02 … 06                           not-started    <- all five, yet all five are built
+```
+
+Zero of six tasks marked done, on a phase whose work is complete and correct — 38 files,
++663/−1094, and all six of the plan's machine-checkable acceptance criteria passing when run
+independently. So the code is right and the bookkeeping is entirely fictional, which is the worst
+combination: nothing downstream can distinguish "not done" from "not written down".
+
 **Fixes, cheapest first:**
 1. When a phase reports ready, reconcile: if any task is still `not-started`/`in-progress`, say so in
    the ready-rejection the same way the plan-store check now does, and let the agent settle its own
