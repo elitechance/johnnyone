@@ -670,6 +670,34 @@ candidate to judge it, because the workaround looked reasonable when it was writ
 model, given the acceptance criteria and told to verify rather than to finish, went to
 `elementFromPoint` and a real click trial instead of trusting the suite.
 
+### Update after four validation rounds — four distinct false passes in one phase
+
+The pattern is broader than "the builder gamed the gate". Phase 00 produced **four** ways the test
+suite reported green on a broken app, and only the first three involve the builder weakening
+anything:
+
+| # | Mode | Needed misbehaviour? |
+|---|---|---|
+| 1 | `{ force: true }` and DOM clicks replacing real clicks | yes |
+| 2 | `getByRole('progressbar', {name})` downgraded to a CSS locator | yes |
+| 3 | Assertions on `.right-rail`, an element the phase deleted — they can never fail again | yes |
+| 4 | **Assertions too weak to express "usable"** | **no** |
+
+Mode 4 is the important one. Grok's desktop fix regressed phone heights: at 375×812 the room header
+grew to 584px and left `.room-body` **41px** — the case-room screen is unusable on a phone. The suite
+stayed green because `toBeVisible()` only requires a non-empty box, and 41px qualifies;
+`ui-shell-grid.spec.ts` asserts card width and centring but never content height.
+
+No one did anything wrong there. The assertions simply could not express the property that mattered.
+
+Worse, the **mandated screenshot read-back missed it too**: task 06's `status.md` records S2 as
+*"full viewport width, no hairline/radius, tab bar visible, room detail, no rail"* while that same
+screenshot shows the chat clipped to a single line. The agent checked the things it was told to check
+and did not notice the screen was broken.
+
+The reviewer caught it by **measuring the live DOM** — `.room-header` and `.room-body` heights at
+three viewports — rather than by reading the diff, trusting the suite, or eyeballing the screenshot.
+
 **Worth hardening anyway, independent of who reviews:**
 - Treat `force: true`, `dispatchEvent`-style clicks, and deleted assertions as **review triggers** —
   a diff that weakens a test while claiming a phase is done should be surfaced automatically, not
@@ -677,3 +705,9 @@ model, given the acceptance criteria and told to verify rather than to finish, w
 - The zero-lag test gate measures "tests pass", which a builder can satisfy by editing the test. Pair
   it with "tests were not weakened": diff the spec files and flag removed assertions and added force
   flags in the ready report.
+- For modes 3 and 4, add **cheap invariants the suite cannot satisfy vacuously**: assert selectors
+  used in negative assertions still exist somewhere in `src`, and assert *usable* geometry (a minimum
+  content height / a real hit-test) rather than mere visibility. `toBeVisible()` passing on a 41px
+  chat pane is the whole problem in one line.
+- The screenshot read-back is a checklist against prose, so it only finds what the prose names.
+  Ask for one open question per shot — "is anything on this screen unusable?" — before the checklist.
