@@ -373,3 +373,51 @@ structure" — the initiative would stall at planning-approved with a misleading
 
 **Note for future briefs:** do not specify a plan output path. J1 owns that. My brief did, and it
 cost a review cycle.
+
+---
+
+## J1-11 — Review has no severity gate, so polish blocks progress like defects
+
+**Severity:** high · stalls otherwise-finished plans · **Status:** open, worked around
+
+The planning review never converges on a large plan, because a lens returns a single
+PASS / NEEDS_CHANGES / BLOCKED verdict with no notion of "good enough".
+
+Observed on the Caseroom initiative across rounds:
+
+| Round | product | qa | lead |
+|---|---|---|---|
+| 1 | NEEDS_CHANGES | PASS | PASS |
+| 2 | NEEDS_CHANGES | PASS | NEEDS_CHANGES |
+| 3 | **PASS** | PASS | NEEDS_CHANGES |
+| 4 | NEEDS_CHANGES *(regressed)* | PASS | NEEDS_CHANGES — **0 of 10 findings marked blocking** |
+
+Round 4 is the tell. The lead lens returned NEEDS_CHANGES while marking **none** of its ten findings
+blocking, and explicitly recorded the phase shape as *"checked and accepted"*. The product lens
+regressed from PASS to NEEDS_CHANGES on newly-noticed mock frames. Each round the lenses read a
+larger plan more carefully and find more refinements — a plan of 11 phases and 49 tasks has an
+effectively unbounded supply of them.
+
+Two structural causes:
+
+1. **No severity in the gate.** The lenses *do* self-label (`[blocking]`, `[minor]`, "not a
+   finding, recorded so it is not mistaken for one") — the information exists and is discarded. The
+   verdict enum cannot express "ship it, with follow-ups".
+2. **Findings can target immutable inputs.** Most of the surviving items ask for frames in
+   `artifacts/*.html`, which the planner is told are locked inputs it may not edit. It can only add
+   register entries; the lens then finds the next undrawn state. The loop cannot close by
+   construction.
+
+Combined with the round cap this produces the worst outcome: six rounds of real work, then
+`needs_attention`, which does not auto-resume (J1-04) — so it sat idle six hours overnight.
+
+**Worked around** by an amend instructing one comprehensive sweep of all undrawn states into the
+plan's own §5.3 register, then report ready.
+
+**Fixes worth making:**
+- Let a lens return **PASS_WITH_FOLLOWUPS**, or gate only on findings the lens marked blocking. The
+  labels are already there.
+- Have the coordinator diff findings across rounds: if round N's findings are disjoint from round
+  N−1's and none are blocking, that is convergence-by-exhaustion, not a failing plan — advance it.
+- Tell lenses explicitly that inputs marked immutable are out of scope for findings; a gap in a
+  locked mock is a note, never a NEEDS_CHANGES.
