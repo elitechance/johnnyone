@@ -121,6 +121,14 @@ pub struct AppState {
     /// Handle to the running relay connection loop. Aborted + respawned by
     /// `relay::reconnect` when connection settings change (reconnect-on-save).
     pub relay_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Plan ids that currently have a coordinator loop running.
+    ///
+    /// `spawn_coordinator_loop` used to `tokio::spawn` unconditionally, so every call that resumes
+    /// or amends a run started ANOTHER loop against the same plan. Three amends on one planning run
+    /// left three loops racing: one approved the plan and exited, a survivor ran a further review
+    /// round hours later and stamped `needs_attention` over the approved plan, burning three lens
+    /// agents on work already finished. This set makes the spawn idempotent per plan.
+    pub coordinator_loops: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl AppState {
@@ -167,6 +175,7 @@ impl AppState {
             worker_relay_config: Arc::new(Mutex::new(None)),
             agent_reports: Arc::new(Mutex::new(HashMap::new())),
             relay_task: Arc::new(Mutex::new(None)),
+            coordinator_loops: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -205,6 +214,7 @@ impl AppState {
             worker_relay_config: Arc::new(Mutex::new(None)),
             agent_reports: Arc::new(Mutex::new(HashMap::new())),
             relay_task: Arc::new(Mutex::new(None)),
+            coordinator_loops: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 

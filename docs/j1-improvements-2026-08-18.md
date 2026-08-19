@@ -421,3 +421,40 @@ plan's own §5.3 register, then report ready.
   N−1's and none are blocking, that is convergence-by-exhaustion, not a failing plan — advance it.
 - Tell lenses explicitly that inputs marked immutable are out of scope for findings; a gap in a
   locked mock is a note, never a NEEDS_CHANGES.
+
+---
+
+## J1-12 — `spawn_coordinator_loop` has no dedupe; amends stack racing loops
+
+**Severity:** high · corrupts terminal state, burns agents · **Status:** fixed
+
+`spawn_coordinator_loop` was a bare `tokio::spawn` with no check for an existing loop on the same
+plan. Eight call sites reach it — create, start, resume, amend, run-from-phase — and several can
+fire for one plan in a single session.
+
+Observed on the Caseroom planning run. I sent three amends while converging the plan, so three
+coordinator loops ran concurrently against one row:
+
+| Time (UTC) | What happened |
+|---|---|
+| 13:10:35 | one loop reaches PASS → **plan approved**, development run auto-created and started |
+| 13:42:20 | a **surviving sibling** dispatches a further review round on the already-approved plan |
+| 13:46:22 | that round returns NEEDS_CHANGES, trips the 6-round cap, writes `needs_attention` |
+
+Net effect: an approved plan displayed as needing human attention hours after it was done, three
+lens agents burned re-reviewing finished work, and a false alert that would pull a human in for
+nothing. The development run was unaffected — it is a separate row — but only by luck of the
+partitioning, not by design.
+
+Note the error path already guards with `WHERE status NOT IN ('approved','blocked','stopped')`, so
+someone anticipated a stale writer. The round-cap escalation writes its own UPDATE without that
+guard, so it overwrote `approved` anyway. Two writers, one guard.
+
+**Fixed:** `AppState.coordinator_loops: Arc<Mutex<HashSet<String>>>` makes the spawn idempotent per
+plan — a second call for a plan already looping logs and returns. The slot is released on every exit
+path (clean finish and error alike), or a plan could never be resumed for the life of the process.
+130/130 tests pass.
+
+**Also worth doing:** put the `status NOT IN ('approved','blocked','stopped')` guard on the
+round-cap escalation UPDATE too. Defence in depth — no writer should be able to move a plan out of a
+terminal state.

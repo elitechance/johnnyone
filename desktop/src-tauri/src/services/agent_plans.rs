@@ -1917,7 +1917,20 @@ pub fn git_diff(state: &AppState, path: String) -> Result<GitDiffView, String> {
     })
 }
 
+/// Start the coordinator loop for a plan, **at most once**.
+///
+/// Callers are many — create, start, resume, amend, run-from-phase — and several can fire for one
+/// plan in a single session. Without this guard each call spawned another loop against the same
+/// row; the loops then race on the same state machine, and a straggler can undo a terminal status
+/// its sibling already reached.
 async fn spawn_coordinator_loop(state: AppState, plan_id: String) {
+    {
+        let mut running = state.coordinator_loops.lock().await;
+        if !running.insert(plan_id.clone()) {
+            tracing::debug!(plan_id = %plan_id, "coordinator loop already running; not spawning another");
+            return;
+        }
+    }
     tokio::spawn(async move {
         if let Err(error) = coordinator_loop(state.clone(), plan_id.clone()).await {
             let _ = state.db.with_conn(|conn| {
@@ -1940,7 +1953,49 @@ async fn spawn_coordinator_loop(state: AppState, plan_id: String) {
                 json!({ "reason": error }),
             );
         }
+        // Release the slot on EVERY exit path — clean finish or error — or the plan could never be
+        // resumed for the remaining life of the process.
+        state.coordinator_loops.lock().await.remove(&plan_id);
     });
+}
+
+/// Does the plan store actually contain a plan?
+///
+/// The coordinator accepts a `ready` report on trust, which has burned two runs: once when a nudge
+/// was mistaken for the task and the planner reported ready having written nothing, and once when
+/// the plan was written to the app's docs directory instead of the initiative store. Both advanced
+/// to review against a store holding only `brief.md`, and three lens agents graded an empty
+/// directory.
+///
+/// The methodology's shape is `overview.md` plus a non-empty `phases/`, which is also exactly what
+/// `parse_plan` needs later to create the development run — so checking it here catches the failure
+/// at the point it happens rather than several minutes and three agents later.
+fn planning_deliverable_missing(plan_path: &str) -> Option<String> {
+    let root = std::path::Path::new(plan_path);
+    let overview = root.join("overview.md");
+    let phases = root.join("phases");
+    let has_overview = overview.is_file();
+    let has_phases = phases
+        .read_dir()
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false);
+    if has_overview && has_phases {
+        return None;
+    }
+    let mut missing = Vec::new();
+    if !has_overview {
+        missing.push("overview.md");
+    }
+    if !has_phases {
+        missing.push("a non-empty phases/ directory");
+    }
+    Some(format!(
+        "The plan store at {} is missing {}. A `ready` report was received, but there is no plan \
+         to review. Write the plan to THAT directory — not to the app repo's docs tree, which is a \
+         mirror and not the deliverable — then report ready again.",
+        plan_path,
+        missing.join(" and ")
+    ))
 }
 
 async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String> {
@@ -1955,6 +2010,25 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                         .clone()
                         .ok_or_else(|| "Planning run has no planner session".to_string())?;
                     wait_for_planner_ready(&state, &session_id, &plan_id).await?;
+                    // Trust, but verify. A `ready` with an empty store is not readiness — bounce it
+                    // back to the planner instead of spending a review round on nothing.
+                    if let Some(reason) = planning_deliverable_missing(&run.plan.plan_path) {
+                        tracing::warn!(plan_id = %plan_id, "planner reported ready with no plan in the store");
+                        append_event(
+                            &state,
+                            &plan_id,
+                            None,
+                            "planning_ready_rejected",
+                            json!({ "reason": reason }),
+                        )?;
+                        terminal::send_terminal_input(
+                            &state,
+                            session_id.clone(),
+                            format!("{}\r", reason),
+                        )
+                        .await?;
+                        continue;
+                    }
                     state.db.with_conn(|conn| {
                         conn.execute(
                             "UPDATE agent_plans SET status = 'planning_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'planning_planner_running'",
@@ -6682,6 +6756,49 @@ mod store_tests {
             normalize_stage_provider(Some("  grok ")),
             Some("grok".to_string())
         );
+    }
+
+    #[test]
+    fn planning_deliverable_missing_flags_an_empty_store() {
+        let dir = tmp_dir("deliverable");
+        let path = dir.to_string_lossy().to_string();
+
+        // Empty store — exactly what a false `ready` leaves behind.
+        let reason = planning_deliverable_missing(&path).expect("empty store must be rejected");
+        assert!(reason.contains("overview.md"), "{reason}");
+        assert!(reason.contains("phases/"), "{reason}");
+
+        // Only the brief the coordinator seeds: still not a plan.
+        std::fs::write(dir.join("brief.md"), "the ask").unwrap();
+        assert!(planning_deliverable_missing(&path).is_some());
+
+        // overview.md alone, phases/ absent.
+        std::fs::write(dir.join("overview.md"), "# plan").unwrap();
+        let reason = planning_deliverable_missing(&path).expect("phases/ still missing");
+        assert!(reason.contains("phases/"), "{reason}");
+        assert!(!reason.contains("overview.md and"), "{reason}");
+
+        // phases/ present but EMPTY — a directory is not a plan.
+        std::fs::create_dir(dir.join("phases")).unwrap();
+        assert!(
+            planning_deliverable_missing(&path).is_some(),
+            "an empty phases/ must not count as a deliverable"
+        );
+
+        // A real phase inside: now it is a plan.
+        std::fs::create_dir(dir.join("phases/00-first")).unwrap();
+        assert!(planning_deliverable_missing(&path).is_none());
+    }
+
+    #[test]
+    fn planning_deliverable_missing_names_the_store_not_the_docs_mirror() {
+        // The second failure mode: the plan was written to the app docs tree instead of the store.
+        // The message must point at the store path and say the docs tree is not the deliverable.
+        let dir = tmp_dir("deliverable-msg");
+        let path = dir.to_string_lossy().to_string();
+        let reason = planning_deliverable_missing(&path).expect("empty store");
+        assert!(reason.contains(&path), "must name the store path: {reason}");
+        assert!(reason.contains("mirror"), "must say the docs tree is a mirror: {reason}");
     }
 
     /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
