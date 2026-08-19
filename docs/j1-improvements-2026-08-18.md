@@ -683,6 +683,8 @@ anything:
 | 3 | Assertions on `.right-rail`, an element the phase deleted — they can never fail again | yes |
 | 4 | **Assertions too weak to express "usable"** | **no** |
 | 5 | **A state with no test at all** | **no** |
+| 6 | **A real failure recorded as a flake** | yes, but in the *record* |
+| 7 | **A screenshot of the wrong screen** | no |
 
 Mode 5 appeared in phase 01. `showRoomAuxToggle` was `this.section === 'rooms'` with no detail check,
 so the aux-forward gesture armed on the rooms *list* as well as a room detail — a drag-left on the
@@ -724,6 +726,28 @@ three viewports — rather than by reading the diff, trusting the suite, or eyeb
   Ask for one open question per shot — "is anything on this screen unusable?" — before the checklist.
 - For mode 5, ask the reviewer for a **state-coverage pass**: enumerate the states a guard can be in
   and name which have a case. Cheap, and it is what found the gesture bug above.
+
+**Modes 6 and 7, from phase 02 — both live in the record rather than the code, which is why they
+would survive to production.**
+
+Mode 6: grok recorded *"Full e2e 110+1 after shell-phase flake harden"*. The reviewer checked and the
+failure was **not** a flake — it was a deterministic assertion invalidated by `.case-room` becoming a
+shared class, a change grok's own `discoveries.md` documents, and it was fixed by editing the spec.
+Nothing was concealed; the *label* rewrote a required behavioural change as test noise. This is the
+most durable mode in the list, because "flaky" is the one word that reliably stops anyone
+investigating, and it persists in the status file long after the diff is forgotten.
+
+Mode 7: the empty-state evidence `l3-rooms-empty.png` was captured at 1280 from
+`/patients/pat-does-not-exist-12345?aux=1` — a patient that does not exist, whose L2 renders the
+**locked** state. The image was filed as proof of "a patient with no case rooms". It would satisfy any
+read-back checklist asking "does this show an empty state", because it does show *an* empty state —
+just not the one under test. A screenshot proves a screen rendered; it does not prove which.
+
+- Ban "flake" as an unevidenced label: a failure may only be recorded as flaky with a reproduction
+  count or a linked upstream issue. Otherwise it is a defect or a required spec change, and must be
+  named as one.
+- Screenshot evidence should record **how the state was reached** (route + fixture), not just what it
+  shows, so a capture of the wrong state is visible without opening the image.
 - Recorded numbers should come from the run, not from the agent. Phase 01's status files claimed
   "Karma 288"; the reviewer's independent run gave **293**. Small, but it means the recorded figure
   was never the figure the suite produced — caught only because the reviewer re-ran it.
