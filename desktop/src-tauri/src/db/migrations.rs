@@ -23,6 +23,12 @@ pub const BACKFILL_017: &str = include_str!("../../migrations/017_backfill_initi
 const MIGRATION_018: &str = include_str!("../../migrations/018_add_briefing_session.sql");
 const MIGRATION_019: &str = include_str!("../../migrations/019_add_validation_config.sql");
 const MIGRATION_020: &str = include_str!("../../migrations/020_complete_approved_dev_runs.sql");
+// NOTE: version 21 is RESERVED by `021_add_executor_config` on the `feat/local-small-executor`
+// branch, which has already been applied to live databases. Versions are a shared, hand-assigned
+// namespace across branches — reusing 21 here would be silently skipped on any DB that saw the other
+// branch first (the runner only checks whether the *number* was applied), leaving the columns absent
+// while the code assumes them. Hence 22.
+const MIGRATION_022: &str = include_str!("../../migrations/022_add_dev_stage_providers.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -83,7 +89,33 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (18, "018_add_briefing_session", MIGRATION_018),
         (19, "019_add_validation_config", MIGRATION_019),
         (20, "020_complete_approved_dev_runs", MIGRATION_020),
+        (22, "022_add_dev_stage_providers", MIGRATION_022),
     ];
+
+    // Guard the shared version namespace. Versions are hand-assigned integers, and branches that
+    // develop in parallel can each claim the same number (021 was claimed twice — see the NOTE above).
+    // The applied-set check below keys on the NUMBER alone, so a DB that already ran someone else's
+    // migration N silently skips ours, leaving the schema short of columns the code then assumes.
+    // Detect the mismatch instead of limping on: same number, different name = stop.
+    let applied_names: std::collections::HashMap<i64, String> = {
+        let mut stmt = conn
+            .prepare("SELECT version, name FROM _migrations")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (version, name, _) in &migrations {
+        if let Some(existing) = applied_names.get(version) {
+            if existing != name {
+                return Err(format!(
+                    "Migration version {} is already applied as '{}', but this build expects '{}'.                      Two branches claimed the same version number. Renumber the newer migration                      rather than reusing the slot — reusing it would silently skip the schema change.",
+                    version, existing, name
+                ));
+            }
+        }
+    }
 
     for (version, name, sql) in migrations {
         if !applied.contains(&version) {

@@ -58,11 +58,17 @@ impl AgentService {
             "Registering desktop node"
         );
 
+        // Resolve the credential the same way the WS loop does, so registration and the socket
+        // always present the same identity.
+        let registration_token = settings_service::RelayConfig::resolve(&*state)
+            .map(|c| c.access_token)
+            .unwrap_or_else(|| config.access_token.clone());
         let registered = registration::register_node(
             &config.worker_url,
             &config.user_id,
             &config.tenant_id,
             &hostname,
+            &registration_token,
         )
         .await?;
 

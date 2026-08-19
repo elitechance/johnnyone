@@ -124,6 +124,9 @@ type AgentPlan {
   reviewerSessionId: String
   workerProvider: String!
   reviewerProvider: String!
+  # Non-null on a planning row that binds a different agent for the development stage.
+  devWorkerProvider: String
+  devReviewerProvider: String
   currentPhaseId: String
   currentPhaseIndex: Int!
   error: String
@@ -426,6 +429,12 @@ input CreateAgentPlanInput {
   workerSetupCommands: String
   # Same, for a "shell" reviewerProvider — run in each spawned reviewer shell.
   reviewerSetupCommands: String
+  # Per-stage provider binding for the continuous SDLC loop. Set these on a planning or briefing
+  # create to say which agent BUILDS and which VALIDATES once planning hands off to development
+  # (e.g. claude plans, grok builds, claude validates). Omit both to keep the previous behaviour,
+  # where the development stage inherits whichever agent ran planning.
+  devWorkerProvider: String
+  devReviewerProvider: String
 }
 
 # Briefing loop (overhaul P4, D1). Create an Initiative at initiative_status='briefing' with a draft
@@ -437,6 +446,12 @@ input CreateBriefingInput {
   workerProvider: String!
   reviewerProvider: String!
   model: String
+  # Per-stage provider binding for the continuous SDLC loop. Set these on a planning or briefing
+  # create to say which agent BUILDS and which VALIDATES once planning hands off to development
+  # (e.g. claude plans, grok builds, claude validates). Omit both to keep the previous behaviour,
+  # where the development stage inherits whichever agent ran planning.
+  devWorkerProvider: String
+  devReviewerProvider: String
 }
 
 # Accept a briefing brief (overhaul P4, D1/D4): flips the same Initiative briefing→planning.

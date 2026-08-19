@@ -170,6 +170,12 @@ pub struct AgentPlan {
     /// and every SELECT (order is load-bearing); nullable for deploy-skew safety like the
     /// initiative axes.
     pub validation_config: Option<String>,
+    /// Per-stage provider binding (SDLC stage providers). Set on the **planning/briefing** row to
+    /// say what the *development* stage-run should use; NULL means "inherit this row's
+    /// worker/reviewer providers", which is the pre-existing single-agent behaviour. Appended after
+    /// `validation_config` in the positional row map and every SELECT — order is load-bearing.
+    pub dev_worker_provider: Option<String>,
+    pub dev_reviewer_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +259,14 @@ pub struct CreateAgentPlanInput {
     /// each (lazily-created) reviewer shell is spawned.
     #[serde(default)]
     pub reviewer_setup_commands: Option<String>,
+    /// Development-stage provider binding. Set on a **planning** or **briefing** create to say
+    /// which agent builds (`dev_worker_provider`) and which validates
+    /// (`dev_reviewer_provider`) once the coordinator hands planning off to development. Both
+    /// NULL → the development run inherits this run's providers (pre-existing behaviour).
+    #[serde(default)]
+    pub dev_worker_provider: Option<String>,
+    #[serde(default)]
+    pub dev_reviewer_provider: Option<String>,
 }
 
 /// Input for `create_briefing_run` (overhaul P4, D1). Mirrors the briefing-relevant
@@ -270,6 +284,14 @@ pub struct CreateBriefingInput {
     pub reviewer_provider: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Development-stage provider binding. Set on a **planning** or **briefing** create to say
+    /// which agent builds (`dev_worker_provider`) and which validates
+    /// (`dev_reviewer_provider`) once the coordinator hands planning off to development. Both
+    /// NULL → the development run inherits this run's providers (pre-existing behaviour).
+    #[serde(default)]
+    pub dev_worker_provider: Option<String>,
+    #[serde(default)]
+    pub dev_reviewer_provider: Option<String>,
 }
 
 // ── Usage Log ────────────────────────────────────────────────────────────────
@@ -319,6 +341,8 @@ mod tests {
             created_at: "".into(),
             updated_at: "".into(),
             validation_config: Some("[]".into()),
+            dev_worker_provider: None,
+            dev_reviewer_provider: None,
         }
     }
 

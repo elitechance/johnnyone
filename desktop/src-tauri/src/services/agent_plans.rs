@@ -35,7 +35,19 @@ const MAX_REVISION_ROUNDS: i64 = 6;
 /// report before the coordinator re-requests it. The agent has clearly stopped
 /// working (Grok's volatile chrome is filtered out of the idle key) but never ran
 /// the report command.
-const READY_NUDGE_IDLE_MS: u64 = 20_000;
+///
+/// This was 20s, which was far too aggressive: a static screen does NOT mean a stopped
+/// agent. A planning turn opens a multi-page brief, a requirements doc, the methodology and
+/// the conventions before it writes anything — minutes of quiet reasoning during which the
+/// normalized screen never changes. The coordinator would nudge a working agent, and the
+/// nudge (which hands over the ready command) could be mistaken for the instruction —
+/// producing a "ready" with no deliverable, which then advanced the run to review against an
+/// empty plan directory. Observed 2026-08-19 on the Caseroom initiative: prompt at 00:53:06,
+/// nudge at 00:53:53, false ready at 00:54:20, three review lenses grading nothing.
+///
+/// 3 minutes is long enough to cover a genuine read-and-think and short enough that a truly
+/// wedged agent still escalates within ~15 minutes across MAX_READY_NUDGES.
+const READY_NUDGE_IDLE_MS: u64 = 180_000;
 /// How many times to re-request a report before escalating to needs_attention,
 /// so a run can never hang forever waiting on a report that won't arrive.
 const MAX_READY_NUDGES: u32 = 5;
@@ -198,6 +210,35 @@ fn update_plan_status_and_health(
     conn.execute(
         "UPDATE agent_plans SET status = ?1, health = ?2, error = ?3, updated_at = datetime('now') WHERE id = ?4",
         params![new_status, health_from_status(new_status), error, plan_id],
+    )
+}
+
+/// Trim a caller-supplied stage provider down to `Some(non-empty)` or `None`. An empty string from
+/// a form field must land as SQL NULL, not `''` — NULL is what means "inherit the planning row's
+/// providers", and `''` would resolve to a provider that does not exist.
+fn normalize_stage_provider(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Which providers the development stage-run should use, given its planning row.
+///
+/// Returns `(worker, reviewer)`. A `dev_*` column set on the planning row wins; NULL falls back to
+/// that row's own provider, which is the pre-existing single-agent behaviour (so initiatives created
+/// before migration 021 keep working unchanged). The two sides resolve independently: binding only
+/// the builder still leaves validation on the planning provider.
+pub fn development_stage_providers(planning: &AgentPlan) -> (String, String) {
+    (
+        planning
+            .dev_worker_provider
+            .clone()
+            .unwrap_or_else(|| planning.worker_provider.clone()),
+        planning
+            .dev_reviewer_provider
+            .clone()
+            .unwrap_or_else(|| planning.reviewer_provider.clone()),
     )
 }
 
@@ -368,8 +409,8 @@ fn create_planning_run(
         conn.execute(
             // Fresh initiative: id == initiative_id (?1); plan_path (?4) is the store path;
             // initiative_status='planning', health seeded 'in-progress'.
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands, initiative_id, initiative_status, health, validation_config)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?1, 'planning', 'in-progress', NULL)",
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, app_scope, docs_scope, reference_paths, reviewer_setup_commands, initiative_id, initiative_status, health, validation_config, dev_worker_provider, dev_reviewer_provider)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', ?5, NULL, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?1, 'planning', 'in-progress', NULL, ?13, ?14)",
             params![
                 plan_id,
                 title,
@@ -383,6 +424,8 @@ fn create_planning_run(
                 docs_scope,
                 reference_paths,
                 input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
+                normalize_stage_provider(input.dev_worker_provider.as_deref()),
+                normalize_stage_provider(input.dev_reviewer_provider.as_deref()),
             ],
         )
         .map_err(|e| format!("Failed to create planning run: {}", e))
@@ -462,8 +505,8 @@ pub async fn create_briefing_run(
             // Fresh briefing Initiative: id == initiative_id (?1); plan_path (?4) is the store path;
             // initiative_status='briefing', worker/reviewer sessions NULL (no planner yet),
             // briefing_session_id (?7) links the chat session, health seeded 'in-progress'.
-            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, initiative_id, initiative_status, health, briefing_session_id, validation_config)
-             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', NULL, NULL, ?5, ?6, 0, ?8, ?1, 'briefing', 'in-progress', ?7, NULL)",
+            "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_index, brief, initiative_id, initiative_status, health, briefing_session_id, validation_config, dev_worker_provider, dev_reviewer_provider)
+             VALUES (?1, 'planning', ?2, ?3, ?4, 'draft', NULL, NULL, ?5, ?6, 0, ?8, ?1, 'briefing', 'in-progress', ?7, NULL, ?9, ?10)",
             params![
                 plan_id,
                 title,
@@ -473,6 +516,8 @@ pub async fn create_briefing_run(
                 input.reviewer_provider,
                 chat_session.id,
                 input.brief.clone().unwrap_or_default(),
+                normalize_stage_provider(input.dev_worker_provider.as_deref()),
+                normalize_stage_provider(input.dev_reviewer_provider.as_deref()),
             ],
         )
         .map_err(|e| format!("Failed to create briefing run: {}", e))
@@ -674,7 +719,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -696,7 +741,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -3007,7 +3052,8 @@ async fn wait_for_done_report(
             }
             nudges_sent += 1;
             let nudge = format!(
-                "You have not reported completion. When the docs are committed, run this exact command:\n{}",
+                "COORDINATOR STATUS CHECK — not a new task. Run the command below ONLY once the docs \
+                 are actually committed; if you are still working, ignore this and continue.\n{}",
                 report_command(session_id, "done")
             );
             terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", nudge))
@@ -3319,8 +3365,18 @@ async fn wait_for_agent_ready_report(
                 attempt = nudges_sent,
                 "coordinator re-requesting ready report"
             );
+            // Wording matters: this arrives as an ordinary message in the agent's terminal and
+            // carries a ready-to-run command. Phrased loosely ("if this turn is complete…"), an
+            // agent that has not started — or is mid-read — can take it as its instruction and
+            // report ready with nothing produced. Lead with what this is NOT, and make the
+            // precondition concrete before the command appears.
             let nudge = format!(
-                "You have not reported completion to the coordinator. If this turn is complete, run exactly:\n{}\nIf you are not finished, continue the work.",
+                "COORDINATOR STATUS CHECK — this is not a new task and not permission to finish.\n\
+                 Run the command below ONLY if you have already produced this turn's deliverable \
+                 and written it to disk. If you have not started, are still reading, or are still \
+                 working: ignore this message entirely and continue the task you were assigned. \
+                 Reporting ready without the deliverable advances the run to review against an \
+                 empty result and wastes a full cycle.\n{}",
                 report_command(session_id, "ready")
             );
             terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", nudge))
@@ -3611,19 +3667,25 @@ fn auto_start_development<'a>(
     // handle_planning_reviewer_output → back here. A concrete boxed return type stops the opaque-type
     // cycle the compiler otherwise can't resolve.
     Box::pin(async move {
+    let (dev_worker, dev_reviewer) = development_stage_providers(&planning.plan);
     let input = CreateAgentPlanInput {
         run_type: Some("development".to_string()),
         title: Some(planning.plan.title.clone()),
         workspace_path: planning.plan.workspace_path.clone(),
         plan_path: planning.plan.plan_path.clone(),
-        worker_provider: planning.plan.worker_provider.clone(),
-        reviewer_provider: planning.plan.reviewer_provider.clone(),
+        // Per-stage providers: the planning row may bind a different builder/validator for the
+        // development stage (e.g. grok builds, claude validates). NULL columns inherit planning's.
+        worker_provider: dev_worker,
+        reviewer_provider: dev_reviewer,
         brief: planning.plan.brief.clone(),
         app_scope: planning.plan.app_scope.clone(),
         docs_scope: planning.plan.docs_scope.clone(),
         reference_paths: planning.plan.reference_paths.clone(),
         worker_setup_commands: None,
         reviewer_setup_commands: None,
+        // A development row is terminal in the stage chain — it never hands off again.
+        dev_worker_provider: None,
+        dev_reviewer_provider: None,
     };
     let dev = match create_plan(state, input) {
         Ok(dev) => dev,
@@ -5597,6 +5659,9 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         // Appended last (P7, D3) — order is load-bearing; every SELECT feeding this mapper
         // ends with validation_config.
         validation_config: row.get(25)?,
+        // Per-stage providers, appended after validation_config (order is load-bearing).
+        dev_worker_provider: row.get(26)?,
+        dev_reviewer_provider: row.get(27)?,
     })
 }
 
@@ -6530,7 +6595,93 @@ mod store_tests {
             reference_paths: None,
             worker_setup_commands: None,
             reviewer_setup_commands: None,
+            dev_worker_provider: None,
+            dev_reviewer_provider: None,
         }
+    }
+
+    /// Build a planning-row AgentPlan with the given per-stage provider bindings.
+    fn planning_plan_with_dev(
+        dev_worker: Option<&str>,
+        dev_reviewer: Option<&str>,
+    ) -> crate::db::models::AgentPlan {
+        crate::db::models::AgentPlan {
+            id: "P".into(),
+            run_type: "planning".into(),
+            title: "t".into(),
+            workspace_path: "/w".into(),
+            plan_path: "/p".into(),
+            status: "draft".into(),
+            worker_session_id: None,
+            reviewer_session_id: None,
+            worker_provider: "claude_code".into(),
+            reviewer_provider: "claude_code".into(),
+            current_phase_id: None,
+            current_phase_index: 0,
+            error: None,
+            brief: None,
+            app_scope: None,
+            docs_scope: None,
+            reference_paths: None,
+            amend_brief: None,
+            phase_run_mode: "continue".into(),
+            initiative_id: "P".into(),
+            initiative_status: "planning".into(),
+            health: "in-progress".into(),
+            briefing_session_id: None,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            validation_config: None,
+            dev_worker_provider: dev_worker.map(str::to_string),
+            dev_reviewer_provider: dev_reviewer.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn development_stage_providers_bind_builder_and_validator_independently() {
+        // The shape the product owner asked for: claude plans, grok builds, claude validates.
+        let plan = planning_plan_with_dev(Some("grok"), Some("claude_code"));
+        assert_eq!(
+            development_stage_providers(&plan),
+            ("grok".to_string(), "claude_code".to_string())
+        );
+
+        // Only the builder bound → validation stays on the planning provider.
+        let plan = planning_plan_with_dev(Some("grok"), None);
+        assert_eq!(
+            development_stage_providers(&plan),
+            ("grok".to_string(), "claude_code".to_string())
+        );
+
+        // Only the validator bound → the builder stays on the planning provider.
+        let plan = planning_plan_with_dev(None, Some("grok"));
+        assert_eq!(
+            development_stage_providers(&plan),
+            ("claude_code".to_string(), "grok".to_string())
+        );
+    }
+
+    #[test]
+    fn development_stage_providers_inherit_when_unbound() {
+        // Pre-migration-021 initiatives (both columns NULL) keep the old single-agent behaviour:
+        // whatever ran planning also runs development. This is the regression guard.
+        let plan = planning_plan_with_dev(None, None);
+        assert_eq!(
+            development_stage_providers(&plan),
+            ("claude_code".to_string(), "claude_code".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_stage_provider_treats_blank_as_unbound() {
+        // An empty form field must become SQL NULL (= inherit), never a provider named "".
+        assert_eq!(normalize_stage_provider(None), None);
+        assert_eq!(normalize_stage_provider(Some("")), None);
+        assert_eq!(normalize_stage_provider(Some("   ")), None);
+        assert_eq!(
+            normalize_stage_provider(Some("  grok ")),
+            Some("grok".to_string())
+        );
     }
 
     /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
@@ -6643,7 +6794,7 @@ mod store_tests {
 
         let plan = conn
             .query_row(
-                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config FROM agent_plans WHERE id='B'",
+                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider FROM agent_plans WHERE id='B'",
                 [],
                 agent_plan_from_row,
             )
@@ -6767,6 +6918,8 @@ mod store_tests {
                 worker_provider: "claude_code".to_string(),
                 reviewer_provider: "claude_code".to_string(),
                 model: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
             },
         )
         .await
@@ -6898,6 +7051,8 @@ mod store_tests {
                 worker_provider: "claude_code".to_string(),
                 reviewer_provider: "claude_code".to_string(),
                 model: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
             },
         )
         .await
@@ -7093,6 +7248,8 @@ mod store_tests {
                 created_at: "".into(),
                 updated_at: "".into(),
                 validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -7203,6 +7360,8 @@ mod validation_lens_tests {
                 created_at: "".into(),
                 updated_at: "".into(),
                 validation_config: validation_config.map(|s| s.to_string()),
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
             },
             phases: vec![],
             tasks: vec![],
