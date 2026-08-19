@@ -523,3 +523,47 @@ Worth noting for two reasons:
 2. It argues against over-specifying implementation in the plan. The acceptance criteria that made
    this checkable were the greppable ones (`grep -rn "auxExistsFor"` shows one definition and three
    consumers), not the prose telling the developer which of two equivalent end-states to reach.
+
+---
+
+## J1-14 — The developer works ahead of the task boundaries and the coordinator's view goes stale
+
+**Severity:** medium · wrong progress state, possible wasted rounds · **Status:** open, observed live
+
+Phase 00 has six tasks with strict intra-phase ordering. One hour in, the task states read:
+
+```
+01-single-shape-column-contract   in-progress
+02-column-contract-specs          not-started
+03-shell-card-frame               not-started
+04-tabs-at-every-width            not-started
+05-breakpoint-service-narrowing   not-started
+06-frame-e2e-and-screenshots      not-started
+```
+
+But the working tree already contains work belonging to tasks **03, 05 and 06**: `shell.component.html`
+and `.scss` rewritten, `breakpoint.service.ts` deleted, `ui-medium-aux.spec.ts` deleted, and 17 e2e
+specs modified. The agent is building the whole phase coherently and leaving five `status.yml` files
+saying `not-started`.
+
+Left alone this would be a documentation nit. It is not, because **the coordinator reads these
+files**: `task_status_from_file` / `task_status_path` parse `state:` out of each task's
+`status.yml`, so the coordinator's model of what remains is derived from what the agent remembered
+to write. An agent that works ahead makes that model wrong, and the coordinator can then prompt for
+a task whose work already exists — spending a round for the agent to discover there is nothing to
+do, or worse, to redo it.
+
+The instruction to maintain these files lives only in prompt prose. Nothing verifies it, and nothing
+reconciles the files against the tree.
+
+**Fixes, cheapest first:**
+1. When a phase reports ready, reconcile: if any task is still `not-started`/`in-progress`, say so in
+   the ready-rejection the same way the plan-store check now does, and let the agent settle its own
+   bookkeeping before validation.
+2. Have the phase prompt state that task status must be updated **as each task completes, not at the
+   end**, and make it an acceptance line rather than a passing remark.
+3. Longer term: derive progress from evidence (files touched, tests passing) rather than from
+   self-reported state, and treat `status.yml` as the agent's claim to be checked, not the truth.
+
+Same shape as J1-07 and J1-10: the coordinator trusts an agent's self-report about its own progress
+with nothing verifying it.
