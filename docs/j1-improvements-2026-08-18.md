@@ -437,6 +437,26 @@ Combined with the round cap this produces the worst outcome: six rounds of real 
 **Worked around** by an amend instructing one comprehensive sweep of all undrawn states into the
 plan's own §5.3 register, then report ready.
 
+**This is a known, recurring failure — the codebase says so.** `MAX_REVISION_ROUNDS` carries the
+comment: *"Without this a review that never converges churns indefinitely (the Marketplace run hit
+**116 rounds over 4 days**)."* The cap is a circuit breaker, not a convergence mechanism: it stops
+the bleeding and parks the run at `needs_attention`, but it never lets a good-but-imperfect plan
+through.
+
+**Reproduced on the lokal-infra blob-release initiative, 2026-08-20.** Findings per round:
+`20 → 13 → 14 → 15 → 5 → 13 → 16 → 15 → …` across eleven rounds and ~30 lens agents, for a plan of 5
+phases / 13 tasks. The round that dropped to 5 was a manual triage instruction I sent; it rebounded
+immediately afterwards. By round 8 the plan had **zero blocking findings** and was still rejected,
+while the product lens separately recorded that scope was faithful, all brief deliverables were
+carried, and every locked decision respected.
+
+Two genuinely blocking defects *were* found and fixed in that run — a `cf deploy` guard placed after
+`createDatabase`/`runMigrations`/`runSeeds` so it guarded nothing, and an acceptance criterion whose
+grep pattern could not match the output it was meant to catch. Both were buried among a dozen
+cosmetic findings, which is exactly why they survived several rounds: **the absence of a severity
+gate hides real defects in noise.** That is the strongest argument for the fix, stronger than the
+wasted rounds.
+
 **Fixes worth making:**
 - Let a lens return **PASS_WITH_FOLLOWUPS**, or gate only on findings the lens marked blocking. The
   labels are already there.

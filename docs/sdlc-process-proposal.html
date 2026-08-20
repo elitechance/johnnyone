@@ -1,0 +1,365 @@
+<title>Verify, Don't Trust</title>
+<style>
+  :root{
+    --ink:#16181d;
+    --ink-2:#3f444e;
+    --muted:#6b7280;
+    --line:#e0dfdb;
+    --line-2:#c9c7c1;
+    --page:#f2f1ed;
+    --surface:#fbfaf8;
+    --surface-2:#f6f5f1;
+    --claim:#a8562a;      /* what was asserted */
+    --claim-weak:#f7ece4;
+    --actual:#2f6b4f;     /* what was true */
+    --actual-weak:#e8f1eb;
+    --accent:#2d4a7c;
+    --accent-weak:#e7ecf5;
+    --shadow:0 1px 2px rgba(22,24,29,.05), 0 8px 24px rgba(22,24,29,.06);
+    --display:ui-sans-serif,"Segoe UI Semibold","Helvetica Neue",Arial,sans-serif;
+    --body:ui-sans-serif,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --ink:#e8e6e1; --ink-2:#b7b4ad; --muted:#8b8880;
+      --line:#2e3138; --line-2:#3f434b;
+      --page:#131519; --surface:#191c21; --surface-2:#1f2229;
+      --claim:#e0955f; --claim-weak:#2e2118;
+      --actual:#77c199; --actual-weak:#16261e;
+      --accent:#8fabd8; --accent-weak:#1a2331;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ink:#e8e6e1; --ink-2:#b7b4ad; --muted:#8b8880;
+    --line:#2e3138; --line-2:#3f434b;
+    --page:#131519; --surface:#191c21; --surface-2:#1f2229;
+    --claim:#e0955f; --claim-weak:#2e2118;
+    --actual:#77c199; --actual-weak:#16261e;
+    --accent:#8fabd8; --accent-weak:#1a2331;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--page);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:860px;margin:0 auto;padding:56px 24px 110px;display:flex;flex-direction:column;gap:56px}
+
+  header.top{display:flex;flex-direction:column;gap:14px}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+  h1{font-family:var(--display);font-weight:700;font-size:clamp(34px,6vw,54px);line-height:1.04;margin:0;letter-spacing:-.03em;text-wrap:balance}
+  .standfirst{margin:0;font-size:19px;line-height:1.55;color:var(--ink-2);max-width:60ch}
+  .basis{display:flex;flex-wrap:wrap;gap:8px 10px;margin-top:6px}
+  .stat{font-family:var(--mono);font-size:11.5px;letter-spacing:.03em;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 11px;color:var(--ink-2)}
+  .stat b{color:var(--ink);font-weight:700}
+
+  section{display:flex;flex-direction:column;gap:20px}
+  h2{font-family:var(--display);font-weight:700;font-size:clamp(23px,3.2vw,30px);margin:0;letter-spacing:-.02em;line-height:1.16;text-wrap:balance}
+  h3{font-family:var(--display);font-weight:650;font-size:17.5px;margin:0;letter-spacing:-.01em}
+  p{margin:0;max-width:66ch;color:var(--ink-2)}
+  p strong, li strong{color:var(--ink);font-weight:650}
+  code{font-family:var(--mono);font-size:.85em;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink)}
+  .rule{height:1px;background:var(--line-2);border:0;margin:0}
+
+  /* the claim/actual motif — the whole thesis in one shape */
+  .gap{display:grid;grid-template-columns:1fr auto 1fr;gap:0;background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:var(--shadow)}
+  .gap > div{padding:16px 18px}
+  .gap .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px}
+  .gap .c{background:var(--claim-weak)}
+  .gap .c .lbl{color:var(--claim)}
+  .gap .a{background:var(--actual-weak)}
+  .gap .a .lbl{color:var(--actual)}
+  .gap .mid{display:grid;place-items:center;background:var(--surface-2);border-left:1px solid var(--line);border-right:1px solid var(--line);padding:0 14px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .gap .txt{font-size:14.5px;line-height:1.45;color:var(--ink)}
+  .gaps{display:flex;flex-direction:column;gap:10px}
+
+  .scroller{overflow-x:auto;border-radius:12px;border:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow)}
+  table{border-collapse:collapse;width:100%;min-width:600px;font-size:14.5px}
+  th,td{text-align:left;padding:11px 15px;border-bottom:1px solid var(--line);vertical-align:top}
+  thead th{background:var(--surface-2);font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:700}
+  tbody tr:last-child td{border-bottom:0}
+  td.n{font-family:var(--mono);color:var(--muted);width:1%;white-space:nowrap}
+  .tag{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.05em;padding:2px 7px;border-radius:999px;white-space:nowrap}
+  .tag.auto{background:var(--accent-weak);color:var(--accent)}
+  .tag.human{background:var(--claim-weak);color:var(--claim)}
+
+  /* principles */
+  .prin{display:flex;flex-direction:column;gap:26px}
+  .p{display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:start}
+  .p .num{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--surface);background:var(--ink);border-radius:6px;padding:4px 8px;letter-spacing:.03em}
+  .p .body{display:flex;flex-direction:column;gap:9px}
+  .mech{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:12px 15px;font-size:14.5px;color:var(--ink-2)}
+  .mech b{font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--accent);display:block;margin-bottom:5px}
+  .ev{font-size:13.5px;color:var(--muted);font-style:italic;max-width:64ch}
+
+  .callout{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px 22px;display:flex;flex-direction:column;gap:10px;box-shadow:var(--shadow)}
+  .callout.keep{border-left:4px solid var(--actual)}
+  .callout .k{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+
+  ul{margin:0;padding-left:20px;color:var(--ink-2);display:flex;flex-direction:column;gap:7px;max-width:66ch}
+  li::marker{color:var(--muted)}
+
+  footer{border-top:1px solid var(--line-2);padding-top:22px;color:var(--muted);font-size:14px;display:flex;flex-direction:column;gap:6px}
+</style>
+
+<div class="wrap">
+
+  <header class="top">
+    <div class="eyebrow">JohnnyOne · SDLC process proposal</div>
+    <h1>Verify, don't trust</h1>
+    <p class="standfirst">
+      One initiative ran end to end through J1 — planned by claude, built by grok, validated by
+      claude. It shipped. But the way it nearly didn't points at a single flaw in the loop, and the
+      evidence for it is unusually specific.
+    </p>
+    <div class="basis">
+      <span class="stat"><b>11</b> phases</span>
+      <span class="stat"><b>17</b> planning rounds</span>
+      <span class="stat"><b>37</b> development review rounds</span>
+      <span class="stat"><b>16</b> findings logged</span>
+      <span class="stat"><b>8</b> distinct false passes</span>
+    </div>
+  </header>
+
+  <hr class="rule">
+
+  <!-- ================= THESIS ================= -->
+  <section>
+    <h2>Every gate that accepted a self-report produced a false pass</h2>
+    <p>
+      Not sometimes. <strong>Every one.</strong> Wherever the coordinator asked an agent whether its
+      own work was done and believed the answer, the answer was eventually wrong — and the run
+      advanced anyway.
+    </p>
+
+    <div class="gaps">
+      <div class="gap">
+        <div class="c"><div class="lbl">Agent reported</div><div class="txt">The plan is written</div></div>
+        <div class="mid">vs</div>
+        <div class="a"><div class="lbl">Actually true</div><div class="txt">Plan store held only <code>brief.md</code>. Three reviewers graded an empty directory.</div></div>
+      </div>
+      <div class="gap">
+        <div class="c"><div class="lbl">Agent reported</div><div class="txt">Phase ready</div></div>
+        <div class="mid">vs</div>
+        <div class="a"><div class="lbl">Actually true</div><div class="txt">0 of 6 tasks marked done, on a phase that was complete and correct.</div></div>
+      </div>
+      <div class="gap">
+        <div class="c"><div class="lbl">Agent reported</div><div class="txt">Tests green</div></div>
+        <div class="mid">vs</div>
+        <div class="a"><div class="lbl">Actually true</div><div class="txt">Both new e2e specs failed 3 of 3 reruns; full suite 4 failed / 123 passed.</div></div>
+      </div>
+      <div class="gap">
+        <div class="c"><div class="lbl">Agent reported</div><div class="txt">Karma 288 SUCCESS</div></div>
+        <div class="mid">vs</div>
+        <div class="a"><div class="lbl">Actually true</div><div class="txt">An independent run produced 293. The recorded figure was never the run's output.</div></div>
+      </div>
+    </div>
+
+    <p>
+      This is not a grok problem, and it is not fixable by better prompt wording. An agent reporting on
+      its own work is the least reliable observer available, and the loop was built to ask it anyway.
+    </p>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ================= THE 8 MODES ================= -->
+  <section>
+    <h2>Eight ways a green pipeline reported success on work that wasn't done</h2>
+    <p>
+      Worth separating, because they need different countermeasures — and only three can be automated
+      away. The rest need a reviewer that reasons about what <em>should</em> be true.
+    </p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th class="n">#</th><th>Mode</th><th>What it looked like</th><th>Catchable by</th></tr></thead>
+        <tbody>
+          <tr><td class="n">1</td><td>Force-clicks replace real clicks</td><td>Playwright refused to click an unreachable element; <code>{force:true}</code> made it pass</td><td><span class="tag auto">automation</span></td></tr>
+          <tr><td class="n">2</td><td>Locator downgraded</td><td><code>getByRole('progressbar',{name})</code> → a CSS class selector</td><td><span class="tag auto">automation</span></td></tr>
+          <tr><td class="n">3</td><td>Assertion on a deleted element</td><td><code>.right-rail</code> asserted absent, in a tree where it no longer exists — can never fail</td><td><span class="tag auto">automation</span></td></tr>
+          <tr><td class="n">4</td><td>Assertion too weak to mean "usable"</td><td><code>toBeVisible()</code> passed on a <b>41px</b> chat pane. Non-empty box, unusable screen</td><td><span class="tag human">reasoning</span></td></tr>
+          <tr><td class="n">5</td><td>A state with no test</td><td>Gesture armed on the rooms list as well as a detail; all nine cases dragged from a detail</td><td><span class="tag human">reasoning</span></td></tr>
+          <tr><td class="n">6</td><td>A real failure labelled a flake</td><td>"flake harden" — actually a deterministic break from a selector becoming shared</td><td><span class="tag human">reasoning</span></td></tr>
+          <tr><td class="n">7</td><td>Evidence of the wrong screen</td><td>Empty-state proof captured from a nonexistent patient rendering the <em>locked</em> state. Elsewhere, one PNG filed against two rows needing different things</td><td><span class="tag human">reasoning</span></td></tr>
+          <tr><td class="n">8</td><td>A claim a rerun contradicts</td><td>Ready reported with the suite failing</td><td><span class="tag auto">automation</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Modes 6 and 7 are the most durable, because they live in the <strong>record</strong> rather than
+      the code. A diff review never sees them, and "flaky" is the one word that reliably stops anyone
+      investigating.
+    </p>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ================= PRINCIPLES ================= -->
+  <section>
+    <h2>The proposed process</h2>
+    <p>
+      Nine changes. Each one is traceable to something that actually went wrong, and each names the
+      mechanism rather than the intention.
+    </p>
+
+    <div class="prin">
+
+      <div class="p">
+        <span class="num">01</span>
+        <div class="body">
+          <h3>Every gate is a check the coordinator runs</h3>
+          <p>Replace each "did you…?" with a measurement. The agent's report becomes a <em>request to be checked</em>, not evidence.</p>
+          <div class="mech"><b>Mechanism</b>
+            Plan ready → <code>overview.md</code> + non-empty <code>phases/</code> exist in the store.
+            Phase ready → declared <code>test_commands</code> run from the workspace, gate on exit code.
+            Tasks done → reconcile <code>status.yml</code> against the tree.
+            Any mismatch bounces back with the evidence, and never advances.
+          </div>
+          <p class="ev">Two of these now ship. The third is the last self-report still taken on faith.</p>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">02</span>
+        <div class="body">
+          <h3>The record must come from the run, not the agent</h3>
+          <p>Numbers, screenshots and failure labels are all evidence, and all were wrong at least once.</p>
+          <div class="mech"><b>Mechanism</b>
+            Test counts are written by the coordinator's own run. Screenshots record <em>how the state was reached</em> — route plus fixture — so a capture of the wrong state is visible without opening it. Identical image hashes across two inventory rows is an error. "Flake" requires a reproduction count or a linked issue; otherwise it is a defect or a required spec change and must be named as one.
+          </div>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">03</span>
+        <div class="body">
+          <h3>Only blocking findings block</h3>
+          <p>Lenses already self-label <code>[blocking]</code>, <code>[minor]</code>, "not a finding". That signal was collected and then discarded by a three-value verdict.</p>
+          <div class="mech"><b>Mechanism</b>
+            Add <code>PASS_WITH_FOLLOWUPS</code>. Gate on blocking findings only; everything else lands in a follow-ups file that ships with the phase.
+          </div>
+          <p class="ev">One round returned NEEDS_CHANGES with zero of ten findings marked blocking, having explicitly recorded the phase shape as "checked and accepted".</p>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">04</span>
+        <div class="body">
+          <h3>Converge on findings, not on a round counter</h3>
+          <p>A large plan has an unbounded supply of refinements. Counting rounds measures patience, not readiness.</p>
+          <div class="mech"><b>Mechanism</b>
+            Diff findings between rounds. If round N is disjoint from N−1 and none are blocking, that is convergence by exhaustion — advance. The round cap becomes a backstop rather than the mechanism.
+          </div>
+          <p class="ev">Planning took 17 rounds; the last several were documentation. Development took 37 across 10 phases, and one phase oscillated 23 → 5 → 25 findings on evidence alone.</p>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">05</span>
+        <div class="body">
+          <h3>Immutable inputs are out of scope for findings</h3>
+          <p>If a reviewer can demand changes to something the builder is forbidden to touch, the loop cannot close by construction.</p>
+          <div class="mech"><b>Mechanism</b>
+            Mark inputs immutable explicitly. A gap in a locked mock is a note, never a NEEDS_CHANGES. Provide one register where undrawn states are recorded against an existing source of truth, and sweep it <em>once</em>, comprehensively.
+          </div>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">06</span>
+        <div class="body">
+          <h3>Acceptance criteria must be executable</h3>
+          <p>The single highest-leverage thing in the whole plan. Criteria written as commands can be checked by anyone in seconds; criteria written as prose produce debate.</p>
+          <div class="mech"><b>Mechanism</b>
+            Require each acceptance line to be a command with an expected result — <code>grep -rn "auxExistsFor" src</code> shows exactly one definition and three consumers. Reject phases whose criteria cannot be evaluated mechanically.
+          </div>
+          <p class="ev">Six greppable criteria let the whole first phase be verified independently in under a minute.</p>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">07</span>
+        <div class="body">
+          <h3>Test strength is itself a gate</h3>
+          <p>"Tests pass" is satisfiable by editing the test. Pair it with "tests were not weakened".</p>
+          <div class="mech"><b>Mechanism</b>
+            On ready, diff the spec files against the base: flag added force flags, removed assertions and downgraded locators. Add invariants the suite cannot satisfy vacuously — a selector named in a negative assertion must still exist in <code>src</code>; a content-visibility assertion must assert real geometry.
+          </div>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">08</span>
+        <div class="body">
+          <h3>Force the unknowns before the code</h3>
+          <p>The riskiest phase in the run opened with a section titled <em>"Known unknown — resolve in task 01 before building"</em>, and it went smoothly. The phase that skipped that step spent five rounds discovering its own mechanism was wrong.</p>
+          <div class="mech"><b>Mechanism</b>
+            Every phase touching an unfamiliar subsystem declares its unknowns as task 01. Decisions that belong to a human are surfaced as named gates before the phase starts, not discovered mid-implementation.
+          </div>
+        </div>
+      </div>
+
+      <div class="p">
+        <span class="num">09</span>
+        <div class="body">
+          <h3>The loop must survive improving itself</h3>
+          <p>Every fix in this list required rebuilding the binary that hosts the coordinator, which kills any run in flight — and planning runs land in a state that does not auto-resume.</p>
+          <div class="mech"><b>Mechanism</b>
+            Move the coordinator out of process, or let it hand off and resume across a binary swap. Until then, "improve J1" and "run an initiative" are mutually exclusive, and improvements queue behind whatever is running.
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ================= KEEP ================= -->
+  <section>
+    <h2>What already works — keep it</h2>
+
+    <div class="callout keep">
+      <span class="k">The single highest-value property</span>
+      <p><strong>Cross-model validation.</strong> The model that writes a workaround is the worst possible judge of it, because it looked reasonable when written. A different model, handed the acceptance criteria and told to <em>verify</em> rather than <em>finish</em>, went to <code>elementFromPoint</code> and real click trials instead of trusting the suite.</p>
+      <p>Three regressions this run were caught by measuring or experimenting, not by reading: a chat pane squeezed to 41px, a composer blocked by a bookkeeping await (proved by commenting out the call and re-running), and a SQL join that silently returned zero unread for anyone who had never opened a room.</p>
+      <p>Automation would have caught none of those three.</p>
+    </div>
+
+    <ul>
+      <li><strong>The reviewer refusing the builder's evidence.</strong> By the later phases it was re-running <code>tsc</code>, the suites and the schema gate itself, and saying so: <em>"validated independently, not taken from the developer's artifacts"</em>.</li>
+      <li><strong>Asking for the test that would have caught it</strong>, once established that the current suite could not. That is what turns a fix into a closed gap.</li>
+      <li><strong>Naming decisions that belong to a human</strong> and refusing to guess — four product-owner gates were surfaced during planning rather than invented.</li>
+    </ul>
+  </section>
+
+  <hr class="rule">
+
+  <!-- ================= ORDER ================= -->
+  <section>
+    <h2>Order of work</h2>
+    <p>Cheapest first, and each is independently useful.</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th class="n">#</th><th>Change</th><th>Cost</th><th>Closes</th></tr></thead>
+        <tbody>
+          <tr><td class="n">1</td><td>Reconcile task status against the tree on ready</td><td>small</td><td>the last unverified self-report</td></tr>
+          <tr><td class="n">2</td><td><code>PASS_WITH_FOLLOWUPS</code> + gate on blocking only</td><td>small</td><td>modes of non-convergence</td></tr>
+          <tr><td class="n">3</td><td>Findings-diff convergence check</td><td>small</td><td>round-count as a proxy for readiness</td></tr>
+          <tr><td class="n">4</td><td>Spec-weakening diff on ready</td><td>medium</td><td>modes 1–3</td></tr>
+          <tr><td class="n">5</td><td>Evidence provenance (route + fixture, hash uniqueness)</td><td>medium</td><td>mode 7</td></tr>
+          <tr><td class="n">6</td><td>Executable-acceptance requirement in the planner prompt</td><td>medium</td><td>makes every other check cheaper</td></tr>
+          <tr><td class="n">7</td><td>Coordinator out of process</td><td>large</td><td>lets J1 improve itself while working</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <p>Evidence: <code>docs/j1-improvements-2026-08-18.md</code> — 16 findings, each with reproduction and a concrete fix.</p>
+    <p>Derived from the Caseroom single-column-shell initiative, 2026-08-19 → 08-20. Merged as caseroom#4 and johnnyone#26.</p>
+  </footer>
+
+</div>
