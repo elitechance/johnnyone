@@ -29,6 +29,7 @@ const MIGRATION_020: &str = include_str!("../../migrations/020_complete_approved
 // branch first (the runner only checks whether the *number* was applied), leaving the columns absent
 // while the code assumes them. Hence 22.
 const MIGRATION_022: &str = include_str!("../../migrations/022_add_dev_stage_providers.sql");
+const MIGRATION_023: &str = include_str!("../../migrations/023_add_test_commands.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -90,6 +91,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (19, "019_add_validation_config", MIGRATION_019),
         (20, "020_complete_approved_dev_runs", MIGRATION_020),
         (22, "022_add_dev_stage_providers", MIGRATION_022),
+        (23, "023_add_test_commands", MIGRATION_023),
     ];
 
     // Guard the shared version namespace. Versions are hand-assigned integers, and branches that

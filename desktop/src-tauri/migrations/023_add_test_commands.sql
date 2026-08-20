@@ -1,0 +1,11 @@
+-- The coordinator's own test gate (J1-16).
+--
+-- "All three test layers green" is the project's phase rule, but the coordinator only ever learned
+-- the result from the agent's own report. That report has been wrong: a phase was reported ready
+-- with both new e2e specs failing 3-of-3 reruns and the full suite at 4 failed / 123 passed, and an
+-- earlier phase recorded "Karma 288" where an independent run gave 293.
+--
+-- Nullable JSON array of shell commands, run from the plan's workspace_path when a phase reports
+-- ready. NULL or empty preserves today's behaviour exactly, so existing runs are unaffected — this
+-- is opt-in per plan.
+ALTER TABLE agent_plans ADD COLUMN test_commands TEXT;

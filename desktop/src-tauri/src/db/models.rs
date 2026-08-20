@@ -176,6 +176,9 @@ pub struct AgentPlan {
     /// `validation_config` in the positional row map and every SELECT — order is load-bearing.
     pub dev_worker_provider: Option<String>,
     pub dev_reviewer_provider: Option<String>,
+    /// Nullable JSON array of shell commands the coordinator runs itself when a phase reports ready
+    /// (J1-16). NULL/empty preserves the previous behaviour of trusting the agent's report.
+    pub test_commands: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +346,7 @@ mod tests {
             validation_config: Some("[]".into()),
             dev_worker_provider: None,
             dev_reviewer_provider: None,
+            test_commands: None,
         }
     }
 

@@ -719,7 +719,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider, test_commands FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -741,7 +741,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider, test_commands FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -1998,6 +1998,75 @@ fn planning_deliverable_missing(plan_path: &str) -> Option<String> {
     ))
 }
 
+/// Run the plan's declared test commands and return the first failure, if any.
+///
+/// "All three test layers green" is the project's phase rule, but the coordinator only ever learned
+/// the outcome from the agent's own report — and that report has been wrong. A phase was reported
+/// ready with both new e2e specs failing 3-of-3 reruns and the full suite at 4 failed / 123 passed;
+/// an earlier phase recorded "Karma 288" where an independent run produced 293. Every place the
+/// coordinator trusts an agent's self-report about its own work has produced a false pass.
+///
+/// Opt-in: `test_commands` is a JSON array of shell strings run from `workspace_path`. NULL or empty
+/// keeps the previous behaviour exactly, so existing plans are unaffected.
+async fn failing_test_command(
+    plan: &AgentPlan,
+) -> Option<String> {
+    let raw = plan.test_commands.as_deref()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let commands: Vec<String> = serde_json::from_str(&raw).ok()?;
+    let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
+    let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+
+    for command in commands.iter().filter(|c| !c.trim().is_empty()) {
+        tracing::info!(plan_id = %plan.id, %command, "coordinator running declared test command");
+        let output = tokio::process::Command::new(shell)
+            .arg(flag)
+            .arg(command)
+            .current_dir(&plan.workspace_path)
+            .output()
+            .await;
+        match output {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                // Tail, not head: test runners put the summary at the end.
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail = |text: &str| -> String {
+                    text.lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                return Some(format!(
+                    "The phase was reported ready, but the coordinator ran `{}` in {} and it FAILED \
+                     (exit {}). A phase is not done until its declared tests pass — fix the failures \
+                     and report ready again. Do not edit the tests to make them pass.\n\n\
+                     --- stdout (tail) ---\n{}\n--- stderr (tail) ---\n{}",
+                    command,
+                    plan.workspace_path,
+                    out.status.code().unwrap_or(-1),
+                    tail(&stdout),
+                    tail(&stderr),
+                ));
+            }
+            Err(error) => {
+                return Some(format!(
+                    "The coordinator could not run the declared test command `{}` in {}: {}. \
+                     Check the command and the workspace, then report ready again.",
+                    command, plan.workspace_path, error
+                ));
+            }
+        }
+    }
+    None
+}
+
 async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String> {
     loop {
         let run = get_plan(&state, &plan_id)?;
@@ -2058,6 +2127,19 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                     .clone()
                     .ok_or_else(|| "Plan has no worker session".to_string())?;
                 wait_for_worker_ready(&state, &session_id, &plan_id, Some(&phase.phase_id)).await?;
+                // Verify the phase's own test gate rather than taking the agent's word for it.
+                if let Some(reason) = failing_test_command(&run.plan).await {
+                    tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "declared tests failed on a ready report");
+                    append_event(
+                        &state,
+                        &plan_id,
+                        Some(&phase.phase_id),
+                        "phase_ready_rejected_tests_failed",
+                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
+                    )?;
+                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    continue;
+                }
                 state.db.with_conn(|conn| {
                     conn.execute(
                         "UPDATE agent_plans SET status = 'phase_review_running', updated_at = datetime('now') WHERE id = ?1 AND status = 'phase_worker_running'",
@@ -2381,7 +2463,15 @@ async fn notify_discord(
         settings_service::KEY_WEB_CLIENT_URL,
         settings_service::DEFAULT_WEB_CLIENT_URL,
     );
-    let link = format!("{}/{}/{}", base.trim_end_matches('/'), mode, plan_id);
+    // J1-01: link to the unified console, NOT /planning/<id> or /development/<id>. Those routes are
+    // deprecated redirects that drop the id (`redirectTo: 'initiatives'` with no query param), so the
+    // alert landed the reader on the initiatives LIST having lost which run it was about — at exactly
+    // the moment the run needs a human. `mode` is still used for the embed's "Mode" field below.
+    let link = format!(
+        "{}/initiatives?initiativeId={}",
+        base.trim_end_matches('/'),
+        plan_id
+    );
     let description = if reason.is_empty() {
         format!("[Open the run →]({})", link)
     } else {
@@ -2399,9 +2489,32 @@ async fn notify_discord(
             ],
         }]
     });
+    // J1-02: reqwest returns Ok(response) for ANY HTTP status, so checking only for Err() discarded
+    // every 4xx/5xx — a revoked webhook, a deleted channel, a malformed embed or a 429 all looked
+    // like success. Observed live: this same webhook 403'd on a User-Agent check while the code
+    // reported nothing.
     let client = reqwest::Client::new();
-    if let Err(error) = client.post(webhook).json(&payload).send().await {
-        tracing::warn!(%error, plan_id, "failed to POST Discord notification");
+    match client.post(webhook).json(&payload).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                %status,
+                retry_after = retry_after.as_deref().unwrap_or("-"),
+                plan_id,
+                body = %body.chars().take(200).collect::<String>(),
+                "Discord rejected the notification"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, plan_id, "failed to POST Discord notification");
+        }
     }
 }
 
@@ -5736,6 +5849,7 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         // Per-stage providers, appended after validation_config (order is load-bearing).
         dev_worker_provider: row.get(26)?,
         dev_reviewer_provider: row.get(27)?,
+        test_commands: row.get(28)?,
     })
 }
 
@@ -6707,6 +6821,7 @@ mod store_tests {
             updated_at: "now".into(),
             validation_config: None,
             dev_worker_provider: dev_worker.map(str::to_string),
+            test_commands: None,
             dev_reviewer_provider: dev_reviewer.map(str::to_string),
         }
     }
@@ -6799,6 +6914,63 @@ mod store_tests {
         let reason = planning_deliverable_missing(&path).expect("empty store");
         assert!(reason.contains(&path), "must name the store path: {reason}");
         assert!(reason.contains("mirror"), "must say the docs tree is a mirror: {reason}");
+    }
+
+    fn plan_with_test_commands(workspace: &str, commands: Option<&str>) -> crate::db::models::AgentPlan {
+        let mut plan = planning_plan_with_dev(None, None);
+        plan.workspace_path = workspace.to_string();
+        plan.test_commands = commands.map(str::to_string);
+        plan
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_is_opt_in() {
+        let dir = tmp_dir("tests-optin");
+        let w = dir.to_string_lossy().to_string();
+        // Unset and empty both preserve the previous behaviour: no gate, no failure.
+        assert!(failing_test_command(&plan_with_test_commands(&w, None)).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some(""))).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("[]"))).await.is_none());
+        // Malformed JSON must not fail a phase — it is a config error, not a test failure.
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("not json"))).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_passes_when_every_command_succeeds() {
+        let dir = tmp_dir("tests-pass");
+        let w = dir.to_string_lossy().to_string();
+        let plan = plan_with_test_commands(&w, Some(r#"["true","exit 0"]"#));
+        assert!(failing_test_command(&plan).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_reports_the_first_failure_with_output() {
+        let dir = tmp_dir("tests-fail");
+        let w = dir.to_string_lossy().to_string();
+        // The second command fails; the third must never run.
+        let marker = dir.join("third-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["true","echo boom-on-stdout && exit 3","touch {}"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let reason = failing_test_command(&plan).await.expect("must fail");
+        assert!(reason.contains("exit 3"), "{reason}");
+        assert!(reason.contains("boom-on-stdout"), "output tail must be included: {reason}");
+        assert!(
+            reason.contains("Do not edit the tests to make them pass"),
+            "must not invite the workaround this whole gate exists to catch: {reason}"
+        );
+        assert!(!marker.exists(), "commands after the first failure must not run");
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_reports_an_unrunnable_command() {
+        let plan = plan_with_test_commands("/nonexistent-workspace-xyz", Some(r#"["true"]"#));
+        let reason = failing_test_command(&plan).await.expect("must report");
+        assert!(reason.contains("could not run"), "{reason}");
     }
 
     /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
@@ -6911,7 +7083,7 @@ mod store_tests {
 
         let plan = conn
             .query_row(
-                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider FROM agent_plans WHERE id='B'",
+                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, dev_worker_provider, dev_reviewer_provider, test_commands FROM agent_plans WHERE id='B'",
                 [],
                 agent_plan_from_row,
             )
@@ -7366,7 +7538,8 @@ mod store_tests {
                 updated_at: "".into(),
                 validation_config: None,
                 dev_worker_provider: None,
-                dev_reviewer_provider: None,
+                test_commands: None,
+            dev_reviewer_provider: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -7478,7 +7651,8 @@ mod validation_lens_tests {
                 updated_at: "".into(),
                 validation_config: validation_config.map(|s| s.to_string()),
                 dev_worker_provider: None,
-                dev_reviewer_provider: None,
+                test_commands: None,
+            dev_reviewer_provider: None,
             },
             phases: vec![],
             tasks: vec![],
