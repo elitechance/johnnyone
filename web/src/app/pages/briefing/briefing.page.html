@@ -39,10 +39,37 @@
         </ion-item>
         <ion-item>
           <ion-select
-            label="Agent"
+            label="Planning agent"
             labelPlacement="stacked"
             interface="popover"
             [(ngModel)]="createProvider">
+            @for (p of providerChoices(); track p) {
+              <ion-select-option [value]="p">{{ p }}</ion-select-option>
+            }
+          </ion-select>
+        </ion-item>
+        <!-- Per-stage agents: development can use a different builder and validator than planning
+             (e.g. claude plans, grok builds, claude validates). "Same as planning" keeps the
+             previous single-agent behaviour. -->
+        <ion-item>
+          <ion-select
+            label="Development agent (builds)"
+            labelPlacement="stacked"
+            interface="popover"
+            [(ngModel)]="createDevWorkerProvider">
+            <ion-select-option [value]="''">Same as planning</ion-select-option>
+            @for (p of providerChoices(); track p) {
+              <ion-select-option [value]="p">{{ p }}</ion-select-option>
+            }
+          </ion-select>
+        </ion-item>
+        <ion-item>
+          <ion-select
+            label="Validation agent (reviews the build)"
+            labelPlacement="stacked"
+            interface="popover"
+            [(ngModel)]="createDevReviewerProvider">
+            <ion-select-option [value]="''">Same as planning</ion-select-option>
             @for (p of providerChoices(); track p) {
               <ion-select-option [value]="p">{{ p }}</ion-select-option>
             }

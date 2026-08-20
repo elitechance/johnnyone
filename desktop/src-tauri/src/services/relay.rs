@@ -65,7 +65,22 @@ pub async fn spawn_connection(state: AppState, config: RelayConfig) {
             )
             .await
             {
-                Ok(()) => break,
+                // A clean close is NOT a reason to stop relaying. The worker side closes the socket
+                // routinely — Durable Object eviction, connection-lifetime limits, a worker deploy —
+                // and `AgentService::start` returns Ok(()) for all of them. Breaking here left the
+                // desktop permanently detached after an ordinary close: the process stayed up and
+                // healthy on 127.0.0.1, local agents kept reporting, but every worker call proxying
+                // to this node answered "Desktop not connected" until someone restarted it by hand.
+                // Observed 2026-08-19 14:18:07 mid-run ("Received close frame / Agent session ended
+                // normally", then silence).
+                //
+                // Reconnect on both outcomes; only a shutdown signal ends the loop. Back off a
+                // little longer after a clean close than after an error, since a clean close usually
+                // means the far side is cycling and an instant retry would just race it.
+                Ok(()) => {
+                    tracing::info!("Relay session closed by the server; reconnecting in 3s");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
                 Err(error) => {
                     tracing::error!(
                         %error,

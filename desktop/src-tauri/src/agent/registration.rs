@@ -32,11 +32,19 @@ pub struct RegisteredNode {
 
 /// Register this desktop node with the CF Worker via GraphQL mutation.
 /// Returns the server-assigned node ID (may reuse existing if hostname matches).
+/// Register this machine as the user's desktop node.
+///
+/// The `access_token` is REQUIRED even though the tenant/user headers are still sent: the worker was
+/// hardened so identity comes from the credential, not from headers ("identity must come from the
+/// credential, not a header"). Registering without an Authorization header returns UNAUTHENTICATED,
+/// which stalls the whole relay — the desktop can never attach, and every worker call that proxies to
+/// it fails with "Desktop not connected".
 pub async fn register_node(
     worker_url: &str,
     user_id: &str,
     tenant_id: &str,
     hostname: &str,
+    access_token: &str,
 ) -> Result<RegisteredNode, String> {
     let client = reqwest::Client::new();
 
@@ -60,11 +68,16 @@ pub async fn register_node(
 
     let graphql_url = format!("{}/graphql", worker_url.trim_end_matches('/'));
 
-    let response = client
+    let mut request = client
         .post(&graphql_url)
         .header("Content-Type", "application/json")
         .header("x-tenant-id", tenant_id)
-        .header("x-user-id", user_id)
+        .header("x-user-id", user_id);
+    // Carry the credential. Skipped only when unset, so a token-less local/dev worker still works.
+    if !access_token.trim().is_empty() {
+        request = request.header("Authorization", format!("Bearer {}", access_token.trim()));
+    }
+    let response = request
         .json(&GraphqlRequest {
             query: query.to_string(),
             variables,

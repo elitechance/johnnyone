@@ -82,6 +82,10 @@ export interface CreateAgentPlanInput {
   workerSetupCommands?: string;
   /** When reviewerProvider is 'shell', commands run in each spawned reviewer shell. */
   reviewerSetupCommands?: string;
+  /** Per-stage agent binding: which agent BUILDS the development stage and which VALIDATES it.
+   * Omit both to inherit the planning agent (behaviour before per-stage providers existed). */
+  devWorkerProvider?: string;
+  devReviewerProvider?: string;
 }
 
 /** Create an Initiative in briefing (overhaul P4, D1). `brief` is the raw ask. */
@@ -92,6 +96,10 @@ export interface CreateBriefingInput {
   workerProvider: string;
   reviewerProvider: string;
   model?: string;
+  /** Per-stage agent binding: which agent BUILDS the development stage and which VALIDATES it.
+   * Omit both to inherit the planning agent (behaviour before per-stage providers existed). */
+  devWorkerProvider?: string;
+  devReviewerProvider?: string;
 }
 
 /** Accept a briefing brief (overhaul P4, D1/D4). `finalBrief` optionally overrides the stored draft. */
@@ -111,6 +119,9 @@ export interface AgentPlan {
   reviewerSessionId?: string;
   workerProvider: string;
   reviewerProvider: string;
+  /** Non-null on a planning row that binds a different agent for the development stage. */
+  devWorkerProvider?: string | null;
+  devReviewerProvider?: string | null;
   currentPhaseId?: string;
   currentPhaseIndex: number;
   error?: string;

@@ -30,6 +30,7 @@ import {
   toConfigJson,
   providerOptions,
 } from '../validation-config/validation-config-logic';
+import { stageProviderPayload } from './stage-providers';
 
 /**
  * New-initiative create form (overhaul P4, briefing step removed). Creating provisions the initiative
@@ -71,6 +72,10 @@ export class BriefingPage implements OnInit {
   protected createWorkspacePath = '';
   protected createRawAsk = '';
   protected createProvider = 'claude_code';
+  // Per-stage agents. Empty string = "same as planning", which sends nothing and leaves the
+  // development stage inheriting the planning agent (the behaviour before stage providers existed).
+  protected createDevWorkerProvider = '';
+  protected createDevReviewerProvider = '';
   protected readonly creating = signal(false);
   protected readonly createError = signal<string | null>(null);
 
@@ -195,6 +200,7 @@ export class BriefingPage implements OnInit {
         brief,
         workerProvider: this.createProvider,
         reviewerProvider: this.createProvider,
+        ...stageProviderPayload(this.createDevWorkerProvider, this.createDevReviewerProvider),
       })
       .subscribe({
         next: async (run) => {
