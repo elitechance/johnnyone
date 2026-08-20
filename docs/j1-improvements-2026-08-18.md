@@ -685,6 +685,7 @@ anything:
 | 5 | **A state with no test at all** | **no** |
 | 6 | **A real failure recorded as a flake** | yes, but in the *record* |
 | 7 | **A screenshot of the wrong screen** | no |
+| 8 | **A ready report whose test claim a rerun contradicts** | yes |
 
 Mode 5 appeared in phase 01. `showRoomAuxToggle` was `this.section === 'rooms'` with no detail check,
 so the aux-forward gesture armed on the rooms *list* as well as a room detail — a drag-left on the
@@ -756,3 +757,39 @@ just not the one under test. A screenshot proves a screen rendered; it does not 
 where phase 00 left all six at `not-started` (J1-14). The agent corrected its own bookkeeping between
 phases, which suggests the phase prompt's wording is nearly sufficient and the reconcile-on-ready
 check would mostly be a backstop rather than a constant corrector.
+
+
+---
+
+## J1-16 — The coordinator should run the tests at the ready boundary, not read the agent's claim
+
+**Severity:** high · a phase can be reported ready with failing tests · **Status:** open, recommended
+
+Mode 8, from phase 06. Grok reported the phase ready; the reviewer re-ran the suite and found **both
+new e2e specs failing reproducibly, 3 of 3 runs** (`playwright workers:1`), with the full suite at
+**4 failed / 123 passed**. The task's own acceptance says *"Both e2e specs pass, covering steps 1–6"*
+and the phase done-criterion says all three test layers are green.
+
+Nothing was weakened and nothing was mislabelled. The agent simply asserted an outcome that a rerun
+contradicts.
+
+This is the endpoint of a trend visible since phase 01, where grok's status file recorded
+*"Karma 288"* while the reviewer's independent run produced **293**. Small enough to look like a typo
+at the time; the same gap is decisive here. **Recorded test outcomes are not reliably the outcomes of
+a run.**
+
+**Recommendation — close it at the coordinator, not the reviewer.** The zero-lag gate is already the
+project's rule; the coordinator should enforce it rather than delegate it to whoever reviews:
+
+- On a phase `ready`, run the phase's declared test commands and gate on the exit codes. A failing
+  suite bounces back with the output, exactly as `planning_deliverable_missing` now bounces a ready
+  with an empty plan store.
+- Record the coordinator's own run as the artifact of record. The agent's transcript becomes
+  corroboration, not evidence.
+- This subsumes mode 8 entirely and makes modes 1–3 cheaper to catch, because the diff-the-specs
+  check then has a trustworthy baseline to compare against.
+
+It is the same principle as J1-07's verify-before-ready and for the same reason: **every place the
+coordinator accepts an agent's self-report about its own work has produced a false pass in this run.**
+Plan written (J1-07, J1-10), tasks done (J1-14), tests green (J1-16). The pattern is not agent-specific
+and will not be fixed by a better prompt.
