@@ -7,6 +7,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **SDLC gates — evidence-backed stage promotion (verdicts, ready gates, loop
+  guards)**. Closes the false-pass modes catalogued in
+  `docs/j1-improvements-2026-08-18.md`: every place the coordinator trusted an
+  agent's self-report about its own work had eventually produced a false pass.
+  Rust only (`services/agent_plans.rs`, `services/planner_prompts.rs`,
+  `services/git_history.rs`) — no schema, migration, web, or worker change.
+  **(1) A fourth verdict** — `PASS_WITH_FOLLOWUPS` lets a lens record a
+  non-blocking observation without costing a review round; previously the only way
+  to record anything at all was `NEEDS_CHANGES`, so naming nits and real defects
+  competed for the same signal. `verdict_advances()` is the single answer to "does
+  this let the stage move on"; `merged_verdict()` preserves follow-ups in the
+  roll-up rather than flattening them to `PASS`, and both pass paths now record the
+  verdict they *reached* — writing the literal `"PASS"` dropped the follow-ups at
+  the one step meant to carry them (caught on the first live run, where 7 of 9
+  lens verdicts used the new token). **(2) Six ready gates** run before a review
+  round is spent: `acceptance_not_executable` (a criterion must name what decides
+  it in backticks — a command, a route + element, a `file:line`; placement
+  agnostic), `failing_test_command` (the coordinator runs the plan's declared
+  `test_commands` itself instead of believing the report), `spec_weakened_reason`
+  (spec lines removed from the plan store during development are rejected — the
+  store's `HEAD` is the contract T2 reviews against, so editing it makes the review
+  check the work against itself), `evidence_provenance_reason` (screenshots must be
+  byte-distinct and described; scoped to files the worker added, so approved mocks
+  are untouched), `unfinished_tasks_reason`, and the existing
+  `planning_deliverable_missing`. **(3) Two loop guards** —
+  `stalled_findings_reason()` compares findings across rounds and parks a run whose
+  objections have not moved in three rounds, quoting the objection, because a round
+  counter cannot tell slow convergence from none; comparison is by containment, not
+  Jaccard, so a reviewer restating an objection in more detail is not scored as
+  progress. `bounce_ready_or_escalate()` bounds the ready-gate loop at 3 attempts
+  per stage, which was previously unbounded — an agent that could not satisfy a
+  gate would have been corrected forever. The planner and worker prompts state
+  every rule up front, since a gate the agent only meets as a bounce costs a round.
+  See `docs/sdlc-gates.md`.
 - **Web-app shell — nav rail, initiative console, lifecycle bar, amber theme
   (overhaul P8)**. Applies the approved 2026-07 mock to the web client; **web +
   `ui` Angular only** — no Rust/worker/relay edit, no new route or GraphQL op, no
