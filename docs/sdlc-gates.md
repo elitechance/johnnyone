@@ -177,6 +177,24 @@ Opt-in by construction: a plan whose tasks declare no status is not judged.
 - The recording bug above was caught by reading this timeline: three follow-up verdicts, one
   clean `PASS` in the record.
 
+Development, same initiative, run `2af99c0a` — **`spec_weakened_reason` fired three times**:
+
+| When | Phase | What the worker removed |
+|---|---|---|
+| 08:34 | `01-composer-rows` | rows from the phase's screens-to-verify table |
+| 09:14 | `01-composer-rows` | CSS from the D2 mock artifact the phase is measured against |
+| 15:04 | `02-drag-reveal` | acceptance criteria, incl. the one requiring `onMove` on **both** gestures |
+
+This is the gate's whole case, observed rather than argued. Each of those edits would have left a
+review that still passed, against goalposts the worker had moved — and nothing downstream would
+have looked wrong. The third is the sharpest: the removed line was the criterion requiring the
+drag to follow the pointer on *both* gestures, deleted while that phase was failing review for
+exactly that behaviour.
+
+The bounce budget also showed why it is per-stage rather than per-run: phase 01 spent two of its
+three, and phase 02 started fresh at 1/3 rather than inheriting a nearly-exhausted budget from a
+phase that had already been fixed.
+
 ---
 
 ## Where the code is
