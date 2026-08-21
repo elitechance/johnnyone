@@ -176,3 +176,34 @@ pub fn amend_commit_message(brief: &str) -> String {
         format!("amend: {}", trimmed)
     }
 }
+
+/// Paths (repo-relative) that exist in the working tree but not in git.
+///
+/// In a plan store this is precisely "added since the plan was approved", because the
+/// store is committed at approval — which makes it the way to tell a screenshot the
+/// worker just produced from a mock the planner shipped with the spec.
+///
+/// Returns an empty list rather than an error when the path is not a repo, so a plan
+/// store without git history simply opts out.
+pub fn untracked_files(plan_path: &str) -> Vec<String> {
+    Command::new("git")
+        .args([
+            "-C",
+            plan_path,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}

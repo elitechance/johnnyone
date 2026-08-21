@@ -1,5 +1,10 @@
 # Coordinator (CO) — T1/T2 handoff, signals, and reliability
 
+> **Gates** — what CO checks before it believes a `ready`, how lens verdicts roll up
+> (including the non-blocking `PASS_WITH_FOLLOWUPS`), and the guards that stop a
+> non-converging loop live in **[`sdlc-gates.md`](sdlc-gates.md)**. This document covers the
+> handoff and transport those gates sit on top of.
+
 How the planner/development **coordinator** drives the two-tier agent loop, how it
 detects "phase done" and review verdicts, the reliability mechanisms around that,
 and the known-fragile parts. Code lives in

@@ -131,10 +131,11 @@ Tasks path: {{tasks_path}}
 Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
-Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work.
+Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. The task and phase files under {{phase_path}} are the spec you are being measured against, not working notes — do not edit or delete them. If a requirement is wrong or impossible, record that in the task's decisions file and leave the requirement standing, so the change is a decision someone made rather than one that happened quietly; the coordinator rejects a ready report that removed spec lines.
 
 This phase will be reviewed against the three lenses in {{conventions_path}}/review-lenses.md, so prepare the evidence each needs:
 - Product (no code): for every screen in the plan's screens-to-verify inventory, capture a final screenshot of the delivered screen so it can be matched against the agreed mock.
+  A screenshot is the one claim the reviewer cannot re-derive, so each one has to carry its own provenance: name the file in the task's decisions or status file and say what it shows — the route or screen it was taken on and the state it is in. Capture a distinct image per claim; the coordinator rejects a ready report whose images are byte-identical to each other or that nothing describes.
 - QA (behavioral): make sure each acceptance criterion is actually verifiable, every feature is really wired (not stubbed), and the phase's tests were run green with output captured.
 - Lead (structural): reuse shared widgets/services instead of forking them, follow conventions (record any deviation in decisions.md), keep tenancy/authorization scoping and input/path validation intact, and don't leak secrets or creep out of scope.
 
@@ -201,7 +202,7 @@ Create or update a methodology-compliant plan at the plan output path. Read the 
 For UI-related work, include concrete mocks or visual references unless the UI impact is trivial and documented in a decision. The plan must name the existing routes/components/widgets/styles/tests it expects to touch so T2 can verify the plan is synced with the current source code. Include local and live validation strategy when the feature must be testable by the user. Do not implement application code. Only create/update plan files.
 
 The plan will be reviewed against the three lenses in {{conventions_path}}/review-lenses.md, so make it reviewable:
-- Give every phase/task EXPLICIT, TESTABLE acceptance criteria + a definition-of-done (observable; never "works"/"looks good"). [enables the QA lens]
+- Give every phase/task EXPLICIT, TESTABLE acceptance criteria + a definition-of-done under an `## Acceptance` (or `## Definition of done`) heading. Every criterion must name the thing that decides it, in backticks: the command to run, the route and element to look at, the file:line to read. "The aux layer traps focus" is not a criterion; "`npm run e2e -- aux-focus` passes" and "on `/patients/:id` with the aux layer open, Tab from the last control reaches `.aux-skip-link`" are. A criterion nobody can run is one the worker cannot finish and the reviewer can only agree with, which is where a false pass starts — the coordinator rejects a ready report whose criteria do not name their check. [enables the QA lens]
 - For user-facing work, include a "screens to verify" inventory: each screen/flow → its mock/visual reference → how to navigate to it → its acceptance. [enables the Product lens]
 - Prefer reusing existing shared components/widgets over new or forked ones, and note foreseeable security/maintainability concerns. [enables the Lead lens]
 
