@@ -2095,6 +2095,111 @@ fn spec_weakened_reason(plan_path: &str) -> Option<String> {
     ))
 }
 
+/// How many times a `ready` may be bounced back for the same stage before the coordinator
+/// stops and asks for a human.
+///
+/// Every ready-gate rejection sends the agent a correction and loops. Nothing bounded
+/// that loop: an agent that cannot satisfy a gate — or does not understand the
+/// correction — would be told the same thing forever, and unattended that is an
+/// overnight run that burns tokens and arrives nowhere. Three attempts is enough to
+/// clear a misunderstanding and few enough to notice.
+const MAX_READY_BOUNCES: i64 = 3;
+
+/// Ready-gate rejections recorded for this stage since it last started.
+///
+/// Counts every `*_ready_rejected*` event back to the stage's start (or the plan being
+/// stopped), so the budget is per attempt at the stage rather than for the life of the
+/// plan, and a phase that starts fresh gets a fresh budget.
+fn ready_bounces(
+    events: &[AgentPlanEvent],
+    start_event_type: &str,
+    phase_id: Option<&str>,
+) -> i64 {
+    let mut n = 0;
+    for event in events.iter().rev() {
+        if event.event_type == "agent_plan_stopped" {
+            break;
+        }
+        if event.event_type == start_event_type
+            && phase_id.map_or(true, |pid| event.phase_id.as_deref() == Some(pid))
+        {
+            break;
+        }
+        if !event.event_type.contains("ready_rejected") {
+            continue;
+        }
+        if let Some(pid) = phase_id {
+            if event.phase_id.as_deref() != Some(pid) {
+                continue;
+            }
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Record a ready-gate rejection, then either send the correction back to the agent or —
+/// once the bounce budget is spent — park the stage for a human.
+///
+/// Either way the caller just `continue`s: on escalation the plan status becomes
+/// `needs_attention`, which both coordinator loops treat as terminal on their next pass.
+async fn bounce_ready_or_escalate(
+    state: &AppState,
+    run: &AgentPlanRun,
+    session_id: &str,
+    phase_id: Option<&str>,
+    event_type: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let start_event_type = if phase_id.is_some() {
+        "agent_phase_started"
+    } else {
+        "planning_started"
+    };
+    let bounces = ready_bounces(&run.events, start_event_type, phase_id) + 1;
+    append_event(
+        state,
+        &run.plan.id,
+        phase_id,
+        event_type,
+        json!({
+            "reason": reason.chars().take(400).collect::<String>(),
+            "bounce": bounces,
+            "maxBounces": MAX_READY_BOUNCES,
+        }),
+    )?;
+    if bounces >= MAX_READY_BOUNCES {
+        let escalation = ready_bounce_exhausted(bounces, reason);
+        state.db.with_conn(|conn| {
+            update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&escalation))
+                .map_err(|e| e.to_string())
+        })?;
+        let event = if phase_id.is_some() {
+            "agent_phase_needs_attention"
+        } else {
+            "planning_needs_attention"
+        };
+        return append_event(
+            state,
+            &run.plan.id,
+            phase_id,
+            event,
+            json!({ "reason": escalation, "cause": "ready_bounces_exhausted", "bounces": bounces }),
+        );
+    }
+    terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", reason)).await
+}
+
+/// The message a human sees when a stage cannot get past a ready gate.
+fn ready_bounce_exhausted(bounces: i64, last_reason: &str) -> String {
+    format!(
+        "The agent reported ready {} times and each was rejected by the same class of check, so \
+         it is not converging on what the gate wants. Coordinator paused — needs a human \
+         decision. Last rejection:\n\n{}",
+        bounces, last_reason
+    )
+}
+
 /// The most problems to quote back at once. Enough for the planner to see the pattern
 /// without burying it in a wall of text.
 const MAX_ACCEPTANCE_PROBLEMS: usize = 12;
@@ -2501,19 +2606,7 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                     }
                     if let Some(reason) = acceptance_not_executable(&run.plan.plan_path) {
                         tracing::warn!(plan_id = %plan_id, "planner reported ready with acceptance criteria nobody can run");
-                        append_event(
-                            &state,
-                            &plan_id,
-                            None,
-                            "planning_ready_rejected_acceptance",
-                            json!({ "reason": reason.chars().take(400).collect::<String>() }),
-                        )?;
-                        terminal::send_terminal_input(
-                            &state,
-                            session_id.clone(),
-                            format!("{}\r", reason),
-                        )
-                        .await?;
+                        bounce_ready_or_escalate(&state, &run, &session_id, None, "planning_ready_rejected_acceptance", &reason).await?;
                         continue;
                     }
                     state.db.with_conn(|conn| {
@@ -2548,50 +2641,22 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                 // Verify the phase's own test gate rather than taking the agent's word for it.
                 if let Some(reason) = failing_test_command(&run.plan).await {
                     tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "declared tests failed on a ready report");
-                    append_event(
-                        &state,
-                        &plan_id,
-                        Some(&phase.phase_id),
-                        "phase_ready_rejected_tests_failed",
-                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
-                    )?;
-                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    bounce_ready_or_escalate(&state, &run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_tests_failed", &reason).await?;
                     continue;
                 }
                 if let Some(reason) = spec_weakened_reason(&run.plan.plan_path) {
                     tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "ready reported with the plan store spec edited");
-                    append_event(
-                        &state,
-                        &plan_id,
-                        Some(&phase.phase_id),
-                        "phase_ready_rejected_spec_weakened",
-                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
-                    )?;
-                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    bounce_ready_or_escalate(&state, &run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_spec_weakened", &reason).await?;
                     continue;
                 }
                 if let Some(reason) = evidence_provenance_reason(&run.plan.plan_path, &phase.phase_id) {
                     tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "ready reported with unsupported visual evidence");
-                    append_event(
-                        &state,
-                        &plan_id,
-                        Some(&phase.phase_id),
-                        "phase_ready_rejected_evidence",
-                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
-                    )?;
-                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    bounce_ready_or_escalate(&state, &run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_evidence", &reason).await?;
                     continue;
                 }
                 if let Some(reason) = unfinished_tasks_reason(&run.plan, &phase.phase_id) {
                     tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "ready reported with unfinished task statuses");
-                    append_event(
-                        &state,
-                        &plan_id,
-                        Some(&phase.phase_id),
-                        "phase_ready_rejected_tasks_open",
-                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
-                    )?;
-                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    bounce_ready_or_escalate(&state, &run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_tasks_open", &reason).await?;
                     continue;
                 }
                 state.db.with_conn(|conn| {
@@ -7722,6 +7787,71 @@ mod store_tests {
         std::fs::create_dir_all(&phase_dir).unwrap();
         std::fs::write(phase_dir.join("phase.md"), body).unwrap();
         dir
+    }
+
+    fn rejection(event_type: &str, phase_id: Option<&str>) -> AgentPlanEvent {
+        AgentPlanEvent {
+            id: String::new(),
+            plan_id: String::new(),
+            phase_id: phase_id.map(str::to_string),
+            phase_index: None,
+            phase_title: None,
+            event_type: event_type.to_string(),
+            actor: String::new(),
+            category: String::new(),
+            summary: String::new(),
+            status_before: None,
+            status_after: None,
+            reason: None,
+            verdict: None,
+            task_id: None,
+            clarification_attempt: None,
+            payload_json: "{}".to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn ready_bounces_are_counted_per_stage_attempt() {
+        // Rejections before the stage restarted belong to a previous attempt.
+        let events = vec![
+            rejection("planning_ready_rejected", None),
+            rejection("planning_started", None),
+            rejection("planning_ready_rejected", None),
+            rejection("planning_ready_rejected_acceptance", None),
+        ];
+        assert_eq!(ready_bounces(&events, "planning_started", None), 2);
+    }
+
+    #[test]
+    fn a_plan_stop_clears_the_bounce_budget() {
+        let events = vec![
+            rejection("planning_ready_rejected", None),
+            rejection("agent_plan_stopped", None),
+            rejection("planning_ready_rejected", None),
+        ];
+        assert_eq!(ready_bounces(&events, "planning_started", None), 1);
+    }
+
+    #[test]
+    fn each_phase_gets_its_own_bounce_budget() {
+        let events = vec![
+            rejection("phase_ready_rejected_evidence", Some("p2")),
+            rejection("phase_ready_rejected_tests_failed", Some("p1")),
+            rejection("phase_ready_rejected_evidence", Some("p1")),
+        ];
+        assert_eq!(ready_bounces(&events, "agent_phase_started", Some("p1")), 2);
+        assert_eq!(ready_bounces(&events, "agent_phase_started", Some("p2")), 1);
+    }
+
+    /// The escalation has to carry the last correction — a human waking up to a parked run
+    /// needs the objection, not just a count.
+    #[test]
+    fn the_escalation_quotes_the_last_rejection() {
+        let msg = ready_bounce_exhausted(3, "Acceptance criterion does not name its check");
+        assert!(msg.contains("3 times"), "{msg}");
+        assert!(msg.contains("does not name its check"), "{msg}");
+        assert!(msg.contains("needs a human decision"), "{msg}");
     }
 
     #[test]
