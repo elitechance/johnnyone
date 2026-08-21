@@ -2095,6 +2095,141 @@ fn spec_weakened_reason(plan_path: &str) -> Option<String> {
     ))
 }
 
+/// The most problems to quote back at once. Enough for the planner to see the pattern
+/// without burying it in a wall of text.
+const MAX_ACCEPTANCE_PROBLEMS: usize = 12;
+
+/// Whether a markdown heading introduces acceptance criteria.
+fn is_acceptance_heading(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('#') else {
+        return false;
+    };
+    let title = rest.trim_start_matches('#').trim().to_ascii_lowercase();
+    title.starts_with("acceptance") || title.starts_with("definition of done")
+}
+
+fn is_heading(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+fn bullet_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| {
+            trimmed
+                .split_once(". ")
+                .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                .map(|(_, rest)| rest)
+        })?;
+    Some(rest.trim()).filter(|r| !r.is_empty())
+}
+
+/// A criterion is executable when it names the thing that decides it in backticks — a
+/// command, a route, a selector, a file:line. The backtick is doing real work here: it
+/// is the difference between "the aux layer traps focus" and "`npm run e2e -- aux-focus`".
+fn names_a_check(bullet: &str) -> bool {
+    match bullet.split_once('`') {
+        Some((_, rest)) => rest.contains('`'),
+        None => false,
+    }
+}
+
+/// Acceptance bullets in a markdown document, as (heading, bullet) pairs.
+fn acceptance_bullets(body: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut heading: Option<String> = None;
+    for line in body.lines() {
+        if is_acceptance_heading(line) {
+            heading = Some(line.trim().trim_start_matches('#').trim().to_string());
+            continue;
+        }
+        if is_heading(line) {
+            heading = None;
+            continue;
+        }
+        if let (Some(section), Some(bullet)) = (heading.as_ref(), bullet_text(line)) {
+            found.push((section.clone(), bullet.to_string()));
+        }
+    }
+    found
+}
+
+/// Reject a planning `ready` whose acceptance criteria cannot be run by anybody.
+///
+/// "Give every phase EXPLICIT, TESTABLE acceptance criteria" has been in the planner
+/// prompt all along, and plans still came back with criteria like "the layout works on
+/// mobile". Nothing downstream can act on that: the worker cannot tell when it is done,
+/// and the reviewer cannot do better than agree with it, which is where a false pass
+/// starts. Testability has to be a property the coordinator decides, not an adjective in
+/// a prompt.
+///
+/// The rule is placement-agnostic — acceptance may live in a task prompt, a phase
+/// overview, wherever the plan puts it — but every phase needs some, and each criterion
+/// has to name what decides it in backticks: a command, a route, a selector, a file:line.
+fn acceptance_not_executable(plan_path: &str) -> Option<String> {
+    let phases_dir = Path::new(plan_path).join("phases");
+    let mut phases: Vec<PathBuf> = phases_dir
+        .read_dir()
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    if phases.is_empty() {
+        return None;
+    }
+    phases.sort();
+
+    let mut problems: Vec<String> = Vec::new();
+    for phase in &phases {
+        let phase_id = phase
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut prose = String::new();
+        collect_prose(phase, &mut prose);
+        let bullets = acceptance_bullets(&prose);
+        if bullets.is_empty() {
+            problems.push(format!(
+                "  {} — no acceptance criteria anywhere in the phase",
+                phase_id
+            ));
+            continue;
+        }
+        for (section, bullet) in bullets.iter().filter(|(_, b)| !names_a_check(b)) {
+            problems.push(format!(
+                "  {} ({}) — nothing names what decides this: {}",
+                phase_id,
+                section,
+                bullet.chars().take(120).collect::<String>()
+            ));
+        }
+    }
+    if problems.is_empty() {
+        return None;
+    }
+    let shown = problems.len().min(MAX_ACCEPTANCE_PROBLEMS);
+    let more = problems.len().saturating_sub(shown);
+    let suffix = if more > 0 {
+        format!("\n  … and {} more", more)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "The plan was reported ready, but these acceptance criteria cannot be run by \
+         anybody:\n{}{}\n\nA criterion nobody can run is not a criterion — the worker cannot tell \
+         when it is done, and the reviewer can do no better than agree with it. Rewrite each one so \
+         it names the thing that decides it, in backticks: the command to run, the route and \
+         element to look at, the file:line to read. \"The aux layer traps focus\" becomes \"`npm run \
+         e2e -- aux-focus` passes\" or \"on `/patients/:id` with the aux layer open, Tab from the \
+         last control returns to `.aux-skip-link`\". Then report ready again.",
+        problems[..shown].join("\n"),
+        suffix
+    ))
+}
+
 /// File extensions treated as visual evidence.
 const EVIDENCE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 
@@ -2355,6 +2490,23 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                             None,
                             "planning_ready_rejected",
                             json!({ "reason": reason }),
+                        )?;
+                        terminal::send_terminal_input(
+                            &state,
+                            session_id.clone(),
+                            format!("{}\r", reason),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    if let Some(reason) = acceptance_not_executable(&run.plan.plan_path) {
+                        tracing::warn!(plan_id = %plan_id, "planner reported ready with acceptance criteria nobody can run");
+                        append_event(
+                            &state,
+                            &plan_id,
+                            None,
+                            "planning_ready_rejected_acceptance",
+                            json!({ "reason": reason.chars().take(400).collect::<String>() }),
                         )?;
                         terminal::send_terminal_input(
                             &state,
@@ -7562,6 +7714,107 @@ mod store_tests {
         let dir = approved_store("ev-scope");
         shot(&dir, "phases/02-detail/artifacts/mystery.png", b"other phase pixels");
         assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
+    }
+
+    fn plan_with_phase(tag: &str, phase: &str, body: &str) -> PathBuf {
+        let dir = tmp_dir(tag);
+        let phase_dir = dir.join("phases").join(phase);
+        std::fs::create_dir_all(&phase_dir).unwrap();
+        std::fs::write(phase_dir.join("phase.md"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn criteria_that_name_their_check_pass() {
+        let dir = plan_with_phase(
+            "acc-good",
+            "01-shell",
+            "# Phase\n\n## Acceptance\n\
+             - `npm run e2e -- aux-focus` passes\n\
+             - On `/patients/:id` with the aux layer open, Tab from the last control reaches `.aux-skip-link`\n\
+             - 3. `ng test --watch=false` reports 0 failures\n",
+        );
+        assert_eq!(acceptance_not_executable(&dir.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn prose_criteria_are_rejected_with_the_offending_line() {
+        let dir = plan_with_phase(
+            "acc-prose",
+            "01-shell",
+            "# Phase\n\n## Acceptance criteria\n\
+             - The layout works on mobile\n\
+             - `npm run e2e` passes\n",
+        );
+        let reason = acceptance_not_executable(&dir.to_string_lossy()).expect("prose criterion");
+        assert!(reason.contains("The layout works on mobile"), "{reason}");
+        // The one that does name its check must not be dragged in with it.
+        assert!(!reason.contains("npm run e2e` passes"), "{reason}");
+    }
+
+    #[test]
+    fn a_phase_with_no_acceptance_at_all_is_rejected() {
+        let dir = plan_with_phase("acc-none", "01-shell", "# Phase\n\nBuild the shell.\n");
+        let reason = acceptance_not_executable(&dir.to_string_lossy()).expect("no criteria");
+        assert!(reason.contains("no acceptance criteria"), "{reason}");
+        assert!(reason.contains("01-shell"), "{reason}");
+    }
+
+    /// Acceptance may live in a task prompt rather than the phase overview — the check
+    /// must not dictate where the plan puts it.
+    #[test]
+    fn acceptance_is_found_wherever_the_phase_keeps_it() {
+        let dir = tmp_dir("acc-placement");
+        let task = dir.join("phases/01-shell/tasks/t1");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(dir.join("phases/01-shell/overview.md"), "# Phase\nBuild it.\n").unwrap();
+        std::fs::write(
+            task.join("prompt.md"),
+            "# Task\n\n## Definition of done\n- `ng test` reports 0 failures\n",
+        )
+        .unwrap();
+        assert_eq!(acceptance_not_executable(&dir.to_string_lossy()), None);
+    }
+
+    /// A later heading closes the acceptance section, so unrelated bullets are not judged
+    /// as criteria.
+    #[test]
+    fn bullets_after_the_acceptance_section_are_not_criteria() {
+        let dir = plan_with_phase(
+            "acc-scope",
+            "01-shell",
+            "# Phase\n\n## Acceptance\n- `ng test` reports 0 failures\n\n\
+             ## Notes\n- Watch out for the sticky header\n",
+        );
+        assert_eq!(acceptance_not_executable(&dir.to_string_lossy()), None);
+    }
+
+    /// Every phase is judged, not just the first — a plan cannot pass on one good phase.
+    #[test]
+    fn a_later_phase_with_prose_criteria_is_still_caught() {
+        let dir = plan_with_phase(
+            "acc-multi",
+            "01-shell",
+            "# Phase\n\n## Acceptance\n- `ng test` reports 0 failures\n",
+        );
+        let second = dir.join("phases/02-detail");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            second.join("phase.md"),
+            "# Phase\n\n## Acceptance\n- Looks good on tablet\n",
+        )
+        .unwrap();
+        let reason = acceptance_not_executable(&dir.to_string_lossy()).expect("second phase");
+        assert!(reason.contains("02-detail"), "{reason}");
+        assert!(!reason.contains("01-shell"), "{reason}");
+    }
+
+    /// An empty pair of backticks is not a check; the span has to have something in it.
+    #[test]
+    fn an_unclosed_backtick_does_not_count_as_naming_a_check() {
+        assert!(names_a_check("`ng test` reports 0 failures"));
+        assert!(!names_a_check("the `list stays scrolled"));
+        assert!(!names_a_check("it works"));
     }
 
     #[test]
