@@ -2095,6 +2095,135 @@ fn spec_weakened_reason(plan_path: &str) -> Option<String> {
     ))
 }
 
+/// File extensions treated as visual evidence.
+const EVIDENCE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// Files whose text can reference a piece of evidence and say what it shows.
+const EVIDENCE_PROSE_EXTENSIONS: &[&str] = &["md", "yml", "yaml", "txt"];
+
+fn has_extension(path: &str, extensions: &[&str]) -> bool {
+    match path.rsplit_once('.') {
+        Some((_, ext)) => extensions.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Reject a phase `ready` whose visual evidence does not hold up on its own terms.
+///
+/// Screenshots are the one claim a reviewer cannot re-derive: a passing test can be
+/// re-run, but a picture is taken on trust. Two failures have shown up in practice —
+/// the same screen submitted twice under different names, and a file dropped in with
+/// nothing saying what it shows. Both leave a phase looking evidenced when it is not,
+/// and both are decidable from the files themselves.
+///
+/// Scope is the evidence the worker added: untracked files under the phase, since the
+/// store was committed at approval. Mocks that shipped with the spec are tracked and so
+/// are left alone. A phase that added no images opts out, which keeps non-visual work
+/// unaffected.
+fn evidence_provenance_reason(plan_path: &str, phase_id: &str) -> Option<String> {
+    let phase_prefix = format!("phases/{}/", phase_id);
+    let added: Vec<String> = super::git_history::untracked_files(plan_path)
+        .into_iter()
+        .filter(|p| p.starts_with(&phase_prefix))
+        .collect();
+    let evidence: Vec<&String> = added
+        .iter()
+        .filter(|p| has_extension(p, EVIDENCE_EXTENSIONS))
+        .collect();
+    if evidence.is_empty() {
+        return None;
+    }
+
+    let root = Path::new(plan_path);
+    let mut problems: Vec<String> = Vec::new();
+
+    // Byte-identical evidence: whatever these two are named, they show one screen.
+    // Compared by content rather than by digest — no hashing dependency, and an exact
+    // comparison cannot collide.
+    let loaded: Vec<(&String, Vec<u8>)> = evidence
+        .iter()
+        .filter_map(|p| std::fs::read(root.join(p)).ok().map(|bytes| (*p, bytes)))
+        .collect();
+    let mut duplicates: Vec<String> = Vec::new();
+    for (i, (path, bytes)) in loaded.iter().enumerate() {
+        if let Some((earlier, _)) = loaded[..i]
+            .iter()
+            .find(|(_, other)| other.len() == bytes.len() && other == bytes)
+        {
+            duplicates.push(format!("  {} is byte-identical to {}", path, earlier));
+        }
+    }
+    if !duplicates.is_empty() {
+        problems.push(format!(
+            "These files are the same image under different names, so they cannot be evidence \
+             for two different things:\n{}",
+            duplicates.join("\n")
+        ));
+    }
+
+    // Evidence nobody claims: a file with no prose naming it proves nothing, because
+    // nothing states what it is supposed to show.
+    let prose = phase_prose(root, &phase_prefix, &added);
+    let unreferenced: Vec<String> = evidence
+        .iter()
+        .filter(|p| {
+            let name = p.rsplit('/').next().unwrap_or(p);
+            !prose.contains(name)
+        })
+        .map(|p| format!("  {}", p))
+        .collect();
+    if !unreferenced.is_empty() {
+        problems.push(format!(
+            "Nothing under the phase says what these show, so they support no claim:\n{}",
+            unreferenced.join("\n")
+        ));
+    }
+
+    if problems.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The phase was reported ready, but its visual evidence does not hold up:\n\n{}\n\n\
+         A screenshot is the one claim the reviewer cannot re-derive, so it has to carry its own \
+         provenance. For each image, name it in the task's decisions or status file and say what \
+         it shows — the route or screen it was taken on and the state it is in. Capture a distinct \
+         image per claim rather than reusing one, then report ready again.",
+        problems.join("\n\n")
+    ))
+}
+
+/// All prose under the phase — tracked and newly added alike — concatenated, so a
+/// reference to an image counts wherever the worker recorded it.
+fn phase_prose(root: &Path, phase_prefix: &str, added: &[String]) -> String {
+    let mut text = String::new();
+    for path in added.iter().filter(|p| has_extension(p, EVIDENCE_PROSE_EXTENSIONS)) {
+        if let Ok(body) = std::fs::read_to_string(root.join(path)) {
+            text.push_str(&body);
+            text.push('\n');
+        }
+    }
+    collect_prose(&root.join(phase_prefix.trim_end_matches('/')), &mut text);
+    text
+}
+
+/// Depth-limited walk collecting prose file contents under `dir`.
+fn collect_prose(dir: &Path, out: &mut String) {
+    let Ok(entries) = dir.read_dir() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_prose(&path, out);
+        } else if has_extension(&path.to_string_lossy(), EVIDENCE_PROSE_EXTENSIONS) {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                out.push_str(&body);
+                out.push('\n');
+            }
+        }
+    }
+}
+
 /// Run the plan's declared test commands and return the first failure, if any.
 ///
 /// "All three test layers green" is the project's phase rule, but the coordinator only ever learned
@@ -2284,6 +2413,18 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                         &plan_id,
                         Some(&phase.phase_id),
                         "phase_ready_rejected_spec_weakened",
+                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
+                    )?;
+                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    continue;
+                }
+                if let Some(reason) = evidence_provenance_reason(&run.plan.plan_path, &phase.phase_id) {
+                    tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "ready reported with unsupported visual evidence");
+                    append_event(
+                        &state,
+                        &plan_id,
+                        Some(&phase.phase_id),
+                        "phase_ready_rejected_evidence",
                         json!({ "reason": reason.chars().take(400).collect::<String>() }),
                     )?;
                     terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
@@ -7349,6 +7490,78 @@ mod store_tests {
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "--quiet", "-m", "initial"]);
         dir
+    }
+
+    fn shot(dir: &std::path::Path, rel: &str, bytes: &[u8]) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_phase_with_no_images_opts_out_of_the_evidence_check() {
+        let dir = approved_store("ev-none");
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/status.yml"), "status: done\n").unwrap();
+        assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
+    }
+
+    #[test]
+    fn described_and_distinct_evidence_passes() {
+        let dir = approved_store("ev-good");
+        shot(&dir, "phases/01-shell/artifacts/aux-open.png", b"open state pixels");
+        shot(&dir, "phases/01-shell/artifacts/aux-closed.png", b"closed state pixels");
+        std::fs::write(
+            dir.join("phases/01-shell/tasks/t1/decisions.md"),
+            "aux-open.png — /patients/42 with the aux layer open.\naux-closed.png — same route, aux dismissed.\n",
+        )
+        .unwrap();
+        assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
+    }
+
+    #[test]
+    fn one_screen_submitted_twice_is_caught() {
+        let dir = approved_store("ev-dupe");
+        shot(&dir, "phases/01-shell/artifacts/aux-open.png", b"identical pixels");
+        shot(&dir, "phases/01-shell/artifacts/aux-closed.png", b"identical pixels");
+        std::fs::write(
+            dir.join("phases/01-shell/tasks/t1/decisions.md"),
+            "aux-open.png and aux-closed.png show both states.\n",
+        )
+        .unwrap();
+        let reason =
+            evidence_provenance_reason(&dir.to_string_lossy(), "01-shell").expect("duplicate evidence");
+        assert!(reason.contains("byte-identical"), "{reason}");
+        assert!(reason.contains("aux-closed.png"), "{reason}");
+    }
+
+    #[test]
+    fn evidence_nobody_describes_is_caught() {
+        let dir = approved_store("ev-orphan");
+        shot(&dir, "phases/01-shell/artifacts/mystery.png", b"some pixels");
+        let reason =
+            evidence_provenance_reason(&dir.to_string_lossy(), "01-shell").expect("unreferenced evidence");
+        assert!(reason.contains("mystery.png"), "{reason}");
+        assert!(reason.contains("support no claim"), "{reason}");
+    }
+
+    /// Mocks shipped with the approved plan are tracked, so they are spec, not the
+    /// worker's evidence — judging them would bounce every phase that has mocks.
+    #[test]
+    fn mocks_committed_with_the_plan_are_not_judged_as_evidence() {
+        let dir = approved_store("ev-mocks");
+        shot(&dir, "phases/01-shell/artifacts/mock-a.png", b"same mock bytes");
+        shot(&dir, "phases/01-shell/artifacts/mock-b.png", b"same mock bytes");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "mocks"]);
+        assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
+    }
+
+    /// Another phase's screenshots must not decide this phase's readiness.
+    #[test]
+    fn evidence_is_scoped_to_the_phase_under_review() {
+        let dir = approved_store("ev-scope");
+        shot(&dir, "phases/02-detail/artifacts/mystery.png", b"other phase pixels");
+        assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
     }
 
     #[test]

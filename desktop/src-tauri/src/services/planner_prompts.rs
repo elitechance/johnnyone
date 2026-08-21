@@ -131,10 +131,11 @@ Tasks path: {{tasks_path}}
 Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
-Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work.
+Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. The task and phase files under {{phase_path}} are the spec you are being measured against, not working notes — do not edit or delete them. If a requirement is wrong or impossible, record that in the task's decisions file and leave the requirement standing, so the change is a decision someone made rather than one that happened quietly; the coordinator rejects a ready report that removed spec lines.
 
 This phase will be reviewed against the three lenses in {{conventions_path}}/review-lenses.md, so prepare the evidence each needs:
 - Product (no code): for every screen in the plan's screens-to-verify inventory, capture a final screenshot of the delivered screen so it can be matched against the agreed mock.
+  A screenshot is the one claim the reviewer cannot re-derive, so each one has to carry its own provenance: name the file in the task's decisions or status file and say what it shows — the route or screen it was taken on and the state it is in. Capture a distinct image per claim; the coordinator rejects a ready report whose images are byte-identical to each other or that nothing describes.
 - QA (behavioral): make sure each acceptance criterion is actually verifiable, every feature is really wired (not stubbed), and the phase's tests were run green with output captured.
 - Lead (structural): reuse shared widgets/services instead of forking them, follow conventions (record any deviation in decisions.md), keep tenancy/authorization scoping and input/path validation intact, and don't leak secrets or creep out of scope.
 
