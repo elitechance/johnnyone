@@ -1199,6 +1199,9 @@ pub async fn manual_pass_phase(
         &id,
         &phase_id,
         "Manual pass after failed T2 verdict clarification",
+        // A human overriding a failed clarification is a plain pass — there are no lens
+        // follow-ups to carry.
+        "PASS",
     )
     .await?;
     get_plan(&state, &id)
@@ -4473,7 +4476,12 @@ async fn handle_planning_reviewer_output(
                 &run.plan.id,
                 None,
                 "planning_gate_result",
-                review_payload("PASS", None, &review),
+                // Record the verdict that was actually reached, not the literal "PASS". A
+                // PASS_WITH_FOLLOWUPS recorded as PASS drops the follow-ups at the one step
+                // that was supposed to carry them, and every later reader — the timeline, the
+                // convergence check, anyone auditing why a plan was approved — sees a clean
+                // pass that nobody gave.
+                review_payload(v, None, &review),
             )?;
             // Continuous SDLC (D-auto): hand the approved plan straight to development — no manual step.
             // `auto_start_development` returns a boxed future (breaks the async-recursion type cycle).
@@ -4741,7 +4749,7 @@ async fn handle_reviewer_output(
     let review = parse_review_insights(output);
     match verdict.as_deref() {
         Some(v) if verdict_advances(v) => {
-            pass_phase(state, &run.plan.id, &phase.phase_id, "T2 passed phase").await
+            pass_phase(state, &run.plan.id, &phase.phase_id, "T2 passed phase", v).await
         }
         Some("NEEDS_CHANGES") => {
             state.db.with_conn(|conn| {
@@ -4921,9 +4929,13 @@ async fn pass_phase(
     plan_id: &str,
     phase_id: &str,
     summary: &str,
+    verdict: &str,
 ) -> Result<(), String> {
     let run = get_plan(state, plan_id)?;
     let phase = find_phase(&run, phase_id)?;
+    // The verdict the gate actually reached, not a literal 'pass' — a phase passed with
+    // follow-ups has to say so, or the follow-ups are lost at the step meant to carry them.
+    let gate_verdict = verdict.to_ascii_lowercase();
     let next_phase = run
         .phases
         .iter()
@@ -4932,8 +4944,8 @@ async fn pass_phase(
     let should_continue = run.plan.phase_run_mode != "single";
     state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE agent_plan_phases SET status = 'passed', gate_verdict = 'pass', reviewer_idle_at = datetime('now'), summary = ?1, updated_at = datetime('now') WHERE plan_id = ?2 AND phase_id = ?3",
-            params![summary, plan_id, phase_id],
+            "UPDATE agent_plan_phases SET status = 'passed', gate_verdict = ?1, reviewer_idle_at = datetime('now'), summary = ?2, updated_at = datetime('now') WHERE plan_id = ?3 AND phase_id = ?4",
+            params![gate_verdict, summary, plan_id, phase_id],
         )
         .map_err(|e| e.to_string())?;
         if should_continue {
@@ -7852,6 +7864,68 @@ mod store_tests {
         assert!(msg.contains("3 times"), "{msg}");
         assert!(msg.contains("does not name its check"), "{msg}");
         assert!(msg.contains("needs a human decision"), "{msg}");
+    }
+
+    /// A phase that passes with follow-ups must be recorded as such.
+    ///
+    /// This is the bug this test exists for: the pass path wrote the literal `'pass'`, so a
+    /// PASS_WITH_FOLLOWUPS arrived at the one step meant to carry the follow-ups and lost
+    /// them. It went unnoticed because the unit tests covered the verdict *merge* and never
+    /// the recording, and the run still advanced — the record was wrong, not the routing.
+    #[tokio::test]
+    async fn a_phase_passed_with_followups_is_recorded_with_followups() {
+        let (state, root) = test_state();
+        let plan_path = root.join("plan");
+        scaffold_plan(&plan_path, "followups record");
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .expect("create plan");
+
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status)
+                     VALUES ('ph1', ?1, '01-only', 'Only phase', 0, 'reviewer_running')",
+                    params![run.plan.id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        pass_phase(&state, &run.plan.id, "01-only", "passed", "PASS_WITH_FOLLOWUPS")
+            .await
+            .expect("pass phase");
+
+        let verdict: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT gate_verdict FROM agent_plan_phases WHERE plan_id = ?1 AND phase_id = '01-only'",
+                    params![run.plan.id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(verdict, "pass_with_followups", "the follow-ups must survive the record");
+
+        // And a clean pass still records as a clean pass.
+        pass_phase(&state, &run.plan.id, "01-only", "passed", "PASS").await.unwrap();
+        let verdict: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT gate_verdict FROM agent_plan_phases WHERE plan_id = ?1 AND phase_id = '01-only'",
+                    params![run.plan.id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(verdict, "pass");
     }
 
     #[test]
