@@ -1998,6 +1998,103 @@ fn planning_deliverable_missing(plan_path: &str) -> Option<String> {
     ))
 }
 
+/// Files in the plan store a phase worker is expected to write as it goes: its own
+/// progress record and the decisions it made along the way. Everything else in the store
+/// is the spec it was given.
+fn is_worker_writable_store_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(name, "status.yml" | "status.yaml" | "status.md" | "decisions.md")
+}
+
+/// Lines removed per file in a unified diff, in file order.
+///
+/// A deleted file shows as `+++ /dev/null`, so the name is taken from the `---` side
+/// when the `+++` side has none — deleting a spec file outright is the strongest form of
+/// the thing this is looking for and must not be the one case that slips through.
+fn removed_lines_by_file(diff: &str) -> Vec<(String, Vec<String>)> {
+    let mut files: Vec<(String, Vec<String>)> = Vec::new();
+    let mut old_path: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old_path = rest.strip_prefix("a/").map(str::to_string);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let path = rest
+                .strip_prefix("b/")
+                .map(str::to_string)
+                .or_else(|| old_path.take());
+            if let Some(path) = path {
+                files.push((path, Vec::new()));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            if let Some(current) = files.last_mut() {
+                let text = rest.trim();
+                if !text.is_empty() {
+                    current.1.push(text.to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Reject a phase `ready` when the worker rewrote the spec it was being measured against.
+///
+/// The plan store is committed when T2 approves the plan, so during development its HEAD
+/// *is* the agreed contract, and T2 reviews the phase against it. A worker that edits
+/// those files moves the goalposts to wherever the work landed: the review still passes,
+/// but it is no longer checking what was agreed — the most expensive kind of false pass,
+/// because nothing downstream looks wrong.
+///
+/// Only removed lines count. Adding detail to a spec is normal; deleting or rewording an
+/// existing requirement is the move worth catching, and a reworded line appears here as a
+/// removal. The worker's own status and decisions files are excluded — writing those is
+/// the job.
+fn spec_weakened_reason(plan_path: &str) -> Option<String> {
+    let diff = super::git_history::diff_head(plan_path).ok()?;
+    if diff.trim().is_empty() {
+        return None;
+    }
+    let weakened: Vec<(String, Vec<String>)> = removed_lines_by_file(&diff)
+        .into_iter()
+        .filter(|(path, removed)| !removed.is_empty() && !is_worker_writable_store_file(path))
+        .collect();
+    if weakened.is_empty() {
+        return None;
+    }
+    let detail = weakened
+        .iter()
+        .map(|(path, removed)| {
+            let sample: Vec<String> = removed
+                .iter()
+                .take(3)
+                .map(|line| format!("      - {}", line.chars().take(160).collect::<String>()))
+                .collect();
+            let more = removed.len().saturating_sub(3);
+            let suffix = if more > 0 {
+                format!("\n      … and {} more removed line(s)", more)
+            } else {
+                String::new()
+            };
+            format!("  {}\n{}{}", path, sample.join("\n"), suffix)
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+    Some(format!(
+        "The phase was reported ready, but the plan store's spec has been edited during \
+         development — these lines were removed:\n{}\n\nThose files are the contract the review \
+         measures the work against, so changing them makes the review check the work against \
+         itself. Restore them (`git -C {} checkout -- .`, keeping your status and decisions \
+         files), then report ready again. If a requirement is genuinely wrong or impossible, do \
+         not delete it — say so in the task's decisions file and report ready with it still \
+         open, so the change is a decision someone made rather than one that happened quietly.",
+        detail, plan_path
+    ))
+}
+
 /// Run the plan's declared test commands and return the first failure, if any.
 ///
 /// "All three test layers green" is the project's phase rule, but the coordinator only ever learned
@@ -2175,6 +2272,18 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                         &plan_id,
                         Some(&phase.phase_id),
                         "phase_ready_rejected_tests_failed",
+                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
+                    )?;
+                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    continue;
+                }
+                if let Some(reason) = spec_weakened_reason(&run.plan.plan_path) {
+                    tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "ready reported with the plan store spec edited");
+                    append_event(
+                        &state,
+                        &plan_id,
+                        Some(&phase.phase_id),
+                        "phase_ready_rejected_spec_weakened",
                         json!({ "reason": reason.chars().take(400).collect::<String>() }),
                     )?;
                     terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
@@ -7211,6 +7320,104 @@ mod store_tests {
             normalize_stage_provider(Some("  grok ")),
             Some("grok".to_string())
         );
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A plan store committed at approval, i.e. the contract a phase is measured against.
+    fn approved_store(tag: &str) -> PathBuf {
+        let dir = tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-shell/tasks/t1")).unwrap();
+        std::fs::write(
+            dir.join("phases/01-shell/tasks/t1/prompt.md"),
+            "# Task\n- The aux layer must trap focus while open\n- The list must stay scrolled\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/status.yml"), "status: todo\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\nSingle column shell.\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    #[test]
+    fn a_clean_store_passes_the_spec_check() {
+        let dir = approved_store("spec-clean");
+        assert_eq!(spec_weakened_reason(&dir.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn worker_progress_files_are_not_spec_edits() {
+        let dir = approved_store("spec-status");
+        // Recording progress and decisions is the job, not goalpost-moving.
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/status.yml"), "status: done\n").unwrap();
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/decisions.md"), "Chose CSS grid.\n").unwrap();
+        assert_eq!(spec_weakened_reason(&dir.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn adding_detail_to_a_spec_is_not_weakening() {
+        let dir = approved_store("spec-add");
+        let task = dir.join("phases/01-shell/tasks/t1/prompt.md");
+        let extended = std::fs::read_to_string(&task).unwrap() + "- Note: focus returns to the trigger\n";
+        std::fs::write(&task, extended).unwrap();
+        assert_eq!(spec_weakened_reason(&dir.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn dropping_an_acceptance_criterion_is_caught() {
+        let dir = approved_store("spec-drop");
+        std::fs::write(
+            dir.join("phases/01-shell/tasks/t1/prompt.md"),
+            "# Task\n- The list must stay scrolled\n",
+        )
+        .unwrap();
+        let reason = spec_weakened_reason(&dir.to_string_lossy()).expect("dropped criterion");
+        assert!(reason.contains("trap focus"), "the reason must quote what was removed: {reason}");
+        assert!(reason.contains("prompt.md"), "{reason}");
+    }
+
+    #[test]
+    fn deleting_a_spec_file_outright_is_caught() {
+        let dir = approved_store("spec-delete");
+        std::fs::remove_file(dir.join("phases/01-shell/tasks/t1/prompt.md")).unwrap();
+        let reason = spec_weakened_reason(&dir.to_string_lossy()).expect("deleted spec file");
+        assert!(reason.contains("prompt.md"), "a deleted file must still be named: {reason}");
+    }
+
+    #[test]
+    fn removed_lines_are_attributed_to_the_right_file() {
+        // The `--- a/` header precedes `+++ b/`, so a naive parser attributes the first
+        // file's removals to the previous one.
+        let diff = "\
+diff --git a/one.md b/one.md
+--- a/one.md
++++ b/one.md
+@@ -1,2 +1,1 @@
+ keep
+-gone from one
+diff --git a/two.md b/two.md
+--- a/two.md
++++ b/two.md
+@@ -1,2 +1,1 @@
+ keep
+-gone from two
+";
+        let files = removed_lines_by_file(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], ("one.md".to_string(), vec!["gone from one".to_string()]));
+        assert_eq!(files[1], ("two.md".to_string(), vec!["gone from two".to_string()]));
     }
 
     #[test]
