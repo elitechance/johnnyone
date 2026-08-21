@@ -813,3 +813,53 @@ It is the same principle as J1-07's verify-before-ready and for the same reason:
 coordinator accepts an agent's self-report about its own work has produced a false pass in this run.**
 Plan written (J1-07, J1-10), tasks done (J1-14), tests green (J1-16). The pattern is not agent-specific
 and will not be fixed by a better prompt.
+
+---
+
+## J1-17 — Development ran on `main` with an uncommitted working tree
+
+**Observed 2026-08-21, initiative `ea554e33` (Caseroom QA shell fixes), development run `2af99c0a`.**
+
+Two phases passed and a third was in progress with every change sitting **uncommitted on `main`**:
+
+```
+$ git -C lokal/apps/caseroom branch --show-current
+main
+$ git status --short
+ M frontend/caseroom/src/app/shell/shell.component.ts
+ M frontend/caseroom/src/app/shell/shell.component.scss
+ … 13 more
+```
+
+The previous Caseroom run produced a feature branch (`feat/single-column-3layer-shell`, merged as
+PR #4), so this is not how it normally goes — nothing in the coordinator *requires* it, and this
+time nothing produced one.
+
+**Why it matters, in order of severity:**
+
+1. **Two phases of passed, reviewed work exist only as unstaged edits.** Any `git checkout`,
+   `git stash`, or a worker that decides to reset the tree destroys reviewed work with no
+   recovery. The plan store is committed at approval; the actual code is not.
+2. **`spec_weakened_reason` compares the plan store, not the app repo** — it is untouched by this.
+   But the *phase* boundary loses its meaning: there is no per-phase commit, so "what did phase 01
+   change" cannot be answered, and a phase can silently modify what an earlier phase established.
+3. **The verify step cannot isolate a regression.** Phase 02's test run covers phases 00–02
+   together; if a later phase breaks an earlier one, the bisect surface is one undifferentiated
+   diff.
+4. Working on `main` directly means the PR-and-review path that caught the last run's problems is
+   skipped by default.
+
+**Recommendation.** Make the branch part of starting a development run, and the commit part of
+passing a phase:
+
+- On development start, create and check out `initiative/<slug>` in the workspace if the current
+  branch is the default branch. Refuse to start on `main`/`master` otherwise — a run that cannot
+  isolate its own work should not begin.
+- On `pass_phase`, commit the workspace with `phase(<phase_id>): <summary>`. The plan store already
+  does exactly this at approval (`commit_plan_on_pass`); the app repo deserves the same treatment
+  and the code is already written.
+- This also gives the evidence and spec gates a per-phase baseline to diff against, which is
+  strictly better than diffing against the state at run start.
+
+The plan store having a git history while the code does not is the inversion worth fixing: the
+**deliverable** is the code.
