@@ -14,7 +14,7 @@ use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::time::{sleep, Duration, Instant};
@@ -2067,6 +2067,46 @@ async fn failing_test_command(
     None
 }
 
+/// Tasks the agent has not marked finished, when it says the phase is done.
+///
+/// The coordinator parses these files to model progress (`task_status_from_file`), so an agent that
+/// works ahead and forgets the bookkeeping makes that model wrong — the coordinator can then prompt
+/// for a task whose work already exists. Observed: a phase reported ready with **0 of 6** tasks
+/// marked done, on work that was complete and correct.
+///
+/// Returns a message naming the offenders, or None when every task is `done`. A phase whose tasks
+/// carry no status files at all is not second-guessed — absence is a plan-shape choice, not a lie.
+fn unfinished_tasks_reason(plan: &AgentPlan, phase_id: &str) -> Option<String> {
+    let phase_dir = Path::new(&plan.plan_path).join("phases").join(phase_id);
+    let tasks = parse_tasks(&phase_dir, phase_id).ok()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    // Only judge tasks that actually declare a status; a plan with no status files opts out.
+    let declared: Vec<&ParsedTask> = tasks.iter().filter(|t| t.status_path.is_some()).collect();
+    if declared.is_empty() {
+        return None;
+    }
+    let open: Vec<String> = declared
+        .iter()
+        .filter(|t| normalize_task_status(&t.status) != "done")
+        .map(|t| format!("{} ({})", t.task_id, t.status))
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The phase was reported ready, but {} of {} tasks are not marked done:\n  {}\n\n\
+         The coordinator reads these files to know what remains, so leaving them stale makes its \
+         view of the run wrong. Update each task's status as you finish it, then report ready again. \
+         If a task's work is genuinely complete, say so in its status file rather than leaving the \
+         previous value.",
+        open.len(),
+        declared.len(),
+        open.join("\n  ")
+    ))
+}
+
 async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String> {
     loop {
         let run = get_plan(&state, &plan_id)?;
@@ -2135,6 +2175,18 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                         &plan_id,
                         Some(&phase.phase_id),
                         "phase_ready_rejected_tests_failed",
+                        json!({ "reason": reason.chars().take(400).collect::<String>() }),
+                    )?;
+                    terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
+                    continue;
+                }
+                if let Some(reason) = unfinished_tasks_reason(&run.plan, &phase.phase_id) {
+                    tracing::warn!(plan_id = %plan_id, phase = %phase.phase_id, "ready reported with unfinished task statuses");
+                    append_event(
+                        &state,
+                        &plan_id,
+                        Some(&phase.phase_id),
+                        "phase_ready_rejected_tasks_open",
                         json!({ "reason": reason.chars().take(400).collect::<String>() }),
                     )?;
                     terminal::send_terminal_input(&state, session_id.clone(), format!("{}\r", reason)).await?;
@@ -2543,7 +2595,7 @@ fn discord_message_for(
     // visible in the web lens panel.
     match event_type {
         // Phase done.
-        "agent_phase_gate_result" if verdict == "PASS" => Some((
+        "agent_phase_gate_result" if verdict_advances(&verdict) => Some((
             "success",
             format!("✅ Phase {} passed review", phase),
             summary,
@@ -2555,7 +2607,7 @@ fn discord_message_for(
             String::new(),
         )),
         // Plan done (planning approved).
-        "planning_gate_result" if verdict == "PASS" => Some((
+        "planning_gate_result" if verdict_advances(&verdict) => Some((
             "success",
             "✅ Plan passed review".to_string(),
             summary,
@@ -2631,7 +2683,7 @@ Report your verdict AND your reasons through the coordinator API — this is the
 {
   "query": "mutation($v:String!,$s:String,$f:String){reportAgentResult(sessionId:\"SESSION_ID\",kind:\"verdict\",verdict:$v,summary:$s,findings:$f)}",
   "variables": {
-    "v": "<PASS|NEEDS_CHANGES|BLOCKED>",
+    "v": "<PASS|PASS_WITH_FOLLOWUPS|NEEDS_CHANGES|BLOCKED>",
     "s": "<one sentence: your LENS_NAME verdict and the core reason>",
     "f": "<if not PASS: the specific, actionable things to fix, one per line; if PASS: none>"
   }
@@ -2872,17 +2924,23 @@ async fn wait_for_lens_verdict(
 /// if every lens passed. An unrecognized token is treated as NEEDS_CHANGES (safe).
 fn merged_verdict<'a>(verdicts: impl IntoIterator<Item = &'a str>) -> &'static str {
     let mut needs_changes = false;
+    let mut followups = false;
     let mut count = 0;
     for v in verdicts {
         count += 1;
         match v {
             "BLOCKED" => return "BLOCKED",
             "PASS" => {}
+            // Advances, but the roll-up must not launder it into a clean PASS: the follow-ups
+            // still have to travel with the phase.
+            "PASS_WITH_FOLLOWUPS" => followups = true,
             _ => needs_changes = true, // NEEDS_CHANGES or anything unexpected
         }
     }
     if count == 0 || needs_changes {
         "NEEDS_CHANGES"
+    } else if followups {
+        "PASS_WITH_FOLLOWUPS"
     } else {
         "PASS"
     }
@@ -3174,7 +3232,7 @@ async fn run_planning_lens_fanout_review(
 /// enum) is left for the agent to fill, so there is no shell-escaping risk.
 fn report_command(session_id: &str, kind: &str) -> String {
     const READY: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"ready\\\")}\"}'";
-    const VERDICT: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"verdict\\\",verdict:\\\"<PASS|NEEDS_CHANGES|BLOCKED>\\\")}\"}'";
+    const VERDICT: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"verdict\\\",verdict:\\\"<PASS|PASS_WITH_FOLLOWUPS|NEEDS_CHANGES|BLOCKED>\\\")}\"}'";
     const BLOCKED: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"blocked\\\")}\"}'";
     const DONE: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"done\\\")}\"}'";
     let tmpl = match kind {
@@ -3310,7 +3368,19 @@ fn worker_report_instruction(session_id: &str) -> String {
 
 fn reviewer_report_instruction(session_id: &str) -> String {
     format!(
-        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator receives your verdict. After you decide, run this exact command — replace <PASS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
+        "\n\n---\nCHOOSING A VERDICT. Use PASS when you found nothing worth changing. Use \
+         PASS_WITH_FOLLOWUPS when the work is correct and shippable but you are recording \
+         observations that do NOT block it — style, naming, documentation, coverage you would like \
+         later. Those travel with the work as follow-ups instead of holding it. Reserve \
+         NEEDS_CHANGES for something that must change before this ships: a defect, a contradiction, \
+         a missing acceptance criterion, evidence that does not support its claim. Reserve BLOCKED \
+         for work that cannot proceed without a decision you are not able to make. Do not spend a \
+         NEEDS_CHANGES on items you would be content to see shipped and fixed later — that is what \
+         PASS_WITH_FOLLOWUPS is for, and using it keeps genuine defects visible instead of buried \
+         among refinements.\n\nIMPORTANT — this is the ONLY way the coordinator receives your \
+         verdict. After you decide, run this exact command — replace \
+         <PASS|PASS_WITH_FOLLOWUPS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen \
+         print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
         report_command(session_id, "verdict")
     )
 }
@@ -3682,21 +3752,139 @@ fn event_payload_verdict(event: &AgentPlanEvent) -> Option<String> {
         })
 }
 
-/// Consecutive non-PASS review rounds at the tail of the event log for a given gate
-/// event type (optionally scoped to one phase). Stops at the most recent PASS so an
-/// amend cycle / a later phase starts its count fresh.
-fn count_consecutive_non_pass(
+/// How many *prior* rounds must repeat the current round's findings before the
+/// coordinator calls the loop stuck. Two means the same objections survived three
+/// reviews in a row — the worker is not moving them and more rounds will not help.
+const FINDINGS_STALL_ROUNDS: usize = 2;
+
+/// Word overlap at which two findings are treated as the same objection reworded.
+const SAME_FINDING_OVERLAP: f64 = 0.7;
+
+/// Fewer content words than this and an overlap score means nothing — two three-word
+/// findings can share two words by coincidence.
+const MIN_FINDING_WORDS: usize = 3;
+
+/// Words that appear in nearly every finding and so say nothing about which objection
+/// it is. Leaving them in drags unrelated findings toward each other.
+const FINDING_STOPWORDS: &[&str] = &[
+    "and", "are", "but", "for", "from", "has", "have", "into", "its", "not", "that", "the",
+    "their", "then", "there", "they", "this", "was", "were", "when", "which", "with", "you",
+];
+
+/// Fraction of a round's findings that must recur for the round to count as a repeat.
+const ROUND_REPEAT_RATIO: f64 = 0.8;
+
+/// Content words of a finding, lowercased with punctuation dropped. Reviewers rarely
+/// repeat an objection verbatim, so comparison runs on words rather than on the
+/// sentence; words under three characters carry no signal about *which* objection this
+/// is and would inflate the overlap between unrelated findings.
+fn finding_words(finding: &str) -> BTreeSet<String> {
+    finding
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| w.to_lowercase())
+        .filter(|w| !FINDING_STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Whether two findings are the same objection, allowing for rewording.
+/// Scored by containment (shared words over the *smaller* finding) rather than by
+/// Jaccard: a reviewer who restates the same objection with more detail than last round
+/// has not raised a different objection, but Jaccard reads every added word as
+/// divergence and would score a faithful restatement as progress.
+fn same_finding(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
+    let smaller = a.len().min(b.len());
+    if smaller < MIN_FINDING_WORDS {
+        return false;
+    }
+    let shared = a.intersection(b).count() as f64;
+    shared / smaller as f64 >= SAME_FINDING_OVERLAP
+}
+
+/// Whether `prior` raised substantially the same findings as `current` — i.e. the
+/// round in between changed nothing the reviewer cares about.
+fn round_repeats(current: &[BTreeSet<String>], prior: &[String]) -> bool {
+    if current.is_empty() || prior.is_empty() {
+        return false;
+    }
+    let prior: Vec<BTreeSet<String>> = prior.iter().map(|f| finding_words(f)).collect();
+    let recurring = current
+        .iter()
+        .filter(|c| prior.iter().any(|p| same_finding(c, p)))
+        .count() as f64;
+    recurring / current.len() as f64 >= ROUND_REPEAT_RATIO
+}
+
+/// A reason to stop looping when review rounds keep raising the same findings.
+///
+/// The round counter alone cannot tell a loop that is converging slowly from one that
+/// is not converging at all: six rounds of genuine progress and six rounds of the
+/// reviewer restating one objection both hit the cap the same way. Comparing findings
+/// across rounds separates them, so a stuck loop reaches a human in three rounds
+/// instead of burning the full budget first — and the reason names the objection the
+/// human has to rule on rather than only the round count.
+///
+/// `prior_rounds` is newest-first, as [`tail_non_pass_findings`] returns it.
+fn stalled_findings_reason(current: &[String], prior_rounds: &[Vec<String>]) -> Option<String> {
+    if prior_rounds.len() < FINDINGS_STALL_ROUNDS {
+        return None;
+    }
+    let current_words: Vec<BTreeSet<String>> = current.iter().map(|f| finding_words(f)).collect();
+    if current_words.iter().all(|w| w.len() < MIN_FINDING_WORDS) {
+        return None;
+    }
+    if !prior_rounds[..FINDINGS_STALL_ROUNDS]
+        .iter()
+        .all(|prior| round_repeats(&current_words, prior))
+    {
+        return None;
+    }
+    let repeated = current.first().map(String::as_str).unwrap_or("(no detail)");
+    Some(format!(
+        "Review is not converging — the same findings have come back unchanged for {} rounds in a row, so further rounds will not resolve them. Still open: {}",
+        FINDINGS_STALL_ROUNDS + 1,
+        repeated
+    ))
+}
+
+/// Findings from each non-advancing round at the tail of the event log for one gate,
+/// newest first, using the same streak boundaries as [`count_consecutive_non_pass`].
+fn tail_non_pass_findings(
     events: &[AgentPlanEvent],
     gate_event_type: &str,
     start_event_type: &str,
     phase_id: Option<&str>,
-) -> i64 {
-    let mut n = 0;
+) -> Vec<Vec<String>> {
+    let mut rounds = Vec::new();
+    for_each_tail_non_pass_gate(events, gate_event_type, start_event_type, phase_id, |event| {
+        let findings = serde_json::from_str::<serde_json::Value>(&event.payload_json)
+            .ok()
+            .and_then(|p| {
+                p.get("findings").and_then(|f| f.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<String>>()
+                })
+            })
+            .unwrap_or_default();
+        rounds.push(findings);
+    });
+    rounds
+}
+
+/// Walk the tail of the event log backwards, calling `visit` for each gate event in the
+/// current non-advancing streak. Stops at a plan stop, at the start of this stage/phase,
+/// or at the most recent advancing verdict, so an amend cycle / a later phase starts
+/// fresh.
+fn for_each_tail_non_pass_gate(
+    events: &[AgentPlanEvent],
+    gate_event_type: &str,
+    start_event_type: &str,
+    phase_id: Option<&str>,
+    mut visit: impl FnMut(&AgentPlanEvent),
+) {
     for event in events.iter().rev() {
-        // Reset boundaries: a manual stop, or a fresh (re)start of this attempt, ends
-        // the backward count. Rounds from before the user last intervened (stopped /
-        // restarted / amended) must NOT carry over — otherwise a re-run of a stuck
-        // plan re-escalates on its very first round.
         if event.event_type == "agent_plan_stopped" {
             break;
         }
@@ -3714,11 +3902,25 @@ fn count_consecutive_non_pass(
             }
         }
         match event_payload_verdict(event).as_deref() {
-            Some("PASS") => break,
-            Some(_) => n += 1,
+            // A followups verdict advances, so it ends the non-PASS streak like a clean PASS.
+            Some(v) if verdict_advances(v) => break,
+            Some(_) => visit(event),
             None => {}
         }
     }
+}
+
+/// Consecutive non-PASS review rounds at the tail of the event log for a given gate
+/// event type (optionally scoped to one phase). Stops at the most recent PASS so an
+/// amend cycle / a later phase starts its count fresh.
+fn count_consecutive_non_pass(
+    events: &[AgentPlanEvent],
+    gate_event_type: &str,
+    start_event_type: &str,
+    phase_id: Option<&str>,
+) -> i64 {
+    let mut n = 0;
+    for_each_tail_non_pass_gate(events, gate_event_type, start_event_type, phase_id, |_| n += 1);
     n
 }
 
@@ -3754,6 +3956,19 @@ async fn escalate_phase_no_converge(
         "Phase {} still not passing after {} review rounds (last: {} — {}). Coordinator paused — needs a human decision.",
         phase.phase_id, round, verdict, summary
     );
+    escalate_phase(state, run, phase, round, &reason).await
+}
+
+/// Park a phase for a human, recording `reason` as the health message and on the
+/// event timeline.
+async fn escalate_phase(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    round: i64,
+    reason: &str,
+) -> Result<(), String> {
+    let reason = reason.to_string();
     state.db.with_conn(|conn| {
         update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
             .map_err(|e| e.to_string())
@@ -3775,7 +3990,7 @@ async fn handle_planning_reviewer_output(
     let verdict = parse_verdict(output);
     let review = parse_review_insights(output);
     match verdict.as_deref() {
-        Some("PASS") => {
+        Some(v) if verdict_advances(v) => {
             state.db.with_conn(|conn| {
                 update_plan_status_and_health(conn, &run.plan.id, "approved", None)
                     .map_err(|e| e.to_string())
@@ -3809,7 +4024,24 @@ async fn handle_planning_reviewer_output(
                 "planning_gate_result",
                 review_payload(&verdict, Some("sent_back_to_planner"), &review),
             )?;
-            // Loop guard: a review that never converges must not churn forever.
+            // Loop guard: a review that never converges must not churn forever. Repeated
+            // findings prove non-convergence sooner than the round cap does.
+            if let Some(reason) = stalled_findings_reason(
+                &review.findings,
+                &tail_non_pass_findings(&run.events, "planning_gate_result", "planning_started", None),
+            ) {
+                state.db.with_conn(|conn| {
+                    update_plan_status_and_health(conn, &run.plan.id, "needs_attention", Some(&reason))
+                        .map_err(|e| e.to_string())
+                })?;
+                return append_event(
+                    state,
+                    &run.plan.id,
+                    None,
+                    "planning_needs_attention",
+                    json!({ "reason": reason, "rounds": round, "cause": "findings_not_converging" }),
+                );
+            }
             if round >= MAX_REVISION_ROUNDS {
                 let reason = format!(
                     "Plan still not passing after {} review rounds (last: {} — {}). Coordinator paused — needs a human decision.",
@@ -3986,7 +4218,7 @@ async fn clarify_planning_or_needs_attention(
         .clone()
         .ok_or_else(|| "Planning run has no reviewer session".to_string())?;
     let prompt = format!(
-        "You have not reported a verdict to the coordinator. Run exactly this command — replace <PASS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
+        "You have not reported a verdict to the coordinator. Run exactly this command — replace <PASS|PASS_WITH_FOLLOWUPS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
         report_command(&reviewer_session_id, "verdict")
     );
     terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
@@ -4041,7 +4273,9 @@ async fn handle_reviewer_output(
     let verdict = parse_verdict(output);
     let review = parse_review_insights(output);
     match verdict.as_deref() {
-        Some("PASS") => pass_phase(state, &run.plan.id, &phase.phase_id, "T2 passed phase").await,
+        Some(v) if verdict_advances(v) => {
+            pass_phase(state, &run.plan.id, &phase.phase_id, "T2 passed phase").await
+        }
         Some("NEEDS_CHANGES") => {
             state.db.with_conn(|conn| {
                 conn.execute(
@@ -4063,6 +4297,17 @@ async fn handle_reviewer_output(
                 review_payload("NEEDS_CHANGES", None, &review),
             )?;
             let round = consecutive_non_pass_phase_rounds(run, &phase.phase_id) + 1;
+            if let Some(reason) = stalled_findings_reason(
+                &review.findings,
+                &tail_non_pass_findings(
+                    &run.events,
+                    "agent_phase_gate_result",
+                    "agent_phase_started",
+                    Some(&phase.phase_id),
+                ),
+            ) {
+                return escalate_phase(state, run, phase, round, &reason).await;
+            }
             if round >= MAX_REVISION_ROUNDS {
                 let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
                 return escalate_phase_no_converge(state, run, phase, round, "NEEDS_CHANGES", &summary).await;
@@ -4090,6 +4335,17 @@ async fn handle_reviewer_output(
                 review_payload("BLOCKED", Some("sent_back_to_worker"), &review),
             )?;
             let round = consecutive_non_pass_phase_rounds(run, &phase.phase_id) + 1;
+            if let Some(reason) = stalled_findings_reason(
+                &review.findings,
+                &tail_non_pass_findings(
+                    &run.events,
+                    "agent_phase_gate_result",
+                    "agent_phase_started",
+                    Some(&phase.phase_id),
+                ),
+            ) {
+                return escalate_phase(state, run, phase, round, &reason).await;
+            }
             if round >= MAX_REVISION_ROUNDS {
                 let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
                 return escalate_phase_no_converge(state, run, phase, round, "BLOCKED", &summary).await;
@@ -4180,7 +4436,7 @@ async fn clarify_or_needs_attention(
         .clone()
         .ok_or_else(|| "Plan has no reviewer session".to_string())?;
     let prompt = format!(
-        "You have not reported a verdict to the coordinator. Run exactly this command — replace <PASS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
+        "You have not reported a verdict to the coordinator. Run exactly this command — replace <PASS|PASS_WITH_FOLLOWUPS|NEEDS_CHANGES|BLOCKED> with your single chosen verdict:\n{}\nThen print a short footer with SUMMARY, FINDINGS, and NEXT_STEPS for the record.",
         report_command(&reviewer_session_id, "verdict")
     );
     terminal::send_terminal_input(state, reviewer_session_id, format!("{}\r", prompt)).await?;
@@ -4933,9 +5189,20 @@ fn normalize_verdict_token(value: &str) -> Option<String> {
         .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
         .to_ascii_uppercase();
     match token.as_str() {
-        "PASS" | "NEEDS_CHANGES" | "BLOCKED" => Some(token),
+        "PASS" | "NEEDS_CHANGES" | "BLOCKED" | "PASS_WITH_FOLLOWUPS" => Some(token),
         _ => None,
     }
+}
+
+/// Does this verdict let the phase advance?
+///
+/// `PASS_WITH_FOLLOWUPS` exists because the lenses already grade severity — they write
+/// `[blocking]`, `[minor]`, and even "not a finding, recorded so it is not re-opened" — and the
+/// three-value verdict threw that away. A round returned NEEDS_CHANGES with **zero of ten** findings
+/// marked blocking, having explicitly accepted the phase's shape. Non-blocking observations should
+/// ship with the phase as follow-ups, not hold it.
+pub fn verdict_advances(verdict: &str) -> bool {
+    matches!(verdict, "PASS" | "PASS_WITH_FOLLOWUPS")
 }
 
 /// Strip ANSI/VT escape sequences (CSI `ESC [ … final`, OSC `ESC ] … BEL/ST`). The
@@ -6580,6 +6847,79 @@ mod coordinator_terminal_tests {
         gate_event(event_type, None, "")
     }
 
+    fn gate_event_with_findings(
+        event_type: &str,
+        phase_id: Option<&str>,
+        verdict: &str,
+        findings: &[&str],
+    ) -> AgentPlanEvent {
+        let mut event = gate_event(event_type, phase_id, verdict);
+        event.payload_json = json!({ "verdict": verdict, "findings": findings }).to_string();
+        event
+    }
+
+    /// The findings walk must honour the same streak boundaries as the round counter:
+    /// rounds before the last passing verdict belong to a resolved cycle and must not be
+    /// compared against the current one.
+    #[test]
+    fn tail_findings_stop_at_the_last_passing_verdict() {
+        let events = vec![
+            gate_event_with_findings("planning_gate_result", None, "NEEDS_CHANGES", &["old objection"]),
+            gate_event("planning_gate_result", None, "PASS"),
+            gate_event_with_findings("planning_gate_result", None, "NEEDS_CHANGES", &["first", "second"]),
+            gate_event_with_findings("planning_gate_result", None, "NEEDS_CHANGES", &["third"]),
+        ];
+        let rounds = tail_non_pass_findings(&events, "planning_gate_result", "planning_started", None);
+        // Newest first, and nothing from before the PASS.
+        assert_eq!(rounds, vec![vec!["third".to_string()], vec!["first".to_string(), "second".to_string()]]);
+    }
+
+    /// A followups verdict advances, so it closes the streak exactly like a clean PASS.
+    #[test]
+    fn tail_findings_stop_at_a_followups_verdict() {
+        let events = vec![
+            gate_event_with_findings("planning_gate_result", None, "NEEDS_CHANGES", &["stale"]),
+            gate_event("planning_gate_result", None, "PASS_WITH_FOLLOWUPS"),
+            gate_event_with_findings("planning_gate_result", None, "NEEDS_CHANGES", &["fresh"]),
+        ];
+        let rounds = tail_non_pass_findings(&events, "planning_gate_result", "planning_started", None);
+        assert_eq!(rounds, vec![vec!["fresh".to_string()]]);
+    }
+
+    /// Phase gates are scoped: another phase's findings must not be compared against this one's.
+    #[test]
+    fn tail_findings_are_scoped_to_one_phase() {
+        let events = vec![
+            gate_event_with_findings("agent_phase_gate_result", Some("p2"), "NEEDS_CHANGES", &["other phase"]),
+            gate_event_with_findings("agent_phase_gate_result", Some("p1"), "NEEDS_CHANGES", &["mine"]),
+        ];
+        let rounds = tail_non_pass_findings(
+            &events,
+            "agent_phase_gate_result",
+            "agent_phase_started",
+            Some("p1"),
+        );
+        assert_eq!(rounds, vec![vec!["mine".to_string()]]);
+    }
+
+    /// End to end: three rounds of the same objection on one phase reads as a stall,
+    /// which is what turns the round cap from the only guard into the last one.
+    #[test]
+    fn three_repeating_phase_rounds_report_a_stall() {
+        let objection = "Aux panel does not trap focus when it opens over the detail layer";
+        let events = vec![
+            gate_event_with_findings("agent_phase_gate_result", Some("p1"), "NEEDS_CHANGES", &[objection]),
+            gate_event_with_findings("agent_phase_gate_result", Some("p1"), "NEEDS_CHANGES", &[objection]),
+        ];
+        let prior = tail_non_pass_findings(
+            &events,
+            "agent_phase_gate_result",
+            "agent_phase_started",
+            Some("p1"),
+        );
+        assert!(stalled_findings_reason(&[objection.to_string()], &prior).is_some());
+    }
+
     #[test]
     fn count_consecutive_non_pass_stops_at_last_pass_and_scopes_phase() {
         // Planning: three NEEDS_CHANGES in a row → 3.
@@ -6971,6 +7311,107 @@ mod store_tests {
         let plan = plan_with_test_commands("/nonexistent-workspace-xyz", Some(r#"["true"]"#));
         let reason = failing_test_command(&plan).await.expect("must report");
         assert!(reason.contains("could not run"), "{reason}");
+    }
+
+    /// Three rounds of the same objection, reworded each time — the loop is stuck.
+    #[test]
+    fn repeated_findings_stall_even_when_reworded() {
+        let current = vec![
+            "The upload button has no disabled state while the request is in flight".to_string(),
+        ];
+        let prior = vec![
+            vec!["Upload button is missing a disabled state during the in-flight request".to_string()],
+            vec!["No disabled state on the upload button while the request is in flight".to_string()],
+        ];
+        let reason = stalled_findings_reason(&current, &prior).expect("stall");
+        assert!(reason.contains("not converging"), "{reason}");
+        // The reason must name the objection a human has to rule on, not just a count.
+        assert!(reason.contains("upload button"), "{reason}");
+    }
+
+    #[test]
+    fn progress_between_rounds_is_not_a_stall() {
+        let current = vec!["Patient list virtualization drops rows past the scroll buffer".to_string()];
+        let prior = vec![
+            vec!["The upload button has no disabled state while in flight".to_string()],
+            vec!["The upload button has no disabled state while in flight".to_string()],
+        ];
+        assert_eq!(stalled_findings_reason(&current, &prior), None);
+    }
+
+    #[test]
+    fn a_stall_needs_more_than_one_prior_round() {
+        let finding = vec!["Aux panel does not trap focus when opened".to_string()];
+        // One repeat is a normal revision cycle, not a stuck loop.
+        assert_eq!(stalled_findings_reason(&finding, &[finding.clone()]), None);
+        assert!(stalled_findings_reason(&finding, &[finding.clone(), finding.clone()]).is_some());
+    }
+
+    #[test]
+    fn partial_progress_clears_the_stall() {
+        // Two of three findings recur, below the repeat ratio — the worker is moving.
+        let current = vec![
+            "Aux panel does not trap focus when opened".to_string(),
+            "Detail header loses the back affordance on narrow widths".to_string(),
+            "Invite list has no empty state".to_string(),
+        ];
+        let prior_round = vec![
+            "Aux panel does not trap focus when opened".to_string(),
+            "Detail header loses the back affordance on narrow widths".to_string(),
+        ];
+        assert_eq!(
+            stalled_findings_reason(&current, &[prior_round.clone(), prior_round]),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_findings_never_stall() {
+        // A reviewer that reports no findings gives nothing to compare — the round cap
+        // stays the only guard rather than parking the plan on no evidence.
+        assert_eq!(stalled_findings_reason(&[], &[vec![], vec![]]), None);
+        let blank = vec!["ok".to_string(), "??".to_string()];
+        assert_eq!(stalled_findings_reason(&blank, &[blank.clone(), blank.clone()]), None);
+    }
+
+    #[test]
+    fn unrelated_findings_of_similar_shape_are_not_the_same_objection() {
+        let a = finding_words("The doctors list has no empty state");
+        let b = finding_words("The invites list has no loading state");
+        assert!(!same_finding(&a, &b));
+        let c = finding_words("The doctors list is missing an empty state");
+        assert!(same_finding(&a, &c));
+    }
+
+    #[test]
+    fn pass_with_followups_advances_but_needs_changes_does_not() {
+        assert!(verdict_advances("PASS"));
+        assert!(verdict_advances("PASS_WITH_FOLLOWUPS"));
+        assert!(!verdict_advances("NEEDS_CHANGES"));
+        assert!(!verdict_advances("BLOCKED"));
+        assert!(!verdict_advances("nonsense"));
+    }
+
+    #[test]
+    fn normalize_accepts_the_followups_token() {
+        assert_eq!(normalize_verdict_token("pass_with_followups").as_deref(), Some("PASS_WITH_FOLLOWUPS"));
+        assert_eq!(normalize_verdict_token("PASS_WITH_FOLLOWUPS extra words").as_deref(), Some("PASS_WITH_FOLLOWUPS"));
+        assert_eq!(normalize_verdict_token("maybe").as_deref(), None);
+    }
+
+    #[test]
+    fn merged_verdict_does_not_launder_followups_into_a_clean_pass() {
+        // All clean → PASS.
+        assert_eq!(merged_verdict(["PASS", "PASS", "PASS"]), "PASS");
+        // One lens carries follow-ups → the roll-up must say so, so they travel with the work.
+        assert_eq!(merged_verdict(["PASS", "PASS_WITH_FOLLOWUPS", "PASS"]), "PASS_WITH_FOLLOWUPS");
+        // A real objection still wins over follow-ups.
+        assert_eq!(merged_verdict(["PASS_WITH_FOLLOWUPS", "NEEDS_CHANGES"]), "NEEDS_CHANGES");
+        // BLOCKED beats everything.
+        assert_eq!(merged_verdict(["PASS_WITH_FOLLOWUPS", "BLOCKED"]), "BLOCKED");
+        // And the roll-up advances iff it is a passing verdict.
+        assert!(verdict_advances(merged_verdict(["PASS", "PASS_WITH_FOLLOWUPS"])));
+        assert!(!verdict_advances(merged_verdict(["PASS", "NEEDS_CHANGES"])));
     }
 
     /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
