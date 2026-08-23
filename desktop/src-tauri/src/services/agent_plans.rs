@@ -2245,10 +2245,35 @@ fn names_a_check(bullet: &str) -> bool {
 }
 
 /// Acceptance bullets in a markdown document, as (heading, bullet) pairs.
+///
+/// A bullet is joined with its continuation lines before being judged. Criteria that name a
+/// command, four file paths and a `find` invocation do not fit on one line, and reading only
+/// the first line rejected exactly the most thorough ones — the backticks were on the wrap.
+/// A continuation is an indented line that starts no new bullet and no new heading.
 fn acceptance_bullets(body: &str) -> Vec<(String, String)> {
-    let mut found = Vec::new();
+    let mut found: Vec<(String, String)> = Vec::new();
     let mut heading: Option<String> = None;
+    let mut open: Option<(String, String)> = None;
+
     for line in body.lines() {
+        let starts_new_block = is_heading(line) || bullet_text(line).is_some();
+        let is_continuation = !starts_new_block
+            && !line.trim().is_empty()
+            && line.starts_with(char::is_whitespace);
+
+        if is_continuation {
+            if let Some((_, bullet)) = open.as_mut() {
+                bullet.push(' ');
+                bullet.push_str(line.trim());
+            }
+            continue;
+        }
+
+        // Any other line closes the bullet being accumulated.
+        if let Some(pair) = open.take() {
+            found.push(pair);
+        }
+
         if is_acceptance_heading(line) {
             heading = Some(line.trim().trim_start_matches('#').trim().to_string());
             continue;
@@ -2258,8 +2283,11 @@ fn acceptance_bullets(body: &str) -> Vec<(String, String)> {
             continue;
         }
         if let (Some(section), Some(bullet)) = (heading.as_ref(), bullet_text(line)) {
-            found.push((section.clone(), bullet.to_string()));
+            open = Some((section.clone(), bullet.to_string()));
         }
+    }
+    if let Some(pair) = open.take() {
+        found.push(pair);
     }
     found
 }
@@ -7939,6 +7967,55 @@ mod store_tests {
              - 3. `ng test --watch=false` reports 0 failures\n",
         );
         assert_eq!(acceptance_not_executable(&dir.to_string_lossy()), None);
+    }
+
+    /// A criterion that names its check on a continuation line is still executable.
+    ///
+    /// The gate used to read only a bullet's first line, so the most thorough criteria — the
+    /// ones that wrap because they name a command *and* four paths — were the ones it
+    /// rejected. Observed live: it burned two of a planning run's three bounces on
+    /// well-formed acceptance.
+    #[test]
+    fn a_wrapped_bullet_is_judged_whole() {
+        let dir = plan_with_phase(
+            "acc-wrap",
+            "00-drag",
+            "# Phase\n\n## Acceptance\n\
+             - [ ] These four files exist, each larger than 10 kB (a real capture, not a placeholder):\n\
+             \u{20}     `e2e/screenshots/centre-mid-drag.png`, `e2e/screenshots/chips-yield.png` — check with\n\
+             \u{20}     `find e2e/screenshots -name '*mid-drag*.png' | xargs ls -la`.\n",
+        );
+        assert_eq!(acceptance_not_executable(&dir.to_string_lossy()), None);
+    }
+
+    /// Wrapping does not launder prose into a criterion — a bullet with no check anywhere
+    /// across its lines is still rejected.
+    #[test]
+    fn a_wrapped_bullet_with_no_check_is_still_rejected() {
+        let dir = plan_with_phase(
+            "acc-wrap-bad",
+            "00-drag",
+            "# Phase\n\n## Acceptance\n\
+             - [ ] The layout works on mobile and also on tablet, and the reviewer should be\n\
+             \u{20}     satisfied that it looks correct at every width we support.\n",
+        );
+        let reason = acceptance_not_executable(&dir.to_string_lossy()).expect("still prose");
+        assert!(reason.contains("layout works on mobile"), "{reason}");
+    }
+
+    /// The next bullet closes the previous one — continuations must not swallow siblings.
+    #[test]
+    fn a_following_bullet_is_not_absorbed_as_a_continuation() {
+        let dir = plan_with_phase(
+            "acc-wrap-sib",
+            "00-drag",
+            "# Phase\n\n## Acceptance\n\
+             - [ ] `ng test` reports 0 failures\n\
+             - [ ] Looks good on tablet\n",
+        );
+        let reason = acceptance_not_executable(&dir.to_string_lossy()).expect("second bullet");
+        assert!(reason.contains("Looks good on tablet"), "{reason}");
+        assert!(!reason.contains("ng test"), "the passing sibling must not be dragged in: {reason}");
     }
 
     #[test]
