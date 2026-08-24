@@ -2006,7 +2006,14 @@ fn planning_deliverable_missing(plan_path: &str) -> Option<String> {
 /// is the spec it was given.
 fn is_worker_writable_store_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    matches!(name, "status.yml" | "status.yaml" | "status.md" | "decisions.md")
+    matches!(
+        name,
+        // Progress, decisions, and the phase's discovery log. `discoveries.md` ships with a
+        // `## YYYY-MM-DD — <title>` template and tells the worker to "append dated entries and
+        // keep moving" — so replacing that placeholder is the file working as intended, not the
+        // spec being weakened. Judging it cost a run two of its three bounces and parked a phase.
+        "status.yml" | "status.yaml" | "status.md" | "decisions.md" | "discoveries.md"
+    )
 }
 
 /// Lines removed per file in a unified diff, in file order.
@@ -8110,6 +8117,31 @@ mod store_tests {
         // Recording progress and decisions is the job, not goalpost-moving.
         std::fs::write(dir.join("phases/01-shell/tasks/t1/status.yml"), "status: done\n").unwrap();
         std::fs::write(dir.join("phases/01-shell/tasks/t1/decisions.md"), "Chose CSS grid.\n").unwrap();
+        assert_eq!(spec_weakened_reason(&dir.to_string_lossy()), None);
+    }
+
+    /// The phase discovery log is the worker's to write, template included.
+    ///
+    /// `discoveries.md` ships with a `## YYYY-MM-DD — <title>` placeholder and instructs the
+    /// worker to append dated entries. Replacing that template with a real discovery read as
+    /// removed spec lines and burned two of a run's three bounces before parking the phase.
+    #[test]
+    fn filling_in_the_discoveries_template_is_not_weakening() {
+        let dir = approved_store("spec-discoveries");
+        std::fs::write(
+            dir.join("phases/01-shell/discoveries.md"),
+            "# Discoveries\n\n## YYYY-MM-DD — <title>\n**Context:** <which task hit this>\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "phase scaffold"]);
+
+        // The worker replaces the placeholder with a real entry.
+        std::fs::write(
+            dir.join("phases/01-shell/discoveries.md"),
+            "# Discoveries\n\n## 2026-08-23 — Documents are case_documents rows\n**Context:** task 03\n",
+        )
+        .unwrap();
         assert_eq!(spec_weakened_reason(&dir.to_string_lossy()), None);
     }
 
