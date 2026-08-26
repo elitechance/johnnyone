@@ -2139,6 +2139,16 @@ fn planning_deliverable_missing(plan_path: &str) -> Option<String> {
 /// progress record and the decisions it made along the way. Everything else in the store
 /// is the spec it was given.
 fn is_worker_writable_store_file(path: &str) -> bool {
+    // Worker OUTPUT under an `artifacts/` directory — phase artifacts
+    // (`phases/<id>/artifacts/…`) or the plan-level `artifacts/` — is the evidence the worker
+    // produces (test logs, capture scripts, screenshots), not the spec it is measured against.
+    // Editing or regenerating it is the job. Counting it as spec-weakening parks any phase whose
+    // work IS producing evidence: 02-acceptance bounced three times on its own
+    // `cargo-test-lib.txt` and `capture-library.mjs` and escalated to needs_attention, because a
+    // fresh test run and an edited capture script both show as "removed lines" here.
+    if path.starts_with("artifacts/") || path.contains("/artifacts/") {
+        return true;
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
         name,
@@ -2148,6 +2158,27 @@ fn is_worker_writable_store_file(path: &str) -> bool {
         // spec being weakened. Judging it cost a run two of its three bounces and parked a phase.
         "status.yml" | "status.yaml" | "status.md" | "decisions.md" | "discoveries.md"
     )
+}
+
+#[cfg(test)]
+mod worker_writable_tests {
+    use super::is_worker_writable_store_file;
+
+    #[test]
+    fn artifacts_are_worker_output_not_spec() {
+        // Phase and plan-level artifacts: worker output, must not count as spec-weakening.
+        assert!(is_worker_writable_store_file("phases/02-acceptance/artifacts/cargo-test-lib.txt"));
+        assert!(is_worker_writable_store_file("phases/02-acceptance/artifacts/capture-library.mjs"));
+        assert!(is_worker_writable_store_file("phases/01-shell/artifacts/aux-open.png"));
+        assert!(is_worker_writable_store_file("artifacts/summary.md"));
+        // Progress/decisions/discoveries stay writable.
+        assert!(is_worker_writable_store_file("phases/00-x/status.yml"));
+        assert!(is_worker_writable_store_file("decisions.md"));
+        // The spec itself is NOT writable — overview, prompts, task specs.
+        assert!(!is_worker_writable_store_file("overview.md"));
+        assert!(!is_worker_writable_store_file("phases/02-acceptance/tasks/02-02/prompt.md"));
+        assert!(!is_worker_writable_store_file("phases/02-acceptance/overview.md"));
+    }
 }
 
 /// Lines removed per file in a unified diff, in file order.
