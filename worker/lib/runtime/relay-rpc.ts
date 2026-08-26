@@ -1,6 +1,6 @@
 import { readCachedRpc, writeCachedRpc } from './desktop-rpc-cache';
 import { resolveOnlineNode } from '../auth/resolve-online-node';
-import { applyAltTokenToContext } from '../auth/api-key';
+import { requireIdentity } from '../auth/require-identity';
 
 /**
  * Relay-RPC helper — replaces the legacy `hostGraphqlRequest` forward path.
@@ -52,16 +52,14 @@ export async function relayRpc<T>(
   method: string,
   params: Record<string, unknown> = {},
 ): Promise<T> {
-  // Populate ctx.auth from a jk_ API-key Bearer token if the platform JWT
-  // middleware didn't (key auth isn't a JWT). No-op for JWT/header auth.
-  await applyAltTokenToContext(ctx as any);
+  const identity = await requireIdentity(ctx as any);
 
-  const cached = readCachedRpc<T>(ctx.auth, method, params);
+  const cached = readCachedRpc<T>(identity, method, params);
   if (cached !== null) {
     return cached;
   }
 
-  const node = await resolveOnlineNode(ctx.db, ctx.auth);
+  const node = await resolveOnlineNode(ctx.db, identity);
 
   if (!node) {
     throw new Error(
@@ -98,6 +96,6 @@ export async function relayRpc<T>(
   }
 
   const data = body.data as T;
-  writeCachedRpc(ctx.auth, method, params, data);
+  writeCachedRpc(identity, method, params, data);
   return data;
 }

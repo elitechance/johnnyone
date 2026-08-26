@@ -1,3 +1,5 @@
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -44,8 +46,9 @@ export default async function listChannelBindings(
   args: { channelType?: string },
   ctx: ResolverContext,
 ) {
+  const ident = await requireIdentity(ctx as any);
   let sql = `SELECT * FROM channel_bindings WHERE tenant_id = ? AND user_id = ? AND is_deleted = 0`;
-  const bindings: string[] = [ctx.auth.tenantId, ctx.auth.userId];
+  const bindings: string[] = [ident.tenantId, ident.userId];
 
   if (args.channelType) {
     sql += ` AND channel_type = ?`;

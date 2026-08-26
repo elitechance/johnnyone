@@ -100,6 +100,7 @@ export interface CreateBriefingInput {
    * Omit both to inherit the planning agent (behaviour before per-stage providers existed). */
   devWorkerProvider?: string;
   devReviewerProvider?: string;
+  executorConfig?: string;
 }
 
 /** Accept a briefing brief (overhaul P4, D1/D4). `finalBrief` optionally overrides the stored draft. */
@@ -143,6 +144,10 @@ export interface AgentPlan {
   health: 'in-progress' | 'needs-attention' | 'blocked' | string;
   /** Non-empty only on a briefing Initiative: its kind='user' chat session (overhaul P4, D3). */
   briefingSessionId?: string;
+  /** Local-small executor JSON. Null/empty = commercial. */
+  executorConfig?: string | null;
+  /** Host consecutive non-pass planning rounds for this initiative. */
+  consecutiveNonPassPlanningRounds?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -320,16 +325,27 @@ export interface WorkspaceValidation {
   error?: string;
 }
 
+export interface PlannerSmallModePrompts {
+  planner: string;
+  reviewer: string;
+  leafWrapper: string;
+  amendPlanner: string;
+}
+
 export interface PlannerPromptSettings {
   schema?: string;
   development: {
     worker: string;
     reviewer: string;
+    workerNudge?: string | null;
   };
   planning: {
     planner: string;
     reviewer: string;
+    amendPlanner?: string | null;
+    amendReviewer?: string | null;
   };
+  smallMode?: PlannerSmallModePrompts;
 }
 
 export interface ChatAttachment {
@@ -350,8 +366,9 @@ export class JohnnyApiService {
     plan {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
-      brief appScope docsScope referencePaths amendBrief validationConfig phaseRunMode
+      brief appScope docsScope referencePaths amendBrief validationConfig executorConfig phaseRunMode
       initiativeId initiativeStatus health briefingSessionId
+      consecutiveNonPassPlanningRounds
       createdAt updatedAt
     }
     phases {
@@ -766,8 +783,9 @@ export class JohnnyApiService {
         `query GetPlannerPromptSettings {
           getPlannerPromptSettings {
             schema
-            development { worker reviewer }
-            planning { planner reviewer }
+            development { worker reviewer workerNudge }
+            planning { planner reviewer amendPlanner amendReviewer }
+            smallMode { planner reviewer leafWrapper amendPlanner }
           }
         }`
       )
@@ -778,14 +796,16 @@ export class JohnnyApiService {
     const payload = {
       development: input.development,
       planning: input.planning,
+      ...(input.smallMode ? { smallMode: input.smallMode } : {}),
     };
     return this.gql
       .mutate<{ updatePlannerPromptSettings: PlannerPromptSettings }>(
         `mutation UpdatePlannerPromptSettings($input: PlannerPromptSettingsInput!) {
           updatePlannerPromptSettings(input: $input) {
             schema
-            development { worker reviewer }
-            planning { planner reviewer }
+            development { worker reviewer workerNudge }
+            planning { planner reviewer amendPlanner amendReviewer }
+            smallMode { planner reviewer leafWrapper amendPlanner }
           }
         }`,
         { input: payload }
@@ -803,7 +823,8 @@ export class JohnnyApiService {
             id runType title workspacePath planPath status workerSessionId reviewerSessionId
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
             brief appScope docsScope referencePaths
-            initiativeId initiativeStatus health validationConfig briefingSessionId
+            initiativeId initiativeStatus health validationConfig executorConfig briefingSessionId
+            consecutiveNonPassPlanningRounds
             createdAt updatedAt
           }
         }`,
@@ -823,6 +844,40 @@ export class JohnnyApiService {
         { id }
       )
       .pipe(map((data) => data.getAgentPlan));
+  }
+
+  getPlanCheck(planId: string, phaseId?: string): Observable<string | null> {
+    return this.gql
+      .query<{ getPlanCheck: string | null }>(
+        `query GetPlanCheck($planId: ID!, $phaseId: String) {
+          getPlanCheck(planId: $planId, phaseId: $phaseId)
+        }`,
+        { planId, phaseId: phaseId ?? null }
+      )
+      .pipe(map((data) => data.getPlanCheck));
+  }
+
+  getTaskRun(planId: string, phaseId: string, taskId?: string): Observable<string | null> {
+    return this.gql
+      .query<{ getTaskRun: string | null }>(
+        `query GetTaskRun($planId: ID!, $phaseId: String!, $taskId: String) {
+          getTaskRun(planId: $planId, phaseId: $phaseId, taskId: $taskId)
+        }`,
+        { planId, phaseId, taskId: taskId ?? null }
+      )
+      .pipe(map((data) => data.getTaskRun));
+  }
+
+  getKlooDoctor(): Observable<string> {
+    return this.gql
+      .query<{ getKlooDoctor: string }>(`query GetKlooDoctor { getKlooDoctor }`)
+      .pipe(map((data) => data.getKlooDoctor));
+  }
+
+  getKlooProbe(): Observable<string> {
+    return this.gql
+      .query<{ getKlooProbe: string }>(`query GetKlooProbe { getKlooProbe }`)
+      .pipe(map((data) => data.getKlooProbe));
   }
 
   /** Full SDLC event timeline for one Initiative (planning-run + development-run events merged,

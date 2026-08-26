@@ -1,0 +1,6 @@
+id: 05-clamp
+files: [src/clamp.rs]
+verify: "cargo test clamp_works -- --exact"
+must_contain: ["pub fn clamp(x: i32, lo: i32, hi: i32) -> i32"]
+depends_on: []
+ctx: 32768

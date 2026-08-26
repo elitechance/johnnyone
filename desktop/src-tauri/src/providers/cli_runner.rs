@@ -23,6 +23,24 @@ impl CliProcess {
     pub fn is_running(&mut self) -> bool {
         self.child.try_wait().ok().flatten().is_none()
     }
+
+    /// Block until the child exits and return its status (needed for check 1 / 127).
+    pub async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
+        self.child
+            .wait()
+            .await
+            .map_err(|e| format!("Failed to wait for process: {}", e))
+    }
+
+    /// OS pid, if the child is still attached.
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    #[cfg(test)]
+    pub fn from_child(child: Child, session_id: String) -> Self {
+        Self { child, session_id }
+    }
 }
 
 /// Spawn a CLI subprocess and stream its output line by line.
@@ -33,6 +51,31 @@ pub async fn spawn_cli<F>(
     config: CliSpawnConfig,
     session_id: String,
     parse_line: F,
+) -> Result<(CliProcess, mpsc::Receiver<StreamChunk>), String>
+where
+    F: Fn(&str) -> Option<StreamChunk> + Send + 'static,
+{
+    spawn_cli_inner(config, session_id, parse_line, false).await
+}
+
+/// Same as [`spawn_cli`] but the child is the leader of a new process group
+/// (unix) so Stop can `kill -TERM -<pid>` and reap verify/tool grandchildren.
+pub async fn spawn_cli_process_group<F>(
+    config: CliSpawnConfig,
+    session_id: String,
+    parse_line: F,
+) -> Result<(CliProcess, mpsc::Receiver<StreamChunk>), String>
+where
+    F: Fn(&str) -> Option<StreamChunk> + Send + 'static,
+{
+    spawn_cli_inner(config, session_id, parse_line, true).await
+}
+
+async fn spawn_cli_inner<F>(
+    config: CliSpawnConfig,
+    session_id: String,
+    parse_line: F,
+    process_group: bool,
 ) -> Result<(CliProcess, mpsc::Receiver<StreamChunk>), String>
 where
     F: Fn(&str) -> Option<StreamChunk> + Send + 'static,
@@ -59,6 +102,10 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if process_group {
+        #[cfg(unix)]
+        cmd.process_group(0);
+    }
 
     for (key, val) in &config.env_vars {
         if val.is_empty() {

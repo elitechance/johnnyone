@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { generateApiKey, sha256Hex, applyAltTokenToContext, validateApiKeyToken, isTokenLike } from './auth/api-key';
+import { generateApiKey, sha256Hex, validateApiKeyToken, isTokenLike } from './auth/api-key';
+import { requireIdentity } from './auth/require-identity';
 import { requireScope } from './auth/scopes';
 import * as desktopRpcMod from './runtime/desktop-rpc';
 
@@ -33,7 +34,7 @@ describe('Phase 05 integration (jk_ on both paths + scopes + revoke effect)', ()
     const h = await sha256Hex(g.secret);
     const row = { id: g.keyId, tenant_id: 't1', user_id: 'u1', key_hash: h, scopes: '["sessions:read","terminal:write"]', revoked_at: null, expires_at: null, is_deleted: 0 };
     const ctx = makeCtxWithDbAndReq(g.token, row);
-    await applyAltTokenToContext(ctx);
+    await requireIdentity(ctx);
     expect(ctx.auth).toMatchObject({ tenantId: 't1', userId: 'u1' });
     expect(ctx.apiKey).toMatchObject({ id: g.keyId, scopes: ['sessions:read', 'terminal:write'] });
   });

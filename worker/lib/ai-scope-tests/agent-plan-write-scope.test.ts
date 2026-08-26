@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 describe('AgentPlan WRITE scope (tenant isolation)', () => {
   beforeEach(() => {
@@ -30,10 +27,10 @@ describe('AgentPlan WRITE scope (tenant isolation)', () => {
     }
 
     // cross
-    const b = { ...mockCtx, auth: { tenantId: 'tB', userId: 'uB' } };
+    const b = authedCtx({ tenantId: 'tB', userId: 'uB' });
     const spyB = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({});
     const { default: delB } = await import('../../resolvers/ai/delete-agent-plan');
     await delB(null, { id: 'p1' }, b as any);
-    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: b.auth }), 'delete_agent_plan', { id: 'p1' });
+    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 'tB', userId: 'uB' }) }), 'delete_agent_plan', { id: 'p1' });
   });
 });

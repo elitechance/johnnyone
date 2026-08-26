@@ -1,9 +1,21 @@
 pub mod agent_plans;
+pub mod atomic_fs;
 pub mod chat_host;
+pub mod coordinator_flight;
 pub mod git_history;
 pub mod host_files;
+pub mod plan_check;
 pub mod planner_prompts;
 pub mod providers;
 pub mod relay;
 pub mod sessions;
 pub mod settings;
+pub mod task_check;
+pub mod task_loop;
+pub mod task_replan;
+pub mod task_spec;
+pub mod task_state;
+pub mod verify_policy;
+pub mod workspace_git;
+#[cfg(test)]
+mod fixture_spine;

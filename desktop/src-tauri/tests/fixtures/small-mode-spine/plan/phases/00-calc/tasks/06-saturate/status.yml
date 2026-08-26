@@ -1,0 +1,13 @@
+schema: task-status/v1
+state: not-started
+started: null
+completed: null
+owner: null
+blockers: []
+validation:
+  state: pending
+  validator: null
+  checked_at: null
+  summary: null
+artifacts: []
+notes: []

@@ -1,4 +1,4 @@
-import { applyAltTokenToContext } from '../../lib/auth/api-key';
+import { requireIdentity } from '../../lib/auth/require-identity';
 
 interface ResolverContext {
   db: D1Database;
@@ -48,15 +48,13 @@ export default async function listDesktopNodes(
   args: Record<string, never>,
   ctx: ResolverContext,
 ) {
-  // Apply jk_ API-key identity so key-authenticated callers see their own nodes
-  // (the platform JWT middleware only populates ctx.auth for JWTs). No-op for JWT.
-  await applyAltTokenToContext(ctx as unknown as Record<string, unknown>);
+  const id = await requireIdentity(ctx as any);
 
   const result = await ctx.db
     .prepare(
       `SELECT * FROM desktop_nodes WHERE tenant_id = ? AND user_id = ? AND is_deleted = 0 ORDER BY last_heartbeat_at DESC`,
     )
-    .bind(ctx.auth.tenantId, ctx.auth.userId)
+    .bind(id.tenantId, id.userId)
     .all<DesktopNodeRow>();
 
   return result.results.map(mapDesktopNodeRow);

@@ -1,6 +1,8 @@
 // unlink-channel.ts — Mutation: unlinkChannel
 // Phase 2: Unlink an external messaging channel from the user's account
 
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -16,12 +18,13 @@ export default async function unlinkChannel(
   args: { id: string },
   ctx: ResolverContext,
 ) {
+  const ident = await requireIdentity(ctx as any);
   const now = new Date().toISOString();
 
   const binding = await ctx.db.prepare(
     `SELECT * FROM channel_bindings WHERE id = ? AND tenant_id = ? AND user_id = ? AND is_deleted = 0`,
   )
-    .bind(args.id, ctx.auth.tenantId, ctx.auth.userId)
+    .bind(args.id, ident.tenantId, ident.userId)
     .first();
 
   if (!binding) {

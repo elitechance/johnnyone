@@ -23,11 +23,11 @@ pub const BACKFILL_017: &str = include_str!("../../migrations/017_backfill_initi
 const MIGRATION_018: &str = include_str!("../../migrations/018_add_briefing_session.sql");
 const MIGRATION_019: &str = include_str!("../../migrations/019_add_validation_config.sql");
 const MIGRATION_020: &str = include_str!("../../migrations/020_complete_approved_dev_runs.sql");
-// NOTE: version 21 is RESERVED by `021_add_executor_config` on the `feat/local-small-executor`
-// branch, which has already been applied to live databases. Versions are a shared, hand-assigned
-// namespace across branches — reusing 21 here would be silently skipped on any DB that saw the other
-// branch first (the runner only checks whether the *number* was applied), leaving the columns absent
-// while the code assumes them. Hence 22.
+// 021 landed on `feat/local-small-executor`; 022/023 on `main`. Both were applied to live DBs
+// under these exact numbers (verified against `_migrations` at merge time), so the union below is
+// what the running databases already reflect. Versions are a shared, hand-assigned namespace across
+// branches — the runner only checks whether the *number* was applied, so never reuse one.
+const MIGRATION_021: &str = include_str!("../../migrations/021_add_executor_config.sql");
 const MIGRATION_022: &str = include_str!("../../migrations/022_add_dev_stage_providers.sql");
 const MIGRATION_023: &str = include_str!("../../migrations/023_add_test_commands.sql");
 
@@ -36,7 +36,7 @@ const MIGRATION_023: &str = include_str!("../../migrations/023_add_test_commands
 pub fn health_from_status(status: &str) -> &'static str {
     match status {
         "blocked" => "blocked",
-        "needs_attention" | "phase_needs_changes" => "needs-attention",
+        "needs_attention" | "phase_needs_changes" | "phase_replan_running" => "needs-attention",
         // Terminal, healthy end states: a fully-approved/complete run is DONE, not
         // "in-progress". Without this, the HEALTH axis is stuck on in-progress forever
         // after approval (the console reads it straight from this derivation).
@@ -90,6 +90,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (18, "018_add_briefing_session", MIGRATION_018),
         (19, "019_add_validation_config", MIGRATION_019),
         (20, "020_complete_approved_dev_runs", MIGRATION_020),
+        (21, "021_add_executor_config", MIGRATION_021),
         (22, "022_add_dev_stage_providers", MIGRATION_022),
         (23, "023_add_test_commands", MIGRATION_023),
     ];
@@ -311,6 +312,7 @@ mod tests {
         assert_eq!(health_from_status("blocked"), "blocked");
         assert_eq!(health_from_status("needs_attention"), "needs-attention");
         assert_eq!(health_from_status("phase_needs_changes"), "needs-attention");
+        assert_eq!(health_from_status("phase_replan_running"), "needs-attention");
         assert_eq!(health_from_status("draft"), "in-progress");
         assert_eq!(health_from_status("approved"), "complete");
         assert_eq!(health_from_status("done"), "complete");

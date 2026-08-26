@@ -94,6 +94,14 @@ describe('api-key primitives', () => {
     expect(isTokenLike('')).toBe(false);
   });
 
+  it('authorizeForAltToken delegates to requireIdentity (no inlined jk_ parser)', async () => {
+    const { authorizeForAltToken } = await import('./api-key');
+    const authSrc = authorizeForAltToken.toString();
+    expect(authSrc).toContain('requireIdentity');
+    expect(authSrc).not.toContain('validateApiKeyToken');
+    expect(authSrc).not.toContain('isTokenLike');
+  });
+
   it('no secret leakage in errors or parse fails', () => {
     // parse never throws and returns null; we don't embed secret in any error path here
     const p = parseApiKey('jk_bad');

@@ -44,6 +44,8 @@ describe('RelayTerminalService Phase 02 (real service + faked WS capture)', () =
       getAccessToken: vi.fn(() => 'access-abc123'),
       getRefreshToken: vi.fn(() => 'refresh-xyz'),
       refresh: vi.fn().mockResolvedValue(undefined),
+      ensureFreshToken: vi.fn().mockResolvedValue(undefined),
+      logout: vi.fn(),
       getTokenExpiresAt: vi.fn(() => null),
       getExpiresIn: vi.fn(() => 3600),
       isTokenNearExpiry: vi.fn(() => false),
@@ -51,6 +53,7 @@ describe('RelayTerminalService Phase 02 (real service + faked WS capture)', () =
     inst.zone = { run: (fn: any) => fn() };
     inst['workerBaseUrl'] = () => 'http://localhost:8787';
     inst.visualSubscriptions = new Map();
+    inst.streamSubscriptions = new Map();
     inst.pendingInput = new Map();
     inst.pendingTimers = new Map();
     inst.reconnectTimer = null;
@@ -77,14 +80,13 @@ describe('RelayTerminalService Phase 02 (real service + faked WS capture)', () =
 
   it('ensureConnected uses the REAL relayWsUrl output (faked WS captures token, no nodeId)', async () => {
     const inst = makeInstance();
-    const getExpSpy = inst.auth.getExpiresIn;
-    // ensure token path etc
+    const ensureSpy = inst.auth.ensureFreshToken;
     await (inst as any).ensureConnected().catch(() => {});
     expect(capturedUrl).toBeTruthy();
     expect(capturedUrl).toContain('token=access-abc123');
     const u = new URL(capturedUrl.replace(/^wss?:/, 'http:'));
     expect(u.searchParams.has('nodeId')).toBe(false);
-    expect(getExpSpy).toHaveBeenCalled(); // verifies consult AuthService.expiresIn for gating
+    expect(ensureSpy).toHaveBeenCalled();
   });
 
   it('display-only nodes: listDesktopNodes is not used for socket routing (relayWsUrl has no node)', () => {
@@ -108,21 +110,24 @@ describe('RelayTerminalService Phase 02 (real service + faked WS capture)', () =
     // (exercises real relayWsUrl after "refresh" with the new value)
     capturedUrl = '';
     (inst as any).socket = null;
-    inst.auth.refresh = vi.fn().mockResolvedValue(undefined);
-    const refreshSpy = inst.auth.refresh as any;
-    await (inst.auth.refresh as any)();
-    inst.auth.getAccessToken = vi.fn(() => 'access-NEW-999');
+    inst.auth.ensureFreshToken = vi.fn().mockImplementation(async () => {
+      inst.auth.getAccessToken = vi.fn(() => 'access-NEW-999');
+    });
+    const ensureSpy = inst.auth.ensureFreshToken as any;
     await (inst as any).ensureConnected().catch(() => {});
 
     expect(capturedUrl).toContain('token=access-NEW-999');
-    expect(refreshSpy).toHaveBeenCalled();
+    expect(ensureSpy).toHaveBeenCalled();
   });
 
   it('refresh-fail surfaces error (no silent dead, real ensure throws)', async () => {
     const inst = makeInstance();
     inst.auth.getAccessToken = vi.fn(() => null);
     inst.auth.getRefreshToken = vi.fn(() => 'r');
-    inst.auth.refresh = vi.fn().mockRejectedValue(new Error('refresh failed'));
+    inst.auth.ensureFreshToken = vi.fn().mockImplementation(async () => {
+      inst.auth.logout();
+      throw new Error('invalid refresh token');
+    });
 
     let threw: any = null;
     try {
@@ -132,6 +137,49 @@ describe('RelayTerminalService Phase 02 (real service + faked WS capture)', () =
       console.error('refresh-fail-threw:', String(e));
     }
     expect(threw).toBeTruthy();
-    expect(String(threw)).toMatch(/No valid authentication token|refresh/i);
+    expect(String(threw)).toMatch(/No valid authentication token|refresh|invalid refresh/i);
+    expect(inst.auth.logout).toHaveBeenCalled();
+  });
+
+  it('auth-class ensureFreshToken reject: logout already called and WebSocket is not constructed', async () => {
+    let constructCount = 0;
+    (global as any).WebSocket = function (this: any, url: string) {
+      constructCount += 1;
+      this.url = url;
+      this.readyState = 1;
+      this.close = vi.fn();
+      this.send = vi.fn();
+      return this;
+    };
+    const inst = makeInstance();
+    inst.auth.ensureFreshToken = vi.fn().mockImplementation(async () => {
+      inst.auth.logout();
+      throw new Error('invalid refresh token');
+    });
+    const before = constructCount;
+    await expect((inst as any).ensureConnected()).rejects.toBeTruthy();
+    expect(inst.auth.logout).toHaveBeenCalled();
+    expect(constructCount).toBe(before);
+  });
+
+  it('transport-class ensureFreshToken reject does not call logout', async () => {
+    const inst = makeInstance();
+    inst.auth.ensureFreshToken = vi.fn().mockRejectedValue(new TypeError('network'));
+    await expect((inst as any).ensureConnected()).rejects.toBeTruthy();
+    expect(inst.auth.logout).not.toHaveBeenCalled();
+  });
+
+  it('scheduleReconnectForVisualSubscriptions calls ensureFreshToken, not auth.refresh', async () => {
+    vi.useFakeTimers();
+    const inst = makeInstance();
+    inst.visualSubscriptions.set('sess-1', 1);
+    inst.lastDisconnectWasAuthRejection = true;
+    inst.authFailureCount = 1;
+    inst.auth.ensureFreshToken = vi.fn().mockResolvedValue(undefined);
+    inst.auth.refresh = vi.fn().mockResolvedValue(undefined);
+    (inst as any).scheduleReconnectForVisualSubscriptions();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(inst.auth.ensureFreshToken).toHaveBeenCalled();
+    expect(inst.auth.refresh).not.toHaveBeenCalled();
   });
 });

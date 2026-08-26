@@ -1,0 +1,6 @@
+id: 01-add
+files: [src/add.rs]
+verify: "cargo test add_works -- --exact"
+must_contain: ["pub fn add(a: i32, b: i32) -> i32"]
+depends_on: []
+ctx: 32768

@@ -1,0 +1,6 @@
+id: 07-gcd
+files: [src/gcd.rs]
+verify: "cargo test gcd_works -- --exact"
+must_contain: ["pub fn gcd(a: i32, b: i32) -> i32"]
+depends_on: []
+ctx: 32768

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { authedCtx } from './test-authed-ctx';
 
 const makeStubDb = (overrides: any = {}) => {
   const calls: any[] = [];
@@ -22,14 +23,14 @@ describe('createApiKey (JWT-only + hash-only + scopes)', () => {
 
   it('rejects when ctx.apiKey present (no key-mints-key)', async () => {
     const { default: create } = await import('../../resolvers/create-api-key');
-    const ctx = { db: makeStubDb(), auth: { tenantId: 't1', userId: 'u1' }, apiKey: { id: 'k1', scopes: [] } } as any;
+    const ctx = authedCtx({ tenantId: 't1', userId: 'u1', db: makeStubDb(), apiKey: { id: 'k1', scopes: [] } });
     await expect(create(null, { input: { name: 'x', scopes: ['sessions:read'] } }, ctx)).rejects.toThrow(/cannot manage/);
   });
 
   it('creates, stores only hash, returns secret once', async () => {
     const db = makeStubDb();
     const { default: create } = await import('../../resolvers/create-api-key');
-    const ctx = { db, auth: { tenantId: 't1', userId: 'u1' } } as any;
+    const ctx = authedCtx({ tenantId: 't1', userId: 'u1', db });
     const res = await create(null, { input: { name: ' CI bot ', scopes: ['sessions:read', 'terminal:write'] } }, ctx);
     expect(res.secret).toMatch(/^jk_/);
     expect(res.apiKey.keyPrefix).toMatch(/^jk_/);
@@ -43,7 +44,7 @@ describe('createApiKey (JWT-only + hash-only + scopes)', () => {
 
   it('rejects invalid name or scopes', async () => {
     const { default: create } = await import('../../resolvers/create-api-key');
-    const ctx = { db: makeStubDb(), auth: { tenantId: 't1', userId: 'u1' } } as any;
+    const ctx = authedCtx({ tenantId: 't1', userId: 'u1', db: makeStubDb() });
     await expect(create(null, { input: { name: '', scopes: ['sessions:read'] } }, ctx)).rejects.toThrow(/name/);
     await expect(create(null, { input: { name: 'n', scopes: [] } }, ctx)).rejects.toThrow(/scope/);
     await expect(create(null, { input: { name: 'n', scopes: ['nope:foo'] } }, ctx)).rejects.toThrow(/invalid scope/);
@@ -51,7 +52,7 @@ describe('createApiKey (JWT-only + hash-only + scopes)', () => {
 
   it('rejects bad/missing expiresAt at create; normalizes valid future date', async () => {
     const { default: create } = await import('../../resolvers/create-api-key');
-    const ctx = { db: makeStubDb(), auth: { tenantId: 't1', userId: 'u1' } } as any;
+    const ctx = authedCtx({ tenantId: 't1', userId: 'u1', db: makeStubDb() });
     await expect(create(null, { input: { name: 'n', scopes: ['sessions:read'], expiresAt: 'not-a-date' } }, ctx)).rejects.toThrow(/valid ISO/);
     await expect(create(null, { input: { name: 'n', scopes: ['sessions:read'], expiresAt: new Date(Date.now() - 1000).toISOString() } }, ctx)).rejects.toThrow(/future/);
 

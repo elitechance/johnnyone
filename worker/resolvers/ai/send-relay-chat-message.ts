@@ -1,4 +1,4 @@
-import { applyAltTokenToContext } from '../../lib/auth/api-key';
+import { requireIdentity } from '../../lib/auth/require-identity';
 
 interface ResolverContext {
   db: D1Database;
@@ -31,9 +31,7 @@ export default async function sendRelayChatMessage(
   args: { input: RelayChatMessageInput },
   ctx: ResolverContext,
 ) {
-  // Apply jk_ API-key identity so key-authenticated callers resolve their own
-  // online node (the platform JWT middleware only populates ctx.auth for JWTs).
-  await applyAltTokenToContext(ctx as unknown as Record<string, unknown>);
+  const id = await requireIdentity(ctx as any);
 
   const { sessionId, content, provider, model, workingDirectory } = args.input;
 
@@ -44,7 +42,7 @@ export default async function sendRelayChatMessage(
        WHERE tenant_id = ? AND user_id = ? AND status = 'online' AND is_deleted = 0
        ORDER BY last_heartbeat_at DESC LIMIT 1`,
     )
-    .bind(ctx.auth.tenantId, ctx.auth.userId)
+    .bind(id.tenantId, id.userId)
     .first<{ id: string }>();
 
   if (!node) {
@@ -60,8 +58,8 @@ export default async function sendRelayChatMessage(
     relayId,
     sessionId,
     content,
-    userId: ctx.auth.userId,
-    tenantId: ctx.auth.tenantId,
+    userId: id.userId,
+    tenantId: id.tenantId,
   };
 
   if (provider?.trim()) relayData.provider = provider.trim();

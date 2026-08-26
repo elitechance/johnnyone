@@ -1,0 +1,6 @@
+id: 02-sub
+files: [src/sub.rs]
+verify: "cargo test sub_works -- --exact"
+must_contain: ["pub fn sub(a: i32, b: i32) -> i32"]
+depends_on: []
+ctx: 32768

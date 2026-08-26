@@ -169,6 +169,24 @@ pub fn initiative_attachments_path(initiatives_dir: &Path, initiative_id: &str) 
     initiatives_dir.join(initiative_id).join("attachments")
 }
 
+/// Absolute run-state directory for one development phase:
+/// `<dir>/<initiative_id>/runs/<plan_id>/<phase_id>`.
+/// Pure — no filesystem or DB access. Lives *next to* the plan store, never
+/// inside it. Phase-keyed so a later phase cannot clobber this phase's
+/// `tasks.json`. Not a snapshot helper (Amendment 1 / D7).
+pub fn initiative_runs_path(
+    initiatives_dir: &Path,
+    initiative_id: &str,
+    plan_id: &str,
+    phase_id: &str,
+) -> PathBuf {
+    initiatives_dir
+        .join(initiative_id)
+        .join("runs")
+        .join(plan_id)
+        .join(phase_id)
+}
+
 /// Resolve the configured global initiatives store dir (absolute).
 /// Falls back to `DEFAULT_INITIATIVES_DIR` when the setting is unset/empty.
 pub fn resolve_initiatives_dir(state: &AppState) -> PathBuf {
@@ -363,6 +381,26 @@ mod tests {
         assert_eq!(
             initiative_attachments_path(Path::new("/store"), "abc"),
             PathBuf::from("/store/abc/attachments")
+        );
+    }
+
+    #[test]
+    fn initiative_runs_path_is_phase_keyed() {
+        let path = initiative_runs_path(
+            Path::new("/store"),
+            "init-1",
+            "plan-1",
+            "00-atomic-plan-store",
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/store/init-1/runs/plan-1/00-atomic-plan-store")
+        );
+        let rendered = path.to_string_lossy();
+        assert!(
+            !rendered.contains("snapshots"),
+            "runs path must not include a snapshots segment: {}",
+            rendered
         );
     }
 
