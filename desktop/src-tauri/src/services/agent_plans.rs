@@ -2771,6 +2771,28 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
     // plan: later prompt-only phase).
     let session_id = ensure_dev_worker_session(state, run).await?;
     wait_for_worker_ready(state, &session_id, &run.plan.id, Some(&phase.phase_id)).await?;
+    // Phase-ready gates (main's SDLC false-pass defenses): verify the phase's own claims before
+    // spending a three-lens review round. Each bounces the worker and re-polls on the next tick.
+    if let Some(reason) = failing_test_command(&run.plan).await {
+        tracing::warn!(plan_id = %run.plan.id, phase = %phase.phase_id, "declared tests failed on a ready report");
+        bounce_ready_or_escalate(state, run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_tests_failed", &reason).await?;
+        return Ok(());
+    }
+    if let Some(reason) = spec_weakened_reason(&run.plan.plan_path) {
+        tracing::warn!(plan_id = %run.plan.id, phase = %phase.phase_id, "ready reported with the plan store spec edited");
+        bounce_ready_or_escalate(state, run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_spec_weakened", &reason).await?;
+        return Ok(());
+    }
+    if let Some(reason) = evidence_provenance_reason(&run.plan.plan_path, &phase.phase_id) {
+        tracing::warn!(plan_id = %run.plan.id, phase = %phase.phase_id, "ready reported with unsupported visual evidence");
+        bounce_ready_or_escalate(state, run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_evidence", &reason).await?;
+        return Ok(());
+    }
+    if let Some(reason) = unfinished_tasks_reason(&run.plan, &phase.phase_id) {
+        tracing::warn!(plan_id = %run.plan.id, phase = %phase.phase_id, "ready reported with unfinished task statuses");
+        bounce_ready_or_escalate(state, run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_tasks_open", &reason).await?;
+        return Ok(());
+    }
     enter_phase_review(state, &run.plan.id, &phase).await
 }
 
@@ -3487,6 +3509,20 @@ async fn coordinator_loop(state: AppState, plan_id: String) -> Result<(), String
                     // restart mid-check fan out lenses on an unchecked plan.
                     append_event(&state, &plan_id, None, "planning_planner_ready", json!({}))?;
                     let refreshed = get_plan(&state, &plan_id)?;
+                    // Planning-ready gates (main): a `ready` with no plan in the store, or with
+                    // acceptance criteria nobody can run, is bounced to the planner before any
+                    // plan-check / lens review. Runs ahead of gate_planning_lenses so the branch's
+                    // local-small plan-check still owns everything downstream.
+                    if let Some(reason) = planning_deliverable_missing(&refreshed.plan.plan_path) {
+                        tracing::warn!(plan_id = %plan_id, "planner reported ready with no plan in the store");
+                        bounce_ready_or_escalate(&state, &refreshed, &session_id, None, "planning_ready_rejected", &reason).await?;
+                        continue;
+                    }
+                    if let Some(reason) = acceptance_not_executable(&refreshed.plan.plan_path) {
+                        tracing::warn!(plan_id = %plan_id, "planner reported ready with acceptance criteria nobody can run");
+                        bounce_ready_or_escalate(&state, &refreshed, &session_id, None, "planning_ready_rejected_acceptance", &reason).await?;
+                        continue;
+                    }
                     gate_planning_lenses(&state, &refreshed, &PlanningCheckCtrl::live()).await?;
                 }
                 "planning_review_running" => {
