@@ -309,7 +309,29 @@ impl MutationRoot {
         &self,
         input: PlannerPromptSettingsInput,
     ) -> async_graphql::Result<GqlPlannerPromptSettings> {
-        Ok(planner_prompt_service::save_prompt_settings(input.into())?.into())
+        let current = planner_prompt_service::load_prompt_settings()?;
+        let small_mode = input.small_mode.map(|sm| planner_prompt_service::SmallModePrompts {
+            planner: sm.planner,
+            reviewer: sm.reviewer,
+            leaf_wrapper: sm.leaf_wrapper,
+            amend_planner: sm.amend_planner,
+        });
+        let merged = planner_prompt_service::overlay_prompt_settings(
+            current,
+            planner_prompt_service::PlannerDevelopmentOverlay {
+                worker: input.development.worker,
+                reviewer: input.development.reviewer,
+                worker_nudge: input.development.worker_nudge,
+            },
+            planner_prompt_service::PlannerPlanningOverlay {
+                planner: input.planning.planner,
+                reviewer: input.planning.reviewer,
+                amend_planner: input.planning.amend_planner,
+                amend_reviewer: input.planning.amend_reviewer,
+            },
+            small_mode,
+        );
+        Ok(planner_prompt_service::save_prompt_settings(merged)?.into())
     }
 
     async fn connect_relay(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
@@ -512,6 +534,16 @@ struct GqlPlannerPromptSettings {
     schema: String,
     development: GqlPlannerDevelopmentPrompts,
     planning: GqlPlannerPlanningPrompts,
+    small_mode: Option<GqlPlannerSmallModePrompts>,
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "PlannerSmallModePrompts", rename_fields = "camelCase")]
+struct GqlPlannerSmallModePrompts {
+    planner: String,
+    reviewer: String,
+    leaf_wrapper: String,
+    amend_planner: String,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -519,6 +551,7 @@ struct GqlPlannerPromptSettings {
 struct GqlPlannerDevelopmentPrompts {
     worker: String,
     reviewer: String,
+    worker_nudge: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]
@@ -526,6 +559,8 @@ struct GqlPlannerDevelopmentPrompts {
 struct GqlPlannerPlanningPrompts {
     planner: String,
     reviewer: String,
+    amend_planner: Option<String>,
+    amend_reviewer: Option<String>,
 }
 
 impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
@@ -535,11 +570,20 @@ impl From<PlannerPromptSettings> for GqlPlannerPromptSettings {
             development: GqlPlannerDevelopmentPrompts {
                 worker: value.development.worker,
                 reviewer: value.development.reviewer,
+                worker_nudge: value.development.worker_nudge,
             },
             planning: GqlPlannerPlanningPrompts {
                 planner: value.planning.planner,
                 reviewer: value.planning.reviewer,
+                amend_planner: Some(value.planning.amend_planner),
+                amend_reviewer: Some(value.planning.amend_reviewer),
             },
+            small_mode: Some(GqlPlannerSmallModePrompts {
+                planner: value.small_mode.planner,
+                reviewer: value.small_mode.reviewer,
+                leaf_wrapper: value.small_mode.leaf_wrapper,
+                amend_planner: value.small_mode.amend_planner,
+            }),
         }
     }
 }
@@ -662,6 +706,16 @@ impl From<UpsertProviderConfigInputGql> for UpsertProviderConfigInput {
 struct PlannerPromptSettingsInput {
     development: PlannerDevelopmentPromptsInput,
     planning: PlannerPlanningPromptsInput,
+    small_mode: Option<PlannerSmallModePromptsInput>,
+}
+
+#[derive(InputObject)]
+#[graphql(name = "PlannerSmallModePromptsInput", rename_fields = "camelCase")]
+struct PlannerSmallModePromptsInput {
+    planner: String,
+    reviewer: String,
+    leaf_wrapper: String,
+    amend_planner: String,
 }
 
 #[derive(InputObject)]
@@ -669,6 +723,7 @@ struct PlannerPromptSettingsInput {
 struct PlannerDevelopmentPromptsInput {
     worker: String,
     reviewer: String,
+    worker_nudge: Option<String>,
 }
 
 #[derive(InputObject)]
@@ -676,20 +731,8 @@ struct PlannerDevelopmentPromptsInput {
 struct PlannerPlanningPromptsInput {
     planner: String,
     reviewer: String,
+    amend_planner: Option<String>,
+    amend_reviewer: Option<String>,
 }
 
-impl From<PlannerPromptSettingsInput> for PlannerPromptSettings {
-    fn from(value: PlannerPromptSettingsInput) -> Self {
-        // Build a default so we have the up-to-date amend templates; then
-        // overlay the input's worker/reviewer/planner/reviewer onto it. This
-        // lets older clients that don't know about amend_planner/amend_reviewer
-        // still update prompts without losing the defaults.
-        let mut prompts = PlannerPromptSettings::default();
-        prompts.schema = String::new();
-        prompts.development.worker = value.development.worker;
-        prompts.development.reviewer = value.development.reviewer;
-        prompts.planning.planner = value.planning.planner;
-        prompts.planning.reviewer = value.planning.reviewer;
-        prompts
-    }
-}
+

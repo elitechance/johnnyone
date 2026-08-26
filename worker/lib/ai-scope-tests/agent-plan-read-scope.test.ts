@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 describe('AgentPlan READ scope (tenant isolation)', () => {
   beforeEach(() => {
@@ -23,10 +20,10 @@ describe('AgentPlan READ scope (tenant isolation)', () => {
     await get(null, { id: 'p1' }, mockCtx as any);
     expect(spy).toHaveBeenCalledWith(mockCtx, 'get_agent_plan', { id: 'p1' });
 
-    const b = { ...mockCtx, auth: { tenantId: 'tB', userId: 'uB' } };
+    const b = authedCtx({ tenantId: 'tB', userId: 'uB' });
     const spyB = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce([] as any);
     const { default: listB } = await import('../../resolvers/ai/list-agent-plans');
     await listB(null, {}, b as any);
-    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: b.auth }), 'list_agent_plans', expect.anything());
+    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 'tB', userId: 'uB' }) }), 'list_agent_plans', expect.anything());
   });
 });

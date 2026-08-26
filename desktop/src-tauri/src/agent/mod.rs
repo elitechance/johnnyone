@@ -58,19 +58,64 @@ impl AgentService {
             "Registering desktop node"
         );
 
-        // Resolve the credential the same way the WS loop does, so registration and the socket
-        // always present the same identity.
-        let registration_token = settings_service::RelayConfig::resolve(&*state)
-            .map(|c| c.access_token)
-            .unwrap_or_else(|| config.access_token.clone());
-        let registered = registration::register_node(
-            &config.worker_url,
-            &config.user_id,
-            &config.tenant_id,
-            &hostname,
-            &registration_token,
-        )
-        .await?;
+        // Re-resolve the credential on every start (D10). Do not rely only on
+        // the spawn-time AgentConfig clone in relay.rs.
+        let resolved = settings_service::RelayConfig::resolve(&*state);
+        let worker_url = resolved
+            .as_ref()
+            .map(|c| c.worker_url.clone())
+            .unwrap_or_else(|| config.worker_url.clone());
+        let user_id = resolved
+            .as_ref()
+            .map(|c| c.user_id.clone())
+            .unwrap_or_else(|| config.user_id.clone());
+        let tenant_id = resolved
+            .as_ref()
+            .map(|c| c.tenant_id.clone())
+            .unwrap_or_else(|| config.tenant_id.clone());
+        let token = registration::access_token_for_attempt(
+            resolved.as_ref().map(|c| c.access_token.as_str()),
+            &config.access_token,
+        );
+
+        let registered = {
+            let state_for_io = Arc::clone(&state);
+            let fallback_token = config.access_token.clone();
+            registration::register_with_optional_refresh(
+                &token,
+                |tok| {
+                    let wu = worker_url.clone();
+                    let uid = user_id.clone();
+                    let tid = tenant_id.clone();
+                    let hn = hostname.clone();
+                    let tok = tok.to_string();
+                    async move {
+                        registration::register_node(&wu, &uid, &tid, &hn, &tok).await
+                    }
+                },
+                {
+                    let st = Arc::clone(&state_for_io);
+                    move || {
+                        let st = Arc::clone(&st);
+                        async move { crate::services::relay::refresh_access_token(&st).await }
+                    }
+                },
+                {
+                    let st = Arc::clone(&state_for_io);
+                    move || {
+                        let st = Arc::clone(&st);
+                        let fallback = fallback_token.clone();
+                        async move {
+                            settings_service::RelayConfig::resolve(&st)
+                                .map(|c| c.access_token)
+                                .filter(|t| !t.trim().is_empty())
+                                .unwrap_or(fallback)
+                        }
+                    }
+                },
+            )
+            .await?
+        };
 
         let node_id = registered.id;
         tracing::info!(
@@ -703,7 +748,7 @@ impl AgentService {
             message: String,
         }
 
-        let worker_config = state
+        let snapshot = state
             .worker_relay_config
             .lock()
             .await
@@ -729,15 +774,37 @@ impl AgentService {
             .map_err(|e| format!("Failed to create attachment directory: {}", e))?;
 
         let client = reqwest::Client::new();
-        let graphql_url = format!("{}/graphql", worker_config.worker_url.trim_end_matches('/'));
         let mut saved_paths = Vec::new();
 
         for attachment in &command.attachments {
-            let response = client
-                .post(&graphql_url)
-                .header("Content-Type", "application/json")
-                .header("x-tenant-id", &worker_config.tenant_id)
-                .header("x-user-id", &worker_config.user_id)
+            // Resolve at call time — same credential the WS loop uses.
+            // Do not send the spawn-time WorkerRelayConfig snapshot token.
+            let resolved = settings_service::RelayConfig::resolve(state);
+            let tenant_id = resolved
+                .as_ref()
+                .map(|c| c.tenant_id.as_str())
+                .unwrap_or(snapshot.tenant_id.as_str());
+            let user_id = resolved
+                .as_ref()
+                .map(|c| c.user_id.as_str())
+                .unwrap_or(snapshot.user_id.as_str());
+            let worker_url = resolved
+                .as_ref()
+                .map(|c| c.worker_url.as_str())
+                .unwrap_or(snapshot.worker_url.as_str());
+            let graphql_url = format!("{}/graphql", worker_url.trim_end_matches('/'));
+            let auth_headers = registration::attachment_graphql_headers(
+                tenant_id,
+                user_id,
+                resolved.as_ref().map(|c| c.access_token.as_str()),
+                snapshot.access_token.as_str(),
+            );
+            let response = registration::apply_headers(
+                client
+                    .post(&graphql_url)
+                    .header("Content-Type", "application/json"),
+                &auth_headers,
+            )
                 .json(&serde_json::json!({
                     "query": "query GetChatAttachment($id: ID!) { getChatAttachment(id: $id) { id originalName contentType size dataBase64 } }",
                     "variables": { "id": attachment.id }
@@ -791,11 +858,12 @@ impl AgentService {
             let display_path = Self::display_workspace_path(&workspace_path, &local_path);
             saved_paths.push(display_path.clone());
 
-            let _ = client
-                .post(&graphql_url)
-                .header("Content-Type", "application/json")
-                .header("x-tenant-id", &worker_config.tenant_id)
-                .header("x-user-id", &worker_config.user_id)
+            let _ = registration::apply_headers(
+                client
+                    .post(&graphql_url)
+                    .header("Content-Type", "application/json"),
+                &auth_headers,
+            )
                 .json(&serde_json::json!({
                     "query": "mutation DeleteChatAttachment($input: MarkChatAttachmentDeliveredInput!) { deleteChatAttachment(input: $input) { id status localPath } }",
                     "variables": { "input": { "id": content.id, "localPath": display_path } }
@@ -920,6 +988,10 @@ impl AgentService {
                 Self::rpc_add_initiative_reference_path(&req.params, state)
             }
             "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
+            "get_plan_check" => Self::rpc_get_plan_check(&req.params, state),
+            "get_task_run" => Self::rpc_get_task_run(&req.params, state),
+            "get_kloo_doctor" => Self::rpc_get_kloo_doctor().await,
+            "get_kloo_probe" => Self::rpc_get_kloo_probe().await,
             "update_planner_prompt_settings" => {
                 Self::rpc_update_planner_prompt_settings(&req.params)
             }
@@ -1219,9 +1291,8 @@ impl AgentService {
             .get("initiativeId")
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'initiativeId' parameter".to_string())?;
-        // Cap generously — an Initiative's two runs rarely exceed a few hundred events; the console
-        // renders the full SDLC timeline oldest-first.
-        let events = crate::services::agent_plans::list_initiative_events(state, initiative_id, 500)?;
+        // Latest 2000 (DESC then reverse to oldest-first) so new events stay visible after 500.
+        let events = crate::services::agent_plans::list_initiative_events(state, initiative_id, 2000)?;
         serde_json::to_value(events).map_err(|e| e.to_string())
     }
 
@@ -1849,6 +1920,54 @@ impl AgentService {
         serde_json::to_value(settings).map_err(|e| e.to_string())
     }
 
+    fn rpc_get_plan_check(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let plan_id = params
+            .get("planId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'planId' parameter".to_string())?;
+        let phase_id = params.get("phaseId").and_then(|v| v.as_str());
+        match crate::services::agent_plans::get_plan_check_json(state, plan_id, phase_id)? {
+            Some(raw) => Ok(serde_json::Value::String(raw)),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
+    fn rpc_get_task_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let plan_id = params
+            .get("planId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'planId' parameter".to_string())?;
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'phaseId' parameter".to_string())?;
+        let task_id = params.get("taskId").and_then(|v| v.as_str());
+        match crate::services::agent_plans::get_task_run_json(state, plan_id, phase_id, task_id)? {
+            Some(raw) => Ok(serde_json::Value::String(raw)),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
+    async fn rpc_get_kloo_doctor() -> Result<serde_json::Value, String> {
+        tokio::task::spawn_blocking(crate::services::agent_plans::get_kloo_doctor_json)
+            .await
+            .map(serde_json::Value::String)
+            .map_err(|e| format!("kloo doctor join: {e}"))
+    }
+
+    async fn rpc_get_kloo_probe() -> Result<serde_json::Value, String> {
+        tokio::task::spawn_blocking(crate::services::agent_plans::get_kloo_probe_json)
+            .await
+            .map(serde_json::Value::String)
+            .map_err(|e| format!("kloo probe join: {e}"))
+    }
+
     fn rpc_update_planner_prompt_settings(
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
@@ -1856,9 +1975,33 @@ impl AgentService {
             .get("input")
             .cloned()
             .ok_or_else(|| "Missing 'input' parameter".to_string())?;
-        let settings: crate::services::planner_prompts::PlannerPromptSettings =
-            serde_json::from_value(input).map_err(|e| e.to_string())?;
-        let saved = crate::services::planner_prompts::save_prompt_settings(settings)?;
+        let current = crate::services::planner_prompts::load_prompt_settings()?;
+        let development: crate::services::planner_prompts::PlannerDevelopmentOverlay =
+            serde_json::from_value(
+                input
+                    .get("development")
+                    .cloned()
+                    .ok_or_else(|| "Missing development prompts".to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        let planning: crate::services::planner_prompts::PlannerPlanningOverlay =
+            serde_json::from_value(
+                input
+                    .get("planning")
+                    .cloned()
+                    .ok_or_else(|| "Missing planning prompts".to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        let small_mode = match input.get("smallMode") {
+            Some(v) if !v.is_null() => Some(
+                serde_json::from_value(v.clone()).map_err(|e| e.to_string())?,
+            ),
+            _ => None,
+        };
+        let merged = crate::services::planner_prompts::overlay_prompt_settings(
+            current, development, planning, small_mode,
+        );
+        let saved = crate::services::planner_prompts::save_prompt_settings(merged)?;
         serde_json::to_value(saved).map_err(|e| e.to_string())
     }
 
@@ -2109,6 +2252,9 @@ impl AgentService {
                 "Shell sessions don't support chat-mode messages — type into the terminal pane instead.".to_string(),
             );
         }
+        if matches!(provider, CliProvider::Kloo) {
+            return Err("kloo is a oneshot executor, not a chat provider".to_string());
+        }
 
         let config = match provider {
             CliProvider::ClaudeCode => claude_code::build_config(
@@ -2139,6 +2285,7 @@ impl AgentService {
                 ollama_cli::build_config(&req.content, &working_dir, &model, cli_path_ref)
             }
             CliProvider::Shell => unreachable!("shell provider already rejected"),
+            CliProvider::Kloo => unreachable!("kloo provider already rejected"),
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -2148,6 +2295,7 @@ impl AgentService {
             CliProvider::Cline => cline::parse_line,
             CliProvider::Ollama => ollama_cli::parse_line,
             CliProvider::Shell => unreachable!("shell provider already rejected"),
+            CliProvider::Kloo => unreachable!("kloo provider already rejected"),
         };
 
         let (_process, mut rx) =

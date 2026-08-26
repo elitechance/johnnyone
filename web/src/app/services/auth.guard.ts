@@ -6,7 +6,8 @@ export const authGuard: CanActivateFn = (_route, state): boolean | UrlTree => {
   const auth = inject(AuthService);
   const router = inject(Router);
 
-  if (auth.isAuthenticated()) {
+  // Recompute against *now* so an in-tab expiry cannot ride a boot-time snapshot.
+  if (auth.syncAuthState()) {
     return true;
   }
 

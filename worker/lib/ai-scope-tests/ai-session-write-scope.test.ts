@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 describe('AI session WRITE scope (tenant isolation)', () => {
   beforeEach(() => {
@@ -16,13 +13,13 @@ describe('AI session WRITE scope (tenant isolation)', () => {
     const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ id: 'new-s' } as any);
     const { default: create } = await import('../../resolvers/ai/create-ai-session');
     await create(null, { input: { provider: 'ollama', workingDirectory: '~' } }, mockCtx as any);
-    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ auth: mockCtx.auth }), 'create_session', expect.anything());
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 't1', userId: 'u1' }) }), 'create_session', expect.anything());
 
-    const b = { ...mockCtx, auth: { tenantId: 'tB', userId: 'uB' } };
+    const b = authedCtx({ tenantId: 'tB', userId: 'uB' });
     const spyB = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ id: 'b-s' } as any);
     const { default: createB } = await import('../../resolvers/ai/create-ai-session');
     await createB(null, { input: { provider: 'ollama' } }, b as any);
-    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: b.auth }), 'create_session', expect.anything());
+    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 'tB', userId: 'uB' }) }), 'create_session', expect.anything());
   });
 
   it('updateAiSessionTitle: ctx.auth + only id+value in args', async () => {
@@ -57,10 +54,10 @@ describe('AI session WRITE scope (tenant isolation)', () => {
     await del(null, { id: 's1' }, mockCtx as any);
     expect(spy).toHaveBeenCalledWith(mockCtx, 'delete_session', { id: 's1' });
 
-    const b = { ...mockCtx, auth: { tenantId: 'tB', userId: 'uB' } };
+    const b = authedCtx({ tenantId: 'tB', userId: 'uB' });
     const spyB = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce(false);
     const { default: delB } = await import('../../resolvers/ai/delete-ai-session');
     await delB(null, { id: 's1' }, b as any);
-    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: b.auth }), 'delete_session', { id: 's1' });
+    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 'tB', userId: 'uB' }) }), 'delete_session', { id: 's1' });
   });
 });

@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 describe('AI session READ scope (tenant isolation via node resolution)', () => {
   beforeEach(() => {
@@ -18,7 +15,7 @@ describe('AI session READ scope (tenant isolation via node resolution)', () => {
     await listAiSessions(null, { status: null }, mockCtx as any);
     expect(spy).toHaveBeenCalledWith(mockCtx, 'list_sessions', { status: null });
 
-    const otherCtx = { ...mockCtx, auth: { tenantId: 't2', userId: 'u2' } };
+    const otherCtx = authedCtx({ tenantId: 't2', userId: 'u2' });
     const spy2 = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce([] as any);
     const { default: list2 } = await import('../../resolvers/ai/list-ai-sessions');
     await list2(null, {}, otherCtx as any);
@@ -43,7 +40,7 @@ describe('AI session READ scope (tenant isolation via node resolution)', () => {
     expect(spy).toHaveBeenCalledWith(mockCtx, 'list_messages', { sessionId: 's1', limit: 10, offset: 0 });
 
     // different tenant should not resolve same node (in real: would hit different desktop)
-    const other = { ...mockCtx, auth: { tenantId: 'other', userId: 'u' } };
+    const other = authedCtx({ tenantId: 'other', userId: 'u' });
     const spyOther = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ error: 'no node' } as any);
     await listMsgs(null, { sessionId: 's1' }, other as any);
     expect(spyOther).toHaveBeenCalledWith(other, 'list_messages', expect.anything());
@@ -61,13 +58,13 @@ describe('AI session READ scope (tenant isolation via node resolution)', () => {
     const aSpy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ data: 'a-only' });
     const { default: getA } = await import('../../resolvers/ai/get-ai-session');
     await getA(null, { id: 's-owned-by-a' }, mockCtx as any);
-    expect(aSpy).toHaveBeenCalledWith(expect.objectContaining({ auth: { tenantId: 't1', userId: 'u1' } }), expect.anything(), expect.anything());
+    expect(aSpy).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 't1', userId: 'u1' }) }), expect.anything(), expect.anything());
 
-    const bCtx = { ...mockCtx, auth: { tenantId: 'tB', userId: 'uB' } };
+    const bCtx = authedCtx({ tenantId: 'tB', userId: 'uB' });
     const bSpy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ data: 'b-data' });
     const { default: getB } = await import('../../resolvers/ai/get-ai-session');
     await getB(null, { id: 's-owned-by-a' }, bCtx as any);
-    expect(bSpy).toHaveBeenCalledWith(expect.objectContaining({ auth: { tenantId: 'tB', userId: 'uB' } }), expect.anything(), expect.anything());
+    expect(bSpy).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 'tB', userId: 'uB' }) }), expect.anything(), expect.anything());
   });
 
   // Direct test of the real node lookup path used by Phase 03 partner ops (after refactor to shared resolveOnlineNode)
@@ -91,7 +88,7 @@ describe('AI session READ scope (tenant isolation via node resolution)', () => {
       get: () => ({ fetch: mockFetch })
     };
     const env = { CHAT_RELAY_DO: doNamespace as any };
-    const ctx = { db, env, auth: { tenantId: 't1', userId: 'u1' } };
+    const ctx = authedCtx({ tenantId: 't1', userId: 'u1', db, env });
 
     const { desktopRpc } = await import('../runtime/desktop-rpc');
     const res = await desktopRpc(ctx as any, 'list_sessions', {});
@@ -101,7 +98,7 @@ describe('AI session READ scope (tenant isolation via node resolution)', () => {
 
     // no node -> throws (required by prompt)
     const dbNone = makeStubD1(null);
-    const ctxNone = { db: dbNone, env: { CHAT_RELAY_DO: doNamespace as any }, auth: { tenantId: 't-no', userId: 'u-no' } };
+    const ctxNone = authedCtx({ tenantId: 't-no', userId: 'u-no', db: dbNone, env: { CHAT_RELAY_DO: doNamespace as any } });
     await expect( desktopRpc(ctxNone as any, 'list_sessions', {}) ).rejects.toThrow(/No online backend app found/);
   });
 });

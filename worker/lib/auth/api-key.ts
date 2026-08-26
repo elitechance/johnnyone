@@ -10,6 +10,7 @@
 
 import type { ApiScope } from './scopes';
 import { requireScope } from './scopes';
+import { requireIdentity } from './require-identity';
 
 const KEY_PREFIX = 'jk_';
 const MIN_SECRET_BYTES = 16; // >=128 bits
@@ -157,44 +158,11 @@ export async function validateApiKeyToken(
 }
 
 /**
- * Populate ctx.auth + ctx.apiKey from a jk_ Bearer token if present in ctx.request.
- * Safe no-op if already authenticated or not a jk_ token.
- * Used to extend the GraphQL auth path for alt tokens (resolvers see the populated ctx).
- */
-export async function applyAltTokenToContext(ctx: any): Promise<void> {
-  try {
-    const auth = ctx && ctx.auth;
-    if (auth && auth.userId) return; // already set by platform JWT
-    const req = ctx && ctx.request;
-    if (!req || !req.headers) return;
-    let token = '';
-    if (typeof req.headers.get === 'function') {
-      token = req.headers.get('Authorization') || '';
-    } else if (req.headers.Authorization) {
-      token = String(req.headers.Authorization);
-    }
-    token = token.replace(/^Bearer\s+/i, '').trim();
-    if (!isTokenLike(token)) return;
-    const db = ctx.db;
-    if (!db) return;
-    const v = await validateApiKeyToken(token, db);
-    if (v) {
-      ctx.auth = { userId: v.userId, tenantId: v.tenantId, isAuthenticated: true };
-      (ctx as any).apiKey = v.apiKey;
-      updateLastUsed(db, v.apiKey.id); // best-effort
-    }
-  } catch {
-    // never throw from auth fallback
-  }
-}
-
-/**
  * Central helper for alt-token (jk_) auth + optional scope enforcement.
- * Call at start of resolvers that support API key access.
- * For key-management resolvers, use apply + manual reject instead.
+ * Identity only through requireIdentity; then optional requireScope.
  */
 export async function authorizeForAltToken(ctx: any, scope?: ApiScope): Promise<void> {
-  await applyAltTokenToContext(ctx);
+  await requireIdentity(ctx);
   if (scope) {
     requireScope(ctx as any, scope);
   }

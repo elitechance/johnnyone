@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
 function makeStubD1(returnRow: { id: string } | null) {
   const bind = vi.fn().mockReturnThis();
@@ -50,7 +51,7 @@ function makeCtx(nodeId: string, auth: any) {
       get: () => ({ fetch })
     } as any
   };
-  return { db, env, auth };
+  return authedCtx({ tenantId: auth.tenantId, userId: auth.userId, db, env });
 }
 
 async function callOp(opPath: string, args: any, ctx: any) {

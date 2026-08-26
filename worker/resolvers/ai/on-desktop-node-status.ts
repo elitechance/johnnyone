@@ -1,3 +1,5 @@
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   auth: { userId: string; tenantId: string };
   pubsub: {
@@ -6,7 +8,9 @@ interface ResolverContext {
 }
 
 export default {
-  subscribe: (_parent: unknown, _args: Record<string, never>, ctx: ResolverContext) =>
-    ctx.pubsub.subscribe(`desktop-node-status:${ctx.auth.tenantId}`),
+  subscribe: async (_parent: unknown, _args: Record<string, never>, ctx: ResolverContext) => {
+    const id = await requireIdentity(ctx as any);
+    return ctx.pubsub.subscribe(`desktop-node-status:${id.tenantId}`);
+  },
   resolve: (payload: unknown) => payload,
 };

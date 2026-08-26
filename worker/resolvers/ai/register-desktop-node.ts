@@ -1,3 +1,5 @@
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -37,6 +39,7 @@ export default async function registerDesktopNode(
   args: { input: RegisterDesktopNodeInput },
   ctx: ResolverContext,
 ) {
+  const id = await requireIdentity(ctx as any);
   const { hostname, os, arch, version, capabilities } = args.input;
 
   // Check if node with same hostname already exists for this user
@@ -44,7 +47,7 @@ export default async function registerDesktopNode(
     .prepare(
       `SELECT id FROM desktop_nodes WHERE tenant_id = ? AND user_id = ? AND hostname = ? AND is_deleted = 0`,
     )
-    .bind(ctx.auth.tenantId, ctx.auth.userId, hostname)
+    .bind(id.tenantId, id.userId, hostname)
     .first<{ id: string }>();
 
   let nodeId: string;
@@ -64,7 +67,7 @@ export default async function registerDesktopNode(
         version ?? null,
         capabilities ?? '[]',
         nodeId,
-        ctx.auth.tenantId,
+        id.tenantId,
       )
       .run();
   } else {
@@ -77,8 +80,8 @@ export default async function registerDesktopNode(
       )
       .bind(
         nodeId,
-        ctx.auth.tenantId,
-        ctx.auth.userId,
+        id.tenantId,
+        id.userId,
         hostname,
         os ?? null,
         arch ?? null,

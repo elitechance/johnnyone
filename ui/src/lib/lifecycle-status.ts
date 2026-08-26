@@ -68,3 +68,70 @@ export function healthMeta(health: string | null | undefined): StatusMeta {
 export function stageIndex(status: string | null | undefined): number {
   return (LIFECYCLE_STAGES as readonly string[]).indexOf(key(status));
 }
+
+export interface StageFillArgs {
+  active: number;
+  idx: number;
+  planningRound?: number | null;
+  planningRoundMax?: number | null;
+  devDone?: number | null;
+  devTotal?: number | null;
+}
+
+function pct(numer: number, denom: number): string {
+  if (!Number.isFinite(numer) || !Number.isFinite(denom) || denom <= 0) return '60%';
+  return `${Math.max(0, Math.min(100, Math.round((numer / denom) * 100)))}%`;
+}
+
+export function stageFill(args: StageFillArgs): string {
+  const { active, idx } = args;
+  if (active < 0 || idx > active) return '0%';
+  if (idx < active) return '100%';
+  if (idx === 0 && args.planningRound && args.planningRoundMax) {
+    return pct(args.planningRound, args.planningRoundMax);
+  }
+  if (idx === 1 && args.devTotal && args.devTotal > 0) {
+    return pct(args.devDone ?? 0, args.devTotal);
+  }
+  return '60%';
+}
+
+export function phaseNnOf(phaseId: string | null | undefined): string {
+  const id = (phaseId ?? '').trim();
+  return id.split('-')[0] || '';
+}
+
+export interface StageDescriptionArgs {
+  stage: string;
+  planningRound?: number | null;
+  planningRoundMax?: number | null;
+  devDone?: number | null;
+  devTotal?: number | null;
+  replan?: boolean;
+  replanExhausted?: boolean;
+  replanParked?: boolean;
+  phaseNn?: string;
+}
+
+const STAGE_COPY: Record<string, string> = {
+  planning: 'Turn the brief into a task tree.',
+  development: 'T1 workers build against the plan.',
+  review: 'Configurable validation lenses run in parallel.',
+  done: 'Work complete.',
+};
+
+export function stageDescription(args: StageDescriptionArgs): string {
+  const nn = args.phaseNn ?? 'NN';
+  if (args.stage === 'planning' && args.planningRound && args.planningRoundMax) {
+    return `Review round ${args.planningRound} of ${args.planningRoundMax}`;
+  }
+  if (args.stage === 'development') {
+    if (args.replan) return `Phase ${nn} · re-planning`;
+    if (args.replanExhausted) return `Phase ${nn} · replan cap reached`;
+    if (args.replanParked) return `Phase ${nn} · replan parked`;
+    if (args.devTotal != null && args.devTotal > 0) {
+      return `Phase ${nn} · ${args.devDone ?? 0} of ${args.devTotal} tasks done`;
+    }
+  }
+  return STAGE_COPY[args.stage] ?? '';
+}

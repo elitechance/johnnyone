@@ -3,6 +3,7 @@ pub mod cli_runner;
 pub mod cline;
 pub mod codex;
 pub mod grok;
+pub mod kloo_cli;
 pub mod ollama_cli;
 pub mod output_parser;
 
@@ -23,6 +24,9 @@ pub enum CliProvider {
     /// `$SHELL` (or bash) in a tmux pane; the user types commands themselves.
     /// Doesn't participate in chat-mode message exchange — terminal-mode only.
     Shell,
+    /// `kloo --benchmark` oneshot executor (local-small / task.yml loop).
+    /// Not a chat provider — spawn via `kloo_cli::build_config` + `cli_runner`.
+    Kloo,
 }
 
 impl CliProvider {
@@ -34,6 +38,7 @@ impl CliProvider {
             Self::Ollama => "ollama",
             Self::Grok => "grok",
             Self::Shell => "shell",
+            Self::Kloo => "kloo",
         }
     }
 
@@ -45,6 +50,7 @@ impl CliProvider {
             "ollama" => Some(Self::Ollama),
             "grok" => Some(Self::Grok),
             "shell" | "bash" | "sh" => Some(Self::Shell),
+            "kloo" => Some(Self::Kloo),
             _ => None,
         }
     }
@@ -59,6 +65,7 @@ impl CliProvider {
             // Honor the user's $SHELL at runtime; this static default is the
             // fallback if $SHELL isn't set. Resolved in terminal.rs::provider_command.
             Self::Shell => "bash",
+            Self::Kloo => "kloo",
         }
     }
 }
@@ -133,5 +140,12 @@ mod tests {
         assert_eq!(CliProvider::from_str("sh"), Some(CliProvider::Shell));
         assert_eq!(CliProvider::Shell.as_str(), "shell");
         assert_eq!(CliProvider::Shell.default_command(), "bash");
+    }
+
+    #[test]
+    fn kloo_provider_resolves() {
+        assert_eq!(CliProvider::from_str("kloo"), Some(CliProvider::Kloo));
+        assert_eq!(CliProvider::Kloo.as_str(), "kloo");
+        assert_eq!(CliProvider::Kloo.default_command(), "kloo");
     }
 }

@@ -1628,6 +1628,130 @@ ion-modal.workspace-picker .picker-empty {
     border-color: color-mix(in srgb, var(--jo-accent) 30%, transparent);
   }
 }
+
+.console-list .chip.kloo,
+.console .chip.kloo {
+  background: color-mix(in srgb, var(--jo-st-development) 22%, transparent);
+  color: var(--jo-st-development);
+  border: 1px solid var(--jo-st-development);
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
+.checks-surface,
+.tasks-surface {
+  padding: 12px 14px;
+  overflow: auto;
+  background: var(--jo-bg, #0d1117);
+  color: var(--jo-fg, #e6edf3);
+}
+.check-stats,
+.task-counts {
+  font-size: 12px;
+  color: var(--jo-fg-muted, #8a92a0);
+  margin: 8px 0;
+}
+.rule-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 12px;
+}
+.rule-chip {
+  border: 1px solid var(--jo-border, #30363d);
+  background: var(--jo-bg-elevated, #161b22);
+  color: inherit;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rule-chip.on {
+  border-color: var(--jo-accent, #e8a33d);
+  color: var(--jo-accent, #e8a33d);
+}
+.check-table ion-item {
+  --background: var(--jo-bg-elevated, #161b22);
+  --border-color: var(--jo-border, #30363d);
+  font-size: 13px;
+}
+.more-placeholder,
+.failed-alert {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px dashed var(--jo-border, #30363d);
+  background: transparent;
+  color: var(--jo-fg-muted, #8a92a0);
+  cursor: pointer;
+  text-align: left;
+}
+.failed-alert {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--jo-bad, #ff6868) 50%, transparent);
+  color: var(--jo-bad, #ff6868);
+}
+.stack-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 8px 0 12px;
+  background: var(--jo-bg-elevated, #161b22);
+}
+.stack-bar .seg.done { background: var(--jo-st-done, #4bbd74); }
+.stack-bar .seg.running { background: var(--jo-st-development, #9a7ef0); }
+.stack-bar .seg.failed { background: var(--jo-bad, #ff6868); }
+.stack-bar .seg.blocked { background: var(--jo-warn, #ffb454); }
+.stack-bar .seg.pending { background: #30363d; }
+.task-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.task-table th,
+.task-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--jo-border, #30363d);
+  text-align: left;
+  vertical-align: top;
+}
+.task-table tr.sel td {
+  background: color-mix(in srgb, var(--jo-accent, #e8a33d) 12%, transparent);
+}
+.state-chip {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.state-chip[data-state='done'] { color: var(--jo-st-done, #4bbd74); }
+.state-chip[data-state='failed'] { color: var(--jo-bad, #ff6868); }
+.state-chip[data-state='blocked'] { color: var(--jo-warn, #ffb454); }
+.state-chip[data-state='running'] { color: var(--jo-st-development, #9a7ef0); }
+.blocked-by {
+  font-size: 11px;
+  color: var(--jo-fg-muted, #8a92a0);
+}
+.task-detail {
+  margin-top: 14px;
+}
+.task-detail h4 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+.five-checks .bad { color: var(--jo-bad, #ff6868); }
+.replan-banner {
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--jo-warn, #ffb454) 16%, transparent);
+  color: var(--jo-warn, #ffb454);
+}
+.tw { overflow-x: auto; }
 .console-right .lens-cfg .cfg {
   font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
   font-size: 11.5px;

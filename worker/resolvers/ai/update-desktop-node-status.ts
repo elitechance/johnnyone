@@ -1,3 +1,5 @@
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   auth: { userId: string; tenantId: string };
@@ -27,6 +29,7 @@ export default async function updateDesktopNodeStatus(
   args: { id: string; status: string },
   ctx: ResolverContext,
 ) {
+  const id = await requireIdentity(ctx as any);
   const validStatuses = ['online', 'offline', 'busy'];
   if (!validStatuses.includes(args.status)) {
     throw new Error(`Invalid status: ${args.status}. Must be one of: ${validStatuses.join(', ')}`);
@@ -36,7 +39,7 @@ export default async function updateDesktopNodeStatus(
     .prepare(
       `SELECT id FROM desktop_nodes WHERE id = ? AND tenant_id = ? AND is_deleted = 0`,
     )
-    .bind(args.id, ctx.auth.tenantId)
+    .bind(args.id, id.tenantId)
     .first();
 
   if (!existing) {
@@ -47,7 +50,7 @@ export default async function updateDesktopNodeStatus(
     .prepare(
       `UPDATE desktop_nodes SET status = ?, last_heartbeat_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND tenant_id = ?`,
     )
-    .bind(args.status, args.id, ctx.auth.tenantId)
+    .bind(args.status, args.id, id.tenantId)
     .run();
 
   const node = await ctx.db
@@ -59,7 +62,7 @@ export default async function updateDesktopNodeStatus(
     throw new Error('Failed to update desktop node status');
   }
 
-  ctx.pubsub?.publish(`desktop-node-status:${ctx.auth.tenantId}`, {
+  ctx.pubsub?.publish(`desktop-node-status:${id.tenantId}`, {
     id: node.id,
     tenantId: node.tenant_id,
     userId: node.user_id,

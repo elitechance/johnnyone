@@ -17,12 +17,26 @@ function normStatus(status: string | null | undefined): string {
  *  (`needs_attention`/`blocked`). Development statuses only; a healthy/running/idle run is not paused. */
 const PAUSED_STATUSES = new Set(['needs-attention', 'blocked']);
 
+/** In-flight development statuses. These win over a `needs-attention` *health* chip
+ *  (S9 maps `phase_replan_running` → that chip; the run is busy, not Resume). */
+const BUSY_STATUSES = new Set([
+  'phase-replan-running',
+  'phase-worker-running',
+  'phase-review-running',
+]);
+
+export function isBusyStatus(status: string | null | undefined): boolean {
+  return BUSY_STATUSES.has(normStatus(status));
+}
+
 /** True when the run is paused (needs_attention/blocked) — drives Resume vs Run, the banner, and the
- *  pre-selected paused phase. Checks `status` (source of truth) and `health` (defensive, deploy-skew). */
+ *  pre-selected paused phase. Busy status wins over health so a replan in flight is not Resume. */
 export function isPausedRun(run: AgentPlanRun | null | undefined): boolean {
   const plan = run?.plan;
   if (!plan) return false;
-  return PAUSED_STATUSES.has(normStatus(plan.status)) || PAUSED_STATUSES.has(normStatus(plan.health));
+  const status = normStatus(plan.status);
+  if (isBusyStatus(plan.status)) return false;
+  return PAUSED_STATUSES.has(status) || PAUSED_STATUSES.has(normStatus(plan.health));
 }
 
 /** Panel is shown ONLY for a DEVELOPMENT run that has ≥1 phase — hidden while planning/briefing or when

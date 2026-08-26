@@ -9,16 +9,19 @@ import type { StreamEvent } from '@johnnyone/ui';
 
 /** Per-session terminal pane tab. The Transcript surface was removed (the rendered-stream lane only
  *  covered structured chat-API sessions, not J1's tmux-driven agents); Raw terminal is the default. */
-export type PaneTab = 'raw' | 'plan' | 'diff';
+export type PaneTab = 'raw' | 'plan' | 'diff' | 'checks' | 'tasks';
 
 export const DEFAULT_PANE_TAB: PaneTab = 'raw';
+
+const KNOWN_TABS = new Set<PaneTab>(['raw', 'plan', 'diff', 'checks', 'tasks']);
 
 /** Cap per-session transcript growth in long sessions. */
 export const MAX_TRANSCRIPT_EVENTS = 2000;
 
 /** Active tab for a pane, defaulting to the Transcript view (D6). */
 export function paneTabOf(tabs: Record<string, PaneTab>, id: string): PaneTab {
-  return tabs[id] ?? DEFAULT_PANE_TAB;
+  const t = tabs[id];
+  return t && KNOWN_TABS.has(t) ? t : DEFAULT_PANE_TAB;
 }
 
 /** Live until the last event of the turn (`final`) — drives the tab's `.live` dot. */

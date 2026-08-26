@@ -1,6 +1,8 @@
 // link-channel.ts — Mutation: linkChannel
 // Phase 2: Link an external messaging channel to the user's account
 
+import { requireIdentity } from '../../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -22,6 +24,7 @@ export default async function linkChannel(
   args: { input: LinkChannelInput },
   ctx: ResolverContext,
 ) {
+  const ident = await requireIdentity(ctx as any);
   const { input } = args;
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -32,8 +35,8 @@ export default async function linkChannel(
   )
     .bind(
       id,
-      ctx.auth.tenantId,
-      ctx.auth.userId,
+      ident.tenantId,
+      ident.userId,
       input.channelType,
       input.channelIdentifier,
       input.channelConfig ?? '{}',
@@ -44,8 +47,8 @@ export default async function linkChannel(
 
   return {
     id,
-    tenantId: ctx.auth.tenantId,
-    userId: ctx.auth.userId,
+    tenantId: ident.tenantId,
+    userId: ident.userId,
     channelType: input.channelType,
     channelIdentifier: input.channelIdentifier,
     channelConfig: input.channelConfig ?? '{}',

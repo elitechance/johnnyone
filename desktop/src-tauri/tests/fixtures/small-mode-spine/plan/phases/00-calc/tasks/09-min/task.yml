@@ -1,0 +1,6 @@
+id: 09-min
+files: [src/min.rs]
+verify: "cargo test min_works -- --exact"
+must_contain: ["pub fn min(a: i32, b: i32) -> i32"]
+depends_on: []
+ctx: 32768

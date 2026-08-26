@@ -1,3 +1,5 @@
+import { requireIdentity } from '../lib/auth/require-identity';
+
 interface ResolverContext {
   db: D1Database;
   env: WorkerEnv;
@@ -23,13 +25,14 @@ export default async function getChatAttachment(
   args: { id: string },
   ctx: ResolverContext,
 ) {
+  const idn = await requireIdentity(ctx as any);
   const row = await ctx.db
     .prepare(
       `SELECT id, original_name, content_type, size, r2_key, status
        FROM chat_attachments
        WHERE id = ? AND tenant_id = ? AND user_id = ?`,
     )
-    .bind(args.id, ctx.auth.tenantId, ctx.auth.userId)
+    .bind(args.id, idn.tenantId, idn.userId)
     .first<ChatAttachmentRow>();
 
   if (!row) {

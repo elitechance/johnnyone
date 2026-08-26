@@ -7,7 +7,13 @@ const authMiddlewarePath = path.resolve(__dirname, '../../../../lokal/apps/lokal
 const modulesAuthRewrite = {
   name: 'rewrite-modules-auth-mw',
   transform(code: string, id: string) {
-    if (id.includes('chat-relay-do') || id.includes('upgrade.test')) {
+    if (
+      id.includes('chat-relay-do') ||
+      id.includes('upgrade.test') ||
+      id.includes('require-identity') ||
+      id.includes('resolver-fail-closed') ||
+      id.includes('relay-register-upgrade-heartbeat')
+    ) {
       // Keep the source on disk using the canonical 'modules/auth/auth-middleware' import
       // but rewrite at transform time to a resolvable absolute path so the vitest-pool-workers
       // / workerd context can load the builtin verifier (signJwt, verify*) without bare-specifier failure.

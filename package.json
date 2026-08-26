@@ -8,7 +8,9 @@
     "//desktop": "Build (no cache) AND launch the desktop backend against the live worker (johnnyone.ethan-353.workers.dev). Frees :7788 first, then runs in the BACKGROUND (nohup) and returns the prompt; logs go to /tmp/johnnyone-desktop.log. Stop it with: lsof -ti:7788 | xargs kill. Override identity with JOHNNYONE_USER_ID / JOHNNYONE_TENANT_ID env vars.",
     "desktop": "npm run build:desktop && { lsof -ti:7788 | xargs -r kill 2>/dev/null; DISPLAY=\"${DISPLAY:-:0}\" JOHNNYONE_WORKER_URL=https://johnnyone.ethan-353.workers.dev JOHNNYONE_TENANT_ID=\"${JOHNNYONE_TENANT_ID:-00000000-0000-0000-0000-000000000001}\" JOHNNYONE_USER_ID=\"${JOHNNYONE_USER_ID:-00000000-0000-0000-0000-000000000002}\" nohup ./desktop/src-tauri/target/release/johnnyone-desktop > /tmp/johnnyone-desktop.log 2>&1 & echo \"johnnyone-desktop launched in background -> log: /tmp/johnnyone-desktop.log (stop: lsof -ti:7788 | xargs kill)\"; }",
     "//deploy:web": "Deploy BOTH hosted Cloudflare surfaces (prod): the worker (johnnyone.ethan-353.workers.dev) and the web client (johnnyone.pages.dev). Builds web fresh (no nx cache) so no stale bundle is uploaded.",
-    "deploy:web": "nx build web --skip-nx-cache && lokal cf worker deploy --env prod && lokal cf pages deploy --env prod"
+    "deploy:web": "nx build web --skip-nx-cache && lokal cf worker deploy --env prod && lokal cf pages deploy --env prod",
+    "//deploy:worker": "Deploy only the Cloudflare worker (prod). Does not build or deploy Pages.",
+    "deploy:worker": "lokal cf worker deploy --env prod"
   },
   "dependencies": {
     "@angular/animations": "^19.0.0",

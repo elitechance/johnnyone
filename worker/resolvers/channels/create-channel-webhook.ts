@@ -1,4 +1,5 @@
 import { normalizeMessage, type NormalizedMessage } from '../../lib/channels/normalize';
+import { requireIdentity } from '../../lib/auth/require-identity';
 
 interface ResolverContext {
   db: D1Database;
@@ -42,6 +43,7 @@ export default async function createChannelWebhook(
   args: { channelType: string; payload: string },
   ctx: ResolverContext,
 ) {
+  await requireIdentity(ctx as any);
   const { channelType, payload } = args;
 
   // Normalize the incoming message based on channel type

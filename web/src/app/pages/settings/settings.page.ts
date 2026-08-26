@@ -2,6 +2,9 @@ import { Component, OnInit, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import {
+  IonAccordion,
+  IonAccordionGroup,
+  IonBadge,
   IonButton,
   IonCard,
   IonCardContent,
@@ -14,13 +17,32 @@ import {
   IonItem,
   IonLabel,
   IonList,
+  IonNote,
+  IonSpinner,
   IonText,
+  IonTextarea,
   IonTitle,
   IonToolbar,
 } from '@ionic/angular/standalone';
 import { firstValueFrom } from 'rxjs';
 import { GRAPHQL_API_URL, JohnnyApiService } from '@johnnyone/ui';
 import { AuthService } from '../../services/auth.service';
+import {
+  COMMERCIAL_ROWS,
+  SMALL_MODE_ROWS,
+  applyMutationResult,
+  applyResetFailure,
+  applySaveFailure,
+  differsFromDefault,
+  emptyDraft,
+  fromSettings,
+  isDirty,
+  resetKey,
+  toUpdateInput,
+  type LoadState,
+  type PromptDraft,
+  type PromptKey,
+} from './settings-prompts-logic';
 
 const DISCORD_WEBHOOK_SETTING = 'discord_webhook_url';
 
@@ -45,130 +67,25 @@ const DISCORD_WEBHOOK_SETTING = 'discord_webhook_url';
     IonInput,
     IonButton,
     IonText,
+    IonNote,
+    IonTextarea,
+    IonAccordion,
+    IonAccordionGroup,
+    IonBadge,
+    IonSpinner,
   ],
-  template: `
-    <ion-header>
-      <ion-toolbar>
-        <ion-title>Settings</ion-title>
-      </ion-toolbar>
-    </ion-header>
-    <ion-content class="ion-padding">
-      <ion-card>
-        <ion-card-header>
-          <ion-card-title>Connection</ion-card-title>
-          <ion-card-subtitle>Where this client talks to the worker</ion-card-subtitle>
-        </ion-card-header>
-        <ion-card-content>
-          <ion-list lines="none">
-            <ion-item>
-              <ion-label>
-                <h3>Worker GraphQL URL</h3>
-                <p>{{ apiUrl }}</p>
-              </ion-label>
-            </ion-item>
-            <ion-item>
-              <ion-label>
-                <h3>Tenant ID</h3>
-                <p>{{ tenantId() || '—' }}</p>
-              </ion-label>
-            </ion-item>
-          </ion-list>
-          <ion-text color="medium">
-            <p>
-              <em>
-                Worker URL is fixed at build time per Master plan §Decisions #3. Per-user host
-                registration UI ships in Phase 3 (installer control panel).
-              </em>
-            </p>
-          </ion-text>
-        </ion-card-content>
-      </ion-card>
-
-      <ion-card>
-        <ion-card-header>
-          <ion-card-title>Alerts</ion-card-title>
-          <ion-card-subtitle>Ping a Discord channel when a run needs your attention</ion-card-subtitle>
-        </ion-card-header>
-        <ion-card-content>
-          <ion-list lines="none">
-            <ion-item>
-              <ion-input
-                label="Discord webhook URL"
-                labelPlacement="stacked"
-                type="url"
-                autocomplete="off"
-                placeholder="https://discord.com/api/webhooks/…"
-                [(ngModel)]="discordWebhook"
-              ></ion-input>
-            </ion-item>
-          </ion-list>
-          <ion-button expand="block" (click)="saveDiscordWebhook()" [disabled]="savingDiscord()">
-            {{ savingDiscord() ? 'Saving…' : 'Save webhook' }}
-          </ion-button>
-          @if (discordSaved()) {
-            <ion-text color="success"><p>Saved.</p></ion-text>
-          }
-          <ion-text color="medium">
-            <p>
-              <em>
-                Fires only on attention (a run is blocked / needs a human decision) — never on
-                routine review changes. Leave blank to disable. Stored on the host.
-              </em>
-            </p>
-          </ion-text>
-        </ion-card-content>
-      </ion-card>
-
-      <ion-card>
-        <ion-card-header>
-          <ion-card-title>Workspace tools</ion-card-title>
-          <ion-card-subtitle>Surfaces the P8 nav rail does not list — folding into Work (P8 D13)</ion-card-subtitle>
-        </ion-card-header>
-        <ion-card-content>
-          <ion-button expand="block" fill="outline" routerLink="/developer">
-            Developer API console
-          </ion-button>
-          <ion-text color="medium">
-            <p>
-              <em>
-                Planning &amp; development are now stages of an Initiative in the Work console — run
-                them there. The legacy /planning &amp; /development pages were removed.
-              </em>
-            </p>
-          </ion-text>
-        </ion-card-content>
-      </ion-card>
-
-      <ion-card>
-        <ion-card-header>
-          <ion-card-title>Account</ion-card-title>
-        </ion-card-header>
-        <ion-card-content>
-          <ion-button expand="block" color="medium" (click)="logout()">Sign out</ion-button>
-        </ion-card-content>
-      </ion-card>
-
-      <ion-card>
-        <ion-card-header>
-          <ion-card-title>Provider configs</ion-card-title>
-          <ion-card-subtitle>Coming after Phase 2</ion-card-subtitle>
-        </ion-card-header>
-        <ion-card-content>
-          <p>
-            Provider CRUD (Claude Code, Codex, Cline, Ollama) routes through the host via
-            relay-RPC — full wiring lands once Phase 2 task 08 migrates
-            <code>listProviderConfigs</code>, <code>upsertProviderConfig</code>, and
-            <code>deleteProviderConfig</code> off the legacy forward path.
-          </p>
-        </ion-card-content>
-      </ion-card>
-    </ion-content>
-  `,
+  templateUrl: './settings.page.html',
+  styleUrl: './settings.page.scss',
 })
 export class SettingsPage implements OnInit {
   readonly apiUrl = inject(GRAPHQL_API_URL);
   private readonly auth = inject(AuthService);
   private readonly api = inject(JohnnyApiService);
+
+  readonly commercialRows = COMMERCIAL_ROWS;
+  readonly smallModeRows = SMALL_MODE_ROWS;
+  readonly differsFromDefault = differsFromDefault;
+  readonly isDirty = isDirty;
 
   tenantId = (() => {
     const id = this.auth.getTenantId();
@@ -179,6 +96,15 @@ export class SettingsPage implements OnInit {
   savingDiscord = signal(false);
   discordSaved = signal(false);
 
+  promptLoadState = signal<LoadState>('idle');
+  draft = signal<PromptDraft>(emptyDraft());
+  lastSaved = signal<PromptDraft>(emptyDraft());
+  smallModeSupported = signal(true);
+  unsupportedKeys = signal<PromptKey[]>([]);
+  savingPrompts = signal(false);
+  promptsSaved = signal(false);
+  saveError = signal('');
+
   ngOnInit(): void {
     firstValueFrom(this.api.getSetting(DISCORD_WEBHOOK_SETTING))
       .then((value) => {
@@ -187,6 +113,83 @@ export class SettingsPage implements OnInit {
       .catch(() => {
         /* setting not set yet / host unreachable — leave blank */
       });
+    void this.loadPrompts();
+  }
+
+  isUnsupported(key: PromptKey): boolean {
+    return this.unsupportedKeys().includes(key);
+  }
+
+  setPrompt(key: PromptKey, value: string): void {
+    this.draft.update((draft) => ({ ...draft, [key]: value }));
+    this.promptsSaved.set(false);
+    this.saveError.set('');
+  }
+
+  async loadPrompts(): Promise<void> {
+    this.promptLoadState.set('loading');
+    this.saveError.set('');
+    try {
+      const settings = await firstValueFrom(this.api.getPlannerPromptSettings());
+      const { draft, smallModeSupported, unsupportedKeys } = fromSettings(settings);
+      this.draft.set(draft);
+      this.lastSaved.set({ ...draft });
+      this.smallModeSupported.set(smallModeSupported);
+      this.unsupportedKeys.set(unsupportedKeys);
+      this.promptLoadState.set('ready');
+    } catch {
+      this.promptLoadState.set('load-error');
+    }
+  }
+
+  async savePrompts(): Promise<void> {
+    if (this.savingPrompts() || this.promptLoadState() !== 'ready') return;
+    this.savingPrompts.set(true);
+    this.promptsSaved.set(false);
+    this.saveError.set('');
+    try {
+      const returned = await firstValueFrom(
+        this.api.updatePlannerPromptSettings(
+          toUpdateInput(this.draft(), this.smallModeSupported()),
+        ),
+      );
+      const next = applyMutationResult(returned);
+      this.lastSaved.set(next);
+      this.draft.set(next);
+      this.promptsSaved.set(true);
+    } catch {
+      const failed = applySaveFailure(this.draft(), this.lastSaved());
+      this.draft.set(failed.draft);
+      this.lastSaved.set(failed.lastSaved);
+      this.saveError.set('Could not save planner prompts.');
+    } finally {
+      this.savingPrompts.set(false);
+    }
+  }
+
+  async resetPrompt(key: PromptKey): Promise<void> {
+    const result = resetKey(this.draft(), this.lastSaved(), key);
+    if (!result) return;
+    this.draft.set(result.draft);
+    this.savingPrompts.set(true);
+    this.promptsSaved.set(false);
+    this.saveError.set('');
+    try {
+      const returned = await firstValueFrom(
+        this.api.updatePlannerPromptSettings(
+          toUpdateInput(result.persist, this.smallModeSupported()),
+        ),
+      );
+      const saved = applyMutationResult(returned);
+      this.lastSaved.set(saved);
+      this.draft.update((draft) => ({ ...draft, [key]: saved[key] }));
+      this.promptsSaved.set(true);
+    } catch {
+      this.draft.set(applyResetFailure(this.draft(), this.lastSaved(), key));
+      this.saveError.set('Could not save planner prompts.');
+    } finally {
+      this.savingPrompts.set(false);
+    }
   }
 
   async saveDiscordWebhook(): Promise<void> {

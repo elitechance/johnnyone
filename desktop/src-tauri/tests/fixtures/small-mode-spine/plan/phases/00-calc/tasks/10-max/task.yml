@@ -1,0 +1,6 @@
+id: 10-max
+files: [src/max.rs]
+verify: "cargo test max_works -- --exact"
+must_contain: ["pub fn max(a: i32, b: i32) -> i32"]
+depends_on: []
+ctx: 32768

@@ -1,0 +1,6 @@
+id: 03-mul
+files: [src/mul.rs]
+verify: "cargo test mul_works -- --exact"
+must_contain: ["pub fn mul(a: i32, b: i32) -> i32"]
+depends_on: []
+ctx: 32768

@@ -3,6 +3,23 @@
   height: 100%;
 }
 
+.executor-card {
+  margin: 12px 0;
+}
+
+.preflight-running {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.preflight-json {
+  font-size: 12px;
+  white-space: pre-wrap;
+  margin-top: 8px;
+}
+
 .briefing-shell {
   height: 100%;
   display: flex;

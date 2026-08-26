@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as desktopRpcMod from '../../lib/runtime/desktop-rpc';
+import { authedCtx } from '../auth/test-authed-ctx';
 
-const mockCtx = {
-  db: {} as any,
-  env: { CHAT_RELAY_DO: {} as any },
-  auth: { tenantId: 't1', userId: 'u1' },
-};
+const mockCtx = authedCtx({ tenantId: 't1', userId: 'u1' });
 
 /**
  * Documents the intentional passthrough of host paths (Task 06 decision).
@@ -49,12 +46,12 @@ describe('Host path exposure — passthrough (documented + scoped)', () => {
   });
 
   it('getAgentPlan under foreign ctx: receives call with foreign auth (passthrough to desktopRpc)', async () => {
-    const bCtx = { ...mockCtx, auth: { tenantId: 'tB', userId: 'uB' } };
+    const bCtx = authedCtx({ tenantId: 'tB', userId: 'uB' });
     const spyB = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ error: 'no node for B' } as any);
     const { default: getB } = await import('../../resolvers/ai/get-agent-plan');
     await getB(null, { id: 'p1' }, bCtx as any);
     // B's lookup used B's auth, not t1; no path for t1's plan exposed to B
-    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: bCtx.auth }), 'get_agent_plan', { id: 'p1' });
+    expect(spyB).toHaveBeenCalledWith(expect.objectContaining({ auth: expect.objectContaining({ tenantId: 'tB', userId: 'uB' }) }), 'get_agent_plan', { id: 'p1' });
   });
 
   it('HostFileContent.path would passthrough raw for owner (documented; see read-host-file)', async () => {

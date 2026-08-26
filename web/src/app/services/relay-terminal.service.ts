@@ -59,7 +59,6 @@ export class RelayTerminalService {
   private readonly errorSubject = new Subject<string>();
   private authFailureCount = 0;
   private connectAttemptEverOpened = false;
-  private justRefreshedForReconnect = false; // to dedupe double refresh on reconnect path
   private lastDisconnectWasAuthRejection = false; // per Task 04 decision #2: branch refresh/reconnect for auth vs transient
 
   screens(): Observable<TerminalScreen> {
@@ -271,7 +270,6 @@ export class RelayTerminalService {
     this.socket = null;
     this.connectAttemptEverOpened = false;
     this.lastDisconnectWasAuthRejection = false;
-    this.justRefreshedForReconnect = false;
   }
 
   private async sendControl(type: 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_kill', sessionId: string): Promise<void> {
@@ -380,29 +378,11 @@ export class RelayTerminalService {
   private async ensureConnected(): Promise<void> {
     if (this.socket && this.socket.readyState === WS_OPEN) return;
 
-    // Gate proactive refresh: only if no token OR near expiry (using stored expiresAt).
-    // Per Task 04 decisions: reactive-on-rejection is source of truth; proactive only for
-    // obviously expired (or absent). Avoids refresh roundtrip + token rotation on every connect.
-    // After schedule's failure refresh, token will be present so ensure will not re-refresh (collapses double).
+    // Near-expiry / missing-token refresh is owned by AuthService.ensureFreshToken
+    // (single-flight, D8 auth-vs-transport, Amendment 2 reject-after-logout).
     const apiUrl = getWorkerGraphqlUrl();
-    const hadToken = !!this.auth.getAccessToken();
-    // Consult AuthService.expiresIn (via stored value + near-expiry helper) per Task 04 decisions.
-    // Only refresh proactively when access token missing or near expiry (not on EVERY connect whenever refreshToken exists).
-    const expiresIn = this.auth.getExpiresIn();
-    const needsRefresh = !hadToken || (expiresIn != null && this.auth.isTokenNearExpiry());
-    if (this.justRefreshedForReconnect) {
-      this.justRefreshedForReconnect = false;
-      // deduped: schedule already did the refresh for this reconnect; do not refresh again
-    } else if (needsRefresh && this.auth.getRefreshToken()) {
-      try {
-        await this.auth.refresh(apiUrl);
-      } catch (e) {
-        if (!this.auth.getAccessToken()) {
-          throw new Error('No valid authentication token. Please log in or refresh.');
-        }
-        // proceed with prior token if refresh failed but one still present
-      }
-    } else if (!hadToken) {
+    await this.auth.ensureFreshToken(apiUrl);
+    if (!this.auth.getAccessToken()) {
       throw new Error('No valid authentication token. Please log in or refresh.');
     }
 
@@ -480,9 +460,8 @@ export class RelayTerminalService {
         // For transient (post-open), just ensure (no forced refresh this cycle).
         if (this.lastDisconnectWasAuthRejection || this.authFailureCount > 0) {
           const apiUrl = getWorkerGraphqlUrl();
-          await this.auth.refresh(apiUrl);
+          await this.auth.ensureFreshToken(apiUrl);
           this.authFailureCount = 0;
-          this.justRefreshedForReconnect = true; // signal to ensureConnected to skip (dedupe double-refresh)
           this.lastDisconnectWasAuthRejection = false;
         }
         await this.ensureConnected();

@@ -7,6 +7,7 @@ import {
   defaultLenses,
   consolePaneFor,
   CONSOLE_SEGMENTS,
+  modeChip,
 } from './console-logic';
 
 // Pure spec (no Angular/Ionic) — runs under the plugin-less web/vitest.config.ts. Pins the console's
@@ -167,5 +168,14 @@ describe('consolePaneFor / CONSOLE_SEGMENTS', () => {
     expect(consolePaneFor('nope')).toBe('console');
     expect(consolePaneFor(null)).toBe('console');
     expect(consolePaneFor(undefined)).toBe('console');
+  });
+});
+
+describe('modeChip', () => {
+  it('is kloo only for local-small', () => {
+    expect(modeChip('{"mode":"local-small"}')).toBe('kloo');
+    expect(modeChip(null)).toBeNull();
+    expect(modeChip('{"mode":"commercial"}')).toBeNull();
+    expect(modeChip('')).toBeNull();
   });
 });

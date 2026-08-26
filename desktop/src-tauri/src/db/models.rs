@@ -179,6 +179,13 @@ pub struct AgentPlan {
     /// Nullable JSON array of shell commands the coordinator runs itself when a phase reports ready
     /// (J1-16). NULL/empty preserves the previous behaviour of trusting the agent's report.
     pub test_commands: Option<String>,
+    /// Nullable JSON `{mode, profile?, provider?, model?, ctx?}`. NULL/empty = commercial.
+    /// Same deploy-skew pattern as `validation_config` (migration 021).
+    pub executor_config: Option<String>,
+    /// Host `consecutive_non_pass_planning_rounds` for this initiative. Not a DB
+    /// column — filled on list/get. `None` until attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_non_pass_planning_rounds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +302,9 @@ pub struct CreateBriefingInput {
     pub dev_worker_provider: Option<String>,
     #[serde(default)]
     pub dev_reviewer_provider: Option<String>,
+    /// Optional JSON executor config. NULL/absent = commercial.
+    #[serde(default)]
+    pub executor_config: Option<String>,
 }
 
 // ── Usage Log ────────────────────────────────────────────────────────────────
@@ -347,6 +357,8 @@ mod tests {
             dev_worker_provider: None,
             dev_reviewer_provider: None,
             test_commands: None,
+            executor_config: None,
+            consecutive_non_pass_planning_rounds: None,
         }
     }
 
@@ -373,6 +385,8 @@ mod tests {
             Some("[]")
         );
         assert!(v.get("validation_config").is_none());
+        assert!(v.as_object().unwrap().contains_key("executorConfig"));
+        assert!(v.get("executor_config").is_none());
         // …and the snake_case forms are absent (guards against a missing rename_all).
         assert!(v.get("initiative_id").is_none());
         assert!(v.get("initiative_status").is_none());

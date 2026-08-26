@@ -114,11 +114,15 @@ pub fn delete_provider_config(state: &AppState, provider: String) -> Result<(), 
 }
 
 pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, String> {
+    // Probe kloo so provider_configs has a path for the oneshot loop, but do
+    // not return it: the briefing/terminal pickers treat this list as chat
+    // providers and only filter `shell`.
     let providers = [
         CliProvider::ClaudeCode,
         CliProvider::Codex,
         CliProvider::Ollama,
         CliProvider::Grok,
+        CliProvider::Kloo,
     ];
 
     if simulator::host_simulator_enabled() {
@@ -131,6 +135,12 @@ pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, Str
                 path: Some(simulator::simulated_cli_path(provider.default_command())),
             })
             .collect::<Vec<_>>();
+
+        let user_facing: Vec<DetectedTool> = simulated_tools
+            .iter()
+            .filter(|t| t.provider != CliProvider::Kloo.as_str())
+            .cloned()
+            .collect();
 
         for tool in &simulated_tools {
             let _ = state.db.with_conn(|conn| {
@@ -151,7 +161,7 @@ pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, Str
             });
         }
 
-        return Ok(simulated_tools);
+        return Ok(user_facing);
     }
 
     let mut results = Vec::new();
@@ -160,12 +170,15 @@ pub async fn detect_cli_tools(state: &AppState) -> Result<Vec<DetectedTool>, Str
         let command = provider.default_command();
         let (found, path) = detect_command(command).await;
 
-        results.push(DetectedTool {
+        let tool = DetectedTool {
             provider: provider.as_str().to_string(),
             command: command.to_string(),
             found,
             path: path.clone(),
-        });
+        };
+        if *provider != CliProvider::Kloo {
+            results.push(tool);
+        }
 
         let _ = state.db.with_conn(|conn| {
             conn.execute(
