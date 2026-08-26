@@ -332,6 +332,19 @@ export interface PlannerSmallModePrompts {
   amendPlanner: string;
 }
 
+export interface PromptLibraryEntry {
+  id: string;
+  key: string;
+  name: string;
+  role: string;
+  scope: string;
+  version: string;
+  usedCount: number;
+  customised: boolean;
+  readOnly: boolean;
+  engineReads: boolean;
+}
+
 export interface PlannerPromptSettings {
   schema?: string;
   development: {
@@ -775,6 +788,27 @@ export class JohnnyApiService {
         { key, value }
       )
       .pipe(map((data) => data.updateSetting));
+  }
+
+  listPromptLibrary(): Observable<PromptLibraryEntry[]> {
+    return this.gql
+      .query<{ listPromptLibrary: PromptLibraryEntry[] }>(
+        `query ListPromptLibrary {
+          listPromptLibrary {
+            id
+            key
+            name
+            role
+            scope
+            version
+            usedCount
+            customised
+            readOnly
+            engineReads
+          }
+        }`
+      )
+      .pipe(map((data) => data.listPromptLibrary));
   }
 
   getPlannerPromptSettings(): Observable<PlannerPromptSettings> {

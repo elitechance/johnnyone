@@ -1,4 +1,12 @@
 .planner-prompts-card {
+  .prompts-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
   .next-run {
     display: block;
     margin-bottom: 12px;

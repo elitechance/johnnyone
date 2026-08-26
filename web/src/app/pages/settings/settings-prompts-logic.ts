@@ -221,3 +221,12 @@ export function toUpdateInput(
 export function rowsForLoadState(state: LoadState): boolean {
   return state === 'ready';
 }
+
+/** Expand the Settings accordion matching `?prompt=<key>`; invalid/missing stays collapsed. */
+export function accordionValueFromQuery(
+  param: string | null,
+  keys: PromptKey[],
+): PromptKey | undefined {
+  if (!param) return undefined;
+  return keys.find((key) => key === param);
+}
