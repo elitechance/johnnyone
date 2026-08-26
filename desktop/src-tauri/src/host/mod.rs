@@ -6,6 +6,7 @@ use crate::services::{
     agent_plans,
     chat_host,
     planner_prompts::{self as planner_prompt_service, PlannerPromptSettings},
+    prompt_library::{self as prompt_library_service, PromptLibraryEntry},
     providers::{self as provider_service, DetectedTool},
     relay as relay_service,
     sessions as session_service, settings as settings_service,
@@ -130,6 +131,17 @@ impl QueryRoot {
 
     async fn get_planner_prompt_settings(&self) -> async_graphql::Result<GqlPlannerPromptSettings> {
         Ok(planner_prompt_service::load_prompt_settings()?.into())
+    }
+
+    async fn list_prompt_library(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<GqlPromptLibraryEntry>> {
+        let state = ctx.data_unchecked::<AppState>();
+        Ok(prompt_library_service::list_prompt_library(state)?
+            .into_iter()
+            .map(GqlPromptLibraryEntry::from)
+            .collect())
     }
 
     async fn host_settings(&self, ctx: &Context<'_>) -> async_graphql::Result<GqlHostSettings> {
@@ -526,6 +538,38 @@ struct GqlRelayConnectionStatus {
     connected: bool,
     session_id: Option<String>,
     last_heartbeat: Option<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "PromptLibraryEntry", rename_fields = "camelCase")]
+struct GqlPromptLibraryEntry {
+    id: String,
+    key: String,
+    name: String,
+    role: String,
+    scope: String,
+    version: String,
+    used_count: i32,
+    customised: bool,
+    read_only: bool,
+    engine_reads: bool,
+}
+
+impl From<PromptLibraryEntry> for GqlPromptLibraryEntry {
+    fn from(value: PromptLibraryEntry) -> Self {
+        Self {
+            id: value.id,
+            key: value.key,
+            name: value.name,
+            role: value.role,
+            scope: value.scope,
+            version: value.version,
+            used_count: value.used_count,
+            customised: value.customised,
+            read_only: value.read_only,
+            engine_reads: value.engine_reads,
+        }
+    }
 }
 
 #[derive(SimpleObject, Clone)]

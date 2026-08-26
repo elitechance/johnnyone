@@ -52,6 +52,7 @@ export type {
   UploadChunkResult,
   TmuxSession,
   PlannerPromptSettings,
+  PromptLibraryEntry,
   ChatAttachment,
   GitActionResult,
   GitFilesView,

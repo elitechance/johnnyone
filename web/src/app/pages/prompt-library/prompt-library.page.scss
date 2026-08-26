@@ -1,0 +1,168 @@
+.library {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 8px 12px 24px;
+}
+
+.new-hint {
+  padding-inline: 8px;
+  font-size: 12px;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0 4px;
+}
+
+.filters ion-select {
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 120px;
+  max-width: 180px;
+}
+
+.filters ion-searchbar {
+  flex: 1 1 auto;
+  min-width: 140px;
+  padding: 0;
+}
+
+.legend,
+.footnote {
+  display: block;
+  padding: 4px 4px 12px;
+  font-size: 12px;
+}
+
+.footnote {
+  padding-top: 12px;
+  color: var(--ion-color-medium);
+}
+
+.cols,
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) 76px 88px 40px minmax(200px, 1.6fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.cols {
+  padding: 6px 12px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ion-color-medium);
+}
+
+.row {
+  width: 100%;
+  padding: 4px 0;
+}
+
+.name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.name ion-label {
+  min-width: 0;
+}
+
+.used {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+.used-count {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.used ion-chip {
+  margin-inline: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: auto;
+}
+
+.act {
+  justify-self: end;
+}
+
+ion-chip.custom {
+  --background: var(--ion-color-warning-tint, rgba(245, 193, 74, 0.18));
+  --color: var(--ion-color-warning-shade, #c58b12);
+}
+
+.state {
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--ion-color-medium);
+  font-size: 13px;
+}
+
+.state.loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 900px) {
+  .filters {
+    flex-wrap: wrap;
+  }
+
+  .filters ion-select {
+    flex: 1 1 140px;
+    max-width: none;
+  }
+
+  .cols {
+    display: none;
+  }
+
+  .row {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      'name act'
+      'meta meta';
+  }
+
+  .used {
+    flex-wrap: wrap;
+  }
+
+  .name {
+    grid-area: name;
+  }
+
+  .act {
+    grid-area: act;
+  }
+
+  .meta-line {
+    grid-area: meta;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+}
+
+@media (min-width: 901px) {
+  .meta-line {
+    display: contents;
+  }
+}

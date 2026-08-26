@@ -1,6 +1,7 @@
-import { Component, OnInit, inject, signal } from '@angular/core';
+import { Component, DestroyRef, OnInit, inject, signal } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
-import { RouterLink } from '@angular/router';
+import { ActivatedRoute, RouterLink } from '@angular/router';
 import {
   IonAccordion,
   IonAccordionGroup,
@@ -29,7 +30,9 @@ import { GRAPHQL_API_URL, JohnnyApiService } from '@johnnyone/ui';
 import { AuthService } from '../../services/auth.service';
 import {
   COMMERCIAL_ROWS,
+  PROMPT_KEYS,
   SMALL_MODE_ROWS,
+  accordionValueFromQuery,
   applyMutationResult,
   applyResetFailure,
   applySaveFailure,
@@ -81,6 +84,8 @@ export class SettingsPage implements OnInit {
   readonly apiUrl = inject(GRAPHQL_API_URL);
   private readonly auth = inject(AuthService);
   private readonly api = inject(JohnnyApiService);
+  private readonly route = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
 
   readonly commercialRows = COMMERCIAL_ROWS;
   readonly smallModeRows = SMALL_MODE_ROWS;
@@ -104,8 +109,14 @@ export class SettingsPage implements OnInit {
   savingPrompts = signal(false);
   promptsSaved = signal(false);
   saveError = signal('');
+  openPromptAccordion = signal<PromptKey | undefined>(undefined);
 
   ngOnInit(): void {
+    this.route.queryParamMap.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((params) => {
+      this.openPromptAccordion.set(
+        accordionValueFromQuery(params.get('prompt'), PROMPT_KEYS),
+      );
+    });
     firstValueFrom(this.api.getSetting(DISCORD_WEBHOOK_SETTING))
       .then((value) => {
         this.discordWebhook = value ?? '';

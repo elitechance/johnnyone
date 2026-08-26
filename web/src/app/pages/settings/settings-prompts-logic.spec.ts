@@ -6,6 +6,8 @@ import type { PlannerPromptSettings } from '@johnnyone/ui';
 import { SHIPPED_PROMPT_DEFAULTS } from './planner-prompt-defaults';
 import {
   ADDITIVE_KEYS,
+  PROMPT_KEYS,
+  accordionValueFromQuery,
   applyMutationResult,
   applyResetFailure,
   applySaveFailure,
@@ -220,5 +222,11 @@ describe('settings-prompts-logic', () => {
     expect(rowsForLoadState('loading')).toBe(false);
     expect(rowsForLoadState('load-error')).toBe(false);
     expect(rowsForLoadState('ready')).toBe(true);
+  });
+
+  it("accordionValueFromQuery('planning.planner') expands that accordion", () => {
+    expect(accordionValueFromQuery('planning.planner', PROMPT_KEYS)).toBe('planning.planner');
+    expect(accordionValueFromQuery('zzzz', PROMPT_KEYS)).toBeUndefined();
+    expect(accordionValueFromQuery(null, PROMPT_KEYS)).toBeUndefined();
   });
 });

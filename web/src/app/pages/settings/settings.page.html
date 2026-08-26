@@ -71,11 +71,14 @@
   </ion-card>
 
   <ion-card class="planner-prompts-card">
-    <ion-card-header>
+    <ion-card-header class="prompts-head">
       <ion-card-title>Planner prompts</ion-card-title>
       <ion-card-subtitle>
         These strings are what the next planner / reviewer / leaf sees.
       </ion-card-subtitle>
+      <ion-button fill="outline" size="small" routerLink="/settings/prompts">
+        Prompt library
+      </ion-button>
     </ion-card-header>
     <ion-card-content>
       <ion-note color="warning" class="next-run">
@@ -98,7 +101,7 @@
 
       @if (promptLoadState() === 'ready') {
         <h3 class="prompt-group">Commercial</h3>
-        <ion-accordion-group>
+        <ion-accordion-group [value]="openPromptAccordion()">
           @for (row of commercialRows; track row.key) {
             <ion-accordion [value]="row.key">
               <div slot="header" class="prompt-head">
@@ -149,7 +152,7 @@
             This desktop does not support small mode yet.
           </ion-note>
         }
-        <ion-accordion-group [class.sm-disabled]="!smallModeSupported()">
+        <ion-accordion-group [class.sm-disabled]="!smallModeSupported()" [value]="openPromptAccordion()">
           @for (row of smallModeRows; track row.key) {
             <ion-accordion [value]="row.key" [disabled]="!smallModeSupported()">
               <div slot="header" class="prompt-head">

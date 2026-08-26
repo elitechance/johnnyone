@@ -1,0 +1,140 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Prompts</ion-title>
+    <ion-buttons slot="end">
+      <ion-button
+        fill="solid"
+        color="primary"
+        size="small"
+        [routerLink]="newHref()"
+        aria-label="Customise a built-in via Duplicate"
+      >
+        + New
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <div class="library">
+    <ion-note class="new-hint">Customise a built-in via Duplicate</ion-note>
+    <div class="filters">
+      <ion-select
+        interface="popover"
+        placeholder="All roles"
+        [value]="roleFilter()"
+        (ionChange)="onRoleChange($event.detail.value)"
+        aria-label="Filter by role"
+      >
+        <ion-select-option value="">All roles</ion-select-option>
+        <ion-select-option value="planner">planner</ion-select-option>
+        <ion-select-option value="worker">worker</ion-select-option>
+        <ion-select-option value="lens">lens</ion-select-option>
+      </ion-select>
+      <ion-select
+        interface="popover"
+        placeholder="All scopes"
+        [value]="scopeFilter()"
+        (ionChange)="onScopeChange($event.detail.value)"
+        aria-label="Filter by scope"
+      >
+        <ion-select-option value="">All scopes</ion-select-option>
+        <ion-select-option value="builtin">built-in</ion-select-option>
+        <ion-select-option value="workspace">workspace</ion-select-option>
+        <ion-select-option value="project">project</ion-select-option>
+      </ion-select>
+      <ion-searchbar
+        debounce="250"
+        placeholder="Search name or key"
+        [value]="query()"
+        (ionInput)="onSearch($event.detail.value)"
+        aria-label="Search prompts"
+      ></ion-searchbar>
+    </div>
+    <ion-note class="legend">● = customised; built-in read-only; Duplicate to edit</ion-note>
+
+    @if (view() === 'loading') {
+      <div class="state loading">
+        <ion-spinner name="crescent"></ion-spinner>
+        <ion-text color="medium"><p>Loading prompts…</p></ion-text>
+      </div>
+    }
+
+    @if (view() === 'error') {
+      <div class="state error">
+        <ion-text color="danger"><p>Could not load prompts.</p></ion-text>
+        <ion-button fill="outline" (click)="load()">Retry</ion-button>
+      </div>
+    }
+
+    @if (view() === 'empty') {
+      <div class="state empty">No prompts match.</div>
+    }
+
+    @if (view() === 'ready') {
+      <div class="cols">
+        <div>NAME</div>
+        <div>ROLE</div>
+        <div>SCOPE</div>
+        <div>VER</div>
+        <div>USED</div>
+        <div></div>
+      </div>
+      <ion-list>
+        @for (row of filtered(); track row.key) {
+          <ion-item
+            lines="full"
+            [button]="row.customised"
+            [detail]="false"
+            [class.customised]="row.customised"
+            (click)="onRowClick(row)"
+          >
+            <div class="row">
+              <div class="name">
+                @if (row.customised) {
+                  <ion-badge color="warning">●</ion-badge>
+                }
+                <ion-label>
+                  <h2>{{ row.name }}</h2>
+                  <p>{{ row.key }}</p>
+                </ion-label>
+              </div>
+              <div class="meta-line">
+                <ion-chip>{{ row.role }}</ion-chip>
+                <ion-chip [class.custom]="row.customised">{{ scopeLabel(row.scope) }}</ion-chip>
+                <ion-chip>{{ row.version }}</ion-chip>
+                <span class="used">
+                  <span class="used-count">{{ formatUsed(row.usedCount) }}</span>
+                  @if (!row.engineReads) {
+                    <ion-chip color="warning">not read by current engine</ion-chip>
+                  }
+                </span>
+              </div>
+              <div class="act">
+                <ion-button
+                  fill="outline"
+                  size="small"
+                  routerLink="/settings"
+                  [queryParams]="editorQueryParams(row.key)"
+                  (click)="$event.stopPropagation()"
+                >
+                  @if (rowAction(row).kind === 'duplicate') {
+                    Duplicate to edit
+                  } @else {
+                    Open editor
+                  }
+                </ion-button>
+              </div>
+            </div>
+          </ion-item>
+        }
+      </ion-list>
+      <ion-note class="footnote">
+        Catalog is the existing PlannerPromptSettings slots (commercial + small-mode).
+        There is no project-scoped row today — picking scope=project shows empty.
+        USED is credited only when a live path reads that settings field.
+        Inert slots show 0 runs plus not read by current engine.
+      </ion-note>
+    }
+  </div>
+</ion-content>

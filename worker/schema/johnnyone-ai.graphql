@@ -336,6 +336,19 @@ type PlannerPromptSettings {
   smallMode: PlannerSmallModePrompts
 }
 
+type PromptLibraryEntry {
+  id: ID!
+  key: String!
+  name: String!
+  role: String!
+  scope: String!
+  version: String!
+  usedCount: Int!
+  customised: Boolean!
+  readOnly: Boolean!
+  engineReads: Boolean!
+}
+
 type PlannerSmallModePrompts {
   planner: String!
   reviewer: String!
@@ -520,6 +533,7 @@ type Query {
   listDetectedCliTools: [DetectedTool!]!
   getSetting(key: String!): String!
   getPlannerPromptSettings: PlannerPromptSettings!
+  listPromptLibrary: [PromptLibraryEntry!]!
   getPlanCheck(planId: ID!, phaseId: String): String
   getTaskRun(planId: ID!, phaseId: String!, taskId: String): String
   getKlooDoctor: String!

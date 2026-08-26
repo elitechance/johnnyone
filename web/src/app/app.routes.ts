@@ -105,6 +105,15 @@ export const appRoutes: Route[] = [
       import('./pages/developer/developer.page').then((m) => m.DeveloperPage),
   },
   {
+    path: 'settings/prompts',
+    title: 'Prompts',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/prompt-library/prompt-library.page').then(
+        (m) => m.PromptLibraryPage,
+      ),
+  },
+  {
     path: 'settings',
     title: 'Settings',
     canActivate: [authGuard],

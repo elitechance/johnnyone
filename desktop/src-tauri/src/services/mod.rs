@@ -6,6 +6,7 @@ pub mod git_history;
 pub mod host_files;
 pub mod plan_check;
 pub mod planner_prompts;
+pub mod prompt_library;
 pub mod providers;
 pub mod relay;
 pub mod sessions;

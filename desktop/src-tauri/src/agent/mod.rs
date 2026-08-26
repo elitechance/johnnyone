@@ -988,6 +988,7 @@ impl AgentService {
                 Self::rpc_add_initiative_reference_path(&req.params, state)
             }
             "get_planner_prompt_settings" => Self::rpc_get_planner_prompt_settings(),
+            "list_prompt_library" => Self::rpc_list_prompt_library(state),
             "get_plan_check" => Self::rpc_get_plan_check(&req.params, state),
             "get_task_run" => Self::rpc_get_task_run(&req.params, state),
             "get_kloo_doctor" => Self::rpc_get_kloo_doctor().await,
@@ -1918,6 +1919,11 @@ impl AgentService {
     fn rpc_get_planner_prompt_settings() -> Result<serde_json::Value, String> {
         let settings = crate::services::planner_prompts::load_prompt_settings()?;
         serde_json::to_value(settings).map_err(|e| e.to_string())
+    }
+
+    fn rpc_list_prompt_library(state: &Arc<AppState>) -> Result<serde_json::Value, String> {
+        let entries = crate::services::prompt_library::list_prompt_library(state)?;
+        serde_json::to_value(entries).map_err(|e| e.to_string())
     }
 
     fn rpc_get_plan_check(

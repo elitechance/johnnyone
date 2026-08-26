@@ -40,4 +40,9 @@ describe('settings-prompts wiring', () => {
     expect(routes).toMatch(/path:\s*'settings'/);
     expect(routes).toMatch(/SettingsPage/);
   });
+
+  it('Planner prompts card links to the Prompt library', () => {
+    expect(html).toContain('Prompt library');
+    expect(html).toMatch(/settings\/prompts/);
+  });
 });
