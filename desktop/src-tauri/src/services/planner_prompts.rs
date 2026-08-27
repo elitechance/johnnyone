@@ -498,9 +498,9 @@ Field types (serde will reject anything else):
 
 cwd is the directory to run verify in (e.g. desktop/src-tauri). When cwd is set, every files[] and new: path is still workspace-relative and must live under that cwd (files_outside_cwd otherwise).
 
-verify must be an allowlisted AND scoped argv command: cargo test with a filter (bare `cargo test` is verify_not_allowlisted), npx vitest|jest run + a file, npx nx build + a single project, go test + a package that is not ./..., python -m pytest + a file, node + a test file.
+verify must be an allowlisted AND scoped argv command: cargo test with a filter (bare `cargo test` is verify_not_allowlisted), npx vitest|jest run + a file, npx playwright test + a spec file, npx nx build + a single project, npx ng build (optionally + a project), go test + a package that is not ./..., python -m pytest + a file, node + a test file.
 
-UI tasks (.html/.scss/.css in files[]) ARE allowed — a small model writes the markup/styles and the T2 review lens judges the visual result with vision and guides revisions. Every UI task still needs a mechanical verify so the leaf executor knows when it is done: prefer a component/render test (npx vitest run <spec>, with must_contain anchoring the structure it must produce); a task editing ONLY styling with no testable logic may gate on a scoped build (npx nx build <project>). For every UI task, have it capture a screenshot and list that screen in screens-to-verify so the reviewer can judge it visually.
+UI tasks (.html/.scss/.css in files[]) ARE allowed — a small model writes the markup/styles and the T2 review lens judges the visual result with vision and guides revisions. Every UI task still needs a mechanical verify so the leaf executor knows when it is done: prefer a structural test (npx vitest run <spec>, or npx playwright test <spec> for an Ionic/Angular app, with must_contain anchoring what it must produce or remove); a task editing ONLY styling with no testable logic may gate on a scoped build (npx nx build <project>, or npx ng build for an Angular app). For every UI task, have it capture a screenshot and list that screen in screens-to-verify so the reviewer can judge it visually.
 
 No two tasks in a phase may claim the same file (file_collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward."#
     };
@@ -675,6 +675,7 @@ planning:
     #[test]
     #[test]
     #[test]
+    #[test]
     fn commercial_templates_match_pinned_fingerprints() {
         // Ten shipped DEFAULT_* strings. Not workerNudge (no shipped default).
         assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x57b8ba3c4843e8a7);
@@ -683,10 +684,10 @@ planning:
         assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_REVIEWER), 0x882713aa907d5d7f);
         assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_PLANNER), 0x7f841cf263c8c761);
         assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_REVIEWER), 0xea96c82d6fcfac66);
-        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_PLANNER), 0xc7fbb4dfd5b9e3e9);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_PLANNER), 0xea74fb71968a2b4d);
         assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_REVIEWER), 0x37ef8923327e716d);
         assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_LEAF_WRAPPER), 0x464e7f9226edda96);
-        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_AMEND_PLANNER), 0xc38db436dc11c197);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_AMEND_PLANNER), 0x20caf23012644a43);
     }
 
     #[test]

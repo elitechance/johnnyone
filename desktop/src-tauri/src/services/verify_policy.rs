@@ -377,10 +377,91 @@ fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
     match package {
         "vitest" | "jest" => validate_npx_vitest_jest(rest),
         "nx" => validate_npx_nx_build(rest),
+        "playwright" => validate_npx_playwright(rest),
+        "ng" => validate_npx_ng_build(rest),
         other => Err(VerifyPolicyError::not_allowlisted(format!(
-            "npx package must be vitest, jest, or nx, got {other:?}"
+            "npx package must be vitest, jest, nx, playwright, or ng, got {other:?}"
         ))),
     }
+}
+
+/// `npx playwright test <file>` — a file-scoped e2e run. The spec file scopes it to
+/// one flow; a bare `playwright test` runs the whole suite and is rejected as
+/// not_scoped. An optional `--project <name>` may follow. This is the structural
+/// gate a UI task uses (assert the change is present/absent in the DOM); the review
+/// lens judges the visual result.
+fn validate_npx_playwright(rest: &[String]) -> Result<(), VerifyPolicyError> {
+    if rest.first().map(String::as_str) != Some("test") {
+        return Err(VerifyPolicyError::not_allowlisted(
+            "npx playwright: only `test` is allowed",
+        ));
+    }
+    let mut files = 0usize;
+    let mut idx = 1;
+    while idx < rest.len() {
+        let t = rest[idx].as_str();
+        if eq_value(t, "--project").is_some() {
+            idx += 1;
+            continue;
+        }
+        if t == "--project" {
+            let _ = take_flag_value(rest, idx, t)?;
+            idx += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "npx playwright test flag {t:?} is not allowed"
+            )));
+        }
+        jail_token(t)?;
+        files += 1;
+        idx += 1;
+    }
+    if files == 0 {
+        return Err(VerifyPolicyError::not_scoped(
+            "npx playwright test must name a spec file (a bare `playwright test` runs the whole suite)",
+        ));
+    }
+    Ok(())
+}
+
+/// `npx ng build [<project>]` — Angular CLI whole-app compile. One app per build
+/// (no monorepo fan-out), so it is scoped by construction; an optional project name
+/// and `--configuration <name>` (or `-c` / `--prod`) may follow. The compile-only
+/// gate for a styling/markup change; the review lens judges the visual result.
+fn validate_npx_ng_build(rest: &[String]) -> Result<(), VerifyPolicyError> {
+    if rest.first().map(String::as_str) != Some("build") {
+        return Err(VerifyPolicyError::not_allowlisted(
+            "npx ng: only `build` is allowed",
+        ));
+    }
+    let mut idx = 1;
+    if let Some(p) = rest.get(idx).map(String::as_str) {
+        if !p.is_empty() && !p.starts_with('-') {
+            idx += 1;
+        }
+    }
+    while idx < rest.len() {
+        let t = rest[idx].as_str();
+        if eq_value(t, "--configuration").is_some() {
+            idx += 1;
+            continue;
+        }
+        if t == "--configuration" || t == "-c" {
+            let _ = take_flag_value(rest, idx, t)?;
+            idx += 2;
+            continue;
+        }
+        if t == "--prod" {
+            idx += 1;
+            continue;
+        }
+        return Err(VerifyPolicyError::not_allowlisted(format!(
+            "npx ng build: unexpected argument {t:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// `npx vitest|jest run <file>` — a scoped unit/component test. Unchanged from the
@@ -824,6 +905,45 @@ mod tests {
         assert_eq!(
             check_verify("npx nx build").unwrap_err().rule,
             "verify_not_scoped"
+        );
+    }
+
+    #[test]
+    fn allow_npx_playwright_test_file() {
+        assert!(check_verify("npx playwright test e2e/new-room.spec.ts").is_ok());
+        assert!(check_verify("npx playwright test e2e/new-room.spec.ts --project chromium").is_ok());
+        assert!(check_verify("npx playwright test e2e/new-room.spec.ts --project=chromium").is_ok());
+    }
+
+    #[test]
+    fn reject_bare_playwright_test_as_unscoped() {
+        assert_eq!(
+            check_verify("npx playwright test").unwrap_err().rule,
+            "verify_not_scoped"
+        );
+    }
+
+    #[test]
+    fn allow_npx_ng_build() {
+        assert!(check_verify("npx ng build").is_ok());
+        assert!(check_verify("npx ng build caseroom").is_ok());
+        assert!(check_verify("npx ng build caseroom --configuration production").is_ok());
+        assert!(check_verify("npx ng build --configuration production").is_ok());
+    }
+
+    #[test]
+    fn reject_ng_non_build_and_playwright_junk() {
+        assert_eq!(
+            check_verify("npx ng test").unwrap_err().rule,
+            "verify_not_allowlisted"
+        );
+        assert_eq!(
+            check_verify("npx ng build app extra").unwrap_err().rule,
+            "verify_not_allowlisted"
+        );
+        assert_eq!(
+            check_verify("npx playwright test a.spec.ts --headed").unwrap_err().rule,
+            "verify_not_allowlisted"
         );
     }
 
