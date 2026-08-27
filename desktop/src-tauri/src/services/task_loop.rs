@@ -15,7 +15,7 @@ use crate::services::atomic_fs;
 use crate::services::settings as settings_service;
 use crate::services::task_check::{
     classify, digest_bytes, next_attempt, Attempt, CheckInputs, CheckReport, FailureClass,
-    SpawnFailure, Step,
+    Ladder, SpawnFailure, Step,
 };
 use crate::services::task_spec::{self, load_task_spec, TaskSpec};
 use crate::services::verify_policy::{
@@ -217,6 +217,14 @@ pub struct KlooPhaseCtx {
     pub phase_dir: PathBuf,
     pub workspace: PathBuf,
     pub runs_dir: PathBuf,
+    /// Executor-config developer: the BASE-tier model (e.g. a local small model), the
+    /// provider name to pass kloo `--provider` for that tier, a default `--ctx`, and an
+    /// optional profile path. Parsed once from the plan's `executor_config`; `None` fields
+    /// fall back to kloo's defaults (so a commercial run is byte-identical to before).
+    pub exec_provider: Option<String>,
+    pub exec_model: Option<String>,
+    pub exec_ctx: Option<u32>,
+    pub exec_profile: Option<String>,
     /// Optional absolute path to the kloo binary. Tests pass a per-test
     /// wrapper so they never mutate process-global `PATH` / `J1_FAKE_KLOO_*`.
     /// Production leaves this `None` and resolves `kloo` from PATH.
@@ -511,6 +519,11 @@ pub async fn run_kloo_phase_ex(
         &run.plan.id,
         &phase.phase_id,
     );
+    let exec = crate::services::agent_plans::parse_executor_config(
+        run.plan.executor_config.as_deref(),
+    )
+    .ok()
+    .flatten();
     let ctx = KlooPhaseCtx {
         plan_id: run.plan.id.clone(),
         phase_id: phase.phase_id.clone(),
@@ -522,6 +535,10 @@ pub async fn run_kloo_phase_ex(
             run.plan.executor_config.as_deref(),
         )
         .unwrap_or_default(),
+        exec_provider: exec.as_ref().and_then(|e| e.provider.clone()),
+        exec_model: exec.as_ref().and_then(|e| e.model.clone()),
+        exec_ctx: exec.as_ref().and_then(|e| e.ctx),
+        exec_profile: exec.as_ref().and_then(|e| e.profile.clone()),
     };
     let mut host = RealHost {
         state: state.clone(),
@@ -621,7 +638,8 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                 return Ok(PhaseLoopOutcome::Cancelled);
             }
             let history = attempts_to_history(row_ref(&file, &task_id)?.attempts.as_slice());
-            let step = next_attempt(&history, last_class);
+            let step =
+                Ladder::for_executor(ctx.exec_model.as_deref()).next_attempt(&history, last_class);
             let (model, label) = match step {
                 Step::Run { model, label, .. } | Step::RetryInfra { model, label } => {
                     (model, label)
@@ -654,9 +672,15 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                 verify: spec.verify.clone(),
                 cwd: spec.cwd.clone(),
                 model: model.clone(),
-                ctx: spec.ctx,
-                profile: None,
-                provider: None,
+                ctx: spec.ctx.or(ctx.exec_ctx),
+                profile: ctx.exec_profile.clone(),
+                // The configured provider applies to the BASE tier (the configured model);
+                // commercial escalation tiers keep kloo's default provider resolution.
+                provider: if ctx.exec_model.as_deref() == Some(model.as_str()) {
+                    ctx.exec_provider.clone()
+                } else {
+                    None
+                },
                 cli_path: ctx.kloo_cli.clone(),
                 status_file: None,
             };
@@ -1499,6 +1523,7 @@ mod tests {
         spawned_files: Vec<Vec<String>>,
         spawned_prompts: Vec<String>,
         spawned_models: Vec<String>,
+        spawned_providers: Vec<Option<String>>,
         commits: Vec<String>,
         events: Vec<String>,
         index: HashMap<(String, String), String>,
@@ -1516,6 +1541,7 @@ mod tests {
                 spawned_files: vec![],
                 spawned_prompts: vec![],
                 spawned_models: vec![],
+                spawned_providers: vec![],
                 commits: vec![],
                 events: vec![],
                 index: HashMap::new(),
@@ -1577,6 +1603,7 @@ mod tests {
             self.spawned_files.push(req.files.clone());
             self.spawned_prompts.push(req.prompt.clone());
             self.spawned_models.push(req.model.clone());
+            self.spawned_providers.push(req.provider.clone());
             let next = self
                 .spawn_scripts
                 .pop_front()
@@ -1678,6 +1705,10 @@ mod tests {
                 runs_dir,
                 kloo_cli: None,
                 leaf_wrapper: String::new(),
+                exec_provider: None,
+                exec_model: None,
+                exec_ctx: None,
+                exec_profile: None,
             },
             root.to_path_buf(),
         )
@@ -1915,6 +1946,31 @@ mod tests {
             "map entry must be gone"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn executor_config_sets_base_model_and_provider() {
+        // I6: the executor_config's provider/model/ctx must reach the kloo request.
+        let root = tmp("exec-cfg");
+        let (mut ctx, _) = ctx_for(&root, "00-x");
+        ctx.exec_model = Some("muse-glimmer-30b".into());
+        ctx.exec_provider = Some("lokalai".into());
+        ctx.exec_ctx = Some(65536);
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "01-a",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_pass("a.rs", "fn a() {}\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+        // base tier ran the CONFIGURED model via the CONFIGURED provider (not qwen3-coder / default)
+        assert_eq!(host.spawned_models[0], "muse-glimmer-30b");
+        assert_eq!(host.spawned_providers[0].as_deref(), Some("lokalai"));
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        assert_eq!(file.tasks[0].succeeded_tier.as_deref(), Some("muse-glimmer-30b"));
     }
 
     #[tokio::test]

@@ -304,8 +304,8 @@ pub enum Step {
 
 #[derive(Debug, Clone)]
 pub struct LadderSlot {
-    pub model: &'static str,
-    pub label: &'static str,
+    pub model: String,
+    pub label: String,
     pub max_model_attempts: u32,
 }
 
@@ -319,22 +319,42 @@ impl Default for Ladder {
         Self {
             slots: vec![
                 LadderSlot {
-                    model: "qwen/qwen3-coder",
-                    label: "qwen3-coder",
+                    model: "qwen/qwen3-coder".to_string(),
+                    label: "qwen3-coder".to_string(),
                     max_model_attempts: 2,
                 },
                 LadderSlot {
-                    model: "anthropic/claude-sonnet-5",
-                    label: "claude",
+                    model: "anthropic/claude-sonnet-5".to_string(),
+                    label: "claude".to_string(),
                     max_model_attempts: 1,
                 },
                 LadderSlot {
-                    model: "anthropic/claude-opus-5",
-                    label: "opus",
+                    model: "anthropic/claude-opus-5".to_string(),
+                    label: "opus".to_string(),
                     max_model_attempts: 1,
                 },
             ],
         }
+    }
+}
+
+impl Ladder {
+    /// Ladder whose BASE tier is the executor-configured model (e.g. a local model
+    /// served by the profile's provider), keeping the commercial escalation tiers
+    /// above it. `None`/empty base_model ⇒ the default ladder (qwen3-coder base).
+    /// The base label is the model id after the last '/' (or the whole id), so logs
+    /// and `succeededTier` name the real model, not a stale "qwen3-coder".
+    pub fn for_executor(base_model: Option<&str>) -> Self {
+        let mut ladder = Ladder::default();
+        if let Some(m) = base_model.map(str::trim).filter(|s| !s.is_empty()) {
+            let label = m.rsplit('/').next().unwrap_or(m).to_string();
+            ladder.slots[0] = LadderSlot {
+                model: m.to_string(),
+                label,
+                max_model_attempts: 2,
+            };
+        }
+        ladder
     }
 }
 
@@ -394,6 +414,33 @@ pub fn next_attempt(history: &[Attempt], class: Option<FailureClass>) -> Step {
 mod tests {
     use super::*;
     use crate::providers::kloo_cli::{FilesChanged, HookResult, VerifyResult};
+
+    #[test]
+    fn for_executor_sets_base_tier_and_keeps_escalation() {
+        // base tier = configured model, label derived from the id after the last '/'
+        let l = Ladder::for_executor(Some("muse-glimmer-30b"));
+        match l.next_attempt(&[], None) {
+            Step::Run { model, label, .. } => {
+                assert_eq!(model, "muse-glimmer-30b");
+                assert_eq!(label, "muse-glimmer-30b");
+            }
+            s => panic!("{s:?}"),
+        }
+        // after the base tier is exhausted on MODEL failures, escalation is still commercial
+        let hist = vec![
+            Attempt { label: "muse-glimmer-30b".into(), model: "muse-glimmer-30b".into(), class: Some(FailureClass::Model), infra_retry: false },
+            Attempt { label: "muse-glimmer-30b".into(), model: "muse-glimmer-30b".into(), class: Some(FailureClass::Model), infra_retry: false },
+        ];
+        match l.next_attempt(&hist, Some(FailureClass::Model)) {
+            Step::Run { label, .. } => assert_eq!(label, "claude"),
+            s => panic!("{s:?}"),
+        }
+        // None base ⇒ default ladder (unchanged commercial behaviour)
+        match Ladder::for_executor(None).next_attempt(&[], None) {
+            Step::Run { model, .. } => assert_eq!(model, "qwen/qwen3-coder"),
+            s => panic!("{s:?}"),
+        }
+    }
 
     fn spec_add() -> TaskSpec {
         TaskSpec {
