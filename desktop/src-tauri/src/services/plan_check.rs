@@ -1028,24 +1028,20 @@ fn check_must_contain(spec: &TaskSpec, report: &mut PlanCheckReport) {
 }
 
 fn check_ui_forbidden(spec: &TaskSpec, report: &mut PlanCheckReport) {
+    // UI files (.html/.scss/.css) are ALLOWED — a small model can write them, and the
+    // T2 review lens judges the visual result with vision and guides revisions. The only
+    // requirement is the ordinary one: the task carries a mechanical verify (a component
+    // test, or a scoped `npx nx build <project>` for a stand-alone styling change).
+    //
+    // `mock:` stays rejected: it is not one of the closed task.yml fields, and inventing
+    // mock data was the "taught then forbidden" trap (finding #18). Kept under this rule
+    // so the plan-check contract's rule set is unchanged.
     if spec.mock.is_some() {
         report.items.push(item(
             Some(&spec.id),
             RULE_UI_TASK_FORBIDDEN,
-            format!("{} sets mock: (UI tasks are forbidden in small mode)", spec.id),
+            format!("{} sets mock: (not a task.yml field; do not invent mock data)", spec.id),
         ));
-        return;
-    }
-    for path in &spec.files {
-        let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".html") || lower.ends_with(".scss") || lower.ends_with(".css") {
-            report.items.push(item(
-                Some(&spec.id),
-                RULE_UI_TASK_FORBIDDEN,
-                format!("{path} is a UI file (html/scss/css)"),
-            ));
-            return;
-        }
     }
 }
 
@@ -2343,7 +2339,15 @@ mod tests {
         );
         std::fs::write(ws.join("src/a.html"), "<p></p>\n").unwrap();
         let report = check_plan(&plan, &ws, None);
-        assert!(has_rule(&report, RULE_UI_TASK_FORBIDDEN), "{:?}", report.items);
+        // UI files are now allowed: a .html task must NOT trip ui_task_forbidden.
+        assert!(
+            !report
+                .items
+                .iter()
+                .any(|i| i.rule == RULE_UI_TASK_FORBIDDEN && i.task_id.as_deref() == Some("01-html")),
+            "{:?}",
+            report.items
+        );
 
         write_task(
             &plan,

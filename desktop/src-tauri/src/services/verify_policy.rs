@@ -340,42 +340,56 @@ fn npx_prefix_has_no_install(argv: &[String]) -> bool {
 }
 
 fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
-    let mut runner = None;
-    let mut has_run = false;
-    let mut files = 0usize;
+    // Phase 1: consume leading npx flags, then read the package name.
     let mut i = 1;
-    while i < argv.len() {
-        let t = argv[i].as_str();
-        if runner.is_none() {
-            if t == "--no-install" {
-                i += 1;
-                continue;
-            }
-            if let Some(val) = eq_value(t, "--prefix").or_else(|| eq_value(t, "--config")) {
-                jail_token(val)?;
-                i += 1;
-                continue;
-            }
-            if t == "--prefix" || t == "--config" {
-                let val = take_flag_value(argv, i, t)?;
-                jail_token(val)?;
-                i += 2;
-                continue;
-            }
-            if t.starts_with('-') {
-                return Err(VerifyPolicyError::not_allowlisted(format!(
-                    "npx flag {t:?} is not allowed"
-                )));
-            }
-            if t != "vitest" && t != "jest" {
-                return Err(VerifyPolicyError::not_allowlisted(format!(
-                    "npx package must be vitest or jest, got {t:?}"
-                )));
-            }
-            runner = Some(t);
+    let package;
+    loop {
+        let Some(t) = argv.get(i).map(String::as_str) else {
+            return Err(VerifyPolicyError::not_allowlisted(
+                "npx must invoke vitest, jest, or nx",
+            ));
+        };
+        if t == "--no-install" {
             i += 1;
             continue;
         }
+        if let Some(val) = eq_value(t, "--prefix").or_else(|| eq_value(t, "--config")) {
+            jail_token(val)?;
+            i += 1;
+            continue;
+        }
+        if t == "--prefix" || t == "--config" {
+            let val = take_flag_value(argv, i, t)?;
+            jail_token(val)?;
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            return Err(VerifyPolicyError::not_allowlisted(format!(
+                "npx flag {t:?} is not allowed"
+            )));
+        }
+        package = t;
+        i += 1;
+        break;
+    }
+    let rest = &argv[i..];
+    match package {
+        "vitest" | "jest" => validate_npx_vitest_jest(rest),
+        "nx" => validate_npx_nx_build(rest),
+        other => Err(VerifyPolicyError::not_allowlisted(format!(
+            "npx package must be vitest, jest, or nx, got {other:?}"
+        ))),
+    }
+}
+
+/// `npx vitest|jest run <file>` — a scoped unit/component test. Unchanged from the
+/// original allowlist: needs `run` and at least one file-like argument, no flags.
+fn validate_npx_vitest_jest(rest: &[String]) -> Result<(), VerifyPolicyError> {
+    let mut has_run = false;
+    let mut files = 0usize;
+    for token in rest {
+        let t = token.as_str();
         if t == "--no-install" {
             return Err(VerifyPolicyError::not_allowlisted(
                 "--no-install after the npx package does not guard npx",
@@ -388,22 +402,58 @@ fn validate_npx(argv: &[String]) -> Result<(), VerifyPolicyError> {
         }
         if t == "run" {
             has_run = true;
-            i += 1;
             continue;
         }
         jail_token(t)?;
         files += 1;
-        i += 1;
-    }
-    if runner.is_none() {
-        return Err(VerifyPolicyError::not_allowlisted(
-            "npx must invoke vitest or jest",
-        ));
     }
     if !has_run || files == 0 {
         return Err(VerifyPolicyError::not_scoped(
             "npx vitest/jest must include `run` and a file-like argument",
         ));
+    }
+    Ok(())
+}
+
+/// `npx nx build <project>` — a SCOPED build, the done-gate for a small-mode task
+/// whose only real output is presentation (a stand-alone `.scss`/`.css` change has
+/// no meaningful unit test). "Scoped" = one named project; a bare `nx build` builds
+/// the whole repo and is rejected as not_scoped. An optional `--configuration <name>`
+/// (or `-c <name>` / `--prod`) is allowed; nothing else. Visual correctness is not
+/// this gate's job — the T2 review lens judges that with vision.
+fn validate_npx_nx_build(rest: &[String]) -> Result<(), VerifyPolicyError> {
+    if rest.first().map(String::as_str) != Some("build") {
+        return Err(VerifyPolicyError::not_allowlisted(
+            "npx nx: only `build` is allowed",
+        ));
+    }
+    let mut idx = 1;
+    match rest.get(idx).map(String::as_str) {
+        Some(p) if !p.is_empty() && !p.starts_with('-') => idx += 1,
+        _ => {
+            return Err(VerifyPolicyError::not_scoped(
+                "npx nx build must name a single project (a bare `nx build` builds the whole repo)",
+            ));
+        }
+    }
+    while idx < rest.len() {
+        let t = rest[idx].as_str();
+        if eq_value(t, "--configuration").is_some() {
+            idx += 1;
+            continue;
+        }
+        if t == "--configuration" || t == "-c" {
+            let _ = take_flag_value(rest, idx, t)?;
+            idx += 2;
+            continue;
+        }
+        if t == "--prod" {
+            idx += 1;
+            continue;
+        }
+        return Err(VerifyPolicyError::not_allowlisted(format!(
+            "npx nx build: unexpected argument {t:?}"
+        )));
     }
     Ok(())
 }
@@ -757,6 +807,42 @@ mod tests {
                 "run",
                 "queue.service.spec.ts"
             ])
+        );
+    }
+
+    #[test]
+    fn allow_npx_nx_build_scoped_project() {
+        assert!(check_verify("npx nx build web").is_ok());
+        // with a configuration flag
+        assert!(check_verify("npx nx build web --configuration production").is_ok());
+        assert!(check_verify("npx nx build web -c production").is_ok());
+        assert!(check_verify("npx nx build web --prod").is_ok());
+    }
+
+    #[test]
+    fn reject_bare_nx_build_as_unscoped() {
+        assert_eq!(
+            check_verify("npx nx build").unwrap_err().rule,
+            "verify_not_scoped"
+        );
+    }
+
+    #[test]
+    fn reject_nx_non_build_and_junk_args() {
+        // only `build` is allowed after nx
+        assert_eq!(
+            check_verify("npx nx test web").unwrap_err().rule,
+            "verify_not_allowlisted"
+        );
+        // no stray positional after the project
+        assert_eq!(
+            check_verify("npx nx build web extra").unwrap_err().rule,
+            "verify_not_allowlisted"
+        );
+        // unknown package still rejected
+        assert_eq!(
+            check_verify("npx webpack build").unwrap_err().rule,
+            "verify_not_allowlisted"
         );
     }
 
