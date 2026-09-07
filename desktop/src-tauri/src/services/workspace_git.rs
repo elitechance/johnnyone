@@ -1,7 +1,8 @@
 //! Workspace-repo git helpers for kloo-mode task commits.
 //!
-//! Distinct from `git_history.rs` (plan-store `.git`). Commits only the
-//! allowed `files[]` in `plan.workspace_path`.
+//! Distinct from `git_history.rs` (plan-store `.git`). `commit_task` commits only
+//! the allowed `files[]`; `commit_phase` is the phase-boundary backstop that commits
+//! whatever a T1 worker left behind.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -88,6 +89,65 @@ pub fn commit_task(
     ))
 }
 
+/// Commit everything left in the workspace at a phase boundary. `Ok(None)` if the tree
+/// is already clean.
+///
+/// A T1 tmux worker (claude_code / grok) is never TOLD to commit — no task prompt asks for
+/// it and `planner_prompts` injects no such instruction — so whether a phase's work lands in
+/// git depends on the agent's habits. One initiative committed per phase; the next reported
+/// `approved`/`complete` with all seven phases living only in the working tree, where any
+/// checkout or clean would have destroyed them. This is the deterministic backstop: after a
+/// phase passes, J1 commits the workspace itself rather than hoping.
+///
+/// Unlike `commit_task` this stages everything (`git add -A`), because there is no `files[]`
+/// contract on the T1 path — the whole point is that we do not know what the agent touched.
+pub fn commit_phase(
+    workspace: &Path,
+    phase_id: &str,
+    summary: &str,
+) -> Result<Option<String>, String> {
+    if !workspace.join(".git").exists() {
+        return Ok(None);
+    }
+    ensure_identity(workspace);
+
+    let add = git(workspace, &["add", "-A"])?;
+    if !add.status.success() {
+        return Err(format!(
+            "git add -A failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+    let staged = git(workspace, &["diff", "--cached", "--quiet"])?;
+    if staged.status.success() {
+        return Ok(None); // nothing left to commit — the worker already did it
+    }
+
+    let first_line = summary.lines().next().unwrap_or("").trim();
+    let subject = if first_line.is_empty() {
+        format!("phase {phase_id}: work committed by JohnnyOne")
+    } else {
+        let mut s: String = first_line.chars().take(64).collect();
+        if first_line.chars().count() > 64 {
+            s.push('…');
+        }
+        format!("phase {phase_id}: {s}")
+    };
+    let body = "Committed at the phase boundary by JohnnyOne. The worker left changes\n                uncommitted; this backstop keeps a passed phase from living only in the\n                working tree.";
+    let commit = git(workspace, &["commit", "-m", &subject, "-m", body])?;
+    if !commit.status.success() {
+        return Err(format!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        ));
+    }
+    let sha = git(workspace, &["rev-parse", "HEAD"])?;
+    if !sha.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&sha.stdout).trim().to_string()))
+}
+
 /// Index `task <phase>/<id>:` subjects. Newest commit for a pair wins.
 pub fn index_task_commits(
     workspace: &Path,
@@ -158,6 +218,62 @@ mod tests {
         assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
         ensure_identity(&d);
         d
+    }
+
+    #[test]
+    fn commit_phase_sweeps_everything_a_worker_left_behind() {
+        let repo = tmp_repo();
+        // a worker that wrote files and never committed -- the initiative-2 failure
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/b.rs"), "fn b() {}\n").unwrap();
+        let sha = commit_phase(&repo, "06-loop-metering", "PASS — metering wired")
+            .unwrap()
+            .expect("a dirty tree must produce a commit");
+        assert!(!sha.is_empty());
+        let status = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "tree must be clean after the phase commit"
+        );
+        let log = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "log", "-1", "--pretty=%s"])
+            .output()
+            .unwrap();
+        let subject = String::from_utf8_lossy(&log.stdout);
+        assert!(subject.contains("phase 06-loop-metering:"), "{subject}");
+        assert!(subject.contains("PASS"), "{subject}");
+    }
+
+    #[test]
+    fn commit_phase_is_a_no_op_when_the_worker_already_committed() {
+        let repo = tmp_repo();
+        std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+        commit_task(&repo, "00-x", "01-y", "y", &[Path::new("a.rs")])
+            .unwrap()
+            .expect("commit");
+        assert!(
+            commit_phase(&repo, "00-x", "PASS").unwrap().is_none(),
+            "a clean tree must not produce an empty phase commit"
+        );
+    }
+
+    #[test]
+    fn commit_phase_subject_is_bounded_and_single_line() {
+        let repo = tmp_repo();
+        std::fs::write(repo.join("a.rs"), "x\n").unwrap();
+        let long = "y".repeat(400);
+        commit_phase(&repo, "01-p", &format!("{long}\nsecond line")).unwrap().unwrap();
+        let log = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "log", "-1", "--pretty=%s"])
+            .output()
+            .unwrap();
+        let subject = String::from_utf8_lossy(&log.stdout);
+        assert!(subject.len() < 120, "subject not bounded: {}", subject.len());
+        assert!(!subject.contains("second line"), "{subject}");
     }
 
     #[test]
