@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA: &str = "j1-task-amendment/v1";
 /// Distinct from planning's `MAX_REVISION_ROUNDS` (6). A surgical replan
 /// must not burn six commercial planner calls mid-phase.
-pub const MAX_REPLAN_ROUNDS: u32 = 3;
+pub const MAX_REPLAN_ROUNDS: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -361,6 +361,7 @@ mod tests {
             files: vec!["src/x.rs".into()],
             verify: "cargo test spec -- --exact".into(),
             must_contain: vec![],
+            must_not_contain: vec![],
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             ctx: None,
             mock: None,
@@ -680,12 +681,10 @@ mod tests {
 
     #[test]
     fn cap_is_three_not_six() {
-        assert_eq!(MAX_REPLAN_ROUNDS, 3);
-        assert_ne!(MAX_REPLAN_ROUNDS, 6);
-        assert!(!replan_cap_reached(1));
-        assert!(!replan_cap_reached(2));
-        assert!(replan_cap_reached(3));
-        assert!(replan_cap_reached(4));
+        assert_eq!(MAX_REPLAN_ROUNDS, 8);
+        assert!(!replan_cap_reached(MAX_REPLAN_ROUNDS - 1));
+        assert!(replan_cap_reached(MAX_REPLAN_ROUNDS));
+        assert!(replan_cap_reached(MAX_REPLAN_ROUNDS + 1));
         let mut a = TaskAmendment {
             schema: SCHEMA.into(),
             plan_id: "p".into(),
@@ -693,14 +692,15 @@ mod tests {
             round: 1,
             routed: vec![],
         };
-        assert_eq!(increment_replan_round(&mut a), Ok(2));
-        assert_eq!(increment_replan_round(&mut a), Ok(3));
+        for expected in 2..=MAX_REPLAN_ROUNDS {
+            assert_eq!(increment_replan_round(&mut a), Ok(expected));
+        }
         assert_eq!(increment_replan_round(&mut a), Err(()));
-        assert_eq!(a.round, 3);
+        assert_eq!(a.round, MAX_REPLAN_ROUNDS);
         assert_eq!(next_episode_round(None), Ok(1));
         assert_eq!(next_episode_round(Some(&a)), Err(()));
-        a.round = 1;
-        assert_eq!(next_episode_round(Some(&a)), Ok(2));
+        a.round = MAX_REPLAN_ROUNDS - 1;
+        assert_eq!(next_episode_round(Some(&a)), Ok(MAX_REPLAN_ROUNDS));
         a.round = 0;
         assert_eq!(next_episode_round(Some(&a)), Ok(1));
     }
@@ -748,7 +748,7 @@ mod tests {
             schema: SCHEMA.into(),
             plan_id: "p".into(),
             phase_id: "00-x".into(),
-            round: 3,
+            round: MAX_REPLAN_ROUNDS,
             routed: vec![],
         };
         save_amendment(&path, &a).unwrap();

@@ -483,7 +483,7 @@ macro_rules! small_mode_task_constraints {
         r#"Each task dir must contain task.yml + prompt.md. Write them at exactly phases/<phase-id>/tasks/<task-id>/ — the tasks/ segment is required. Plan-check only walks that path; a task.yml at phases/<phase-id>/<task-id>/ is empty_plan.
 
 task.yml fields (only these):
-id, files, new, verify, must_contain, depends_on, ctx, cwd
+id, files, new, verify, must_contain, must_not_contain, depends_on, ctx, cwd
 Do not invent other fields.
 
 Field types (serde will reject anything else):
@@ -491,7 +491,8 @@ Field types (serde will reject anything else):
 - files: YAML list of workspace-relative paths
 - new: optional YAML list of new file paths (subset of files). Omit if none. Never a boolean.
 - verify: a SINGLE quoted string, e.g. verify: "cargo test add_works -- --exact". Not a YAML list.
-- must_contain: YAML list of strings
+- must_contain: YAML list of strings (tokens that MUST remain in files[])
+- must_not_contain: YAML list of strings (the deletion gate — tokens that MUST be ABSENT from files[] after the task; see LOCAL-SMALL sizing below)
 - depends_on: YAML list of task ids
 - ctx: integer token budget such as 32768. Never prose.
 - cwd: optional relative directory
@@ -502,7 +503,15 @@ verify must be an allowlisted AND scoped argv command: cargo test with a filter 
 
 UI tasks (.html/.scss/.css in files[]) ARE allowed — a small model writes the markup/styles and the T2 review lens judges the visual result with vision and guides revisions. Every UI task still needs a mechanical verify so the leaf executor knows when it is done: prefer a structural test (npx vitest run <spec>, or npx playwright test <spec> for an Ionic/Angular app, with must_contain anchoring what it must produce or remove); a task editing ONLY styling with no testable logic may gate on a scoped build (npx nx build <project>, or npx ng build for an Angular app). For every UI task, have it capture a screenshot and list that screen in screens-to-verify so the reviewer can judge it visually.
 
-No two tasks in a phase may claim the same file (file_collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward."#
+LOCAL-SMALL sizing (the leaf executor is a SMALL model — plan for its reach, not a commercial model's):
+- One file per task wherever possible, with a short list of concrete edits the prompt.md quotes VERBATIM (byte-for-byte OLD text). A big multi-concern task makes a small model loop or stop half-done.
+- Split a large change into per-file tasks chained by depends_on. EXCEPTION: when two files cannot compile independently (a component class + its template that binds a removed member; an interface + a same-file consumer), put BOTH in one task's files[] so the scoped verify build is satisfiable — never leave a task whose verify can only pass once a DIFFERENT task also runs (that deadlocks).
+- Order a split removal so every intermediate state still COMPILES: strip the template/usages before the member they read, or bundle them.
+- LARGE FILES (> ~1000 lines / ~40 KB): NEVER tell the leaf to read the whole file — that overflows a small model's window and the model call errors before any edit. Quote the exact OLD/NEW edit blocks INLINE in prompt.md (byte-for-byte) and instruct "do NOT read_file; apply the edits below directly". If a file needs many scattered edits, split them into several small same-file tasks chained by depends_on so no single step holds much.
+- REMOVE-AND-ADD is TWO tasks, never one. If a change both DELETES existing content (would carry must_not_contain) AND introduces NEW content not yet in the file (a new test/assertion/branch the file does not already contain, expressed as must_contain), SPLIT it: (a) a pure-DELETE task gated by must_not_contain only (its must_contain, if any, names only content that ALREADY survives), then (b) a pure-ADD task depends_on (a), gated by must_contain for the new content only. A small model reliably deletes OR adds in one pass but OSCILLATES trying to balance both — it is the executor's real ceiling. This applies especially to spec/e2e rewrites that drop an old flow and add a "the X is gone" assertion.
+- DELETION tasks (remove/delete/drop a symbol, prop, binding, block, import) MUST carry must_not_contain listing the exact tokens removed — mirror the acceptance grep ("-> no hits"). Without it a small model stops at the first green build with the removal half-done and the task falsely passes. must_contain (what stays) + must_not_contain (what goes) + a scoped verify together must make "done" mean "actually complete".
+
+No two tasks in a phase may claim the same file (file_collision) unless one transitively depends_on the other (sequential same-file edits are fine; only concurrently-schedulable overlap is a collision). must_contain must be non-trivial: each needle at least 4 characters and not a stop-needle. depends_on must resolve, form a DAG, and never point forward."#
     };
 }
 
@@ -684,10 +693,10 @@ planning:
         assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_REVIEWER), 0x882713aa907d5d7f);
         assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_PLANNER), 0x7f841cf263c8c761);
         assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_REVIEWER), 0xea96c82d6fcfac66);
-        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_PLANNER), 0xea74fb71968a2b4d);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_PLANNER), 0x9845d60ea37b816b);
         assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_REVIEWER), 0x37ef8923327e716d);
         assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_LEAF_WRAPPER), 0x464e7f9226edda96);
-        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_AMEND_PLANNER), 0x20caf23012644a43);
+        assert_eq!(fnv1a64(DEFAULT_SMALL_MODE_AMEND_PLANNER), 0x4863f68ff2ddcdbd);
     }
 
     #[test]

@@ -335,6 +335,7 @@ mod tests {
             files: vec!["src/x.rs".into()],
             verify: "cargo test spec -- --exact".into(),
             must_contain: vec![],
+            must_not_contain: vec![],
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             ctx: None,
             mock: None,

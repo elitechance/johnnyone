@@ -6607,12 +6607,11 @@ pub(crate) async fn handle_reviewer_output(
                 let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
                 return escalate_phase_no_converge(state, run, phase, round, "NEEDS_CHANGES", &summary).await;
             }
-            let phase_path = Path::new(&run.plan.plan_path)
-                .join("phases")
-                .join(&phase.phase_id);
-            if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
-                return park_kloo_review(state, run, phase, "NEEDS_CHANGES", &review).await;
-            }
+            // Both modes route through send_reviewer_feedback_to_worker: for a claude
+            // worker it injects the feedback into the live session; for kloo/local-small
+            // it bridges the reviewer's insights into a guided replan (I19) so the amend
+            // planner turns them into corrective glimmer tasks. (kloo mode used to park
+            // here, before the bridge existed.)
             send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
         Some("BLOCKED") => {
@@ -6707,11 +6706,50 @@ pub(crate) async fn send_reviewer_feedback_to_worker(
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
-    if !crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
-        let worker_session_id = ensure_dev_worker_session(state, run).await?;
-        let prompt = append_worker_report(run, reviewer_feedback_prompt(phase, reviewer_output));
-        terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
+    // KLOO / local-small (glimmer): there is no persistent worker session to inject
+    // reviewer feedback into (glimmer runs as per-task kloo subprocesses with fixed,
+    // self-contained task.yml prompts). BRIDGE the reviewer's insights into a REPLAN:
+    // write them as the queued guidance the amend planner (claude_code) consumes, then
+    // start the replan. The amend planner rewrites the affected task prompts to address
+    // the reviewer's findings, and glimmer re-runs the updated tasks. Everything stays on
+    // the CLI (claude_code), the full API verdict is preserved, and OpenRouter is never used.
+    if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
+        let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
+        let guidance = format!(
+            "The 3-lens validation returned a non-pass verdict for this phase. The phase's \
+             existing tasks are already committed, so ADD one or more NEW corrective tasks \
+             (with fresh ids the phase has not used) that fix exactly what the reviewer \
+             flagged — each scoped to the affected files[], with must_contain / \
+             must_not_contain anchoring the required end state and depends_on the tasks it \
+             builds on — so the small-model executor applies the fixes on the next pass. Do \
+             not rewrite an already-`done` task in place (it will not re-run). Reviewer \
+             findings to address:\n\n{}",
+            reviewer_verdict_block(reviewer_output)
+        );
+        crate::services::task_replan::write_human_comment(&runs_dir, &guidance)?;
+        append_event(
+            state,
+            &run.plan.id,
+            Some(&phase.phase_id),
+            "agent_feedback_sent_to_worker",
+            feedback_event_payload(review),
+        )?;
+        return begin_phase_replan(
+            state,
+            run,
+            phase,
+            "reviewer-feedback",
+            "reviewer",
+            &ReplanCtrl::live(),
+        )
+        .await;
     }
+
+    // NON-kloo (claude_code worker): inject the feedback into the worker's live session
+    // and loop the phase back review → development.
+    let worker_session_id = ensure_dev_worker_session(state, run).await?;
+    let prompt = append_worker_report(run, reviewer_feedback_prompt(phase, reviewer_output));
+    terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
     state.db.with_conn(|conn| {
         // Review requested changes → loop back to the worker: leave the `review` stage, return to
         // `development` for the same phase (the bar reverts review → development).

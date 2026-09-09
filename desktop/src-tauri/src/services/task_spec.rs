@@ -11,6 +11,9 @@ pub struct TaskSpec {
     pub verify: String,
     #[serde(default)]
     pub must_contain: Vec<String>,
+    /// Symbols that MUST be ABSENT from files[] after the task (deletion gate).
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default)]
@@ -343,6 +346,7 @@ verify: "cargo test spec -- --exact"
             files: vec!["src/x.rs".into()],
             verify: "cargo test spec -- --exact".into(),
             must_contain: vec![],
+            must_not_contain: vec![],
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             ctx: None,
             mock: None,

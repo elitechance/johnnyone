@@ -1139,6 +1139,11 @@ async fn residue_commits<H: LoopHost>(
         spec.files
             .iter()
             .any(|f| contents.get(f).map(|c| c.contains(n)).unwrap_or(false))
+    }) && spec.must_not_contain.iter().all(|n| {
+        !spec
+            .files
+            .iter()
+            .any(|f| contents.get(f).map(|c| c.contains(n)).unwrap_or(false))
     });
     if !needles_ok {
         return Ok(false);

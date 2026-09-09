@@ -9,6 +9,7 @@ pub const CHECK_EXIT: &str = "exit";
 pub const CHECK_SCOPE: &str = "scope";
 pub const CHECK_CHANGED: &str = "changed";
 pub const CHECK_MUST_CONTAIN: &str = "must_contain";
+pub const CHECK_MUST_NOT_CONTAIN: &str = "must_not_contain";
 pub const CHECK_VERIFY: &str = "verify";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +147,25 @@ pub fn run_checks(
         }
     }
 
+    // must_not_contain: the deletion gate. Every needle must be ABSENT from
+    // every files[] file — a half-done removal that still compiles fails here,
+    // where verify (compiles) + must_contain (present) alone would let it pass.
+    for needle in &spec.must_not_contain {
+        let still_in = spec.files.iter().find(|file| {
+            inputs
+                .post_contents
+                .get(*file)
+                .map(|c| c.contains(needle.as_str()))
+                .unwrap_or(false)
+        });
+        if let Some(file) = still_in {
+            failed.push(CheckFail {
+                check: CHECK_MUST_NOT_CONTAIN.into(),
+                reason: format!("must_not_contain {:?} still present in {}", needle, file),
+            });
+        }
+    }
+
     let verify_ok = result.verify.as_ref().map(|v| v.passed) == Some(true);
     let postchecks_ok = result
         .postchecks
@@ -265,7 +285,11 @@ pub fn classify(
         return FailureClass::Infra;
     }
     if report
-        .map(|r| r.has_fail(CHECK_CHANGED) || r.has_fail(CHECK_MUST_CONTAIN))
+        .map(|r| {
+            r.has_fail(CHECK_CHANGED)
+                || r.has_fail(CHECK_MUST_CONTAIN)
+                || r.has_fail(CHECK_MUST_NOT_CONTAIN)
+        })
         .unwrap_or(false)
     {
         return FailureClass::Model;
@@ -348,11 +372,18 @@ impl Ladder {
         let mut ladder = Ladder::default();
         if let Some(m) = base_model.map(str::trim).filter(|s| !s.is_empty()) {
             let label = m.rsplit('/').next().unwrap_or(m).to_string();
-            ladder.slots[0] = LadderSlot {
+            // Local-small runs are GLIMMER-ONLY: no commercial escalation tiers.
+            // The default ladder's escalation models (anthropic/claude-*) resolve
+            // through OpenRouter (kloo_cli DEFAULT_PROVIDER), which this deployment
+            // does not use. Replace the whole ladder with the single base tier and
+            // give it more attempts; when it exhausts, the coordinator's route:planner
+            // path hands off to the replan planner (claude_code = the direct Anthropic
+            // subscription, NOT OpenRouter) to re-decompose for the small model.
+            ladder.slots = vec![LadderSlot {
                 model: m.to_string(),
                 label,
-                max_model_attempts: 2,
-            };
+                max_model_attempts: 3,
+            }];
         }
         ladder
     }
@@ -416,7 +447,7 @@ mod tests {
     use crate::providers::kloo_cli::{FilesChanged, HookResult, VerifyResult};
 
     #[test]
-    fn for_executor_sets_base_tier_and_keeps_escalation() {
+    fn for_executor_is_glimmer_only_no_openrouter_escalation() {
         // base tier = configured model, label derived from the id after the last '/'
         let l = Ladder::for_executor(Some("muse-glimmer-30b"));
         match l.next_attempt(&[], None) {
@@ -426,14 +457,17 @@ mod tests {
             }
             s => panic!("{s:?}"),
         }
-        // after the base tier is exhausted on MODEL failures, escalation is still commercial
-        let hist = vec![
-            Attempt { label: "muse-glimmer-30b".into(), model: "muse-glimmer-30b".into(), class: Some(FailureClass::Model), infra_retry: false },
-            Attempt { label: "muse-glimmer-30b".into(), model: "muse-glimmer-30b".into(), class: Some(FailureClass::Model), infra_retry: false },
-        ];
-        match l.next_attempt(&hist, Some(FailureClass::Model)) {
-            Step::Run { label, .. } => assert_eq!(label, "claude"),
+        let g = || Attempt { label: "muse-glimmer-30b".into(), model: "muse-glimmer-30b".into(), class: Some(FailureClass::Model), infra_retry: false };
+        // after 2 MODEL failures there is still a 3rd glimmer attempt (max_model_attempts=3)
+        match l.next_attempt(&[g(), g()], Some(FailureClass::Model)) {
+            Step::Run { model, .. } => assert_eq!(model, "muse-glimmer-30b"),
             s => panic!("{s:?}"),
+        }
+        // after 3 MODEL failures the ladder is EXHAUSTED — NO commercial/OpenRouter tier;
+        // the coordinator's route:planner path hands off to the replan planner instead.
+        match l.next_attempt(&[g(), g(), g()], Some(FailureClass::Model)) {
+            Step::Exhausted => {}
+            s => panic!("expected Exhausted (glimmer-only), got {s:?}"),
         }
         // None base ⇒ default ladder (unchanged commercial behaviour)
         match Ladder::for_executor(None).next_attempt(&[], None) {
@@ -448,6 +482,7 @@ mod tests {
             files: vec!["src/add.rs".into()],
             verify: "cargo test add -- --exact".into(),
             must_contain: vec!["pub fn add".into()],
+            must_not_contain: vec![],
             depends_on: vec![],
             ctx: Some(32_768),
             mock: None,
@@ -615,6 +650,30 @@ mod tests {
         let body = contents(&[("src/add.rs", "fn nope() {}")]);
         let report = run_checks(&spec, &result, 0, &ci(&[], pre, post, body));
         assert!(report.has_fail(CHECK_MUST_CONTAIN));
+    }
+
+    #[test]
+    fn present_forbidden_fails_must_not_contain() {
+        // A deletion that still compiles and keeps the must_contain guard, but
+        // leaves the forbidden symbol behind, must FAIL the deletion gate.
+        let mut spec = spec_add();
+        spec.must_not_contain = vec!["patientMode".into()];
+        let (result, pre, post, _) = green_inputs();
+        let body = contents(&[("src/add.rs", "pub fn add() { let patientMode = 1; }")]);
+        let report = run_checks(&spec, &result, 0, &ci(&[], pre, post, body));
+        assert!(report.has_fail(CHECK_MUST_NOT_CONTAIN));
+        // and it classifies as a Model failure (retry/escalate), like must_contain
+        assert_eq!(classify(Some(&report), Some(&result), None, Some(0), None), FailureClass::Model);
+    }
+
+    #[test]
+    fn absent_forbidden_passes_must_not_contain() {
+        let mut spec = spec_add();
+        spec.must_not_contain = vec!["patientMode".into()];
+        let (result, pre, post, _) = green_inputs();
+        let body = contents(&[("src/add.rs", "pub fn add() {}")]);
+        let report = run_checks(&spec, &result, 0, &ci(&[], pre, post, body));
+        assert!(!report.has_fail(CHECK_MUST_NOT_CONTAIN));
     }
 
     #[test]
