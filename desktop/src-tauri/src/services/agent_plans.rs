@@ -6841,6 +6841,29 @@ async fn pass_phase(
     // The verdict the gate actually reached, not a literal 'pass' — a phase passed with
     // follow-ups has to say so, or the follow-ups are lost at the step meant to carry them.
     let gate_verdict = verdict.to_ascii_lowercase();
+
+    // A T1 tmux worker is never instructed to commit -- no task prompt asks, and
+    // planner_prompts injects nothing -- so whether a phase's work reaches git depends on
+    // the agent's habits. One initiative committed per phase; the next reported complete
+    // with all seven phases living only in the working tree. Commit at the boundary
+    // ourselves. No-op when the worker already committed; never fatal to the pass.
+    match crate::services::workspace_git::commit_phase(
+        Path::new(&run.plan.workspace_path),
+        phase_id,
+        summary,
+    ) {
+        Ok(Some(sha)) => {
+            tracing::info!(
+                plan_id, phase_id, sha = %sha,
+                "phase boundary: committed work the worker left uncommitted"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(plan_id, phase_id, error = %e, "phase-boundary commit failed");
+        }
+    }
+
     let next_phase = run
         .phases
         .iter()
