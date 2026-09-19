@@ -233,7 +233,13 @@ pub async fn resize_terminal(
     rows: u16,
 ) -> Result<(), String> {
     let terminal = ensure_terminal_session(state, &session_id, cols, rows).await?;
-    resize_pane(&terminal.pane_id, cols, rows).await?;
+    // Never resize an EXTERNAL tmux pane — a tmux session has one shared size,
+    // so resizing here would squash the user's own attached client to the web
+    // viewport. Same rule `ensure_terminal_session` already applies; this path
+    // (the xterm resize observer) was missing it.
+    if !load_session_config(state, &session_id)?.attached_tmux {
+        resize_pane(&terminal.pane_id, cols, rows).await?;
+    }
     if has_terminal_visual_subscribers(state, &session_id).await {
         start_capture_loop(state, None, terminal).await;
     }

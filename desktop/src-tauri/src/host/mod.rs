@@ -144,6 +144,19 @@ impl QueryRoot {
             .collect())
     }
 
+    /// External tmux sessions a new terminal can attach to (excludes the
+    /// `johnnyone_<id>` panes JohnnyOne already manages). Mirrors the worker's
+    /// `listTmuxSessions` — the console prefers the host when it is reachable
+    /// (`queryPreferLocalHost`) and has no worker fallback, so this field must
+    /// exist on BOTH surfaces or attach breaks in the desktop app.
+    async fn list_tmux_sessions(&self) -> async_graphql::Result<Vec<GqlTmuxSession>> {
+        Ok(crate::terminal::list_external_tmux_sessions()
+            .await?
+            .into_iter()
+            .map(GqlTmuxSession::from)
+            .collect())
+    }
+
     async fn host_settings(&self, ctx: &Context<'_>) -> async_graphql::Result<GqlHostSettings> {
         let state = ctx.data_unchecked::<AppState>();
         Ok(settings_service::load_host_settings(state).into())
@@ -406,6 +419,11 @@ struct AiSession {
     total_cost_cents: i64,
     created_at: String,
     updated_at: String,
+    /// True when this session views an EXTERNAL tmux session rather than its
+    /// own `johnnyone_<id>` pane. Mirrors the worker's `attachedTmux` — the
+    /// console selects it on the shared `listAiSessions` query that
+    /// `queryPreferLocalHost` may route here.
+    attached_tmux: bool,
 }
 
 impl From<Session> for AiSession {
@@ -422,6 +440,7 @@ impl From<Session> for AiSession {
             total_cost_cents: value.total_cost_cents,
             created_at: value.created_at,
             updated_at: value.updated_at,
+            attached_tmux: value.attached_tmux,
         }
     }
 }
@@ -686,6 +705,26 @@ impl From<ChatCompleteEvent> for GqlAiChatComplete {
     }
 }
 
+/// An external tmux session a terminal can attach to. Mirrors the worker's
+/// `TmuxSession` type field-for-field so one client query serves both surfaces.
+#[derive(SimpleObject)]
+#[graphql(name = "TmuxSession", rename_fields = "camelCase")]
+struct GqlTmuxSession {
+    name: String,
+    attached: bool,
+    windows: u32,
+}
+
+impl From<crate::terminal::ExternalTmuxSession> for GqlTmuxSession {
+    fn from(value: crate::terminal::ExternalTmuxSession) -> Self {
+        Self {
+            name: value.name,
+            attached: value.attached,
+            windows: value.windows,
+        }
+    }
+}
+
 #[derive(InputObject)]
 #[graphql(name = "CreateAiSessionInput", rename_fields = "camelCase")]
 struct CreateAiSessionInput {
@@ -693,6 +732,11 @@ struct CreateAiSessionInput {
     provider: Option<String>,
     model: Option<String>,
     working_directory: Option<String>,
+    /// When set, the new session ATTACHES to this existing external tmux
+    /// session instead of spawning a `johnnyone_<id>` pane. Closing it only
+    /// detaches. Must mirror the worker input — the console's attach flow
+    /// sends this field whichever surface the mutation lands on.
+    tmux_session_name: Option<String>,
 }
 
 impl From<CreateAiSessionInput> for CreateSessionInput {
@@ -710,8 +754,7 @@ impl From<CreateAiSessionInput> for CreateSessionInput {
             // Setup commands are a planner/development (shell-worker) concern,
             // not exposed on the host AiSession surface.
             setup_commands: None,
-            // tmux-attach is exposed via the worker RPC surface, not the host.
-            tmux_session_name: None,
+            tmux_session_name: value.tmux_session_name,
         }
     }
 }
