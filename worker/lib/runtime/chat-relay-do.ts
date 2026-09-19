@@ -388,7 +388,14 @@ export class ChatRelayDO implements DurableObject {
             const rpcCtx = {
               db: (this.env as any).DB as D1Database,
               env: { CHAT_RELAY_DO: (this.env as any).CHAT_RELAY_DO },
-              auth: { userId: authCtx.userId, tenantId: authCtx.tenantId },
+              // `isAuthenticated` is REQUIRED: this ctx carries no `request`, so
+              // `requireIdentity` (relayRpc's first step) falls through to its
+              // already-verified-socket branch (D13), which trusts `ctx.auth` ids
+              // ONLY when this flag is true. Without it every ownership check threw
+              // UNAUTHENTICATED — which isn't a transport error, so it surfaced as
+              // `forbidden_session` and silently killed every client→desktop
+              // terminal/stream control. The socket was authenticated at upgrade.
+              auth: { userId: authCtx.userId, tenantId: authCtx.tenantId, isAuthenticated: true },
             };
             try {
               const owned = await verifySessionOwnership(rpcCtx as any, sid);
