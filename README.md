@@ -305,11 +305,18 @@ Only the **worker** and **web client** deploy to Cloudflare. The desktop binary
 runs on each user's machine.
 
 ```bash
-npm run deploy:web                      # web client only → johnnyone.pages.dev
-lokal cf worker deploy --env prod       # worker only → johnnyone.ethan-353.workers.dev
+npm run deploy:web                      # worker + web client, BOTH (see note)
+npm run deploy:worker                   # worker only → johnnyone.ethan-353.workers.dev
+lokal cf pages deploy --env prod        # Pages only (after a fresh nx build web)
 lokal cf deploy --env prod              # worker + Pages, both
-lokal cf db migrate --env prod          # apply D1 migrations
+lokal cf db migrate --env prod          # apply D1 migrations (NOT part of deploy:web)
 ```
+
+> **`deploy:web` is not web-only.** Despite the name it runs
+> `nx build web --skip-nx-cache && lokal cf worker deploy --env prod && lokal cf pages deploy --env prod`
+> — so it ships the **worker too**, including any uncommitted worker changes in
+> your tree. Use `npm run deploy:worker` when you mean worker-only, and
+> `lokal cf pages deploy --env prod` when you mean Pages-only.
 
 ### Account + URLs
 

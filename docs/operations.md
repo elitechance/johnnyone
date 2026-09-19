@@ -190,6 +190,53 @@ rejects foreign `sessionId` (returns `forbidden_session` ack). The DO forwards
 relay` and `terminal_command failed error=…` (in `agent/mod.rs`) to localize
 failures. (See also `docs/api-partner/` for the partner WSS contract.)
 
+### `forbidden_session` does NOT only mean "foreign session"
+
+The gate calls `verifySessionOwnership` → `relayRpc` → `requireIdentity`. That context carries no
+`request`, so `requireIdentity` uses its already-verified-socket branch (D13), which trusts
+`ctx.auth` ids **only when `isAuthenticated === true`**. If the flag is missing, it throws
+`UNAUTHENTICATED` — which is not one of the transport messages `verifySessionOwnership` re-throws,
+so it is swallowed into `owned = false` and the client just sees `forbidden_session`. Every
+client→desktop control (`visual_subscribe`/`visual_refresh`/`stream_subscribe`/terminal input) rides
+this gate, so one bad ctx silently kills all live terminal streaming for remote clients while
+GraphQL keeps working.
+
+**Triage:** if the desktop log shows **no** `terminal_command received from relay` line for the
+attempt, the deny happened worker-side, not on the host. Split the two deny branches by whether a
+`get_session` RPC reached the host at all (the auth-context guard replies without one) — and note
+that the initiative console masks a dead stream with its `capturePrimaryScreen` poll, so check the
+plain shell surface (`/shells/:id`), which has no poll and fails visibly.
+
+## TWO GraphQL surfaces — the console picks one, with no fallback
+
+There are two independent schemas, and **a field the console selects must exist on BOTH**:
+
+| Surface | Schema source | Reached when |
+|---|---|---|
+| Worker | `worker/schema/*.graphql` + `worker/resolvers/**` | remote browser (`johnnyone.pages.dev`) |
+| Desktop host | `desktop/src-tauri/src/host/mod.rs` (`QueryRoot`/`MutationRoot`, async-graphql) | page served on `localhost` — i.e. the desktop app |
+
+`GraphQLClient.queryPreferLocalHost()` (`ui/src/services/graphql-client.ts`) routes to
+`127.0.0.1:7788` whenever `window.location.hostname` is `localhost`/`127.0.0.1`, and **falls back to
+nothing** — if the host schema lacks the field, the query hard-errors
+(`Unknown field "X" on type "QueryRoot"`) and the calling page shows a load error.
+
+**Symptom to recognise:** a feature works in a remote browser but is broken *only in the desktop app*
+(or vice-versa). That asymmetry almost always means schema drift, not a logic bug.
+
+Adding a field used by the console is therefore a **two-file change minimum** — the worker schema AND
+`host/mod.rs`. Real incident: tmux attach shipped worker-only, so `listTmuxSessions`, `attachedTmux`
+on `AiSession`, and `tmuxSessionName` on `CreateAiSessionInput` were all missing on the host; the
+Shells page issued both calls in one `Promise.all`, so the desktop app showed an empty, errored list.
+
+Check parity by introspecting the running host directly:
+
+```bash
+curl -s -X POST http://127.0.0.1:7788/graphql -H 'content-type: application/json' \
+  -d '{"query":"{ __type(name:\"AiSession\"){ fields{ name } } }"}'
+# and the exact query the client sends — probe with the SAME field set, or the gap hides
+```
+
 ## Deploying — use the `lokal` CLI
 
 Deploy with the **`lokal` CLI** (preferred — wraps build + Cloudflare deploy).

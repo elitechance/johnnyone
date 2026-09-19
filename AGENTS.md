@@ -194,8 +194,14 @@ npm run deploy:web    # nx build web && lokal cf worker deploy --env prod && lok
   `run-`) may need adding to `MUTATION_PREFIXES` in the shared `lokal` CLI
   (`lokal/apps/lokal-infra/packages/cli/cloudflare/worker.ts`) — a **separate repo**. Without it, the
   resolver falls back to `type Query` and `lokal cf worker validate` breaks.
-- Restart the engine with `npm run desktop` (rebuilds release engine, frees `:7788`, relaunches). This
-  **kills any tmux agent pane**, so do it at a chosen boundary, not mid-phase.
+- Restart the engine with `npm run desktop` (rebuilds release engine, frees `:7788`, relaunches).
+  tmux panes **survive** this — they are separate processes and the host reattaches by
+  `tmux_session_name` (verified across repeated restarts with `johnnyone_*` panes still listed).
+  What it DOES cost: ~10s with no host, which the user sees in their open UI as
+  **"connection refused"**, plus any in-flight relay RPC. So **tell the user before you cut over**,
+  and batch engine changes into ONE rebuild at a boundary rather than restarting per fix.
+- **Only rebuild/restart the engine for `desktop/` changes.** Web- or worker-only changes reach the
+  user through `npm run deploy:web`; restarting the host for them is pure downtime for no gain.
 
 ## A worked example (this session shipped these)
 
