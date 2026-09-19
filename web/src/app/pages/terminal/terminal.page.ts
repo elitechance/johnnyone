@@ -429,7 +429,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // Mobile master-detail hides the list only when the selection actually RESOLVES to a plan. A
   // `recoverableEmpty` selection (set but unresolved) keeps the list/back affordance visible so the
   // user can recover instead of being stranded (C1).
-  protected readonly hasResolvedSelection = computed<boolean>(() => !!this.selectedInitiative());
+  /**
+   * Drives `.has-selection`, which the ≤760px container query uses to decide whether the center pane
+   * or the master list owns the phone screen. The plain-shell surface renders NO master list
+   * (`@if (!plainShellMode())`) and never loads initiatives (`loadInitiatives` is skipped), so keying
+   * this off the initiative alone left `.has-selection` permanently false there — and
+   * `.console:not(.has-selection) .console-center { display: none }` hid the terminal on every phone
+   * viewport while the plain-shell topbar (a direct grid child) still rendered. Desktop never hit it
+   * because the container stays wider than the query. A shell IS the selection on that surface.
+   */
+  protected readonly hasResolvedSelection = computed<boolean>(
+    () => this.plainShellMode() || !!this.selectedInitiative(),
+  );
   /** The session the selected initiative's tabs display: worker ?? reviewer ?? briefing (P1/D2). */
   protected readonly primarySessionId = computed<string | null>(() =>
     resolvePrimarySessionId(this.selectedInitiative()),
@@ -2290,7 +2301,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   /** Start/stop the Raw-terminal capture poll for the given primary session (null = stop). Seeds the
-   *  pane immediately, then refreshes every 2.5s so a mostly-idle agent session still renders live. */
+   *  pane immediately, then refreshes every 500ms so a mostly-idle agent session still renders live. */
   private syncPrimaryScreenPoll(sessionId: string | null): void {
     if (sessionId === this.primaryScreenSessionId) return;
     this.primaryScreenSessionId = sessionId;
@@ -2300,7 +2311,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.primaryScreenPollInterval = setInterval(() => {
       if (this.primaryScreenSessionId !== sessionId || document.hidden) return;
       void this.capturePrimaryScreen(sessionId);
-    }, 2500);
+    }, 500);
   }
 
   /** Pull one screen snapshot via the reliable `captureTerminal` request/response path and inject it

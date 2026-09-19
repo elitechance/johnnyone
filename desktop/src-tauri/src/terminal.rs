@@ -18,12 +18,17 @@ const INBOX_DIR: &str = ".johnnyone/inbox";
 /// typed into the TUI — avoids Codex `\n` literals and Grok paste blobs.
 const FILE_HANDOFF_MIN_LEN: usize = 200;
 
-const CAPTURE_INTERVAL_ACTIVE_MS: u64 = 2_000;
+const CAPTURE_INTERVAL_ACTIVE_MS: u64 = 500;
 const CAPTURE_INTERVAL_IDLE_MS: u64 = 10_000;
 const CAPTURE_ACTIVITY_WINDOW_MS: u128 = 3_000;
-const CURSOR_ONLY_MIN_INTERVAL_MS: u128 = 2_000;
+const CURSOR_ONLY_MIN_INTERVAL_MS: u128 = 500;
 /// Minimum interval between `terminal_screen` relay events (all publish paths).
-const MIN_TERMINAL_SCREEN_PUBLISH_MS: u128 = 2_000;
+/// This throttle bounds Cloudflare Durable Object traffic — it is a cost control,
+/// not a rendering detail. Keep the mechanism; only the value is tuned. At 500ms a
+/// continuously-changing pane publishes at most 2 events/sec per subscribed session
+/// (4x the previous 2s ceiling). The idle cadence above is what keeps a quiet
+/// session cheap, so lower that one only deliberately.
+const MIN_TERMINAL_SCREEN_PUBLISH_MS: u128 = 500;
 const DEFAULT_HISTORY_CAPTURE_LINES: u16 = 200;
 const MAX_HISTORY_CAPTURE_LINES: u16 = 2000;
 
