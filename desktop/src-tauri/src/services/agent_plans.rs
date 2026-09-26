@@ -4,7 +4,7 @@ use crate::db::models::{
     CreateBriefingInput, CreateSessionInput, ValidationLens,
 };
 use crate::providers::CliProvider;
-use crate::events::AgentPlanRunEvent;
+use crate::events::{AgentPlanRunEvent, StreamEvent};
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
@@ -3634,6 +3634,35 @@ pub async fn record_agent_report(
         "update" => None,
         other => return Err(format!("unknown report kind: {}", other)),
     };
+    // Human-facing lane (D6): `update` is progress narration and `blocked` needs attention —
+    // both are things a watcher wants live, so mirror them onto the structured stream BEFORE the
+    // slot insert moves `summary`. The other kinds (`ready`/`verdict`/`done`) are coordinator
+    // control signals, not narration, and stay off this lane. Emitting is best-effort: a send
+    // error just means nobody is subscribed, exactly as the chat/terminal lanes treat it.
+    if matches!(kind_norm.as_str(), "update" | "blocked") {
+        let text = summary
+            .clone()
+            .or_else(|| reason.clone())
+            .or_else(|| findings.clone())
+            .unwrap_or_else(|| {
+                if kind_norm == "blocked" {
+                    "Agent is blocked and needs a decision.".to_string()
+                } else {
+                    "(no summary)".to_string()
+                }
+            });
+        let _ = state.stream_event_tx.send(StreamEvent {
+            session_id: session_id.clone(),
+            seq: next_report_stream_seq(),
+            kind: if kind_norm == "blocked" { "error" } else { "text" }.to_string(),
+            text: Some(text),
+            language: None,
+            tool_name: None,
+            data: Some(json!({ "role": role, "reportKind": kind_norm })),
+            r#final: None,
+        });
+    }
+
     state.agent_reports.lock().await.insert(
         session_id.clone(),
         AgentReport {
@@ -3649,6 +3678,15 @@ pub async fn record_agent_report(
     );
     tracing::info!(session_id, role, kind = %kind_norm, "recorded structured agent report");
     Ok(())
+}
+
+/// Monotonic `seq` for report-sourced stream events. `StreamEvent.seq` only has to order/dedup
+/// events on the client, so one process-wide counter is enough — it never collides with the chat
+/// lane's per-turn counter because the client keys transcripts by `sessionId` first.
+fn next_report_stream_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REPORT_SEQ: AtomicU64 = AtomicU64::new(0);
+    REPORT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A `verdict` report is legitimate from the plan's `reviewer` or any lens session.
@@ -4637,10 +4675,15 @@ fn report_command(session_id: &str, kind: &str) -> String {
     const VERDICT: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"verdict\\\",verdict:\\\"<PASS|PASS_WITH_FOLLOWUPS|NEEDS_CHANGES|BLOCKED>\\\")}\"}'";
     const BLOCKED: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"blocked\\\")}\"}'";
     const DONE: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"done\\\")}\"}'";
+    // `update` is the one kind whose payload is free text, so unlike the enum-only kinds above it
+    // CAN break the surrounding quoting. The placeholder tells the agent the constraint inline;
+    // a malformed body just fails the curl, which is harmless — progress is advisory, never a gate.
+    const UPDATE: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"update\\\",summary:\\\"ONE_LINE_NO_QUOTES\\\")}\"}'";
     let tmpl = match kind {
         "verdict" => VERDICT,
         "blocked" => BLOCKED,
         "done" => DONE,
+        "update" => UPDATE,
         _ => READY,
     };
     tmpl.replace("SESSION_ID", session_id)
@@ -4762,9 +4805,10 @@ async fn run_docs_commit_agent(state: &AppState, plan_id: &str) -> Result<(), St
 
 fn worker_report_instruction(session_id: &str) -> String {
     format!(
-        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator knows you are done. When this phase is complete and ready for T2 review, run this exact command:\n{}\n\nIf you get genuinely stuck and need a human decision you cannot resolve yourself (e.g. a missing credential, or an ambiguous requirement with no safe default), FIRST clearly state your question/blocker in your output, THEN run this command and wait — the coordinator will alert a human, who replies right here to unblock you:\n{}\n",
+        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator knows you are done. When this phase is complete and ready for T2 review, run this exact command:\n{}\n\nIf you get genuinely stuck and need a human decision you cannot resolve yourself (e.g. a missing credential, or an ambiguous requirement with no safe default), FIRST clearly state your question/blocker in your output, THEN run this command and wait — the coordinator will alert a human, who replies right here to unblock you:\n{}\n\nPROGRESS (optional, but do it). A human may be watching this run from a phone, where they see ONLY what you report here — not your terminal. After each meaningful step (a task finished, a test suite run, a decision taken), run this to tell them what just happened:\n{}\n\nReplace ONE_LINE_NO_QUOTES with a single short line of plain text — no quotes, no newlines, no backslashes, since it sits inside a shell-quoted JSON string. Say what changed, not what you are about to do: \"migration 0021 applied, 14 tests pass\" beats \"working on migrations\". Do NOT report every tool call — aim for a handful per phase. This never gates anything; if the command fails, carry on.\n",
         report_command(session_id, "ready"),
         report_command(session_id, "blocked"),
+        report_command(session_id, "update"),
     )
 }
 

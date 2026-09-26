@@ -109,6 +109,16 @@
       @if (sh?.provider) {
         <span class="ps-dim">· {{ providerLabel(sh!.provider) }}</span>
       }
+      <!-- Transcript vs Raw. Transcript is the phone default (the mirrored pane is 172 cols wide
+           and hard-wraps below ~55); Raw is the real terminal, still one tap away. -->
+      <div class="ps-views" role="group" aria-label="Shell view">
+        <button type="button" class="ps-view" [class.on]="shellView() === 'transcript'"
+                [attr.aria-pressed]="shellView() === 'transcript'"
+                (click)="setShellView('transcript')">Transcript</button>
+        <button type="button" class="ps-view" [class.on]="shellView() === 'raw'"
+                [attr.aria-pressed]="shellView() === 'raw'"
+                (click)="setShellView('raw')">Raw</button>
+      </div>
       @if (sh) {
         <button class="ps-detach" (click)="closeTerminalPane(sh.id)">
           {{ sh.attached_tmux ? 'detach' : 'close' }}
@@ -123,7 +133,31 @@
            shell session (no per-pane header/tabs, no initiative chrome). -->
       @let sh = currentSession();
       @let shScreen = sh ? (terminalScreens()[sh.id] || null) : null;
-      @if (sh) {
+      @if (sh && shellView() === 'transcript') {
+        <!-- Append-only transcript, fed by the structured stream lane (D6). Reflows at any width,
+             so it does not inherit the mirrored pane's column count. Composer reuses the raw-input
+             path, so replying works identically in either view. -->
+        <section class="terminal-surface shell-transcript">
+          <div class="st-log">
+            @for (ev of shellTranscript(); track $index) {
+              <article class="st-row" [class.err]="ev.kind === 'error'">
+                <span class="st-ic">{{ ev.kind === 'error' ? '!' : ev.kind === 'tool_call' ? '⌘' : '¶' }}</span>
+                <div class="st-bd">
+                  @if (ev.toolName) { <div class="st-hd">{{ ev.toolName }}</div> }
+                  <div class="st-tx">{{ ev.text }}</div>
+                </div>
+              </article>
+            } @empty {
+              <div class="st-empty">
+                <div class="st-empty-t">No transcript yet</div>
+                <div class="st-empty-c">
+                  Progress appears here as the agent reports it. Switch to <b>Raw</b> for the live terminal.
+                </div>
+              </div>
+            }
+          </div>
+        </section>
+      } @else if (sh) {
         <johnny-terminal-screen
           class="terminal-surface plain-shell-screen"
           [screen]="shScreen"

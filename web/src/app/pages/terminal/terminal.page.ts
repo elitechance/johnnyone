@@ -489,6 +489,28 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     () => isPlainShellSurface(this.surfaceParam(), null),
   );
 
+  /**
+   * Plain-shell surface view. The terminal mirrors a tmux pane sized by whoever attached first
+   * (measured: 172 cols), so on a phone its lines hard-wrap into ~55 and the TUI layout is
+   * destroyed. The transcript is append-only prose that reflows at any width, so it is the phone
+   * default; a wide viewport keeps the real terminal, which is what a desktop user came for.
+   * `null` = follow the viewport; an explicit choice sticks for the rest of the visit.
+   */
+  private readonly shellViewOverride = signal<'transcript' | 'raw' | null>(null);
+  protected readonly shellView = computed<'transcript' | 'raw'>(
+    () => this.shellViewOverride() ?? (this.isCompactWorkspace() ? 'transcript' : 'raw'),
+  );
+
+  protected setShellView(view: 'transcript' | 'raw'): void {
+    this.shellViewOverride.set(view);
+  }
+
+  /** Transcript rows for the plain-shell session, newest last. */
+  protected shellTranscript(): StreamEvent[] {
+    const id = this.currentSession()?.id;
+    return id ? this.transcriptEventsFor(id) : [];
+  }
+
   // Plan-tab projections over `planRun` (P2, pure `plan-tab-logic`).
   protected readonly planNav = computed<DocNavEntry[]>(() => docNavModel(this.planRun()));
   protected readonly planCards = computed<PhaseCard[]>(() => phaseCards(this.planRun()));
