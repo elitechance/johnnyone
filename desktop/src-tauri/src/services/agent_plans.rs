@@ -22,6 +22,15 @@ use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
 const TERMINAL_STARTUP_WAIT_MS: u64 = 2_500;
+
+/// Prompt delivery (see `deliver_agent_prompt`). A fresh agent CLI can still be starting when the
+/// fixed startup wait elapses — worst case it is showing a modal (a first-run "do you trust this
+/// folder?") that EATS the keystrokes. The prompt then never arrives, the agent idles at an empty
+/// composer, and the coordinator waits forever on a `ready` that cannot come. Observed on a real
+/// run: 150s of silence with no recovery. So verify delivery and retry instead of assuming.
+const PROMPT_DELIVERY_ATTEMPTS: u32 = 3;
+const PROMPT_DELIVERY_POLL_MS: u64 = 1_200;
+const PROMPT_DELIVERY_POLLS: u32 = 10;
 /// Still referenced in planning prompt text that asks the planner to narrate
 /// readiness; the coordinator no longer scrapes it (completion comes via the
 /// `reportAgentResult` API).
@@ -936,7 +945,7 @@ pub async fn start_plan(
     )?;
 
     let prompt = worker_phase_prompt(&state, &run, &phase)?;
-    terminal::send_terminal_input(&state, worker_session_id, format!("{}\r", prompt)).await?;
+    deliver_agent_prompt(&state, &worker_session_id, &prompt).await?;
 
     spawn_coordinator_loop(state.clone(), id.clone()).await;
     get_plan(&state, &id)
@@ -1485,7 +1494,7 @@ async fn start_planning_run_inner(
     })?;
     append_event(&state, &id, None, "planning_started", json!({}))?;
     let prompt = planning_planner_prompt(&state, &run)?;
-    terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
+    deliver_agent_prompt(&state, &planner_session_id, &prompt).await?;
     spawn_coordinator_loop(state.clone(), id.clone()).await;
     get_plan(&state, &id)
 }
@@ -3230,7 +3239,7 @@ async fn spawn_replan_planner(
     // Prompt is built after worker_session_id is stored so the ready-curl is appended.
     let refreshed = get_plan(state, &run.plan.id)?;
     let prompt = replan_planner_prompt(state, &refreshed, phase, amend_path, preflight_path)?;
-    terminal::send_terminal_input(state, session.id, format!("{}\r", prompt)).await?;
+    deliver_agent_prompt(state, &session.id, &prompt).await?;
     Ok(())
 }
 
@@ -3698,6 +3707,85 @@ pub async fn record_agent_report(
     Ok(())
 }
 
+/// Send an agent its opening prompt and CONFIRM the CLI actually took it.
+///
+/// `send_terminal_input` only guarantees the keystrokes reached tmux — not that the TUI consumed
+/// them. A modal swallows them silently, which used to strand the whole run. So after sending we
+/// look for the prompt echoed in the pane and re-send if it is absent, and we name a trust dialog
+/// explicitly because that is the one cause a human must clear by hand.
+///
+/// Errors are real: the caller should fail the run loudly rather than wait on an agent that was
+/// never told what to do.
+async fn deliver_agent_prompt(
+    state: &AppState,
+    session_id: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    let probe = prompt_probe(prompt);
+    for attempt in 1..=PROMPT_DELIVERY_ATTEMPTS {
+        terminal::send_terminal_input(state, session_id.to_string(), format!("{}\r", prompt))
+            .await?;
+        for _ in 0..PROMPT_DELIVERY_POLLS {
+            sleep(Duration::from_millis(PROMPT_DELIVERY_POLL_MS)).await;
+            let Ok(snapshot) = terminal::capture_terminal_session(state, session_id).await else {
+                continue;
+            };
+            if pane_awaiting_trust(&snapshot.content) {
+                // Deliberately NOT auto-answered: it is a security decision about a directory,
+                // and clicking through it on the user's behalf is not ours to make.
+                return Err(format!(
+                    "agent CLI is waiting on a folder-trust prompt and cannot receive its task. \
+                     Open the session's terminal, approve the workspace once, then re-run. \
+                     (session {session_id})"
+                ));
+            }
+            if probe.is_empty() || snapshot.content.contains(&probe) {
+                return Ok(());
+            }
+        }
+        tracing::warn!(
+            session_id,
+            attempt,
+            "agent prompt not visible in pane after send; re-sending"
+        );
+    }
+    Err(format!(
+        "agent CLI never acknowledged its prompt after {PROMPT_DELIVERY_ATTEMPTS} attempts \
+         (session {session_id}); it may be showing a modal or failed to start"
+    ))
+}
+
+/// A distinctive, quote-free slice of the prompt to look for in the pane. Long prompts wrap and
+/// the TUI may re-flow them, so we take a short run of the first line's words — enough to be
+/// unique, short enough to survive wrapping. Empty when nothing suitable exists, which makes the
+/// delivery check fall back to "sent it, carry on" rather than failing a run on a weak probe.
+fn prompt_probe(prompt: &str) -> String {
+    prompt
+        .lines()
+        .find(|line| line.trim().len() >= 12)
+        .map(|line| {
+            let trimmed = line.trim();
+            // Cut on a CHAR boundary: slicing by raw byte index panics mid-character, and agent
+            // prompts routinely carry em dashes and accents.
+            let end = trimmed
+                .char_indices()
+                .map(|(i, c)| i + c.len_utf8())
+                .take_while(|end| *end <= 33)
+                .last()
+                .unwrap_or(0);
+            trimmed[..end].trim().to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// A first-run directory-trust modal, across the agent CLIs J1 drives.
+fn pane_awaiting_trust(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("trust this folder")
+        || lower.contains("do you trust")
+        || lower.contains("trust the files in this folder")
+}
+
 /// Read a report's markdown attachment, if `evidence` names one.
 ///
 /// Deliberately strict and always size-capped: any workspace file read must be bounded (a prior
@@ -3880,7 +3968,7 @@ async fn spawn_ephemeral_agent(
     terminal::attach_terminal_headless(state, session_id.clone(), 120, 36).await?;
     sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
     let prompt = prompt_for(&session_id);
-    terminal::send_terminal_input(state, session_id.clone(), format!("{}\r", prompt)).await?;
+    deliver_agent_prompt(state, &session_id, &prompt).await?;
     Ok(session_id)
 }
 
@@ -14677,4 +14765,79 @@ mod replan_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+}
+
+#[cfg(test)]
+mod prompt_delivery_tests {
+    use super::{pane_awaiting_trust, prompt_probe, read_report_markdown};
+
+    #[test]
+    fn probe_is_a_short_distinctive_slice_of_the_first_real_line() {
+        let probe = prompt_probe("You are the T1 developer for this phase.\nDo the work.");
+        assert!(!probe.is_empty());
+        assert!(probe.len() <= 33, "probe should stay short: {probe:?}");
+        assert!(
+            "You are the T1 developer for this phase.".starts_with(&probe),
+            "probe must be a prefix of the line it came from: {probe:?}"
+        );
+    }
+
+    #[test]
+    fn probe_skips_blank_and_trivial_leading_lines() {
+        // A leading newline or a tiny line must not become the probe — it would match anything.
+        let probe = prompt_probe("\n\n---\nPlan the release process for this repository.");
+        assert!(probe.starts_with("Plan the release"), "got {probe:?}");
+    }
+
+    #[test]
+    fn probe_is_empty_when_nothing_is_distinctive() {
+        // Empty probe = delivery check degrades to "sent it", never a false failure.
+        assert_eq!(prompt_probe(""), "");
+        assert_eq!(prompt_probe("\n \n"), "");
+        assert_eq!(prompt_probe("ok"), "");
+    }
+
+    #[test]
+    fn probe_does_not_split_a_multibyte_character() {
+        // Slicing by byte index would panic mid-character; the cut must land on a boundary.
+        let probe = prompt_probe("Résumé the phase — ünïcödé everywhere, keep going please");
+        assert!(!probe.is_empty());
+    }
+
+    #[test]
+    fn detects_the_trust_modal_across_wordings() {
+        assert!(pane_awaiting_trust("  Yes, I trust this folder"));
+        assert!(pane_awaiting_trust("Do you trust the files in this folder?"));
+        assert!(pane_awaiting_trust("DO YOU TRUST"), "must be case-insensitive");
+    }
+
+    #[test]
+    fn ordinary_pane_content_is_not_a_trust_modal() {
+        assert!(!pane_awaiting_trust("running tests, 14 passed"));
+        assert!(!pane_awaiting_trust(""));
+        // The word "trust" alone must not trip it.
+        assert!(!pane_awaiting_trust("we trust the gate output here"));
+    }
+
+    #[test]
+    fn report_markdown_is_rejected_unless_it_is_a_real_absolute_md_file() {
+        assert_eq!(read_report_markdown("report.md"), None, "relative path");
+        assert_eq!(read_report_markdown("/tmp/report.txt"), None, "wrong extension");
+        assert_eq!(read_report_markdown("/tmp/nope-does-not-exist.md"), None, "missing");
+        assert_eq!(read_report_markdown(""), None);
+    }
+
+    #[test]
+    fn report_markdown_reads_a_real_file_and_skips_an_empty_one() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("j1-report-test-good.md");
+        std::fs::write(&good, "# Title\n\n```mermaid\nflowchart LR\nA-->B\n```\n").unwrap();
+        let body = read_report_markdown(good.to_str().unwrap()).expect("should read");
+        assert!(body.contains("```mermaid"));
+        let empty = dir.join("j1-report-test-empty.md");
+        std::fs::write(&empty, "   \n\n").unwrap();
+        assert_eq!(read_report_markdown(empty.to_str().unwrap()), None, "blank file");
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(empty);
+    }
 }
