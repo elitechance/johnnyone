@@ -139,23 +139,63 @@
              path, so replying works identically in either view. -->
         <section class="terminal-surface shell-transcript">
           <div class="st-log">
-            @for (ev of shellTranscript(); track $index) {
-              <article class="st-row" [class.err]="ev.kind === 'error'">
-                <span class="st-ic">{{ ev.kind === 'error' ? '!' : ev.kind === 'tool_call' ? '⌘' : '¶' }}</span>
+            @for (row of shellRows(); track $index) {
+              <article class="st-row"
+                       [class.err]="row.type === 'error'"
+                       [class.you]="row.type === 'you'"
+                       [class.md]="row.type === 'markdown'">
+                <span class="st-ic">{{
+                  row.type === 'error' ? '!' : row.type === 'you' ? '›' : row.type === 'markdown' ? '▤' : '¶'
+                }}</span>
                 <div class="st-bd">
-                  @if (ev.toolName) { <div class="st-hd">{{ ev.toolName }}</div> }
-                  <div class="st-tx">{{ ev.text }}</div>
+                  @if (row.tool) { <div class="st-hd">{{ row.tool }}</div> }
+                  @if (row.type === 'markdown') {
+                    <!-- The agent's written-up report: headings, tables, code and mermaid. -->
+                    <johnny-markdown-view class="st-md" [markdown]="row.text" />
+                  } @else {
+                    <div class="st-tx">{{ row.text }}</div>
+                  }
                 </div>
               </article>
             } @empty {
-              <div class="st-empty">
-                <div class="st-empty-t">No transcript yet</div>
-                <div class="st-empty-c">
-                  Progress appears here as the agent reports it. Switch to <b>Raw</b> for the live terminal.
+              @if (!shellPending()) {
+                <div class="st-empty">
+                  <div class="st-empty-t">No updates yet</div>
+                  <div class="st-empty-c">
+                    Progress appears here as the agent reports it. Switch to <b>Raw</b> for the live terminal.
+                  </div>
                 </div>
-              </div>
+              }
+            }
+
+            <!-- Waiting on the agent's next report. Appears only after a short delay, so a fast
+                 reply never flashes a spinner. -->
+            @if (shellPending()) {
+              <article class="st-row st-wait" aria-live="polite" aria-label="Waiting for the agent">
+                <span class="st-ic"><span class="st-spin"></span></span>
+                <div class="st-bd">
+                  <div class="st-dots"><i></i><i></i><i></i></div>
+                </div>
+              </article>
             }
           </div>
+
+          <footer class="st-foot">
+            <span class="st-live">{{ shellLiveness() }}</span>
+          </footer>
+
+          <form class="st-composer" (ngSubmit)="sendShellMessage()">
+            <input
+              id="shell-transcript-input"
+              name="shellDraft"
+              class="st-input"
+              type="text"
+              autocomplete="off"
+              placeholder="Reply to the agent…"
+              [(ngModel)]="shellDraft"
+            />
+            <button class="st-send" type="submit" [disabled]="!shellDraft.trim()">Send</button>
+          </form>
         </section>
       } @else if (sh) {
         <johnny-terminal-screen

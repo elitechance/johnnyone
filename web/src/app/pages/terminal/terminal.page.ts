@@ -511,6 +511,106 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return id ? this.transcriptEventsFor(id) : [];
   }
 
+  // ── Plain-shell transcript: send → echo → wait → settle ──────────────────
+  //
+  // The transcript is driven ENTIRELY by agent reports over the API, so there is a real gap
+  // between sending and the first report back. Rather than leave the log looking frozen, a
+  // message you send is echoed locally at once, and a pending row animates in its place until
+  // a report lands. The 500ms delay before that row appears keeps a fast reply from flashing
+  // a spinner nobody needed.
+  private static readonly SHELL_PENDING_DELAY_MS = 500;
+
+  protected shellDraft = '';
+  /** Locally-echoed sends, positioned by how many events existed when each was sent. */
+  private readonly shellEchoes = signal<Array<{ sessionId: string; atIndex: number; text: string }>>([]);
+  /** True once the pending row should actually render (i.e. the delay has elapsed). */
+  protected readonly shellPending = signal(false);
+  private shellPendingTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Wall-clock of the newest report, for the "last update" liveness line. */
+  protected readonly shellLastEventAt = signal<number | null>(null);
+  /** Ticks so the liveness line re-renders while nothing else changes. */
+  private readonly shellClock = signal(0);
+  private shellClockInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Merged display rows: local echoes interleaved with reports, in send order. */
+  protected shellRows(): Array<{
+    type: 'you' | 'agent' | 'error' | 'markdown';
+    text: string;
+    tool?: string;
+  }> {
+    const id = this.currentSession()?.id;
+    if (!id) return [];
+    const events = this.transcriptEventsFor(id);
+    const echoes = this.shellEchoes().filter((e) => e.sessionId === id);
+    const rows: Array<{
+      type: 'you' | 'agent' | 'error' | 'markdown';
+      text: string;
+      tool?: string;
+    }> = [];
+    for (let i = 0; i <= events.length; i++) {
+      for (const e of echoes) {
+        if (e.atIndex === i) rows.push({ type: 'you', text: e.text });
+      }
+      const ev = events[i];
+      if (ev) {
+        // A `code`/markdown event is the agent's written-up report (host read it from the
+        // file it named), so it renders as rich markdown — mermaid fences included.
+        const isMarkdown = ev.kind === 'code' && ev.language === 'markdown';
+        rows.push({
+          type: isMarkdown ? 'markdown' : ev.kind === 'error' ? 'error' : 'agent',
+          text: ev.text ?? '',
+          tool: ev.toolName,
+        });
+      }
+    }
+    return rows;
+  }
+
+  /** "last update 42s ago" — an explicit liveness claim, unlike inferring it from scrolling text. */
+  protected shellLiveness(): string {
+    this.shellClock();
+    const at = this.shellLastEventAt();
+    if (at === null) return 'no updates yet';
+    const secs = Math.max(0, Math.round((Date.now() - at) / 1000));
+    if (secs < 60) return `last update ${secs}s ago`;
+    return `last update ${Math.floor(secs / 60)}m ${secs % 60}s ago`;
+  }
+
+  /** Called from the stream subscription when a report lands — settles the pending row. */
+  private settleShellPending(sessionId: string): void {
+    this.shellLastEventAt.set(Date.now());
+    if (this.currentSession()?.id !== sessionId) return;
+    this.clearShellPendingTimer();
+    this.shellPending.set(false);
+  }
+
+  private clearShellPendingTimer(): void {
+    if (this.shellPendingTimer) {
+      clearTimeout(this.shellPendingTimer);
+      this.shellPendingTimer = null;
+    }
+  }
+
+  /** Send from the transcript composer: echo locally, then wait for the agent to report back. */
+  protected async sendShellMessage(): Promise<void> {
+    const text = this.shellDraft.trim();
+    const id = this.currentSession()?.id;
+    if (!text || !id) return;
+    this.shellDraft = '';
+    this.shellEchoes.update((list) => [
+      ...list,
+      { sessionId: id, atIndex: this.transcriptEventsFor(id).length, text },
+    ]);
+    this.clearShellPendingTimer();
+    this.shellPendingTimer = setTimeout(
+      () => this.shellPending.set(true),
+      TerminalPage.SHELL_PENDING_DELAY_MS,
+    );
+    // Reuses the existing raw-input path (relay → host → tmux), so replying from the
+    // transcript is the same wire call the terminal makes. `\r` submits in the agent TUI.
+    await this.onTerminalRawInput(`${text}\r`, id);
+  }
+
   // Plan-tab projections over `planRun` (P2, pure `plan-tab-logic`).
   protected readonly planNav = computed<DocNavEntry[]>(() => docNavModel(this.planRun()));
   protected readonly planCards = computed<PhaseCard[]>(() => phaseCards(this.planRun()));
@@ -941,6 +1041,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!this.plainShellMode()) {
       void this.loadInitiatives();
     }
+    // Drives the transcript's "last update Ns ago" line. A plain counter bump — the value is
+    // derived from wall-clock at render, so this only exists to schedule the re-render.
+    if (!this.shellClockInterval) {
+      this.shellClockInterval = setInterval(() => this.shellClock.update((n) => n + 1), 1000);
+    }
     void this.detectTools();
     void this.loadLastWorkingDirectory();
     this.subscribeToRelaySessionEvents();
@@ -1039,6 +1144,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.clearShellPendingTimer();
+    if (this.shellClockInterval) {
+      clearInterval(this.shellClockInterval);
+      this.shellClockInterval = null;
+    }
     this.flushWorkspaceState();
     this.workspaceResizeObserver?.disconnect();
     this.workspaceResizeObserver = null;
@@ -1825,6 +1935,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!this.streamEventsSubscription) {
       this.streamEventsSubscription = this.relayTerminal.streamEvents().subscribe((event) => {
         this.transcriptEvents.update((bySession) => appendTranscriptEvent(bySession, event));
+        // A report landing is what ends the "waiting" state on the shell transcript.
+        this.settleShellPending(event.sessionId);
       });
     }
   }

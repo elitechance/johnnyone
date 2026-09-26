@@ -3661,6 +3661,24 @@ pub async fn record_agent_report(
             data: Some(json!({ "role": role, "reportKind": kind_norm })),
             r#final: None,
         });
+
+        // Rich payload. `summary` rides a shell-quoted JSON one-liner, so it can never carry
+        // markdown — newlines, quotes and backticks all break it. Instead the agent WRITES a
+        // markdown file (mermaid fences included) and passes its path as `evidence`; the host
+        // reads it here and emits it as a second event the console renders properly. Files are
+        // the one channel with no quoting or length limit that agents already use constantly.
+        if let Some(md) = evidence.as_deref().and_then(read_report_markdown) {
+            let _ = state.stream_event_tx.send(StreamEvent {
+                session_id: session_id.clone(),
+                seq: next_report_stream_seq(),
+                kind: "code".to_string(),
+                text: Some(md),
+                language: Some("markdown".to_string()),
+                tool_name: None,
+                data: Some(json!({ "role": role, "reportKind": kind_norm })),
+                r#final: None,
+            });
+        }
     }
 
     state.agent_reports.lock().await.insert(
@@ -3678,6 +3696,41 @@ pub async fn record_agent_report(
     );
     tracing::info!(session_id, role, kind = %kind_norm, "recorded structured agent report");
     Ok(())
+}
+
+/// Read a report's markdown attachment, if `evidence` names one.
+///
+/// Deliberately strict and always size-capped: any workspace file read must be bounded (a prior
+/// incident had an unbounded walk read a 46GB model directory into memory). A miss of any kind —
+/// not a path, wrong extension, missing, too big, not UTF-8 — returns `None` and the textual
+/// summary still went out on its own event, so a bad path degrades rather than failing the report.
+const MAX_REPORT_MARKDOWN_BYTES: u64 = 256 * 1024;
+
+fn read_report_markdown(evidence: &str) -> Option<String> {
+    let path = Path::new(evidence.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(ext.as_str(), "md" | "markdown") {
+        return None;
+    }
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_REPORT_MARKDOWN_BYTES {
+        if meta.len() > MAX_REPORT_MARKDOWN_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                bytes = meta.len(),
+                "report markdown exceeds cap; ignoring"
+            );
+        }
+        return None;
+    }
+    let body = fs::read_to_string(path).ok()?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some(body)
 }
 
 /// Monotonic `seq` for report-sourced stream events. `StreamEvent.seq` only has to order/dedup
@@ -4679,11 +4732,15 @@ fn report_command(session_id: &str, kind: &str) -> String {
     // CAN break the surrounding quoting. The placeholder tells the agent the constraint inline;
     // a malformed body just fails the curl, which is harmless — progress is advisory, never a gate.
     const UPDATE: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"update\\\",summary:\\\"ONE_LINE_NO_QUOTES\\\")}\"}'";
+    // Rich variant: the one-liner still rides `summary`, while anything that needs formatting
+    // goes in a markdown FILE whose absolute path rides `evidence` — no quoting limit, any length.
+    const UPDATE_MD: &str = "curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json' -d '{\"query\":\"mutation{reportAgentResult(sessionId:\\\"SESSION_ID\\\",kind:\\\"update\\\",summary:\\\"ONE_LINE_NO_QUOTES\\\",evidence:\\\"ABSOLUTE_PATH_TO_MD\\\")}\"}'";
     let tmpl = match kind {
         "verdict" => VERDICT,
         "blocked" => BLOCKED,
         "done" => DONE,
         "update" => UPDATE,
+        "update_md" => UPDATE_MD,
         _ => READY,
     };
     tmpl.replace("SESSION_ID", session_id)
@@ -4805,10 +4862,11 @@ async fn run_docs_commit_agent(state: &AppState, plan_id: &str) -> Result<(), St
 
 fn worker_report_instruction(session_id: &str) -> String {
     format!(
-        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator knows you are done. When this phase is complete and ready for T2 review, run this exact command:\n{}\n\nIf you get genuinely stuck and need a human decision you cannot resolve yourself (e.g. a missing credential, or an ambiguous requirement with no safe default), FIRST clearly state your question/blocker in your output, THEN run this command and wait — the coordinator will alert a human, who replies right here to unblock you:\n{}\n\nPROGRESS (optional, but do it). A human may be watching this run from a phone, where they see ONLY what you report here — not your terminal. After each meaningful step (a task finished, a test suite run, a decision taken), run this to tell them what just happened:\n{}\n\nReplace ONE_LINE_NO_QUOTES with a single short line of plain text — no quotes, no newlines, no backslashes, since it sits inside a shell-quoted JSON string. Say what changed, not what you are about to do: \"migration 0021 applied, 14 tests pass\" beats \"working on migrations\". Do NOT report every tool call — aim for a handful per phase. This never gates anything; if the command fails, carry on.\n",
+        "\n\n---\nIMPORTANT — this is the ONLY way the coordinator knows you are done. When this phase is complete and ready for T2 review, run this exact command:\n{}\n\nIf you get genuinely stuck and need a human decision you cannot resolve yourself (e.g. a missing credential, or an ambiguous requirement with no safe default), FIRST clearly state your question/blocker in your output, THEN run this command and wait — the coordinator will alert a human, who replies right here to unblock you:\n{}\n\nPROGRESS (optional, but do it). A human may be watching this run from a phone, where they see ONLY what you report here — not your terminal. After each meaningful step (a task finished, a test suite run, a decision taken), run this to tell them what just happened:\n{}\n\nReplace ONE_LINE_NO_QUOTES with a single short line of plain text — no quotes, no newlines, no backslashes, since it sits inside a shell-quoted JSON string. Say what changed, not what you are about to do: \"migration 0021 applied, 14 tests pass\" beats \"working on migrations\". Do NOT report every tool call — aim for a handful per phase. This never gates anything; if the command fails, carry on.\n\nFINAL WRITE-UP (do this once, when the phase is done — right before you report ready). A one-line summary cannot carry a real explanation, so write your closing report to a MARKDOWN FILE and send its absolute path. It is rendered properly in the console: headings, lists, tables, fenced code, and ```mermaid diagrams all display. Prefer a mermaid diagram whenever you are describing a flow, a sequence, or how pieces relate — it reads far better than prose on a phone.\n{}\n\nReplace ABSOLUTE_PATH_TO_MD with the file you just wrote (must be an absolute path ending .md, under 256 KB). Write it somewhere durable such as the plan directory. Keep the summary one-liner as well — it is what shows in the timeline, with the write-up expanded underneath.\n",
         report_command(session_id, "ready"),
         report_command(session_id, "blocked"),
         report_command(session_id, "update"),
+        report_command(session_id, "update_md"),
     )
 }
 
