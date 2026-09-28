@@ -14,6 +14,7 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { Title } from '@angular/platform-browser';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import {
   IonModal,
@@ -884,6 +885,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** The transcript's scroll container. Not static: it only exists in transcript view. */
   @ViewChild('shellLog')
   private shellLog?: ElementRef<HTMLElement>;
+  private readonly browserTitle = inject(Title);
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
   sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 
@@ -1020,6 +1022,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       },
       { allowSignalWrites: true },
     );
+
+    // The route sets a static title of "Shell", which is useless once several are open — every
+    // tab reads the same. Name the actual session ("Shell · kord") so tabs, history and the
+    // window switcher are distinguishable. Scoped to the plain-shell surface; every other route
+    // keeps the title its route declares.
+    effect(() => {
+      if (!this.plainShellMode()) return;
+      const name = this.currentSession()?.title?.trim();
+      this.browserTitle.setTitle(name ? `Shell · ${name}` : 'Shell');
+    });
 
     // P1: when the selected initiative's primary session changes, keep its visual + stream lanes
     // subscribed on the SAME machinery as the visible pane (via `lanedSessionIds`), so its

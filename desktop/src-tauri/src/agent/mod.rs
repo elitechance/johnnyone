@@ -700,15 +700,16 @@ impl AgentService {
 
         let saved = Self::save_command_attachments(state, command).await?;
         let mut data = command.data.trim_end_matches(['\r', '\n']).to_string();
+        // ONE line. A newline inside a TUI composer either submits early — splitting the message
+        // so the agent sees the text without its attachments — or is swallowed, which is what
+        // produced the run-together "workspace:- ./path" a user reported. Same constraint the
+        // reporting brief already follows.
         if !data.is_empty() {
-            data.push_str("\n\n");
+            data.push(' ');
         }
-        data.push_str("Attached image files saved in this workspace:\n");
-        for path in saved {
-            data.push_str("- ");
-            data.push_str(&path);
-            data.push('\n');
-        }
+        data.push_str("[Attached image files saved in this workspace: ");
+        data.push_str(&saved.join(", "));
+        data.push(']');
         data.push('\r');
         Ok(Self::with_shell_brief(state, &command.session_id, data).await)
     }
