@@ -200,6 +200,25 @@
             <span class="st-live">{{ shellLiveness() }}</span>
           </footer>
 
+          <!-- Pasted or dropped images, staged before sending. The workspace-level paste handler
+               captures them; this is where they become visible and removable. -->
+          @if (shellAttachments().length > 0) {
+            <div class="st-attach">
+              @for (att of shellAttachments(); track att.id) {
+                <figure class="st-thumb">
+                  <img [src]="att.previewUrl" [alt]="att.file.name || 'Pasted image'" />
+                  <button
+                    type="button"
+                    class="st-thumb-x"
+                    title="Remove image"
+                    aria-label="Remove image"
+                    (click)="removeShellAttachment(att.id)"
+                  >✕</button>
+                </figure>
+              }
+            </div>
+          }
+
           <form class="st-composer" (ngSubmit)="sendShellMessage()">
             <input
               id="shell-transcript-input"
@@ -207,10 +226,15 @@
               class="st-input"
               type="text"
               autocomplete="off"
-              placeholder="Reply to the agent…"
+              [placeholder]="shellAttachments().length > 0 ? 'Add a note (optional)…' : 'Reply to the agent…'"
               [(ngModel)]="shellDraft"
+              (paste)="onShellComposerPaste($event)"
             />
-            <button class="st-send" type="submit" [disabled]="!shellDraft.trim()">Send</button>
+            <button
+              class="st-send"
+              type="submit"
+              [disabled]="shellSending() || (!shellDraft.trim() && shellAttachments().length === 0)"
+            >{{ shellSending() ? 'Sending…' : 'Send' }}</button>
           </form>
         </section>
       } @else if (sh) {

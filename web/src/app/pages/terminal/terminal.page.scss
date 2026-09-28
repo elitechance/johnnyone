@@ -1245,6 +1245,52 @@ ion-modal.workspace-picker .picker-empty {
     font-variant-numeric: tabular-nums;
   }
 
+  /* Staged images, between the log and the composer so they read as part of the draft. */
+  .st-attach {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 12px 0;
+    border-top: 1px solid var(--jo-border);
+    background: var(--jo-bg-elevated);
+  }
+  .st-thumb {
+    position: relative;
+    margin: 0;
+    width: 52px;
+    height: 52px;
+    border-radius: 7px;
+    overflow: hidden;
+    border: 1px solid var(--jo-border);
+    background: var(--jo-bg-base);
+
+    img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+  }
+  .st-thumb-x {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 17px;
+    height: 17px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(7, 9, 13, 0.82);
+    color: var(--jo-fg-strong);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+
+    &:focus-visible { outline: 2px solid var(--jo-accent); outline-offset: 1px; }
+  }
+
   .st-composer {
     flex: 0 0 auto;
     display: flex;

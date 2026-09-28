@@ -677,11 +677,15 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected async sendShellMessage(): Promise<void> {
     const text = this.shellDraft.trim();
     const id = this.currentSession()?.id;
-    if (!text || !id) return;
+    if (!id) return;
+    const hasAttachments = this.pendingAttachmentsForSession(id).length > 0;
+    // An image on its own is a perfectly good message.
+    if (!text && !hasAttachments) return;
     this.shellDraft = '';
+    const echoText = text || `Sent ${this.pendingAttachmentsForSession(id).length} image(s)`;
     this.shellEchoes.update((list) => [
       ...list,
-      { sessionId: id, atIndex: this.transcriptEventsFor(id).length, text },
+      { sessionId: id, atIndex: this.transcriptEventsFor(id).length, text: echoText },
     ]);
     this.clearShellPendingTimer();
     this.shellPendingTimer = setTimeout(
@@ -690,10 +694,36 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     );
     this.shellLastSendAt.set(Date.now());
     this.scrollShellLogToBottom(true);
-    // Send exactly what the user typed. The host appends the reporting brief to the first
-    // message of a shell session (`with_shell_brief`) so that plumbing never appears here.
-    // Reuses the existing raw-input path (relay → host → tmux); `\r` submits in the agent TUI.
+    // Pasted/dropped images go through the attachment path, which uploads them and sends a
+    // message referencing the saved files. Text-only stays on the plain raw-input path.
+    // Either way the host appends the reporting brief to a shell session's first message
+    // (`with_shell_brief`), so that plumbing never shows up here.
+    if (this.pendingAttachmentsForSession(id).length > 0) {
+      await this.sendAttachmentMessage(id, text);
+      return;
+    }
     await this.onTerminalRawInput(`${text}\r`, id);
+  }
+
+  /** Paste straight onto the composer (the workspace-level handler misses a focused input). */
+  onShellComposerPaste(event: ClipboardEvent): void {
+    this.onWorkspacePaste(event);
+  }
+
+  /** Attachments for the transcript's current session. */
+  protected shellAttachments(): PendingImageAttachment[] {
+    const id = this.currentSession()?.id;
+    return id ? this.pendingAttachmentsForSession(id) : [];
+  }
+
+  protected shellSending(): boolean {
+    const id = this.currentSession()?.id;
+    return id ? this.isSendingAttachmentsForSession(id) : false;
+  }
+
+  protected removeShellAttachment(attachmentId: string): void {
+    const id = this.currentSession()?.id;
+    if (id) this.removePendingAttachment(id, attachmentId);
   }
 
   // Plan-tab projections over `planRun` (P2, pure `plan-tab-logic`).
