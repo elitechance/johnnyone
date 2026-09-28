@@ -831,20 +831,31 @@ impl AgentService {
         });
     }
 
-    /// Shell and attached-tmux sessions get the brief; plan agents already have the instruction
-    /// in their prompt, so briefing them again would just be noise in their context.
+    /// Which sessions get the reporting brief and the silent-agent nudge.
+    ///
+    /// Only sessions that could plausibly REPORT. An attached tmux pane is one the user chose to
+    /// talk to, and a spawned shell carrying setup commands launched something into it. A bare
+    /// `shell` with no setup commands is just bash: it cannot report, and both the brief and the
+    /// nudge land as a command it tries to execute — observed as
+    /// `bash: syntax error near unexpected token '('`.
+    ///
+    /// Plan agents are excluded implicitly: they are `claude_code`/`grok`/… and already carry the
+    /// instruction in their prompt, so briefing them again would be noise in their context.
     fn session_wants_brief(state: &Arc<AppState>, session_id: &str) -> bool {
         use rusqlite::OptionalExtension;
         state
             .db
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT provider, attached_tmux FROM sessions WHERE id = ?1",
+                    "SELECT provider, attached_tmux, setup_commands FROM sessions WHERE id = ?1",
                     rusqlite::params![session_id],
                     |row| {
                         let provider: String = row.get(0)?;
                         let attached: i64 = row.get(1)?;
-                        Ok(provider == "shell" || attached != 0)
+                        let setup: Option<String> = row.get(2)?;
+                        let launched_something =
+                            setup.map(|s| !s.trim().is_empty()).unwrap_or(false);
+                        Ok(attached != 0 || (provider == "shell" && launched_something))
                     },
                 )
                 .optional()
