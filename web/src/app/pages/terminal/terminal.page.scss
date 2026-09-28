@@ -1181,6 +1181,15 @@ ion-modal.workspace-picker .picker-empty {
 
     b { color: var(--jo-fg-strong); font-weight: 600; }
   }
+  /* Live activity lifted from the pane while we wait on the next report. Monospace and amber so
+     it reads as transient machine status, clearly not part of the committed transcript. */
+  .st-act {
+    font-family: var(--jo-font-mono, ui-monospace, monospace);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--jo-amber);
+    overflow-wrap: anywhere;
+  }
   .st-spin {
     width: 10px;
     height: 10px;

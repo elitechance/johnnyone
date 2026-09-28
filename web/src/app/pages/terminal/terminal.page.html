@@ -174,9 +174,13 @@
               <article class="st-row st-wait" aria-live="polite" aria-label="Waiting for the agent">
                 <span class="st-ic"><span class="st-spin"></span></span>
                 <div class="st-bd">
-                  @if (shellPendingStale()) {
-                    <!-- Long silence usually means the agent answered in its terminal without
-                         reporting, which the transcript cannot see. Say so instead of spinning. -->
+                  @if (shellActivity(); as act) {
+                    <!-- Real activity from the live pane, so a long think shows what it is doing
+                         instead of an uninformative spin. Replaced by the report when it lands. -->
+                    <div class="st-act">{{ act }}</div>
+                  } @else if (shellPendingStale() && !shellBusy()) {
+                    <!-- Silent AND idle: the agent most likely answered in its terminal without
+                         reporting, which the transcript cannot see. Say so rather than spin on. -->
                     <div class="st-stale">
                       Still no reply reported. The agent may have answered in its terminal without
                       reporting it — open <b>Raw</b> to check.

@@ -88,6 +88,7 @@ import {
   appendTranscriptEvent,
   diffStreamSubscriptions,
 } from './terminal-transcript-tab';
+import { agentActivityLine, agentIsBusy } from './shell-activity';
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
@@ -571,6 +572,27 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       }
     }
     return rows;
+  }
+
+  /**
+   * What the agent is doing RIGHT NOW, lifted from the live pane.
+   *
+   * Reports arrive in bursts and a long think can run minutes with nothing to show, so the wait
+   * would otherwise be a content-free spinner. The pane's status row is the one thing the screen
+   * mirror is genuinely good at — it changes on ~93% of ticks while the body sits still — so it
+   * fills the gap until the real report replaces it.
+   */
+  protected shellActivity(): string | null {
+    const id = this.currentSession()?.id;
+    if (!id) return null;
+    return agentActivityLine(this.terminalScreens()[id]?.content ?? null);
+  }
+
+  /** True when the pane shows a turn in flight but has not produced a timer line yet. */
+  protected shellBusy(): boolean {
+    const id = this.currentSession()?.id;
+    if (!id) return false;
+    return agentIsBusy(this.terminalScreens()[id]?.content ?? null);
   }
 
   /** "last update 42s ago" — an explicit liveness claim, unlike inferring it from scrolling text. */
