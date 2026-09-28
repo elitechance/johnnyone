@@ -1193,13 +1193,18 @@ ion-modal.workspace-picker .picker-empty {
     font-family: var(--jo-font-mono, ui-monospace, monospace);
     font-size: 10.5px;
     line-height: 1.45;
-    white-space: pre;
     overflow-x: auto;
     max-height: 210px;
     overflow-y: hidden;
     /* Fade the top so it reads as "a window onto something longer", not a truncated block. */
     mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
     -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
+  }
+  /* One pane row. `pre` whitespace keeps the TUI's column alignment; colours come from inline
+     spans the ANSI renderer writes. */
+  .st-peek-l {
+    white-space: pre;
+    min-height: 1.45em;
   }
   .st-stale {
     font-size: 12.5px;

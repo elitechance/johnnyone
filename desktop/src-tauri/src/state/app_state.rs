@@ -109,6 +109,9 @@ pub struct AppState {
     /// user message only. In-memory on purpose: a host restart re-briefing an agent is harmless,
     /// whereas persisting it risks a session that never gets told at all.
     pub shell_briefed: Arc<Mutex<HashSet<String>>>,
+    /// When each session last reported. The shell nudge watcher compares this against the time a
+    /// user message was sent, to tell "answered and reported" from "answered and stayed silent".
+    pub shell_last_report_at: Arc<Mutex<HashMap<String, Instant>>>,
     /// Last keyboard/input activity per terminal session for adaptive capture pacing.
     pub terminal_last_input_at: Arc<Mutex<HashMap<String, Instant>>>,
     /// Last relay/UI publish time per session — enforces min interval for DO traffic.
@@ -172,6 +175,7 @@ impl AppState {
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
             terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
             shell_briefed: Arc::new(Mutex::new(HashSet::new())),
+            shell_last_report_at: Arc::new(Mutex::new(HashMap::new())),
             terminal_last_input_at: Arc::new(Mutex::new(HashMap::new())),
             terminal_last_screen_publish_at: Arc::new(Mutex::new(HashMap::new())),
             terminal_pending_screen: Arc::new(Mutex::new(HashMap::new())),
@@ -213,6 +217,7 @@ impl AppState {
             terminal_capture_tasks: Arc::new(Mutex::new(HashMap::new())),
             terminal_visual_subscribers: Arc::new(Mutex::new(HashMap::new())),
             shell_briefed: Arc::new(Mutex::new(HashSet::new())),
+            shell_last_report_at: Arc::new(Mutex::new(HashMap::new())),
             terminal_last_input_at: Arc::new(Mutex::new(HashMap::new())),
             terminal_last_screen_publish_at: Arc::new(Mutex::new(HashMap::new())),
             terminal_pending_screen: Arc::new(Mutex::new(HashMap::new())),

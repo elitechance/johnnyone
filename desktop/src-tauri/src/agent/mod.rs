@@ -20,6 +20,12 @@ use message_types::{
     SessionUpdated, TerminalCommandAck, TerminalScreen,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// A shell agent that answered but never reported gets one reminder after this long.
+const SHELL_NUDGE_AFTER_SECS: u64 = 60;
+/// Gap between the two captures used to decide the pane has actually gone quiet.
+const SHELL_NUDGE_IDLE_PROBE_SECS: u64 = 3;
 use tokio::sync::Mutex;
 use tracing;
 
@@ -736,6 +742,8 @@ impl AgentService {
         if !Self::session_wants_brief(state, session_id) {
             return data;
         }
+        // Every user message arms the "answered but never reported" guard, not just the first.
+        Self::arm_shell_report_nudge(state, session_id);
         {
             let mut briefed = state.shell_briefed.lock().await;
             if !briefed.insert(session_id.to_string()) {
@@ -754,6 +762,73 @@ impl AgentService {
         );
         let tail: String = data[body.len()..].to_string();
         format!("{body}{brief}{tail}")
+    }
+
+    /// Nudge a shell agent that answered but never reported.
+    ///
+    /// The transcript only shows what an agent reports, so an agent that replies in its pane and
+    /// stops leaves the console blank with no way to tell that from still-thinking. The
+    /// coordinator already solves this for plan agents by nudging when they go idle without a
+    /// signal; this is the same guard for the shells a human talks to.
+    ///
+    /// Fires ONLY when both are true: nothing was reported since the message was sent, and the
+    /// pane has actually gone quiet. A long think is not a failure to report, so an agent still
+    /// working is never interrupted. One nudge per message — if it is ignored, a second will not
+    /// help and would just be noise in the agent's context.
+    fn arm_shell_report_nudge(state: &Arc<AppState>, session_id: &str) {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let armed_at = Instant::now();
+            tokio::time::sleep(Duration::from_secs(SHELL_NUDGE_AFTER_SECS)).await;
+
+            // Reported since we armed? Nothing to do.
+            if let Some(at) = state.shell_last_report_at.lock().await.get(&session_id) {
+                if *at >= armed_at {
+                    return;
+                }
+            }
+
+            // Still working? Leave it alone. Two captures a few seconds apart settle it without
+            // needing to know any CLI's wording for "busy".
+            let Ok(first) = crate::terminal::capture_terminal_session(&state, &session_id).await
+            else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(SHELL_NUDGE_IDLE_PROBE_SECS)).await;
+            let Ok(second) = crate::terminal::capture_terminal_session(&state, &session_id).await
+            else {
+                return;
+            };
+            let a = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&first.content);
+            let b = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&second.content);
+            if a != b {
+                return;
+            }
+
+            // Re-check: a report may have landed during the probe.
+            if let Some(at) = state.shell_last_report_at.lock().await.get(&session_id) {
+                if *at >= armed_at {
+                    return;
+                }
+            }
+
+            let nudge = format!(
+                " [JohnnyOne: you answered but did not report it, so the phone console is still \
+                 showing nothing. Write your reply as markdown to a file and run: curl -s \
+                 127.0.0.1:7788/graphql -H 'content-type: application/json' -d \
+                 '{{\"query\":\"mutation{{reportAgentResult(sessionId:\\\"{session_id}\\\",\
+                 kind:\\\"update\\\",summary:\\\"ONE LINE NO QUOTES\\\",\
+                 evidence:\\\"/absolute/path/to/reply.md\\\")}}\"}}']"
+            );
+            tracing::info!(session_id = %session_id, "nudging shell agent to report its reply");
+            let _ = crate::terminal::send_terminal_input(
+                &state,
+                session_id.clone(),
+                format!("{nudge}\r"),
+            )
+            .await;
+        });
     }
 
     /// Shell and attached-tmux sessions get the brief; plan agents already have the instruction

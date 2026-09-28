@@ -14,7 +14,7 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { Title } from '@angular/platform-browser';
+import { DomSanitizer, SafeHtml, Title } from '@angular/platform-browser';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import {
   IonModal,
@@ -89,7 +89,7 @@ import {
   appendTranscriptEvent,
   diffStreamSubscriptions,
 } from './terminal-transcript-tab';
-import { agentActivityLine, agentIsBusy, paneTail, screenIdleKey } from './shell-activity';
+import { agentActivityLine, agentIsBusy, paneTailHtml, screenIdleKey } from './shell-activity';
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
@@ -603,11 +603,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    * we already hold. Watching the tool calls and output scroll past says far more than
    * "Slithering… (4m 17s)". It is replaced by the agent's reported answer once that lands.
    */
-  protected shellPaneTail(): string[] {
+  protected shellPaneTail(): SafeHtml[] {
     const id = this.currentSession()?.id;
     if (!id) return [];
-    return paneTail(this.terminalScreens()[id]?.content ?? null);
+    const content = this.terminalScreens()[id]?.content ?? null;
+    if (content === this.shellTailSource) return this.shellTailCache;
+    this.shellTailSource = content;
+    // Safe by construction: `paneTailHtml` HTML-escapes the pane text before adding any markup,
+    // so the only tags present are the colour spans it writes itself.
+    this.shellTailCache = paneTailHtml(content).map((html) =>
+      this.sanitizer.bypassSecurityTrustHtml(html),
+    );
+    return this.shellTailCache;
   }
+  /** Memoised so a template re-read does not re-parse the pane or churn SafeHtml identities. */
+  private shellTailSource: string | null = null;
+  private shellTailCache: SafeHtml[] = [];
 
   /**
    * Is the agent working?
@@ -939,6 +950,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
   private shellLog?: ElementRef<HTMLElement>;
   private readonly browserTitle = inject(Title);
+  private readonly sanitizer = inject(DomSanitizer);
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
   sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 

@@ -128,3 +128,117 @@ export function paneTail(content: string | null | undefined, maxLines = PANE_TAI
     });
   return lines.slice(-Math.max(1, maxLines));
 }
+
+
+/** xterm's 256-colour palette as CSS, computed rather than tabulated. */
+function xterm256(i: number): string {
+  if (i < 16) {
+    const base = [
+      '#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
+      '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#ffffff',
+    ];
+    return base[i];
+  }
+  if (i < 232) {
+    const n = i - 16;
+    const steps = [0, 95, 135, 175, 215, 255];
+    const r = steps[Math.floor(n / 36) % 6];
+    const g = steps[Math.floor(n / 6) % 6];
+    const b = steps[n % 6];
+    return `rgb(${r},${g},${b})`;
+  }
+  const v = 8 + (i - 232) * 10;
+  return `rgb(${v},${v},${v})`;
+}
+
+function escapeHtmlText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Render a pane line's ANSI colours as HTML.
+ *
+ * The preview exists to look like the terminal; stripping it to grey text loses the colour that
+ * makes agent output scannable - the diff greens, the error reds, the dimmed tool chrome.
+ *
+ * Only SGR is interpreted; every other escape is dropped, since cursor moves and screen clears
+ * have no meaning in a static block. Text is HTML-escaped BEFORE any markup is added, so pane
+ * content can never inject markup - the only tags in the output are the ones this function writes.
+ */
+export function ansiLineToHtml(line: string): string {
+  const SGR = /\u001b\[([0-9;]*)m/g;
+  let out = '';
+  let cursor = 0;
+  let fg: string | null = null;
+  let bold = false;
+  let dim = false;
+
+  const openSpan = (): string => {
+    const styles: string[] = [];
+    if (fg) styles.push(`color:${fg}`);
+    if (bold) styles.push('font-weight:600');
+    if (dim) styles.push('opacity:.65');
+    return styles.length === 0 ? '' : `<span style="${styles.join(';')}">`;
+  };
+  const flush = (text: string): void => {
+    if (!text) return;
+    const span = openSpan();
+    out += span ? span + escapeHtmlText(text) + '</span>' : escapeHtmlText(text);
+  };
+
+  let match: RegExpExecArray | null;
+  while ((match = SGR.exec(line)) !== null) {
+    flush(line.slice(cursor, match.index));
+    cursor = match.index + match[0].length;
+    const codes = (match[1] || '0').split(';').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code === 0) {
+        fg = null;
+        bold = false;
+        dim = false;
+      } else if (code === 1) bold = true;
+      else if (code === 2) dim = true;
+      else if (code === 22) {
+        bold = false;
+        dim = false;
+      } else if (code === 39) fg = null;
+      else if (code >= 30 && code <= 37) fg = xterm256(code - 30);
+      else if (code >= 90 && code <= 97) fg = xterm256(code - 90 + 8);
+      else if (code === 38 && codes[i + 1] === 5) {
+        fg = xterm256(codes[i + 2] ?? 7);
+        i += 2;
+      } else if (code === 38 && codes[i + 1] === 2) {
+        fg = `rgb(${codes[i + 2] ?? 0},${codes[i + 3] ?? 0},${codes[i + 4] ?? 0})`;
+        i += 4;
+      }
+    }
+  }
+  flush(line.slice(cursor));
+  // Any non-SGR escape that survived is noise in a static block.
+  return out.replace(ANSI, '');
+}
+
+/**
+ * Colour-preserving variant of `paneTail`. Same line selection, but each surviving line is
+ * returned as HTML with its ANSI colours intact.
+ */
+export function paneTailHtml(
+  content: string | null | undefined,
+  maxLines = PANE_TAIL_LINES,
+): string[] {
+  if (!content) return [];
+  const kept = content
+    .split('\n')
+    .map((line) => line.replace(/█+/g, '').replace(/\s+$/, ''))
+    .filter((line) => {
+      const plain = stripAnsi(line).trim();
+      if (!plain) return false;
+      return !/^[─-╿\-_=\s]+$/.test(plain);
+    });
+  return kept.slice(-Math.max(1, maxLines)).map(ansiLineToHtml);
+}

@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { agentActivityLine, agentIsBusy, paneTail, screenIdleKey } from './shell-activity';
+import {
+  agentActivityLine,
+  agentIsBusy,
+  ansiLineToHtml,
+  paneTail,
+  paneTailHtml,
+  screenIdleKey,
+} from './shell-activity';
 
 // Fixtures are verbatim rows captured from live Claude Code panes.
 const WORKING = [
@@ -171,5 +178,64 @@ describe('paneTail', () => {
     expect(paneTail(null)).toEqual([]);
     expect(paneTail('')).toEqual([]);
     expect(paneTail('a\nb', 0)).toEqual(['b']);
+  });
+});
+
+
+describe('ansiLineToHtml / paneTailHtml (colour preserved)', () => {
+  const E = '';
+
+  it('wraps 256-colour runs in styled spans', () => {
+    const html = ansiLineToHtml(`${E}[38;5;180mMustering${E}[39m`);
+    expect(html).toContain('<span style="color:');
+    expect(html).toContain('Mustering');
+  });
+
+  it('maps the basic 30-37 range', () => {
+    expect(ansiLineToHtml(`${E}[31mred${E}[0m`)).toContain('#cd3131');
+    expect(ansiLineToHtml(`${E}[32mgreen${E}[0m`)).toContain('#0dbc79');
+  });
+
+  it('resets colour on 0 and 39 so a run does not bleed', () => {
+    const html = ansiLineToHtml(`${E}[31mred${E}[0mplain`);
+    expect(html.endsWith('plain')).toBe(true);
+  });
+
+  it('carries bold and dim as weight and opacity', () => {
+    expect(ansiLineToHtml(`${E}[1mbold${E}[22m`)).toContain('font-weight:600');
+    expect(ansiLineToHtml(`${E}[2mdim${E}[22m`)).toContain('opacity:.65');
+  });
+
+  it('ESCAPES pane content - markup in the terminal can never become markup here', () => {
+    const html = ansiLineToHtml('<img src=x onerror=alert(1)>');
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
+  });
+
+  it('escapes inside a coloured run too', () => {
+    const html = ansiLineToHtml(`${E}[31m<b>hi</b>${E}[0m`);
+    expect(html).not.toContain('<b>');
+    expect(html).toContain('&lt;b&gt;');
+  });
+
+  it('drops non-SGR escapes, which mean nothing in a static block', () => {
+    expect(ansiLineToHtml(`${E}[2Jcleared`)).toBe('cleared');
+  });
+
+  it('plain text passes through untouched', () => {
+    expect(ansiLineToHtml('just text')).toBe('just text');
+  });
+
+  it('paneTailHtml keeps the same lines as paneTail, but coloured', () => {
+    const pane = [`${E}[31mone${E}[0m`, '───', `${E}[32mtwo${E}[0m`].join('\n');
+    const html = paneTailHtml(pane, 10);
+    expect(html.length).toBe(2);
+    expect(html[0]).toContain('one');
+    expect(html[1]).toContain('#0dbc79');
+  });
+
+  it('paneTailHtml is empty for nothing', () => {
+    expect(paneTailHtml(null)).toEqual([]);
+    expect(paneTailHtml('')).toEqual([]);
   });
 });

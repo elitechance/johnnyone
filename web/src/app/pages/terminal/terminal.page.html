@@ -187,7 +187,11 @@
                        agent's reported answer arrives. -->
                   @if (shellPaneTail(); as tail) {
                     @if (tail.length > 0 && (shellBusy() || shellPending())) {
-                      <pre class="st-peek">{{ tail.join('\n') }}</pre>
+                      <div class="st-peek">
+                        @for (line of tail; track $index) {
+                          <div class="st-peek-l" [innerHTML]="line"></div>
+                        }
+                      </div>
                     }
                   }
                   @if (!shellActivity() && shellShowNoReply()) {

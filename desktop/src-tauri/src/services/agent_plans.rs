@@ -3720,6 +3720,12 @@ pub async fn record_agent_report(
             evidence,
         },
     );
+    // The shell nudge watcher reads this to tell "answered and reported" from "went quiet".
+    state
+        .shell_last_report_at
+        .lock()
+        .await
+        .insert(session_id.clone(), std::time::Instant::now());
     tracing::info!(session_id, role, kind = %kind_norm, "recorded structured agent report");
     Ok(())
 }
@@ -5281,7 +5287,7 @@ fn snapshot_idle_key(snapshot: &terminal::TerminalSnapshot) -> String {
 }
 
 
-fn normalize_terminal_snapshot_for_idle(content: &str) -> String {
+pub(crate) fn normalize_terminal_snapshot_for_idle(content: &str) -> String {
     strip_ansi_escapes(content)
         .lines()
         .filter_map(|line| {
