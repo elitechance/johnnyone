@@ -89,7 +89,7 @@ import {
   appendTranscriptEvent,
   diffStreamSubscriptions,
 } from './terminal-transcript-tab';
-import { agentActivityLine, agentIsBusy, screenIdleKey } from './shell-activity';
+import { agentActivityLine, agentIsBusy, paneTail, screenIdleKey } from './shell-activity';
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
@@ -594,6 +594,19 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const id = this.currentSession()?.id;
     if (!id) return null;
     return agentActivityLine(this.terminalScreens()[id]?.content ?? null);
+  }
+
+  /**
+   * Live tail of the pane, shown while the agent works.
+   *
+   * We poll the pane anyway for busy-detection, so a spinner would be throwing away information
+   * we already hold. Watching the tool calls and output scroll past says far more than
+   * "Slithering… (4m 17s)". It is replaced by the agent's reported answer once that lands.
+   */
+  protected shellPaneTail(): string[] {
+    const id = this.currentSession()?.id;
+    if (!id) return [];
+    return paneTail(this.terminalScreens()[id]?.content ?? null);
   }
 
   /**

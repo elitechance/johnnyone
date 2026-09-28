@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentActivityLine, agentIsBusy, screenIdleKey } from './shell-activity';
+import { agentActivityLine, agentIsBusy, paneTail, screenIdleKey } from './shell-activity';
 
 // Fixtures are verbatim rows captured from live Claude Code panes.
 const WORKING = [
@@ -130,5 +130,46 @@ describe('screenIdleKey (provider-agnostic churn)', () => {
   it('is empty for nothing at all', () => {
     expect(screenIdleKey(null)).toBe('');
     expect(screenIdleKey('\n  \n')).toBe('');
+  });
+});
+
+
+describe('paneTail', () => {
+  it('returns the last N meaningful lines', () => {
+    const pane = Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n');
+    const tail = paneTail(pane, 5);
+    expect(tail).toEqual(['line 35', 'line 36', 'line 37', 'line 38', 'line 39']);
+  });
+
+  it('strips escapes so the preview is plain text', () => {
+    const tail = paneTail('\u001b[38;5;180mBuilding\u001b[39m', 5);
+    expect(tail).toEqual(['Building']);
+    expect(tail[0]).not.toContain('\u001b');
+  });
+
+  it('drops separator rules and blank padding but keeps real content', () => {
+    const pane = [
+      'Ran 1 shell command',
+      '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500',
+      '',
+      '------',
+      '2 + 2 = 4',
+    ].join('\n');
+    expect(paneTail(pane, 10)).toEqual(['Ran 1 shell command', '2 + 2 = 4']);
+  });
+
+  it('keeps a prompt line - it is content, not chrome', () => {
+    expect(paneTail('\u276f what is 2+2?', 5)).toEqual(['\u276f what is 2+2?']);
+  });
+
+  it('works on a Grok pane', () => {
+    const grok = ['     Worked for 13s', '  Shift+Tab:mode  |  Ctrl+x:shortcuts'].join('\n');
+    expect(paneTail(grok, 10)).toEqual(['     Worked for 13s', '  Shift+Tab:mode  |  Ctrl+x:shortcuts']);
+  });
+
+  it('is empty for nothing, and never returns zero lines for a bad depth', () => {
+    expect(paneTail(null)).toEqual([]);
+    expect(paneTail('')).toEqual([]);
+    expect(paneTail('a\nb', 0)).toEqual(['b']);
   });
 });

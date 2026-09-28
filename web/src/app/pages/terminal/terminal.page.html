@@ -181,14 +181,24 @@
                     <!-- Real activity from the live pane, so a long think shows what it is doing
                          instead of an uninformative spin. Replaced by the report when it lands. -->
                     <div class="st-act">{{ act }}</div>
-                  } @else if (shellShowNoReply()) {
+                  }
+                  <!-- Live tail of the pane. We poll it anyway, so show the work scrolling past
+                       rather than throwing it away behind a spinner. It disappears when the
+                       agent's reported answer arrives. -->
+                  @if (shellPaneTail(); as tail) {
+                    @if (tail.length > 0 && (shellBusy() || shellPending())) {
+                      <pre class="st-peek">{{ tail.join('\n') }}</pre>
+                    }
+                  }
+                  @if (!shellActivity() && shellShowNoReply()) {
                     <!-- Silent AND idle: the agent most likely answered in its terminal without
                          reporting, which the transcript cannot see. Say so rather than spin on. -->
                     <div class="st-stale">
                       Still no reply reported. The agent may have answered in its terminal without
                       reporting it — open <b>Raw</b> to check.
                     </div>
-                  } @else {
+                  }
+                  @if (!shellActivity() && shellPaneTail().length === 0 && !shellShowNoReply()) {
                     <div class="st-dots"><i></i><i></i><i></i></div>
                   }
                 </div>

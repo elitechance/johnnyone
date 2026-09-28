@@ -1180,6 +1180,27 @@ ion-modal.workspace-picker .picker-empty {
 
   /* Waiting on the next report. */
   .st-row.st-wait { border-bottom: 0; }
+  /* Live tail of the pane while the agent works. Dimmed and monospace so it reads as a window
+     onto the terminal, clearly not part of the committed transcript — and it disappears when
+     the reported answer arrives. Scrolls sideways on its own rather than widening the log. */
+  .st-peek {
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    border-radius: 7px;
+    border: 1px solid var(--jo-border);
+    background: var(--jo-bg-base);
+    color: var(--jo-fg-muted);
+    font-family: var(--jo-font-mono, ui-monospace, monospace);
+    font-size: 10.5px;
+    line-height: 1.45;
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 210px;
+    overflow-y: hidden;
+    /* Fade the top so it reads as "a window onto something longer", not a truncated block. */
+    mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
+  }
   .st-stale {
     font-size: 12.5px;
     line-height: 1.5;

@@ -99,3 +99,32 @@ export function screenIdleKey(content: string | null | undefined): string {
     .filter((line) => line.trim().length > 0)
     .join('\n');
 }
+
+
+/** Default depth of the live pane preview shown while an agent works. */
+export const PANE_TAIL_LINES = 20;
+
+/**
+ * The last meaningful lines of the pane, for a live preview while waiting.
+ *
+ * A spinner throws away information we already have. We poll the pane anyway, so show the work:
+ * the tool calls and output scrolling past are far more reassuring than "Slithering… (4m 17s)",
+ * and it costs nothing extra. Replaced by the agent's reported answer once it lands.
+ *
+ * Only unambiguous chrome is dropped — separator rules and box edges, which carry no information
+ * once stripped of their layout. Anything that could be content is kept, because deciding what is
+ * "chrome" per CLI is exactly the provider-specific guessing that broke busy-detection.
+ */
+export function paneTail(content: string | null | undefined, maxLines = PANE_TAIL_LINES): string[] {
+  if (!content) return [];
+  const lines = stripAnsi(content)
+    .split('\n')
+    .map((line) => line.replace(/\u2588+/g, '').trimEnd())
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return false;
+      // Pure rules / box edges: nothing but line-drawing, dashes or box corners.
+      return !/^[\u2500-\u257F\-_=\s]+$/.test(t);
+    });
+  return lines.slice(-Math.max(1, maxLines));
+}
