@@ -3615,7 +3615,24 @@ pub async fn record_agent_report(
 ) -> Result<(), String> {
     let kind_norm = kind.trim().to_ascii_lowercase();
     // Identity is derived from the session, never self-declared (spoof guard).
-    let role = plan_role_for_session(state, &session_id)?;
+    //
+    // Narration (`update`/`blocked`) is allowed from ANY session that really exists, not just a
+    // plan's. A shell you attached by hand is a legitimate reporter — it is exactly what the
+    // console's transcript renders — and refusing it left that surface permanently empty. The
+    // spoof guard still does its real job: the session must exist, and the CONTROL signals
+    // (`ready`/`verdict`/`done`) that advance a run still require a verified plan role, so no
+    // caller can drive someone else's run by guessing an id.
+    let role = match plan_role_for_session(state, &session_id) {
+        Ok(role) => role,
+        Err(err) => {
+            let narration = matches!(kind_norm.as_str(), "update" | "blocked");
+            if narration && session_exists(state, &session_id)? {
+                "shell".to_string()
+            } else {
+                return Err(err);
+            }
+        }
+    };
     let verdict_norm = match kind_norm.as_str() {
         "ready" => {
             if role != "worker" {
@@ -3871,6 +3888,22 @@ fn plan_role_for_session(state: &AppState, session_id: &str) -> Result<String, S
         .map_err(|e| e.to_string())
     })?;
     role.ok_or_else(|| "session id does not belong to any plan".to_string())
+}
+
+/// Does this session id name a real, non-deleted session? The existence check behind allowing
+/// narration from non-plan sessions — an unguessable id is the credential, exactly as it is for
+/// the plan-scoped reports.
+fn session_exists(state: &AppState, session_id: &str) -> Result<bool, String> {
+    state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
+            params![session_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|found| found.unwrap_or(false))
+        .map_err(|e| e.to_string())
+    })
 }
 
 /// Register an ephemeral agent session (lens reviewer, docs agent, …) so its

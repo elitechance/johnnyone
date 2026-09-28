@@ -519,13 +519,20 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // a report lands. The 500ms delay before that row appears keeps a fast reply from flashing
   // a spinner nobody needed.
   private static readonly SHELL_PENDING_DELAY_MS = 500;
+  /** After this long with no report, stop pretending and tell the user where to look. */
+  private static readonly SHELL_PENDING_STALE_MS = 90_000;
 
   protected shellDraft = '';
   /** Locally-echoed sends, positioned by how many events existed when each was sent. */
   private readonly shellEchoes = signal<Array<{ sessionId: string; atIndex: number; text: string }>>([]);
   /** True once the pending row should actually render (i.e. the delay has elapsed). */
   protected readonly shellPending = signal(false);
+  /** True when we have waited long enough that a silent agent is the likely explanation. */
+  protected readonly shellPendingStale = signal(false);
   private shellPendingTimer: ReturnType<typeof setTimeout> | null = null;
+  private shellStaleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Sessions already told how to report, so the instruction rides only the first message. */
+  private readonly shellBriefed = new Set<string>();
   /** Wall-clock of the newest report, for the "last update" liveness line. */
   protected readonly shellLastEventAt = signal<number | null>(null);
   /** Ticks so the liveness line re-renders while nothing else changes. */
@@ -589,6 +596,33 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       clearTimeout(this.shellPendingTimer);
       this.shellPendingTimer = null;
     }
+    if (this.shellStaleTimer) {
+      clearTimeout(this.shellStaleTimer);
+      this.shellStaleTimer = null;
+    }
+    this.shellPendingStale.set(false);
+  }
+
+  /**
+   * One-line brief appended to the FIRST message of a session.
+   *
+   * An agent you attached by hand was never told any of this — only plan-spawned agents get the
+   * reporting instructions in their prompt — so it answers in its TUI and the transcript stays
+   * empty forever. This tells it how to make its reply visible here.
+   *
+   * Deliberately ONE line: this is pasted into a TUI composer, where an embedded newline submits
+   * early and splits the message in half.
+   */
+  private shellReportBrief(sessionId: string): string {
+    return (
+      ` [JohnnyOne: this conversation is being read on a phone, which shows ONLY what you report` +
+      ` — your terminal output is not visible there. After you answer, write your reply as markdown` +
+      ` (mermaid fences render) to a file, then run:` +
+      ` curl -s 127.0.0.1:7788/graphql -H 'content-type: application/json'` +
+      ` -d '{"query":"mutation{reportAgentResult(sessionId:\\"${sessionId}\\",kind:\\"update\\",` +
+      `summary:\\"ONE LINE NO QUOTES\\",evidence:\\"/absolute/path/to/reply.md\\")}"}'` +
+      ` — replace the summary and path, and do this for every reply.]`
+    );
   }
 
   /** Send from the transcript composer: echo locally, then wait for the agent to report back. */
@@ -606,9 +640,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       () => this.shellPending.set(true),
       TerminalPage.SHELL_PENDING_DELAY_MS,
     );
+    this.shellStaleTimer = setTimeout(
+      () => this.shellPendingStale.set(true),
+      TerminalPage.SHELL_PENDING_STALE_MS,
+    );
+    // The brief rides the first message only — after that the agent has the instruction in context.
+    const briefed = this.shellBriefed.has(id);
+    if (!briefed) this.shellBriefed.add(id);
+    const payload = briefed ? text : `${text}${this.shellReportBrief(id)}`;
     // Reuses the existing raw-input path (relay → host → tmux), so replying from the
     // transcript is the same wire call the terminal makes. `\r` submits in the agent TUI.
-    await this.onTerminalRawInput(`${text}\r`, id);
+    await this.onTerminalRawInput(`${payload}\r`, id);
   }
 
   // Plan-tab projections over `planRun` (P2, pure `plan-tab-logic`).

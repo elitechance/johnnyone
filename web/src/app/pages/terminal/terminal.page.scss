@@ -1174,6 +1174,13 @@ ion-modal.workspace-picker .picker-empty {
 
   /* Waiting on the next report. */
   .st-row.st-wait { border-bottom: 0; }
+  .st-stale {
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--jo-fg-muted);
+
+    b { color: var(--jo-fg-strong); font-weight: 600; }
+  }
   .st-spin {
     width: 10px;
     height: 10px;

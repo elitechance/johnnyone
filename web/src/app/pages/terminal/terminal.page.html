@@ -174,7 +174,16 @@
               <article class="st-row st-wait" aria-live="polite" aria-label="Waiting for the agent">
                 <span class="st-ic"><span class="st-spin"></span></span>
                 <div class="st-bd">
-                  <div class="st-dots"><i></i><i></i><i></i></div>
+                  @if (shellPendingStale()) {
+                    <!-- Long silence usually means the agent answered in its terminal without
+                         reporting, which the transcript cannot see. Say so instead of spinning. -->
+                    <div class="st-stale">
+                      Still no reply reported. The agent may have answered in its terminal without
+                      reporting it — open <b>Raw</b> to check.
+                    </div>
+                  } @else {
+                    <div class="st-dots"><i></i><i></i><i></i></div>
+                  }
                 </div>
               </article>
             }
