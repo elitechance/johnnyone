@@ -672,10 +672,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     const nearBottom = distanceFromBottom < 120;
     if (!force && !nearBottom) return;
-    requestAnimationFrame(() => {
+    const pin = () => {
       const node = this.shellLog?.nativeElement;
       if (node) node.scrollTop = node.scrollHeight;
-    });
+    };
+    requestAnimationFrame(pin);
+    if (!force) return;
+    // A forced pin has to outlast content that grows AFTER layout: mermaid renders async and
+    // images decode late, either of which pushes the newest row back below the fold. Re-pin a
+    // couple of times rather than trust the first frame.
+    setTimeout(pin, 120);
+    setTimeout(pin, 400);
   }
 
   /** Send from the transcript composer: echo locally, then wait for the agent to report back. */
@@ -904,7 +911,19 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   @ViewChild('consoleRoot', { static: true })
   private consoleRoot?: ElementRef<HTMLElement>;
   /** The transcript's scroll container. Not static: it only exists in transcript view. */
+  /**
+   * The transcript's scroll container.
+   *
+   * A setter, not a plain query, because switching to Raw DESTROYS this element and coming back
+   * creates a fresh one at scrollTop 0 — so the log reopened at the top instead of on the newest
+   * message. Pinning here covers every way it can appear: view switch, first open, session
+   * change.
+   */
   @ViewChild('shellLog')
+  private set shellLogRef(ref: ElementRef<HTMLElement> | undefined) {
+    this.shellLog = ref;
+    if (ref) this.scrollShellLogToBottom(true);
+  }
   private shellLog?: ElementRef<HTMLElement>;
   private readonly browserTitle = inject(Title);
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
