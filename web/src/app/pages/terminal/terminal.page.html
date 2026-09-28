@@ -181,7 +181,7 @@
                     <!-- Real activity from the live pane, so a long think shows what it is doing
                          instead of an uninformative spin. Replaced by the report when it lands. -->
                     <div class="st-act">{{ act }}</div>
-                  } @else if (shellPendingStale() && !shellBusy()) {
+                  } @else if (shellShowNoReply()) {
                     <!-- Silent AND idle: the agent most likely answered in its terminal without
                          reporting, which the transcript cannot see. Say so rather than spin on. -->
                     <div class="st-stale">

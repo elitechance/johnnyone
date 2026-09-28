@@ -528,10 +528,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly shellEchoes = signal<Array<{ sessionId: string; atIndex: number; text: string }>>([]);
   /** True once the pending row should actually render (i.e. the delay has elapsed). */
   protected readonly shellPending = signal(false);
-  /** True when we have waited long enough that a silent agent is the likely explanation. */
-  protected readonly shellPendingStale = signal(false);
   private shellPendingTimer: ReturnType<typeof setTimeout> | null = null;
-  private shellStaleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Wall-clock of the last frame showing a turn in flight — the "it is alive" reference. */
+  private readonly shellLastBusyAt = signal<number | null>(null);
+  /** Wall-clock of the last message sent from the composer. */
+  private readonly shellLastSendAt = signal<number | null>(null);
   /** Wall-clock of the newest report, for the "last update" liveness line. */
   protected readonly shellLastEventAt = signal<number | null>(null);
   /** Ticks so the liveness line re-renders while nothing else changes. */
@@ -616,11 +617,26 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       clearTimeout(this.shellPendingTimer);
       this.shellPendingTimer = null;
     }
-    if (this.shellStaleTimer) {
-      clearTimeout(this.shellStaleTimer);
-      this.shellStaleTimer = null;
-    }
-    this.shellPendingStale.set(false);
+  }
+
+  /**
+   * Whether to say "nothing was reported".
+   *
+   * Only when the session is genuinely QUIET: no live activity line, the pane is not mid-turn,
+   * and nothing has happened — report, send, or a busy frame — for the idle window. It is a
+   * statement about silence, so it must never sit alongside the animation, and it must not fire
+   * just because a long think outlived a timer started when you hit send.
+   */
+  protected shellShowNoReply(): boolean {
+    this.shellClock(); // re-evaluate as the clock ticks
+    if (this.shellActivity() || this.shellBusy()) return false;
+    const since = Math.max(
+      this.shellLastEventAt() ?? 0,
+      this.shellLastBusyAt() ?? 0,
+      this.shellLastSendAt() ?? 0,
+    );
+    if (!since) return false;
+    return Date.now() - since >= TerminalPage.SHELL_PENDING_STALE_MS;
   }
 
   /** Send from the transcript composer: echo locally, then wait for the agent to report back. */
@@ -638,10 +654,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       () => this.shellPending.set(true),
       TerminalPage.SHELL_PENDING_DELAY_MS,
     );
-    this.shellStaleTimer = setTimeout(
-      () => this.shellPendingStale.set(true),
-      TerminalPage.SHELL_PENDING_STALE_MS,
-    );
+    this.shellLastSendAt.set(Date.now());
     // Send exactly what the user typed. The host appends the reporting brief to the first
     // message of a shell session (`with_shell_brief`) so that plumbing never appears here.
     // Reuses the existing raw-input path (relay → host → tmux); `\r` submits in the agent TUI.
@@ -1959,6 +1972,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         if (screen.sessionId === this.currentSession()?.id) {
           this.terminalScreen.set(screen);
           this.terminalError.set(null);
+          // A frame showing a turn in flight resets the idle clock, so a long think never
+          // gets accused of having gone silent.
+          if (agentIsBusy(screen.content)) this.shellLastBusyAt.set(Date.now());
         }
       },
       error: (err) => {
