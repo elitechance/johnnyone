@@ -695,7 +695,7 @@ impl AgentService {
         command: &message_types::TerminalCommand,
     ) -> Result<String, String> {
         if command.attachments.is_empty() {
-            return Ok(command.data.clone());
+            return Ok(Self::with_shell_brief(state, &command.session_id, command.data.clone()).await);
         }
 
         let saved = Self::save_command_attachments(state, command).await?;
@@ -710,7 +710,72 @@ impl AgentService {
             data.push('\n');
         }
         data.push('\r');
-        Ok(data)
+        Ok(Self::with_shell_brief(state, &command.session_id, data).await)
+    }
+
+    /// Append the console's reporting brief to a user's FIRST message in a shell/attached session.
+    ///
+    /// An agent you attached by hand was never told that the phone console shows only what it
+    /// reports, so it answers in its pane and the transcript stays empty. The brief has to reach
+    /// it somehow — but it is plumbing, and the user should not have to look at it in their own
+    /// message, so the host adds it here instead of the client.
+    ///
+    /// Only this relay path is touched, which is user input by definition: the coordinator calls
+    /// `send_terminal_input` directly and its agents are already briefed by their plan prompt.
+    /// One line, because a newline submits early in a TUI composer and would split the message.
+    async fn with_shell_brief(state: &Arc<AppState>, session_id: &str, data: String) -> String {
+        if data.trim().is_empty() {
+            return data;
+        }
+        // Control keys and navigation are not messages — never brief on those.
+        let body = data.trim_end_matches(['\r', '\n']);
+        if body.trim().is_empty() || body.chars().any(|c| c.is_control()) {
+            return data;
+        }
+        if !Self::session_wants_brief(state, session_id) {
+            return data;
+        }
+        {
+            let mut briefed = state.shell_briefed.lock().await;
+            if !briefed.insert(session_id.to_string()) {
+                return data;
+            }
+        }
+        let brief = format!(
+            " [JohnnyOne: this conversation is being read on a phone console that shows ONLY what \
+             you report — your terminal output is not visible there. After you answer, write your \
+             reply as markdown (```mermaid fences render) to a file, then run: curl -s \
+             127.0.0.1:7788/graphql -H 'content-type: application/json' -d \
+             '{{\"query\":\"mutation{{reportAgentResult(sessionId:\\\"{session_id}\\\",\
+             kind:\\\"update\\\",summary:\\\"ONE LINE NO QUOTES\\\",\
+             evidence:\\\"/absolute/path/to/reply.md\\\")}}\"}}' — replace the summary and path, \
+             and do this for every reply.]"
+        );
+        let tail: String = data[body.len()..].to_string();
+        format!("{body}{brief}{tail}")
+    }
+
+    /// Shell and attached-tmux sessions get the brief; plan agents already have the instruction
+    /// in their prompt, so briefing them again would just be noise in their context.
+    fn session_wants_brief(state: &Arc<AppState>, session_id: &str) -> bool {
+        use rusqlite::OptionalExtension;
+        state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT provider, attached_tmux FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id],
+                    |row| {
+                        let provider: String = row.get(0)?;
+                        let attached: i64 = row.get(1)?;
+                        Ok(provider == "shell" || attached != 0)
+                    },
+                )
+                .optional()
+                .map(|found| found.unwrap_or(false))
+                .map_err(|e| e.to_string())
+            })
+            .unwrap_or(false)
     }
 
     async fn save_command_attachments(
