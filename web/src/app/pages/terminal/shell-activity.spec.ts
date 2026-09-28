@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentActivityLine, agentIsBusy } from './shell-activity';
+import { agentActivityLine, agentIsBusy, screenIdleKey } from './shell-activity';
 
 // Fixtures are verbatim rows captured from live Claude Code panes.
 const WORKING = [
@@ -91,5 +91,44 @@ describe('agentIsBusy', () => {
   it('is false at an idle composer', () => {
     expect(agentIsBusy(FINISHED)).toBe(false);
     expect(agentIsBusy(null)).toBe(false);
+  });
+});
+
+
+describe('screenIdleKey (provider-agnostic churn)', () => {
+  it('ignores colour changes - a repaint in new colours is not progress', () => {
+    const a = '\u001b[38;5;174mBuilding\u001b[39m';
+    const b = '\u001b[38;5;180mBuilding\u001b[39m';
+    expect(screenIdleKey(a)).toBe(screenIdleKey(b));
+  });
+
+  it('ignores the blinking cursor block', () => {
+    expect(screenIdleKey('ready \u2588')).toBe(screenIdleKey('ready'));
+  });
+
+  it('ignores blank-line churn and trailing padding', () => {
+    expect(screenIdleKey('a\n\n\nb')).toBe(screenIdleKey('a\nb'));
+    expect(screenIdleKey('a   \nb')).toBe(screenIdleKey('a\nb'));
+  });
+
+  it('DOES change when real content changes', () => {
+    expect(screenIdleKey('Worked for 13s')).not.toBe(screenIdleKey('Worked for 14s'));
+  });
+
+  it('works on a Grok pane, which has none of the Claude markers', () => {
+    const grok = [
+      '     Worked for 13s',
+      '  | \u276f                  |',
+      '  Shift+Tab:mode  |  Ctrl+x:shortcuts',
+    ].join('\n');
+    expect(agentIsBusy(grok)).toBe(false);
+    expect(agentActivityLine(grok)).toBeNull();
+    expect(screenIdleKey(grok).length).toBeGreaterThan(0);
+    expect(screenIdleKey(grok)).not.toBe(screenIdleKey(grok.replace('13s', '19s')));
+  });
+
+  it('is empty for nothing at all', () => {
+    expect(screenIdleKey(null)).toBe('');
+    expect(screenIdleKey('\n  \n')).toBe('');
   });
 });

@@ -77,3 +77,25 @@ export function agentIsBusy(content: string | null | undefined): boolean {
   // Colour codes can land mid-phrase, so match on the stripped text.
   return /esc to interrupt/i.test(stripAnsi(content));
 }
+
+
+/**
+ * A comparison key for "has this pane changed?".
+ *
+ * Busy detection must not depend on one CLI's wording. Claude says `esc to interrupt`, Grok shows
+ * a boxed composer and `Worked for 13s`, Codex differs again — matching any of those strings only
+ * ever works for the CLI it was written against. What every agent has in common is that its pane
+ * CHANGES while it works, so churn is the portable signal. This mirrors the host coordinator's
+ * `normalize_terminal_snapshot_for_idle`, which settled the same question server-side.
+ *
+ * Escapes and the blinking cursor block are dropped so a colour tick or a blink is not mistaken
+ * for progress.
+ */
+export function screenIdleKey(content: string | null | undefined): string {
+  if (!content) return '';
+  return stripAnsi(content)
+    .split('\n')
+    .map((line) => line.replace(/\u2588+/g, '').trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .join('\n');
+}

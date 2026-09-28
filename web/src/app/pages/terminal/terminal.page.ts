@@ -88,7 +88,7 @@ import {
   appendTranscriptEvent,
   diffStreamSubscriptions,
 } from './terminal-transcript-tab';
-import { agentActivityLine, agentIsBusy } from './shell-activity';
+import { agentActivityLine, agentIsBusy, screenIdleKey } from './shell-activity';
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
@@ -529,8 +529,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** True once the pending row should actually render (i.e. the delay has elapsed). */
   protected readonly shellPending = signal(false);
   private shellPendingTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Wall-clock of the last frame showing a turn in flight — the "it is alive" reference. */
+  /** Wall-clock of the last frame whose CONTENT changed — the "it is alive" reference. */
   private readonly shellLastBusyAt = signal<number | null>(null);
+  /** Last normalised pane content per session, for churn detection. */
+  private readonly shellIdleKeys = new Map<string, string>();
+  /** A pane that changed within this window counts as working. */
+  private static readonly SHELL_BUSY_WINDOW_MS = 3_000;
   /** Wall-clock of the last message sent from the composer. */
   private readonly shellLastSendAt = signal<number | null>(null);
   /** Wall-clock of the newest report, for the "last update" liveness line. */
@@ -587,11 +591,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return agentActivityLine(this.terminalScreens()[id]?.content ?? null);
   }
 
-  /** True when the pane shows a turn in flight but has not produced a timer line yet. */
+  /**
+   * Is the agent working?
+   *
+   * Churn, not wording. Claude prints `esc to interrupt`, Grok draws a boxed composer, Codex
+   * differs again — a string match only ever works for the CLI it was written against. Every
+   * agent's pane changes while it works, so a recent content change is the portable signal.
+   * `agentIsBusy` is still consulted because when a CLI does say so it is instant, whereas churn
+   * needs one frame to establish.
+   */
   protected shellBusy(): boolean {
+    this.shellClock();
     const id = this.currentSession()?.id;
     if (!id) return false;
-    return agentIsBusy(this.terminalScreens()[id]?.content ?? null);
+    if (agentIsBusy(this.terminalScreens()[id]?.content ?? null)) return true;
+    const at = this.shellLastBusyAt();
+    return at !== null && Date.now() - at < TerminalPage.SHELL_BUSY_WINDOW_MS;
   }
 
   /** "last update 42s ago" — an explicit liveness claim, unlike inferring it from scrolling text. */
@@ -639,6 +654,25 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return Date.now() - since >= TerminalPage.SHELL_PENDING_STALE_MS;
   }
 
+  /**
+   * Keep the transcript pinned to the newest row.
+   *
+   * Only when the reader is already near the bottom: yanking the view down while someone is
+   * reading back through earlier output is worse than not following at all. Runs after the row
+   * is in the DOM, since the height it adds is what we are scrolling past.
+   */
+  private scrollShellLogToBottom(force = false): void {
+    const el = this.shellLog?.nativeElement;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distanceFromBottom < 120;
+    if (!force && !nearBottom) return;
+    requestAnimationFrame(() => {
+      const node = this.shellLog?.nativeElement;
+      if (node) node.scrollTop = node.scrollHeight;
+    });
+  }
+
   /** Send from the transcript composer: echo locally, then wait for the agent to report back. */
   protected async sendShellMessage(): Promise<void> {
     const text = this.shellDraft.trim();
@@ -655,6 +689,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       TerminalPage.SHELL_PENDING_DELAY_MS,
     );
     this.shellLastSendAt.set(Date.now());
+    this.scrollShellLogToBottom(true);
     // Send exactly what the user typed. The host appends the reporting brief to the first
     // message of a shell session (`with_shell_brief`) so that plumbing never appears here.
     // Reuses the existing raw-input path (relay → host → tmux); `\r` submits in the agent TUI.
@@ -816,6 +851,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private terminalWorkspace?: ElementRef<HTMLElement>;
   @ViewChild('consoleRoot', { static: true })
   private consoleRoot?: ElementRef<HTMLElement>;
+  /** The transcript's scroll container. Not static: it only exists in transcript view. */
+  @ViewChild('shellLog')
+  private shellLog?: ElementRef<HTMLElement>;
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
   sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 
@@ -1972,9 +2010,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         if (screen.sessionId === this.currentSession()?.id) {
           this.terminalScreen.set(screen);
           this.terminalError.set(null);
-          // A frame showing a turn in flight resets the idle clock, so a long think never
-          // gets accused of having gone silent.
-          if (agentIsBusy(screen.content)) this.shellLastBusyAt.set(Date.now());
+          // Any real content change resets the idle clock, so a long think is never accused of
+          // having gone silent — and it works for every provider, not just the ones we can parse.
+          const key = screenIdleKey(screen.content);
+          if (key && this.shellIdleKeys.get(screen.sessionId) !== key) {
+            this.shellIdleKeys.set(screen.sessionId, key);
+            this.shellLastBusyAt.set(Date.now());
+          }
         }
       },
       error: (err) => {
@@ -1990,6 +2032,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         this.transcriptEvents.update((bySession) => appendTranscriptEvent(bySession, event));
         // A report landing is what ends the "waiting" state on the shell transcript.
         this.settleShellPending(event.sessionId);
+        if (event.sessionId === this.currentSession()?.id) this.scrollShellLogToBottom();
       });
     }
   }

@@ -138,7 +138,7 @@
              so it does not inherit the mirrored pane's column count. Composer reuses the raw-input
              path, so replying works identically in either view. -->
         <section class="terminal-surface shell-transcript">
-          <div class="st-log">
+          <div class="st-log" #shellLog>
             @for (row of shellRows(); track $index) {
               <article class="st-row"
                        [class.err]="row.type === 'error'"
