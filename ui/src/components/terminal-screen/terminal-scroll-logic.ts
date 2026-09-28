@@ -59,3 +59,26 @@ export const CONSOLE_CAPTURE_LINES = 1500;
 export function consoleCaptureLines(): number {
   return CONSOLE_CAPTURE_LINES;
 }
+
+/** Repaint coalescing windows, in ms. */
+export const MIRROR_RENDER_DELAY_MS = 500;
+export const MOBILE_RENDER_DELAY_MS = 220;
+
+/**
+ * How long to coalesce repaints before redrawing the pane.
+ *
+ * A forced render (explicit refresh, first paint) is always immediate. Mirror mode matches the
+ * stream's own 500ms cadence so a frame costs exactly one repaint — it renders the pane verbatim,
+ * so there is nothing to gain from painting more often than frames arrive. Mobile keeps its
+ * shorter window because that path still reflows and benefits from settling sooner.
+ */
+export function renderDelayMs(opts: {
+  mirrorMode: boolean;
+  mobileInputMode: boolean;
+  force: boolean;
+}): number {
+  if (opts.force) return 0;
+  if (opts.mirrorMode) return MIRROR_RENDER_DELAY_MS;
+  if (opts.mobileInputMode) return MOBILE_RENDER_DELAY_MS;
+  return 0;
+}

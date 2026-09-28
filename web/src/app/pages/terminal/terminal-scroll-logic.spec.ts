@@ -6,6 +6,8 @@ import {
   nextPinState,
   consoleCaptureLines,
   CONSOLE_CAPTURE_LINES,
+  renderDelayMs,
+  MIRROR_RENDER_DELAY_MS,
 } from '../../../../../ui/src/components/terminal-screen/terminal-scroll-logic';
 
 describe('viewportAnchorFromBottom', () => {
@@ -76,5 +78,26 @@ describe('consoleCaptureLines (C2b)', () => {
   it('returns the raised primary-pane capture depth (materially > 200)', () => {
     expect(consoleCaptureLines()).toBe(1500);
     expect(consoleCaptureLines()).toBeGreaterThan(200);
+  });
+});
+
+describe('renderDelayMs (repaint coalescing)', () => {
+  it('mirror coalesces at the stream cadence so a frame costs one repaint', () => {
+    expect(renderDelayMs({ mirrorMode: true, mobileInputMode: false, force: false })).toBe(500);
+    expect(MIRROR_RENDER_DELAY_MS).toBe(500);
+  });
+
+  it('mirror wins over mobile — a mirror never reflows, so it need not settle early', () => {
+    expect(renderDelayMs({ mirrorMode: true, mobileInputMode: true, force: false })).toBe(500);
+  });
+
+  it('a forced render is always immediate, mirror or not', () => {
+    expect(renderDelayMs({ mirrorMode: true, mobileInputMode: true, force: true })).toBe(0);
+    expect(renderDelayMs({ mirrorMode: false, mobileInputMode: true, force: true })).toBe(0);
+  });
+
+  it('keeps the existing mobile and desktop behaviour untouched', () => {
+    expect(renderDelayMs({ mirrorMode: false, mobileInputMode: true, force: false })).toBe(220);
+    expect(renderDelayMs({ mirrorMode: false, mobileInputMode: false, force: false })).toBe(0);
   });
 });

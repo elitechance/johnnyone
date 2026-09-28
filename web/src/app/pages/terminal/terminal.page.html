@@ -215,11 +215,12 @@
         </section>
       } @else if (sh) {
         <johnny-terminal-screen
-          class="terminal-surface plain-shell-screen"
+          class="terminal-surface plain-shell-screen mirror"
           [screen]="shScreen"
           [title]="sh.title || 'Shell'"
           [terminalProvider]="sh.provider"
           [disabled]="false"
+          [mirrorMode]="true"
           [mobileInputMode]="isCompactWorkspace()"
           [showInput]="true"
           [imageAttachments]="pendingAttachmentsForSession(sh.id)"

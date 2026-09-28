@@ -1009,6 +1009,12 @@ ion-modal.workspace-picker .picker-empty {
     flex: 1;
     min-height: 0;
   }
+  /* Raw mirror: the pane keeps its real width (172 cols is normal), so the surface PANS rather
+     than reflowing. Reflow is what destroyed the layout this view exists to show. */
+  .plain-shell-screen.mirror {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+  }
   /* Transcript/Raw switch in the plain-shell top bar. */
   .ps-views {
     margin-left: auto;

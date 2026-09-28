@@ -23,6 +23,7 @@ import {
   restoreTargetTop,
   shouldPreserveReadingPosition,
   nextPinState,
+  renderDelayMs,
 } from './terminal-scroll-logic';
 
 export interface TerminalImageAttachmentPreview {
@@ -44,6 +45,16 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   @Input() screen: TerminalScreen | null = null;
   @Input() disabled = false;
   @Input() mobileInputMode = false;
+  /**
+   * Raw mirror: render the pane EXACTLY as it is, at the size tmux says it is.
+   *
+   * The fitting path exists to squeeze a pane into the viewport, but an attached tmux window has
+   * one shared size (measured: 172 cols) and no amount of column clamping makes that fit a phone
+   * — it only reflows, which destroys the TUI layout the Raw view exists to show. So in mirror
+   * mode nothing is fitted, clipped or reflowed: the terminal is sized to the snapshot and the
+   * container scrolls. Reading the pane is the transcript's job; Raw is for fidelity.
+   */
+  @Input() mirrorMode = false;
   /** Provider id (e.g. grok, codex) — Grok TUI needs color + layout preserved on mobile. */
   @Input() terminalProvider = '';
   @Input() showInput = true;
@@ -574,6 +585,20 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   fit(): void {
     if (!this.terminal || !this.fitAddon) return;
 
+    // Mirror: the pane's own geometry wins. No proposal, no clamp, no reflow.
+    if (this.mirrorMode) {
+      const cols = this.screen?.cols ?? this.terminal.cols;
+      const rows = this.screen?.rows ?? this.terminal.rows;
+      if (cols > 0 && rows > 0 && (this.terminal.cols !== cols || this.terminal.rows !== rows)) {
+        try {
+          this.terminal.resize(cols, rows);
+        } catch {
+          // A resize can throw mid-teardown; the next frame retries.
+        }
+      }
+      return;
+    }
+
     try {
       const colsBefore = this.terminal.cols;
       // FitAddon occasionally rounds up by one row when the host's height is
@@ -631,6 +656,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   }
 
   private applyColumnFit(): void {
+    // Mirror mode never narrows the buffer — that is the reflow it exists to avoid.
+    if (this.mirrorMode) return;
     if (!this.terminal || !this.mobileInputMode || this.isGrokTerminal()) return;
     this.clampColsToViewportWidth(this.terminal.cols);
   }
@@ -726,7 +753,11 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private scheduleRenderScreen(force: boolean): void {
     if (!this.terminal || !this.screen) return;
 
-    const delay = this.mobileInputMode && !force ? 220 : 0;
+    const delay = renderDelayMs({
+      mirrorMode: this.mirrorMode,
+      mobileInputMode: this.mobileInputMode,
+      force,
+    });
     if (delay === 0) {
       this.renderScreen(force);
       return;
@@ -896,6 +927,11 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
 
   private prepareSnapshotContent(content: string): string {
     const repaired = this.repairAnsiSequences(content);
+    // Mirror: no sanitising. `repairAnsiSequences` stays because a capture can split a frame
+    // mid-escape — repairing that restores what tmux actually drew, it does not reinterpret it.
+    if (this.mirrorMode) {
+      return repaired;
+    }
     if (this.mobileInputMode) {
       if (this.isGrokTerminal()) {
         return this.sanitizeGrokMobileSnapshot(repaired);
@@ -1175,7 +1211,8 @@ export class TerminalScreenComponent implements AfterViewInit, OnChanges, OnDest
   private clipSnapshotToTerminalWidth(content: string): string {
     if (!this.terminal) return content;
     const cols = Math.max(1, this.terminal.cols);
-    if (!this.mobileInputMode) {
+    // Mirror is sized to the pane, so there is nothing to clip — just give xterm CRLFs.
+    if (this.mirrorMode || !this.mobileInputMode) {
       return content
         .replace(/\r\n/g, '\n')
         .replace(/\r/g, '\n')
