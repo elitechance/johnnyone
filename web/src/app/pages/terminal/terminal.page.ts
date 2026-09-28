@@ -536,6 +536,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly shellIdleKeys = new Map<string, string>();
   /** A pane that changed within this window counts as working. */
   private static readonly SHELL_BUSY_WINDOW_MS = 3_000;
+  /** How often the transcript samples the pane just to answer "is it working?". */
+  private static readonly SHELL_ACTIVITY_POLL_MS = 2_000;
+  private shellActivityPoll: ReturnType<typeof setInterval> | null = null;
+  private shellActivityPollId: string | null = null;
   /** Wall-clock of the last message sent from the composer. */
   private readonly shellLastSendAt = signal<number | null>(null);
   /** Wall-clock of the newest report, for the "last update" liveness line. */
@@ -704,6 +708,23 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
     await this.onTerminalRawInput(`${text}\r`, id);
+  }
+
+  /** One pane sample for the activity indicator. Best-effort: a miss just skips this tick. */
+  private async sampleShellPane(sessionId: string): Promise<void> {
+    if (document.hidden) return;
+    try {
+      const screen = await firstValueFrom(this.api.captureTerminal(sessionId));
+      if (!screen || this.shellActivityPollId !== sessionId) return;
+      this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: screen }));
+      const key = screenIdleKey(screen.content);
+      if (key && this.shellIdleKeys.get(sessionId) !== key) {
+        this.shellIdleKeys.set(sessionId, key);
+        this.shellLastBusyAt.set(Date.now());
+      }
+    } catch {
+      // transient relay/host hiccup — next tick retries
+    }
   }
 
   /** Paste straight onto the composer (the workspace-level handler misses a focused input). */
@@ -1023,6 +1044,32 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       { allowSignalWrites: true },
     );
 
+    // Keep a live read of the pane while the transcript is open.
+    //
+    // This deliberately does NOT rely on the pushed screen stream. That stream is
+    // subscribe/unsubscribe managed and was observed flapping — subscribe, refresh, unsubscribe
+    // barely a second later — which left `terminalScreens` empty and the activity indicator dead
+    // even while the agent was plainly working. `captureTerminal` is the same reliable
+    // request/response path the initiative console already falls back to, with no subscription
+    // lifecycle to lose. It only feeds "is it working" and the status line; transcript CONTENT
+    // still comes solely from agent reports.
+    effect(() => {
+      const active = this.plainShellMode() && this.shellView() === 'transcript';
+      const id = active ? this.currentSession()?.id ?? null : null;
+      if (id === this.shellActivityPollId) return;
+      this.shellActivityPollId = id;
+      if (this.shellActivityPoll) {
+        clearInterval(this.shellActivityPoll);
+        this.shellActivityPoll = null;
+      }
+      if (!id) return;
+      void this.sampleShellPane(id);
+      this.shellActivityPoll = setInterval(
+        () => void this.sampleShellPane(id),
+        TerminalPage.SHELL_ACTIVITY_POLL_MS,
+      );
+    });
+
     // The route sets a static title of "Shell", which is useless once several are open — every
     // tab reads the same. Name the actual session ("Shell · kord") so tabs, history and the
     // window switcher are distinguishable. Scoped to the plain-shell surface; every other route
@@ -1275,6 +1322,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.clearShellPendingTimer();
+    if (this.shellActivityPoll) {
+      clearInterval(this.shellActivityPoll);
+      this.shellActivityPoll = null;
+    }
     if (this.shellClockInterval) {
       clearInterval(this.shellClockInterval);
       this.shellClockInterval = null;
