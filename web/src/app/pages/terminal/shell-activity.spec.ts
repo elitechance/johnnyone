@@ -53,6 +53,36 @@ describe('agentActivityLine', () => {
   });
 });
 
+describe('agentActivityLine with real wire data', () => {
+  // Captured verbatim off the relay. Every word carries its own colour change — the hand-written
+  // fixtures above are far cleaner than anything that actually arrives, which is exactly how the
+  // escape codes shipped unnoticed the first time.
+  const WIRE =
+    '[38;5;174m✽[39m [38;5;180mMustering…[38;5;174m ' +
+    '[38;5;246m(36s · ↓[39m [38;5;246m2.0k tokens)[39m';
+
+  it('returns clean text with no escape codes left in it', () => {
+    const out = agentActivityLine(WIRE);
+    expect(out).toBe('Mustering… (36s · ↓ 2.0k tokens)');
+    expect(out).not.toContain('');
+    expect(out).not.toMatch(/\[\d+;/);
+  });
+
+  it('strips the colour code sitting in front of the spinner glyph', () => {
+    // The glyph is wrapped, so a strip that ran after matching would leave "✽" attached.
+    expect(agentActivityLine(WIRE)?.startsWith('Mustering')).toBe(true);
+  });
+
+  it('finds the line inside a full coloured pane', () => {
+    const pane = ['[2m  120[0m', '', WIRE, '[90m────[0m', '❯ '].join('\n');
+    expect(agentActivityLine(pane)).toBe('Mustering… (36s · ↓ 2.0k tokens)');
+  });
+
+  it('detects busy through colour codes split across the phrase', () => {
+    expect(agentIsBusy('[2m · [36mesc to [0minterrupt[0m')).toBe(true);
+  });
+});
+
 describe('agentIsBusy', () => {
   it('detects the interrupt affordance shown mid-turn', () => {
     expect(agentIsBusy(WORKING)).toBe(true);

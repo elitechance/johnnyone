@@ -14,6 +14,18 @@
 /** Spinner glyphs the agent CLIs prefix their status line with. */
 const GLYPHS = ['✻', '✽', '✶', '✳', '✢', '·', '●', '◐', '◓', '◑', '◒', '⏺', '*', '→'];
 
+/**
+ * CSI/OSC escape sequences. Screen content arrives as the RAW pane — xterm interprets these, but
+ * we are extracting plain text, so they must come off first or a colourful status line reads as
+ * `[38;5;174m✽[39m Mustering…`. Real captured rows carry a colour change per word.
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI = /(?:\[[0-9;?]*[ -/]*[@-~]|\][^]*(?:|\\)|[@-Z\\-_])/g;
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI, '');
+}
+
 /** `(12s`, `(9m 12s`, `(1h 2m` — a parenthesised elapsed time. */
 const ELAPSED = /\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\b/;
 
@@ -40,7 +52,9 @@ export function agentActivityLine(content: string | null | undefined): string | 
   if (!content) return null;
   const lines = content.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
-    const raw = lines[i];
+    // Strip escapes BEFORE any matching: the glyph, the ellipsis and the timer are each wrapped
+    // in their own colour codes on a real pane.
+    const raw = stripAnsi(lines[i] ?? '');
     if (!raw || !raw.trim()) continue;
     // "Cogitated for 6s · done 1:15 PM" is a FINISHED turn, not current activity.
     if (/\bdone\b\s+\d{1,2}:\d{2}/.test(raw)) continue;
@@ -60,5 +74,6 @@ export function agentActivityLine(content: string | null | undefined): string | 
  */
 export function agentIsBusy(content: string | null | undefined): boolean {
   if (!content) return false;
-  return /esc to interrupt/i.test(content);
+  // Colour codes can land mid-phrase, so match on the stripped text.
+  return /esc to interrupt/i.test(stripAnsi(content));
 }
