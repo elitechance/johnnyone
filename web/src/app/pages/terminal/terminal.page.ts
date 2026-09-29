@@ -549,7 +549,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly paneChangedAt = new Map<string, number>();
   /** A pane that changed within this window counts as working. */
   private static readonly SHELL_BUSY_WINDOW_MS = 3_000;
-  private shellActivityPoll: ReturnType<typeof setInterval> | null = null;
   private shellActivityPollId: string | null = null;
   /** Wall-clock of the last message sent from the composer. */
   private readonly shellLastSendAt = signal<number | null>(null);
@@ -750,24 +749,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
     await this.onTerminalRawInput(`${text}\r`, id);
-  }
-
-  /** One pane sample for the activity indicator. Best-effort: a miss just skips this tick. */
-  private async sampleShellPane(sessionId: string): Promise<void> {
-    if (document.hidden) return;
-    try {
-      const screen = await firstValueFrom(this.api.captureTerminal(sessionId));
-      if (!screen || this.shellActivityPollId !== sessionId) return;
-      this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: screen }));
-      const key = screenIdleKey(screen.content);
-      if (key && this.shellIdleKeys.get(sessionId) !== key) {
-        this.shellIdleKeys.set(sessionId, key);
-        this.shellLastBusyAt.set(Date.now());
-      }
-      this.notePaneContent(sessionId, screen.content);
-    } catch {
-      // transient relay/host hiccup — next tick retries
-    }
   }
 
   /** Attachments for the transcript's current session. */
@@ -1095,38 +1076,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       { allowSignalWrites: true },
     );
 
-    // Keep a live read of the pane while the transcript is open.
-    //
-    // This deliberately does NOT rely on the pushed screen stream. That stream is
-    // subscribe/unsubscribe managed and was observed flapping — subscribe, refresh, unsubscribe
-    // barely a second later — which left `terminalScreens` empty and the activity indicator dead
-    // even while the agent was plainly working. `captureTerminal` is the same reliable
-    // request/response path the initiative console already falls back to, with no subscription
-    // lifecycle to lose. It only feeds "is it working" and the status line; transcript CONTENT
-    // still comes solely from agent reports.
+    // Entering the transcript refreshes the screen subscription rather than starting a poll.
+    // The stream is change-driven — an idle pane publishes nothing — so once it stays up (see
+    // VISUAL_UNSUBSCRIBE_GRACE_MS) there is nothing a poll adds except constant traffic.
     effect(() => {
       const active = this.plainShellMode() && this.shellView() === 'transcript';
       const id = active ? this.currentSession()?.id ?? null : null;
       if (id === this.shellActivityPollId) return;
       this.shellActivityPollId = id;
-      if (this.shellActivityPoll) {
-        clearInterval(this.shellActivityPoll);
-        this.shellActivityPoll = null;
-      }
       if (!id) return;
-      // Self-scheduling and adaptive: 2s while the pane is moving, 10s once it settles. A shell
-      // left open on an idle agent should not cost the same as one mid-build.
-      const tick = async () => {
-        if (this.shellActivityPollId !== id) return;
-        if (!document.hidden) await this.sampleShellPane(id);
-        if (this.shellActivityPollId !== id) return;
-        const changed = this.paneChangedRecently(id, POLL_FAST_MS * 2);
-        this.shellActivityPoll = setTimeout(
-          () => void tick(),
-          pollDelayMs(changed, POLL_FAST_MS, POLL_IDLE_MS),
-        ) as unknown as ReturnType<typeof setInterval>;
-      };
-      void tick();
+      this.enqueueTerminalVisualSync(() => this.syncTerminalVisualSubscriptions({ refresh: true }));
     });
 
     // The route sets a static title of "Shell", which is useless once several are open — every
@@ -1380,11 +1339,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   ngOnDestroy(): void {
+    for (const timer of this.pendingVisualUnsubscribes.values()) clearTimeout(timer);
+    this.pendingVisualUnsubscribes.clear();
     this.clearShellPendingTimer();
-    if (this.shellActivityPoll) {
-      clearTimeout(this.shellActivityPoll as unknown as ReturnType<typeof setTimeout>);
-      this.shellActivityPoll = null;
-    }
     if (this.shellClockInterval) {
       clearInterval(this.shellClockInterval);
       this.shellClockInterval = null;
@@ -2234,22 +2191,54 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return ids;
   }
 
+  /**
+   * Grace period before dropping a screen subscription.
+   *
+   * `lanedSessionIds()` derives from the session LIST, which is refetched and rebuilt often, so it
+   * can be transiently empty while the current session is perfectly alive. Unsubscribing the
+   * instant a session left that set produced subscribe → refresh → unsubscribe barely a second
+   * apart, over and over — the stream never stayed up long enough to deliver, which is what made
+   * the activity indicator look dead and forced polls in as a workaround.
+   *
+   * A session that really has gone away is still dropped, just a few seconds later; the cost of
+   * being late is one idle capture loop, against a stream that never works.
+   */
+  private static readonly VISUAL_UNSUBSCRIBE_GRACE_MS = 10_000;
+  private readonly pendingVisualUnsubscribes = new Map<string, ReturnType<typeof setTimeout>>();
+
   private async syncTerminalVisualSubscriptions(options?: { refresh?: boolean }): Promise<void> {
     if (document.hidden) return;
     const visibleIds = this.lanedSessionIds();
 
     for (const sessionId of Array.from(this.terminalVisualSubscriptions)) {
       if (!visibleIds.has(sessionId)) {
-        await this.unsubscribeTerminalVisual(sessionId);
+        this.scheduleVisualUnsubscribe(sessionId);
       }
     }
 
     for (const sessionId of visibleIds) {
+      // Back in view before the grace period elapsed: keep the subscription we already have.
+      const pending = this.pendingVisualUnsubscribes.get(sessionId);
+      if (pending) {
+        clearTimeout(pending);
+        this.pendingVisualUnsubscribes.delete(sessionId);
+      }
       await this.subscribeTerminalVisual(sessionId);
       if (options?.refresh) {
         await this.relayTerminal.refreshVisual(sessionId);
       }
     }
+  }
+
+  private scheduleVisualUnsubscribe(sessionId: string): void {
+    if (this.pendingVisualUnsubscribes.has(sessionId)) return;
+    const timer = setTimeout(() => {
+      this.pendingVisualUnsubscribes.delete(sessionId);
+      // Re-check: it may have come back into view while we waited.
+      if (this.lanedSessionIds().has(sessionId)) return;
+      void this.unsubscribeTerminalVisual(sessionId);
+    }, TerminalPage.VISUAL_UNSUBSCRIBE_GRACE_MS);
+    this.pendingVisualUnsubscribes.set(sessionId, timer);
   }
 
   private enqueueTerminalVisualSync(task: () => Promise<void>): void {
