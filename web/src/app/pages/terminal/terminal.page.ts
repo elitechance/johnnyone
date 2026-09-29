@@ -758,11 +758,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  /** Paste straight onto the composer (the workspace-level handler misses a focused input). */
-  onShellComposerPaste(event: ClipboardEvent): void {
-    this.onWorkspacePaste(event);
-  }
-
   /** Attachments for the transcript's current session. */
   protected shellAttachments(): PendingImageAttachment[] {
     const id = this.currentSession()?.id;

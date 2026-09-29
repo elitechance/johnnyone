@@ -249,6 +249,9 @@
             </div>
           }
 
+          <!-- No (paste) handler here ON PURPOSE. This form sits inside `.workspace-shell`, whose
+               own (paste) handler already stages the image — paste events bubble. Binding one here
+               too ran both and staged every image TWICE. -->
           <form class="st-composer" (ngSubmit)="sendShellMessage()">
             <input
               id="shell-transcript-input"
@@ -258,7 +261,6 @@
               autocomplete="off"
               [placeholder]="shellAttachments().length > 0 ? 'Add a note (optional)…' : 'Reply to the agent…'"
               [(ngModel)]="shellDraft"
-              (paste)="onShellComposerPaste($event)"
             />
             <button
               class="st-send"
