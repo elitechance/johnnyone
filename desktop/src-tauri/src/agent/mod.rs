@@ -780,29 +780,40 @@ impl AgentService {
         let session_id = session_id.to_string();
         tokio::spawn(async move {
             let armed_at = Instant::now();
+            tracing::debug!(session_id = %session_id, "shell report nudge armed");
             tokio::time::sleep(Duration::from_secs(SHELL_NUDGE_AFTER_SECS)).await;
 
             // Reported since we armed? Nothing to do.
             if let Some(at) = state.shell_last_report_at.lock().await.get(&session_id) {
                 if *at >= armed_at {
+                    tracing::debug!(session_id = %session_id, "nudge skipped: agent reported");
                     return;
                 }
             }
 
             // Still working? Leave it alone. Two captures a few seconds apart settle it without
             // needing to know any CLI's wording for "busy".
-            let Ok(first) = crate::terminal::capture_terminal_session(&state, &session_id).await
-            else {
-                return;
+            let first = match crate::terminal::capture_terminal_session(&state, &session_id).await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(session_id = %session_id, %error, "nudge skipped: capture failed");
+                    return;
+                }
             };
             tokio::time::sleep(Duration::from_secs(SHELL_NUDGE_IDLE_PROBE_SECS)).await;
-            let Ok(second) = crate::terminal::capture_terminal_session(&state, &session_id).await
-            else {
-                return;
+            let second = match crate::terminal::capture_terminal_session(&state, &session_id).await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(session_id = %session_id, %error, "nudge skipped: capture failed");
+                    return;
+                }
             };
             let a = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&first.content);
             let b = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&second.content);
             if a != b {
+                tracing::debug!(session_id = %session_id, "nudge skipped: pane still changing");
                 return;
             }
 
