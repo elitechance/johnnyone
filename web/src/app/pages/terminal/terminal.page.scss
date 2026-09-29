@@ -1200,6 +1200,24 @@ ion-modal.workspace-picker .picker-empty {
     mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
     -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
   }
+  /* Seeded pane tail shown when nothing has been reported yet. Taller than the waiting-row
+     preview, since here it IS the content rather than an aside, and unfaded so the first line
+     is readable. */
+  .st-seed { padding: 4px 0 2px; }
+  .st-seed-h {
+    font-family: var(--jo-font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--jo-fg-faint);
+    margin-bottom: 6px;
+  }
+  .st-peek.st-peek-seed {
+    max-height: none;
+    mask-image: none;
+    -webkit-mask-image: none;
+  }
+
   /* One pane row. `pre` whitespace keeps the TUI's column alignment; colours come from inline
      spans the ANSI renderer writes. */
   .st-peek-l {

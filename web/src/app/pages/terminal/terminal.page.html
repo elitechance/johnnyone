@@ -158,13 +158,29 @@
                 </div>
               </article>
             } @empty {
+              <!-- Nothing reported yet. An empty page tells you nothing about a session that may
+                   have been working for an hour, so seed it with the tail of the pane. Only when
+                   idle: while busy the waiting row below already shows the same tail. -->
               @if (!shellPending() && !shellBusy()) {
-                <div class="st-empty">
-                  <div class="st-empty-t">No updates yet</div>
-                  <div class="st-empty-c">
-                    Progress appears here as the agent reports it. Switch to <b>Raw</b> for the live terminal.
-                  </div>
-                </div>
+                @if (shellPaneTail(); as tail) {
+                  @if (tail.length > 0) {
+                    <div class="st-seed">
+                      <div class="st-seed-h">From the terminal · nothing reported yet</div>
+                      <div class="st-peek st-peek-seed">
+                        @for (line of tail; track $index) {
+                          <div class="st-peek-l" [innerHTML]="line"></div>
+                        }
+                      </div>
+                    </div>
+                  } @else {
+                    <div class="st-empty">
+                      <div class="st-empty-t">No updates yet</div>
+                      <div class="st-empty-c">
+                        Progress appears here as the agent reports it. Switch to <b>Raw</b> for the live terminal.
+                      </div>
+                    </div>
+                  }
+                }
               }
             }
 
