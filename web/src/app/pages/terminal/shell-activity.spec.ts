@@ -5,6 +5,7 @@ import {
   ansiLineToHtml,
   paneTail,
   paneTailHtml,
+  pollDelayMs,
   screenIdleKey,
 } from './shell-activity';
 
@@ -237,5 +238,16 @@ describe('ansiLineToHtml / paneTailHtml (colour preserved)', () => {
   it('paneTailHtml is empty for nothing', () => {
     expect(paneTailHtml(null)).toEqual([]);
     expect(paneTailHtml('')).toEqual([]);
+  });
+});
+
+describe('pollDelayMs (adaptive sampling)', () => {
+  it('polls fast only while the pane is changing', () => {
+    expect(pollDelayMs(true, 2000, 10000)).toBe(2000);
+    expect(pollDelayMs(false, 2000, 10000)).toBe(10000);
+  });
+
+  it('idles far slower than it runs — that is the whole point', () => {
+    expect(pollDelayMs(false, 500, 5000)).toBeGreaterThan(pollDelayMs(true, 500, 5000) * 4);
   });
 });

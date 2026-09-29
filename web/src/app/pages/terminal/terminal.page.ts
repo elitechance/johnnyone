@@ -89,7 +89,17 @@ import {
   appendTranscriptEvent,
   diffStreamSubscriptions,
 } from './terminal-transcript-tab';
-import { agentActivityLine, agentIsBusy, paneTailHtml, screenIdleKey } from './shell-activity';
+import {
+  agentActivityLine,
+  agentIsBusy,
+  CONSOLE_POLL_FAST_MS,
+  CONSOLE_POLL_IDLE_MS,
+  paneTailHtml,
+  POLL_FAST_MS,
+  POLL_IDLE_MS,
+  pollDelayMs,
+  screenIdleKey,
+} from './shell-activity';
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
@@ -534,10 +544,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly shellLastBusyAt = signal<number | null>(null);
   /** Last normalised pane content per session, for churn detection. */
   private readonly shellIdleKeys = new Map<string, string>();
+  /** Last seen pane content + when it last changed, per session — drives adaptive poll pacing. */
+  private readonly paneIdleKeys = new Map<string, string>();
+  private readonly paneChangedAt = new Map<string, number>();
   /** A pane that changed within this window counts as working. */
   private static readonly SHELL_BUSY_WINDOW_MS = 3_000;
-  /** How often the transcript samples the pane just to answer "is it working?". */
-  private static readonly SHELL_ACTIVITY_POLL_MS = 2_000;
   private shellActivityPoll: ReturnType<typeof setInterval> | null = null;
   private shellActivityPollId: string | null = null;
   /** Wall-clock of the last message sent from the composer. */
@@ -753,6 +764,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         this.shellIdleKeys.set(sessionId, key);
         this.shellLastBusyAt.set(Date.now());
       }
+      this.notePaneContent(sessionId, screen.content);
     } catch {
       // transient relay/host hiccup — next tick retries
     }
@@ -1102,11 +1114,19 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         this.shellActivityPoll = null;
       }
       if (!id) return;
-      void this.sampleShellPane(id);
-      this.shellActivityPoll = setInterval(
-        () => void this.sampleShellPane(id),
-        TerminalPage.SHELL_ACTIVITY_POLL_MS,
-      );
+      // Self-scheduling and adaptive: 2s while the pane is moving, 10s once it settles. A shell
+      // left open on an idle agent should not cost the same as one mid-build.
+      const tick = async () => {
+        if (this.shellActivityPollId !== id) return;
+        if (!document.hidden) await this.sampleShellPane(id);
+        if (this.shellActivityPollId !== id) return;
+        const changed = this.paneChangedRecently(id, POLL_FAST_MS * 2);
+        this.shellActivityPoll = setTimeout(
+          () => void tick(),
+          pollDelayMs(changed, POLL_FAST_MS, POLL_IDLE_MS),
+        ) as unknown as ReturnType<typeof setInterval>;
+      };
+      void tick();
     });
 
     // The route sets a static title of "Shell", which is useless once several are open — every
@@ -1362,7 +1382,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   ngOnDestroy(): void {
     this.clearShellPendingTimer();
     if (this.shellActivityPoll) {
-      clearInterval(this.shellActivityPoll);
+      clearTimeout(this.shellActivityPoll as unknown as ReturnType<typeof setTimeout>);
       this.shellActivityPoll = null;
     }
     if (this.shellClockInterval) {
@@ -2670,10 +2690,37 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.stopPrimaryScreenPoll();
     if (!sessionId) return;
     void this.capturePrimaryScreen(sessionId); // seed immediately (no black-frame wait)
-    this.primaryScreenPollInterval = setInterval(() => {
-      if (this.primaryScreenSessionId !== sessionId || document.hidden) return;
-      void this.capturePrimaryScreen(sessionId);
-    }, 500);
+    // Self-scheduling rather than a fixed interval, so the rate can follow the pane. A constant
+    // 500ms poll spent the same bandwidth on a session idle for an hour as on one mid-build.
+    const tick = async () => {
+      if (this.primaryScreenSessionId !== sessionId) return;
+      if (!document.hidden) await this.capturePrimaryScreen(sessionId);
+      if (this.primaryScreenSessionId !== sessionId) return;
+      const changed = this.paneChangedRecently(sessionId, CONSOLE_POLL_FAST_MS * 3);
+      this.primaryScreenPollInterval = setTimeout(
+        () => void tick(),
+        pollDelayMs(changed, CONSOLE_POLL_FAST_MS, CONSOLE_POLL_IDLE_MS),
+      ) as unknown as ReturnType<typeof setInterval>;
+    };
+    this.primaryScreenPollInterval = setTimeout(
+      () => void tick(),
+      CONSOLE_POLL_FAST_MS,
+    ) as unknown as ReturnType<typeof setInterval>;
+  }
+
+  /** Did this pane change within `window` ms? Drives how often it is worth sampling again. */
+  private paneChangedRecently(sessionId: string, window: number): boolean {
+    const at = this.paneChangedAt.get(sessionId);
+    return at !== undefined && Date.now() - at < window;
+  }
+
+  /** Records a pane content change, for adaptive poll pacing. */
+  private notePaneContent(sessionId: string, content: string | null | undefined): void {
+    const key = screenIdleKey(content);
+    if (!key) return;
+    if (this.paneIdleKeys.get(sessionId) === key) return;
+    this.paneIdleKeys.set(sessionId, key);
+    this.paneChangedAt.set(sessionId, Date.now());
   }
 
   /** Pull one screen snapshot via the reliable `captureTerminal` request/response path and inject it
@@ -2686,6 +2733,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       const screen = await firstValueFrom(this.api.captureTerminal(sessionId, consoleCaptureLines()));
       if (screen && this.primaryScreenSessionId === sessionId && this.primarySessionId() === sessionId) {
         this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: screen }));
+        this.notePaneContent(sessionId, screen.content);
       }
     } catch {
       // best-effort — a transient relay/host hiccup just skips this tick
@@ -2694,7 +2742,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   private stopPrimaryScreenPoll(): void {
     if (!this.primaryScreenPollInterval) return;
-    clearInterval(this.primaryScreenPollInterval);
+    clearTimeout(this.primaryScreenPollInterval as unknown as ReturnType<typeof setTimeout>);
     this.primaryScreenPollInterval = null;
   }
 

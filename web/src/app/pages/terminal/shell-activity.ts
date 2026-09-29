@@ -242,3 +242,22 @@ export function paneTailHtml(
     });
   return kept.slice(-Math.max(1, maxLines)).map(ansiLineToHtml);
 }
+
+
+/** Poll cadences, in ms. Fast only while something is actually changing. */
+export const POLL_FAST_MS = 2_000;
+export const POLL_IDLE_MS = 10_000;
+export const CONSOLE_POLL_FAST_MS = 500;
+export const CONSOLE_POLL_IDLE_MS = 5_000;
+
+/**
+ * How long to wait before sampling a pane again.
+ *
+ * A constant fast poll spends the same bandwidth on a session that has been idle for an hour as
+ * on one mid-build — and J1 had three overlapping samplers doing exactly that. Poll fast only
+ * while the pane is changing; a pane that has not moved will not have moved in another 500ms
+ * either, and the first changed frame immediately restores the fast rate.
+ */
+export function pollDelayMs(changedRecently: boolean, fast: number, idle: number): number {
+  return changedRecently ? fast : idle;
+}
