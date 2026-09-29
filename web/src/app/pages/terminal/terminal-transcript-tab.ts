@@ -36,6 +36,19 @@ export function appendTranscriptEvent(
   max: number = MAX_TRANSCRIPT_EVENTS,
 ): Record<string, StreamEvent[]> {
   const prev = bySession[event.sessionId] ?? [];
+  // Collapse a repeat of the row already at the end.
+  //
+  // Observed: one answer rendered SIX identical times. An agent can call the reporting API more
+  // than once for the same reply — a retry, a loop, or simply following the instruction twice —
+  // and a delivery can repeat. None of that is worth six identical paragraphs on a phone.
+  //
+  // Only the immediately preceding row is compared, so the same text genuinely recurring later
+  // (a repeated build step, say) still shows. Matching on kind + text rather than `seq` because
+  // the chat lane restarts `seq` per turn, so equal seqs do not imply the same event.
+  const last = prev[prev.length - 1];
+  if (last && last.kind === event.kind && (last.text ?? '') === (event.text ?? '')) {
+    return bySession;
+  }
   const next = [...prev, event];
   if (next.length > max) {
     next.splice(0, next.length - max);
