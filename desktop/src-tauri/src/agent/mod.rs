@@ -744,6 +744,9 @@ impl AgentService {
         }
         // Every user message arms the "answered but never reported" guard, not just the first.
         Self::arm_shell_report_nudge(state, session_id);
+        // Store the prompt so the transcript can pair it with the reply. Uses the body BEFORE the
+        // brief is appended — the plumbing is ours, not something the user said.
+        crate::services::agent_plans::record_user_prompt(state, session_id, body);
         {
             let mut briefed = state.shell_briefed.lock().await;
             if !briefed.insert(session_id.to_string()) {

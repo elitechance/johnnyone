@@ -529,15 +529,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       const reports = await firstValueFrom(this.api.listSessionReports(sessionId));
       if (!reports?.length) return true; // nothing stored yet is a valid answer
       const restored: StreamEvent[] = [];
-      let seq = -reports.length; // negative: history sorts before anything live
+      let seq = -reports.length * 2; // negative: history sorts before anything live
       for (const report of reports) {
         if (report.summary?.trim()) {
           restored.push({
             sessionId,
             seq: seq++,
-            kind: report.kind === 'blocked' ? 'error' : 'text',
+            // A stored prompt is what the USER typed — it renders as their row, not the agent's.
+            kind: report.kind === 'prompt' ? 'prompt' : report.kind === 'blocked' ? 'error' : 'text',
             text: report.summary,
-          } as StreamEvent);
+            data: { at: report.createdAt },
+          } as unknown as StreamEvent);
         }
         if (report.markdown?.trim()) {
           restored.push({
@@ -546,7 +548,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
             kind: 'code',
             language: 'markdown',
             text: report.markdown,
-          } as StreamEvent);
+            data: { at: report.createdAt },
+          } as unknown as StreamEvent);
         }
       }
       if (!restored.length) return true;
@@ -586,7 +589,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   protected shellDraft = '';
   /** Locally-echoed sends, positioned by how many events existed when each was sent. */
-  private readonly shellEchoes = signal<Array<{ sessionId: string; atIndex: number; text: string }>>([]);
+  private readonly shellEchoes = signal<
+    Array<{ sessionId: string; atIndex: number; text: string; at: string }>
+  >([]);
+  /** Arrival time per live event, so rows that were not stored still show when they happened. */
+  private readonly eventStamps = new WeakMap<object, string>();
   /** True once the pending row should actually render (i.e. the delay has elapsed). */
   protected readonly shellPending = signal(false);
   private shellPendingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -615,6 +622,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     type: 'you' | 'agent' | 'error' | 'markdown';
     text: string;
     tool?: string;
+    at?: string;
   }> {
     const id = this.currentSession()?.id;
     if (!id) return [];
@@ -624,20 +632,29 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       type: 'you' | 'agent' | 'error' | 'markdown';
       text: string;
       tool?: string;
+      at?: string;
     }> = [];
     for (let i = 0; i <= events.length; i++) {
       for (const e of echoes) {
-        if (e.atIndex === i) rows.push({ type: 'you', text: e.text });
+        if (e.atIndex === i) rows.push({ type: 'you', text: e.text, at: e.at });
       }
       const ev = events[i];
       if (ev) {
         // A `code`/markdown event is the agent's written-up report (host read it from the
         // file it named), so it renders as rich markdown — mermaid fences included.
         const isMarkdown = ev.kind === 'code' && ev.language === 'markdown';
+        const stamped = (ev as unknown as { data?: { at?: string } }).data?.at;
         rows.push({
-          type: isMarkdown ? 'markdown' : ev.kind === 'error' ? 'error' : 'agent',
+          type: isMarkdown
+            ? 'markdown'
+            : (ev.kind as string) === 'prompt'
+              ? 'you'
+              : ev.kind === 'error'
+                ? 'error'
+                : 'agent',
           text: ev.text ?? '',
           tool: ev.toolName,
+          at: this.rowTime(stamped ?? this.eventStamps.get(ev)),
         });
       }
     }
@@ -656,6 +673,28 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const id = this.currentSession()?.id;
     if (!id) return null;
     return agentActivityLine(this.terminalScreens()[id]?.content ?? null);
+  }
+
+  /**
+   * A row's timestamp, short and local.
+   *
+   * Shows the time alone for today and prefixes the date once a transcript spans days, so a long
+   * session does not read as if everything happened this afternoon.
+   */
+  protected rowTime(iso?: string | null): string | undefined {
+    if (!iso) return undefined;
+    // SQLite writes "YYYY-MM-DD HH:MM:SS" in UTC with no zone marker; make that explicit or the
+    // browser reads it as local time and the whole transcript is hours off.
+    const normalised = /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(iso)
+      ? `${iso.replace(' ', 'T')}Z`
+      : iso;
+    const at = new Date(normalised);
+    if (Number.isNaN(at.getTime())) return undefined;
+    const time = at.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    const sameDay = at.toDateString() === new Date().toDateString();
+    return sameDay
+      ? time
+      : `${at.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${time}`;
   }
 
   /**
@@ -797,7 +836,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const echoText = text || `Sent ${this.pendingAttachmentsForSession(id).length} image(s)`;
     this.shellEchoes.update((list) => [
       ...list,
-      { sessionId: id, atIndex: this.transcriptEventsFor(id).length, text: echoText },
+      {
+        sessionId: id,
+        atIndex: this.transcriptEventsFor(id).length,
+        text: echoText,
+        at: this.rowTime(new Date().toISOString()) ?? '',
+      },
     ]);
     this.clearShellPendingTimer();
     this.shellPendingTimer = setTimeout(
@@ -2220,6 +2264,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // per session, bounded to MAX_TRANSCRIPT_EVENTS to cap long-session growth.
     if (!this.streamEventsSubscription) {
       this.streamEventsSubscription = this.relayTerminal.streamEvents().subscribe((event) => {
+        // Stamp on arrival: a live event has no stored `created_at` until it is read back.
+        this.eventStamps.set(event as unknown as object, new Date().toISOString());
         this.transcriptEvents.update((bySession) => appendTranscriptEvent(bySession, event));
         // A report landing is what ends the "waiting" state on the shell transcript.
         this.settleShellPending(event.sessionId);

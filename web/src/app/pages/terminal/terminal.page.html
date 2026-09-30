@@ -148,6 +148,11 @@
                   row.type === 'error' ? '!' : row.type === 'you' ? '›' : row.type === 'markdown' ? '▤' : '¶'
                 }}</span>
                 <div class="st-bd">
+                  <!-- Who and when, so a reply can be matched to the prompt it answers. -->
+                  <div class="st-meta">
+                    <span class="st-who">{{ row.type === 'you' ? 'You' : 'Agent' }}</span>
+                    @if (row.at) { <span class="st-when">{{ row.at }}</span> }
+                  </div>
                   @if (row.tool) { <div class="st-hd">{{ row.tool }}</div> }
                   @if (row.type === 'markdown') {
                     <!-- The agent's written-up report: headings, tables, code and mermaid. -->

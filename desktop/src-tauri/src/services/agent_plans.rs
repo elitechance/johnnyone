@@ -3892,6 +3892,33 @@ pub struct SessionReport {
     pub created_at: String,
 }
 
+
+/// Store a message the USER typed, so the transcript can pair it with the reply that followed.
+///
+/// Replies were persisted but prompts were not, leaving a reloaded transcript as a list of
+/// answers with nothing to anchor them to. Recorded on the same table as reports so one query
+/// returns the conversation in order, with `kind = "prompt"` distinguishing the two.
+///
+/// Best-effort: the message has already been delivered to the agent by the time this runs, so a
+/// storage failure must never interfere with it.
+pub fn record_user_prompt(state: &AppState, session_id: &str, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let result = state.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO session_reports (id, session_id, kind, role, summary) \
+             VALUES (?1, ?2, 'prompt', 'user', ?3)",
+            params![Uuid::new_v4().to_string(), session_id, trimmed],
+        )
+        .map_err(|e| e.to_string())
+    });
+    if let Err(error) = result {
+        tracing::warn!(session_id, %error, "failed to persist user prompt");
+    }
+}
+
 /// Read back a session's reports so a freshly-opened console shows what it missed.
 ///
 /// Returns the most recent `limit` in chronological order: the query takes the newest rows, then

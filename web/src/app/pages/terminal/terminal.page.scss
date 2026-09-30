@@ -1091,6 +1091,19 @@ ion-modal.workspace-picker .picker-empty {
     font-family: var(--jo-font-mono, ui-monospace, monospace);
   }
   .st-bd { min-width: 0; flex: 1; }
+  /* Speaker + time. Quiet, but present on every row so a reply can be paired with its prompt. */
+  .st-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    margin-bottom: 3px;
+    font-family: var(--jo-font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+  }
+  .st-who { color: var(--jo-fg-muted); text-transform: uppercase; font-weight: 600; }
+  .st-when { color: var(--jo-fg-faint); font-variant-numeric: tabular-nums; }
+  .st-row.you .st-who { color: var(--jo-accent); }
   .st-hd {
     font-family: var(--jo-font-mono, ui-monospace, monospace);
     font-size: 11px;
