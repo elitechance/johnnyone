@@ -1,4 +1,5 @@
 import { Injectable, inject } from '@angular/core';
+import { SessionReport } from '../models/stream-event.model';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { GraphQLClient } from './graphql-client';
@@ -414,6 +415,21 @@ export class JohnnyApiService {
     return this.gql
       .queryPreferLocalHost<{ listAiSessions: AiSession[] }>(query, query, { status })
       .pipe(map((data) => data.listAiSessions));
+  }
+
+  /** A session's persisted reports, oldest->newest — what the transcript hydrates from. */
+  listSessionReports(sessionId: string, limit = 100): Observable<SessionReport[]> {
+    const query = `query ListSessionReports($sessionId: ID!, $limit: Int) {
+      listSessionReports(sessionId: $sessionId, limit: $limit) {
+        id sessionId kind role summary markdown createdAt
+      }
+    }`;
+    return this.gql
+      .queryPreferLocalHost<{ listSessionReports: SessionReport[] }>(query, query, {
+        sessionId,
+        limit,
+      })
+      .pipe(map((data) => data.listSessionReports));
   }
 
   /** External tmux sessions a new terminal can attach to (excludes johnnyone_<id> panes). */

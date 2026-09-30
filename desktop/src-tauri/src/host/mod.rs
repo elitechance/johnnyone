@@ -149,6 +149,24 @@ impl QueryRoot {
     /// `listTmuxSessions` — the console prefers the host when it is reachable
     /// (`queryPreferLocalHost`) and has no worker fallback, so this field must
     /// exist on BOTH surfaces or attach breaks in the desktop app.
+    /// A session's persisted reports, oldest→newest. Lets a freshly-opened transcript show what
+    /// it missed instead of starting blank. Must exist on BOTH GraphQL surfaces — the console
+    /// prefers the host when reachable and has no worker fallback.
+    async fn list_session_reports(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<GqlSessionReport>> {
+        let state = ctx.data_unchecked::<AppState>();
+        Ok(
+            agent_plans::list_session_reports(state, &session_id, limit.unwrap_or(100) as i64)?
+                .into_iter()
+                .map(GqlSessionReport::from)
+                .collect(),
+        )
+    }
+
     async fn list_tmux_sessions(&self) -> async_graphql::Result<Vec<GqlTmuxSession>> {
         Ok(crate::terminal::list_external_tmux_sessions()
             .await?
@@ -701,6 +719,33 @@ impl From<ChatCompleteEvent> for GqlAiChatComplete {
         Self {
             session_id: value.session_id,
             message_id: value.message_id,
+        }
+    }
+}
+
+/// One persisted agent report. Mirrors the worker's `SessionReport` field-for-field.
+#[derive(SimpleObject)]
+#[graphql(name = "SessionReport", rename_fields = "camelCase")]
+struct GqlSessionReport {
+    id: String,
+    session_id: String,
+    kind: String,
+    role: Option<String>,
+    summary: Option<String>,
+    markdown: Option<String>,
+    created_at: String,
+}
+
+impl From<agent_plans::SessionReport> for GqlSessionReport {
+    fn from(value: agent_plans::SessionReport) -> Self {
+        Self {
+            id: value.id,
+            session_id: value.session_id,
+            kind: value.kind,
+            role: value.role,
+            summary: value.summary,
+            markdown: value.markdown,
+            created_at: value.created_at,
         }
     }
 }

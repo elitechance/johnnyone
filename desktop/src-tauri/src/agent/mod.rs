@@ -1084,6 +1084,7 @@ impl AgentService {
         let result = match req.method.as_str() {
             "list_sessions" => Self::rpc_list_sessions(&req.params, state),
             "list_tmux_sessions" => Self::rpc_list_tmux_sessions().await,
+            "list_session_reports" => Self::rpc_list_session_reports(&req.params, state),
             // Programmatic, deterministic one-shot pane capture (overhaul P2, decision D7).
             // Complements the throttled live terminal_screen push; input still rides the
             // terminal_command envelope — no new shell transport.
@@ -1205,6 +1206,21 @@ impl AgentService {
 
     /// List external tmux sessions a new terminal can attach to (excludes the
     /// johnnyone_<id> panes JohnnyOne already manages).
+    /// A session's persisted reports, so a freshly-opened console can show its history.
+    fn rpc_list_session_reports(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
+        let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+        let reports =
+            crate::services::agent_plans::list_session_reports(state, session_id, limit)?;
+        serde_json::to_value(&reports).map_err(|e| e.to_string())
+    }
+
     async fn rpc_list_tmux_sessions() -> Result<serde_json::Value, String> {
         let sessions = crate::terminal::list_external_tmux_sessions().await?;
         serde_json::to_value(&sessions).map_err(|e| e.to_string())

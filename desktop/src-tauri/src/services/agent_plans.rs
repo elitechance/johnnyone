@@ -3707,6 +3707,40 @@ pub async fn record_agent_report(
         }
     }
 
+    // Persist it. The in-memory slot below keeps only the LAST report per session, which is all
+    // the coordinator needs, but the console needs history — without this a page reload showed an
+    // empty transcript for a session that had been reporting all day.
+    let markdown = evidence.as_deref().and_then(read_report_markdown);
+    let report_row = (
+        Uuid::new_v4().to_string(),
+        session_id.clone(),
+        kind_norm.clone(),
+        role.clone(),
+        summary.clone(),
+        markdown,
+        verdict_norm.clone(),
+        findings.clone(),
+        severity.clone(),
+        reason.clone(),
+        evidence.clone(),
+    );
+    if let Err(error) = state.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO session_reports \
+             (id, session_id, kind, role, summary, markdown, verdict, findings, severity, reason, evidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                report_row.0, report_row.1, report_row.2, report_row.3, report_row.4,
+                report_row.5, report_row.6, report_row.7, report_row.8, report_row.9,
+                report_row.10
+            ],
+        )
+        .map_err(|e| e.to_string())
+    }) {
+        // Never fail the report over its own audit trail: the live event already went out.
+        tracing::warn!(session_id, %error, "failed to persist session report");
+    }
+
     state.agent_reports.lock().await.insert(
         session_id.clone(),
         AgentReport {
@@ -3842,6 +3876,57 @@ fn read_report_markdown(evidence: &str) -> Option<String> {
         return None;
     }
     Some(body)
+}
+
+
+/// A persisted report, newest last — the transcript's history.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReport {
+    pub id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub role: Option<String>,
+    pub summary: Option<String>,
+    pub markdown: Option<String>,
+    pub created_at: String,
+}
+
+/// Read back a session's reports so a freshly-opened console shows what it missed.
+///
+/// Returns the most recent `limit` in chronological order: the query takes the newest rows, then
+/// reverses them, so a long-running session yields its LATEST activity rather than its first.
+pub fn list_session_reports(
+    state: &AppState,
+    session_id: &str,
+    limit: i64,
+) -> Result<Vec<SessionReport>, String> {
+    let limit = limit.clamp(1, 500);
+    state.db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, kind, role, summary, markdown, created_at \
+                 FROM session_reports WHERE session_id = ?1 \
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id, limit], |row| {
+                Ok(SessionReport {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    role: row.get(3)?,
+                    summary: row.get(4)?,
+                    markdown: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().rev().collect())
+    })
 }
 
 /// Monotonic `seq` for report-sourced stream events. `StreamEvent.seq` only has to order/dedup

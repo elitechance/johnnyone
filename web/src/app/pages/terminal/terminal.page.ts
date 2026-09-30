@@ -517,6 +517,54 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.shellViewOverride.set(view);
   }
 
+  /**
+   * Read a session's stored reports into the transcript.
+   *
+   * Prepends rather than replaces: a live event may already have landed between opening the
+   * session and this resolving, and dropping it would lose the newest thing on screen. Stored
+   * rows are filtered against what is already present so nothing doubles up.
+   */
+  private async hydrateTranscript(sessionId: string): Promise<void> {
+    try {
+      const reports = await firstValueFrom(this.api.listSessionReports(sessionId));
+      if (!reports?.length) return;
+      const restored: StreamEvent[] = [];
+      let seq = -reports.length; // negative: history sorts before anything live
+      for (const report of reports) {
+        if (report.summary?.trim()) {
+          restored.push({
+            sessionId,
+            seq: seq++,
+            kind: report.kind === 'blocked' ? 'error' : 'text',
+            text: report.summary,
+          } as StreamEvent);
+        }
+        if (report.markdown?.trim()) {
+          restored.push({
+            sessionId,
+            seq: seq++,
+            kind: 'code',
+            language: 'markdown',
+            text: report.markdown,
+          } as StreamEvent);
+        }
+      }
+      if (!restored.length) return;
+      this.transcriptEvents.update((bySession) => {
+        const live = bySession[sessionId] ?? [];
+        const seenLive = new Set(live.map((e) => `${e.kind}:${e.text ?? ''}`));
+        const history = restored.filter((e) => !seenLive.has(`${e.kind}:${e.text ?? ''}`));
+        if (!history.length) return bySession;
+        return { ...bySession, [sessionId]: [...history, ...live] };
+      });
+      this.shellLastEventAt.set(Date.now());
+      this.scrollShellLogToBottom(true);
+    } catch (err) {
+      // History is a nicety — a failure just leaves the transcript as it was.
+      console.error('Failed to load session reports:', err);
+    }
+  }
+
   /** Transcript rows for the plain-shell session, newest last. */
   protected shellTranscript(): StreamEvent[] {
     const id = this.currentSession()?.id;
@@ -544,6 +592,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly shellLastBusyAt = signal<number | null>(null);
   /** Last normalised pane content per session, for churn detection. */
   private readonly shellIdleKeys = new Map<string, string>();
+  /** Sessions whose stored reports have been read back, so history loads once per session. */
+  private readonly hydratedSessions = new Set<string>();
   /** Last seen pane content + when it last changed, per session — drives adaptive poll pacing. */
   private readonly paneIdleKeys = new Map<string, string>();
   private readonly paneChangedAt = new Map<string, number>();
@@ -1075,6 +1125,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       },
       { allowSignalWrites: true },
     );
+
+    // Hydrate the transcript from persisted reports when a shell opens.
+    //
+    // The live lane only delivers what arrives while connected, so a reload — or simply opening a
+    // session that has been working for an hour — used to show nothing. Reports are now persisted
+    // host-side, so read the history once per session and let the live events append after it.
+    effect(() => {
+      const id = this.plainShellMode() ? this.currentSession()?.id ?? null : null;
+      if (!id || this.hydratedSessions.has(id)) return;
+      this.hydratedSessions.add(id);
+      void this.hydrateTranscript(id);
+    });
 
     // Entering the transcript refreshes the screen subscription rather than starting a poll.
     // The stream is change-driven — an idle pane publishes nothing — so once it stays up (see

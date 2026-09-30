@@ -111,7 +111,7 @@ export {
 } from './lib/lifecycle-status';
 export type { StatusMeta, LifecycleStage } from './lib/lifecycle-status';
 export type { TerminalScreen } from './models/terminal.model';
-export type { StreamEvent } from './models/stream-event.model';
+export type { StreamEvent, SessionReport } from './models/stream-event.model';
 
 // ── Render core ──────────────────────────────────────────────────────────────
 export {

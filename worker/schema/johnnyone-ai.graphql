@@ -411,6 +411,18 @@ input CreateAiSessionInput {
   tmuxSessionName: String
 }
 
+# One persisted agent report (`reportAgentResult`). Mirrors the host type field-for-field so a
+# single client query serves both surfaces.
+type SessionReport {
+  id: ID!
+  sessionId: ID!
+  kind: String!
+  role: String
+  summary: String
+  markdown: String
+  createdAt: String!
+}
+
 # An external tmux session a terminal can attach to.
 type TmuxSession {
   name: String!
@@ -525,6 +537,8 @@ type Query {
   listDesktopNodes: [DesktopNode!]!
   listAiSessions(status: String): [AiSession!]!
   listTmuxSessions: [TmuxSession!]!
+  # A session's reports, oldest->newest, so a freshly-opened transcript is not blank.
+  listSessionReports(sessionId: ID!, limit: Int): [SessionReport!]!
   # Deterministic one-shot pane capture (overhaul P2) — relay to host `capture_terminal`.
   captureTerminal(sessionId: ID!, historyLines: Int): TerminalScreen!
   getAiSession(id: ID!): AiSession

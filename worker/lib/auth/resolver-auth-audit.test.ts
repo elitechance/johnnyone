@@ -63,6 +63,7 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/ai/list-initiative-events.ts',
   'resolvers/ai/list-prompt-library.ts',
   'resolvers/ai/list-provider-configs.ts',
+  'resolvers/ai/list-session-reports.ts',
   'resolvers/ai/list-tmux-sessions.ts',
   'resolvers/ai/list-workspace-files.ts',
   'resolvers/ai/on-desktop-node-status.ts',

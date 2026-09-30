@@ -18,3 +18,19 @@ export interface StreamEvent {
   /** Last event of a turn. */
   final?: boolean;
 }
+
+/**
+ * A persisted agent report (`reportAgentResult`), read back from the host DB.
+ *
+ * The live `StreamEvent` lane only delivers what arrives while a client is connected, so a
+ * reloaded console used to start blank. These rows are the history it hydrates from.
+ */
+export interface SessionReport {
+  id: string;
+  sessionId: string;
+  kind: string;
+  role?: string | null;
+  summary?: string | null;
+  markdown?: string | null;
+  createdAt: string;
+}
