@@ -1191,6 +1191,31 @@ ion-modal.workspace-picker .picker-empty {
     .mermaid-error { color: #f07a72; font-size: 12px; }
   }
 
+  /* "Open <file>" buttons under a report that names files. */
+  .st-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .st-file {
+    border: 1px solid var(--jo-border);
+    border-radius: 999px;
+    background: var(--jo-bg-raised);
+    color: var(--jo-accent);
+    font-family: var(--jo-font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    padding: 5px 11px;
+    cursor: pointer;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &:disabled { opacity: 0.55; cursor: default; }
+    &:focus-visible { outline: 2px solid var(--jo-accent); outline-offset: 1px; }
+  }
+
   /* Waiting on the next report. */
   .st-row.st-wait { border-bottom: 0; }
   /* Live tail of the pane while the agent works. Dimmed and monospace so it reads as a window

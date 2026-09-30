@@ -98,6 +98,7 @@ import {
   POLL_FAST_MS,
   POLL_IDLE_MS,
   pollDelayMs,
+  reportFilePaths,
   screenIdleKey,
 } from './shell-activity';
 
@@ -567,6 +568,44 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       // Leave the transcript as it was, and allow a later attempt to succeed.
       console.error('Failed to load session reports:', err);
       return false;
+    }
+  }
+
+  /** Files a report points at, offered as "Open" buttons since a path alone is inert. */
+  protected reportFiles(markdown: string): string[] {
+    return reportFilePaths(markdown);
+  }
+
+  protected readonly openingFile = signal<string | null>(null);
+
+  /**
+   * Fetch a file the report mentioned and show it.
+   *
+   * A report saying "saved to x.html" is useless on a phone — the browser cannot read the host
+   * filesystem, so the path renders as inert text. The host file API can, so read it here and
+   * hand the browser something it CAN display: a blob for text/html, a data URI for an image.
+   * Opened in a new tab rather than inline so a full page renders at full size.
+   */
+  protected async openReportFile(path: string): Promise<void> {
+    if (this.openingFile()) return;
+    this.openingFile.set(path);
+    try {
+      const file = await firstValueFrom(this.api.readFile(path));
+      const type = file.contentType || 'application/octet-stream';
+      const href =
+        file.encoding === 'base64'
+          ? `data:${type};base64,${file.content}`
+          : URL.createObjectURL(new Blob([file.content], { type }));
+      const win = window.open(href, '_blank', 'noopener');
+      if (!win) {
+        // Popup blocked — fall back to a same-tab navigation rather than failing silently.
+        window.location.href = href;
+      }
+    } catch (err) {
+      console.error('Failed to open report file:', err);
+      this.terminalError.set(`Could not open ${path}`);
+    } finally {
+      this.openingFile.set(null);
     }
   }
 

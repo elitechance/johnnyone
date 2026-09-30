@@ -261,3 +261,34 @@ export const CONSOLE_POLL_IDLE_MS = 5_000;
 export function pollDelayMs(changedRecently: boolean, fast: number, idle: number): number {
   return changedRecently ? fast : idle;
 }
+
+
+/** Workspace-ish file paths a report can point at, which the console can then open. */
+const VIEWABLE = /\.(html?|png|jpe?g|gif|svg|webp|md|txt|log|json|ya?ml|csv|diff|patch)$/i;
+
+/**
+ * File paths mentioned in a report, so the transcript can offer to open them.
+ *
+ * A report that says "saved to path/to/file.html" is useless on a phone: the path renders as
+ * inert text and the browser cannot read the host filesystem. Extracting the paths lets the
+ * console fetch them through the host file API and show them.
+ *
+ * Absolute paths and workspace-relative ones both count; anything without a viewable extension is
+ * ignored so prose like `src/app` does not sprout buttons.
+ */
+export function reportFilePaths(markdown: string | null | undefined, max = 6): string[] {
+  if (!markdown) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  // Paths inside backticks, or bare tokens that look like a path with a known extension.
+  const candidates = markdown.match(/[~./A-Za-z0-9_-][\w./~-]*\.[A-Za-z0-9]{1,6}\b/g) ?? [];
+  for (const raw of candidates) {
+    const path = raw.replace(/^[`'"(]+|[`'".,)]+$/g, '');
+    if (!path.includes('/') || !VIEWABLE.test(path)) continue;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+    if (out.length >= max) break;
+  }
+  return out;
+}

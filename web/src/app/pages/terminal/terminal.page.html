@@ -157,6 +157,20 @@
                   @if (row.type === 'markdown') {
                     <!-- The agent's written-up report: headings, tables, code and mermaid. -->
                     <johnny-markdown-view class="st-md" [markdown]="row.text" />
+                    <!-- A path in a report is inert text here: the browser cannot read the host
+                         filesystem. These fetch it through the host file API and show it. -->
+                    @if (reportFiles(row.text); as files) {
+                      @if (files.length > 0) {
+                        <div class="st-files">
+                          @for (f of files; track f) {
+                            <button type="button" class="st-file" [disabled]="openingFile() !== null"
+                                    (click)="openReportFile(f)">
+                              {{ openingFile() === f ? 'Opening…' : 'Open ' + f.split('/').slice(-1)[0] }}
+                            </button>
+                          }
+                        </div>
+                      }
+                    }
                   } @else {
                     <div class="st-tx">{{ row.text }}</div>
                   }

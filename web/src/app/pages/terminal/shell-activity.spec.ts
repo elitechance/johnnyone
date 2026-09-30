@@ -6,6 +6,7 @@ import {
   paneTail,
   paneTailHtml,
   pollDelayMs,
+  reportFilePaths,
   screenIdleKey,
 } from './shell-activity';
 
@@ -249,5 +250,36 @@ describe('pollDelayMs (adaptive sampling)', () => {
 
   it('idles far slower than it runs — that is the whole point', () => {
     expect(pollDelayMs(false, 500, 5000)).toBeGreaterThan(pollDelayMs(true, 500, 5000) * 4);
+  });
+});
+
+describe('reportFilePaths', () => {
+  it('finds a viewable path inside prose and backticks', () => {
+    const md = 'Saved to `personal/plans/x/transcript-sample.html` for review.';
+    expect(reportFilePaths(md)).toEqual(['personal/plans/x/transcript-sample.html']);
+  });
+
+  it('takes images and docs, ignores prose that merely contains dots', () => {
+    expect(reportFilePaths('see a/b/shot.png and e.g. this')).toEqual(['a/b/shot.png']);
+  });
+
+  it('ignores paths with no viewable extension', () => {
+    expect(reportFilePaths('run src/app/main.ts and node_modules/x.mjs')).toEqual([]);
+  });
+
+  it('requires a slash — a bare filename is probably prose', () => {
+    expect(reportFilePaths('the README.md file')).toEqual([]);
+  });
+
+  it('de-duplicates and caps the list', () => {
+    const md = Array.from({ length: 12 }, (_, i) => `d/f${i}.png`).join(' ') + ' d/f0.png';
+    const out = reportFilePaths(md);
+    expect(out.length).toBe(6);
+    expect(new Set(out).size).toBe(6);
+  });
+
+  it('is empty for nothing', () => {
+    expect(reportFilePaths(null)).toEqual([]);
+    expect(reportFilePaths('')).toEqual([]);
   });
 });
