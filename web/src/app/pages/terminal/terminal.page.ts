@@ -700,6 +700,20 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return at !== null && Date.now() - at < TerminalPage.SHELL_BUSY_WINDOW_MS;
   }
 
+  /**
+   * Which build this page is actually running.
+   *
+   * A cached `index.html` keeps requesting the OLD content-hashed chunks, which still exist on
+   * the CDN — so the app can run last week's code indefinitely while every server-side check says
+   * the fix is deployed. That cost a long debugging detour. Reading the main chunk's hash out of
+   * the DOM needs no build-time plumbing and is unique per deploy, so "what build are you on?"
+   * becomes a question you can answer by looking.
+   */
+  protected buildId(): string {
+    const src = document.querySelector<HTMLScriptElement>('script[src*="main-"]')?.src ?? '';
+    return /main-([A-Z0-9]+)\.js/.exec(src)?.[1] ?? 'unknown';
+  }
+
   /** "last update 42s ago" — an explicit liveness claim, unlike inferring it from scrolling text. */
   protected shellLiveness(): string {
     this.shellClock();

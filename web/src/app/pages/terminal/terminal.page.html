@@ -228,6 +228,9 @@
 
           <footer class="st-foot">
             <span class="st-live">{{ shellLiveness() }}</span>
+            <!-- Which build is actually running. A cached index.html can keep serving old chunks
+                 long after a deploy, so this makes "are you on the new code?" answerable. -->
+            <span class="st-build" title="UI build">build {{ buildId() }}</span>
           </footer>
 
           <!-- Pasted or dropped images, staged before sending. The workspace-level paste handler

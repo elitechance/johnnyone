@@ -1282,6 +1282,13 @@ ion-modal.workspace-picker .picker-empty {
     border-top: 1px solid var(--jo-border);
     background: var(--jo-bg-elevated);
   }
+  .st-build {
+    float: right;
+    font-family: var(--jo-font-mono, ui-monospace, monospace);
+    font-size: 10.5px;
+    color: var(--jo-fg-faint);
+    opacity: 0.75;
+  }
   .st-live {
     font-family: var(--jo-font-mono, ui-monospace, monospace);
     font-size: 10.5px;
