@@ -524,10 +524,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    * session and this resolving, and dropping it would lose the newest thing on screen. Stored
    * rows are filtered against what is already present so nothing doubles up.
    */
-  private async hydrateTranscript(sessionId: string): Promise<void> {
+  private async hydrateTranscript(sessionId: string): Promise<boolean> {
     try {
       const reports = await firstValueFrom(this.api.listSessionReports(sessionId));
-      if (!reports?.length) return;
+      if (!reports?.length) return true; // nothing stored yet is a valid answer
       const restored: StreamEvent[] = [];
       let seq = -reports.length; // negative: history sorts before anything live
       for (const report of reports) {
@@ -549,7 +549,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
           } as StreamEvent);
         }
       }
-      if (!restored.length) return;
+      if (!restored.length) return true;
       this.transcriptEvents.update((bySession) => {
         const live = bySession[sessionId] ?? [];
         const seenLive = new Set(live.map((e) => `${e.kind}:${e.text ?? ''}`));
@@ -559,9 +559,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       });
       this.shellLastEventAt.set(Date.now());
       this.scrollShellLogToBottom(true);
+      return true;
     } catch (err) {
-      // History is a nicety — a failure just leaves the transcript as it was.
+      // Leave the transcript as it was, and allow a later attempt to succeed.
       console.error('Failed to load session reports:', err);
+      return false;
     }
   }
 
@@ -1134,8 +1136,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     effect(() => {
       const id = this.plainShellMode() ? this.currentSession()?.id ?? null : null;
       if (!id || this.hydratedSessions.has(id)) return;
-      this.hydratedSessions.add(id);
-      void this.hydrateTranscript(id);
+      // Marked only on SUCCESS. Marking up-front meant one failed fetch — a expired token, a
+      // relay hiccup, or simply loading before the query was deployed — permanently disabled
+      // history for that session until the page was reloaded.
+      void this.hydrateTranscript(id).then((ok) => {
+        if (ok) this.hydratedSessions.add(id);
+      });
     });
 
     // Entering the transcript refreshes the screen subscription rather than starting a poll.
