@@ -1,0 +1,37 @@
+.file-viewer {
+  --width: 100%;
+  --height: 100%;
+}
+
+/* Fill the modal: a page or screenshot is worth the whole screen on a phone. */
+.fv-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff; // a page that sets no background should not inherit the dark shell
+}
+
+/* Images are centred and pannable when larger than the viewport, rather than scaled to illegible. */
+.fv-image-wrap {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  overflow: auto;
+}
+.fv-image {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.fv-text {
+  margin: 0;
+  padding: 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--jo-font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  line-height: 1.5;
+}

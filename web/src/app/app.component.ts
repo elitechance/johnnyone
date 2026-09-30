@@ -25,6 +25,7 @@ import {
 import { AuthService } from './services/auth.service';
 import { MermaidZoomService } from './services/mermaid-zoom.service';
 import { MermaidZoomModalComponent } from './components/mermaid-zoom-modal/mermaid-zoom-modal.component';
+import { FileViewerModalComponent } from './components/file-viewer-modal/file-viewer-modal.component';
 import { LauncherMenuComponent } from './components/launcher-menu/launcher-menu.component';
 import { NAV_ITEMS } from './nav-items';
 
@@ -37,6 +38,7 @@ import { NAV_ITEMS } from './nav-items';
     IonRouterOutlet,
     IonSplitPane,
     MermaidZoomModalComponent,
+    FileViewerModalComponent,
   ],
   selector: 'app-root',
   templateUrl: './app.component.html',

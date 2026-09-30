@@ -1,0 +1,40 @@
+<ion-modal [isOpen]="viewer.isOpen()" (didDismiss)="close()" class="file-viewer">
+  <ng-template>
+    <ion-header>
+      <ion-toolbar>
+        <ion-title>{{ title() }}</ion-title>
+        <ion-buttons slot="end">
+          <ion-button (click)="close()" aria-label="Close">
+            <ion-icon slot="icon-only" name="close-outline"></ion-icon>
+          </ion-button>
+        </ion-buttons>
+      </ion-toolbar>
+    </ion-header>
+    <ion-content>
+      @if (viewer.view(); as view) {
+        @switch (view.kind) {
+          @case ('html') {
+            <!-- Sandboxed: workspace HTML is written by an agent, so it must not run with the
+                 app's origin. `allow-scripts` alone keeps it same-origin-less, which is what lets
+                 an embedded mermaid render without granting it access to us. -->
+            <iframe
+              class="fv-frame"
+              [src]="safeSource()"
+              sandbox="allow-scripts"
+              referrerpolicy="no-referrer"
+              title="{{ title() }}"
+            ></iframe>
+          }
+          @case ('image') {
+            <div class="fv-image-wrap">
+              <img class="fv-image" [src]="safeSource()" [alt]="title()" />
+            </div>
+          }
+          @default {
+            <pre class="fv-text">{{ view.source }}</pre>
+          }
+        }
+      }
+    </ion-content>
+  </ng-template>
+</ion-modal>

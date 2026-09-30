@@ -15,6 +15,7 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { DomSanitizer, SafeHtml, Title } from '@angular/platform-browser';
+import { FileViewerService } from '../../services/file-viewer.service';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import {
   IonModal,
@@ -584,7 +585,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    * A report saying "saved to x.html" is useless on a phone — the browser cannot read the host
    * filesystem, so the path renders as inert text. The host file API can, so read it here and
    * hand the browser something it CAN display: a blob for text/html, a data URI for an image.
-   * Opened in a new tab rather than inline so a full page renders at full size.
+   * Shown in an in-app modal rather than a new tab: on a phone a new tab means leaving the
+   * conversation and finding your way back.
    */
   protected async openReportFile(path: string): Promise<void> {
     if (this.openingFile()) return;
@@ -592,14 +594,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     try {
       const file = await firstValueFrom(this.api.readFile(path));
       const type = file.contentType || 'application/octet-stream';
-      const href =
-        file.encoding === 'base64'
-          ? `data:${type};base64,${file.content}`
-          : URL.createObjectURL(new Blob([file.content], { type }));
-      const win = window.open(href, '_blank', 'noopener');
-      if (!win) {
-        // Popup blocked — fall back to a same-tab navigation rather than failing silently.
-        window.location.href = href;
+      if (type.startsWith('image/')) {
+        this.fileViewer.open({ path, kind: 'image', source: `data:${type};base64,${file.content}` });
+      } else if (type.includes('html')) {
+        // A blob keeps the document intact (scripts, styles) where a data: URI would be awkward
+        // to size; the viewer sandboxes it.
+        const url = URL.createObjectURL(new Blob([file.content], { type: 'text/html' }));
+        this.fileViewer.open({ path, kind: 'html', source: url });
+      } else {
+        const text =
+          file.encoding === 'base64' ? atob(file.content) : (file.content as string);
+        this.fileViewer.open({ path, kind: 'text', source: text });
       }
     } catch (err) {
       console.error('Failed to open report file:', err);
@@ -1088,6 +1093,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private shellLog?: ElementRef<HTMLElement>;
   private readonly browserTitle = inject(Title);
   private readonly sanitizer = inject(DomSanitizer);
+  private readonly fileViewer = inject(FileViewerService);
   pendingAttachmentsBySession = signal<Record<string, PendingImageAttachment[]>>({});
   sendingAttachmentsBySession = signal<Record<string, boolean>>({});
 
