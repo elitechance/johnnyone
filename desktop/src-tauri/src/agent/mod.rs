@@ -875,6 +875,14 @@ impl AgentService {
         if !Self::session_wants_brief(state, session_id) {
             return data;
         }
+        // A slash command is addressed to the CLI, not to the agent. Appending the brief made the
+        // brief its arguments (`/compact [JohnnyOne: …]`), so these pass through untouched: no
+        // brief, and no report nudge, because the CLI answers in the pane and there is no reply to
+        // report. Still recorded, so the transcript shows what was sent.
+        if crate::terminal_keys::is_cli_slash_command(body) {
+            crate::services::agent_plans::record_user_prompt(state, session_id, body);
+            return data;
+        }
         // Every user message arms the "answered but never reported" guard, not just the first.
         Self::arm_shell_report_nudge(state, session_id);
         // Store the prompt so the transcript can pair it with the reply. Uses the body BEFORE the

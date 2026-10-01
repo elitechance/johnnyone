@@ -231,6 +231,31 @@ pub fn echo_line(keys: &[String]) -> String {
     format!("⌨ {}", keys.join(" "))
 }
 
+/// Whether a composer line is a slash command typed to the CLI rather than a message to the agent.
+///
+/// `/compact`, `/clear`, `/model opus` are addressed to the CLI itself and must arrive exactly as
+/// typed. The phone brief is appended to messages, so appending it to one of these turns the brief
+/// into the command's arguments — the CLI received `/compact [JohnnyOne: this conversation is
+/// being read on a phone console…]` and took the whole paragraph as the compaction instruction.
+///
+/// Deliberately narrow: the command token is `/` plus a plain name, so a bare path
+/// (`/home/creepy/notes.md`) and a `//key` directive are both still messages.
+pub fn is_cli_slash_command(input: &str) -> bool {
+    let line = input.trim_end_matches(['\r', '\n']);
+    // A command is one line. Anything multiline is prose that happens to open with a slash.
+    if line.contains(['\r', '\n']) {
+        return false;
+    }
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_whitespace().next().unwrap_or("");
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +453,37 @@ mod tests {
     #[test]
     fn echo_names_the_keys_sent() {
         assert_eq!(echo_line(&["Down".into(), "Enter".into()]), "⌨ Down Enter");
+    }
+    #[test]
+    fn slash_commands_are_commands() {
+        assert!(is_cli_slash_command("/compact"));
+        assert!(is_cli_slash_command("/clear\r"));
+        assert!(is_cli_slash_command("/model opus"));
+        // Plugin skills are namespaced.
+        assert!(is_cli_slash_command("/johnnyone:status"));
+    }
+
+    #[test]
+    fn a_path_is_not_a_command() {
+        // The reason the check looks at the whole first token: a message can legitimately open
+        // with an absolute path.
+        assert!(!is_cli_slash_command("/home/creepy/notes.md is the file"));
+    }
+
+    #[test]
+    fn a_key_directive_is_not_a_command() {
+        assert!(!is_cli_slash_command("//key Escape"));
+    }
+
+    #[test]
+    fn prose_is_not_a_command() {
+        assert!(!is_cli_slash_command("please read /compact"));
+        assert!(!is_cli_slash_command("/ "));
+        assert!(!is_cli_slash_command(""));
+    }
+
+    #[test]
+    fn multiline_is_a_message_even_when_it_opens_with_a_slash() {
+        assert!(!is_cli_slash_command("/compact\nand then stop"));
     }
 }
