@@ -26,6 +26,29 @@ use std::time::{Duration, Instant};
 const SHELL_NUDGE_AFTER_SECS: u64 = 60;
 /// Gap between the two captures used to decide the pane has actually gone quiet.
 const SHELL_NUDGE_IDLE_PROBE_SECS: u64 = 3;
+/// Treat the relay as dead once no heartbeat ack has arrived for this long.
+///
+/// Heartbeats go out every 30s (`heartbeat::HEARTBEAT_INTERVAL_SECS`), so this allows three to go
+/// missing before acting — long enough to ride out a slow network or a Durable Object hiccup,
+/// short enough that the phone is not stranded for an hour.
+const HEARTBEAT_STALE_AFTER_SECS: i64 = 95;
+/// How often to test that threshold.
+const HEARTBEAT_LIVENESS_CHECK_SECS: u64 = 15;
+
+/// Whether the relay should be considered dead, given the last ack we saw.
+///
+/// Split out from the watchdog's select arm so the threshold is testable without standing up a
+/// WebSocket. `None` means no ack has ever been recorded; the connect path seeds a timestamp, so
+/// that only happens before a connection exists and must NOT count as stale.
+fn heartbeat_is_stale(
+    last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    match last_heartbeat {
+        Some(last) => now.signed_duration_since(last).num_seconds() >= HEARTBEAT_STALE_AFTER_SECS,
+        None => false,
+    }
+}
 use tokio::sync::Mutex;
 use tracing;
 
@@ -167,6 +190,10 @@ impl AgentService {
                     {
                         let mut status = state.connection_status.lock().await;
                         status.connected = true;
+                        // Seed the ack clock for the liveness watchdog. Without this the watchdog
+                        // would compare against the PREVIOUS connection's last ack — already stale
+                        // — and kill a healthy new socket before its first ack arrives.
+                        status.last_heartbeat = Some(chrono::Utc::now());
                     }
 
                     tracing::info!("WebSocket connected");
@@ -257,6 +284,11 @@ impl AgentService {
         let mut terminal_screen_rx = state.terminal_screen_tx.subscribe();
         let mut stream_event_rx = state.stream_event_tx.subscribe();
         let mut agent_plan_run_rx = state.agent_plan_run_tx.subscribe();
+        // Drives the half-open-socket watchdog in the arm below. Checked often relative to the
+        // staleness threshold so a dead relay is caught promptly rather than on a 90s boundary.
+        let mut liveness = tokio::time::interval(tokio::time::Duration::from_secs(
+            HEARTBEAT_LIVENESS_CHECK_SECS,
+        ));
 
         loop {
             tokio::select! {
@@ -377,6 +409,36 @@ impl AgentService {
                         let _ = writer.send(
                             tokio_tungstenite::tungstenite::Message::Text(json.into())
                         ).await;
+                    }
+                }
+                _ = liveness.tick() => {
+                    // Watchdog for a HALF-OPEN relay socket.
+                    //
+                    // Every other arm here reacts to the socket telling us something. A half-open
+                    // socket never does: the write half is dead but the read half yields neither
+                    // an error nor a Close, so `ws_read.next()` parks forever and this loop never
+                    // returns — which is the ONLY thing that triggers a reconnect. The heartbeat
+                    // task notices (its send fails) but it only `return`s, killing itself quietly,
+                    // so the node sits "connected" with a dead socket until the app restarts.
+                    //
+                    // Observed in the wild: heartbeat acks stopped at 14:15Z, the send failed at
+                    // 15:08Z, and 90 minutes later `relayConnectionStatus` still reported
+                    // connected=true while the kernel held no socket to Cloudflare at all. The
+                    // phone just shows "no online backend".
+                    //
+                    // Acks are the liveness signal, so treat a stale one as a dead connection and
+                    // return Err — the caller logs it and reconnects with backoff.
+                    let last = state.connection_status.lock().await.last_heartbeat;
+                    let now = chrono::Utc::now();
+                    if heartbeat_is_stale(last, now) {
+                        let age_secs = last
+                            .map(|l| now.signed_duration_since(l).num_seconds())
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            age_secs,
+                            "No heartbeat ack within threshold — treating relay as dead"
+                        );
+                        return Err(format!("heartbeat stale for {}s", age_secs));
                     }
                 }
                 _ = shutdown_rx.recv() => {
@@ -2861,5 +2923,84 @@ mod stream_event_tests {
         // Metadata chunks are not transcript events.
         assert!(AgentService::stream_event_from_chunk("s", 4, &chunk(ChunkType::System, "")).is_none());
         assert!(AgentService::stream_event_from_chunk("s", 5, &chunk(ChunkType::Result, "")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod liveness_watchdog_tests {
+    use super::*;
+
+    /// A fixed reference instant, so assertions do not race two clock reads. Deriving the past
+    /// timestamps from a second `Utc::now()` leaves the age a hair under the whole second intended,
+    /// and `num_seconds()` truncates — which silently flipped the boundary case.
+    fn reference_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_760_000_000, 0)
+            .expect("valid fixed timestamp")
+            .to_utc()
+    }
+
+    /// A timestamp `secs_ago` before `reference_now()`.
+    fn ago(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        reference_now() - chrono::Duration::seconds(secs)
+    }
+
+    /// The field failure this watchdog exists for: acks stopped at 14:15Z, yet the node still
+    /// reported connected=true 90 minutes later while holding no socket to Cloudflare.
+    #[test]
+    fn ninety_minute_ack_gap_is_stale() {
+        assert!(heartbeat_is_stale(Some(ago(90 * 60)), reference_now()));
+    }
+
+    /// A couple of missed heartbeats must NOT drop the connection — slow networks and Durable
+    /// Object hiccups are routine, and reconnecting on every blip would be worse than the bug.
+    #[test]
+    fn one_or_two_missed_heartbeats_tolerated() {
+        assert!(!heartbeat_is_stale(Some(ago(31)), reference_now()), "one missed beat");
+        assert!(!heartbeat_is_stale(Some(ago(62)), reference_now()), "two missed beats");
+    }
+
+    /// Three missed beats is the line; at or past it the relay counts as dead.
+    #[test]
+    fn threshold_boundary_is_exact() {
+        assert!(!heartbeat_is_stale(
+            Some(ago(HEARTBEAT_STALE_AFTER_SECS - 1)),
+            reference_now()
+        ));
+        assert!(heartbeat_is_stale(
+            Some(ago(HEARTBEAT_STALE_AFTER_SECS)),
+            reference_now()
+        ));
+    }
+
+    /// A just-acked connection is healthy.
+    #[test]
+    fn fresh_ack_is_healthy() {
+        assert!(!heartbeat_is_stale(Some(reference_now()), reference_now()));
+    }
+
+    /// No ack recorded yet must never read as stale, or the watchdog would kill a connection
+    /// before its first ack could land. The connect path seeds a timestamp for this reason.
+    #[test]
+    fn absent_ack_is_not_stale() {
+        assert!(!heartbeat_is_stale(None, reference_now()));
+    }
+
+    /// Clock skew (an ack stamped slightly in the future) must not read as stale.
+    #[test]
+    fn future_ack_is_not_stale() {
+        assert!(!heartbeat_is_stale(
+            Some(reference_now() + chrono::Duration::seconds(5)),
+            reference_now()
+        ));
+    }
+
+    /// The check must run several times inside the staleness window, so a dead relay is caught
+    /// promptly rather than up to a full threshold late.
+    #[test]
+    fn check_interval_is_well_inside_the_threshold() {
+        assert!(
+            (HEARTBEAT_LIVENESS_CHECK_SECS as i64) * 3 <= HEARTBEAT_STALE_AFTER_SECS,
+            "liveness check should run at least 3x per staleness window"
+        );
     }
 }

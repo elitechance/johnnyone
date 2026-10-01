@@ -12,6 +12,12 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 /// Interval (in heartbeat cycles) at which to include system info.
 const SYSTEM_INFO_EVERY_N: u64 = 4;
 
+/// Give up on a heartbeat write after this long, including the wait for the shared writer lock.
+///
+/// Comfortably longer than any healthy send, well under the main loop's staleness threshold, so a
+/// wedged write surfaces as a reconnect rather than silence.
+const HEARTBEAT_SEND_TIMEOUT_SECS: u64 = 10;
+
 /// Run the periodic heartbeat sender.
 ///
 /// Sends a heartbeat message at regular intervals to keep the WebSocket
@@ -68,15 +74,41 @@ pub async fn run_heartbeat(
                     }
                 };
 
-                let mut writer = ws_write.lock().await;
-                match writer.send(Message::Text(json.into())).await {
-                    Ok(()) => {
+                // Bound BOTH the lock wait and the send.
+                //
+                // On a half-open socket a send can block indefinitely, and it holds `ws_write`
+                // while it does — which starves every other writer, this loop included. Seen in
+                // the wild as a 53-minute gap in heartbeats (14:15Z → 15:08Z) with no error
+                // logged: the loop was not idle, it was parked on the mutex behind a hung send.
+                // That silence is what made the dead relay invisible.
+                //
+                // Timing out instead lets the loop exit, which stops the acks, which the main
+                // loop's liveness watchdog sees — so a wedged socket now ends in a reconnect
+                // rather than a permanently connected-looking node.
+                let send = async {
+                    let mut writer = ws_write.lock().await;
+                    writer.send(Message::Text(json.into())).await
+                };
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(HEARTBEAT_SEND_TIMEOUT_SECS),
+                    send,
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
                         tracing::trace!(cycle = cycle, "Heartbeat sent");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(error = %e, "Failed to send heartbeat");
-                        // Connection is likely broken, exit the heartbeat loop
-                        // The main message loop will detect this and handle reconnection
+                        // Connection is broken. Exiting stops the acks, so the main loop's
+                        // liveness watchdog tears the connection down and reconnects.
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            timeout_secs = HEARTBEAT_SEND_TIMEOUT_SECS,
+                            "Heartbeat send timed out — relay write side is wedged"
+                        );
                         return;
                     }
                 }
