@@ -102,6 +102,7 @@ import {
   reportFilePaths,
   screenIdleKey,
 } from './shell-activity';
+import { composerHeightPx, enterAction, enterSendsForPointer } from './composer-input';
 
 // Re-export so existing/future importers of `PaneTab` from the page keep resolving.
 export type { PaneTab } from './terminal-transcript-tab';
@@ -868,6 +869,37 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     setTimeout(pin, 400);
   }
 
+  /** Whether Enter sends or inserts a newline — see `enterSendsForPointer` for why pointer type. */
+  protected readonly enterSends = computed(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return true;
+    return enterSendsForPointer(window.matchMedia('(pointer: coarse)').matches);
+  });
+
+  /** Enter in the composer: send, or let the newline through. */
+  protected onComposerEnter(event: Event): void {
+    const action = enterAction({
+      shiftKey: (event as KeyboardEvent).shiftKey,
+      enterSends: this.enterSends(),
+    });
+    if (action === 'newline') return;
+    event.preventDefault();
+    void this.sendShellMessage();
+  }
+
+  /** Grow the composer with its content, up to a cap. */
+  protected autoGrowComposer(event: Event): void {
+    const el = event.target as HTMLTextAreaElement | null;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${composerHeightPx(el.scrollHeight)}px`;
+  }
+
+  /** Collapse the composer back to one line after sending. */
+  private resetComposerHeight(): void {
+    const el = document.getElementById('shell-transcript-input') as HTMLTextAreaElement | null;
+    if (el) el.style.height = '';
+  }
+
   /** Send from the transcript composer: echo locally, then wait for the agent to report back. */
   protected async sendShellMessage(): Promise<void> {
     const text = this.shellDraft.trim();
@@ -877,6 +909,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // An image on its own is a perfectly good message.
     if (!text && !hasAttachments) return;
     this.shellDraft = '';
+    this.resetComposerHeight();
     const echoText = text || `Sent ${this.pendingAttachmentsForSession(id).length} image(s)`;
     this.shellEchoes.update((list) => [
       ...list,

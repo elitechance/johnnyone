@@ -591,6 +591,16 @@ impl AgentService {
                         crate::terminal::unsubscribe_terminal_visual(&st, &command.session_id).await
                     } else if command.data.is_empty() && command.attachments.is_empty() {
                         Ok(())
+                    } else if let Some(directive) =
+                        crate::terminal_keys::parse_key_directive(&command.data)
+                    {
+                        // Keys, not text. Parsed HERE rather than in `send_terminal_input` on
+                        // purpose: that function has ~20 internal callers (plan prompts, nudges,
+                        // coordinator messages), and a generated prompt whose first line happened to
+                        // start with the prefix would be silently turned into keystrokes. This relay
+                        // branch is user input by definition — the same reason `with_shell_brief`
+                        // only touches it.
+                        Self::handle_key_directive(&st, &command.session_id, directive).await
                     } else {
                         match Self::prepare_terminal_command_data(&st, &command).await {
                             Ok(data) => {
@@ -792,6 +802,67 @@ impl AgentService {
     /// Only this relay path is touched, which is user input by definition: the coordinator calls
     /// `send_terminal_input` directly and its agents are already briefed by their plan prompt.
     /// One line, because a newline submits early in a TUI composer and would split the message.
+    /// Send the keys a `//key` line asked for, or explain why it could not.
+    ///
+    /// Every outcome writes a transcript row. The console renders only persisted content, so a key
+    /// send that logs nothing leaves you tapping at an unchanged mirror with no way to tell whether
+    /// it landed. A malformed directive is reported and NOT retried as text — typing `Esx` into an
+    /// agent's composer is worse than refusing it.
+    async fn handle_key_directive(
+        state: &Arc<AppState>,
+        session_id: &str,
+        directive: Result<crate::terminal_keys::KeyDirective, String>,
+    ) -> Result<(), String> {
+        use crate::terminal_keys::KeyDirective;
+
+        match directive {
+            Ok(KeyDirective::Help) => {
+                crate::services::agent_plans::record_session_note(
+                    state,
+                    session_id,
+                    "update",
+                    "Key reference",
+                    Some(&crate::terminal_keys::help_markdown()),
+                );
+                Ok(())
+            }
+            Ok(KeyDirective::Keys(keys)) => {
+                tracing::info!(session_id, ?keys, "sending keys from transcript directive");
+                let result = crate::terminal::send_terminal_keys(state, session_id.to_string(), &keys)
+                    .await;
+                match &result {
+                    Ok(()) => crate::services::agent_plans::record_session_note(
+                        state,
+                        session_id,
+                        "update",
+                        &crate::terminal_keys::echo_line(&keys),
+                        None,
+                    ),
+                    Err(error) => crate::services::agent_plans::record_session_note(
+                        state,
+                        session_id,
+                        "blocked",
+                        &format!("Could not send keys: {error}"),
+                        None,
+                    ),
+                }
+                result
+            }
+            Err(message) => {
+                crate::services::agent_plans::record_session_note(
+                    state,
+                    session_id,
+                    "blocked",
+                    &message,
+                    None,
+                );
+                // Already reported to the user, so the ack carries no error — this is a usage
+                // mistake, not a transport failure.
+                Ok(())
+            }
+        }
+    }
+
     async fn with_shell_brief(state: &Arc<AppState>, session_id: &str, data: String) -> String {
         if data.trim().is_empty() {
             return data;

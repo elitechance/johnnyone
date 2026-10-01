@@ -275,15 +275,22 @@
                own (paste) handler already stages the image — paste events bubble. Binding one here
                too ran both and staged every image TWICE. -->
           <form class="st-composer" (ngSubmit)="sendShellMessage()">
-            <input
+            <!-- A textarea, not an input: `input type="text"` cannot hold a newline at all.
+                 Enter sends on a real keyboard (Shift+Enter for a newline); on touch, where there
+                 is no Shift+Enter, Enter inserts the newline and Send submits — the same split
+                 WhatsApp and Slack mobile use. See `enterSends()`. -->
+            <textarea
               id="shell-transcript-input"
               name="shellDraft"
               class="st-input"
-              type="text"
+              rows="1"
               autocomplete="off"
+              [attr.enterkeyhint]="enterSends() ? 'send' : 'enter'"
               [placeholder]="shellAttachments().length > 0 ? 'Add a note (optional)…' : 'Reply to the agent…'"
               [(ngModel)]="shellDraft"
-            />
+              (keydown.enter)="onComposerEnter($event)"
+              (input)="autoGrowComposer($event)"
+            ></textarea>
             <button
               class="st-send"
               type="submit"

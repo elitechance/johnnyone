@@ -1399,6 +1399,13 @@ ion-modal.workspace-picker .picker-empty {
     font: inherit;
     font-size: 14px; // >=16px avoids iOS zoom-on-focus; 14 + the meta viewport is fine here
 
+    // Now a <textarea> (an <input> cannot hold a newline). Keep it looking like the single-line
+    // field it replaced: no drag handle, no baseline gap, and it grows by JS up to a cap.
+    resize: none;
+    overflow-y: auto;
+    display: block;
+    line-height: 1.45;
+
     &::placeholder { color: var(--jo-fg-faint); }
     &:focus { outline: 2px solid var(--jo-accent); outline-offset: -1px; }
   }

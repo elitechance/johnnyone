@@ -3919,6 +3919,40 @@ pub fn record_user_prompt(state: &AppState, session_id: &str, text: &str) {
     }
 }
 
+/// Record a note from J1 itself — not from the user and not from the agent.
+///
+/// Used for key-directive feedback: the console renders only what is persisted here, so a key send
+/// that writes nothing is invisible. You tap, the mirror looks unchanged, and there is no way to
+/// tell whether the key landed or the mirror is simply stale.
+///
+/// `kind` drives how the console styles the row: `blocked` reads as an error, anything else as an
+/// ordinary line. Best-effort — failing to log feedback must never fail the key send itself.
+pub fn record_session_note(
+    state: &AppState,
+    session_id: &str,
+    kind: &str,
+    summary: &str,
+    markdown: Option<&str>,
+) {
+    let result = state.db.with_conn(|conn| {
+        conn.execute(
+            "INSERT INTO session_reports (id, session_id, kind, role, summary, markdown) \
+             VALUES (?1, ?2, ?3, 'system', ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                session_id,
+                kind,
+                summary,
+                markdown,
+            ],
+        )
+        .map_err(|e| e.to_string())
+    });
+    if let Err(error) = result {
+        tracing::warn!(session_id, %error, "failed to persist session note");
+    }
+}
+
 /// Read back a session's reports so a freshly-opened console shows what it missed.
 ///
 /// Returns the most recent `limit` in chronological order: the query takes the newest rows, then
