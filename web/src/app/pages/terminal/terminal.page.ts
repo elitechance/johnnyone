@@ -174,6 +174,13 @@ import { resolveSelectedInitiative } from './console-selection-logic';
 import { consoleCaptureLines } from '../../../../../ui/src/components/terminal-screen/terminal-scroll-logic';
 import { isPlainShellSurface } from '../../components/launcher-menu/launcher-logic';
 import {
+  DEFAULT_SHELL_VIEW,
+  ShellView,
+  isShellView,
+  resolveShellRoute,
+  shellViewTogglePath,
+} from '../shells/shells-route';
+import {
   clampRailWidth,
   clampRightWidth,
   consoleColumns as consoleColumnsTemplate,
@@ -336,6 +343,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private terminalVisualSync: Promise<void> = Promise.resolve();
   private queryParamSub: Subscription | null = null;
   private paramSub: Subscription | null = null;
+  /** The session id a `loadSessions` call is already in flight for. Guards the route handler against
+   *  firing a SECOND concurrent load for the same id: `currentSession()` stays undefined until the
+   *  first fetch lands, so on a slow relay a Transcript/Raw tap during boot slipped past a
+   *  `currentSession()`-only check and raced the load `ngOnInit` had just started. */
+  private pendingSessionId: string | null = null;
   private readonly visibilityChangeHandler = () => {
     if (document.hidden) {
       this.enqueueTerminalVisualSync(() => this.unsubscribeAllTerminalVisuals());
@@ -505,19 +517,39 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   );
 
   /**
-   * Plain-shell surface view. The terminal mirrors a tmux pane sized by whoever attached first
-   * (measured: 172 cols), so on a phone its lines hard-wrap into ~55 and the TUI layout is
-   * destroyed. The transcript is append-only prose that reflows at any width, so it is the phone
-   * default; a wide viewport keeps the real terminal, which is what a desktop user came for.
-   * `null` = follow the viewport; an explicit choice sticks for the rest of the visit.
+   * Plain-shell surface view, now owned by the URL (`/shells/:id/transcript|raw`) rather than by the
+   * viewport. The old rule derived it from `isCompactWorkspace()`, which meant a desktop user always
+   * landed on `raw` — a mirror of a tmux pane sized by whoever attached first (measured: 172 cols),
+   * so the same link opened on a phone hard-wrapped into ~55 columns and destroyed the TUI layout.
+   * Worse, the choice lived only in memory: it could not be shared, bookmarked or restored on reload.
+   *
+   * So the transcript — append-only prose that reflows at any width — is the default for the bare
+   * `/shells/:id`, and raw is a URL you ask for. `null` here only means "the route named no view
+   * yet"; `shellView` resolves that to `DEFAULT_SHELL_VIEW`.
    */
-  private readonly shellViewOverride = signal<'transcript' | 'raw' | null>(null);
-  protected readonly shellView = computed<'transcript' | 'raw'>(
-    () => this.shellViewOverride() ?? (this.isCompactWorkspace() ? 'transcript' : 'raw'),
+  private readonly routeShellView = signal<ShellView | null>(null);
+  protected readonly shellView = computed<ShellView>(
+    () => this.routeShellView() ?? DEFAULT_SHELL_VIEW,
   );
 
-  protected setShellView(view: 'transcript' | 'raw'): void {
-    this.shellViewOverride.set(view);
+  /**
+   * The toggle NAVIGATES instead of mutating local state, so the address bar always describes what
+   * is on screen. `replaceUrl` because flipping a view is a preference, not a step in a journey —
+   * without it, five taps leave five history entries between the user and wherever they came from.
+   *
+   * The session id comes from the ROUTE, not from `currentSession()`: the toggle only renders inside
+   * `@if (plainShellMode())`, which is the matcher route, which always carries the segment — so it is
+   * there from first paint, before any session has resolved. Which URL each view maps to lives in
+   * `shellViewTogglePath` (pure, specced) — notably the default view goes back to the BARE
+   * `/shells/:id` instead of minting `/shells/:id/transcript` over the short shareable form.
+   */
+  protected setShellView(view: ShellView): void {
+    const sessionId = this.route.snapshot.paramMap.get('sessionId');
+    if (!sessionId) return;
+    void this.router.navigate([shellViewTogglePath(sessionId, view)], {
+      queryParams: this.route.snapshot.queryParams,
+      replaceUrl: true,
+    });
   }
 
   /**
@@ -1296,8 +1328,25 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // tab reads the same. Name the actual session ("Shell · kord") so tabs, history and the
     // window switcher are distinguishable. Scoped to the plain-shell surface; every other route
     // keeps the title its route declares.
+    //
+    // `routeShellView()` is read purely as a DEPENDENCY, not for the title text. `AppTitleStrategy`
+    // re-applies the route's static `title` on every successful navigation, and the Transcript/Raw
+    // toggle is now a navigation — so without this line one tap reset the tab to "Shell" for the
+    // rest of the visit (and all open shells back to the same indistinguishable title) because
+    // neither `plainShellMode()` nor the session name had changed and the effect never re-ran.
+    // Effects flush in the change detection that follows the navigation (`activateRoutes` is upstream
+    // of the `tap` that calls `updateTitle`), so this always lands last.
+    //
+    // Deliberately the ROUTE signal, not the resolved `shellView()`: a computed only notifies when
+    // its VALUE changes, and there are navigations that clobber the title while leaving the resolved
+    // view equal. Tapping Transcript on `/shells/x/transcript` navigates to the bare `/shells/x`
+    // (see `shellViewTogglePath`), which moves `routeShellView` from `'transcript'` to `null` while
+    // `shellView` computes `'transcript'` either way — so a `shellView()` dependency would not fire
+    // and the tab would stay stuck at "Shell". The one case still uncovered is the `/Raw` -> `/raw`
+    // heal (`'raw'` -> `'raw'`); a navigation counter is not worth adding for a one-step URL fix.
     effect(() => {
       if (!this.plainShellMode()) return;
+      this.routeShellView();
       const name = this.currentSession()?.title?.trim();
       this.browserTitle.setTitle(name ? `Shell · ${name}` : 'Shell');
     });
@@ -1419,6 +1468,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // though the URL carries no `surface` query.
     const routeSurface = (this.route.snapshot.data['surface'] as string | undefined) ?? null;
     this.surfaceParam.set(routeSurface ?? this.route.snapshot.queryParamMap.get('surface'));
+    // Same reason, same place: resolve the shell view synchronously from the route so the first
+    // paint already shows the right pane. Going through the `paramMap` subscription alone would
+    // render the default once and then swap, flashing the wrong view on every `/shells/:id/raw` open.
+    // Case-folded here too, so a link-rewritten `/raw` -> `/Raw` paints raw immediately rather than
+    // flashing the transcript until the subscription's canonicalising redirect lands.
+    const routeView = this.route.snapshot.paramMap.get('view')?.toLowerCase();
+    this.routeShellView.set(isShellView(routeView) ? routeView : null);
     // Deep-link: select the linked initiative + tab from the URL BEFORE the list loads, so
     // `loadInitiatives` (which otherwise defaults to the first initiative) honors the link.
     const linkedInitiative = this.route.snapshot.queryParamMap.get('initiativeId');
@@ -1435,7 +1491,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.route.snapshot.paramMap.get('sessionId') ??
       this.route.snapshot.queryParamMap.get('sessionId') ??
       undefined;
-    void this.loadSessions(initialSessionId);
+    this.pendingSessionId = initialSessionId ?? null;
+    void this.loadSessions(initialSessionId).finally(() => {
+      if (this.pendingSessionId === initialSessionId) this.pendingSessionId = null;
+    });
     // Skip the initiative master-list entirely in plain-shell mode — a shell has no initiative chrome.
     if (!this.plainShellMode()) {
       void this.loadInitiatives();
@@ -1453,12 +1512,62 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // from one `/shells/:id` to another). Mirrors the `?sessionId` handling below.
     if (!this.paramSub) {
       this.paramSub = this.route.paramMap.subscribe((map) => {
+        // Every decision here lives in `resolveShellRoute` (pure, specced): which view the URL means,
+        // whether the URL needs canonicalising, and whether the session it names has to be fetched.
+        // Both halves are ordering traps — the view must be applied even when the session is
+        // unchanged (a view toggle IS an unchanged session, so an early return on that would make the
+        // toggle a no-op), and the fetch guard must consider the load already in flight, not just the
+        // resolved session.
         const sid = map.get('sessionId');
-        if (!sid || sid === this.currentSession()?.id) return;
-        if (this.sessions().some((s) => s.id === sid)) {
-          void this.selectSession(sid);
-        } else {
-          void this.loadSessions(sid);
+        const rawView = map.get('view');
+        const resolved = resolveShellRoute(
+          { sessionId: sid, view: rawView },
+          {
+            currentSessionId: this.currentSession()?.id,
+            pendingSessionId: this.pendingSessionId,
+            knownSessionIds: this.sessions().map((s) => s.id),
+          },
+        );
+        // `null` (not the resolved default) when the URL names no view, so the signal keeps meaning
+        // "the route asked for nothing" and `shellView` stays the single place the default is applied.
+        this.routeShellView.set(rawView === null ? null : resolved.view);
+        if (resolved.session === 'select') {
+          this.pendingSessionId = null;
+          void this.selectSession(sid!);
+        } else if (resolved.session === 'load') {
+          this.pendingSessionId = sid!;
+          // Cleared once the fetch settles (either way), so the guard only ever suppresses a load
+          // that is genuinely still in flight rather than permanently blacklisting the id.
+          void this.loadSessions(sid!).finally(() => {
+            if (this.pendingSessionId === sid) this.pendingSessionId = null;
+          });
+        }
+        // A `/Raw` from an autocapitalising keyboard, or a third segment that is not a view at all,
+        // renders correctly and then rewrites the address bar in place — the operator keeps the shell
+        // instead of being bounced to the initiatives console by the `**` wildcard.
+        //
+        // This is REENTRANT, and not in the gentle way: on a first load the navigation that created
+        // this component is still inside its own `activateRoutes` when `paramMap` emits synchronously
+        // here, and the router drives transitions through `switchMap` (router-*.mjs `setupNavigations`
+        // — "so we cancel executing navigations when a new one comes in"), NOT `concatMap`. So this
+        // call does not queue behind the outer navigation: `switchMap` unsubscribes the outer chain
+        // and runs the inner one to completion synchronously (same component, nothing lazy left to
+        // load) — its own activation, `NavigationEnd` and `updateTitle` — before control unwinds back
+        // into the outer `take(1)`/`tap`. The two interleave, with the nested navigation finalising
+        // first. That is fine here, and the reasons are worth stating because they are what keeps it
+        // fine: it cannot loop (the healed URL resolves with `redirectTo === null`, so one step
+        // terminates), `route.snapshot` is already advanced when the subjects emit so the preserved
+        // query params are the current ones, and nothing in `web/src/app` subscribes to router events,
+        // so the cancelled outer navigation is invisible. It also cannot double-load an unresolved
+        // session: `resolveShellRoute` returns `session: 'load'` AND `redirectTo` in the SAME pass for
+        // `/shells/<unknown-id>/Raw`, `pendingSessionId` is set below before this redirect fires, and
+        // the redirect's own emission then resolves to `session: 'none'` against that pending id —
+        // which is by design, not luck. Change either half and re-check that pairing.
+        if (resolved.redirectTo) {
+          void this.router.navigate([resolved.redirectTo], {
+            queryParams: this.route.snapshot.queryParams,
+            replaceUrl: true,
+          });
         }
       });
     }
