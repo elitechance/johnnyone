@@ -1232,7 +1232,17 @@ ion-modal.workspace-picker .picker-empty {
     font-size: 10.5px;
     line-height: 1.45;
     overflow-x: auto;
-    max-height: 210px;
+    /* Anchored to the BOTTOM: a terminal writes downwards, so the lines worth seeing are the
+       newest ones. A plain block overflows at the bottom and hid exactly those — the pane had
+       moved on to `Update installed` while the peek still ended at a file it had read. Flexing
+       to `flex-end` makes the box overflow upwards instead, which is also what the top fade
+       below has always claimed is happening. */
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    /* Tall enough for the whole PANE_TAIL_LINES window (20 lines at 1.45 × 10.5px, plus the
+       padding), so in the normal case nothing is cut at all. */
+    max-height: 320px;
     overflow-y: hidden;
     /* Fade the top so it reads as "a window onto something longer", not a truncated block. */
     mask-image: linear-gradient(to bottom, transparent 0, #000 18px);
@@ -1252,6 +1262,8 @@ ion-modal.workspace-picker .picker-empty {
   }
   .st-peek.st-peek-seed {
     max-height: none;
+    /* Unbounded, so there is nothing to anchor against; plain flow keeps the first line first. */
+    display: block;
     mask-image: none;
     -webkit-mask-image: none;
   }
@@ -1261,6 +1273,9 @@ ion-modal.workspace-picker .picker-empty {
   .st-peek-l {
     white-space: pre;
     min-height: 1.45em;
+    /* As a flex item a line would otherwise SHRINK to make the overflow fit, squashing twenty
+       lines into the box instead of pushing the oldest out of it. */
+    flex: 0 0 auto;
   }
   .st-stale {
     font-size: 12.5px;
@@ -1398,6 +1413,13 @@ ion-modal.workspace-picker .picker-empty {
     padding: 10px 12px;
     font: inherit;
     font-size: 14px; // >=16px avoids iOS zoom-on-focus; 14 + the meta viewport is fine here
+
+    // Now a <textarea> (an <input> cannot hold a newline). Keep it looking like the single-line
+    // field it replaced: no drag handle, no baseline gap, and it grows by JS up to a cap.
+    resize: none;
+    overflow-y: auto;
+    display: block;
+    line-height: 1.45;
 
     &::placeholder { color: var(--jo-fg-faint); }
     &:focus { outline: 2px solid var(--jo-accent); outline-offset: -1px; }

@@ -11,6 +11,7 @@
 // `models/ai-session.model` shape.
 import type { CreateAiSessionInput } from '../../../../../ui/src/services/johnny-api.service';
 import type { AiSession } from '../../../../../ui/src/models/ai-session.model';
+import { shellRoutePath } from '../../pages/shells/shells-route';
 
 /** The four §06 launcher rows. Order is the mock's order and is asserted by the spec. */
 export type LauncherKind = 'initiative' | 'shell' | 'attach' | 'files';
@@ -79,11 +80,16 @@ export function terminalRoute(sessionId: string): { path: string; queryParams: {
  * `surface=shell` query param. `queryParams` stays empty (the session id is a path segment) so the
  * `router.navigate([route.path], { queryParams })` call shape at both callers is unchanged.
  * `terminalRoute` is left unchanged for any non-shell caller.
+ *
+ * The path comes from `shellRoutePath`, the single builder for `/shells/...` URLs: the bare form now
+ * also MEANS the transcript view (`/shells/:id/raw` is the other), and a second hard-coded copy of it
+ * here is exactly how the two would drift. `shells-route.ts` imports only router TYPES, so this file
+ * stays Angular-free and loadable under the plugin-less web vitest.
  */
 export function plainTerminalRoute(
   sessionId: string,
 ): { path: string; queryParams: Record<string, never> } {
-  return { path: `/shells/${sessionId}`, queryParams: {} };
+  return { path: shellRoutePath(sessionId), queryParams: {} };
 }
 
 /**

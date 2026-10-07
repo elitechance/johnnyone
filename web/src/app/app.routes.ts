@@ -1,5 +1,6 @@
 import { Route } from '@angular/router';
 import { authGuard } from './services/auth.guard';
+import { matchShellRoute } from './pages/shells/shells-route';
 
 export const appRoutes: Route[] = [
   {
@@ -74,8 +75,21 @@ export const appRoutes: Route[] = [
   // initiative console at /terminal (a shell is not an initiative). `data.surface = 'shell'` makes the
   // terminal page render the plain surface (no lifecycle bar / tabs / validation) from first paint; the
   // session id is the `:sessionId` path segment. Must follow `shells` so `/shells` alone still lists.
+  //
+  // A MATCHER, not a `path`, because one config has to serve `/shells/:id`, `/shells/:id/transcript`
+  // and `/shells/:id/raw`: Angular recreates the routed component when the matched config changes, so
+  // sibling/child routes per view would rebuild the whole TerminalPage on every Transcript/Raw tap —
+  // fresh ngOnInit, fresh `sessions()`/`terminalScreens()`/transcript buffer, re-read pane layouts,
+  // full re-subscribe of the visual + stream lanes. (The xterm view is recreated either way: the
+  // template swaps `johnny-terminal-screen` out for the transcript block. It is the PAGE around it
+  // that the matcher preserves.) With one matcher the component is REUSED and only the `view` param
+  // moves, which `TerminalPage` watches via `paramMap`. `matchShellRoute` is imported statically on
+  // purpose — URL recognition runs before any lazy chunk loads, so a matcher cannot be lazy; the
+  // module is small and component-free, so it costs nothing in the initial bundle. It also matches an
+  // unknown third segment on purpose (the page canonicalises the URL instead of the `**` wildcard
+  // bouncing the operator to the initiatives console).
   {
-    path: 'shells/:sessionId',
+    matcher: matchShellRoute,
     title: 'Shell',
     canActivate: [authGuard],
     data: { surface: 'shell' },

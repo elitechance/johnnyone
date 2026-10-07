@@ -109,8 +109,10 @@
       @if (sh?.provider) {
         <span class="ps-dim">· {{ providerLabel(sh!.provider) }}</span>
       }
-      <!-- Transcript vs Raw. Transcript is the phone default (the mirrored pane is 172 cols wide
-           and hard-wraps below ~55); Raw is the real terminal, still one tap away. -->
+      <!-- Transcript vs Raw. Both are URLs (`/shells/:id/transcript|raw`), so each button is a
+           navigation, not a local flag — the view survives a reload and travels in a shared link.
+           Transcript is the bare-URL default (the mirrored pane is 172 cols wide and hard-wraps
+           below ~55); Raw is the real terminal, still one tap away. -->
       <div class="ps-views" role="group" aria-label="Shell view">
         <button type="button" class="ps-view" [class.on]="shellView() === 'transcript'"
                 [attr.aria-pressed]="shellView() === 'transcript'"
@@ -275,15 +277,22 @@
                own (paste) handler already stages the image — paste events bubble. Binding one here
                too ran both and staged every image TWICE. -->
           <form class="st-composer" (ngSubmit)="sendShellMessage()">
-            <input
+            <!-- A textarea, not an input: `input type="text"` cannot hold a newline at all.
+                 Enter sends on a real keyboard (Shift+Enter for a newline); on touch, where there
+                 is no Shift+Enter, Enter inserts the newline and Send submits — the same split
+                 WhatsApp and Slack mobile use. See `enterSends()`. -->
+            <textarea
               id="shell-transcript-input"
               name="shellDraft"
               class="st-input"
-              type="text"
+              rows="1"
               autocomplete="off"
+              [attr.enterkeyhint]="enterSends() ? 'send' : 'enter'"
               [placeholder]="shellAttachments().length > 0 ? 'Add a note (optional)…' : 'Reply to the agent…'"
               [(ngModel)]="shellDraft"
-            />
+              (keydown.enter)="onComposerEnter($event)"
+              (input)="autoGrowComposer($event)"
+            ></textarea>
             <button
               class="st-send"
               type="submit"

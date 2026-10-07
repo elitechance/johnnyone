@@ -205,7 +205,9 @@ GraphQL keeps working.
 attempt, the deny happened worker-side, not on the host. Split the two deny branches by whether a
 `get_session` RPC reached the host at all (the auth-context guard replies without one) — and note
 that the initiative console masks a dead stream with its `capturePrimaryScreen` poll, so check the
-plain shell surface (`/shells/:id`), which has no poll and fails visibly.
+plain shell surface's RAW view (`/shells/:id/raw`), which has no poll and fails visibly. The URL must
+carry `/raw`: bare `/shells/:id` now renders the transcript, which is fed by the *stream* lane, so a
+populated transcript says nothing about whether visual streaming is alive.
 
 ## TWO GraphQL surfaces — the console picks one, with no fallback
 

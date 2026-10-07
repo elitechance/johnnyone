@@ -231,6 +231,48 @@ pub async fn send_terminal_input(
     Ok(())
 }
 
+/// Send named keys (Escape, Down, C-c …) to a session's pane.
+///
+/// Separate from `send_terminal_input` because these are KEYS, not text: they go to `send-keys`
+/// WITHOUT `-l`, so tmux resolves each name against the pane's current mode. That is the whole point
+/// — an arrow is `ESC [ A` in normal mode and `ESC O A` in application cursor mode, and the agent
+/// CLIs run in the latter, so literal bytes would be wrong half the time.
+///
+/// The whole sequence goes in one `send-keys` call so a menu answer like Down Down Enter cannot be
+/// interleaved with anything else.
+pub async fn send_terminal_keys(
+    state: &AppState,
+    session_id: String,
+    keys: &[String],
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let terminal = ensure_terminal_session_for_input(state, &session_id).await?;
+
+    let mut args = vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        terminal.pane_id.clone(),
+        // Keys may look like options (a literal `-`), so stop option parsing first.
+        "--".to_string(),
+    ];
+    args.extend(keys.iter().cloned());
+    run_tmux(args).await?;
+
+    state
+        .terminal_last_input_at
+        .lock()
+        .await
+        .insert(session_id.clone(), Instant::now());
+    // Same reason as text input: wake the capture loop so the effect of the key shows up at the
+    // active cadence instead of after an idle sleep.
+    if has_terminal_visual_subscribers(state, &session_id).await {
+        start_capture_loop(state, None, terminal).await;
+    }
+    Ok(())
+}
+
 pub async fn resize_terminal(
     state: &AppState,
     session_id: String,

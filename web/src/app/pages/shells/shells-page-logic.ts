@@ -5,8 +5,9 @@
 //
 // `AiSession`/`TmuxSession` are imported type-only (erased at build) at the same relative depth the
 // shipped pure siblings use (`validation-config-logic.ts` — five `../`), so no Angular/runtime dependency
-// leaks in. `openIntent` REUSES Phase 01's `terminalRoute` — the `/terminal?sessionId=` nav shape is
-// defined once (D3), not re-derived here.
+// leaks in. `openIntent` ALIASES Phase 04's `plainTerminalRoute` (NOT `terminalRoute`, and NOT the
+// old `/terminal?sessionId=` shape): a shell opens on `/shells/:id`, built in one place, so the nav
+// shape is defined once (D3/D5) and never re-derived here.
 import type { AiSession } from '../../../../../ui/src/models/ai-session.model';
 import type { TmuxSession } from '../../../../../ui/src/services/johnny-api.service';
 import { plainTerminalRoute } from '../../components/launcher-menu/launcher-logic';
@@ -82,7 +83,10 @@ export function formatRelTime(iso: string, nowIso: string): string {
 
 /**
  * Route args to open a shell session on the terminal surface. Shells always open as a PLAIN terminal
- * (no initiative chrome), so this reuses Phase 4's `plainTerminalRoute` — the `/terminal?sessionId=`
- * shape plus `surface=shell`, defined once (D5). Fix for finding #3(b).
+ * (no initiative chrome), so this ALIASES Phase 4's `plainTerminalRoute` — the dedicated
+ * `/shells/:sessionId` destination (whose route supplies `data.surface = 'shell'`, so there is no
+ * `surface=shell` query and no `/terminal?sessionId=` anywhere in this path), defined once (D5).
+ * That bare URL also means the transcript view; `/shells/:id/raw` is the explicit alternative.
+ * Fix for finding #3(b).
  */
 export const openIntent = plainTerminalRoute;

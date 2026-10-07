@@ -28,7 +28,7 @@ already renders any session and accepts `?sessionId=` deep-links. P6 adds only t
    | Row | Icon | Action |
    |---|---|---|
    | **New initiative** — start at briefing | `create-outline` | navigate `/briefing/new` (P4) |
-   | **Raw shell** — $SHELL · run commands yourself | `terminal-outline` | `createSession({provider:'shell'})` → open `/terminal?sessionId=` |
+   | **Raw shell** — $SHELL · run commands yourself | `terminal-outline` | `createSession({provider:'shell'})` → open `/shells/:sessionId` |
    | **Attach to tmux session** — pick an existing pane | `git-network-outline` | `listTmuxSessions()` radio picker → `createSession({tmuxSessionName})` → open |
    | **Open file manager** — browse the host FS | `folder-outline` | navigate `/files` (P5) |
 
