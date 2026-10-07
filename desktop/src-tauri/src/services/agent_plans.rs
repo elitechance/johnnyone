@@ -3660,6 +3660,29 @@ pub async fn record_agent_report(
         "update" => None,
         other => return Err(format!("unknown report kind: {}", other)),
     };
+    // Read the `evidence` markdown attachment ONCE, here, rather than at each of the two uses
+    // below (the live stream event and the persisted row) — two calls would have read the file
+    // twice and, worse, recorded the refusal note twice for a single bad path.
+    let attachment = read_report_markdown(state, evidence.as_deref().unwrap_or_default());
+    if matches!(attachment, ReportMarkdown::Refused) {
+        // Non-fatal, but NOT silent. `record_session_note`'s own docstring is the argument: "the
+        // console renders only what is persisted here, so a key send that writes nothing is
+        // invisible." The failure mode this covers is not the attacker — who learns nothing from
+        // an error either way — but a legitimate agent writing its report into a new directory:
+        // without this row, a user reading the transcript on their phone cannot tell "no
+        // attachment was sent" from "the attachment was refused". `"blocked"` is the kind the
+        // console renders as an error row (web terminal.page.ts maps it so), matching the sibling
+        // use in `agent/mod.rs` for a key send that could not be delivered.
+        record_session_note(
+            state,
+            &session_id,
+            "blocked",
+            "evidence attachment refused: path outside the allowed roots",
+            None,
+        );
+    }
+    let markdown = attachment.into_body();
+
     // Human-facing lane (D6): `update` is progress narration and `blocked` needs attention —
     // both are things a watcher wants live, so mirror them onto the structured stream BEFORE the
     // slot insert moves `summary`. The other kinds (`ready`/`verdict`/`done`) are coordinator
@@ -3693,7 +3716,7 @@ pub async fn record_agent_report(
         // markdown file (mermaid fences included) and passes its path as `evidence`; the host
         // reads it here and emits it as a second event the console renders properly. Files are
         // the one channel with no quoting or length limit that agents already use constantly.
-        if let Some(md) = evidence.as_deref().and_then(read_report_markdown) {
+        if let Some(md) = markdown.clone() {
             let _ = state.stream_event_tx.send(StreamEvent {
                 session_id: session_id.clone(),
                 seq: next_report_stream_seq(),
@@ -3710,7 +3733,6 @@ pub async fn record_agent_report(
     // Persist it. The in-memory slot below keeps only the LAST report per session, which is all
     // the coordinator needs, but the console needs history — without this a page reload showed an
     // empty transcript for a session that had been reporting all day.
-    let markdown = evidence.as_deref().and_then(read_report_markdown);
     let report_row = (
         Uuid::new_v4().to_string(),
         session_id.clone(),
@@ -3845,22 +3867,110 @@ fn pane_awaiting_trust(content: &str) -> bool {
 
 /// Read a report's markdown attachment, if `evidence` names one.
 ///
-/// Deliberately strict and always size-capped: any workspace file read must be bounded (a prior
-/// incident had an unbounded walk read a 46GB model directory into memory). A miss of any kind —
-/// not a path, wrong extension, missing, too big, not UTF-8 — returns `None` and the textual
-/// summary still went out on its own event, so a bad path degrades rather than failing the report.
+/// Deliberately strict, always CONFINED to [`settings_service::report_markdown_roots`], and always
+/// size-capped: any workspace file read must be bounded (a prior incident had an unbounded walk
+/// read a 46GB model directory into memory). A miss of any kind — not a path, wrong extension,
+/// outside every allowed root, missing, too big, not UTF-8 — returns `None` and the textual summary
+/// still went out on its own event, so a bad path degrades rather than failing the report.
+///
+/// The confinement is the security boundary; see the comment at the guard below for the
+/// exfiltration it prevents. `read_report_markdown_within` takes the roots explicitly so the guard
+/// is testable without an `AppState`.
 const MAX_REPORT_MARKDOWN_BYTES: u64 = 256 * 1024;
 
-fn read_report_markdown(evidence: &str) -> Option<String> {
-    let path = Path::new(evidence.trim());
+/// The outcome of reading an `evidence` attachment.
+///
+/// `Refused` is split out from `Absent` on purpose: the caller has to tell "there was nothing to
+/// attach" from "there was something and the guard said no", because only the second is worth
+/// telling the user about. Collapsing these back into an `Option` is what makes a refusal silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReportMarkdown {
+    /// Read, in-root, non-empty.
+    Body(String),
+    /// Nothing to attach: no path given, not absolute, wrong extension, missing, not a regular
+    /// file, over the size cap, not UTF-8, or blank.
+    Absent,
+    /// An absolute `.md` path that resolved outside every allowed root. A security refusal.
+    Refused,
+}
+
+impl ReportMarkdown {
+    fn into_body(self) -> Option<String> {
+        match self {
+            ReportMarkdown::Body(body) => Some(body),
+            ReportMarkdown::Absent | ReportMarkdown::Refused => None,
+        }
+    }
+}
+
+fn read_report_markdown(state: &AppState, evidence: &str) -> ReportMarkdown {
+    read_report_markdown_within(&settings_service::report_markdown_roots(state), evidence)
+}
+
+fn read_report_markdown_within(roots: &[PathBuf], evidence: &str) -> ReportMarkdown {
+    let trimmed = evidence.trim();
+    let path = Path::new(trimmed);
     if !path.is_absolute() {
-        return None;
+        return ReportMarkdown::Absent;
     }
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    // Extension before confinement: a caller that named no attachment at all (or a `.txt`) is the
+    // ordinary case, not a refusal, and must not raise a security note in the user's transcript.
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    else {
+        return ReportMarkdown::Absent;
+    };
     if !matches!(ext.as_str(), "md" | "markdown") {
-        return None;
+        return ReportMarkdown::Absent;
     }
-    let meta = fs::metadata(path).ok()?;
+    // Directory confinement. Without it this reader had none at all: `reportAgentResult` is
+    // reachable unauthenticated on 127.0.0.1:7788 by design, so ANY local process could pass
+    // `~/.claude/**/MEMORY.md`, a repo's `CLAUDE.md` or private notes as `evidence` and the host
+    // would read the file and persist it into `session_reports.markdown` — which the already
+    // shipped `listSessionReports` serves back through the Cloudflare worker on only
+    // `sessions:read`. That turned a local unauthenticated port into remote file exfiltration.
+    //
+    // `resolve_within_root` is the crate's single containment guard and the reason this is not a
+    // string prefix test: it rejects any `..` component outright and canonicalizes the path
+    // before comparing, so a symlink sitting INSIDE a root but pointing out of it (say
+    // `.johnnyone/reports/innocent.md -> ~/.claude/.../MEMORY.md`, which a raw `starts_with`
+    // would have waved through) resolves to its real target first and is refused.
+    let path = match roots
+        .iter()
+        .find_map(|root| settings_service::resolve_within_root(root, trimmed).ok())
+    {
+        Some(resolved) => resolved,
+        None => {
+            // Refused, but non-fatal — deliberately, matching the persist failure below ("never
+            // fail the report over its own audit trail"). The report itself is a coordinator
+            // control signal: `update`/`blocked` drive the console and the shell nudge watcher,
+            // so hard-failing the mutation over a mis-pathed attachment would stall a healthy run
+            // on a cosmetic mistake, while an attacker learns nothing from an error code either
+            // way. So the markdown is dropped and the textual summary still goes out — but the
+            // refusal is logged loudly with the path, so a legitimate caller using a new
+            // directory sees why its markdown vanished instead of debugging silence.
+            tracing::warn!(
+                path = %path.display(),
+                roots = ?roots,
+                "report markdown is outside every allowed root; omitting it from the report"
+            );
+            return ReportMarkdown::Refused;
+        }
+    };
+    // Everything below acts on the CANONICAL path, never the caller's string — re-resolving it
+    // would reopen the symlink hole the guard just closed.
+    let path = path.as_path();
+    let Ok(meta) = fs::metadata(path) else {
+        return ReportMarkdown::Absent;
+    };
+    // `!meta.is_file()` MUST stay ahead of the read, and is not a tidiness check. A fifo named
+    // `*.md` inside an allowed root (`mkfifo ~/Documents/Workspace/.johnnyone/reports/x.md`) has
+    // no writer, so `fs::read_to_string` on it blocks forever — and this runs inline in
+    // `record_agent_report`, so that one line would hang a live run's report path indefinitely:
+    // a local denial of service with no error and no timeout. Size-capping cannot save us either,
+    // because a fifo reports `len() == 0`. Reject anything that is not a regular file, first.
     if !meta.is_file() || meta.len() > MAX_REPORT_MARKDOWN_BYTES {
         if meta.len() > MAX_REPORT_MARKDOWN_BYTES {
             tracing::warn!(
@@ -3869,13 +3979,15 @@ fn read_report_markdown(evidence: &str) -> Option<String> {
                 "report markdown exceeds cap; ignoring"
             );
         }
-        return None;
+        return ReportMarkdown::Absent;
     }
-    let body = fs::read_to_string(path).ok()?;
+    let Ok(body) = fs::read_to_string(path) else {
+        return ReportMarkdown::Absent;
+    };
     if body.trim().is_empty() {
-        return None;
+        return ReportMarkdown::Absent;
     }
-    Some(body)
+    ReportMarkdown::Body(body)
 }
 
 
@@ -14037,29 +14149,34 @@ mod replan_tests {
             .await
             .unwrap();
         let mut current = get_plan(&state, &run.plan.id).unwrap();
-        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
-        current = get_plan(&state, &run.plan.id).unwrap();
-        assert_eq!(current.plan.status, "phase_replan_running");
-        let a1 = task_replan::load_amendment(&task_replan::amendment_json_path(
-            &replan_runs_dir(&state, &current, "00-x"),
-        ))
-        .unwrap();
-        assert_eq!(a1.round, 2);
-        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
-        current = get_plan(&state, &run.plan.id).unwrap();
-        assert_eq!(current.plan.status, "phase_replan_running");
-        let a2 = task_replan::load_amendment(&task_replan::amendment_json_path(
-            &replan_runs_dir(&state, &current, "00-x"),
-        ))
-        .unwrap();
-        assert_eq!(a2.round, 3);
+        // Driven off MAX_REPLAN_ROUNDS, never a literal. This test asserted a cap of 3 while the
+        // constant had been raised to 8, so it failed for years as a "known baseline" — which
+        // meant the replan cap had NO passing coverage at all, and a cap that never parked (the
+        // runaway this loop exists to stop) would have produced exactly the same red.
+        for round in 2..=MAX_REPLAN_ROUNDS {
+            run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
+            current = get_plan(&state, &run.plan.id).unwrap();
+            assert_eq!(
+                current.plan.status, "phase_replan_running",
+                "round {round} is still under the cap and must keep replanning"
+            );
+            let amendment = task_replan::load_amendment(&task_replan::amendment_json_path(
+                &replan_runs_dir(&state, &current, "00-x"),
+            ))
+            .unwrap();
+            assert_eq!(amendment.round, round, "persisted round must track the loop");
+        }
+        // The round after the last allowed one must park rather than spawn again.
         run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
         let after = get_plan(&state, &run.plan.id).unwrap();
         assert_eq!(after.plan.status, "needs_attention");
         let spawned = log.lock().unwrap().clone();
-        assert_eq!(spawned, vec![1, 2, 3]);
-        assert!(!spawned.contains(&4));
-        assert_eq!(MAX_REPLAN_ROUNDS, 3);
+        assert_eq!(
+            spawned,
+            (1..=MAX_REPLAN_ROUNDS).collect::<Vec<_>>(),
+            "exactly MAX_REPLAN_ROUNDS planner spawns, no more"
+        );
+        assert!(!spawned.contains(&(MAX_REPLAN_ROUNDS + 1)));
         let last_fail = after
             .events
             .iter()
@@ -14292,33 +14409,32 @@ mod replan_tests {
         .unwrap();
         assert_eq!(a1.round, 1);
 
-        seed_partial_run(&state, &current);
-        follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
-            .await
+        // Each re-route costs a round, counted off MAX_REPLAN_ROUNDS rather than a literal 3 (the
+        // constant was raised 3 → 8 and this assertion was never updated, leaving the cap
+        // uncovered — see the sibling cap test).
+        for round in 2..=MAX_REPLAN_ROUNDS {
+            seed_partial_run(&state, &current);
+            follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
+                .await
+                .unwrap();
+            current = get_plan(&state, &run.plan.id).unwrap();
+            assert_eq!(
+                current.plan.status, "phase_replan_running",
+                "re-route {round} is under the cap"
+            );
+            let amendment = task_replan::load_amendment(&task_replan::amendment_json_path(
+                &replan_runs_dir(&state, &current, "00-x"),
+            ))
             .unwrap();
-        current = get_plan(&state, &run.plan.id).unwrap();
-        assert_eq!(current.plan.status, "phase_replan_running");
-        let a2 = task_replan::load_amendment(&task_replan::amendment_json_path(
-            &replan_runs_dir(&state, &current, "00-x"),
-        ))
-        .unwrap();
-        assert_eq!(a2.round, 2, "re-route must increment the persisted round");
+            assert_eq!(
+                amendment.round, round,
+                "re-route must increment the persisted round"
+            );
+            run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
+            current = get_plan(&state, &run.plan.id).unwrap();
+        }
 
-        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
-        current = get_plan(&state, &run.plan.id).unwrap();
-        seed_partial_run(&state, &current);
-        follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
-            .await
-            .unwrap();
-        current = get_plan(&state, &run.plan.id).unwrap();
-        let a3 = task_replan::load_amendment(&task_replan::amendment_json_path(
-            &replan_runs_dir(&state, &current, "00-x"),
-        ))
-        .unwrap();
-        assert_eq!(a3.round, 3);
-
-        run_phase_replan_arm(&state, &current, &ctrl).await.unwrap();
-        current = get_plan(&state, &run.plan.id).unwrap();
+        // One re-route past the cap: park instead of spawning planner MAX_REPLAN_ROUNDS + 1.
         seed_partial_run(&state, &current);
         follow_kloo_outcome_with(&state, &current, phase, partial_planner(), &ctrl)
             .await
@@ -14326,8 +14442,12 @@ mod replan_tests {
         let after = get_plan(&state, &run.plan.id).unwrap();
         assert_eq!(after.plan.status, "needs_attention");
         let spawned = log.lock().unwrap().clone();
-        assert_eq!(spawned, vec![1, 2, 3]);
-        assert!(!spawned.contains(&4));
+        assert_eq!(
+            spawned,
+            (1..=MAX_REPLAN_ROUNDS).collect::<Vec<_>>(),
+            "exactly MAX_REPLAN_ROUNDS planner spawns, no more"
+        );
+        assert!(!spawned.contains(&(MAX_REPLAN_ROUNDS + 1)));
         let pf = crate::services::plan_check::load_plan_check(
             &replan_runs_dir(&state, &after, "00-x").join("preflight.json"),
         )
@@ -14954,7 +15074,33 @@ mod replan_tests {
 
 #[cfg(test)]
 mod prompt_delivery_tests {
-    use super::{pane_awaiting_trust, prompt_probe, read_report_markdown};
+    use super::{pane_awaiting_trust, prompt_probe, read_report_markdown_within, ReportMarkdown};
+    use std::path::PathBuf;
+
+    /// A fresh, real temp dir so `canonicalize` succeeds on the containment prefix. Mirrors
+    /// `settings::tests::guard_tmp_root` (pid + counter, since `rand`/`Date` are unavailable).
+    fn tmp_root(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "j1-report-md-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The pre-fix roots: the whole OS temp dir, which is what the shipped callers really use.
+    fn temp_roots() -> Vec<PathBuf> {
+        vec![std::env::temp_dir()]
+    }
+
+    /// Just the body, for the cases that only care whether anything was attached.
+    fn body(roots: &[PathBuf], evidence: &str) -> Option<String> {
+        read_report_markdown_within(roots, evidence).into_body()
+    }
 
     #[test]
     fn probe_is_a_short_distinctive_slice_of_the_first_real_line() {
@@ -15006,23 +15152,153 @@ mod prompt_delivery_tests {
 
     #[test]
     fn report_markdown_is_rejected_unless_it_is_a_real_absolute_md_file() {
-        assert_eq!(read_report_markdown("report.md"), None, "relative path");
-        assert_eq!(read_report_markdown("/tmp/report.txt"), None, "wrong extension");
-        assert_eq!(read_report_markdown("/tmp/nope-does-not-exist.md"), None, "missing");
-        assert_eq!(read_report_markdown(""), None);
+        let roots = temp_roots();
+        assert_eq!(body(&roots, "report.md"), None, "relative path");
+        assert_eq!(
+            body(&roots, "/tmp/report.txt"),
+            None,
+            "wrong extension"
+        );
+        assert_eq!(
+            body(&roots, "/tmp/nope-does-not-exist.md"),
+            None,
+            "missing"
+        );
+        assert_eq!(body(&roots, ""), None);
     }
 
     #[test]
     fn report_markdown_reads_a_real_file_and_skips_an_empty_one() {
+        let roots = temp_roots();
         let dir = std::env::temp_dir();
         let good = dir.join("j1-report-test-good.md");
         std::fs::write(&good, "# Title\n\n```mermaid\nflowchart LR\nA-->B\n```\n").unwrap();
-        let body = read_report_markdown(good.to_str().unwrap()).expect("should read");
-        assert!(body.contains("```mermaid"));
+        let text = body(&roots, good.to_str().unwrap()).expect("should read");
+        assert!(text.contains("```mermaid"));
         let empty = dir.join("j1-report-test-empty.md");
         std::fs::write(&empty, "   \n\n").unwrap();
-        assert_eq!(read_report_markdown(empty.to_str().unwrap()), None, "blank file");
+        assert_eq!(
+            body(&roots, empty.to_str().unwrap()),
+            None,
+            "blank file"
+        );
         let _ = std::fs::remove_file(good);
         let _ = std::fs::remove_file(empty);
+    }
+
+    // ── Confinement (the security fix) ───────────────────────────────────────────────────────
+    // `read_report_markdown` had NO directory confinement, so an unauthenticated caller on
+    // 127.0.0.1:7788 could name any `.md` on the box as `evidence` and have the host read it and
+    // persist it into `session_reports.markdown`, readable remotely via `listSessionReports`.
+
+    #[test]
+    fn report_markdown_reads_a_file_inside_an_allowed_root() {
+        let root = tmp_root("inside");
+        let file = root.join("reply.md");
+        std::fs::write(&file, "# inside the root\n").unwrap();
+        let text = body(&[root.clone()], file.to_str().unwrap())
+            .expect("a path inside an allowed root must still be read");
+        assert!(text.contains("inside the root"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn report_markdown_refuses_a_path_outside_every_allowed_root() {
+        // The concrete leak: `~/.claude/**/MEMORY.md` is a real, readable `.md` outside any root.
+        let root = tmp_root("outside-root");
+        let elsewhere = tmp_root("outside-secret");
+        let secret = elsewhere.join("MEMORY.md");
+        std::fs::write(&secret, "# private notes\n").unwrap();
+        assert_eq!(
+            read_report_markdown_within(&[root.clone()], secret.to_str().unwrap()),
+            ReportMarkdown::Refused,
+            "a readable .md outside every root must be refused, not read"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn report_markdown_refuses_dotdot_traversal_out_of_the_root() {
+        let root = tmp_root("traversal");
+        let outside = root.parent().unwrap().join("j1-report-md-traversal-escape.md");
+        std::fs::write(&outside, "# escaped\n").unwrap();
+        // Spelled as an in-root path that climbs out; the prefix must be checked post-resolution.
+        let sneaky = root.join("..").join("j1-report-md-traversal-escape.md");
+        assert_eq!(
+            read_report_markdown_within(&[root.clone()], sneaky.to_str().unwrap()),
+            ReportMarkdown::Refused,
+            "'..' must not escape the allowed root"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_markdown_refuses_a_symlink_pointing_out_of_the_root() {
+        // A raw `starts_with` on the supplied path is defeated by this: the path IS under the
+        // root, only its target is not. Hence the canonicalising guard.
+        let root = tmp_root("symlink");
+        let elsewhere = tmp_root("symlink-secret");
+        let secret = elsewhere.join("MEMORY.md");
+        std::fs::write(&secret, "# private notes\n").unwrap();
+        let link = root.join("looks-innocent.md");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert_eq!(
+            read_report_markdown_within(&[root.clone()], link.to_str().unwrap()),
+            ReportMarkdown::Refused,
+            "a symlink inside the root whose target is outside it must be refused"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn report_markdown_searches_every_allowed_root_not_just_the_first() {
+        // Production passes TWO roots (files_root, /tmp) and the majority of real reports live
+        // under the SECOND. Every other test here passes one root, so without this a reorder or a
+        // dropped root would break 330-of-380 rows' worth of behaviour with a green suite.
+        let first = tmp_root("multi-first");
+        let second = tmp_root("multi-second");
+        let file = second.join("reply.md");
+        std::fs::write(&file, "# found in the second root\n").unwrap();
+        let roots = vec![first.clone(), second.clone()];
+        let text = body(&roots, file.to_str().unwrap())
+            .expect("a file under a later root must be found, not just the first");
+        assert!(text.contains("second root"));
+        // ...and a path under neither is still refused, so the search is a search, not a bypass.
+        let outside = tmp_root("multi-outside");
+        let secret = outside.join("MEMORY.md");
+        std::fs::write(&secret, "# private notes\n").unwrap();
+        assert_eq!(
+            read_report_markdown_within(&roots, secret.to_str().unwrap()),
+            ReportMarkdown::Refused,
+            "neither root contains it"
+        );
+        for d in [first, second, outside] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_markdown_does_not_block_on_a_fifo_in_an_allowed_root() {
+        // `!meta.is_file()` ahead of the read is load-bearing: a fifo named `*.md` with no writer
+        // makes `fs::read_to_string` block forever, inline in `record_agent_report`. If this test
+        // ever hangs rather than fails, that ordering has been "simplified" away.
+        let root = tmp_root("fifo");
+        let fifo = root.join("trap.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should be available");
+        assert!(status.success(), "mkfifo failed");
+        assert_eq!(
+            read_report_markdown_within(&[root.clone()], fifo.to_str().unwrap()),
+            ReportMarkdown::Absent,
+            "a fifo is in-root but is not a regular file, so it must be skipped unread"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
