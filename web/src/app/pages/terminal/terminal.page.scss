@@ -1220,7 +1220,8 @@ ion-modal.workspace-picker .picker-empty {
   .st-row.st-wait { border-bottom: 0; }
   /* Live tail of the pane while the agent works. Dimmed and monospace so it reads as a window
      onto the terminal, clearly not part of the committed transcript — and it disappears when
-     the reported answer arrives. Scrolls sideways on its own rather than widening the log. */
+     the reported answer arrives. Scrolls sideways on its own rather than widening the log — except
+     on the narrow console, where it soft-wraps instead (see the container query below .st-peek-l). */
   .st-peek {
     margin: 6px 0 0;
     padding: 8px 10px;
@@ -1240,8 +1241,15 @@ ion-modal.workspace-picker .picker-empty {
     display: flex;
     flex-direction: column;
     justify-content: flex-end;
-    /* Tall enough for the whole PANE_TAIL_LINES window (20 lines at 1.45 × 10.5px, plus the
-       padding), so in the normal case nothing is cut at all. */
+    /* ON THE WIDE SURFACE ONLY: tall enough for the whole PANE_TAIL_LINES window. 20 rows at
+       1.45 × 10.5px = 304.5px, plus 18px of padding + border (this is border-box, from Ionic's
+       `* { box-sizing: border-box }`) = 322.5px for an exact fit, so 320px is 0.8 of a row short
+       and the top fade covers the difference.
+       That "20 lines fit" holds ONLY at one row per line, i.e. where `.st-peek-l` is still
+       `white-space: pre`. The narrow console wraps, where a full-width 172-column line takes 4
+       rows and this box would hold about 5 of the 20 — the container query below .st-peek-l
+       raises it there for exactly that reason, and derives all of those numbers. Do not read this
+       320px as a global "the whole window fits". */
     max-height: 320px;
     overflow-y: hidden;
     /* Fade the top so it reads as "a window onto something longer", not a truncated block. */
@@ -1261,8 +1269,13 @@ ion-modal.workspace-picker .picker-empty {
     margin-bottom: 6px;
   }
   .st-peek.st-peek-seed {
+    /* Unbounded on the WIDE surface: 20 unwrapped rows is ~305px, so there is nothing worth
+       capping. The narrow surface wraps and does cap this — see the container query below, which
+       also explains why the seed scrolls where the waiting peek clips. */
     max-height: none;
-    /* Unbounded, so there is nothing to anchor against; plain flow keeps the first line first. */
+    /* Nothing to anchor against here, and plain flow keeps the FIRST line first — which is the
+       whole point of the seed: nothing has been reported yet, so the beginning of the tail is
+       what matters, not the newest line. */
     display: block;
     mask-image: none;
     -webkit-mask-image: none;
@@ -1272,10 +1285,141 @@ ion-modal.workspace-picker .picker-empty {
      spans the ANSI renderer writes. */
   .st-peek-l {
     white-space: pre;
+    /* A floor of exactly one row, matching `line-height`. It is NOT here to give blank pane lines
+       a row — `paneTailHtml` drops empty lines outright (shell-activity.ts, `if (!plain) return
+       false`), so a blank line never reaches this element. Its only live job is to stop a line
+       whose content somehow measures shorter than a row from collapsing the row rhythm. Being a
+       floor is also why it does not clamp a WRAPPED line on the narrow surface below: used height
+       is max(content, min-height). */
     min-height: 1.45em;
     /* As a flex item a line would otherwise SHRINK to make the overflow fit, squashing twenty
        lines into the box instead of pushing the oldest out of it. */
     flex: 0 0 auto;
+  }
+
+  /* NARROW CONSOLE ONLY: soft-wrap the mirror instead of panning it sideways.
+     The mirrored pane is a tmux pane sized by whoever attached first — measured at 172 columns.
+     Measured width chain at a 390px phone: 390 − 12 (`.terminal-workspace` padding) − 28
+     (`.st-log` padding) − 29 (`.st-ic` 19 + `.st-row` gap 10) = 321 for `.st-bd`, − 22
+     (this box's padding 10×2 + border 1×2) = **299px of content**. `--jo-font-mono` is never
+     defined anywhere in web/src, so the face is always the platform `ui-monospace` fallback —
+     SF Mono on iOS, Roboto Mono on Android, both ~0.6em advance = 6.3px per cell at 10.5px. That
+     is **47 columns** on the first row and 45 on continuations (the 2ch gutter below eats two).
+     So a phone shows barely a quarter of a 172-column line, and reading the mirror meant dragging
+     the box left and right for every single line. Panning is still right on the desktop, where
+     172 columns FIT and the TUI's box drawing and aligned columns survive intact; it is only the
+     narrow surface where the trade flips and legibility beats alignment.
+
+     Driven by the console container query rather than `isCompactWorkspace()` (the 900px viewport
+     media query the component exposes as a signal) for two reasons: this is a layout rule, so it
+     belongs in the stylesheet and needs no change-detection round to take effect; and the thing
+     that actually decides whether 172 columns fit is the width of the box, which tracks the
+     console container's width — not the device's. It reuses the SAME ≤760px breakpoint as the §08
+     master/detail collapse above, so wrapping turns on exactly when the console becomes the
+     single-column phone layout, and also when a desktop window is dragged that narrow.
+
+     Scope worth knowing before changing anything here: `.shell-transcript` renders ONLY inside
+     `@if (plainShellMode())` and only when `shellView() === 'transcript'`, so nothing in this
+     block can affect the initiative console or the raw terminal view.
+
+     Both render sites wrap — the waiting-row peek and the `.st-peek-seed` variant both carry
+     `.st-peek` / `.st-peek-l` — but they are capped DIFFERENTLY; see the seed rule at the end. */
+  @container console (max-width: 760px) {
+    .st-peek {
+      /* `overflow-x: auto` on a box whose content can no longer exceed it is a dead affordance —
+         a scrollbar track (and, on touch, a horizontal drag) that does nothing. With
+         `overflow-wrap: anywhere` below there is no unbreakable token left to overflow, so hide
+         it. Kept as `hidden` rather than `visible` because `overflow-y` is already `hidden` and
+         the two axes cannot disagree about visibility. */
+      overflow-x: hidden;
+      /* Wrapping costs vertical room, so the 320px above — which really does hold the whole
+         PANE_TAIL_LINES window at one row each (20 × 15.225px + 18px chrome = 322.5px) — now
+         holds far less. At 47/45 columns a full-width 172-column line takes
+         1 + ceil((172 − 47) / 45) = **4 rows**, and 320px is 302px of content ÷ 15.225 = 19.8
+         rows, so about **5** full-width lines of the 20. Reading a quarter of the tail is not a
+         fix, so give the wrapping surface its own budget. The clip itself stays: `flex-end` above
+         keeps the surviving lines the NEWEST ones, which is the right end to keep here.
+
+         Everything below is border-box (`* { box-sizing: border-box }` from Ionic's
+         structure.css, imported in styles.scss), so `max-height` INCLUDES the 18px of vertical
+         padding + border — hence the "− 18" in every row count.
+
+         `dvh`, not `%`, and the reason is subtler than "no definite height":
+           - `.st-peek`'s containing block is NOT `.st-log`. At the waiting site the chain is
+             `.st-log` → `article.st-row` (flex row) → `div.st-bd` (`flex: 1; min-width: 0`) →
+             here; at the seed site it is `.st-log` → `div.st-seed` → here. `.st-peek` is not a
+             flex item at either site, so the base rule's `flex: 0 0 auto` on `.st-peek-l` is
+             about `.st-peek`'s own children, not about this box.
+           - `.st-log` itself DOES have a definite height (`flex: 1; min-height: 0` in the
+             `.shell-transcript` column, which is a `1fr` grid track), so "nothing in the chain is
+             definite" would be wrong. The blocker is one level down: `.st-bd` is a stretched item
+             of `.st-row`, whose height is content-derived, so per Flexbox §9.8 stretch yields no
+             definite height and `.st-bd` computes to `auto`. Per CSS2.1 §10.7 a percentage
+             `max-height` against a containing block whose height depends on content is treated as
+             `none` — and it would be circular anyway, since `.st-bd`'s height derives from this
+             box's. Viewport units sidestep all of it.
+           - Declared twice, `vh` then `dvh`: `dvh` excludes the collapsing mobile URL bar, plain
+             `vh` is the fallback if unsupported. `workspace.viewport-height` cannot be reused —
+             it is a parameterless `height: 100vh; height: 100dvh`.
+
+         Why clamp(180px, 45dvh, 520px):
+         - 45dvh middle. Note that `dvh` OVERSTATES this box's share of what the user can see:
+           `:host` is `position: fixed` with `bottom: calc(56px + safe-area-inset-bottom)` (top of
+           this file), so 56px of botnav plus the inset is already gone before this box sees any
+           viewport, and the topbar and composer take more — on a 390×844 phone the surface is
+           ~754px and `.st-log` only ~663px. So 45dvh = 380px is already ~57% of the scrollable
+           log, and the earlier 60dvh was ~76% of it, which buried the prose rows it sits among.
+           380px is 362px of content ÷ 15.225 = 23.8 rows ≈ **6 full-width lines (or ~8 at a more
+           typical 3-row average), up from 5 (~6.6)**. Modest on purpose: the binding constraint
+           was never this cap but the ~663px log, and twenty wrapped 172-column lines would need
+           80 rows ≈ **1236px**, which no phone can show. A better window, not a complete one.
+         - 180px floor. Only engages below a 400px viewport, i.e. split screen — a phone in
+           landscape makes the console wider than 760px, so this query does not even fire there.
+           It is sized to FIT that case (at a ~367px viewport the log is only ~200px) and to stop
+           the box degenerating to a few rows, where the 18px top fade alone is 1.2 rows and 10%
+           of the box. It does not exist to protect the composer: `.st-composer` is `flex: 0 0
+           auto` beside `.st-log`'s `flex: 1; min-height: 0`, so the log absorbs all shortfall and
+           no value here can displace the composer.
+         - 520px ceiling. This query is on the CONSOLE's width, not the device, so a desktop
+           window dragged under 760px also wraps. It engages only above a ~1156px viewport — a
+           portrait/rotated monitor or a tall narrow window — where 45dvh would otherwise be 650px
+           of mirror in a window that still has a full transcript to show. */
+      max-height: clamp(180px, 45vh, 520px);
+      max-height: clamp(180px, 45dvh, 520px);
+    }
+    .st-peek-l {
+      /* `pre-wrap`, not `pre`: still preserves the TUI's runs of leading/inner spaces (losing
+         those would collapse the indentation the pane uses for structure) but now allows a break.
+         `anywhere` — NOT `break-all` — so a break lands at a space when there is one and only
+         chops mid-token for something genuinely longer than the line, e.g. a 120-char path or a
+         progress bar. `break-all` would have hacked ordinary words in half as well. */
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      /* Hanging indent, so a wrapped fragment reads as a CONTINUATION and not as a fresh line of
+         pane output — without it a wrapped 172-column line is indistinguishable from four
+         separate terminal lines. `padding-left` reserves the gutter for every row; the matching
+         negative `text-indent` pulls the FIRST line back out of it, which is the only line that
+         should sit at the real left edge. 2ch is one indent step in the platform `ui-monospace`
+         face, and it costs the two columns already accounted for above (47 first row, 45 after). */
+      padding-left: 2ch;
+      text-indent: -2ch;
+    }
+    /* The SEED variant needs its own cap, and a different one. It deliberately keeps
+       `display: block` and no fade so the FIRST line reads first — nothing has been reported yet,
+       so the beginning of the tail is the useful end. That is exactly why it must not reuse the
+       waiting peek's behaviour: capping a top-anchored block clips the NEWEST lines, which is the
+       bug the `justify-content: flex-end` comment above records fixing.
+       But leaving it `max-height: none` was worse once it started wrapping: 20 lines at 3–4 rows
+       is ~930px, worst case 1236px, inside a ~663px log — taller than the screen, on the first
+       thing a user sees on a quiet session. So cap it to the same budget and let it SCROLL
+       instead of clipping: nothing is destroyed, the remainder is a swipe away, and the empty
+       state stops overflowing the surface. Specificity here is (0,5,0) against the base rule's
+       (0,4,0) — it has to be, to beat the `max-height: none` on `.st-peek.st-peek-seed` above. */
+    .st-peek.st-peek-seed {
+      max-height: clamp(180px, 45vh, 520px);
+      max-height: clamp(180px, 45dvh, 520px);
+      overflow-y: auto;
+    }
   }
   .st-stale {
     font-size: 12.5px;

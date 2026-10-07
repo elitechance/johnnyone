@@ -76,6 +76,19 @@ pub fn get_setting_or(state: &AppState, key: &str, default: &str) -> String {
 }
 
 pub fn set_setting(state: &AppState, key: String, value: String) -> Result<(), String> {
+    // `files_root` is a security boundary, not just a browse root — `report_markdown_roots`
+    // confines the `evidence` markdown reader to it. Reject a value that would make that
+    // confinement vacuous HERE, on the way in, so the caller gets a real error instead of a
+    // silently-ignored setting. `resolve_files_root` re-checks on read because this mutation is
+    // reachable remotely with no scope check and the DB may already hold a poisoned value.
+    if key == KEY_FILES_ROOT {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            if let Err(reason) = reject_unsafe_confinement_root(Path::new(trimmed)) {
+                return Err(format!("Refusing files_root {:?}: it {}", trimmed, reason));
+            }
+        }
+    }
     state.db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -200,15 +213,142 @@ pub fn resolve_initiatives_dir(state: &AppState) -> PathBuf {
 }
 
 /// Resolve the configured global file-manager root (absolute). Falls back to `DEFAULT_FILES_ROOT`
-/// when the setting is unset/empty. Mirrors [`resolve_initiatives_dir`].
+/// when the setting is unset/empty, or when the stored value is too broad to be a confinement
+/// boundary (see [`reject_unsafe_confinement_root`]). Mirrors [`resolve_initiatives_dir`].
+///
+/// The fallback is not belt-and-braces. `files_root` is settable remotely via `updateSetting`,
+/// which performs no scope check, so the DB may ALREADY hold a poisoned value written before this
+/// validation existed; rejecting on write alone would honour it forever. Validating on read too
+/// means a poisoned `files_root` degrades to the default rather than opening every path on the box.
 pub fn resolve_files_root(state: &AppState) -> PathBuf {
     let configured = get_setting_or(state, KEY_FILES_ROOT, DEFAULT_FILES_ROOT);
     let trimmed = configured.trim();
-    PathBuf::from(if trimmed.is_empty() {
-        DEFAULT_FILES_ROOT
+    if trimmed.is_empty() {
+        return PathBuf::from(DEFAULT_FILES_ROOT);
+    }
+    if let Err(reason) = reject_unsafe_confinement_root(Path::new(trimmed)) {
+        tracing::warn!(
+            configured = trimmed,
+            %reason,
+            "stored files_root is unsafe as a confinement root; falling back to the default"
+        );
+        return PathBuf::from(DEFAULT_FILES_ROOT);
+    }
+    PathBuf::from(trimmed)
+}
+
+/// Reject a directory that is too broad to serve as a confinement boundary.
+///
+/// `files_root` began life as a UX browse-root for the file manager, but it is now also a security
+/// boundary: `report_markdown_roots` confines the `evidence` markdown reader to it. That promotion
+/// means it inherits an existing hole — `worker/resolvers/ai/update-setting.ts` has no
+/// `authorizeForAltToken` call, so ANY authenticated identity (an API key with zero scopes
+/// included) can call `updateSetting(key:"files_root", value:"/")`. With `/` as a root every
+/// `starts_with` check passes and the confinement guard silently becomes a no-op, re-opening the
+/// exfiltration of `~/.claude/**/MEMORY.md` it was written to stop. The worker-side scope check is
+/// a separate ticket; this is the host-side half, and it is the half that actually has to hold.
+///
+/// Two rules, both about `$HOME` rather than about any one secret file:
+/// 1. The root may not be a filesystem root, `$HOME` itself, or any ancestor of `$HOME` — those
+///    all make the user's entire home directory, dotfiles included, "in root".
+/// 2. The root may not be a hidden directory directly under `$HOME` (`~/.claude`, `~/.codex`,
+///    `~/.ssh`, `~/.config`). A dotfile directory is never a legitimate browse root, and naming
+///    one is the precise move an attacker makes to aim the reader at the secrets it holds.
+///
+/// Enumerating individual secret filenames was deliberately avoided: that list is unmaintainable
+/// and the next agent CLI to land would quietly fall outside it. Legitimate roots are unaffected —
+/// `/home/creepy/Documents/Workspace` (the real value on this host) passes both rules.
+pub fn reject_unsafe_confinement_root(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("must be an absolute path".to_string());
+    }
+    // Compare canonically where possible so `/home/creepy/..` or a symlinked `$HOME` cannot dodge
+    // the comparison below; a not-yet-created dir falls back to the literal path.
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if candidate.parent().is_none() {
+        return Err("is a filesystem root".to_string());
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+        let c = h.canonicalize().unwrap_or(h);
+        if c.is_absolute() {
+            Some(c)
+        } else {
+            None
+        }
+    });
+    if let Some(home) = home {
+        // `$HOME` itself, or an ancestor of it (`/home`, `/`): the whole home dir would be in-root.
+        if home.starts_with(&candidate) {
+            return Err(format!(
+                "is {} or an ancestor of it",
+                home.display()
+            ));
+        }
+        // A hidden directory directly under `$HOME` — i.e. exactly where agent CLIs keep state.
+        if candidate.parent() == Some(home.as_path())
+            && candidate
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+        {
+            return Err("is a hidden directory in the home directory".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Every directory a report's `evidence` markdown may legitimately live in.
+///
+/// The confinement roots for `agent_plans::read_report_markdown`. That reader had NO directory
+/// confinement at all, and the host's GraphQL on 127.0.0.1:7788 is unauthenticated by design:
+/// any local process could name `~/.claude/**/MEMORY.md`, a repo's `CLAUDE.md` or private notes
+/// as `evidence`, and the host would read it and persist it into `session_reports.markdown` —
+/// which `listSessionReports` then serves back THROUGH the Cloudflare worker on only
+/// `sessions:read`. That is a local-to-remote exfiltration path, and this list is what closes it.
+///
+/// Both roots are load-bearing; measured against this host's `session_reports` table, every
+/// historical evidence path sits under one of them, and both are still in active use:
+/// - `files_root` — the Workspace plan store (`.johnnyone/reports/`, `.johnnyone/replies/`) and
+///   every plan workspace. Defensible as a root because a *same-uid local* caller, which is who
+///   can reach the unauthenticated host port at all, could already read those bytes directly off
+///   disk; admitting them here adds no new capability for that caller. Note this is NOT an
+///   authorization-equivalence claim, and must not be read as one: the `files_root`-rooted reader
+///   is `filesRead` → `host_files::read_file`, whose resolver requires
+///   `authorizeForAltToken(ctx, 'files:read')`, whereas `reportAgentResult` requires nothing at
+///   all. (`hostReadFile` is a third thing again — rooted at the plan's `workspace_path`.) So the
+///   two surfaces are equivalent in *reachable bytes for a local caller*, not in authorization.
+/// - `/tmp` — the agent scratchpads (`/tmp/claude-<uid>/<session>/scratchpad/…`) where the
+///   majority of reports are written, and occasionally a plan workspace itself.
+///
+/// Why `/tmp` is pinned on unix rather than taken from `env::temp_dir()`: `temp_dir()` returns
+/// `$TMPDIR` when it is set, and the host inherits `$TMPDIR` from whatever launched it, so
+/// `TMPDIR=/home/creepy` would have silently admitted all of `$HOME` — `~/.claude` included — and
+/// turned the guard off. The churn this root has to survive (`claude-<uid>/<session>/`) is all
+/// *inside* the path, not in the root itself, so reading the root from the environment bought
+/// nothing and cost the guarantee.
+///
+/// Every root is then passed through [`reject_unsafe_confinement_root`], so neither a poisoned
+/// `files_root` nor a hostile `$TMPDIR` on a non-unix host can widen the boundary to `$HOME` or
+/// its dotfiles — precisely the read the guard exists to stop. A root that fails is dropped rather
+/// than clamped: the result is always narrower, never wider. Kept here, beside
+/// `resolve_files_root`, so the roots have one home rather than being hardcoded at the call site.
+pub fn report_markdown_roots(state: &AppState) -> Vec<PathBuf> {
+    // `resolve_files_root` already validates (and falls back to the default on a poisoned value).
+    let mut roots = vec![resolve_files_root(state)];
+    let temp = if cfg!(unix) {
+        PathBuf::from("/tmp")
     } else {
-        trimmed
-    })
+        std::env::temp_dir()
+    };
+    match reject_unsafe_confinement_root(&temp) {
+        Ok(()) => roots.push(temp),
+        Err(reason) => tracing::warn!(
+            temp = %temp.display(),
+            %reason,
+            "temp dir is unsafe as a confinement root; dropping it from the report markdown roots"
+        ),
+    }
+    roots
 }
 
 /// Resolve `rel` under `root`, rejecting traversal above `root` and any `..` segment.
@@ -417,6 +557,60 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // ── files_root as a security boundary ───────────────────────────────────────────────────
+    // `report_markdown_roots` confines the evidence-markdown reader to `files_root`, and
+    // `updateSetting` is remotely callable with no scope check, so a hostile value here turns the
+    // confinement guard into a no-op. These pin the values that must never be accepted.
+
+    #[test]
+    fn unsafe_confinement_roots_are_rejected() {
+        // The exact attack: files_root = "/" makes every `starts_with` check pass.
+        assert!(reject_unsafe_confinement_root(Path::new("/")).is_err(), "/");
+        assert!(
+            reject_unsafe_confinement_root(Path::new("relative/path")).is_err(),
+            "not absolute"
+        );
+        let home = std::env::var("HOME").expect("HOME is set in the test env");
+        assert!(
+            reject_unsafe_confinement_root(Path::new(&home)).is_err(),
+            "$HOME itself would put every dotfile in root"
+        );
+        assert!(
+            reject_unsafe_confinement_root(Path::new(
+                Path::new(&home).parent().unwrap().to_str().unwrap()
+            ))
+            .is_err(),
+            "an ancestor of $HOME"
+        );
+        // Aiming the root straight at an agent CLI's state dir is the other obvious move.
+        for hidden in [".claude", ".codex", ".ssh", ".config"] {
+            let p = Path::new(&home).join(hidden);
+            assert!(
+                reject_unsafe_confinement_root(&p).is_err(),
+                "hidden dir under $HOME: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_legitimate_files_root_is_still_accepted() {
+        // The real value on this host must keep working — the guard is not allowed to be so tight
+        // that it breaks the production browse root (or the report paths confined to it).
+        assert!(reject_unsafe_confinement_root(Path::new(
+            "/home/creepy/Documents/Workspace"
+        ))
+        .is_ok());
+        // A deep, not-yet-existing dir under $HOME is fine: it is neither $HOME nor hidden there.
+        let home = std::env::var("HOME").expect("HOME is set in the test env");
+        assert!(reject_unsafe_confinement_root(
+            &Path::new(&home).join("Documents/Workspace/nested/does-not-exist-yet")
+        )
+        .is_ok());
+        // A non-hidden sibling of the home dir is a user choice, not an escalation.
+        assert!(reject_unsafe_confinement_root(Path::new("/srv/projects")).is_ok());
     }
 
     #[test]
