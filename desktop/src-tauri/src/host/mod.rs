@@ -23,7 +23,8 @@ use axum::{
     Router,
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::cors::{Any, CorsLayer};
+
+pub mod origin_guard;
 
 type JohnnyHostSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
@@ -32,33 +33,68 @@ pub fn router(state: AppState) -> Router {
         .data(state)
         .finish();
 
-    // CORS: the host's GraphQL is reached from the Tauri webview (any origin)
-    // and from local dev tools (e.g. host-app at :4201). Permissive by design —
-    // the host listens on localhost only, so external origins can't reach it
-    // anyway. Methods/headers must include everything async-graphql sends.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    Router::new()
-        .route("/graphql", get(graphql_playground).post(graphql_handler))
-        .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone()))
-        .layer(cors)
-        .with_state(schema)
+    // Binding `127.0.0.1` (main.rs) keeps other MACHINES out; it does not keep
+    // other WEB PAGES out — any site the user visits can fetch this
+    // unauthenticated surface from their own browser, and async-graphql parses a
+    // CORS-simple `text/plain` POST as JSON, so there is not even a preflight to
+    // fail. `origin_guard::guard_layers` therefore rejects a request whose
+    // `Origin` is neither the webview's nor loopback's, and the CORS layer it
+    // installs reuses the SAME predicate so `access-control-allow-origin: *` is
+    // never echoed.
+    //
+    // What this buys: a page on `https://evil.example` can no longer drive or
+    // read the host API. What it does NOT buy: anything against a non-browser
+    // local attacker — a request with no `Origin` is allowed on purpose so the
+    // baked agent `curl`s keep working, and a local process can omit `Origin`
+    // just as easily. See `origin_guard`'s module docs.
+    origin_guard::guard_layers(
+        Router::new()
+            .route("/graphql", get(graphql_playground).post(graphql_handler))
+            .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone())),
+    )
+    .with_state(schema)
 }
 
+/// `HeaderMap` must come BEFORE `GraphQLRequest`: the latter consumes the body,
+/// and axum requires the body-consuming extractor last.
+///
+/// The per-request `WriteTrust` is injected into the GraphQL context because the
+/// middleware cannot make this call — it does not parse the body, so it has no
+/// idea which setting key is being written. Resolvers that care read it with
+/// `data_opt` and default to the restrictive value, so the subscription
+/// transport (which never carries it) fails closed.
 async fn graphql_handler(
     AxumState(schema): AxumState<JohnnyHostSchema>,
+    headers: axum::http::HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    schema.execute(req.into_inner()).await.into()
+    let write_trust = origin_guard::write_trust_from_headers(&headers);
+    schema
+        .execute(req.into_inner().data(write_trust))
+        .await
+        .into()
 }
 
+/// GraphQL never executes on GET — this route only serves the playground's
+/// HTML — but without a framing policy `evil.example` can iframe it and
+/// clickjack its Run button, which chains with anything the POST rules still
+/// allow. `frame-ancestors 'none'` is the modern control; `X-Frame-Options` is
+/// the fallback for user agents that predate it. Response headers rather than a
+/// `Sec-Fetch-Site` requirement, because WebKitGTK sends no fetch metadata and a
+/// header costs nothing in compatibility.
 async fn graphql_playground() -> impl IntoResponse {
-    Html(playground_source(
-        GraphQLPlaygroundConfig::new("/graphql").subscription_endpoint("/graphql/ws"),
-    ))
+    (
+        [
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "frame-ancestors 'none'",
+            ),
+            (axum::http::header::X_FRAME_OPTIONS, "DENY"),
+        ],
+        Html(playground_source(
+            GraphQLPlaygroundConfig::new("/graphql").subscription_endpoint("/graphql/ws"),
+        )),
+    )
 }
 
 struct QueryRoot;
@@ -124,7 +160,18 @@ impl QueryRoot {
             .collect())
     }
 
+    /// Read one setting. The key is filtered against
+    /// `settings_service::READABLE_SETTING_KEYS` because this surface is
+    /// UNAUTHENTICATED: without the filter an arbitrary key reached
+    /// `access_token`, which for a `jk_` credential is a durable worker API key
+    /// that never expires (`services/relay.rs::refresh_access_token`). Same
+    /// curated-projection idea as `host_settings` below.
     async fn get_setting(&self, ctx: &Context<'_>, key: String) -> async_graphql::Result<String> {
+        if !settings_service::is_readable_setting_key(&key) {
+            return Err(async_graphql::Error::new(format!(
+                "getSetting: {key:?} is not readable over the host API"
+            )));
+        }
         let state = ctx.data_unchecked::<AppState>();
         Ok(settings_service::get_setting(state, key)?)
     }
@@ -306,23 +353,22 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Refused on this surface — see [`provider_config_writes_refused`].
     async fn upsert_provider_config(
         &self,
-        ctx: &Context<'_>,
-        input: UpsertProviderConfigInputGql,
+        _ctx: &Context<'_>,
+        _input: UpsertProviderConfigInputGql,
     ) -> async_graphql::Result<GqlProviderConfig> {
-        let state = ctx.data_unchecked::<AppState>();
-        Ok(provider_service::upsert_provider_config(state, input.into())?.into())
+        Err(provider_config_writes_refused("upsertProviderConfig"))
     }
 
+    /// Refused on this surface — see [`provider_config_writes_refused`].
     async fn delete_provider_config(
         &self,
-        ctx: &Context<'_>,
-        provider: String,
+        _ctx: &Context<'_>,
+        _provider: String,
     ) -> async_graphql::Result<bool> {
-        let state = ctx.data_unchecked::<AppState>();
-        provider_service::delete_provider_config(state, provider)?;
-        Ok(true)
+        Err(provider_config_writes_refused("deleteProviderConfig"))
     }
 
     async fn detect_cli_tools(
@@ -337,12 +383,44 @@ impl MutationRoot {
             .collect())
     }
 
+    /// Write one setting. Two gates, both because this surface is
+    /// UNAUTHENTICATED and reachable from any loopback page in the user's
+    /// browser:
+    ///
+    /// 1. The key must be one a client actually writes
+    ///    (`settings_service::WRITABLE_SETTING_KEYS`), so the settings table
+    ///    cannot be used as arbitrary attacker-controlled storage.
+    /// 2. A **connection** key (`relay::is_connection_key`) additionally needs
+    ///    `WriteTrust::Webview`. Without this, a page on `http://localhost:3000`
+    ///    could point `worker_url` at its own endpoint, and `apply_setting`'s
+    ///    reconnect would hand it the real `jk_` relay credential — which never
+    ///    expires. Gating `getSetting` against RETURNING the token is pointless
+    ///    while a caller can redirect where the token is SENT.
     async fn set_setting(
         &self,
         ctx: &Context<'_>,
         key: String,
         value: String,
     ) -> async_graphql::Result<bool> {
+        if !settings_service::is_writable_setting_key(&key) {
+            return Err(async_graphql::Error::new(format!(
+                "setSetting: {key:?} is not writable over the host API"
+            )));
+        }
+        // Fail closed: a transport that never injected the marker (the
+        // subscription socket) is treated as untrusted.
+        let trust = ctx
+            .data_opt::<origin_guard::WriteTrust>()
+            .copied()
+            .unwrap_or(origin_guard::WriteTrust::Loopback);
+        if relay_service::is_connection_key(&key)
+            && trust != origin_guard::WriteTrust::Webview
+        {
+            return Err(async_graphql::Error::new(format!(
+                "setSetting: {key:?} is a relay-connection key and may only be \
+                 written from the JohnnyOne app itself"
+            )));
+        }
         let state = ctx.data_unchecked::<AppState>();
         crate::services::relay::apply_setting(state, key, value).await?;
         Ok(true)
@@ -382,6 +460,45 @@ impl MutationRoot {
         relay_service::ensure_connected(state).await?;
         Ok(true)
     }
+}
+
+
+/// Provider-config WRITES are refused outright on the host's GraphQL surface,
+/// which is unauthenticated and reachable from any loopback page in the user's
+/// browser (and, over `/graphql/ws`, from a graphql-transport-ws `subscribe`
+/// message — `async-graphql-7.2.1/src/schema.rs:606` executes any
+/// non-subscription operation there, so the socket is a second mutation entry
+/// point).
+///
+/// The reason this is refused rather than tiered like `setSetting`:
+/// `cli_path` BECOMES THE EXECUTED COMMAND (`providers/claude_code.rs:19`,
+/// `providers/ollama_cli.rs:14`, `providers/cline.rs:11` all do
+/// `cli_path.unwrap_or(<default>)` and run it), so a write here is local code
+/// execution on the next agent run — strictly worse than the credential theft
+/// the setting guards close.
+///
+/// Refusing costs nothing, because NOTHING writes provider configs over this
+/// surface. Verified against the built bundles, not the source:
+/// - `dist/host-app/browser/*.js` (the Tauri webview, the only client on this
+///   surface) contains zero occurrences of `upsertProviderConfig` /
+///   `deleteProviderConfig`. It only READS, via
+///   `{ listProviderConfigs { provider cliPath isAvailable defaultModel } }`
+///   (`chunk-DJ5NYM3W.js`), which still works.
+/// - `dist/web/browser/*.js` has both, but as
+///   `upsertProviderConfig(i){return this.gql.mutate(...)}` — `gql.mutate`
+///   targets the WORKER, never `queryPreferLocalHost`. The console's write
+///   therefore travels worker -> WS relay -> `agent/mod.rs:1313`
+///   `rpc_upsert_provider_config` -> `provider_service::upsert_provider_config`,
+///   which never reaches `graphql_handler`. That path is untouched.
+///
+/// The fields stay in the schema so the host keeps field-for-field parity with
+/// the worker's `ProviderConfig` surface; only execution is refused.
+fn provider_config_writes_refused(field: &str) -> async_graphql::Error {
+    async_graphql::Error::new(format!(
+        "{field}: provider configuration cannot be written over the host API \
+         (cliPath is executed). Use the JohnnyOne console, which routes through \
+         the authenticated worker relay."
+    ))
 }
 
 struct SubscriptionRoot;
@@ -514,7 +631,15 @@ impl From<ProviderConfig> for GqlProviderConfig {
             id: value.id,
             provider: value.provider,
             cli_path: value.cli_path,
-            api_key: value.api_key,
+            // Never leave the host. The field stays in the schema for parity
+            // with the worker's `ProviderConfig`, but nothing in the clients
+            // reads it: `ui/src/services/johnny-api.service.ts:726,765` only
+            // SELECTS it, `host-app/src/app/services/host-status.service.ts:110`
+            // asks for `provider cliPath isAvailable defaultModel`, and there is
+            // no `.apiKey` consumer anywhere in `ui/`, `web/` or `host-app/`.
+            // This surface is unauthenticated, so cleartext here is the same
+            // leak class as `getSetting("access_token")`.
+            api_key: String::new(),
             default_model: value.default_model,
             settings: value.settings,
             is_available: value.is_available,
@@ -868,3 +993,353 @@ struct PlannerPlanningPromptsInput {
 }
 
 
+
+#[cfg(test)]
+mod router_tests {
+    //! End-to-end over the REAL schema + a real migrated SQLite DB, driven
+    //! through `router()` with `oneshot`. This is what proves the resolver
+    //! guards actually bite — the pure tests in `origin_guard` only cover the
+    //! decision, not the wiring.
+
+    use super::*;
+    use crate::services::settings as settings_service;
+    use crate::test_support::test_state;
+    use axum::body::Body;
+    use axum::http::{header::CONTENT_TYPE, header::ORIGIN, Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// The attacker's shape, as measured: a CORS-**simple** `text/plain` POST,
+    /// which needs no preflight, from a page served on loopback.
+    fn text_plain_post(origin: Option<&str>, sec_fetch_site: Option<&str>, query: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/graphql")
+            .header(CONTENT_TYPE, "text/plain");
+        if let Some(origin) = origin {
+            builder = builder.header(ORIGIN, origin);
+        }
+        if let Some(site) = sec_fetch_site {
+            builder = builder.header("sec-fetch-site", site);
+        }
+        let body = serde_json::json!({ "query": query }).to_string();
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    async fn body_text(res: axum::http::Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await.unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn attacker_cannot_redirect_worker_url_and_steal_the_relay_token() {
+        let (state, _root) = test_state();
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{setSetting(key:"worker_url",value:"https://attacker")}"#,
+            ))
+            .await
+            .unwrap();
+
+        // The request itself is legal (loopback), so it is the RESOLVER that
+        // must refuse it — hence a 200 carrying a GraphQL error, not a 403.
+        assert_eq!(res.status(), StatusCode::OK);
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+        assert!(!text.contains("\"setSetting\":true"), "write was not refused: {text}");
+
+        // And the credential's destination is untouched.
+        assert_ne!(
+            settings_service::get_setting_or(&probe, settings_service::KEY_WORKER_URL, ""),
+            "https://attacker"
+        );
+    }
+
+    #[tokio::test]
+    async fn attacker_cannot_write_the_access_token() {
+        let (state, _root) = test_state();
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{setSetting(key:"access_token",value:"jk_attacker")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+        assert_eq!(
+            settings_service::get_setting_or(&probe, settings_service::KEY_ACCESS_TOKEN, ""),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn the_webview_can_still_write_a_connection_key() {
+        // Breaking the host-app's login / settings save would be worse than the
+        // bug, so this is the test that keeps the fix honest.
+        let (state, _root) = test_state();
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("tauri://localhost"),
+                None,
+                r#"mutation{setSetting(key:"tenant_id",value:"11111111-1111-1111-1111-111111111111")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("\"setSetting\":true"), "webview write was refused: {text}");
+        assert_eq!(
+            settings_service::get_setting_or(&probe, settings_service::KEY_TENANT_ID, ""),
+            "11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_loopback_origin_may_still_write_a_non_connection_key() {
+        // The demotion is scoped to connection keys; it must not break a local
+        // tool writing an ordinary preference.
+        let (state, _root) = test_state();
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{setSetting(key:"discord_webhook_url",value:"https://discord.example/hook")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("\"setSetting\":true"), "non-connection write was refused: {text}");
+        assert_eq!(
+            settings_service::get_setting_or(&probe, settings_service::KEY_DISCORD_WEBHOOK_URL, ""),
+            "https://discord.example/hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_setting_key_is_refused_even_from_the_webview() {
+        let (state, _root) = test_state();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("tauri://localhost"),
+                None,
+                r#"mutation{setSetting(key:"attacker_planted_key",value:"x")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn get_setting_still_refuses_the_token_through_the_real_schema() {
+        let (state, _root) = test_state();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_ACCESS_TOKEN.to_string(),
+            "jk_realsecret".to_string(),
+        )
+        .unwrap();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"query{getSetting(key:"access_token")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(!text.contains("jk_realsecret"), "token leaked: {text}");
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+    }
+
+    // ── provider configs ──────────────────────────────────────────────────
+    // `cli_path` BECOMES THE EXECUTED COMMAND (`providers/claude_code.rs:19`,
+    // `ollama_cli.rs:14`, `cline.rs:11`), so a write here is local code
+    // execution on the next agent run — strictly worse than the credential
+    // theft the setting guards close, and reachable by the identical route.
+
+    fn seed_provider(state: &AppState) {
+        crate::services::providers::upsert_provider_config(
+            state,
+            crate::db::models::UpsertProviderConfigInput {
+                provider: "claude_code".to_string(),
+                cli_path: Some("/usr/bin/claude".to_string()),
+                api_key: Some(String::new()),
+                default_model: Some(String::new()),
+                settings: Some("{}".to_string()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn provider_cli_path(state: &AppState, provider: &str) -> String {
+        crate::services::providers::list_provider_configs(state)
+            .unwrap()
+            .into_iter()
+            .find(|config| config.provider == provider)
+            .map(|config| config.cli_path)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn attacker_cannot_repoint_a_provider_cli_path() {
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{upsertProviderConfig(input:{provider:"claude_code",cliPath:"/tmp/evil.sh"}){id}}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+        assert_eq!(
+            provider_cli_path(&probe, "claude_code"),
+            "/usr/bin/claude",
+            "the executed command was repointed"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_config_writes_are_refused_even_from_the_webview() {
+        // Unconditional on this surface, not merely tiered: nothing in either
+        // built bundle writes provider configs over HTTP, so there is no
+        // capability to preserve and no reason to leave the vector open to a
+        // local process that omits `Origin`.
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let probe = state.clone();
+        for origin in [Some("tauri://localhost"), None] {
+            let res = router(state.clone())
+                .oneshot(text_plain_post(
+                    origin,
+                    None,
+                    r#"mutation{upsertProviderConfig(input:{provider:"claude_code",cliPath:"/tmp/evil.sh"}){id}}"#,
+                ))
+                .await
+                .unwrap();
+            let text = body_text(res).await;
+            assert!(
+                text.contains("errors"),
+                "origin {origin:?} was allowed to write a provider config: {text}"
+            );
+        }
+        assert_eq!(provider_cli_path(&probe, "claude_code"), "/usr/bin/claude");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_provider_config_is_refused_on_the_http_surface() {
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{deleteProviderConfig(provider:"claude_code")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+        assert_eq!(
+            provider_cli_path(&probe, "claude_code"),
+            "/usr/bin/claude",
+            "the provider row was deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_webview_can_still_read_provider_configs() {
+        // The one thing the host-app actually needs from this surface, with the
+        // exact field set its built bundle requests
+        // (dist/host-app/browser/chunk-DJ5NYM3W.js).
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("tauri://localhost"),
+                None,
+                "{ listProviderConfigs { provider cliPath isAvailable defaultModel } }",
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(!text.contains("errors"), "read was refused: {text}");
+        assert!(text.contains("/usr/bin/claude"), "expected the config, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_relay_path_can_still_write_a_provider_config() {
+        // Pins the SERVICE call the console's route ends in, so the outright HTTP
+        // refusal above cannot be mistaken for a global one.
+        //
+        // Be precise about what this does NOT cover: it calls
+        // `providers::upsert_provider_config` directly and never exercises the
+        // `"upsert_provider_config" =>` dispatch arm or `rpc_upsert_provider_config`,
+        // so it does not prove the worker -> WS relay -> RPC chain. That chain is
+        // verified by reading `agent/mod.rs:1310-1314`; nothing tests the relay
+        // dispatch table at all (62 `rpc_` fns, zero dispatch tests), which is
+        // worth fixing separately.
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        crate::services::providers::upsert_provider_config(
+            &state,
+            crate::db::models::UpsertProviderConfigInput {
+                provider: "claude_code".to_string(),
+                cli_path: Some("/opt/claude".to_string()),
+                api_key: None,
+                default_model: None,
+                settings: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(provider_cli_path(&state, "claude_code"), "/opt/claude");
+    }
+
+    #[tokio::test]
+    async fn the_playground_cannot_be_framed() {
+        let (state, _root) = test_state();
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphql")
+                    .header("sec-fetch-site", "none")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers().clone();
+        let res = res;
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            Some("frame-ancestors 'none'")
+        );
+        assert_eq!(
+            headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+            Some("DENY")
+        );
+        // And the playground itself still renders — the header tuple must not
+        // have replaced the body.
+        let text = body_text(res).await;
+        assert!(
+            text.contains("GraphQL") && text.len() > 500,
+            "playground HTML missing, got {} bytes",
+            text.len()
+        );
+    }
+}
