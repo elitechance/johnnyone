@@ -113,8 +113,12 @@
     </table>
     <p>
       <code>CreateApiKeyInput</code>: <code>&#123; name: String!, scopes: [String!]!, expiresAt? &#125;</code>.
-      Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>, <code>plans:read|write</code>
+      Scopes: <code>terminal:read|write</code>, <code>sessions:read|write</code>, <code>plans:read|write</code>,
+      <code>files:read|write</code>, <code>settings:read|write</code>
       (grant the minimum — a key is restricted to its scopes; a JWT is unrestricted).
+      <code>settings:write</code> is the most privileged: settings include <code>files_root</code>,
+      the root the host measures its own path confinement against, so it is never implied by
+      <code>files:write</code>.
       <code>CreateApiKeyResult</code> returns <code>apiKey</code> (metadata only) + <code>secret</code>
       (the <code>jk_…</code> value, shown <strong>once</strong>).
     </p>
