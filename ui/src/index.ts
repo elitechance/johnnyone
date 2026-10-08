@@ -23,7 +23,10 @@ export {
   HOST_GRAPHQL_API_URL,
   GRAPHQL_WS_URL,
   GRAPHQL_EXTRA_HEADERS,
+  GRAPHQL_AUTH_REFRESH,
+  HttpStatusError,
 } from './services/graphql-client';
+export type { GraphQLAuthRefresh } from './services/graphql-client';
 export {
   JohnnyApiService,
 } from './services/johnny-api.service';
