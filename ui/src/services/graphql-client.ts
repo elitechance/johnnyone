@@ -1,6 +1,6 @@
 import { Injectable, InjectionToken, inject } from '@angular/core';
-import { Observable, from, throwError } from 'rxjs';
-import { map, switchMap } from 'rxjs/operators';
+import { Observable, from } from 'rxjs';
+import { switchMap } from 'rxjs/operators';
 
 export const GRAPHQL_API_URL = new InjectionToken<string>('GRAPHQL_API_URL', {
   providedIn: 'root',
@@ -27,6 +27,23 @@ export const HOST_GRAPHQL_API_URL = new InjectionToken<string>('HOST_GRAPHQL_API
   factory: () => '',
 });
 
+/** Resolves once the stored access token has been renewed (or rejects). */
+export type GraphQLAuthRefresh = () => Promise<void>;
+
+/**
+ * Optional hook that lets the host app renew an expired access token so the
+ * client can replay a request that was rejected at the auth choke point.
+ *
+ * `ui/` is the shared library and must not depend on the Angular
+ * `AuthService`, so the behaviour is injected as a callback and is **off**
+ * unless the app provides one. `web/src/app/app.config.ts` wires it to
+ * `AuthService.ensureFreshToken`.
+ */
+export const GRAPHQL_AUTH_REFRESH = new InjectionToken<GraphQLAuthRefresh | null>(
+  'GRAPHQL_AUTH_REFRESH',
+  { providedIn: 'root', factory: () => null },
+);
+
 export interface GraphQLResponse<T> {
   data: T;
   errors?: GraphQLError[];
@@ -45,7 +62,10 @@ export class GraphQLClient {
   private readonly hostApiUrl = inject(HOST_GRAPHQL_API_URL);
   private readonly wsUrl = inject(GRAPHQL_WS_URL);
   private readonly extraHeaders = inject(GRAPHQL_EXTRA_HEADERS);
+  private readonly authRefresh = inject(GRAPHQL_AUTH_REFRESH);
   private localHostHealth: Promise<boolean> | null = null;
+  /** Shared so a burst of auth failures triggers one refresh, not a storm. */
+  private inflightAuthRefresh: Promise<void> | null = null;
 
   query<T>(query: string, variables?: Record<string, unknown>): Observable<T> {
     return this.request<T>(query, variables);
@@ -161,29 +181,97 @@ export class GraphQLClient {
     variables: Record<string, unknown> | undefined,
     includeAuthHeaders: boolean,
   ): Observable<T> {
-    const body = JSON.stringify({ query, variables });
+    // Eager, as before: the fetch starts when `requestAt` is called, not on
+    // subscribe (`from(fetch(...))` had the same semantics).
+    return from(this.sendWithAuthRetry<T>(apiUrl, query, variables, includeAuthHeaders));
+  }
 
-    return from(
-      fetch(apiUrl, {
-        method: 'POST',
-        headers: this.buildHeaders(true, includeAuthHeaders),
-        body,
-        credentials: 'same-origin',
-      })
-    ).pipe(
-      switchMap((response) => {
-        if (!response.ok) {
-          return throwError(() => new Error(`GraphQL request failed: ${response.status} ${response.statusText}`));
-        }
-        return from(response.json() as Promise<GraphQLResponse<T>>);
-      }),
-      map((result) => {
-        if (result.errors?.length) {
-          throw new GraphQLRequestError(result.errors);
-        }
-        return result.data;
-      })
-    );
+  /**
+   * One send, and — only for an expired/invalid access token — one refresh and
+   * one replay (fix/web-session-resume).
+   *
+   * `buildHeaders` attaches whatever bearer is in localStorage with no
+   * freshness check, so a tab that woke with a dead 15-minute token sends it
+   * and is rejected even though the 7-day refresh token beside it is valid.
+   *
+   * The replay calls `send` directly, never itself, so there is exactly one
+   * retry and no recursion. Off entirely unless the app provided a refresh
+   * hook.
+   */
+  private async sendWithAuthRetry<T>(
+    apiUrl: string,
+    query: string,
+    variables: Record<string, unknown> | undefined,
+    includeAuthHeaders: boolean,
+  ): Promise<T> {
+    try {
+      return await this.send<T>(apiUrl, query, variables, includeAuthHeaders);
+    } catch (error) {
+      const refresh = this.authRefresh;
+      if (!refresh || !includeAuthHeaders || !isExpiredTokenError(error)) {
+        throw error;
+      }
+      try {
+        await this.refreshAuthOnce(refresh);
+      } catch {
+        // A dead refresh token is the app's problem to report (it logs out);
+        // surface the original auth error rather than the refresh failure.
+        throw error;
+      }
+      return await this.send<T>(apiUrl, query, variables, includeAuthHeaders);
+    }
+  }
+
+  /** Collapse concurrent refreshes onto one in-flight promise. */
+  private refreshAuthOnce(refresh: GraphQLAuthRefresh): Promise<void> {
+    if (!this.inflightAuthRefresh) {
+      this.inflightAuthRefresh = Promise.resolve()
+        .then(() => refresh())
+        .finally(() => {
+          this.inflightAuthRefresh = null;
+        });
+    }
+    return this.inflightAuthRefresh;
+  }
+
+  private async send<T>(
+    apiUrl: string,
+    query: string,
+    variables: Record<string, unknown> | undefined,
+    includeAuthHeaders: boolean,
+  ): Promise<T> {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: this.buildHeaders(true, includeAuthHeaders),
+      body: JSON.stringify({ query, variables }),
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      throw new HttpStatusError(response.status, response.statusText);
+    }
+    const result = (await response.json()) as GraphQLResponse<T>;
+    if (result.errors?.length) {
+      // NOTE (QA F2) — a known, accepted trade. This throw used to live in an
+      // rxjs `map`, so it only ran on subscribe. It now sits inside the eager
+      // promise behind `requestAt`, so a `query()`/`mutate()` whose observable
+      // is never subscribed raises an *unhandled rejection* instead of being
+      // silently dropped. Do NOT "fix" this by restructuring the eager/lazy
+      // split: `requestAt` deliberately preserves the request timing of the
+      // original `from(fetch(...))`, where the fetch also started on call
+      // rather than on subscribe, and chasing the rejection would change when
+      // every request in the app fires.
+      //
+      // Latent today, and measured rather than assumed: every `query()` /
+      // `mutate()` call in `web/` and `ui/` goes through
+      // `johnny-api.service.ts`, which returns the observable, and all of its
+      // consumers subscribe — 76 via `firstValueFrom(...)` and 24 via
+      // `.subscribe(...)`, with no site dropping the result. Because the fetch
+      // is eager, a new fire-and-forget call site would both leak a request
+      // and raise this rejection: give it a subscriber or a `.catch`. In a
+      // browser an unhandled rejection is a console error, not a crash.
+      throw new GraphQLRequestError(result.errors, hasAppliedData(result.data));
+    }
+    return result.data;
   }
 
   private async shouldUseLocalHost(): Promise<boolean> {
@@ -252,8 +340,96 @@ export class GraphQLClient {
 }
 
 export class GraphQLRequestError extends Error {
-  constructor(public readonly errors: GraphQLError[]) {
+  constructor(
+    public readonly errors: GraphQLError[],
+    /**
+     * True when the response carried data that reflects *applied* work — i.e.
+     * at least one root field came back non-null. An all-null `data` object is
+     * false: see `hasAppliedData`.
+     */
+    public readonly hasPartialData = false,
+  ) {
     super(errors.map((e) => e.message).join('; '));
     this.name = 'GraphQLRequestError';
   }
+}
+
+/**
+ * Non-2xx transport failure. The message is byte-for-byte what this client
+ * threw before, so existing callers and specs matching on it are unaffected;
+ * `status` is added so the auth check does not have to parse the text.
+ */
+export class HttpStatusError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly statusText: string,
+  ) {
+    super(`GraphQL request failed: ${status} ${statusText}`);
+    this.name = 'HttpStatusError';
+  }
+}
+
+/**
+ * Does this failure mean "the access token you sent is expired or invalid"?
+ *
+ * The JohnnyOne worker's single auth choke point answers a dead bearer with an
+ * HTTP **200** whose body is
+ *   `errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }]`
+ * (`worker/lib/auth/require-identity.ts:19`), so this cannot key on HTTP 401
+ * alone — though a 401 is accepted too, for hosts that do answer that way.
+ *
+ * lokal's `verifyJwt` throws the literal `'Token expired'`
+ * (`modules/auth/auth-middleware.ts:155`), but `buildAuthContext` swallows it
+ * (`:64`) and `requireIdentity` swallows it again (`:95`), so that string never
+ * reaches the client. It is matched anyway, cheaply, in case a host surfaces it.
+ *
+ * A response carrying *applied* data is never retried: part of the operation
+ * may already have been performed, so replaying it could double a write.
+ */
+function isExpiredTokenError(error: unknown): boolean {
+  if (error instanceof HttpStatusError) return error.status === 401;
+  if (!(error instanceof GraphQLRequestError)) return false;
+  if (error.hasPartialData) return false;
+  return error.errors.some(isExpiredTokenGraphQLError);
+}
+
+/**
+ * Did this response carry work that was actually applied? (QA F1.)
+ *
+ * The three nullable root fields in the schema — `getAiSession`,
+ * `getPlanCheck`, `getTaskRun` (`worker/schema/johnnyone-ai.graphql:544`,
+ * `:551`, `:552`) — answer an `UNAUTHENTICATED` by nulling just that field, so
+ * the body is `{data: {getAiSession: null}, errors: [...]}`. `data` is then a
+ * non-null *object* that nonetheless reflects nothing applied, and `getAiSession`
+ * is on the phone's hot path. Reading `data != null` as "partial" blocked the
+ * retry exactly where it was most needed.
+ *
+ * So: `null`/absent `data`, or an object whose every own enumerable value is
+ * `null`, carries nothing and may be retried. One non-null value and it is
+ * applied work — including a falsy one like `0`, `''` or `false` — so the
+ * double-write protection is unchanged for every mixed response. A non-object
+ * `data` (scalar, array) is treated as applied, the conservative direction.
+ */
+function hasAppliedData(data: unknown): boolean {
+  if (data == null) return false;
+  if (typeof data !== 'object' || Array.isArray(data)) return true;
+  return Object.values(data as Record<string, unknown>).some((v) => v !== null);
+}
+
+function isExpiredTokenGraphQLError(error: GraphQLError): boolean {
+  const code = String(error.extensions?.['code'] ?? '');
+  if (/^(UNAUTHENTICATED|UNAUTHORIZED)$/i.test(code)) return true;
+
+  const message = String(error.message ?? '');
+  // An authorization (role/scope) refusal is not a stale token; refreshing
+  // would not change the answer. e.g. 'Unauthorized: ADMIN role required'.
+  if (/\b(role|scope|permission)s?\b/i.test(message)) return false;
+  return (
+    /\bUNAUTHENTICATED\b/i.test(message) ||
+    /\bnot authenticated\b/i.test(message) ||
+    /\bunauthorized\b/i.test(message) ||
+    /\btoken expired\b/i.test(message) ||
+    /\bjwt expired\b/i.test(message) ||
+    /\binvalid token\b/i.test(message)
+  );
 }

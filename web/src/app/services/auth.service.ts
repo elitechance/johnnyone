@@ -1,4 +1,4 @@
-import { Injectable, inject, signal } from '@angular/core';
+import { Injectable, OnDestroy, inject, signal } from '@angular/core';
 import { Router } from '@angular/router';
 import {
   issuedAtMs,
@@ -53,7 +53,7 @@ export function classifyRefreshFailure(error: unknown): RefreshFailureKind {
 }
 
 @Injectable({ providedIn: 'root' })
-export class AuthService {
+export class AuthService implements OnDestroy {
   static readonly TOKEN_KEY = 'johnnyone_access_token';
   static readonly REFRESH_TOKEN_KEY = 'johnnyone_refresh_token';
   static readonly TENANT_KEY = 'johnnyone_tenant_id';
@@ -78,9 +78,22 @@ export class AuthService {
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private lastApiUrl: string | null = null;
   private timerBackoffMs = 0;
+  /** Non-null once the wake listeners are attached; also the removal handle. */
+  private wakeHandler: (() => void) | null = null;
 
   constructor() {
     this.syncAuthState();
+  }
+
+  /**
+   * Root-provided singleton: Angular destroys the root injector only when the
+   * whole `ApplicationRef` goes away (page teardown, HMR, a test harness), so
+   * in production this effectively never runs. It is implemented anyway so the
+   * listeners and timer do not leak across those teardowns.
+   */
+  ngOnDestroy(): void {
+    this.removeWakeHandlers();
+    this.clearRefreshTimer();
   }
 
   async login(apiUrl: string, email: string, password: string, tenantId: string): Promise<void> {
@@ -217,6 +230,82 @@ export class AuthService {
       this.syncAuthState();
     }
     this.armRefreshTimer();
+    this.installWakeHandlers();
+  }
+
+  /**
+   * Refresh when the tab wakes (fix/web-session-resume).
+   *
+   * `armRefreshTimer` schedules a `setTimeout` at 80% of the access token's
+   * 15-minute life. A suspended mobile tab cannot run that timer, so after a
+   * background spell longer than the token's life the resumed tab holds a dead
+   * access token next to a perfectly valid 7-day refresh token — and a resume
+   * is not a cold boot, so nothing calls `ensureFreshToken`. These listeners
+   * are that missing call.
+   *
+   * `pageshow` is listened for in addition to `visibilitychange` because a
+   * back/forward-cache restore can deliver `pageshow` without a
+   * `visibilitychange`. Idempotent: calling it twice attaches one set.
+   */
+  installWakeHandlers(): void {
+    if (this.wakeHandler) return;
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    const handler = () => this.onWake();
+    this.wakeHandler = handler;
+    document.addEventListener('visibilitychange', handler);
+    window.addEventListener('pageshow', handler);
+  }
+
+  removeWakeHandlers(): void {
+    const handler = this.wakeHandler;
+    if (!handler) return;
+    this.wakeHandler = null;
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', handler);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('pageshow', handler);
+    }
+  }
+
+  /**
+   * One wake tick. Deliberately *not* gated on `isSessionLive()` — an expired
+   * access token is the exact case this exists for. The gate is "a refresh
+   * token is on hand", which is the real signed-in marker; without one there is
+   * nothing to recover with and `refresh()` would only force a logout.
+   *
+   * No extra de-duplication: `ensureFreshToken` sets `inflightEnsure`
+   * synchronously before its first await, so simultaneous wake events collapse
+   * onto one refresh, and once it has settled `runEnsureFreshToken` re-checks
+   * `shouldRefreshNow` and early-returns for a fresh token. Verified in
+   * `auth.service.wake.spec.ts`, not assumed.
+   *
+   * The timer is re-armed either way: a timer armed before suspension has an
+   * unreliable remaining delay, and `armRefreshTimer` clears before re-arming.
+   */
+  private onWake(): void {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+    const apiUrl = this.lastApiUrl;
+    if (!apiUrl) return;
+    if (!this.getRefreshToken()) return;
+
+    void this.ensureFreshToken(apiUrl).then(
+      () => {
+        this.syncAuthState();
+        this.armRefreshTimer();
+      },
+      (error: unknown) => {
+        this.syncAuthState();
+        if (classifyRefreshFailure(error) === 'auth') {
+          // `ensureFreshToken` already logged out; do not keep a timer alive.
+          this.clearRefreshTimer();
+          return;
+        }
+        this.armRefreshTimer({ backoff: true });
+      },
+    );
   }
 
   async refresh(apiUrl: string): Promise<void> {
