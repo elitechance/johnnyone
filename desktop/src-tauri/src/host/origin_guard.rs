@@ -160,6 +160,21 @@ fn extra_allowed_origins() -> &'static [String] {
             .map(|entry| entry.trim().to_string())
             .filter(|entry| !entry.is_empty())
             .collect();
+        // Matching is exact, so `*` is inert — it would silently reject
+        // everything instead of allowing everything. Say so rather than leaving
+        // the user to guess. Wildcards are deliberately NOT supported: the whole
+        // point of this list is that it cannot be widened to `*` by accident.
+        for entry in &origins {
+            if entry.contains('*') {
+                tracing::warn!(
+                    entry,
+                    "{} entry contains `*`: wildcards are NOT supported and this \
+                     entry will never match. List each origin in full \
+                     (e.g. http://localhost:3000).",
+                    ENV_ALLOWED_ORIGINS
+                );
+            }
+        }
         if !origins.is_empty() {
             tracing::info!(
                 origins = ?origins,
@@ -241,6 +256,78 @@ pub async fn reject_cross_site(req: Request, next: Next) -> Response {
 
     log_rejection_once(origin.unwrap_or("<unreadable>"));
     (StatusCode::FORBIDDEN, "cross-site request rejected\n").into_response()
+}
+
+/// How far one request is trusted to WRITE connection-critical settings.
+///
+/// The read guard stops a hostile site reading the relay token. It does nothing
+/// about a caller REDIRECTING where that token is sent: `setSetting` with
+/// `worker_url` is a connection key (`services/relay.rs::is_connection_key`),
+/// so `apply_setting` reconnects the relay and the host hands the real `jk_`
+/// credential — a durable API key that never expires — to whatever endpoint was
+/// just written. Gating reads while leaving writes open is no gate at all, so
+/// connection keys need their own, narrower tier.
+///
+/// Why a tier and not simply "refuse connection keys", or "require
+/// `Sec-Fetch-Site: same-origin`":
+/// - Refusing them outright breaks the host-app. Its login writes
+///   `access_token` + `refresh_token` through this very mutation
+///   (`host-app/src/app/services/host-auth.service.ts:88-89`) and its settings
+///   save writes `worker_url` / `tenant_id` / `user_id`. Breaking login is
+///   worse than the bug.
+/// - Requiring `Sec-Fetch-Site` breaks it too, on this platform: WebKitGTK does
+///   not implement fetch metadata, so the production webview sends no
+///   `Sec-Fetch-*` header at all — only `Origin: tauri://localhost`.
+///
+/// So the dividing line is the ORIGIN tier: ours (the webview, an allow-listed
+/// or env-added origin, a genuine same-origin request, or a non-browser client
+/// that sent no `Origin`) versus merely loopback. A page on
+/// `http://localhost:3000` passes the cross-site guard because it is loopback,
+/// but it is not the host-app and has no business rewriting the relay target.
+/// Nothing legitimate loses a capability: the only client that writes settings
+/// to this surface is the host-app webview, and the web console's `setSetting`
+/// goes to the WORKER (`updateSetting`), never here — confirmed in the built
+/// bundles, not just the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteTrust {
+    /// The Tauri webview, an allow-listed origin, a same-origin request, or a
+    /// non-browser client that sent no `Origin` at all.
+    Webview,
+    /// Passed the cross-site guard only because it is loopback. Not ours.
+    Loopback,
+}
+
+/// Pure, so it is unit-testable without a server. Fails closed: anything not
+/// positively recognised is [`WriteTrust::Loopback`].
+pub fn write_trust_with(
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    extra: &[String],
+) -> WriteTrust {
+    // A browser will not let a page forge Sec-Fetch-*, so `same-origin` is
+    // conclusive. `none` (a user-initiated navigation) cannot carry a GraphQL
+    // POST body from a page, so it is equally safe.
+    if matches!(sec_fetch_site, Some("same-origin") | Some("none")) {
+        return WriteTrust::Webview;
+    }
+    match origin {
+        // No Origin: the baked agent curls and local scripts. Same deliberate
+        // trade-off as the read side — see the module docs.
+        None => WriteTrust::Webview,
+        Some(origin)
+            if BUILTIN_ALLOWED_ORIGINS.contains(&origin)
+                || extra.iter().any(|allowed| allowed == origin) =>
+        {
+            WriteTrust::Webview
+        }
+        Some(_) => WriteTrust::Loopback,
+    }
+}
+
+pub fn write_trust_from_headers(headers: &axum::http::HeaderMap) -> WriteTrust {
+    let origin = headers.get(ORIGIN).and_then(|v| v.to_str().ok());
+    let sec_fetch_site = headers.get(&SEC_FETCH_SITE).and_then(|v| v.to_str().ok());
+    write_trust_with(origin, sec_fetch_site, extra_allowed_origins())
 }
 
 /// Wrap the host's routes in the CORS layer and the cross-site guard.
@@ -448,6 +535,65 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+
+    // ── write trust ───────────────────────────────────────────────────────
+
+    fn trust(origin: Option<&str>, sfs: Option<&str>) -> WriteTrust {
+        write_trust_with(origin, sfs, &[])
+    }
+
+    #[test]
+    fn the_webview_tier_may_write_connection_keys() {
+        // Production webview on Linux/macOS, which sends NO Sec-Fetch-* at all
+        // (WebKitGTK does not implement fetch metadata).
+        assert_eq!(trust(Some("tauri://localhost"), None), WriteTrust::Webview);
+        assert_eq!(trust(Some("http://tauri.localhost"), None), WriteTrust::Webview);
+        // host-app devUrl.
+        assert_eq!(trust(Some("http://localhost:4201"), None), WriteTrust::Webview);
+        // Baked agent curls / local scripts: no Origin at all.
+        assert_eq!(trust(None, None), WriteTrust::Webview);
+        assert_eq!(
+            trust(Some("http://127.0.0.1:7788"), Some("same-origin")),
+            WriteTrust::Webview
+        );
+    }
+
+    #[test]
+    fn a_bare_loopback_origin_is_demoted_for_connection_keys() {
+        // THE MEASURED PROBE: a page on localhost:3000 redirecting worker_url
+        // to the attacker so the host hands it the real `jk_` token.
+        assert_eq!(
+            trust(Some("http://localhost:3000"), Some("cross-site")),
+            WriteTrust::Loopback
+        );
+        assert_eq!(trust(Some("http://localhost:3000"), None), WriteTrust::Loopback);
+        // The web dev server may read via the host but never writes settings to
+        // it, so demoting it costs nothing.
+        assert_eq!(trust(Some("http://localhost:4200"), None), WriteTrust::Loopback);
+        assert_eq!(trust(Some("http://127.0.0.1:9999"), None), WriteTrust::Loopback);
+    }
+
+    #[test]
+    fn write_trust_fails_closed_for_anything_hostile() {
+        // These never reach a resolver (the middleware 403s them), but the trust
+        // value must not be the permissive one if that ever changes.
+        assert_eq!(trust(Some("https://evil.example"), Some("cross-site")), WriteTrust::Loopback);
+        assert_eq!(trust(Some("null"), None), WriteTrust::Loopback);
+    }
+
+    #[test]
+    fn an_env_allowed_origin_gets_the_webview_tier() {
+        let extra = vec!["https://console.example".to_string()];
+        assert_eq!(
+            write_trust_with(Some("https://console.example"), Some("cross-site"), &extra),
+            WriteTrust::Webview
+        );
+        assert_eq!(
+            write_trust_with(Some("http://localhost:3000"), Some("cross-site"), &extra),
+            WriteTrust::Loopback
+        );
     }
 
     #[test]
