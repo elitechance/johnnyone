@@ -64,6 +64,21 @@ Seven ops, each rooted at `files_root` and guarded per-path:
 - **Auth on every call** — the worker resolvers call
   `authorizeForAltToken(ctx, 'files:read' | 'files:write')`. Two new API scopes,
   `files:read` and `files:write`, were added to `worker/lib/auth/scopes.ts`.
+  `readHostFile` (the plan-workspace read, confined by the host to the plan's
+  `workspace_path`) is gated by `files:read` on the same helper.
+- **Settings are a separate, higher authority** — `getSetting` / `updateSetting`
+  relay the host `get_setting` / `set_setting` RPCs and are gated by
+  `settings:read` / `settings:write`. These are **not** folded into `files:*`:
+  settings include `files_root`, the root the path guard above is measured
+  against, so `settings:write` can move the boundary that `files:write` is
+  checked against and must never be satisfiable by `files:write`. The read side
+  is scoped too because `get_setting` can return webhook URLs and provider keys.
+  Identity alone is not enough here — a `jk_` key with an empty scope array
+  passes `requireIdentity`, which is why the scope call is mandatory.
+  Pinned by `worker/lib/auth/resolver-scope-audit.test.ts`, which asserts the
+  exact scope string per host-surface resolver (the identity-only
+  `resolver-auth-audit.test.ts` cannot see a missing scope, because its
+  classifier counts a bare `desktopRpc(`/`relayRpc(` call as safe).
 
 These invariants are each pinned by a dedicated `cargo test` (traversal, above-root,
 symlink escape, size caps, chunked-upload round-trip, camelCase wire contract) —
@@ -193,7 +208,10 @@ programmatic round-trips against a temp dir.
 | Shell provider confirmation | `desktop/.../providers/mod.rs`, `desktop/.../terminal.rs` |
 | GraphQL schema | `worker/schema/johnnyone-ai.graphql` |
 | Worker resolvers | `worker/resolvers/ai/files-*.ts`, `capture-terminal.ts` |
-| API scopes | `worker/lib/auth/scopes.ts` (`files:read`, `files:write`) |
+| Plan-workspace file read | `worker/resolvers/ai/read-host-file.ts` (`files:read`) → `desktop/.../services/agent_plans.rs` (`read_host_file`, `resolve_workspace_file_path`) |
+| Host settings read/write | `worker/resolvers/ai/get-setting.ts` (`settings:read`), `update-setting.ts` (`settings:write`) → host `get_setting` / `set_setting` |
+| API scopes | `worker/lib/auth/scopes.ts` (`files:read`, `files:write`, `settings:read`, `settings:write`) |
+| Per-resolver scope audit | `worker/lib/auth/resolver-scope-audit.test.ts` (`SCOPE_GATED`) |
 | Envelope + subscribe controls | `worker/lib/runtime/chat-relay-do.ts` |
 | ui client + types | `ui/src/services/johnny-api.service.ts`, `ui/src/models/stream-event.model.ts`, `ui/src/index.ts` |
 | ui stream service | `web/src/app/services/relay-terminal.service.ts` |

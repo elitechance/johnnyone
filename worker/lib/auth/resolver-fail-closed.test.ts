@@ -5,6 +5,7 @@ import { generateApiKey, sha256Hex } from './api-key';
 import { ForbiddenScopeError } from './scopes';
 import { authedCtx } from './test-authed-ctx';
 import * as desktopRpcMod from '../runtime/desktop-rpc';
+import * as relayRpcMod from '../runtime/relay-rpc';
 
 const SECRET = 'test-secret-for-phase-00';
 
@@ -332,5 +333,109 @@ describe('D1-direct identity (01-02)', () => {
     await expectUnauthenticated(onMsg.subscribe(null, { sessionId: 's1' }, ctx as any));
     await expectUnauthenticated(onDelta.subscribe(null, { relayId: 'r1' }, ctx as any));
     expect(pubsub.subscribe).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Host settings + plan-workspace-read scope enforcement (behavioural).
+ *
+ * The text audit in resolver-scope-audit.test.ts proves the gate is WRITTEN;
+ * these prove it FIRES. The hole being pinned: requireIdentity accepts a valid
+ * `jk_` key regardless of its scope array, so before the gates existed an
+ * empty-scope key could read and write host settings.
+ */
+describe('host settings + read-host-file scope enforcement', () => {
+  function keyCtx(g: { keyId: string; token: string }, keyHash: string, scopes: string[]) {
+    const row = {
+      id: g.keyId,
+      tenant_id: 't1',
+      user_id: 'u1',
+      key_hash: keyHash,
+      scopes: JSON.stringify(scopes),
+      revoked_at: null,
+      expires_at: null,
+      is_deleted: 0,
+    };
+    return {
+      db: stubDbForKey(row),
+      env: { CHAT_RELAY_DO: {} },
+      request: { headers: headers({ Authorization: `Bearer ${g.token}` }) },
+      auth: { isAuthenticated: false },
+    } as any;
+  }
+
+  async function newKeyCtx(scopes: string[]) {
+    const g = generateApiKey();
+    return keyCtx(g, await sha256Hex(g.secret), scopes);
+  }
+
+  async function expectForbiddenScope(p: Promise<unknown>, missing: string) {
+    let out: unknown = Symbol('no-return');
+    try {
+      out = await p;
+    } catch (e) {
+      expect(e).toBeInstanceOf(ForbiddenScopeError);
+      expect((e as any).code).toBe('FORBIDDEN_SCOPE');
+      expect((e as ForbiddenScopeError).missing).toBe(missing);
+      return;
+    }
+    throw new Error(`expected FORBIDDEN_SCOPE (${missing}), got ${JSON.stringify(out)}`);
+  }
+
+  it('updateSetting + jk_ holding files:read+files:write → FORBIDDEN_SCOPE (settings:write is NOT implied by files:write)', async () => {
+    const { default: updateSetting } = await import('../../resolvers/ai/update-setting');
+    // mockResolvedValue, not a bare spy: with the gate removed the relay call would
+    // SUCCEED, so the test fails with a clean `expected FORBIDDEN_SCOPE, got true`
+    // rather than an incidental TypeError from the stub env. The deny must come from
+    // the scope check, not from the fixture being under-built.
+    const spy = vi.spyOn(relayRpcMod, 'relayRpc').mockResolvedValue(true as any);
+    const ctx = await newKeyCtx(['files:read', 'files:write']);
+    await expectForbiddenScope(
+      updateSetting(null, { key: 'files_root', value: '/' } as any, ctx),
+      'settings:write',
+    );
+    // The point of the separation: a files:write key must not be able to move
+    // files_root, the root the host measures its own path confinement against.
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('getSetting + jk_ with an EMPTY scope array → FORBIDDEN_SCOPE (the exact hole that shipped)', async () => {
+    const { default: getSetting } = await import('../../resolvers/ai/get-setting');
+    const spy = vi.spyOn(relayRpcMod, 'relayRpc').mockResolvedValue('leaked-webhook-url' as any);
+    const ctx = await newKeyCtx([]);
+    await expectForbiddenScope(getSetting(null, { key: 'discord_webhook_url' } as any, ctx), 'settings:read');
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('readHostFile + jk_ without files:read → FORBIDDEN_SCOPE', async () => {
+    const { default: readHostFile } = await import('../../resolvers/ai/read-host-file');
+    const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValue({ content: 'leaked' } as any);
+    const ctx = await newKeyCtx(['plans:read']);
+    await expectForbiddenScope(
+      readHostFile(null, { planId: 'p1', path: 'plan/plan.md' } as any, ctx),
+      'files:read',
+    );
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('updateSetting + jk_ WITH settings:write reaches relayRpc', async () => {
+    const { default: updateSetting } = await import('../../resolvers/ai/update-setting');
+    const spy = vi.spyOn(relayRpcMod, 'relayRpc').mockResolvedValueOnce(true as any);
+    const ctx = await newKeyCtx(['settings:write']);
+    await updateSetting(null, { key: 'files_root', value: '/tmp' } as any, ctx);
+    expect(spy).toHaveBeenCalledWith(ctx, 'set_setting', { key: 'files_root', value: '/tmp' });
+    spy.mockRestore();
+  });
+
+  it('readHostFile + jk_ WITH files:read reaches desktopRpc', async () => {
+    const { default: readHostFile } = await import('../../resolvers/ai/read-host-file');
+    const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ ok: true } as any);
+    const ctx = await newKeyCtx(['files:read']);
+    await readHostFile(null, { planId: 'p1', path: 'plan/plan.md' } as any, ctx);
+    expect(spy).toHaveBeenCalledWith(ctx, 'read_host_file', { id: 'p1', path: 'plan/plan.md' });
+    spy.mockRestore();
   });
 });

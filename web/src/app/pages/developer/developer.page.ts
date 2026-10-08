@@ -23,16 +23,16 @@ import { copyOutline, keyOutline, refreshOutline, trashOutline } from 'ionicons/
 import { ApiKey, JohnnyApiService } from '@johnnyone/ui';
 import { firstValueFrom } from 'rxjs';
 import { AuthService } from '../../services/auth.service';
+import { API_SCOPES } from '../../../../../worker/lib/auth/scopes';
 
-/** Scopes a partner API key can carry (worker scopes.ts / runbook §M2M). */
-const ALL_SCOPES = [
-  'terminal:read',
-  'terminal:write',
-  'sessions:read',
-  'sessions:write',
-  'plans:read',
-  'plans:write',
-];
+/**
+ * Scopes a partner API key can carry. Sourced from the worker's canonical
+ * API_SCOPES rather than re-listed here: the previous hardcoded copy had
+ * already drifted (it was missing files:read / files:write), so a key created
+ * from this picker could not be granted scopes the resolvers enforce.
+ * createApiKey validates against the same list, so divergence is a dead end.
+ */
+const ALL_SCOPES: readonly string[] = API_SCOPES;
 
 /**
  * Developer console — in-app management for the partner API credentials:

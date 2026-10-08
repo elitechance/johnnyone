@@ -13,6 +13,14 @@ export const API_SCOPES = [
   'sessions:write',
   'files:read',
   'files:write',
+  // Host settings include `files_root` — the root that the host's own path
+  // confinement is measured against. settings:write is therefore strictly MORE
+  // privileged than files:write (it can move the boundary files:write is
+  // checked against) and must not be satisfiable by it, so it gets its own
+  // pair rather than folding into files:*. The read side is separate too
+  // because get_setting can return webhook URLs and provider keys.
+  'settings:read',
+  'settings:write',
 ] as const;
 
 export type ApiScope = (typeof API_SCOPES)[number];
