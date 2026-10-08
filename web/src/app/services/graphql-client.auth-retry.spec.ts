@@ -241,6 +241,183 @@ describe('GraphQLClient expired-token refresh + single replay', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  /**
+   * QA F1. `getAiSession`, `getPlanCheck` and `getTaskRun` are the schema's
+   * only three NULLABLE root fields (`worker/schema/johnnyone-ai.graphql:544`,
+   * `:551`, `:552`); every Mutation field is non-null, so an auth error there
+   * bubbles to the root and `data` is null outright. On those three queries it
+   * nullifies just that field, so the body arrives as
+   * `{data: {getAiSession: null}, errors: [...]}` — `data` is a non-null
+   * OBJECT, which the first cut of the partial-data rail read as "partial" and
+   * refused to retry. `getAiSession` is on the phone's hot path, i.e. exactly
+   * the surface this change exists to fix.
+   *
+   * Rule: a `data` object whose every own enumerable value is null carries no
+   * applied work, so it is not partial. One non-null field and it is.
+   */
+  describe('all-null data is not partial data (QA F1)', () => {
+    it('{data:{getAiSession:null}, errors:[UNAUTHENTICATED]} → one refresh, one replay', async () => {
+      const refresh = vi.fn(async () => {
+        localStorage.setItem('johnnyone_access_token', 'fresh-token');
+      });
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: { getAiSession: null },
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+        { body: { data: { getAiSession: { id: 's1' } } } },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(
+        firstValueFrom(client.query('query { getAiSession(id: "s1") { id } }')),
+      ).resolves.toEqual({ getAiSession: { id: 's1' } });
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('a nullable String root field (getPlanCheck) behaves the same', async () => {
+      const refresh = vi.fn(async () => {
+        localStorage.setItem('johnnyone_access_token', 'fresh-token');
+      });
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: { getPlanCheck: null },
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+        { body: { data: { getPlanCheck: 'green' } } },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(firstValueFrom(client.query('{ getPlanCheck }'))).resolves.toEqual({
+        getPlanCheck: 'green',
+      });
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('several root fields, ALL null → still retried', async () => {
+      const refresh = vi.fn(async () => undefined);
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: { getAiSession: null, getTaskRun: null },
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+        { body: { data: { getAiSession: null, getTaskRun: 'ok' } } },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(
+        firstValueFrom(client.query('{ getAiSession { id } getTaskRun }')),
+      ).resolves.toEqual({ getAiSession: null, getTaskRun: 'ok' });
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('MIXED data — one field applied, one nulled → still REFUSED (the rail must not loosen)', async () => {
+      const refresh = vi.fn(async () => undefined);
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: { a: 1, b: null },
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(firstValueFrom(client.query('{ a b }'))).rejects.toThrow(
+        /UNAUTHENTICATED/,
+      );
+      expect(refresh).toHaveBeenCalledTimes(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('a falsy-but-not-null applied value (0, "", false) still counts as applied → REFUSED', async () => {
+      const refresh = vi.fn(async () => undefined);
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: { count: 0, label: '', flag: false, missing: null },
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(
+        firstValueFrom(client.query('{ count label flag missing }')),
+      ).rejects.toThrow(/UNAUTHENTICATED/);
+      expect(refresh).toHaveBeenCalledTimes(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('an empty data object {} → retried (nothing was applied)', async () => {
+      const refresh = vi.fn(async () => undefined);
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: {},
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+        { body: { data: { health: 'ok' } } },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(firstValueFrom(client.query('{ health }'))).resolves.toEqual({
+        health: 'ok',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('a non-object data (scalar/array) with an auth error is treated as applied → REFUSED', async () => {
+      const refresh = vi.fn(async () => undefined);
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: [{ id: 1 }],
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(firstValueFrom(client.query('{ things }'))).rejects.toThrow(
+        /UNAUTHENTICATED/,
+      );
+      expect(refresh).toHaveBeenCalledTimes(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('a nested object under an all-null root field is NOT reached (only own top-level values count)', async () => {
+      // `{getAiSession: {id: null}}` means the session WAS resolved and its
+      // field nulled — the root field holds an object, so this is applied work.
+      const refresh = vi.fn(async () => undefined);
+      const { fetchMock } = queueFetch([
+        {
+          body: {
+            data: { getAiSession: { id: null } },
+            errors: [{ message: 'UNAUTHENTICATED', extensions: { code: 'UNAUTHENTICATED' } }],
+          },
+        },
+      ]);
+      const client = makeClient(refresh);
+
+      await expect(
+        firstValueFrom(client.query('{ getAiSession { id } }')),
+      ).rejects.toThrow(/UNAUTHENTICATED/);
+      expect(refresh).toHaveBeenCalledTimes(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('an auth error alongside PARTIAL data is NOT replayed (the write may have landed)', async () => {
     const refresh = vi.fn(async () => undefined);
     const { fetchMock } = queueFetch([

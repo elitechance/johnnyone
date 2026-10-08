@@ -251,7 +251,25 @@ export class GraphQLClient {
     }
     const result = (await response.json()) as GraphQLResponse<T>;
     if (result.errors?.length) {
-      throw new GraphQLRequestError(result.errors, result.data != null);
+      // NOTE (QA F2) — a known, accepted trade. This throw used to live in an
+      // rxjs `map`, so it only ran on subscribe. It now sits inside the eager
+      // promise behind `requestAt`, so a `query()`/`mutate()` whose observable
+      // is never subscribed raises an *unhandled rejection* instead of being
+      // silently dropped. Do NOT "fix" this by restructuring the eager/lazy
+      // split: `requestAt` deliberately preserves the request timing of the
+      // original `from(fetch(...))`, where the fetch also started on call
+      // rather than on subscribe, and chasing the rejection would change when
+      // every request in the app fires.
+      //
+      // Latent today, and measured rather than assumed: every `query()` /
+      // `mutate()` call in `web/` and `ui/` goes through
+      // `johnny-api.service.ts`, which returns the observable, and all of its
+      // consumers subscribe — 76 via `firstValueFrom(...)` and 24 via
+      // `.subscribe(...)`, with no site dropping the result. Because the fetch
+      // is eager, a new fire-and-forget call site would both leak a request
+      // and raise this rejection: give it a subscriber or a `.catch`. In a
+      // browser an unhandled rejection is a console error, not a crash.
+      throw new GraphQLRequestError(result.errors, hasAppliedData(result.data));
     }
     return result.data;
   }
@@ -324,7 +342,11 @@ export class GraphQLClient {
 export class GraphQLRequestError extends Error {
   constructor(
     public readonly errors: GraphQLError[],
-    /** True when the response carried data alongside the errors. */
+    /**
+     * True when the response carried data that reflects *applied* work — i.e.
+     * at least one root field came back non-null. An all-null `data` object is
+     * false: see `hasAppliedData`.
+     */
     public readonly hasPartialData = false,
   ) {
     super(errors.map((e) => e.message).join('; '));
@@ -361,14 +383,37 @@ export class HttpStatusError extends Error {
  * (`:64`) and `requireIdentity` swallows it again (`:95`), so that string never
  * reaches the client. It is matched anyway, cheaply, in case a host surfaces it.
  *
- * A *partial* response (data alongside the error) is never retried: part of the
- * operation may already have been applied, so replaying it could double a write.
+ * A response carrying *applied* data is never retried: part of the operation
+ * may already have been performed, so replaying it could double a write.
  */
 function isExpiredTokenError(error: unknown): boolean {
   if (error instanceof HttpStatusError) return error.status === 401;
   if (!(error instanceof GraphQLRequestError)) return false;
   if (error.hasPartialData) return false;
   return error.errors.some(isExpiredTokenGraphQLError);
+}
+
+/**
+ * Did this response carry work that was actually applied? (QA F1.)
+ *
+ * The three nullable root fields in the schema — `getAiSession`,
+ * `getPlanCheck`, `getTaskRun` (`worker/schema/johnnyone-ai.graphql:544`,
+ * `:551`, `:552`) — answer an `UNAUTHENTICATED` by nulling just that field, so
+ * the body is `{data: {getAiSession: null}, errors: [...]}`. `data` is then a
+ * non-null *object* that nonetheless reflects nothing applied, and `getAiSession`
+ * is on the phone's hot path. Reading `data != null` as "partial" blocked the
+ * retry exactly where it was most needed.
+ *
+ * So: `null`/absent `data`, or an object whose every own enumerable value is
+ * `null`, carries nothing and may be retried. One non-null value and it is
+ * applied work — including a falsy one like `0`, `''` or `false` — so the
+ * double-write protection is unchanged for every mixed response. A non-object
+ * `data` (scalar, array) is treated as applied, the conservative direction.
+ */
+function hasAppliedData(data: unknown): boolean {
+  if (data == null) return false;
+  if (typeof data !== 'object' || Array.isArray(data)) return true;
+  return Object.values(data as Record<string, unknown>).some((v) => v !== null);
 }
 
 function isExpiredTokenGraphQLError(error: GraphQLError): boolean {
