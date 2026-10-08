@@ -353,23 +353,22 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Refused on this surface — see [`provider_config_writes_refused`].
     async fn upsert_provider_config(
         &self,
-        ctx: &Context<'_>,
-        input: UpsertProviderConfigInputGql,
+        _ctx: &Context<'_>,
+        _input: UpsertProviderConfigInputGql,
     ) -> async_graphql::Result<GqlProviderConfig> {
-        let state = ctx.data_unchecked::<AppState>();
-        Ok(provider_service::upsert_provider_config(state, input.into())?.into())
+        Err(provider_config_writes_refused("upsertProviderConfig"))
     }
 
+    /// Refused on this surface — see [`provider_config_writes_refused`].
     async fn delete_provider_config(
         &self,
-        ctx: &Context<'_>,
-        provider: String,
+        _ctx: &Context<'_>,
+        _provider: String,
     ) -> async_graphql::Result<bool> {
-        let state = ctx.data_unchecked::<AppState>();
-        provider_service::delete_provider_config(state, provider)?;
-        Ok(true)
+        Err(provider_config_writes_refused("deleteProviderConfig"))
     }
 
     async fn detect_cli_tools(
@@ -461,6 +460,45 @@ impl MutationRoot {
         relay_service::ensure_connected(state).await?;
         Ok(true)
     }
+}
+
+
+/// Provider-config WRITES are refused outright on the host's GraphQL surface,
+/// which is unauthenticated and reachable from any loopback page in the user's
+/// browser (and, over `/graphql/ws`, from a graphql-transport-ws `subscribe`
+/// message — `async-graphql-7.2.1/src/schema.rs:606` executes any
+/// non-subscription operation there, so the socket is a second mutation entry
+/// point).
+///
+/// The reason this is refused rather than tiered like `setSetting`:
+/// `cli_path` BECOMES THE EXECUTED COMMAND (`providers/claude_code.rs:19`,
+/// `providers/ollama_cli.rs:14`, `providers/cline.rs:11` all do
+/// `cli_path.unwrap_or(<default>)` and run it), so a write here is local code
+/// execution on the next agent run — strictly worse than the credential theft
+/// the setting guards close.
+///
+/// Refusing costs nothing, because NOTHING writes provider configs over this
+/// surface. Verified against the built bundles, not the source:
+/// - `dist/host-app/browser/*.js` (the Tauri webview, the only client on this
+///   surface) contains zero occurrences of `upsertProviderConfig` /
+///   `deleteProviderConfig`. It only READS, via
+///   `{ listProviderConfigs { provider cliPath isAvailable defaultModel } }`
+///   (`chunk-DJ5NYM3W.js`), which still works.
+/// - `dist/web/browser/*.js` has both, but as
+///   `upsertProviderConfig(i){return this.gql.mutate(...)}` — `gql.mutate`
+///   targets the WORKER, never `queryPreferLocalHost`. The console's write
+///   therefore travels worker -> WS relay -> `agent/mod.rs:1313`
+///   `rpc_upsert_provider_config` -> `provider_service::upsert_provider_config`,
+///   which never reaches `graphql_handler`. That path is untouched.
+///
+/// The fields stay in the schema so the host keeps field-for-field parity with
+/// the worker's `ProviderConfig` surface; only execution is refused.
+fn provider_config_writes_refused(field: &str) -> async_graphql::Error {
+    async_graphql::Error::new(format!(
+        "{field}: provider configuration cannot be written over the host API \
+         (cliPath is executed). Use the JohnnyOne console, which routes through \
+         the authenticated worker relay."
+    ))
 }
 
 struct SubscriptionRoot;
@@ -1118,6 +1156,147 @@ mod router_tests {
         let text = body_text(res).await;
         assert!(!text.contains("jk_realsecret"), "token leaked: {text}");
         assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+    }
+
+    // ── provider configs ──────────────────────────────────────────────────
+    // `cli_path` BECOMES THE EXECUTED COMMAND (`providers/claude_code.rs:19`,
+    // `ollama_cli.rs:14`, `cline.rs:11`), so a write here is local code
+    // execution on the next agent run — strictly worse than the credential
+    // theft the setting guards close, and reachable by the identical route.
+
+    fn seed_provider(state: &AppState) {
+        crate::services::providers::upsert_provider_config(
+            state,
+            crate::db::models::UpsertProviderConfigInput {
+                provider: "claude_code".to_string(),
+                cli_path: Some("/usr/bin/claude".to_string()),
+                api_key: Some(String::new()),
+                default_model: Some(String::new()),
+                settings: Some("{}".to_string()),
+            },
+        )
+        .unwrap();
+    }
+
+    fn provider_cli_path(state: &AppState, provider: &str) -> String {
+        crate::services::providers::list_provider_configs(state)
+            .unwrap()
+            .into_iter()
+            .find(|config| config.provider == provider)
+            .map(|config| config.cli_path)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn attacker_cannot_repoint_a_provider_cli_path() {
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{upsertProviderConfig(input:{provider:"claude_code",cliPath:"/tmp/evil.sh"}){id}}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+        assert_eq!(
+            provider_cli_path(&probe, "claude_code"),
+            "/usr/bin/claude",
+            "the executed command was repointed"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_config_writes_are_refused_even_from_the_webview() {
+        // Unconditional on this surface, not merely tiered: nothing in either
+        // built bundle writes provider configs over HTTP, so there is no
+        // capability to preserve and no reason to leave the vector open to a
+        // local process that omits `Origin`.
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let probe = state.clone();
+        for origin in [Some("tauri://localhost"), None] {
+            let res = router(state.clone())
+                .oneshot(text_plain_post(
+                    origin,
+                    None,
+                    r#"mutation{upsertProviderConfig(input:{provider:"claude_code",cliPath:"/tmp/evil.sh"}){id}}"#,
+                ))
+                .await
+                .unwrap();
+            let text = body_text(res).await;
+            assert!(
+                text.contains("errors"),
+                "origin {origin:?} was allowed to write a provider config: {text}"
+            );
+        }
+        assert_eq!(provider_cli_path(&probe, "claude_code"), "/usr/bin/claude");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_provider_config_is_refused_on_the_http_surface() {
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let probe = state.clone();
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("http://localhost:3000"),
+                Some("cross-site"),
+                r#"mutation{deleteProviderConfig(provider:"claude_code")}"#,
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(text.contains("errors"), "expected a GraphQL error, got: {text}");
+        assert_eq!(
+            provider_cli_path(&probe, "claude_code"),
+            "/usr/bin/claude",
+            "the provider row was deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_webview_can_still_read_provider_configs() {
+        // The one thing the host-app actually needs from this surface, with the
+        // exact field set its built bundle requests
+        // (dist/host-app/browser/chunk-DJ5NYM3W.js).
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        let res = router(state)
+            .oneshot(text_plain_post(
+                Some("tauri://localhost"),
+                None,
+                "{ listProviderConfigs { provider cliPath isAvailable defaultModel } }",
+            ))
+            .await
+            .unwrap();
+        let text = body_text(res).await;
+        assert!(!text.contains("errors"), "read was refused: {text}");
+        assert!(text.contains("/usr/bin/claude"), "expected the config, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_relay_path_can_still_write_a_provider_config() {
+        // The console's real route: worker -> WS relay -> `rpc_upsert_provider_config`
+        // -> `provider_service::upsert_provider_config`, which never touches
+        // `graphql_handler`. This is what keeps provider editing working.
+        let (state, _root) = test_state();
+        seed_provider(&state);
+        crate::services::providers::upsert_provider_config(
+            &state,
+            crate::db::models::UpsertProviderConfigInput {
+                provider: "claude_code".to_string(),
+                cli_path: Some("/opt/claude".to_string()),
+                api_key: None,
+                default_model: None,
+                settings: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(provider_cli_path(&state, "claude_code"), "/opt/claude");
     }
 
     #[tokio::test]
