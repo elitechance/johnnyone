@@ -275,9 +275,17 @@ pub async fn reject_cross_site(req: Request, next: Next) -> Response {
 ///   (`host-app/src/app/services/host-auth.service.ts:88-89`) and its settings
 ///   save writes `worker_url` / `tenant_id` / `user_id`. Breaking login is
 ///   worse than the bug.
-/// - Requiring `Sec-Fetch-Site` breaks it too, on this platform: WebKitGTK does
-///   not implement fetch metadata, so the production webview sends no
-///   `Sec-Fetch-*` header at all — only `Origin: tauri://localhost`.
+/// - Requiring `Sec-Fetch-Site` does not help either, for a reason that does not
+///   depend on the platform: a `tauri://localhost` page calling
+///   `127.0.0.1:7788` is CROSS-SITE however the engine behaves, so it never
+///   takes the same-origin short-circuit and always falls through to the
+///   `Origin` allow-list, which therefore has to stand on its own.
+///   (A weaker claim lived here first — that WebKitGTK sends no `Sec-Fetch-*`
+///   at all. That is NOT established: `strings` on the installed WebKitGTK
+///   2.52.6 does contain `Sec-Fetch-Site`, though in what looks like the
+///   generated header-name table rather than an emit site. The conclusion
+///   above holds regardless, so do not reintroduce a fetch-metadata gate on
+///   the strength of the platform guess.)
 ///
 /// So the dividing line is the ORIGIN tier: ours (the webview, an allow-listed
 /// or env-added origin, a genuine same-origin request, or a non-browser client

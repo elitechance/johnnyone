@@ -1280,9 +1280,16 @@ mod router_tests {
 
     #[tokio::test]
     async fn the_relay_path_can_still_write_a_provider_config() {
-        // The console's real route: worker -> WS relay -> `rpc_upsert_provider_config`
-        // -> `provider_service::upsert_provider_config`, which never touches
-        // `graphql_handler`. This is what keeps provider editing working.
+        // Pins the SERVICE call the console's route ends in, so the outright HTTP
+        // refusal above cannot be mistaken for a global one.
+        //
+        // Be precise about what this does NOT cover: it calls
+        // `providers::upsert_provider_config` directly and never exercises the
+        // `"upsert_provider_config" =>` dispatch arm or `rpc_upsert_provider_config`,
+        // so it does not prove the worker -> WS relay -> RPC chain. That chain is
+        // verified by reading `agent/mod.rs:1310-1314`; nothing tests the relay
+        // dispatch table at all (62 `rpc_` fns, zero dispatch tests), which is
+        // worth fixing separately.
         let (state, _root) = test_state();
         seed_provider(&state);
         crate::services::providers::upsert_provider_config(
