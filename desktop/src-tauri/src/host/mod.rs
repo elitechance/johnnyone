@@ -23,7 +23,8 @@ use axum::{
     Router,
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::cors::{Any, CorsLayer};
+
+pub mod origin_guard;
 
 type JohnnyHostSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
@@ -32,20 +33,26 @@ pub fn router(state: AppState) -> Router {
         .data(state)
         .finish();
 
-    // CORS: the host's GraphQL is reached from the Tauri webview (any origin)
-    // and from local dev tools (e.g. host-app at :4201). Permissive by design —
-    // the host listens on localhost only, so external origins can't reach it
-    // anyway. Methods/headers must include everything async-graphql sends.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    Router::new()
-        .route("/graphql", get(graphql_playground).post(graphql_handler))
-        .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone()))
-        .layer(cors)
-        .with_state(schema)
+    // Binding `127.0.0.1` (main.rs) keeps other MACHINES out; it does not keep
+    // other WEB PAGES out — any site the user visits can fetch this
+    // unauthenticated surface from their own browser, and async-graphql parses a
+    // CORS-simple `text/plain` POST as JSON, so there is not even a preflight to
+    // fail. `origin_guard::guard_layers` therefore rejects a request whose
+    // `Origin` is neither the webview's nor loopback's, and the CORS layer it
+    // installs reuses the SAME predicate so `access-control-allow-origin: *` is
+    // never echoed.
+    //
+    // What this buys: a page on `https://evil.example` can no longer drive or
+    // read the host API. What it does NOT buy: anything against a non-browser
+    // local attacker — a request with no `Origin` is allowed on purpose so the
+    // baked agent `curl`s keep working, and a local process can omit `Origin`
+    // just as easily. See `origin_guard`'s module docs.
+    origin_guard::guard_layers(
+        Router::new()
+            .route("/graphql", get(graphql_playground).post(graphql_handler))
+            .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone())),
+    )
+    .with_state(schema)
 }
 
 async fn graphql_handler(
@@ -124,7 +131,18 @@ impl QueryRoot {
             .collect())
     }
 
+    /// Read one setting. The key is filtered against
+    /// `settings_service::READABLE_SETTING_KEYS` because this surface is
+    /// UNAUTHENTICATED: without the filter an arbitrary key reached
+    /// `access_token`, which for a `jk_` credential is a durable worker API key
+    /// that never expires (`services/relay.rs::refresh_access_token`). Same
+    /// curated-projection idea as `host_settings` below.
     async fn get_setting(&self, ctx: &Context<'_>, key: String) -> async_graphql::Result<String> {
+        if !settings_service::is_readable_setting_key(&key) {
+            return Err(async_graphql::Error::new(format!(
+                "getSetting: {key:?} is not readable over the host API"
+            )));
+        }
         let state = ctx.data_unchecked::<AppState>();
         Ok(settings_service::get_setting(state, key)?)
     }
@@ -514,7 +532,15 @@ impl From<ProviderConfig> for GqlProviderConfig {
             id: value.id,
             provider: value.provider,
             cli_path: value.cli_path,
-            api_key: value.api_key,
+            // Never leave the host. The field stays in the schema for parity
+            // with the worker's `ProviderConfig`, but nothing in the clients
+            // reads it: `ui/src/services/johnny-api.service.ts:726,765` only
+            // SELECTS it, `host-app/src/app/services/host-status.service.ts:110`
+            // asks for `provider cliPath isAvailable defaultModel`, and there is
+            // no `.apiKey` consumer anywhere in `ui/`, `web/` or `host-app/`.
+            // This surface is unauthenticated, so cleartext here is the same
+            // leak class as `getSetting("access_token")`.
+            api_key: String::new(),
             default_model: value.default_model,
             settings: value.settings,
             is_available: value.is_available,

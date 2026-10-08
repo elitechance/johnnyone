@@ -23,6 +23,10 @@ pub const KEY_INITIATIVES_DIR: &str = "initiatives_dir";
 /// store). Absolute, user-configurable via the existing `get_setting`/`set_setting` surface — no
 /// dedicated command.
 pub const KEY_FILES_ROOT: &str = "files_root";
+/// Last directory a terminal session was opened in. Seeded by
+/// `migrations/001_initial.sql` and read back by the console's launcher
+/// (`web/src/app/components/launcher-menu/launcher-menu.component.ts:87`).
+pub const KEY_LAST_WORKING_DIRECTORY: &str = "last_working_directory";
 
 pub const DEFAULT_WORKER_URL: &str = "https://johnnyone.ethan-353.workers.dev";
 pub const DEFAULT_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -489,9 +493,114 @@ pub(crate) fn normalize_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Setting keys that `getSetting` may return over the host's UNAUTHENTICATED
+/// GraphQL surface (`host/mod.rs`).
+///
+/// A strict ALLOW-list, not a deny-list. `settings` is a free-form key→value
+/// table that already holds two credentials (`access_token`, `refresh_token`,
+/// and a `jk_` access token is a durable API key that never expires — see
+/// `services/relay.rs::refresh_access_token`). A deny-list would have to
+/// predict the name of every secret anyone ever adds to that table; this list
+/// only has to keep pace with the keys the UI reads, which are enumerable from
+/// the client source. A miss here fails loudly with the key named, which is
+/// diagnosable; a deny-list miss silently exfiltrates a credential.
+///
+/// `settings.key` is a plain `TEXT PRIMARY KEY` (`migrations/001_initial.sql`),
+/// so SQLite looks it up with BINARY collation — a case variant cannot read a
+/// row this list rejects.
+///
+/// Evidence for each entry:
+/// - `initiatives_dir`, `files_root` —
+///   `host-app/src/app/services/host-settings.service.ts:50-51`;
+///   `files_root` also `web/src/app/pages/files/files.page.ts:160`.
+/// - `discord_webhook_url` — `web/src/app/pages/settings/settings.page.ts:50,120`.
+/// - `last_working_directory` —
+///   `web/src/app/components/launcher-menu/launcher-menu.component.ts:87` and
+///   `web/src/app/pages/terminal/terminal.page.ts:3664`.
+/// - the remaining six are already returned verbatim by the curated
+///   `hostSettings` projection (`GqlHostSettings` in `host/mod.rs`), which
+///   deliberately omits `access_token`, so listing them adds no exposure.
+pub const READABLE_SETTING_KEYS: &[&str] = &[
+    KEY_WORKER_URL,
+    KEY_TENANT_ID,
+    KEY_USER_ID,
+    KEY_PLANNER_METHODOLOGY_PATH,
+    KEY_PLANNER_CONVENTIONS_PATH,
+    KEY_WEB_CLIENT_URL,
+    KEY_DISCORD_WEBHOOK_URL,
+    KEY_INITIATIVES_DIR,
+    KEY_FILES_ROOT,
+    KEY_LAST_WORKING_DIRECTORY,
+];
+
+/// Whether `getSetting` may return this key over the host API.
+pub fn is_readable_setting_key(key: &str) -> bool {
+    READABLE_SETTING_KEYS.contains(&key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_setting_keys_are_not_readable_over_the_host_api() {
+        assert!(!is_readable_setting_key(KEY_ACCESS_TOKEN));
+        assert!(!is_readable_setting_key(KEY_REFRESH_TOKEN));
+    }
+
+    #[test]
+    fn unknown_and_secret_looking_keys_are_not_readable() {
+        for key in [
+            "default_provider",
+            "theme",
+            "openrouter_api_key",
+            "anthropic_secret",
+            "some_password",
+            "GITHUB_TOKEN",
+            "",
+        ] {
+            assert!(
+                !is_readable_setting_key(key),
+                "{key:?} must not be readable over the unauthenticated host API"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_the_ui_actually_requests_are_readable() {
+        // getSetting call sites: host-settings.service.ts:50-51,
+        // web settings.page.ts:120 (discord_webhook_url), web files.page.ts:160,
+        // web launcher-menu.component.ts:87 + terminal.page.ts:3664.
+        for key in [
+            KEY_INITIATIVES_DIR,
+            KEY_FILES_ROOT,
+            KEY_DISCORD_WEBHOOK_URL,
+            KEY_LAST_WORKING_DIRECTORY,
+        ] {
+            assert!(is_readable_setting_key(key), "{key:?} must stay readable");
+        }
+        // Already exposed verbatim by the curated `hostSettings` projection, so
+        // listing them here adds no exposure.
+        for key in [
+            KEY_WORKER_URL,
+            KEY_TENANT_ID,
+            KEY_USER_ID,
+            KEY_PLANNER_METHODOLOGY_PATH,
+            KEY_PLANNER_CONVENTIONS_PATH,
+            KEY_WEB_CLIENT_URL,
+        ] {
+            assert!(is_readable_setting_key(key), "{key:?} must stay readable");
+        }
+    }
+
+    #[test]
+    fn the_filter_is_case_sensitive_like_the_sqlite_lookup() {
+        // `settings.key` is a plain TEXT PRIMARY KEY (001_initial.sql:57-60), so
+        // lookups use BINARY collation. A case variant must not slip through.
+        assert!(!is_readable_setting_key("ACCESS_TOKEN"));
+        assert!(!is_readable_setting_key("Access_Token"));
+        assert!(!is_readable_setting_key("FILES_ROOT"));
+    }
 
     #[test]
     fn resolve_relative_path_against_workspace() {
