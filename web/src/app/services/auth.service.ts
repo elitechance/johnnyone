@@ -1,3 +1,4 @@
+import { Location } from '@angular/common';
 import { Injectable, OnDestroy, inject, signal } from '@angular/core';
 import { Router } from '@angular/router';
 import {
@@ -7,6 +8,7 @@ import {
   shouldRefreshNow,
   timerDelayMs,
 } from './auth-session-logic';
+import { loginUrlWithReturn } from './return-url-logic';
 
 export interface AuthUser {
   id: string;
@@ -25,6 +27,9 @@ interface AuthPayload {
 }
 
 export type RefreshFailureKind = 'auth' | 'transport';
+
+/** Why a logout happened. Only `'expired'` remembers the current URL. */
+export type LogoutReason = 'user' | 'expired';
 
 /** Classified refresh failure so callers can distinguish credential death from a blip (D8). */
 export class RefreshFailure extends Error {
@@ -66,6 +71,13 @@ export class AuthService implements OnDestroy {
   private static readonly TIMER_BACKOFF_MAX_MS = 60_000;
 
   private readonly router = inject(Router);
+
+  /**
+   * The **browser** address bar, read via the same seam `Router.initialNavigation()`
+   * itself uses (`location.path(true)`). Not interchangeable with `Router.url`:
+   * see `currentBrowserUrl()`.
+   */
+  private readonly location = inject(Location);
 
   /**
    * Writable session flag. Initial value is conservative; `syncAuthState()` /
@@ -138,7 +150,18 @@ export class AuthService implements OnDestroy {
     this.saveAuth(json.data.login);
   }
 
-  logout(): void {
+  /**
+   * Clear the session and go to `/login`.
+   *
+   * `reason` decides whether the page the user was on is remembered:
+   * - `'user'` (default) — a deliberate sign-out. Signing out and then being
+   *   dropped back where you were on the next sign-in is wrong, so nothing is
+   *   captured. The two user-initiated call sites (settings, terminal) pass
+   *   nothing and keep this behaviour.
+   * - `'expired'` — the session died underneath the user. Keep the current URL
+   *   as `returnUrl` so sign-in returns them to it.
+   */
+  logout(reason: LogoutReason = 'user'): void {
     this.clearRefreshTimer();
     localStorage.removeItem(AuthService.TOKEN_KEY);
     localStorage.removeItem(AuthService.REFRESH_TOKEN_KEY);
@@ -148,7 +171,33 @@ export class AuthService implements OnDestroy {
     localStorage.removeItem(AuthService.EXPIRES_IN_KEY);
     this.syncAuthState();
     this.currentUser.set(null);
-    void this.router.navigateByUrl('/login');
+    void this.router.navigateByUrl(
+      reason === 'expired' ? loginUrlWithReturn(this.currentBrowserUrl()) : '/login',
+    );
+  }
+
+  /**
+   * The URL the user is actually looking at, from the address bar.
+   *
+   * **Deliberately not `Router.url`.** `startSession()` runs inside
+   * `provideAppInitializer`, which is awaited before the root component
+   * bootstraps, so on a full reload of a deep URL the router has not read the
+   * address bar yet and `Router.url` is `'/'` (its `currentUrlTree` is still a
+   * bare `new UrlTree()`). And it never will read it: `initialNavigation()` is
+   * gated on `!hasRequestedNavigation`, which the logout's own `navigateByUrl`
+   * closes by bumping `navigationId` to 1 — so no `CanActivateFn` ever sees the
+   * deep URL and the guard cannot compensate. `Location.path(true)` is the one
+   * source that is correct both at bootstrap and mid-session (the router keeps
+   * the address bar in step as it navigates), so the expiry path reads it for
+   * both triggers rather than branching on which one fired. `true` keeps the
+   * hash.
+   */
+  private currentBrowserUrl(): string {
+    try {
+      return this.location.path(true);
+    } catch {
+      return '';
+    }
   }
 
   getAccessToken(): string | null {
@@ -224,7 +273,7 @@ export class AuthService implements OnDestroy {
       if (hasRefresh && (!token || expired || past80)) {
         await this.ensureFreshToken(apiUrl);
       } else if (token && expired && !hasRefresh) {
-        this.logout();
+        this.logout('expired');
       }
     } catch {
       this.syncAuthState();
@@ -383,7 +432,7 @@ export class AuthService implements OnDestroy {
     } catch (error) {
       this.syncAuthState();
       if (classifyRefreshFailure(error) === 'auth') {
-        this.logout();
+        this.logout('expired');
         throw error instanceof RefreshFailure
           ? error
           : new RefreshFailure('auth', error instanceof Error ? error.message : String(error), {
