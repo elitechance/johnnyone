@@ -15,6 +15,7 @@ import {
 } from '@ionic/angular/standalone';
 import { GRAPHQL_API_URL } from '@johnnyone/ui';
 import { AuthService } from '../../services/auth.service';
+import { safeReturnUrl } from '../../services/return-url-logic';
 
 @Component({
   selector: 'app-login-page',
@@ -60,8 +61,13 @@ export class LoginPage {
         this.password(),
         this.tenantId().trim(),
       );
-      const returnUrl =
-        this.route.snapshot.queryParamMap.get('returnUrl') || '/chat';
+      // `returnUrl` is attacker-controllable (it is just a query param), so it
+      // is validated down to an in-app path before use. This is defence in
+      // depth rather than a fix for a live hole: `navigateByUrl` serializes
+      // through a `UrlTree` and so cannot leave the origin on its own. The
+      // check is what keeps that true if this line ever becomes a raw
+      // `window.location` assignment.
+      const returnUrl = safeReturnUrl(this.route.snapshot.queryParamMap.get('returnUrl'));
       await this.router.navigateByUrl(returnUrl);
     } catch (err) {
       this.error.set(err instanceof Error ? err.message : String(err));
