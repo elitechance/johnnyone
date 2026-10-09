@@ -238,7 +238,20 @@ pub async fn archive_session(state: &AppState, id: String) -> Result<Session, St
 }
 
 pub async fn delete_session(state: &AppState, id: String) -> Result<bool, String> {
-    // Same two-cleanup pattern as archive — see archive_session for rationale.
+    // NOT the same two-cleanup pattern as archive, despite what this comment used to claim.
+    // `archive_session` above reads `attached_tmux` and SKIPS `kill_terminal_session` for an attached
+    // session so it never touches the user's own tmux. This function has no such guard: it calls
+    // `kill_terminal_session` unconditionally. Recorded, not fixed, because it is currently
+    // unreachable as a real hazard — `tmux_session_name` (`crate::terminal`, ~line 1388) is
+    // unconditionally `johnnyone_<id>` and never reads the stored external name, so neither path can
+    // kill an external session like `kloo` or `j1`. The missing guard only becomes a live bug the day
+    // `tmux_session_name` learns about external names; if you add a delete affordance, or teach it,
+    // add the `attached_tmux` check here first.
+    //
+    // Separately: do not route a UI "clear" through here. `record_agent_report`
+    // (`agent_plans.rs:3625`) accepts narration from a non-plan session only while the ROW exists
+    // (`session_exists`, `agent_plans.rs:4160`, has no status filter), so deleting a row breaks
+    // `reportAgentResult` for that id permanently. `/shells` archives for exactly this reason.
     {
         let mut processes = state.active_processes.lock().await;
         if let Some(mut proc) = processes.remove(&id) {

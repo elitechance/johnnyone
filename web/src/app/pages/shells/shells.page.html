@@ -2,6 +2,14 @@
   <ion-toolbar>
     <ion-title>Shells</ion-title>
     <ion-buttons slot="end">
+      @if (shells().length > 0) {
+        <ion-button fill="clear" color="medium" size="small" title="Clear the shell list" aria-label="Clear the shell list" [disabled]="busy()" (click)="clearAll()">
+          Clear
+        </ion-button>
+      }
+      <ion-button fill="clear" color="medium" size="small" title="Refresh" aria-label="Refresh" [disabled]="busy()" (click)="refresh()">
+        <ion-icon slot="icon-only" name="refresh-outline"></ion-icon>
+      </ion-button>
       <ion-button fill="solid" color="primary" size="small" (click)="openLauncher($event)">
         <ion-icon slot="start" name="add-outline"></ion-icon>
         New
@@ -11,6 +19,12 @@
 </ion-header>
 
 <ion-content>
+  <!-- Pull-to-refresh: this is a phone surface first. `handleRefresh` completes the refresher in a
+       `finally`, so a failed load cannot leave the spinner stuck. -->
+  <ion-refresher slot="fixed" (ionRefresh)="handleRefresh($event)">
+    <ion-refresher-content></ion-refresher-content>
+  </ion-refresher>
+
   <div class="shells">
     @if (loadError()) {
       <div class="shells-error">{{ loadError() }}</div>
@@ -40,6 +54,7 @@
               <div class="sub">{{ formatRelTime((s.updatedAt || s.createdAt), nowIso()) }}</div>
             </div>
             <div class="act">Open ▸</div>
+            <button type="button" class="ia danger" title="Clear this shell" aria-label="Clear this shell" [disabled]="busy()" (click)="clearOne(s); $event.stopPropagation()">✕</button>
           </div>
         }
       }

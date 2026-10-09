@@ -376,6 +376,20 @@ export interface ChatAttachment {
 @Injectable({ providedIn: 'root' })
 export class JohnnyApiService {
   private readonly gql = inject(GraphQLClient);
+  /**
+   * The ONE `AiSession` selection set. It was duplicated seven times inline and had drifted:
+   * `attachedTmux` was present in the list/get/create copies but MISSING from the archive/title/
+   * workingDirectory/provider mutations, so those mutations returned a session whose `attachedTmux`
+   * was `undefined`. Nothing depended on it (every caller re-fetches), but the latent bug was real:
+   * patch a local list from one of those results instead of re-fetching and `isShellSession`
+   * (`web/.../shells-page-logic.ts`) drops the row — attached shells silently vanish from `/shells`
+   * until a reload. Selected once here so it cannot drift again.
+   */
+  private readonly sessionFields = `
+    id title provider model workingDirectory status
+    totalInputTokens totalOutputTokens totalCostCents
+    createdAt updatedAt attachedTmux
+  `;
   private readonly agentPlanRunFields = `
     plan {
       id runType title workspacePath planPath status workerSessionId reviewerSessionId
@@ -403,13 +417,8 @@ export class JohnnyApiService {
   // ── Sessions ──────────────────────────────────────────────────────────
 
   listSessions(status?: string): Observable<AiSession[]> {
-    const sessionFields = `
-      id title provider model workingDirectory status
-      totalInputTokens totalOutputTokens totalCostCents
-      createdAt updatedAt attachedTmux
-    `;
     const query = `query ListSessions($status: String) {
-      listAiSessions(status: $status) { ${sessionFields} }
+      listAiSessions(status: $status) { ${this.sessionFields} }
     }`;
 
     return this.gql
@@ -443,13 +452,8 @@ export class JohnnyApiService {
   }
 
   getSession(id: string): Observable<AiSession> {
-    const sessionFields = `
-      id title provider model workingDirectory status
-      totalInputTokens totalOutputTokens totalCostCents
-      createdAt updatedAt attachedTmux
-    `;
     const query = `query GetSession($id: ID!) {
-      getAiSession(id: $id) { ${sessionFields} }
+      getAiSession(id: $id) { ${this.sessionFields} }
     }`;
 
     return this.gql
@@ -473,9 +477,7 @@ export class JohnnyApiService {
       .mutate<{ createAiSession: AiSession }>(
         `mutation CreateAiSession($input: CreateAiSessionInput!) {
           createAiSession(input: $input) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt attachedTmux
+            ${this.sessionFields}
           }
         }`,
         { input }
@@ -488,9 +490,7 @@ export class JohnnyApiService {
       .mutate<{ updateAiSessionTitle: AiSession }>(
         `mutation UpdateAiSessionTitle($id: ID!, $title: String!) {
           updateAiSessionTitle(id: $id, title: $title) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
+            ${this.sessionFields}
           }
         }`,
         { id, title }
@@ -503,9 +503,7 @@ export class JohnnyApiService {
       .mutate<{ updateAiSessionWorkingDirectory: AiSession }>(
         `mutation UpdateAiSessionWorkingDirectory($id: ID!, $workingDirectory: String!) {
           updateAiSessionWorkingDirectory(id: $id, workingDirectory: $workingDirectory) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
+            ${this.sessionFields}
           }
         }`,
         { id, workingDirectory }
@@ -518,9 +516,7 @@ export class JohnnyApiService {
       .mutate<{ updateAiSessionProvider: AiSession }>(
         `mutation UpdateAiSessionProvider($id: ID!, $provider: String!) {
           updateAiSessionProvider(id: $id, provider: $provider) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
+            ${this.sessionFields}
           }
         }`,
         { id, provider }
@@ -533,9 +529,7 @@ export class JohnnyApiService {
       .mutate<{ updateAiSessionArchived: AiSession }>(
         `mutation UpdateAiSessionArchived($id: ID!) {
           updateAiSessionArchived(id: $id) {
-            id title provider model workingDirectory status
-            totalInputTokens totalOutputTokens totalCostCents
-            createdAt updatedAt
+            ${this.sessionFields}
           }
         }`,
         { id }
