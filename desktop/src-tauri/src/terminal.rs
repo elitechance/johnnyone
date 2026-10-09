@@ -1,3 +1,4 @@
+use crate::db::Database;
 use crate::events::TerminalScreenEvent;
 use crate::providers::CliProvider;
 use crate::state::app_state::AppState;
@@ -12,6 +13,16 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
+
+/// The one SET clause that detaches a terminal row, shared by every path that writes it.
+///
+/// Three callers now agree on it: [`kill_terminal_session`], the capture loop's failure break, and
+/// the batched [`demote_terminal_rows`]. Hoisted rather than left as three literals because they
+/// had already drifted — the capture-failure write cleared `terminal_status` but NOT
+/// `tmux_pane_id`, so a row sat `'detached'` while still naming a dead pane until the next host
+/// restart reconciled it. A detached row must never carry a pane id.
+const DETACH_TERMINAL_SET: &str =
+    "terminal_status = 'detached', tmux_pane_id = NULL, updated_at = datetime('now')";
 
 const INBOX_DIR: &str = ".johnnyone/inbox";
 /// Multiline or long prompts are written to a file and a one-line handoff is
@@ -250,15 +261,7 @@ pub async fn send_terminal_keys(
     }
     let terminal = ensure_terminal_session_for_input(state, &session_id).await?;
 
-    let mut args = vec![
-        "send-keys".to_string(),
-        "-t".to_string(),
-        terminal.pane_id.clone(),
-        // Keys may look like options (a literal `-`), so stop option parsing first.
-        "--".to_string(),
-    ];
-    args.extend(keys.iter().cloned());
-    run_tmux(args).await?;
+    run_tmux(send_keys_named_args(&terminal.pane_id, keys)).await?;
 
     state
         .terminal_last_input_at
@@ -319,15 +322,174 @@ pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result
         .map(|_| ())?;
     }
 
-    state.db.with_conn(|conn| {
+    detach_terminal_row(&state.db, session_id)?;
+
+    Ok(())
+}
+
+/// One row whose `terminal_status` claims `'attached'`, as startup reconciliation reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedTerminalRow {
+    pub session_id: String,
+    pub attached_tmux: bool,
+    pub tmux_session_name: Option<String>,
+}
+
+/// Which rows' `terminal_status = 'attached'` is a lie, given the tmux session names that exist.
+///
+/// Pure, because the failure mode worth pinning is mass-demoting the user's live shells. The
+/// question asked of every row is the same one `ensure_terminal_session` asks — "does a tmux
+/// session with EXACTLY this name exist right now?" — so an owned `johnnyone_<id>` row and a row
+/// attached to the user's external tmux need no separate rules: an owned session's tmux is always
+/// gone after a host restart and so always answers no, while the user's `kloo` may legitimately
+/// still be running and so answers yes. One rule, two outcomes.
+///
+/// `live_names = None` means tmux could not be ASKED (no binary, no server) — the `Err` arm of
+/// [`tmux_session_names`], deliberately distinct from `Ok(names)` not containing a name. Then
+/// NOTHING is demoted: wiping every row because the tmux server happened to be down would be
+/// strictly worse than the stale bookkeeping this exists to clear.
+fn terminal_rows_to_demote(
+    rows: &[AttachedTerminalRow],
+    live_names: Option<&[String]>,
+) -> Vec<String> {
+    let Some(live) = live_names else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter(|row| {
+            match expected_tmux_session_name(row) {
+                // An attached row with no usable name can never be captured (`resolve_tmux_target`
+                // errors on it), so its 'attached' is unconditionally stale.
+                None => true,
+                // Exact string equality, never tmux's target parser: `has-session -t kloo`
+                // prefix-matches and would rescue a row whose session had already exited.
+                Some(name) => !live.iter().any(|candidate| *candidate == name),
+            }
+        })
+        .map(|row| row.session_id.clone())
+        .collect()
+}
+
+/// The tmux session name a row's terminal lives under — the same derivation
+/// [`resolve_tmux_target`] performs, over the raw row instead of a loaded `SessionConfig`.
+fn expected_tmux_session_name(row: &AttachedTerminalRow) -> Option<String> {
+    if row.attached_tmux {
+        row.tmux_session_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+    } else {
+        Some(tmux_session_name(&row.session_id))
+    }
+}
+
+/// Detach ONE terminal row: the end state every detach path must produce.
+///
+/// The seam both live-process detach paths share, so neither can drift from the other or from the
+/// startup reconciler. Takes `&Database` rather than `&AppState` because the capture loop holds
+/// only a cloned `Database`.
+fn detach_terminal_row(db: &Database, session_id: &str) -> Result<(), String> {
+    db.with_conn(|conn| {
         conn.execute(
-            "UPDATE sessions SET terminal_status = 'detached', tmux_pane_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+            &format!("UPDATE sessions SET {DETACH_TERMINAL_SET} WHERE id = ?1"),
             params![session_id],
         )
         .map_err(|e| e.to_string())
+    })
+    .map(|_| ())
+}
+
+/// Write the demotion: `terminal_status = 'detached'`, `tmux_pane_id = NULL`, nothing else.
+///
+/// One batched statement per chunk, not one round trip per row. Chunked under SQLite's default
+/// 999-parameter ceiling so a long-lived database cannot overflow the statement. Separate from
+/// [`reconcile_terminal_status_on_startup`] so the SQL can be exercised against a real database
+/// without a tmux server deciding the outcome.
+fn demote_terminal_rows(state: &AppState, session_ids: &[String]) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    state.db.with_conn(|conn| {
+        for chunk in session_ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            conn.execute(
+                &format!(
+                    "UPDATE sessions SET {DETACH_TERMINAL_SET} WHERE id IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(chunk.iter()),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+/// Reconcile `terminal_status` against reality once, at host startup.
+///
+/// Nothing in the running system ever demoted a row that was not re-subscribed: the only writes of
+/// `'detached'` are [`kill_terminal_session`] and the capture loop's failure break, both driven by a
+/// live process. A host restart kills every `johnnyone_*` pane without running either, so rows
+/// accumulate claiming `'attached'` forever and `terminal_status` stops meaning anything. This is
+/// the missing reconcile-on-startup pass.
+///
+/// Touches `terminal_status` and `tmux_pane_id` only — the same end state `kill_terminal_session`
+/// writes. Never `status`; nothing is archived or deleted.
+///
+/// Returns the number of rows demoted.
+pub async fn reconcile_terminal_status_on_startup(state: &AppState) -> Result<usize, String> {
+    let rows: Vec<AttachedTerminalRow> = state.db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, attached_tmux, tmux_session_name FROM sessions WHERE terminal_status = 'attached'",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AttachedTerminalRow {
+                    session_id: row.get::<_, String>(0)?,
+                    attached_tmux: row.get::<_, i64>(1)? != 0,
+                    tmux_session_name: row.get::<_, Option<String>>(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
     })?;
 
-    Ok(())
+    // A clean boot never shells out to tmux and never logs.
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let live = match tmux_session_names().await {
+        Ok(names) => names,
+        Err(error) => {
+            // Not a clean boot and not silent: say why nothing was reconciled.
+            tracing::warn!(
+                attached_rows = rows.len(),
+                %error,
+                "tmux could not be asked which sessions exist; left terminal_status untouched"
+            );
+            return Ok(0);
+        }
+    };
+
+    let stale = terminal_rows_to_demote(&rows, Some(&live));
+    if stale.is_empty() {
+        return Ok(0);
+    }
+
+    demote_terminal_rows(state, &stale)?;
+
+    tracing::info!(
+        demoted = stale.len(),
+        attached_rows = rows.len(),
+        live_tmux_sessions = live.len(),
+        "Reconciled stale terminal_status='attached' rows to detached at startup"
+    );
+    Ok(stale.len())
 }
 
 pub async fn capture_terminal_session(
@@ -589,13 +751,9 @@ async fn start_capture_loop(
                         error = %error,
                         "terminal capture failed"
                     );
-                    let _ = db.with_conn(|conn| {
-                        conn.execute(
-                            "UPDATE sessions SET terminal_status = 'detached', updated_at = datetime('now') WHERE id = ?1",
-                            params![&terminal.session_id],
-                        )
-                        .map_err(|e| e.to_string())
-                        });
+                    // Same end state as `kill_terminal_session`: a detached row must not keep a
+                    // pane id pointing at the pane that just died.
+                    let _ = detach_terminal_row(&db, &terminal.session_id);
                     break;
                 }
             }
@@ -849,22 +1007,9 @@ async fn create_tmux_session(
             for line in setup.lines() {
                 let trimmed = line.trim_end();
                 if !trimmed.is_empty() {
-                    run_tmux(vec![
-                        "send-keys".to_string(),
-                        "-t".to_string(),
-                        pane_id.clone(),
-                        "-l".to_string(),
-                        trimmed.to_string(),
-                    ])
-                    .await?;
+                    run_tmux(send_keys_literal_args(&pane_id, trimmed)).await?;
                 }
-                run_tmux(vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    pane_id.clone(),
-                    "Enter".to_string(),
-                ])
-                .await?;
+                run_tmux(send_keys_named_args(&pane_id, &["Enter".to_string()])).await?;
             }
             // Boot delay for any agent CLI launched by the setup commands.
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
@@ -1296,15 +1441,7 @@ async fn send_single_line_input(
     for segment in input.split_inclusive('\r') {
         let text = segment.trim_end_matches('\r');
         if !text.is_empty() {
-            run_tmux(vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                pane_id.to_string(),
-                "-l".to_string(),
-                "--".to_string(),
-                text.to_string(),
-            ])
-            .await?;
+            run_tmux(send_keys_literal_args(pane_id, text)).await?;
         }
         if segment.ends_with('\r') && submit {
             if provider == CliProvider::Codex {
@@ -1326,14 +1463,9 @@ async fn send_raw_input(
     working_directory: &str,
 ) -> Result<(), String> {
     if input == "\u{3}" {
-        return run_tmux(vec![
-            "send-keys".to_string(),
-            "-t".to_string(),
-            pane_id.to_string(),
-            "C-c".to_string(),
-        ])
-        .await
-        .map(|_| ());
+        return run_tmux(send_keys_named_args(pane_id, &["C-c".to_string()]))
+            .await
+            .map(|_| ());
     }
 
     let input = normalize_terminal_input(input);
@@ -1352,13 +1484,7 @@ async fn send_raw_input(
         }
         if submit {
             sleep(Duration::from_millis(250)).await;
-            run_tmux(vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                pane_id.to_string(),
-                "C-m".to_string(),
-            ])
-            .await?;
+            run_tmux(send_keys_named_args(pane_id, &["C-m".to_string()])).await?;
         }
         return Ok(());
     }
@@ -1367,14 +1493,9 @@ async fn send_raw_input(
 }
 
 async fn send_submit_key(pane_id: &str) -> Result<(), String> {
-    run_tmux(vec![
-        "send-keys".to_string(),
-        "-t".to_string(),
-        pane_id.to_string(),
-        "C-m".to_string(),
-    ])
-    .await
-    .map(|_| ())
+    run_tmux(send_keys_named_args(pane_id, &["C-m".to_string()]))
+        .await
+        .map(|_| ())
 }
 
 async fn paste_buffer(pane_id: &str, input: &str) -> Result<(), String> {
@@ -1412,6 +1533,40 @@ async fn paste_buffer(pane_id: &str, input: &str) -> Result<(), String> {
     ])
     .await
     .map(|_| ())
+}
+
+/// argv for a `send-keys` that types LITERAL text (`-l`) into a pane.
+///
+/// The payload is user data — a setup command, a typed prompt line — so it can begin with `-`, and
+/// tmux parses its own options before positionals. Without an option terminator a line like
+/// `-la` is eaten as flags and never reaches the pane; a line that is exactly `--` would be
+/// swallowed as the terminator itself. One builder so every literal-text call site shares the rule,
+/// and so the rule is testable without a tmux server.
+fn send_keys_literal_args(pane_id: &str, text: &str) -> Vec<String> {
+    vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "-l".to_string(),
+        // The payload is user data and may begin with `-`, so stop option parsing here. Verified on
+        // tmux 3.6: `send-keys -t %83 -l -- --`, `-- -la` and `-- -l` all reach the pane as text.
+        "--".to_string(),
+        text.to_string(),
+    ]
+}
+
+/// argv for a `send-keys` that sends KEY NAMES (Enter, C-c, Down …) to a pane.
+///
+/// Key names can also look like options (a literal `-`), so the same terminator applies.
+fn send_keys_named_args(pane_id: &str, keys: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "--".to_string(),
+    ];
+    args.extend(keys.iter().cloned());
+    args
 }
 
 async fn run_tmux(args: Vec<String>) -> Result<String, String> {
@@ -1605,6 +1760,437 @@ mod tests {
         assert!(!only_sibling.iter().any(|n| n == "kloo"));
         // A name containing a space survives intact — trimming it would merge distinct sessions.
         assert_eq!(parse_session_names("my sess\n"), vec!["my sess"]);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // send-keys option terminator
+    // ---------------------------------------------------------------------------------------
+
+    /// Where in an argv the payload starts: everything after the first bare `--`.
+    ///
+    /// This mirrors how tmux's own getopt parses the vector, so the assertions below are about
+    /// tmux's reading of the argv rather than about our formatting of it.
+    fn payload_after_terminator(args: &[String]) -> Option<&[String]> {
+        args.iter().position(|a| a == "--").map(|i| &args[i + 1..])
+    }
+
+    #[test]
+    fn send_keys_literal_payload_cannot_be_read_as_options() {
+        // The bug: `create_tmux_session` typed setup lines with `send-keys … -l <line>` and no
+        // terminator, so a setup command starting with `-` was parsed as tmux flags and never
+        // reached the pane.
+        for line in [
+            "-la",
+            "-l",
+            "--",
+            "--version",
+            "-",
+            "cd /tmp && ls -la",
+            "-N 3",
+        ] {
+            let args = send_keys_literal_args("%7", line);
+            let payload = payload_after_terminator(&args)
+                .unwrap_or_else(|| panic!("no `--` terminator in argv for {line:?}: {args:?}"));
+            assert_eq!(
+                payload,
+                [line.to_string()],
+                "payload for {line:?} must be exactly the line, as text"
+            );
+            // `-l` must still be a FLAG (before the terminator), not part of the payload.
+            let terminator = args.iter().position(|a| a == "--").unwrap();
+            assert!(
+                args[..terminator].iter().any(|a| a == "-l"),
+                "the literal flag must precede the terminator: {args:?}"
+            );
+            // The target must also be a flag, not swallowed into the text.
+            assert_eq!(args[..terminator], ["send-keys", "-t", "%7", "-l"]);
+        }
+    }
+
+    #[test]
+    fn send_keys_literal_line_that_is_exactly_the_terminator_still_goes_through_as_text() {
+        // A line that is itself `--` is the nastiest case: the FIRST `--` is ours (the terminator)
+        // and the second is the payload. Asserting on the first position proves the line survives
+        // as text rather than being consumed as the terminator.
+        let args = send_keys_literal_args("%7", "--");
+        assert_eq!(
+            args,
+            [
+                "send-keys".to_string(),
+                "-t".to_string(),
+                "%7".to_string(),
+                "-l".to_string(),
+                "--".to_string(),
+                "--".to_string(),
+            ]
+        );
+        assert_eq!(payload_after_terminator(&args).unwrap(), ["--".to_string()]);
+    }
+
+    #[test]
+    fn send_keys_named_keys_cannot_be_read_as_options() {
+        let keys = vec!["-".to_string(), "Enter".to_string()];
+        let args = send_keys_named_args("%7", &keys);
+        assert_eq!(payload_after_terminator(&args).unwrap(), keys.as_slice());
+        let terminator = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[..terminator], ["send-keys", "-t", "%7"]);
+        // No `-l`: these are key NAMES, resolved by tmux against the pane's mode.
+        assert!(!args.iter().any(|a| a == "-l"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // startup reconciliation of terminal_status
+    // ---------------------------------------------------------------------------------------
+
+    fn owned_row(session_id: &str) -> AttachedTerminalRow {
+        AttachedTerminalRow {
+            session_id: session_id.to_string(),
+            attached_tmux: false,
+            tmux_session_name: None,
+        }
+    }
+
+    fn attached_row(session_id: &str, name: Option<&str>) -> AttachedTerminalRow {
+        AttachedTerminalRow {
+            session_id: session_id.to_string(),
+            attached_tmux: true,
+            tmux_session_name: name.map(ToOwned::to_owned),
+        }
+    }
+
+    /// THE assertion that matters: when tmux cannot be ASKED, reconcile NOTHING.
+    ///
+    /// `tmux_session_names()` returns `Err` for "no binary / no server", which is indistinguishable
+    /// from "every session is gone" if you only look at the name list. Treating it as the latter
+    /// would mass-demote every row on the user's machine — strictly worse than the stale-row bug
+    /// this reconciliation exists to fix.
+    #[test]
+    fn tmux_cannot_be_asked_demotes_nothing() {
+        let rows = vec![
+            owned_row("a"),
+            owned_row("b"),
+            attached_row("c", Some("kloo")),
+            attached_row("d", None),
+        ];
+        assert!(
+            terminal_rows_to_demote(&rows, None).is_empty(),
+            "an unaskable tmux must never demote a row"
+        );
+    }
+
+    #[test]
+    fn demotes_only_rows_whose_tmux_session_is_gone() {
+        // Modelled on the live host: `johnnyone_768d…` and `kloo` exist, nothing else does.
+        let live = vec![
+            "j1".to_string(),
+            "johnnyone_768d".to_string(),
+            "kloo".to_string(),
+            "kloo-cli".to_string(),
+            "kord".to_string(),
+        ];
+        let rows = vec![
+            owned_row("768d"),           // johnnyone_768d — alive, keep
+            owned_row("dead-1"),         // johnnyone_dead-1 — gone, demote
+            attached_row("x", Some("kloo")),     // user's own shell, alive, keep
+            attached_row("y", Some("kord")),     // alive, keep
+            attached_row("z", Some("gone-sess")), // gone, demote
+        ];
+        assert_eq!(
+            terminal_rows_to_demote(&rows, Some(&live)),
+            vec!["dead-1".to_string(), "z".to_string()]
+        );
+    }
+
+    #[test]
+    fn attached_row_is_not_rescued_by_a_prefix_match() {
+        // Same hole the exact-match resolution closed: `kloo` must not count as present merely
+        // because `kloo-cli` is. A shelled `has-session -t kloo` would have said yes.
+        let live = vec!["kloo-cli".to_string()];
+        assert_eq!(
+            terminal_rows_to_demote(&[attached_row("x", Some("kloo"))], Some(&live)),
+            vec!["x".to_string()]
+        );
+        // And the converse: an exact match keeps the row.
+        assert!(terminal_rows_to_demote(&[attached_row("x", Some("kloo-cli"))], Some(&live)).is_empty());
+    }
+
+    #[test]
+    fn attached_row_without_a_name_is_demoted() {
+        // `resolve_tmux_target` errors on this row, so it can never be captured — its
+        // `terminal_status='attached'` is unconditionally a lie. But only when tmux COULD be asked.
+        let live: Vec<String> = Vec::new();
+        for name in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                terminal_rows_to_demote(&[attached_row("x", name)], Some(&live)),
+                vec!["x".to_string()],
+                "attached row with name {name:?} must be demoted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_live_list_still_demotes() {
+        // `Ok(vec![])` is "the server answered: no sessions" — distinct from `None`/Err above.
+        let live: Vec<String> = Vec::new();
+        assert_eq!(
+            terminal_rows_to_demote(&[owned_row("a")], Some(&live)),
+            vec!["a".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_rows_means_no_demotions() {
+        assert!(terminal_rows_to_demote(&[], Some(&["kloo".to_string()])).is_empty());
+    }
+
+    #[test]
+    fn owned_session_name_matches_the_spawn_rule() {
+        // The reconciler must derive the SAME name `create_tmux_session` spawns under, including the
+        // non-alphanumeric sanitisation, or it would demote live owned panes.
+        let live = vec![tmux_session_name("a b/c")];
+        assert!(
+            terminal_rows_to_demote(&[owned_row("a b/c")], Some(&live)).is_empty(),
+            "sanitised owned name must resolve against the live list"
+        );
+        assert_eq!(live[0], "johnnyone_a_b_c");
+    }
+
+    /// The batched write, against a real migrated database: exactly the named rows are demoted,
+    /// `tmux_pane_id` is cleared, and `status` is untouched. The pure test above decides WHICH ids;
+    /// this one pins what the SQL does with them — including that one statement covers many rows.
+    #[test]
+    fn demote_terminal_rows_is_one_batched_pass_and_leaves_status_alone() {
+        let (state, _root) = crate::test_support::test_state();
+        state
+            .db
+            .with_conn(|conn| {
+                for i in 0..120 {
+                    conn.execute(
+                        "INSERT INTO sessions (id, terminal_status, tmux_pane_id, status, working_directory) VALUES (?1, 'attached', ?2, 'active', '/tmp')",
+                        params![format!("s{i}"), format!("%{i}")],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                // A row that must NOT be touched.
+                conn.execute(
+                    "INSERT INTO sessions (id, terminal_status, tmux_pane_id, status, working_directory) VALUES ('keep', 'attached', '%999', 'active', '/tmp')",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        let ids: Vec<String> = (0..120).map(|i| format!("s{i}")).collect();
+        demote_terminal_rows(&state, &ids).unwrap();
+
+        state
+            .db
+            .with_conn(|conn| {
+                let demoted: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE terminal_status = 'detached' AND tmux_pane_id IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                assert_eq!(demoted, 120, "every named row demoted, pane id cleared");
+
+                let (status, term, pane): (String, String, Option<String>) = conn
+                    .query_row(
+                        "SELECT status, terminal_status, tmux_pane_id FROM sessions WHERE id = 'keep'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .map_err(|e| e.to_string())?;
+                assert_eq!(term, "attached", "an unnamed row must survive untouched");
+                assert_eq!(pane.as_deref(), Some("%999"));
+                assert_eq!(status, "active");
+
+                // `status` is never written by the reconciler.
+                let actives: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE status = 'active'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                assert_eq!(actives, 121, "status column untouched");
+                Ok(())
+            })
+            .unwrap();
+
+        // An empty demotion set must be a no-op, not a malformed `IN ()`.
+        demote_terminal_rows(&state, &[]).unwrap();
+    }
+
+    /// End-to-end wiring against the REAL tmux server: SELECT → decision → batched UPDATE.
+    ///
+    /// The pure test decides which ids, the DB test pins the SQL; only this one proves the three are
+    /// plumbed together and that the live `tmux_session_names()` answer is the one consulted.
+    ///
+    /// tmux hygiene: creates and kills exactly one session named `zztest-j1-reconcile`, never
+    /// touches any other session, and kills it on every exit path. It only ever writes to its own
+    /// throwaway database, so the user's rows cannot be affected.
+    ///
+    /// When tmux cannot be asked (no binary / no server, e.g. CI) this asserts the OTHER half of
+    /// the contract instead of skipping silently: nothing is demoted at all.
+    #[tokio::test]
+    async fn reconcile_demotes_the_gone_session_and_keeps_the_live_one() {
+        const LIVE: &str = "zztest-j1-reconcile";
+        let tmux_reachable = tmux_session_names().await.is_ok();
+
+        let (state, _root) = crate::test_support::test_state();
+        state
+            .db
+            .with_conn(|conn| {
+                // Attached to a tmux session that is about to be real.
+                conn.execute(
+                    "INSERT INTO sessions (id, terminal_status, tmux_pane_id, attached_tmux, tmux_session_name, status, working_directory) VALUES ('live', 'attached', '%1', 1, ?1, 'active', '/tmp')",
+                    params![LIVE],
+                )
+                .map_err(|e| e.to_string())?;
+                // Attached to one that will never exist.
+                conn.execute(
+                    "INSERT INTO sessions (id, terminal_status, tmux_pane_id, attached_tmux, tmux_session_name, status, working_directory) VALUES ('gone', 'attached', '%2', 1, 'zztest-j1-does-not-exist', 'active', '/tmp')",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                // An owned row: `johnnyone_owned-gone` is never spawned, so it is always stale.
+                conn.execute(
+                    "INSERT INTO sessions (id, terminal_status, tmux_pane_id, attached_tmux, status, working_directory) VALUES ('owned-gone', 'attached', '%3', 0, 'active', '/tmp')",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+
+        if tmux_reachable {
+            run_tmux(vec![
+                "new-session".to_string(),
+                "-d".to_string(),
+                "-s".to_string(),
+                LIVE.to_string(),
+                "-c".to_string(),
+                "/tmp".to_string(),
+                "cat".to_string(),
+            ])
+            .await
+            .expect("create the zztest- session");
+        }
+
+        let demoted = reconcile_terminal_status_on_startup(&state).await;
+
+        // Kill our session before asserting, so a failed assertion still leaves tmux clean.
+        if tmux_reachable {
+            let _ = run_tmux(vec![
+                "kill-session".to_string(),
+                "-t".to_string(),
+                tmux_session_target(LIVE),
+            ])
+            .await;
+        }
+
+        let status_of = |id: &str| -> String {
+            state
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT terminal_status FROM sessions WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap()
+        };
+
+        if tmux_reachable {
+            assert_eq!(demoted.unwrap(), 2, "the two gone sessions, and only those");
+            assert_eq!(status_of("live"), "attached", "a LIVE tmux must survive");
+            assert_eq!(status_of("gone"), "detached");
+            assert_eq!(status_of("owned-gone"), "detached");
+            let pane: Option<String> = state
+                .db
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT tmux_pane_id FROM sessions WHERE id = 'gone'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap();
+            assert!(pane.is_none(), "a demoted row's pane id is cleared");
+        } else {
+            assert_eq!(demoted.unwrap(), 0, "unaskable tmux must demote nothing");
+            for id in ["live", "gone", "owned-gone"] {
+                assert_eq!(status_of(id), "attached");
+            }
+        }
+    }
+
+    /// A capture-failure detach must leave NO pane id behind.
+    ///
+    /// The drift this pins: the capture loop's failure break wrote `terminal_status='detached'` but
+    /// not `tmux_pane_id = NULL`, so a row sat `detached` while still naming the pane that had just
+    /// died — and only the next host restart cleaned it up. Both live detach paths now go through
+    /// `detach_terminal_row`, so this exercises the exact write the capture loop performs.
+    ///
+    /// What it does NOT prove: that the capture loop calls this function. That link is structural —
+    /// `detach_terminal_row` is the only detach SQL in the module besides the batched reconciler,
+    /// and both share `DETACH_TERMINAL_SET` — not something this test checks.
+    #[test]
+    fn capture_failure_detach_clears_the_pane_id() {
+        let (state, _root) = crate::test_support::test_state();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO sessions (id, terminal_status, tmux_pane_id, status, working_directory) VALUES ('s', 'attached', '%42', 'active', '/tmp')",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        detach_terminal_row(&state.db, "s").unwrap();
+
+        let (term, pane, status): (String, Option<String>, String) = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT terminal_status, tmux_pane_id, status FROM sessions WHERE id = 's'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        assert_eq!(term, "detached");
+        assert!(
+            pane.is_none(),
+            "a detached row must not keep a pane id (got {pane:?})"
+        );
+        assert_eq!(status, "active", "status is never touched by a detach");
+    }
+
+    /// The three detach writers agree because they share one SET clause.
+    ///
+    /// Cheap drift guard: if someone re-specialises one of them, this is what catches the clause
+    /// losing `tmux_pane_id = NULL` again.
+    #[test]
+    fn the_detach_set_clause_clears_the_pane_id() {
+        assert!(DETACH_TERMINAL_SET.contains("terminal_status = 'detached'"));
+        assert!(
+            DETACH_TERMINAL_SET.contains("tmux_pane_id = NULL"),
+            "every detach path must clear the pane id: {DETACH_TERMINAL_SET}"
+        );
+        assert!(DETACH_TERMINAL_SET.contains("updated_at = datetime('now')"));
+        // It is a SET clause only — a writer supplies its own WHERE.
+        assert!(!DETACH_TERMINAL_SET.to_ascii_uppercase().contains("WHERE"));
     }
 
     #[test]

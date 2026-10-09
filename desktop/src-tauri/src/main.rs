@@ -8,6 +8,7 @@ use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
 use johnnyone_desktop_lib::services::relay;
 use johnnyone_desktop_lib::state::app_state::AppState;
+use johnnyone_desktop_lib::terminal;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -75,9 +76,11 @@ fn main() {
             //
             // Two things start here (both on Tauri's tokio runtime):
             //   1) Resume any in-flight planner coordinator loops from SQLite.
-            //   2) If relay settings are configured (SQLite, with optional
-            //      JOHNNYONE_* env overrides), register this machine with the
-            //      worker and keep a WebSocket open for relay-RPC.
+            //   2) Reconcile `terminal_status` against the tmux sessions that
+            //      actually exist, THEN (if relay settings are configured in
+            //      SQLite, with optional JOHNNYONE_* env overrides) register
+            //      this machine with the worker and keep a WebSocket open for
+            //      relay-RPC.
             //   3) Local axum GraphQL listener on 127.0.0.1:7788 — what the
             //      embedded host-app Angular UI fetches against. (Will move
             //      to Tauri `invoke()` later; this is the minimal port-over.)
@@ -96,6 +99,20 @@ fn main() {
 
             let agent_state = app_state.clone();
             tauri::async_runtime::spawn(async move {
+                // Reconcile BEFORE the relay registers, awaited in the same task so the ordering is
+                // structural rather than a race between two spawns: a client that connects the
+                // instant we register must not be served pre-reconciliation `terminal_status`.
+                //
+                // A host restart kills every `johnnyone_*` pane without running either of the two
+                // paths that write 'detached' (kill_terminal_session, the capture-loop failure
+                // break), so without this pass rows claim 'attached' forever.
+                match terminal::reconcile_terminal_status_on_startup(&agent_state).await {
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "Failed to reconcile terminal_status at startup"
+                    ),
+                }
                 relay::spawn_if_configured(agent_state).await;
             });
 
