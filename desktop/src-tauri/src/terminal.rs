@@ -313,7 +313,7 @@ pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result
         run_tmux(vec![
             "kill-session".to_string(),
             "-t".to_string(),
-            tmux_session_name,
+            tmux_session_target(&tmux_session_name),
         ])
         .await
         .map(|_| ())?;
@@ -842,13 +842,17 @@ async fn create_tmux_session(
     // launched by the setup is ready before the caller sends any prompt/input.
     if matches!(config.provider, CliProvider::Shell) {
         if let Some(setup) = config.setup_commands.as_deref() {
+            // Address the PANE, never the session name: `send-keys -t <name>` takes a target-pane
+            // and shadows on a same-named window in the current session exactly as `list-panes`
+            // does, so setup commands could be typed into somebody else's live CLI.
+            let pane_id = list_first_pane(tmux_session_name).await?;
             for line in setup.lines() {
                 let trimmed = line.trim_end();
                 if !trimmed.is_empty() {
                     run_tmux(vec![
                         "send-keys".to_string(),
                         "-t".to_string(),
-                        tmux_session_name.to_string(),
+                        pane_id.clone(),
                         "-l".to_string(),
                         trimmed.to_string(),
                     ])
@@ -857,7 +861,7 @@ async fn create_tmux_session(
                 run_tmux(vec![
                     "send-keys".to_string(),
                     "-t".to_string(),
-                    tmux_session_name.to_string(),
+                    pane_id.clone(),
                     "Enter".to_string(),
                 ])
                 .await?;
@@ -930,33 +934,121 @@ fn provider_command(config: &SessionConfig) -> (String, Vec<String>) {
     }
 }
 
+/// Anchored tmux target for a command whose target is a *target-session* (`kill-session`).
+///
+/// For a target-session tmux falls back to fnmatch and then a PREFIX match when nothing matches
+/// exactly, so an unanchored `-t kloo` resolves to `kloo-cli` whenever `kloo` is absent. The `=`
+/// prefix disables that fallback. Measured on tmux 3.6: `has-session -t zzuniq` → rc 0 (it matched
+/// `zzuniq-cli`), `has-session -t =zzuniq` → rc 1.
+///
+/// This is only enough for commands that take a target-SESSION. It is NOT enough for `list-panes`
+/// or `send-keys`, which take a target-window/pane — see [`first_pane_for_session`]. Pane-id
+/// targets (`%18`) are already globally unique and must not be wrapped.
+fn tmux_session_target(session_name: &str) -> String {
+    format!("={session_name}")
+}
+
+/// Session names tmux currently has, as exact strings.
+///
+/// `Err` means tmux itself could not be asked (binary missing, no server running at all). That is
+/// deliberately distinct from `Ok(names)` simply not containing a name: the old `has-session`
+/// shell-out collapsed both into `false`, so "the tmux server is gone" and "that one session
+/// exited" were indistinguishable to callers.
+async fn tmux_session_names() -> Result<Vec<String>, String> {
+    let out = run_tmux(vec![
+        "list-sessions".to_string(),
+        "-F".to_string(),
+        "#{session_name}".to_string(),
+    ])
+    .await?;
+    Ok(parse_session_names(&out))
+}
+
+/// Exact session names out of `list-sessions -F '#{session_name}'`.
+///
+/// Pure, so the matching rule is testable without a tmux server. Only the line terminator is
+/// stripped — a session name may contain spaces, and trimming them would make two distinct
+/// sessions compare equal.
+fn parse_session_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|line| line.trim_end_matches(['\r', '\n']))
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Does a tmux session with EXACTLY this name exist?
+///
+/// Decided by string equality in Rust, not by tmux's target parser. `tmux has-session -t <name>`
+/// prefix-matches, so the old form answered "yes" for `kloo` while only `kloo-cli` existed, and the
+/// "external tmux session is not running" guard waved through a session that had already exited.
 async fn tmux_has_session(name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    tmux_session_names()
         .await
-        .map(|status| status.success())
+        .map(|names| names.iter().any(|candidate| candidate == name))
         .unwrap_or(false)
 }
 
+/// Pick a session's pane out of `list-panes -a -F '#{pane_id}\t#{window_active}\t#{session_name}'`
+/// by EXACT session name.
+///
+/// Why a whole-server listing plus a compare in Rust, instead of `list-panes -t <name>`:
+/// `list-panes` takes a target-WINDOW, and for a colonless target tmux first looks for a window of
+/// that name inside the server's *current* session, consulting the session table only if that
+/// fails. tmux auto-renames a window after the command running in it, so the session `kloo-cli`
+/// (running the `kloo` TUI) owns a window named `kloo` — and `list-panes -t kloo` then returned
+/// kloo-cli's pane `%18`. Measured on tmux 3.6 in the host's own environment (no `$TMUX`, no tty,
+/// where tmux treats the most recently active session as "current"):
+///
+/// ```text
+/// current session: kloo-cli
+/// list-panes -t kloo      -> kloo-cli/kloo/%18   # WRONG
+/// list-panes -t =kloo     -> kloo-cli/kloo/%18   # `=` does NOT anchor a window target
+/// list-panes -s -t =kloo  -> kloo-cli/kloo/%18   # nor does -s
+/// list-panes -t =kloo:    -> kloo/claude/%17     # only the trailing `:` pins the session
+/// ```
+///
+/// Matching here takes tmux's `cmd_find_target` out of the decision entirely, so neither hazard
+/// (prefix fallback, window-name shadowing) can reach the stored `tmux_pane_id` — which feeds
+/// `send-keys` as well as `capture-pane`, so a misresolution typed input into the wrong CLI.
+///
+/// `pane_id` comes first and `session_name` last so `splitn(3, '\t')` keeps a name containing a tab
+/// intact rather than truncating it into some other session's name.
+fn first_pane_for_session(output: &str, session_name: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for line in output.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let pane_id = parts.next().unwrap_or("").trim();
+        let window_active = parts.next().unwrap_or("").trim();
+        let name = parts.next().unwrap_or("").trim_end_matches(['\r', '\n']);
+        if pane_id.is_empty() || name != session_name {
+            continue;
+        }
+        // Preserve the old semantics: `list-panes -t <session>` reported the session's CURRENT
+        // window. Fall back to the session's first pane if tmux reported no active window.
+        if window_active == "1" {
+            return Some(pane_id.to_string());
+        }
+        if fallback.is_none() {
+            fallback = Some(pane_id.to_string());
+        }
+    }
+    fallback
+}
+
+/// First pane of the named session — exact match, with no tmux target matching involved.
 async fn list_first_pane(tmux_session_name: &str) -> Result<String, String> {
     let output = run_tmux(vec![
         "list-panes".to_string(),
-        "-t".to_string(),
-        tmux_session_name.to_string(),
+        "-a".to_string(),
         "-F".to_string(),
-        "#{pane_id}".to_string(),
+        "#{pane_id}\t#{window_active}\t#{session_name}".to_string(),
     ])
     .await?;
 
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "tmux session has no panes".to_string())
+    first_pane_for_session(&output, tmux_session_name)
+        .ok_or_else(|| format!("no tmux pane found for session '{tmux_session_name}'"))
 }
 
 async fn resize_pane(pane_id: &str, cols: u16, rows: u16) -> Result<(), String> {
@@ -1458,5 +1550,229 @@ mod tests {
         let (command, args) = provider_command(&config);
         assert_eq!(command, "bash");
         assert!(args.is_empty(), "shell must launch with no agent args");
+    }
+
+    /// The real `kloo` / `kloo-cli` table, verbatim from
+    /// `tmux list-panes -a -F '#{pane_id}\t#{window_active}\t#{session_name}'` on the host while the
+    /// bug was live. `kloo-cli`'s window is NAMED `kloo` (tmux renames a window after the command
+    /// running in it), and that window is what tmux's target matcher resolved `-t kloo` onto.
+    const LIVE_PANES: &str = "\
+%19\t1\tj1
+%5\t1\tjohnnyone_768d2c33-d85a-4013-9cce-722948c87a69
+%17\t1\tkloo
+%18\t1\tkloo-cli
+%0\t1\tkord";
+
+    #[test]
+    fn first_pane_for_session_matches_exactly_not_by_prefix() {
+        // The whole bug in one assertion: `kloo` must resolve to %17, never kloo-cli's %18.
+        assert_eq!(
+            first_pane_for_session(LIVE_PANES, "kloo").as_deref(),
+            Some("%17")
+        );
+        assert_eq!(
+            first_pane_for_session(LIVE_PANES, "kloo-cli").as_deref(),
+            Some("%18")
+        );
+        // A name that is only a prefix of a real session must not resolve at all.
+        assert_eq!(first_pane_for_session(LIVE_PANES, "kl"), None);
+        assert_eq!(first_pane_for_session(LIVE_PANES, "klo"), None);
+        assert_eq!(first_pane_for_session(LIVE_PANES, "j"), None);
+        assert_eq!(first_pane_for_session(LIVE_PANES, ""), None);
+    }
+
+    #[test]
+    fn first_pane_for_session_prefers_the_active_window() {
+        // Preserves the old `list-panes -t <session>` semantics (the session's CURRENT window),
+        // and still answers when tmux reports no active window for the session.
+        let out = "%1\t0\tsess\n%2\t1\tsess\n%3\t0\tsess";
+        assert_eq!(first_pane_for_session(out, "sess").as_deref(), Some("%2"));
+        let inactive = "%7\t0\tsess\n%8\t0\tsess";
+        assert_eq!(
+            first_pane_for_session(inactive, "sess").as_deref(),
+            Some("%7")
+        );
+    }
+
+    #[test]
+    fn session_names_compare_exactly() {
+        let names = parse_session_names("kloo\nkloo-cli\nj1\n\n");
+        assert_eq!(names, vec!["kloo", "kloo-cli", "j1"]);
+        assert!(names.iter().any(|n| n == "kloo"));
+        // The prefix hole the shelled `has-session -t kloo` had: `kloo` must not count as present
+        // merely because `kloo-cli` is.
+        let only_sibling = parse_session_names("kloo-cli\n");
+        assert!(!only_sibling.iter().any(|n| n == "kloo"));
+        // A name containing a space survives intact — trimming it would merge distinct sessions.
+        assert_eq!(parse_session_names("my sess\n"), vec!["my sess"]);
+    }
+
+    #[test]
+    fn kill_session_target_is_anchored() {
+        // `kill-session` takes a target-SESSION — the one place `=` alone is the right tool: there
+        // is no window to pin, and `=` is what disables tmux's prefix fallback.
+        assert_eq!(tmux_session_target("kloo"), "=kloo");
+        assert_eq!(
+            tmux_session_target(&tmux_session_name("abc-123")),
+            "=johnnyone_abc-123"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // tmux target resolution (the `kloo` / `kloo-cli` same-screen bug)
+    // ---------------------------------------------------------------------------------------------
+
+    /// True when a tmux server is reachable; the target-resolution tests below drive the REAL tmux
+    /// (there is no way to fake `cmd_find_target`), so they skip where tmux is unavailable.
+    async fn tmux_available() -> bool {
+        Command::new("tmux")
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn tmux_quiet(args: &[&str]) {
+        let _ = Command::new("tmux")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    /// Regression guard for "two shells show the same terminal".
+    ///
+    /// Shape of the real incident: session `kloo` (running `claude`) and session `kloo-cli` (running
+    /// the `kloo` TUI). tmux auto-renames a window after its running command, so `kloo-cli`'s single
+    /// window is NAMED `kloo`. `list-panes -t kloo` takes a target-WINDOW, and tmux resolves a
+    /// colonless target as a window inside the server's *current* session BEFORE consulting the
+    /// session table — so whenever `kloo-cli` was the current session, `list_first_pane("kloo")`
+    /// returned kloo-cli's pane and both rows stored the same pane id.
+    ///
+    /// The host runs tmux with no `$TMUX` and no tty, where "current session" is whichever session
+    /// tmux considers most recently active — hence the intermittency. The test reproduces that by
+    /// clearing `$TMUX` and creating the sibling LAST so it is the most recently active session.
+    #[tokio::test]
+    async fn list_first_pane_resolves_the_session_not_a_same_named_window() {
+        if !tmux_available().await {
+            eprintln!("skipping: no tmux server available");
+            return;
+        }
+        // The host process has no $TMUX (it is not launched from inside tmux). Without this the
+        // test would inherit the developer's own pane as the current session and the collision
+        // could not arise.
+        std::env::remove_var("TMUX");
+        std::env::remove_var("TMUX_PANE");
+
+        let target = "zztest-j1pane";
+        let sibling = "zztest-j1pane-sib";
+        tmux_quiet(&["kill-session", "-t", &format!("={target}")]).await;
+        tmux_quiet(&["kill-session", "-t", &format!("={sibling}")]).await;
+
+        // The session we actually want: its window is NOT named `target`.
+        tmux_quiet(&[
+            "new-session", "-d", "-s", target, "-n", "wanted", "sleep", "600",
+        ])
+        .await;
+        tmux_quiet(&["set-option", "-w", "-t", &format!("={target}:"), "automatic-rename", "off"]).await;
+        tmux_quiet(&["rename-window", "-t", &format!("={target}:"), "wanted"]).await;
+
+        // Created LAST so tmux treats it as the current session, and holding a window named exactly
+        // like the session above — the `kloo-cli` shape.
+        sleep(Duration::from_millis(1200)).await;
+        tmux_quiet(&[
+            "new-session", "-d", "-s", sibling, "-n", "decoy", "sleep", "600",
+        ])
+        .await;
+        tmux_quiet(&["set-option", "-w", "-t", &format!("={sibling}:"), "automatic-rename", "off"]).await;
+        tmux_quiet(&["rename-window", "-t", &format!("={sibling}:"), target]).await;
+
+        let want = run_tmux(vec![
+            "list-panes".to_string(),
+            "-t".to_string(),
+            format!("={target}:"),
+            "-F".to_string(),
+            "#{pane_id}".to_string(),
+        ])
+        .await
+        .expect("fixture: target session must have a pane");
+        let want = want.trim().to_string();
+        let decoy = run_tmux(vec![
+            "list-panes".to_string(),
+            "-t".to_string(),
+            format!("={sibling}:"),
+            "-F".to_string(),
+            "#{pane_id}".to_string(),
+        ])
+        .await
+        .expect("fixture: sibling session must have a pane");
+        let decoy = decoy.trim().to_string();
+
+        let current = run_tmux(vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "#{session_name}".to_string(),
+        ])
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+        let resolved = list_first_pane(target).await;
+        let has = tmux_has_session(target).await;
+
+        tmux_quiet(&["kill-session", "-t", &format!("={target}")]).await;
+        tmux_quiet(&["kill-session", "-t", &format!("={sibling}")]).await;
+
+        if current != sibling {
+            // Someone attached a client mid-test and became the current session; the collision
+            // cannot arise in that state, so there is nothing to assert.
+            eprintln!("skipping assertions: current session is {current:?}, not the decoy");
+            return;
+        }
+        assert!(has, "exact-match session lookup must see the session");
+        assert_ne!(
+            resolved.as_deref(),
+            Ok(decoy.as_str()),
+            "list_first_pane({target}) returned a pane owned by {sibling} — anything typed into \
+             the {target} tab would land in the wrong CLI"
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Ok(want.as_str()),
+            "list_first_pane({target}) resolved {resolved:?}; the decoy session {sibling} owns \
+             {decoy} and must never be returned"
+        );
+    }
+
+    /// The prefix/fnmatch hazard on a target-SESSION: with `kloo` gone and `kloo-cli` present,
+    /// an unanchored `has-session -t kloo` SUCCEEDS, so the "external tmux is not running" guard
+    /// waves through a session that does not exist and the caller goes on to capture the sibling.
+    #[tokio::test]
+    async fn tmux_has_session_rejects_a_prefix_sibling() {
+        if !tmux_available().await {
+            eprintln!("skipping: no tmux server available");
+            return;
+        }
+        std::env::remove_var("TMUX");
+        std::env::remove_var("TMUX_PANE");
+
+        let missing = "zztest-j1prefix";
+        let sibling = "zztest-j1prefix-cli";
+        tmux_quiet(&["kill-session", "-t", &format!("={missing}")]).await;
+        tmux_quiet(&["kill-session", "-t", &format!("={sibling}")]).await;
+        tmux_quiet(&["new-session", "-d", "-s", sibling, "sleep", "600"]).await;
+
+        let found = tmux_has_session(missing).await;
+        tmux_quiet(&["kill-session", "-t", &format!("={sibling}")]).await;
+
+        assert!(
+            !found,
+            "has-session must not prefix-match {sibling} when {missing} does not exist"
+        );
     }
 }
