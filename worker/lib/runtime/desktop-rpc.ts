@@ -1,4 +1,4 @@
-import { readCachedRpc, writeCachedRpc } from './desktop-rpc-cache';
+import { readCachedRpc, writeCachedRpc, invalidateCachedRpc } from './desktop-rpc-cache';
 import { resolveOnlineNode } from '../auth/resolve-online-node';
 import { requireIdentity } from '../auth/require-identity';
 
@@ -52,6 +52,10 @@ export async function desktopRpc<T>(
   }
 
   const data = result.data as T;
+  // A successful WRITE makes the related cached reads stale (e.g. `archive_session` → `list_sessions`).
+  // Done here, in the one seam every session resolver already calls, rather than repeated in each
+  // resolver — the same reason the `AiSession` selection set got hoisted: duplicated knowledge drifts.
+  invalidateCachedRpc(identity, method);
   writeCachedRpc(identity, method, params, data);
   return data;
 }

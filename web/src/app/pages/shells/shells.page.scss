@@ -114,3 +114,36 @@
   padding: 4px 10px;
   white-space: nowrap;
 }
+
+// Per-row "clear" ✕. Same idiom as the console's initiative-row actions
+// (`terminal.page.html:33` / `.init-actions .ia`), re-expressed in this page's token vocabulary so
+// it sits consistently with `.row` / `.act` above rather than introducing a new affordance shape.
+.ia {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--ion-color-step-200, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ion-color-medium);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--ion-color-step-100, rgba(255, 255, 255, 0.04));
+  }
+
+  &.danger:hover {
+    color: var(--ion-color-danger, #eb445a);
+    border-color: var(--ion-color-danger, #eb445a);
+  }
+
+  &[disabled] {
+    opacity: 0.4;
+    cursor: default;
+  }
+}
