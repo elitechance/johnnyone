@@ -260,3 +260,133 @@ describe('the Arena tab panel is its own scroller', () => {
     expect(getComputedStyle(panel).paddingBottom).toContain('safe-area-inset-bottom');
   });
 });
+
+// ── Tap targets, measured on mounted components rather than grepped ───────────────────────────
+//
+// REPLACES `expect(ARENA_CSS).toMatch(/min-height:\s*40px/)` in `arena-phone.spec.ts` — the same
+// substring shape I removed for `overflow-wrap` in round 3, which survived in the one assertion
+// that was not rewritten. It passed while four real controls were 20px: `score-phase` is a
+// `<select class="a-input">` and the rule enumerated `textarea.a-input, input.a-input` only, and
+// the three `family-*` radios carried no class at all. iOS asks 44px, Android 48px.
+import { ArenaSetupPage } from './arena-setup.page';
+import { JohnnyApiService } from '../../../../../ui/src/services/johnny-api.service';
+import { ArenaApiService } from './arena-api.service';
+import { ActivatedRoute, convertToParamMap } from '@angular/router';
+import { of } from 'rxjs';
+
+const TAP_MIN = 40;
+
+describe('every control the arena shows is big enough to hit', () => {
+  const api = {
+    getAgentPlan: () =>
+      of({
+        plan: { id: 'p1', runType: 'development', workspacePath: '/w/johnnyone', currentPhaseId: '04-leases' },
+        phases: [
+          { id: 'ph1', phaseId: '04-leases', phaseTitle: 'The lease pool', effectiveTestCommands: ['cargo test'] },
+          { id: 'ph2', phaseId: '08-polish', phaseTitle: 'Polish', effectiveTestCommands: [] },
+        ],
+        tasks: [],
+        events: [],
+      }),
+    runAgentPlanTestGate: () => of({ gateDeclared: true, exitCode: 0, collected: 1, commandsRun: 1, output: '', truncated: false }),
+    updateAgentPlanTestCommands: () => of({ plan: {}, phases: [], tasks: [], events: [] }),
+    repoIdentity: () => of('github.com/lokalcamp/johnnyone'),
+    workflows: () => of([]),
+    workflowSearchState: () =>
+      of({ repo: 'r', phaseType: 'dev-phase', family: 'glm-5.3-flash', consecutiveRejections: 0, halted: false, strikeLimit: 3, recentRejections: [], championWorkflowId: null }),
+    createWorkflowVersion: () => of({}),
+    startWorkflowRun: () => of({}),
+  };
+
+  const mountSetup = async (step: string) => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideRouter([]),
+        { provide: JohnnyApiService, useValue: api },
+        { provide: ArenaApiService, useValue: api },
+        {
+          provide: ActivatedRoute,
+          useValue: {
+            snapshot: {
+              paramMap: convertToParamMap({ id: 'p1' }),
+              queryParamMap: convertToParamMap({ phaseId: '04-leases', step }),
+            },
+          },
+        },
+      ],
+    });
+    const f = TestBed.createComponent(ArenaSetupPage);
+    f.detectChanges();
+    for (let i = 0; i < 60; i += 1) await Promise.resolve();
+    f.detectChanges();
+    return f;
+  };
+
+  /**
+   * Every element a finger can hit, measured from the stylesheet the component actually ships.
+   *
+   * A radio or checkbox BOX is deliberately small — 22px, the platform convention — and what has to
+   * be 44px is the label row around it, which is asserted separately below. Everything else is in.
+   */
+  const tappable = (root: HTMLElement) =>
+    [...root.querySelectorAll<HTMLElement>('button, a[href], select, textarea, input, [role="button"]')]
+      .filter((el) => !(el instanceof HTMLInputElement && (el.type === 'radio' || el.type === 'checkbox')));
+
+  const px = (v: string) => (v.endsWith('px') ? Number.parseFloat(v) : NaN);
+
+  it('the seats step: the family radio ROWS are 44px and every other control clears 40px', async () => {
+    const f = await mountSetup('seats');
+    const labels = [...(f.nativeElement as HTMLElement).querySelectorAll<HTMLElement>('label')]
+      .filter((l) => l.querySelector('input[type="radio"]'));
+    expect(labels.length, 'the family radios are not on screen').toBeGreaterThanOrEqual(3);
+    for (const label of labels) {
+      const h = px(getComputedStyle(label).minHeight);
+      expect(h >= 44, `a family radio row is ${h}px`).toBe(true);
+    }
+    const els = tappable(f.nativeElement as HTMLElement);
+    expect(els.length).toBeGreaterThan(3);
+    for (const el of els) {
+      const cs = getComputedStyle(el);
+      const h = px(cs.minHeight);
+      expect(
+        Number.isFinite(h) && h >= TAP_MIN,
+        `${el.tagName.toLowerCase()}[data-test=${el.getAttribute('data-test') ?? '—'}] has min-height ${cs.minHeight}`,
+      ).toBe(true);
+    }
+  });
+
+  it('the prompt step: the slot textareas and the start control clear 40px', async () => {
+    const f = await mountSetup('prompt');
+    for (const el of tappable(f.nativeElement as HTMLElement)) {
+      const h = px(getComputedStyle(el).minHeight);
+      expect(h >= TAP_MIN, `${el.tagName.toLowerCase()} min-height ${h}`).toBe(true);
+    }
+  });
+
+  it('the gate step, including the phase select when one is shown', async () => {
+    const f = await mountSetup('gate');
+    for (const el of tappable(f.nativeElement as HTMLElement)) {
+      const h = px(getComputedStyle(el).minHeight);
+      expect(h >= TAP_MIN, `${el.tagName.toLowerCase()} min-height ${h}`).toBe(true);
+    }
+  });
+
+  it('the arena row’s controls, enabled and disabled alike', () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({ providers: [provideRouter([])] });
+    for (const phase of [
+      { phaseId: '04-leases', effectiveTestCommands: ['cargo test'] },
+      { phaseId: '08-polish', effectiveTestCommands: [] },
+    ]) {
+      const f = TestBed.createComponent(ArenaRowComponent);
+      f.componentInstance.initiativeId = 'init-1';
+      f.componentInstance.phase = phase as never;
+      f.detectChanges();
+      for (const el of tappable(f.nativeElement as HTMLElement)) {
+        const h = px(getComputedStyle(el).minHeight);
+        expect(h >= TAP_MIN, `${el.getAttribute('data-test')} min-height ${h}`).toBe(true);
+      }
+    }
+  });
+});

@@ -15,6 +15,7 @@ import {
   promotionConfirmCopy,
   NO_GATE_REASON,
   MAX_REJECTION_REASON,
+  MAX_REJECTION_RAW,
   visibleText,
 } from './arena-logic';
 
@@ -171,6 +172,30 @@ describe('rejectionReasonValid — there is no bare no', () => {
     const genuinelyLong = 'x'.repeat(MAX_REJECTION_REASON + 1);
     expect(rejectionReasonValid(genuinelyLong).ok).toBe(false);
     expect(rejectionReasonValid(genuinelyLong).message).toMatch(/2001|too long/);
+  });
+
+  // Moving the cap to visible characters (round 3) fixed one end and opened the other: a reason of
+  // 2,000 VISIBLE characters padded to 102,000 raw ones passed, and the cap's whole rationale is
+  // that a megabyte of text in a halt banner is a denial of service on a phone most of all. Both
+  // ends are needed: what a reader sees, and what is actually sent.
+  it('refuses a payload that is enormous however little of it is visible', () => {
+    const padded = 'x'.repeat(2000) + '\u200b'.repeat(100_000);
+    const v = rejectionReasonValid(padded);
+    expect(v.ok).toBe(false);
+    expect(v.message).toMatch(/invisible|padding|characters long/i);
+  });
+
+  it('states the RAW ceiling as its own number, not as the visible one', () => {
+    expect(MAX_REJECTION_RAW).toBeGreaterThan(MAX_REJECTION_REASON);
+    const v = rejectionReasonValid('x'.repeat(MAX_REJECTION_RAW + 1));
+    expect(v.ok).toBe(false);
+    // The ordinary too-long message still wins when the text is genuinely long.
+    expect(v.message).toMatch(/too long/i);
+  });
+
+  it('still accepts a reason with ordinary invisible padding under both ceilings', () => {
+    const ok = 'coverage is not checked by this gate' + '\u200b'.repeat(50);
+    expect(rejectionReasonValid(ok).ok).toBe(true);
   });
 
   it('keeps a reason that merely CONTAINS an invisible character', () => {

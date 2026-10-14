@@ -142,8 +142,21 @@ describe('the arena stylesheets at 400px', () => {
     expect(ARENA_CSS).not.toMatch(/@media \(max-width[^)]*\)[^}]*display:\s*none/);
   });
 
-  it('keeps every tap target at least 40px tall', () => {
-    expect(ARENA_CSS).toMatch(/min-height:\s*40px/);
+  // The tap-target check that used to live here was `expect(ARENA_CSS).toMatch(/min-height: 40px/)`
+  // — a substring that passed while a bare `<select>` and three unclassed radios were 20px. It is
+  // replaced by MEASURED assertions on mounted components in `arena-console.spec.ts` ("every
+  // control the arena shows is big enough to hit"), which read the computed min-height of every
+  // button, link, select, textarea and input the arena actually renders. This is the last of the
+  // three substring-shaped guards; there are none left in this file.
+  it('contains no substring-shaped assertion pretending to measure a control', () => {
+    // Comment lines are stripped first: the comments here deliberately QUOTE the shapes they
+    // replaced, and a guard that cannot tell code from prose is the thing it is guarding against.
+    const own = readFileSync(join(HERE, 'arena-phone.spec.ts'), 'utf8')
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n');
+    expect(own).not.toMatch(/toMatch\(\/min-height/);
+    expect(own).not.toMatch(/toContain\('overflow-wrap/);
   });
 });
 
@@ -175,7 +188,6 @@ describe('text nobody here chose can always wrap', () => {
   // The previous version of this was `expect(ARENA_CSS).toContain('overflow-wrap: anywhere')` — a
   // substring check that passes however few elements have it. These are the containers that render
   // an operator's reason, a raw host error, a workspace path or a pasted URL.
-  const RULE = /(?:^|[,{\s])SEL\s*(?:,[^{]*)?\{[^}]*overflow-wrap:\s*(?:anywhere|break-word)/;
   for (const selector of ['.a-note', '.a-block', '.a-warn', '.a-list li', '.a-kv dd']) {
     it(`${selector} wraps a long unbroken token`, () => {
       const grouped = new RegExp(
@@ -186,8 +198,5 @@ describe('text nobody here chose can always wrap', () => {
   }
   it('and the long-form containers break a word that has no break opportunity at all', () => {
     expect(ARENA_CSS).toContain('word-break: break-word');
-  });
-  it('(the regex template is unused but documents the shape)', () => {
-    expect(RULE.source).toContain('overflow-wrap');
   });
 });

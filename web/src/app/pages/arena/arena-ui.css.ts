@@ -136,6 +136,37 @@ button.a-btn.danger {
   color: var(--ion-color-danger, #eb445a);
 }
 button.a-btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+/*
+ * TAP TARGETS. Every control a finger can hit — including the ones that carry no class of their
+ * own: a bare <select>, the family radios, and the navigational links. The previous rule enumerated
+ * textarea.a-input / input.a-input and left four real controls at 20px, which the guard did not
+ * catch because it was a substring check for "min-height: 40px" somewhere in this file.
+ *
+ * 40px is this project's own floor. iOS asks 44 and Android 48; the two controls a human is most
+ * likely to be reaching for in a hurry — the primary buttons — are 44.
+ */
+:where(button, select, textarea, input, a, [role='button']) {
+  min-height: 40px;
+}
+input[type='radio'], input[type='checkbox'] {
+  /* The box itself stays small; the row around it is what gets hit. */
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+}
+label:has(input[type='radio']), label:has(input[type='checkbox']) {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+a {
+  display: inline-flex;
+  align-items: center;
+}
+button.a-btn.primary, button.a-btn.danger {
+  min-height: 44px;
+}
 textarea.a-input, input.a-input {
   font: inherit;
   width: 100%;

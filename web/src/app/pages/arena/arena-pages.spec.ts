@@ -747,6 +747,47 @@ describe('WorkflowArenaPage — scoring a recorded run', () => {
     expect(api.calls.some((c) => c.name === 'runWorkflowRunGate')).toBe(false);
   });
 
+  // A promotion must not be made on a score the user has just asked to REPLACE. The host keeps the
+  // database consistent either way, so this is not corruption — it is a champion left sitting on a
+  // score that was then overwritten, which is the inverse of the ordering this page's own copy
+  // calls "falsification, not correction".
+  it('cannot promote while a gate is in flight, and says so rather than only disabling', async () => {
+    let settle: (v: unknown) => void = () => undefined;
+    const pending = new Promise((r) => (settle = r));
+    const api = stubApi({
+      workflowRuns: (id: unknown) => of(id === 'w1' ? [RUN_FAIL] : [RUN_PASS]),
+      workflowPrefs: () => of([PREF_OK]),
+      runWorkflowRunRescore: () => from(pending) as never,
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    // Promotion is available before anything is in flight…
+    expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(false);
+    click(q(f, '[data-test="promote"]'));
+    await flush(f);
+    expect(q(f, '[data-test="promote-confirm"]')).toBeTruthy();
+
+    // …then a re-score starts.
+    click(q(f, '[data-test="rescore-run"]'));
+    await flush(f);
+    click(q(f, '[data-test="rescore-do"]'));
+    await flush(f);
+
+    expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(true);
+    const block = q(f, '[data-test="promote-block"]') as HTMLElement;
+    expect(block, 'the reason must be on screen, not only in a disabled attribute').toBeTruthy();
+    expect(block.textContent).toMatch(/gate is running|in flight|being re-scored/i);
+    // The confirm must not survive into the in-flight state either.
+    const confirmDo = q(f, '[data-test="promote-do"]') as HTMLButtonElement | null;
+    if (confirmDo) {
+      click(confirmDo);
+      await flush(f);
+    }
+    expect(api.calls.some((c) => c.name === 'updateWorkflowChampion')).toBe(false);
+
+    settle({ ...RUN_PASS, gateExit: 1 });
+    await flush(f);
+  });
+
   it('no longer claims nothing scores a run — it says nothing scores one AUTOMATICALLY', async () => {
     const f = await mount(WorkflowArenaPage, unscored(), { id: 'w2' });
     const note = q(f, '[data-test="no-executor-note"]');

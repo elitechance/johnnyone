@@ -94,9 +94,20 @@ export function gateAcceptance(result: {
   };
 }
 
-/** A reason longer than this is refused. Nothing capped it at either layer; a megabyte of text in
- *  a halt banner is its own denial of service, on a phone most of all. */
+/** What a READER may be shown. Nothing capped this at either layer; a megabyte of text in a halt
+ *  banner is its own denial of service, on a phone most of all. */
 export const MAX_REJECTION_REASON = 2000;
+
+/**
+ * What may be SENT, visible or not.
+ *
+ * Two ceilings because each one alone has a hole. Counting raw characters refused a real 1,990-
+ * character reason that happened to carry zero-width padding; counting only visible characters
+ * accepted a 102,000-character payload with 2,000 visible ones — the denial of service the cap
+ * exists to stop, wearing a disguise. Generous enough that no honest reason meets it, small enough
+ * that nothing worth calling a payload passes.
+ */
+export const MAX_REJECTION_RAW = 8000;
 
 /**
  * Characters that are NOT Unicode `White_Space` — so `trim()` keeps them — and yet render as
@@ -149,14 +160,22 @@ export function rejectionReasonValid(reason: string): { ok: boolean; message: st
         'Write a reason that is actually visible. A challenger that passed every check and was rejected anyway means the gate is missing something, and the reason is the only record of what — an empty line in the halt banner tells the next reader nothing.',
     };
   }
-  // The cap counts what a READER sees, for the same reason emptiness does. Checking the raw string
-  // here while checking the visible text above meant 1,990 real characters padded with zero-width
-  // ones were refused as "2010 against a limit of 2000" — one end of the same rule measured one way
-  // and the other end the other.
+  // BOTH ceilings. Visible length is what a reader faces in a halt banner; raw length is what is
+  // actually sent and stored. Measuring only one of them has been wrong in both directions now.
   if (visible.length > MAX_REJECTION_REASON) {
     return {
       ok: false,
       message: `That reason is too long: ${visible.length} characters against a limit of ${MAX_REJECTION_REASON}. It has to be readable in a halt banner on a phone.`,
+    };
+  }
+  if (reason.length > MAX_REJECTION_RAW) {
+    const hidden = reason.length - visible.length;
+    return {
+      ok: false,
+      message:
+        hidden > visible.length
+          ? `That reason is ${reason.length} characters long, of which ${hidden} are invisible padding. Only ${visible.length} would be read; the rest is payload, and the limit is ${MAX_REJECTION_RAW}.`
+          : `That reason is too long: ${reason.length} characters against a limit of ${MAX_REJECTION_RAW}.`,
     };
   }
   return { ok: true, message: null };

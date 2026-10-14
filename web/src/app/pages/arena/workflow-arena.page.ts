@@ -322,6 +322,12 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly promoteBlock = computed(() => {
     const run = this.challengerRun();
     if (!run) return 'This challenger has no run yet, so there is nothing to promote.';
+    // A gate in flight is about to REPLACE this run's score. Promoting now would crown a champion
+    // on a number that is being overwritten as the promotion is recorded — the same ordering this
+    // screen calls falsification when it happens the other way round.
+    if (this.scoring()) {
+      return 'The gate is running on this run. Its score is about to change, so promotion is held until the result arrives — a champion crowned on a score that is being replaced is a champion crowned on nothing.';
+    }
     // A halted search refuses a promotion as well as a run: a promotion used to be the way OUT of
     // a halt, which made the halt escapable with no new evidence. Lifting it is its own decision.
     const halt = this.haltBlock();
@@ -450,6 +456,8 @@ export class WorkflowArenaPage implements OnInit {
   }
 
   protected async promote(): Promise<void> {
+    // `promoteBlock()` already covers a gate in flight; this reads it rather than re-listing the
+    // conditions, so the button, the confirm and the action can never disagree.
     if (this.promoteBlock() !== null || this.promoting()) return;
     const run = this.challengerRun();
     if (!run) return;
@@ -494,6 +502,7 @@ export class WorkflowArenaPage implements OnInit {
   protected async scoreRun(): Promise<void> {
     const run = this.challengerRun();
     if (!run || this.scoring() || this.scoreBlock() !== null || !this.hasGateToScore()) return;
+    this.confirming.set(false);
     this.scoring.set(true);
     this.scoreError.set(null);
     // The refusal is handled IN THE STREAM rather than as a rejected promise: a promise rejection
@@ -517,6 +526,8 @@ export class WorkflowArenaPage implements OnInit {
   protected async rescoreRun(): Promise<void> {
     const run = this.challengerRun();
     if (!run || this.scoring() || this.scoreBlock() !== null || !this.hasGateToScore()) return;
+    // Close any open promotion confirm: the score it was about to act on is being replaced.
+    this.confirming.set(false);
     this.scoring.set(true);
     this.scoreError.set(null);
     const scored = await firstValueFrom(

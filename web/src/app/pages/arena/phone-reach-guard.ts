@@ -194,11 +194,18 @@ export interface TransformRisk {
  * element is laid out correctly and painted somewhere else, so neither a width check nor a height
  * check can see it.
  *
- * OUT OF SCOPE, deliberately, and said here rather than implied: rotations, 3-D transforms,
- * `clip-path`, `mask`, `opacity: 0`, an ancestor's `overflow` clipping a descendant, and anything
- * that depends on the CASCADE — this file reads one stylesheet's text, never the computed style of
- * a rendered tree, so a defect that only exists once two sheets combine belongs to the browser
- * harness, not here.
+ * OUT OF SCOPE here, deliberately — and this note used to claim the browser harness covered it,
+ * which was MEASURED FALSE: `opacity: 0`, `clip-path` and `visibility: hidden` all passed the
+ * harness, because its reachability check was pure geometry. The harness now checks paint
+ * (`checkVisibility`, which covers opacity, visibility and content-visibility) and a centre-point
+ * HIT TEST (which covers clip-path, masks and anything painted on top), and each of the four shapes
+ * is re-run against it as a mutation.
+ *
+ * What is outside BOTH, stated rather than implied: rotations and 3-D transforms that leave a
+ * control hittable but unreadable, colour-contrast failures, a control that is reachable only after
+ * an animation finishes, and anything that needs a real touch device (hover-only affordances, the
+ * software keyboard covering a focused field). Those want a human or a device lab, and nothing in
+ * this branch claims them.
  */
 export function transformRisks(css: string, width = 400): TransformRisk[] {
   const out: TransformRisk[] = [];

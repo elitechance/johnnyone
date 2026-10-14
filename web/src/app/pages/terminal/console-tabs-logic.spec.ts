@@ -164,7 +164,8 @@ describe('wiring — the strip the console renders is the strip this file decide
   it('the console calls the delegating function, not a hand-rolled list', () => {
     const ts = readFileSync(resolve(here, 'terminal.page.ts'), 'utf8');
     expect(ts).toMatch(/visibleTabs\s*=\s*computed\([^;]*consoleTabsWithArena\(/);
-    // A second, literal tab array in the page would be the drift this guards against.
-    expect(ts).not.toMatch(/\[\s*'raw'\s*,\s*'plan'/);
+    // A second, literal tab array in the page would be the drift this guards against — in either
+    // quote style, because `["raw", "plan", …]` evaded the single-quote-only version.
+    expect(ts).not.toMatch(/\[\s*(['"`])raw\1\s*,\s*(['"`])plan\2/);
   });
 });
