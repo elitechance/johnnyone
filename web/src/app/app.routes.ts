@@ -108,6 +108,41 @@ export const appRoutes: Route[] = [
         (m) => m.ValidationConfigPage,
       ),
   },
+  // The workflow arena (MASS). Four lazy authGuard routes, mirroring /files, /shells and
+  // /initiatives/:id/validation. There is deliberately NO per-phase route: phases render inside
+  // TerminalPage's `plan` tab, so the arena's entry point is a row there plus an added `arena` tab,
+  // and the setup wizard hangs off the INITIATIVE, carrying the phase as `?phaseId=`.
+  {
+    path: 'initiatives/:id/arena',
+    title: 'Arena setup',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/arena/arena-setup.page').then((m) => m.ArenaSetupPage),
+  },
+  {
+    path: 'workflows',
+    title: 'Workflows',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/arena/workflows.page').then((m) => m.WorkflowsPage),
+  },
+  // The 3-segment arena route is declared BEFORE `workflows/:id` for readability; Angular matches
+  // on segment count, so neither can shadow the other, and `arena-routes.spec.ts` navigates both
+  // for real rather than trusting that.
+  {
+    path: 'workflows/:id/arena',
+    title: 'Workflow arena',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/arena/workflow-arena.page').then((m) => m.WorkflowArenaPage),
+  },
+  {
+    path: 'workflows/:id',
+    title: 'Workflow',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/arena/workflow-detail.page').then((m) => m.WorkflowDetailPage),
+  },
   // Developer console — authenticated UI for the partner API surface
   // (auth/keys, agent-session CRUD, live WSS terminal). The public docs live
   // at /integration; this is the logged-in console that drives the same API.

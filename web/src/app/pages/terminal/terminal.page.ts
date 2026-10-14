@@ -17,6 +17,11 @@ import { FormsModule } from '@angular/forms';
 import { DomSanitizer, SafeHtml, Title } from '@angular/platform-browser';
 import { FileViewerService } from '../../services/file-viewer.service';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+// The arena (MASS). All three are standalone components with INLINE templates and styles, which is
+// why they can be mounted in jsdom specs — and why none of them adds a byte to terminal.page.scss.
+import { ArenaPanelComponent } from '../arena/arena-panel.component';
+import { ArenaRowComponent } from '../arena/arena-row.component';
+import { GateStripComponent } from '../arena/gate-strip.component';
 import {
   IonModal,
   IonHeader,
@@ -83,6 +88,7 @@ import {
   HostFileEntry,
   TmuxSession,
   phaseNnOf,
+  type TestGateRun,
 } from '@johnnyone/ui';
 import {
   PaneTab,
@@ -125,6 +131,7 @@ import {
   initiativeTabOf,
   rawAttachNeeded,
   visibleConsoleTabs,
+  consoleTabsWithArena,
   isLocalSmall,
   resolvedPaneTab,
 } from './console-tabs-logic';
@@ -260,6 +267,9 @@ addIcons({
     MarkdownViewComponent,
     LifecycleBarComponent,
     StatusPillComponent,
+    ArenaPanelComponent,
+    ArenaRowComponent,
+    GateStripComponent,
     IonModal,
     IonHeader,
     IonToolbar,
@@ -1045,6 +1055,48 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** True while a run/resume submit is in flight (disables the button). */
   protected readonly runSubmitting = signal<boolean>(false);
   /** Whole-panel visibility — dev run with ≥1 phase, else hidden. */
+  // ── The arena (MASS) ───────────────────────────────────────────────────────────────────────
+  // The phases the Arena tab and the plan tab's arena rows are built from. Same `planRun` the rest
+  // of the Plan tab reads; no second fetch.
+  protected readonly arenaPhases = computed(() => this.planRun()?.phases ?? []);
+
+  /** The phase row behind a Plan-tab phase card, so the arena row reads the host's
+   *  `effectiveTestCommands` instead of the card projection re-deriving a gate. */
+  protected arenaPhaseOf(phaseId: string) {
+    return this.arenaPhases().find((p) => p.phaseId === phaseId) ?? null;
+  }
+  /** One run of the CURRENT phase's effective gate, for the Checks tab (mock step 5). */
+  protected readonly phaseGate = signal<TestGateRun | null>(null);
+  protected readonly phaseGatePending = signal(false);
+  /** The gate that actually applies to the current phase — the host's `effectiveTestCommands`,
+   *  never a client-side fallback between the phase's and the plan's. */
+  protected readonly phaseGateCommands = computed<string[]>(() => {
+    const run = this.planRun();
+    const phaseId = run?.plan?.currentPhaseId;
+    const phase = (run?.phases ?? []).find((p) => p.phaseId === phaseId) ?? (run?.phases ?? [])[0];
+    return phase?.effectiveTestCommands ?? [];
+  });
+
+  /** Run the current phase's gate once and show the exit code + collected count on the Checks tab.
+   *  Same resolution and same shell as the coordinator's own ready-check, so what this reports is
+   *  what the coordinator would see. */
+  protected async runPhaseGate(): Promise<void> {
+    const run = this.planRun();
+    const planId = run?.plan?.id;
+    if (!planId || this.phaseGatePending()) return;
+    this.phaseGatePending.set(true);
+    try {
+      this.phaseGate.set(
+        await firstValueFrom(this.api.runAgentPlanTestGate(planId, run?.plan?.currentPhaseId ?? null)),
+      );
+    } catch {
+      // Leave the previous result on screen rather than replacing it with a fabricated one.
+      this.phaseGate.set(null);
+    } finally {
+      this.phaseGatePending.set(false);
+    }
+  }
+
   protected readonly runResumeVisible = computed<boolean>(() => panelVisible(this.planRun()));
   /** Error banner model (shown above the panel when the run is paused). */
   protected readonly runBanner = computed(() => bannerModel(this.planRun()));
@@ -1104,7 +1156,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   });
   protected readonly replanFlags = computed(() => replanFlagsOf(this.parsedPreflight()));
   protected readonly visibleTabs = computed(() =>
-    visibleConsoleTabs(
+    consoleTabsWithArena(
       this.selectedInitiative(),
       !!this.taskRunJson(),
       !!this.planCheckJson(),
@@ -2664,7 +2716,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       value === 'plan' ||
       value === 'diff' ||
       value === 'checks' ||
-      value === 'tasks'
+      value === 'tasks' ||
+      value === 'arena'
     );
   }
 
@@ -2733,6 +2786,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         return 'Checks';
       case 'tasks':
         return 'Tasks';
+      case 'arena':
+        return '⚔ Arena';
     }
   }
 

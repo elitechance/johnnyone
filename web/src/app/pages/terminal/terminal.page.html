@@ -541,6 +541,15 @@
                           <span class="pt">{{ card.phaseTitle }}</span>
                           <span class="pc tnum">{{ card.done }} / {{ card.total }}</span>
                         </div>
+                        <!-- The arena's entry point (MASS step 1): ONE extra row on a phase that
+                             already exists. A standalone component with its own inline styles, so
+                             terminal.page.scss gains nothing and the Plan tab is unchanged
+                             otherwise. The phase it is given is the SAME `planRun` phase row the
+                             rest of this tab reads, so `effectiveTestCommands` is the host's. -->
+                        <johnny-arena-row
+                          [initiativeId]="sel.id"
+                          [phase]="arenaPhaseOf(card.phaseId)"
+                        />
                         <div class="tasklist">
                           @for (t of card.tasks; track t.id) {
                             @let sv = taskStatus(t.status);
@@ -567,6 +576,16 @@
           </section>
         } @else if (activeTab() === 'checks') {
           <section class="terminal-surface checks-surface">
+            <!-- MASS step 5: the gate's exit code and collected count, beside the lens/plan-check
+                 cards that already live here. The gate is a SECOND, parallel score used only to
+                 compare workflows — it does not decide whether a phase is done, and `gateVerdict`
+                 and the lens system are untouched. -->
+            <johnny-gate-strip
+              [gate]="phaseGate()"
+              [pending]="phaseGatePending()"
+              [commands]="phaseGateCommands()"
+              (run)="runPhaseGate()"
+            />
             @if (checks().state === 'empty') {
               <div class="pane-empty">{{ checks().card }}</div>
             } @else {
@@ -623,6 +642,10 @@
                 </div>
               }
             }
+          </section>
+        } @else if (activeTab() === 'arena') {
+          <section class="terminal-surface arena-surface">
+            <app-arena-panel [initiativeId]="sel.id" [phases]="arenaPhases()" />
           </section>
         } @else if (activeTab() === 'tasks') {
           <section class="terminal-surface tasks-surface">

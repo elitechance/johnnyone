@@ -63,6 +63,12 @@ export type {
   GitDiffView,
   WorkspaceFileDiff,
   WorkspaceValidation,
+  // The test gate (migrations 023/025) and the workflow arena (026).
+  TestGateRun,
+  Workflow,
+  WorkflowRun,
+  WorkflowPref,
+  WorkflowSearchState,
 } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
 export type {
