@@ -2199,3 +2199,208 @@ mod qa_b_r3_tests {
         assert_eq!(pool.busy_for("glm-5.3-flash"), 4);
     }
 }
+
+/// QA B round 4 — attacking `WhitespaceMismatch` with the invisible characters it is for.
+#[cfg(test)]
+mod qa_b_r4_tests {
+    use super::*;
+
+    /// Build the override JSON with serde, not `format!("{:?}")`.
+    ///
+    /// QA's first version used Rust's `Debug` for the key, which emits `\u{a0}` — valid Rust,
+    /// invalid JSON — so every non-ASCII case failed to parse and the test was measuring the
+    /// parser rather than the notes.
+    fn note_for(key: &str) -> CapNote {
+        let mut map: BTreeMap<String, u32> = BTreeMap::new();
+        map.insert(key.to_string(), 40);
+        map.insert("qwen3.8-flash-next".to_string(), 4);
+        let raw = serde_json::to_string(&map).expect("serialise");
+        let (_, ns) = SeatCaps::from_override_json(&raw).expect(&raw);
+        ns.into_iter()
+            .find(|n| !matches!(n, CapNote::AboveMeasured { .. }))
+            .unwrap_or_else(|| panic!("no key note for {key:?}"))
+    }
+
+    /// Every whitespace character `str::trim` recognises gets the specific note, naming the
+    /// family it was meant to be and saying the key was NOT trimmed.
+    #[test]
+    fn qa_every_trimmable_invisible_gets_the_specific_note() {
+        for (label, key) in [
+            ("leading space", " glm-5.3-flash"),
+            ("trailing space", "glm-5.3-flash "),
+            ("tab", "\tglm-5.3-flash"),
+            ("trailing newline", "glm-5.3-flash\n"),
+            ("CRLF", "glm-5.3-flash\r\n"),
+            ("non-breaking space", "\u{00a0}glm-5.3-flash"),
+            ("ideographic space", "\u{3000}glm-5.3-flash"),
+            ("vertical tab", "\u{000b}glm-5.3-flash"),
+            ("both sides", "  glm-5.3-flash  "),
+        ] {
+            match note_for(key) {
+                CapNote::WhitespaceMismatch {
+                    configured,
+                    measured,
+                    case_too,
+                } => {
+                    assert_eq!(configured, key, "{label}: the note must quote the key verbatim");
+                    assert_eq!(measured, "glm-5.3-flash", "{label}");
+                    assert!(!case_too, "{label}: only whitespace is wrong here");
+                    let shown = CapNote::WhitespaceMismatch {
+                        configured,
+                        measured,
+                        case_too,
+                    }
+                    .to_string();
+                    assert!(shown.contains("whitespace"), "{label}: {shown}");
+                    assert!(
+                        shown.contains("glm-5.3-flash"),
+                        "{label}: the note must name the intended family: {shown}"
+                    );
+                    assert!(
+                        shown.to_lowercase().contains("not trimmed")
+                            || shown.contains("matched exactly")
+                            || shown.contains("NOT change"),
+                        "{label}: the note must say the key was not corrected: {shown}"
+                    );
+                }
+                other => panic!("{label} ({key:?}) got {other:?}"),
+            }
+        }
+    }
+
+    /// Whitespace AND case wrong together says so, rather than picking one.
+    #[test]
+    fn qa_whitespace_and_case_together_are_both_reported() {
+        match note_for(" GLM-5.3-Flash ") {
+            CapNote::WhitespaceMismatch {
+                configured,
+                measured,
+                case_too,
+            } => {
+                assert_eq!(configured, " GLM-5.3-Flash ");
+                assert_eq!(measured, "glm-5.3-flash");
+                assert!(case_too, "both are wrong, and the note must carry that");
+                let shown = CapNote::WhitespaceMismatch {
+                    configured,
+                    measured,
+                    case_too,
+                }
+                .to_string();
+                assert!(shown.contains("whitespace"), "{shown}");
+                assert!(shown.to_lowercase().contains("case"), "{shown}");
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Case alone stays a CaseMismatch, so the two variants are not interchangeable.
+        assert!(matches!(note_for("GLM-5.3-Flash"), CapNote::CaseMismatch { .. }));
+    }
+
+    /// FINDING (residual, narrow). A ZERO-WIDTH SPACE is not `char::is_whitespace`, so
+    /// `str::trim` leaves it and the near-miss lookup fails — the key falls to the generic
+    /// `UnmeasuredFamily` note, which is the one case `WhitespaceMismatch` exists to improve on.
+    ///
+    /// It is the most invisible of the invisible characters and the hardest for an operator to
+    /// find by eye, and it is the one that gets no pointer to the family it was meant to be. Same
+    /// for a zero-width non-joiner and a BOM. Narrow — nothing types these on purpose — but the
+    /// variant's own justification ("the operator has to be told WHICH invisible character to
+    /// delete") applies most strongly here, so this is the gap the fix did not close.
+    #[test]
+    fn qa_documents_a_zero_width_space_gets_only_the_generic_note() {
+        for (label, key) in [
+            ("zero-width space", "glm-5.3-flash\u{200b}"),
+            ("zero-width non-joiner", "\u{200c}glm-5.3-flash"),
+            ("BOM / zero-width no-break space", "\u{feff}glm-5.3-flash"),
+        ] {
+            // Not trimmable, so the key is genuinely a different name...
+            assert_eq!(key.trim(), key, "{label}: trim leaves it");
+            match note_for(key) {
+                CapNote::UnmeasuredFamily { family } => assert_eq!(family, key, "{label}"),
+                other => panic!("{label}: expected UnmeasuredFamily, got {other:?}"),
+            }
+        }
+        // ...and the real family keeps its measured cap, as the note for the trimmable cases says.
+        let mut map: BTreeMap<String, u32> = BTreeMap::new();
+        map.insert("glm-5.3-flash\u{200b}".to_string(), 40);
+        map.insert("qwen3.8-flash-next".to_string(), 4);
+        let caps = SeatCaps::from_override_json(&serde_json::to_string(&map).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(caps.cap("glm-5.3-flash"), Some(4), "the intended family is untouched");
+        assert_eq!(caps.cap("glm-5.3-flash\u{200b}"), Some(40), "a fourth family, invisibly");
+    }
+
+    /// A whitespace-ONLY key trims to nothing, matches no family, and is reported generically.
+    #[test]
+    fn qa_a_whitespace_only_key_is_a_family_of_its_own() {
+        for key in [" ", "\t", "   ", "\n"] {
+            match note_for(key) {
+                CapNote::UnmeasuredFamily { family } => assert_eq!(family, key),
+                other => panic!("{key:?} got {other:?}"),
+            }
+        }
+        // It really becomes a family, with a cap, which nothing can ever ask for by name.
+        let caps = SeatCaps::from_override_json(r#"{" ": 3, "glm-5.3-flash": 4}"#).unwrap().0;
+        assert_eq!(caps.cap(" "), Some(3));
+        assert_eq!(caps.families().count(), 4);
+    }
+
+    /// The zero-state symmetry must need BOTH routes' wording, not one.
+    ///
+    /// Dev B's `qa_both_routes_for_a_zero_state_the_same_rule` ends in a loop that checks each
+    /// phrase against each route, so dropping the wording from either side fails it. Asserted
+    /// here independently on the two messages themselves, so the symmetry is pinned by a second
+    /// test that does not share the first's structure.
+    #[test]
+    fn qa_the_zero_rule_is_taught_identically_by_both_routes() {
+        let refusal = SeatCaps::from_override_json(r#"{"glm-5.3-flash":0}"#)
+            .expect_err("all-zero is refused");
+        let note = SeatCaps::from_override_json(r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}"#)
+            .expect("accepted in company")
+            .1
+            .into_iter()
+            .find(|n| matches!(n, CapNote::ZeroIgnored { .. }))
+            .expect("a ZeroIgnored note")
+            .to_string();
+
+        for phrase in ["does NOT disable", "disable switch"] {
+            assert!(refusal.contains(phrase), "the refusal is missing {phrase:?}: {refusal}");
+            assert!(note.contains(phrase), "the note is missing {phrase:?}: {note}");
+        }
+        // And the two are genuinely different messages otherwise, so this is a symmetry of the
+        // RULE rather than one string used twice.
+        assert_ne!(refusal, note);
+    }
+
+    /// `ZeroIgnored` can no longer claim a measured cap that does not exist — the round-3 finding.
+    #[test]
+    fn qa_zero_ignored_tells_the_truth_for_both_measured_and_unmeasured() {
+        let (_, ns) = SeatCaps::from_override_json(r#"{"local-7b":0,"glm-5.3-flash":0,"qwen3.8-flash-next":4}"#)
+            .expect("accepted");
+        let for_family = |f: &str| {
+            ns.iter()
+                .find(|n| matches!(n, CapNote::ZeroIgnored { family, .. } if family == f))
+                .unwrap_or_else(|| panic!("no ZeroIgnored for {f}"))
+                .to_string()
+        };
+        // Measured: it is honest to say the cap is kept, and the message names the NUMBER —
+        // better than QA assumed, so the assertion pins the real wording.
+        let measured = for_family("glm-5.3-flash");
+        assert!(
+            measured.contains("its measured cap of 4 is kept"),
+            "the measured case must name the cap it keeps: {measured}"
+        );
+        // Unmeasured: it must not claim any kept cap at all.
+        let unmeasured = for_family("local-7b");
+        assert!(
+            !unmeasured.contains("is kept"),
+            "an unmeasured family has no measured cap to keep: {unmeasured}"
+        );
+        assert!(!unmeasured.contains("measured cap of"), "{unmeasured}");
+        // And the unmeasured, zeroed key now ALSO gets the note that is true about it, which the
+        // round-3 version suppressed.
+        assert!(
+            ns.iter().any(|n| matches!(n, CapNote::UnmeasuredFamily { family } if family == "local-7b")),
+            "the key diagnostics must run before the zero check: {ns:?}"
+        );
+    }
+}

@@ -18793,3 +18793,88 @@ mod qa_b_r2_tests {
         }
     }
 }
+
+/// QA B round 4 — the review gate is a THIRD reader, and it does not go through the taxonomy.
+#[cfg(test)]
+mod qa_b_r4_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git must be available")
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    fn committed_store(tag: &str) -> PathBuf {
+        let dir = crate::test_support::tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-shell/tasks/t1")).unwrap();
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/prompt.md"), "# Task\n- x\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "qa@example.com"]);
+        git(&dir, &["config", "user.name", "qa"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    /// FINDING (scope, not a defect introduced by this branch). `is_fault()` cannot help the one
+    /// production reader of phase evidence that exists, because that reader does not use the
+    /// taxonomy at all.
+    ///
+    /// `evidence_provenance_reason` finds evidence by asking git for untracked files under
+    /// `phases/<id>/` — it never calls `phase_artifacts_state` or `resolve_phase_artifacts_dir`.
+    /// So when an artifacts directory cannot be read, the new `Unreadable` state is never
+    /// consulted and the gate simply sees no evidence: an undescribed screenshot that would have
+    /// been caught is silently not caught, and the phase passes the provenance check.
+    ///
+    /// What a reviewer should conclude: "one reader" is true of the two functions in
+    /// `plan_artifacts`, not of the host. The taxonomy is the right shape and the arena's reader
+    /// should use it — but the existing review gate still has the R2-3 failure mode, in the
+    /// opposite direction (a check that silently passes rather than a phase that looks empty),
+    /// and closing that means routing the gate through the taxonomy too. Out of scope for this
+    /// branch; in scope for whoever wires the arena's gate.
+    #[test]
+    fn qa_documents_the_review_gate_does_not_use_the_artifacts_taxonomy() {
+        let plan = committed_store("qa-r4-gate");
+        let art = plan.join("phases/01-shell/artifacts/runs/RUN-1");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("mystery.png"), b"undescribed pixels").unwrap();
+
+        // Readable: the gate catches the undescribed image.
+        let caught = evidence_provenance_reason(&plan.to_string_lossy(), "01-shell")
+            .expect("an undescribed image must be caught while the directory is readable");
+        assert!(caught.contains("mystery.png"), "{caught}");
+        // And the taxonomy agrees there is evidence there.
+        assert!(matches!(
+            plan_artifacts::phase_artifacts_state(&plan, "01-shell", Some("RUN-1")),
+            plan_artifacts::ArtifactsState::Found(_)
+        ));
+
+        // Now make that directory unlistable. The image is still on disk.
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&art).is_err() {
+            // The taxonomy says FAULT, loudly and actionably.
+            let state = plan_artifacts::phase_artifacts_state(&plan, "01-shell", Some("RUN-1"));
+            assert!(
+                state.is_fault(),
+                "the typed reader must call this a fault; got {state:?}"
+            );
+            // The GATE, which does not ask it, now reports no problem at all.
+            assert_eq!(
+                evidence_provenance_reason(&plan.to_string_lossy(), "01-shell"),
+                None,
+                "the gate passes the phase because it cannot see the evidence it would have \
+                 rejected — the fault the taxonomy identified never reaches it"
+            );
+        }
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Restored: the gate catches it again, so nothing about the store changed.
+        assert!(evidence_provenance_reason(&plan.to_string_lossy(), "01-shell").is_some());
+    }
+}
