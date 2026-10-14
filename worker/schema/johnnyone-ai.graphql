@@ -204,10 +204,24 @@ type AgentPlanPhase {
 
 # One run of a phase's (or a plan's) effective test gate — see the runAgentPlanTestGate mutation.
 type TestGateRun {
+  # Whether a gate was DECLARED at all, at either level.
+  #
+  # This is what separates "passed" from "there was nothing to pass". An exitCode of 0 is returned
+  # both by a gate that ran every command successfully and by a phase that declares no gate, so a
+  # client asking "is this phase proven?" must check `gateDeclared && exitCode == 0`. exitCode == 0
+  # alone only means "nothing failed".
+  #
+  # true with commandsRun == 0 and a non-zero exitCode is the malformed case: a gate is configured
+  # but its stored value could not be read, so nothing ran. That used to report exitCode 0 and was
+  # indistinguishable from a pass.
+  gateDeclared: Boolean!
   # The score. Zero means the gate passed; anything else is the exit code of the FIRST command
   # that failed (-1 when a signal killed it and no code was reported). This is the ONLY score the
   # gate has, by design: a numeric quality score would need a scale, a writer and an interpreter,
   # and each is a place for a false pass to hide.
+  # Three reserved NEGATIVE values cover outcomes with no real exit code, so that a client
+  # treating non-zero as failure refuses them without needing to know which: -1 killed by a
+  # signal, -2 gate declared but unreadable, -3 exceeded the host's per-command timeout.
   exitCode: Int!
   # How many tests the run reported, parsed best-effort from its output.
   #
@@ -656,11 +670,16 @@ type Mutation {
   # Overhaul phase 7 (D1). Persist the Initiative's ordered validation-lens array as a JSON string;
   # a null/empty config clears it (→ desktop resolves the default product/qa/lead template).
   updateAgentPlanValidationConfig(id: ID!, config: String): AgentPlanRun!
-  # Set the coordinator's test gate (migrations 023 / 025). `phaseId` picks the level: null writes
-  # the PLAN's gate, a phase id writes that phase's. An absent or empty `commands` CLEARS the gate
-  # at that level, which is what makes it opt-in — a cleared phase falls back to the plan, a
-  # cleared plan means no gate at all.
-  updateAgentPlanTestCommands(id: ID!, phaseId: String, commands: [String!]): AgentPlanRun!
+  # Set — or explicitly clear — the coordinator's test gate (migrations 023 / 025). `phaseId`
+  # picks the level: null writes the PLAN's gate, a phase id writes that phase's.
+  #
+  # `commands` is NON-NULL and clearing needs `clear: true`. Both are deliberate: with `commands`
+  # optional and an empty list meaning "remove", `updateAgentPlanTestCommands(id: "x")` silently
+  # wiped the Initiative-wide gate, which is the wrong thing for an incomplete call to do to a
+  # mutation that sounds additive. Clearing is still how a level opts out — a cleared phase falls
+  # back to the plan, a cleared plan means no gate at all — it just has to be asked for. Passing
+  # both a non-empty `commands` and `clear: true` is rejected.
+  updateAgentPlanTestCommands(id: ID!, phaseId: String, commands: [String!]!, clear: Boolean): AgentPlanRun!
   # Run a phase's (or the plan's) effective gate ONCE and report the outcome, without bouncing the
   # worker. Same resolution rule and same shell as the coordinator's automatic ready-check, so
   # what this reports is what the coordinator would see. Commands run sequentially from the plan's

@@ -1789,7 +1789,6 @@ impl AgentService {
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
             .filter(|value| !value.trim().is_empty());
-        // Optional: absent or empty CLEARS the gate at the chosen level.
         let commands: Vec<String> = params
             .get("commands")
             .and_then(|value| value.as_array())
@@ -1801,11 +1800,19 @@ impl AgentService {
                     .collect()
             })
             .unwrap_or_default();
+        // Clearing is explicit. An empty `commands` without `clear: true` is REJECTED by the
+        // service, so a call that forgot its arguments cannot wipe a gate — the defaults here are
+        // deliberately the ones that fail loudly rather than the ones that destroy state.
+        let clear = params
+            .get("clear")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         let run = crate::services::agent_plans::update_test_commands(
             state,
             id.to_string(),
             phase_id,
             commands,
+            clear,
         )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
