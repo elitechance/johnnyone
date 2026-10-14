@@ -12278,6 +12278,41 @@ diff --git a/two.md b/two.md
         }
     }
 
+    /// The third malformed direction, which the feature's own test does not cover: a malformed
+    /// PLAN gate underneath a HEALTHY phase gate.
+    ///
+    /// `effective_gate` consults the phase first, so the phase's commands win and the plan's typo
+    /// is never parsed — the gate runs normally and the broken plan value stays LATENT. That is
+    /// the right call (the plan's value is simply not in use), but it means the typo surfaces only
+    /// when some phase without its own gate reports ready, and then that phase is bounced. Pinned
+    /// so the asymmetry with the other two directions is a decision rather than a surprise.
+    #[tokio::test]
+    async fn qa_malformed_plan_gate_under_a_healthy_phase_gate_stays_latent() {
+        let dir = tmp_dir("qa-gate-latent");
+        let w = dir.to_string_lossy().to_string();
+        let plan = plan_with_test_commands(&w, Some("not json"));
+        let healthy_phase = phase_with_test_commands(Some(r#"["true"]"#));
+
+        // The phase's gate runs and passes; the plan's unreadable value is not consulted.
+        let run = run_test_gate(&plan, Some(&healthy_phase))
+            .await
+            .expect("gate must run");
+        assert!(run.gate_declared);
+        assert_eq!(run.exit_code, 0, "{}", run.output);
+        assert_eq!(run.commands_run, 1);
+        assert!(
+            failing_test_command(&plan, Some(&healthy_phase)).await.is_none(),
+            "a phase with its own healthy gate must not be bounced for the plan's typo"
+        );
+
+        // But a phase that declares NOTHING falls through to the plan and IS bounced, so the typo
+        // is not lost — only deferred to the phase it actually governs.
+        let reason = failing_test_command(&plan, Some(&phase_with_test_commands(None)))
+            .await
+            .expect("a phase inheriting a broken plan gate must be bounced");
+        assert!(reason.contains("could not be read"), "{reason}");
+    }
+
     /// `gate_declared` is what separates "passed" from "there was nothing to pass".
     #[tokio::test]
     async fn gate_declared_distinguishes_a_pass_from_an_absent_gate() {
