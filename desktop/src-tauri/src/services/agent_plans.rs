@@ -3818,7 +3818,7 @@ async fn deliver_agent_prompt(
                      (session {session_id})"
                 ));
             }
-            if probe.is_empty() || snapshot.content.contains(&probe) {
+            if probe.is_empty() || pane_acknowledged(&snapshot.content, &probe) {
                 return Ok(());
             }
         }
@@ -3828,10 +3828,45 @@ async fn deliver_agent_prompt(
             "agent prompt not visible in pane after send; re-sending"
         );
     }
-    Err(format!(
-        "agent CLI never acknowledged its prompt after {PROMPT_DELIVERY_ATTEMPTS} attempts \
-         (session {session_id}); it may be showing a modal or failed to start"
-    ))
+    // NOT an error. A failed read-back means "we could not SEE it arrive", which is not the same
+    // as "it did not arrive" — and the caller of this function starts the coordinator loop, so
+    // returning `Err` here throws away the watcher for an agent that is, in every case observed so
+    // far, already working on the prompt. That is what happened to planning run `e9edf0e5` on
+    // 2026-10-14: the probe could not match (see `pane_acknowledged`), delivery "failed" three
+    // times, and the run sat in `planning_planner_running` for eight hours with a planner that had
+    // finished and a coordinator that had never started. It then happened a second time to that
+    // run's first review lens, whose verdict was already in the database when the coordinator died.
+    //
+    // A genuinely dead or modal-blocked CLI is caught downstream instead, by the idle nudges and
+    // the escalation in `wait_for_agent_ready_report` — a backstop that reports the run as needing
+    // attention WITHOUT discarding it. The folder-trust modal above still fails hard, because that
+    // one is a real, specific, human-answerable block.
+    tracing::warn!(
+        session_id,
+        attempts = PROMPT_DELIVERY_ATTEMPTS,
+        "agent prompt never read back in pane; proceeding anyway and leaving it to the idle nudges"
+    );
+    Ok(())
+}
+
+/// Did the pane show the prompt ARRIVE?
+///
+/// The probe text itself is the strongest signal, but a long prompt frequently never appears:
+/// Claude Code collapses pasted input into `[Pasted text #1]`, and a prompt that lands while the
+/// agent is still finishing its last turn is held as a queued message. In both cases the agent has
+/// the prompt and the first 33 characters of it are nowhere on screen. Treating a busy agent as a
+/// delivery failure also re-sends the prompt, which is how one review lens received the same task
+/// three times.
+fn pane_acknowledged(content: &str, probe: &str) -> bool {
+    if !probe.is_empty() && content.contains(probe) {
+        return true;
+    }
+    let lower = content.to_ascii_lowercase();
+    // Collapsed or queued input: the TUI is holding text it will not render in full.
+    lower.contains("[pasted text")
+        || lower.contains("edit queued messages")
+        // Working. Nothing but a submitted prompt puts an interrupt hint on the screen.
+        || lower.contains("esc to interrupt")
 }
 
 /// A distinctive, quote-free slice of the prompt to look for in the pane. Long prompts wrap and
@@ -15074,7 +15109,7 @@ mod replan_tests {
 
 #[cfg(test)]
 mod prompt_delivery_tests {
-    use super::{pane_awaiting_trust, prompt_probe, read_report_markdown_within, ReportMarkdown};
+    use super::{pane_acknowledged, pane_awaiting_trust, prompt_probe, read_report_markdown_within, ReportMarkdown};
     use std::path::PathBuf;
 
     /// A fresh, real temp dir so `canonicalize` succeeds on the containment prefix. Mirrors
@@ -15100,6 +15135,40 @@ mod prompt_delivery_tests {
     /// Just the body, for the cases that only care whether anything was attached.
     fn body(roots: &[PathBuf], evidence: &str) -> Option<String> {
         read_report_markdown_within(roots, evidence).into_body()
+    }
+
+    #[test]
+    fn pane_acknowledged_accepts_the_probe_itself() {
+        let probe = prompt_probe("You are the T1 developer for this phase.\nDo the work.");
+        assert!(pane_acknowledged(
+            "> You are the T1 developer for this phase.\n  working...",
+            &probe
+        ));
+    }
+
+    #[test]
+    fn pane_acknowledged_accepts_a_collapsed_paste() {
+        // THE EIGHT-HOUR STALL. Claude Code renders a long pasted prompt as `[Pasted text #1]`, so
+        // the probe is nowhere on screen even though the agent has the whole prompt.
+        let probe = prompt_probe("You are the Product review lens for this plan.\nRead it.");
+        assert!(!pane_acknowledged("❯ \n  ready", &probe), "control: an idle pane is NOT an ack");
+        assert!(pane_acknowledged("❯ [Pasted text #1]\n  paste again to expand", &probe));
+    }
+
+    #[test]
+    fn pane_acknowledged_accepts_a_queued_or_busy_agent() {
+        // A prompt delivered while the agent is mid-turn is held as a queued message, and a
+        // working agent shows an interrupt hint. Both mean it arrived; neither shows the text.
+        let probe = prompt_probe("Continue updating the plan at /tmp/plan.\nSay the marker.");
+        assert!(pane_acknowledged("❯ Press up to edit queued messages", &probe));
+        assert!(pane_acknowledged("· Considering… (3s)\n  esc to interrupt", &probe));
+    }
+
+    #[test]
+    fn pane_acknowledged_rejects_an_unrelated_pane() {
+        let probe = prompt_probe("You are the T1 developer for this phase.\nDo the work.");
+        assert!(!pane_acknowledged("$ ls\nREADME.md  src\n$ ", &probe));
+        assert!(!pane_acknowledged("", &probe));
     }
 
     #[test]
