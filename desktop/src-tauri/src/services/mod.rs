@@ -24,3 +24,6 @@ mod fixture_spine;
 /// QA A's adversarial tests against the workflow arena (migration 026).
 #[cfg(test)]
 mod workflows_qa_attacks;
+/// QA A round 2: the fixes for round 1, and the surfaces the fixes added.
+#[cfg(test)]
+mod workflows_qa_attacks_r2;
