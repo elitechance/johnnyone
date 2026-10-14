@@ -1,6 +1,19 @@
 // Drives the BUILT web app in real Chrome at a phone viewport and PROVES, per route, that the page
 // rendered and that every control a human needs is reachable. It exits NON-ZERO when it is not.
 //
+// STANDING RISK, written here because the next person should read it before trusting the output:
+// this file is the only thing proving this feature's central claim — that a human can reach the
+// promote button on a phone — it is one unversioned-by-tests script of ~450 lines, and in the round
+// that reviewed it, TWO OF THREE findings were defects in this harness rather than in the product
+// (a metric that read 0 in a clipped layout, and a canned state the host could never produce). Treat
+// a green run as evidence only after checking that the falsifications still fail: collapse the
+// scroller, error every operation, point it at the wrong directory. They are listed at the bottom.
+//
+// CI, recommended and deliberately NOT wired: blocking for changes under `web/src/app/pages/arena/`,
+// the four `*.shell.ts`, and `terminal.page.*`; advisory elsewhere. A browser job that blocks
+// everything gets disabled within a month, and then this evidence evaporates exactly the way it
+// nearly did in a reports folder. Wiring it is the user's call, not a developer's.
+//
 // Round-3 rewrite. The previous version could not fail:
 //   * QA ran it verbatim against the wrong serve root and got seven screenshots and a complete
 //     metrics file with no error — `bodyText: 'no'` (a 404 body) and the exact metric signature of
@@ -63,7 +76,13 @@ const REASONS = [
 const WF = { id: 'w2', repo: 'johnnyone', phaseType: 'dev-phase', family: 'glm-5.3-flash', version: 2, parentId: 'w1', role: 'You are the development worker for one phase of an approved plan.', instruction: 'Implement the phase. Follow the repo conventions. Run the gate before reporting ready.', contract: `capture with .johnnyone/capture.sh, or write in decisions.md why the screen cannot be captured — reference ${LONG_URL}`, hop: '{"steps":["read conventions first","implement"],"returns":"ready"}', fanOut: 2, isChampion: false, createdAt: '2026-10-14T07:00:00Z' };
 const CHAMP = { ...WF, id: 'w1', version: 1, parentId: null, contract: 'a screenshot of each screen you changed', hop: '{"steps":["implement"]}', fanOut: 1, isChampion: true };
 const RUN_PASS = { id: 'r2', workflowId: 'w2', planId: 'p1', seed: 0, gateExit: 0, gateCollected: 23, seatsHeld: '{"glm-5.3-flash":2}', fleetBusy: '{}', startedAt: '2026-10-14T07:00:00Z', endedAt: '2026-10-14T07:06:40Z' };
-const RUN_FAIL = { ...RUN_PASS, id: 'r1', workflowId: 'w1', gateExit: 101, gateCollected: null, seatsHeld: '{"glm-5.3-flash":1}', endedAt: '2026-10-14T07:08:12Z' };
+// SAME SEAT BUDGET as the challenger, and that is not cosmetic. `comparable` is computed on the
+// host by `budgets_are_comparable`, an equality on the parsed seat maps — so a champion holding 1
+// seat against a challenger holding 2 would be written `comparable: 0` and the promotion refused.
+// The old fixture declared 1 against 2 AND `comparable: true`, which is a state J1 cannot reach:
+// the screenshot said "the seat budgets matched" over two runs the same file said did not match.
+// The layout proof was real either way; the state it was proved in was not.
+const RUN_FAIL = { ...RUN_PASS, id: 'r1', workflowId: 'w1', gateExit: 101, gateCollected: null, seatsHeld: '{"glm-5.3-flash":2}', endedAt: '2026-10-14T07:08:12Z' };
 // HALTED, with the long reason first: this is the tallest state the banner can be in.
 const STATE_HALTED = { repo: 'johnnyone', phaseType: 'dev-phase', family: 'glm-5.3-flash', consecutiveRejections: 3, halted: true, strikeLimit: 3, recentRejections: REASONS, championWorkflowId: 'w1' };
 const STATE_OPEN = { ...STATE_HALTED, consecutiveRejections: 1, halted: false, recentRejections: [REASONS[0]] };
@@ -175,7 +194,10 @@ const ROUTES = [
     open: [], controls: ['seats-unmeasured', 'fan-out', 'next-seats', 'family-glm-5.3-flash', 'family-deepseek-v4.1-flash', 'family-qwen3.8-flash-next'] },
   { name: 'arena-setup-prompt', url: '/initiatives/p1/arena?phaseId=04-leases&step=prompt', marker: 'github.com/lokalcamp/johnnyone', ionContent: true,
     open: ['start-search'], controls: ['slot-role', 'slot-instruction', 'slot-contract', 'slot-hop', 'halt-block', 'start-search'] },
-  { name: 'workflows-list', url: '/workflows', marker: 'glm-5.3-flash', ionContent: true,
+  // 'glm-5.3-flash' was NOT a fetched value here: the fleet strip lists the three families from a
+  // constant, so the marker passed with every operation erroring. 'width 2' only exists if a
+  // workflow row rendered.
+  { name: 'workflows-list', url: '/workflows', marker: 'width 2', ionContent: true,
     open: [], controls: ['fleet-strip', 'wf-row-w1', 'wf-row-w2', 'wf-link-w1', 'wf-arena-w1', 'wf-link-w2', 'wf-arena-w2'] },
   { name: 'workflow-detail', url: '/workflows/w2', marker: 'capture with .johnnyone/capture.sh', ionContent: true,
     open: [], controls: ['slot-role', 'slot-instruction', 'slot-contract', 'slot-hop'] },
@@ -286,6 +308,13 @@ for (const scenario of SCENARIOS) {
     const scrollerName = inner ? 'ion-content .inner-scroll' : panel ? 'app-arena-panel' : 'documentElement';
     // scrollHeight/clientHeight on the scroller, NOT a bounding rect on a child inside
     // `contain: size` — that reports the compressed box and is how a clipped route looked healthy.
+    // THE SCROLLER ITSELF MUST BE USER-SCROLLABLE. `scrollTop = 1e6` moves an `overflow: hidden`
+    // box perfectly well, so `maxScrollTop` cannot tell a scroller from a clip — which is exactly
+    // the console-tab defect this branch shipped once (`.terminal-surface { overflow: hidden }`).
+    const scrollerStyle = scroller.nodeType === 1 ? getComputedStyle(scroller) : null;
+    const scrollerClips = scrollerStyle
+      ? /hidden|clip/.test(scrollerStyle.overflowY) && !/auto|scroll/.test(scrollerStyle.overflowY)
+      : false;
     const scrollHeight = scroller.scrollHeight;
     // NO `|| innerHeight` FALLBACK. It masked a zero-height scroller: with `ion-content { height: 0 }`
     // injected, `clientHeight` was 0, the fallback made it 860, and a 3,152px page in a zero-height
@@ -314,9 +343,33 @@ for (const scenario of SCENARIOS) {
           ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true })
           : true;
       const inViewport = r.top >= -1 && r.bottom <= innerHeight + 1 && r.height > 0;
+      // THE FIFTH DEGENERATE SHAPE. A control can be painted, hittable and inside the viewport and
+      // still be unreachable, because `scrollIntoView` scrolls an `overflow: hidden` ancestor that
+      // a FINGER CANNOT. That is this codebase's own round-2 console-tab defect
+      // (`.terminal-surface { height: 100%; overflow: hidden }`), and with a nested clip at 820px
+      // every other check here was satisfied on its own terms: the clipped box no longer overflowed
+      // the scroller, so nothing was "unreachable" by arithmetic.
+      //
+      // So: walk from the control up to the chosen scroller, and fail on any ancestor that CLIPS
+      // (overflow hidden/clip) without being scrollable itself.
+      let clippedBy = null;
+      for (let node = el.parentElement; node && node !== scroller; node = node.parentElement) {
+        const cs = getComputedStyle(node);
+        // A box whose overflow is hidden/clip is NOT user-scrollable, by definition — that is the
+        // whole distinction. (An earlier version of this loop called "has overflow" `scrolls` and
+        // then skipped every box that overflowed, which is every box worth flagging.)
+        const clips = /hidden|clip/.test(cs.overflowY) || /hidden|clip/.test(cs.overflowX);
+        if (!clips) continue;
+        const overflows =
+          node.scrollHeight > node.clientHeight + 1 || node.scrollWidth > node.clientWidth + 1;
+        if (overflows) {
+          clippedBy = `${node.tagName.toLowerCase()}${node.className ? '.' + String(node.className).split(' ')[0] : ''}`;
+          break;
+        }
+      }
+
       // CAN A FINGER ACTUALLY HIT IT? Hit-testing respects `clip-path`, which `checkVisibility`
-      // does not, and it also catches anything painted on top. Three points, because a control can
-      // be partly clipped and still usable.
+      // does not, and it also catches anything painted on top.
       let hittable = false;
       let hitBy = null;
       if (inViewport) {
@@ -338,7 +391,8 @@ for (const scenario of SCENARIOS) {
         inViewport,
         hittable,
         hitBy,
-        reachable: inViewport && painted && hittable,
+        clippedBy,
+        reachable: inViewport && painted && hittable && !clippedBy,
       };
     };
     const controls = route.controls.map(reach);
@@ -370,6 +424,7 @@ for (const scenario of SCENARIOS) {
       // What a human can never see: content taller than the box, minus how far it scrolls.
       unreachablePx: Math.max(0, scrollHeight - clientHeight - maxScrollTop),
       hasIonContent: !!ionContent,
+      scrollerClips,
       horizontalOverflow: Math.max(de.scrollWidth - innerWidth, scroller.scrollWidth - scroller.clientWidth, 0),
       controls,
       interactive: [...new Set(interactive)],
@@ -393,6 +448,8 @@ for (const scenario of SCENARIOS) {
     failures.push(`${route.name}: the scroller (${metrics.scrollerName}) is ${metrics.clientHeight}px tall in an ${metrics.viewport.h}px viewport — the box is bigger than the screen, so anything past the fold is unreachable no matter what the scroll arithmetic says`);
   } else if (Math.abs(metrics.paintedHeight - metrics.clientHeight) > 24) {
     failures.push(`${route.name}: the scroller paints ${metrics.paintedHeight}px but reports clientHeight ${metrics.clientHeight} — the box and the measurement disagree, which is how a clipped layout reports 0px unreachable`);
+  } else if (metrics.scrollerClips && metrics.scrollHeight > metrics.clientHeight + 1) {
+    failures.push(`${route.name}: the scroller (${metrics.scrollerName}) has ${metrics.scrollHeight}px of content in a ${metrics.clientHeight}px box and CLIPS its overflow — a script can scroll it, a finger cannot`);
   } else if (metrics.unreachablePx > 0) {
     failures.push(`${route.name}: ${metrics.unreachablePx}px of content is unreachable (scrollHeight ${metrics.scrollHeight}, clientHeight ${metrics.clientHeight}, maxScrollTop ${metrics.maxScrollTop}, scroller ${metrics.scrollerName})`);
   }
@@ -407,6 +464,7 @@ for (const scenario of SCENARIOS) {
     else if (!c.inViewport) failures.push(`${route.name}: control [data-test="${c.id}"] cannot be scrolled into view (top ${c.top}, bottom ${c.bottom}, viewport ${metrics.viewport.h})`);
     else if (!c.painted) failures.push(`${route.name}: control [data-test="${c.id}"] is in the viewport but NOT PAINTED (opacity, visibility or content-visibility)`);
     else if (!c.hittable) failures.push(`${route.name}: control [data-test="${c.id}"] is painted but NOT HITTABLE at its centre (hit ${c.hitBy ?? 'nothing'}) — something is clipping it or sitting on top of it`);
+    else if (c.clippedBy) failures.push(`${route.name}: control [data-test="${c.id}"] sits inside <${c.clippedBy}>, which CLIPS its overflow and cannot be scrolled — scrollIntoView reached it, a finger cannot`);
   }
   // A control that exists and is not named is a control nobody has proven reachable.
   const named = new Set(route.controls);

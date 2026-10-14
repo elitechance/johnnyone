@@ -788,6 +788,44 @@ describe('WorkflowArenaPage — scoring a recorded run', () => {
     await flush(f);
   });
 
+  // "The button, the confirm and the action cannot disagree" was false as stated: the OUTER control
+  // carried the block expression and the confirm's button carried only `promoting()`, so a halt
+  // arriving while the confirm was open left `promote-do` enabled. Clicking it sent nothing —
+  // `promote()` re-reads the block — but silence beside the button you just pressed is not an
+  // answer, it is the user wondering whether the app is broken.
+  it('a halt arriving while the confirm is open disables the confirm AND says why', async () => {
+    const api = stubApi({
+      workflowRuns: (id: unknown) => of(id === 'w1' ? [RUN_FAIL] : [RUN_PASS]),
+      workflowPrefs: () => of([PREF_OK]),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="promote"]'));
+    await flush(f);
+    const confirmBtn = () => q(f, '[data-test="promote-do"]') as HTMLButtonElement | null;
+    expect(confirmBtn()!.disabled).toBe(false);
+
+    // A rejection is recorded; the host answers with a halted state.
+    click(q(f, '[data-test="reject"]'));
+    await flush(f);
+    type(q(f, '[data-test="reject-reason"]'), 'the gate ignores the cashier path');
+    await flush(f);
+    click(q(f, '[data-test="reject-send"]'));
+    await flush(f);
+    expect(q(f, '[data-test="halt-block"]')).toBeTruthy();
+
+    // The confirm's own button must be disabled, not merely inert…
+    const still = confirmBtn();
+    if (still) {
+      expect(still.disabled, 'promote-do is still enabled under a halt').toBe(true);
+      // …and the reason must be beside it, not only in the outer block far up the page.
+      const why = q(f, '[data-test="promote-confirm"]')!.textContent ?? '';
+      expect(why).toMatch(/paused|halt/i);
+      click(still);
+      await flush(f);
+    }
+    expect(api.calls.some((c) => c.name === 'updateWorkflowChampion')).toBe(false);
+  });
+
   it('no longer claims nothing scores a run — it says nothing scores one AUTOMATICALLY', async () => {
     const f = await mount(WorkflowArenaPage, unscored(), { id: 'w2' });
     const note = q(f, '[data-test="no-executor-note"]');

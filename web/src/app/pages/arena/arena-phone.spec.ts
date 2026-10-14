@@ -148,16 +148,86 @@ describe('the arena stylesheets at 400px', () => {
   // control the arena shows is big enough to hit"), which read the computed min-height of every
   // button, link, select, textarea and input the arena actually renders. This is the last of the
   // three substring-shaped guards; there are none left in this file.
-  it('contains no substring-shaped assertion pretending to measure a control', () => {
-    // Comment lines are stripped first: the comments here deliberately QUOTE the shapes they
-    // replaced, and a guard that cannot tell code from prose is the thing it is guarding against.
-    const own = readFileSync(join(HERE, 'arena-phone.spec.ts'), 'utf8')
+  // A TRIPWIRE, not a guarantee — described that way on purpose. It catches the shape being
+  // written back the way it was written before; it does not stop a determined author, and QA
+  // evaded the first version twice, with `new RegExp('min' + '-height')` and with an escaped
+  // character class. Both spellings are covered now (escapes are normalised, and the property
+  // names are ASSEMBLED here so this file does not contain the literals it searches for), but the
+  // honest claim is "this makes the regression visible", not "this makes it impossible".
+  it('tripwire: no substring assertion about a measured CSS property creeps back in', () => {
+    const PROPS = ['min' + '-height', 'overflow' + '-wrap', 'word' + '-break'];
+    const code = readFileSync(join(HERE, 'arena-phone.spec.ts'), 'utf8')
       .split('\n')
       .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
-      .join('\n');
-    expect(own).not.toMatch(/toMatch\(\/min-height/);
-    expect(own).not.toMatch(/toContain\('overflow-wrap/);
+      .join('\n')
+      .replace(/\\(?=[-\w])/g, '');
+    for (const prop of PROPS) {
+      const assertion = new RegExp(`(toMatch|toContain|toBe)\\s*\\([^)\n]*${prop}`);
+      expect(
+        assertion.test(code),
+        `a substring assertion about ${prop} is back in this file — measure it on a mounted component instead (arena-console.spec.ts)`,
+      ).toBe(false);
+    }
+    // The assembled names must still be the real ones, or this tripwire guards nothing.
+    expect(PROPS).toEqual(['min-height', 'overflow-wrap', 'word-break']);
   });
+
+  it('hides NOTHING at a phone width — no surface disappears the way the plan navigator did', () => {
+    for (const { file, css } of sheets()) {
+      const hidden = phoneHiddenSelectors(css, PHONE);
+      expect(hidden, `${file} hides ${hidden.map((h) => h.selector).join(', ')} at ${PHONE}px`).toEqual([]);
+    }
+  });
+
+  it('declares no box wider than the phone, in px OR in viewport units', () => {
+    for (const { file, css } of sheets()) {
+      const risks = overflowRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
+  it('clips nothing: no fixed-height box hides its own overflow', () => {
+    for (const { file, css } of sheets()) {
+      const risks = clipRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
+  it('covers nothing with a full-viewport overlay', () => {
+    for (const { file, css } of sheets()) {
+      const risks = overlayRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
+  it('moves nothing out from under the finger with a transform', () => {
+    for (const { file, css } of sheets()) {
+      const risks = transformRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
+  it('the arena\u2019s own scrollers are scrollers, not clips', () => {
+    // The console-tab panel is `height: 100%; overflow-y: auto` — one word from being the bug this
+    // guard exists for, and a unit allow-list of px|rem|em used to make the whole shape invisible.
+    const panel = sheets().find((s) => s.file === 'arena-panel.component.ts' && s.css.includes(':host'));
+    expect(panel, 'the panel sheet is not being collected').toBeTruthy();
+    expect(panel!.css).toMatch(/:host\s*\{[^}]*overflow-y:\s*auto/);
+    expect(clipRisks(panel!.css, PHONE)).toEqual([]);
+  });
+
+  it('builds its multi-column layout UP from one column, rather than down from two', () => {
+    expect(ARENA_CSS).toContain('grid-template-columns: 1fr;');
+    expect(/@media \(min-width: \d+px\) \{\s*\.a-cols/.test(ARENA_CSS)).toBe(true);
+    expect(ARENA_CSS).not.toMatch(/@media \(max-width[^)]*\)[^}]*display:\s*none/);
+  });
+
+  // The tap-target check that used to live here was `expect(ARENA_CSS).toMatch(/min-height: 40px/)`
+  // — a substring that passed while a bare `<select>` and three unclassed radios were 20px. It is
+  // replaced by MEASURED assertions on mounted components in `arena-console.spec.ts` ("every
+  // control the arena shows is big enough to hit"), which read the computed min-height of every
+  // button, link, select, textarea and input the arena actually renders. This is the last of the
+  // three substring-shaped guards; there are none left in this file.
 });
 
 describe('the two values copied out of the Sass partial, which cannot be @included from a string', () => {
@@ -196,7 +266,12 @@ describe('text nobody here chose can always wrap', () => {
       expect(grouped.test(ARENA_CSS), `${selector} has no overflow-wrap rule`).toBe(true);
     });
   }
-  it('and the long-form containers break a word that has no break opportunity at all', () => {
-    expect(ARENA_CSS).toContain('word-break: break-word');
+  it('and the same rule breaks a word that has no break opportunity at all', () => {
+    // Checked INSIDE the rule that carries the wrapping, not as a bare substring anywhere in the
+    // sheet: the two declarations only do anything if they land on the same selectors.
+    const rule = /\.a-note[^{]*\{[^}]*\}/.exec(ARENA_CSS)?.[0] ?? '';
+    expect(rule, 'the wrapping rule was not found at all').not.toBe('');
+    expect(/overflow-wrap:\s*(anywhere|break-word)/.test(rule)).toBe(true);
+    expect(/word-break:\s*break-word/.test(rule)).toBe(true);
   });
 });

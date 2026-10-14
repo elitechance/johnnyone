@@ -241,9 +241,17 @@ import {
           <div class="a-warn" data-test="promote-confirm">
             <b>{{ confirmCopy() }}</b>
             <p class="a-note">Promotion is the only step in the arena a human has to take, and it is not undone by a later run.</p>
+            <!-- The SAME expression as the outer control. It used to carry only promoting(), so a
+                 halt (or a gate starting) while this was open left it enabled: the click was inert,
+                 because promote() re-reads the block, but the reader got silence beside the button
+                 they had just pressed. The reason is repeated here rather than left further up the
+                 page, because that is where their eye is. -->
+            @if (promoteBlock(); as block) {
+              <div class="a-block" data-test="promote-confirm-block">{{ block }}</div>
+            }
             <div class="a-row">
               <button type="button" class="a-btn" (click)="confirming.set(false)">Keep the champion for now</button>
-              <button type="button" class="a-btn primary" data-test="promote-do" [disabled]="promoting()" (click)="promote()">{{ promoting() ? 'Promoting…' : 'Yes, promote it' }}</button>
+              <button type="button" class="a-btn primary" data-test="promote-do" [disabled]="promoteBlock() !== null || promoting()" (click)="promote()">{{ promoting() ? 'Promoting…' : 'Yes, promote it' }}</button>
             </div>
           </div>
         }

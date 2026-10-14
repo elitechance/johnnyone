@@ -146,6 +146,18 @@ export function visibleText(value: string): string {
 }
 
 /**
+ * How many characters a READER sees — not how many UTF-16 code units JavaScript stores.
+ *
+ * `.length` counted a decomposed "é" (e + U+0301) as two and an emoji as two, which quietly halved
+ * the budget for Vietnamese, Devanagari, Thai and Hebrew with niqqud while leaving precomposed
+ * Latin and CJK correct. NFC first (so a decomposed character becomes the one a reader sees), then
+ * code points.
+ */
+export function visibleLength(value: string): number {
+  return [...visibleText(value).normalize('NFC')].length;
+}
+
+/**
  * Saying no always carries a reason — there is no bare no (mock step 8), and "a reason that renders
  * as nothing" is a bare no with extra steps. Checked here rather than left to the host: the host is
  * being fixed in parallel, and a client that submits something it knows is empty is wrong either
@@ -153,6 +165,9 @@ export function visibleText(value: string): string {
  */
 export function rejectionReasonValid(reason: string): { ok: boolean; message: string | null } {
   const visible = visibleText(reason);
+  // What a reader sees, counted the way a reader counts. The RAW ceiling below stays in code units
+  // on purpose: it is about the size of the payload being sent and stored, not about reading.
+  const seen = visibleLength(reason);
   if (visible.length === 0) {
     return {
       ok: false,
@@ -162,10 +177,10 @@ export function rejectionReasonValid(reason: string): { ok: boolean; message: st
   }
   // BOTH ceilings. Visible length is what a reader faces in a halt banner; raw length is what is
   // actually sent and stored. Measuring only one of them has been wrong in both directions now.
-  if (visible.length > MAX_REJECTION_REASON) {
+  if (seen > MAX_REJECTION_REASON) {
     return {
       ok: false,
-      message: `That reason is too long: ${visible.length} characters against a limit of ${MAX_REJECTION_REASON}. It has to be readable in a halt banner on a phone.`,
+      message: `That reason is too long: ${seen} characters against a limit of ${MAX_REJECTION_REASON}. It has to be readable in a halt banner on a phone.`,
     };
   }
   if (reason.length > MAX_REJECTION_RAW) {
@@ -174,7 +189,7 @@ export function rejectionReasonValid(reason: string): { ok: boolean; message: st
       ok: false,
       message:
         hidden > visible.length
-          ? `That reason is ${reason.length} characters long, of which ${hidden} are invisible padding. Only ${visible.length} would be read; the rest is payload, and the limit is ${MAX_REJECTION_RAW}.`
+          ? `That reason is ${reason.length} characters long, of which ${hidden} are invisible padding. Only ${seen} would be read; the rest is payload, and the limit is ${MAX_REJECTION_RAW}.`
           : `That reason is too long: ${reason.length} characters against a limit of ${MAX_REJECTION_RAW}.`,
     };
   }

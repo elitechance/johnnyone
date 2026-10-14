@@ -198,6 +198,25 @@ describe('rejectionReasonValid — there is no bare no', () => {
     expect(rejectionReasonValid(ok).ok).toBe(true);
   });
 
+  // The visible cap counted UTF-16 CODE UNITS, so a decomposed "é" (e + U+0301) cost two against a
+  // budget a reader sees one of. That halves the limit for Vietnamese, Devanagari, Thai, Hebrew
+  // with niqqud, and anything macOS has normalised on the way in — while precomposed Latin and CJK
+  // were fine, which is exactly how a bug like this survives a casual test.
+  it('counts what a reader counts, not UTF-16 units', () => {
+    const decomposed = 'e\u0301'.repeat(2000); // 2,000 visible characters, 4,000 code units
+    expect(decomposed.length).toBe(4000);
+    const v = rejectionReasonValid(decomposed);
+    expect(v.ok, v.message ?? '').toBe(true);
+
+    // …and the limit still bites one character past it.
+    expect(rejectionReasonValid('e\u0301'.repeat(MAX_REJECTION_REASON + 1)).ok).toBe(false);
+  });
+
+  it('counts an astral character once, as a reader does', () => {
+    const emoji = '\u{1F44D}'.repeat(1500); // 1,500 visible, 3,000 code units
+    expect(rejectionReasonValid(emoji).ok).toBe(true);
+  });
+
   it('keeps a reason that merely CONTAINS an invisible character', () => {
     expect(rejectionReasonValid('coverage\u200bthreshold missing').ok).toBe(true);
   });
