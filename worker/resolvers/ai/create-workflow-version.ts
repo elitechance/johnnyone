@@ -12,10 +12,15 @@ interface WorkerEnv { CHAT_RELAY_DO: DurableObjectNamespace; [key: string]: unkn
 //
 // Nor is `isChampion`: a new version is never born champion. That is updateWorkflowChampion's job
 // and it needs a green gate and a human.
+//
+// And nor is `repo`: the host derives the repo identity from `workspacePath`
+// (`services::workflows::repo_identity`). The client used to send `basename(workspace_path)`, so two
+// unrelated checkouts called johnnyone shared one champion — a client-supplied identity is a
+// client-supplied champion key. `phaseType` is validated against a closed set for the same reason.
 export default async function createWorkflowVersion(
   _parent: unknown,
   args: {
-    repo: string;
+    workspacePath: string;
     phaseType: string;
     family: string;
     parentId?: string | null;
@@ -29,7 +34,7 @@ export default async function createWorkflowVersion(
 ) {
   await authorizeForAltToken(ctx, 'plans:write');
   return desktopRpc<unknown>(ctx, 'create_workflow_version', {
-    repo: args.repo,
+    workspacePath: args.workspacePath,
     phaseType: args.phaseType,
     family: args.family,
     parentId: args.parentId ?? null,

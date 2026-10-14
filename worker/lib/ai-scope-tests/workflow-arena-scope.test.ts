@@ -62,8 +62,10 @@ describe('workflow arena resolver seam', () => {
       [
         '../../resolvers/ai/create-workflow-version',
         'create_workflow_version',
+        // `repo` is NOT an argument: the host derives the identity from the workspace path,
+        // because a client-supplied identity is a client-supplied champion key.
         {
-          repo: 'r',
+          workspacePath: '/w/johnnyone',
           phaseType: 'dev-phase',
           family: 'glm',
           role: 'ro',
@@ -73,7 +75,7 @@ describe('workflow arena resolver seam', () => {
           fanOut: 3,
         },
         {
-          repo: 'r',
+          workspacePath: '/w/johnnyone',
           phaseType: 'dev-phase',
           family: 'glm',
           parentId: null,
@@ -107,6 +109,19 @@ describe('workflow arena resolver seam', () => {
         'list_workflow_prefs',
         { workflowId: 'w1' },
         { workflowId: 'w1' },
+      ],
+      [
+        '../../resolvers/ai/repo-identity',
+        'get_repo_identity',
+        { workspacePath: '/w/johnnyone' },
+        { workspacePath: '/w/johnnyone' },
+      ],
+      [
+        '../../resolvers/ai/run-workflow-run-gate',
+        'run_workflow_run_gate',
+        { runId: 'r1' },
+        // Same rescore discipline as the recorder: the default must refuse, not overwrite.
+        { runId: 'r1', phaseId: null, rescore: false },
       ],
       [
         '../../resolvers/ai/record-workflow-run-gate',
@@ -235,6 +250,23 @@ describe('workflow arena resolver seam', () => {
     // The read that makes a recorded preference discoverable without issuing a write.
     expect(fieldLine('workflowPrefs')).toContain('workflowId: ID!');
 
+    // `repo` is gone from createWorkflowVersion: the host derives the identity, and this read is
+    // how a client learns it.
+    const create = fieldLine('createWorkflowVersion');
+    expect(create, 'createWorkflowVersion must exist').toBeTruthy();
+    expect(create).toContain('workspacePath: String!');
+    expect(create, 'repo must not be a client argument').not.toContain('repo:');
+    expect(fieldLine('repoIdentity')).toContain('workspacePath: String!');
+
+    // The executor that closes the loop, with the same rescore argument as the recorder.
+    const execute = fieldLine('runWorkflowRunGate');
+    expect(execute, 'runWorkflowRunGate must exist').toBeTruthy();
+    expect(execute).toContain('rescore: Boolean');
+
+    // Scoreability is served per run, so a client can say WHY a run cannot compete.
+    expect(schemaSource).toContain('scoreable: Boolean!');
+    expect(schemaSource).toContain('notScoreableReason: String');
+
     // A rejection's reason is non-null: three of them halt the search and the reasons are all a
     // halted search has to show.
     expect(fieldLine('recordWorkflowRejection')).toContain('reason: String!');
@@ -257,13 +289,13 @@ describe('workflow arena resolver seam', () => {
    * the new one is exactly the "the button did nothing" failure the cache map was written for.
    */
   it('arena reads are uncached, so no write needs an INVALIDATED_READS entry', () => {
-    const reads = [
+    const reads: string[] = [
       'list_workflows',
       'get_workflow',
       'list_workflow_runs',
       'get_workflow_search_state',
     ];
-    const writes = [
+    const writes: string[] = [
       'create_workflow_version',
       'start_workflow_run',
       'record_workflow_run_gate',
@@ -272,7 +304,8 @@ describe('workflow arena resolver seam', () => {
       'record_workflow_rejection',
       'update_workflow_search_resumed',
     ];
-    reads.push('list_workflow_prefs');
+    reads.push('list_workflow_prefs', 'get_repo_identity');
+    writes.push('run_workflow_run_gate');
     for (const read of reads) {
       expect(
         isReadRpcCacheable(read),

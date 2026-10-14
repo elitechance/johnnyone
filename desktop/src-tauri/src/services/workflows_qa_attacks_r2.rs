@@ -19,9 +19,69 @@ use rusqlite::params;
 
 const KEY: (&str, &str, &str) = ("repo", "dev-phase", "glm");
 
+/// Round 3: `workflows.repo` is no longer a caller-supplied string — the host DERIVES it from a
+/// workspace path (`repo_identity`). These tests still want to talk about "repo" and "other-repo"
+/// as logical names, so this maps a logical name to a stable synthetic path and lets the host
+/// derive the identity from it exactly as it would in production.
+///
+/// The path deliberately does not exist: `repo_identity` then finds no git remote and falls back to
+/// the absolute path, which is deterministic and distinct per name. No filesystem, no git, no
+/// dependence on the machine this runs on.
+fn repo_path(name: &str) -> String {
+    format!("/nonexistent-arena-tests/{}", name)
+}
+
+fn repo_id(name: &str) -> String {
+    repo_identity(&repo_path(name)).expect("derive the repo identity")
+}
+
+// --- Test shims over the three service functions that take the derived identity. ---
+//
+// They SHADOW the glob-imported originals deliberately, so that every call site in this file can go
+// on naming the logical repo. An explicit local item wins over a glob import, so `workflow_search_state("repo", …)`
+// below is this shim, which translates and then calls the real one. Nothing about the rule under
+// test changes — only how the key is spelled at the call site.
+
+fn workflow_search_state(
+    state: &AppState,
+    repo: &str,
+    phase_type: &str,
+    family: &str,
+) -> Result<WorkflowSearchState, String> {
+    crate::services::workflows::workflow_search_state(state, &repo_id(repo), phase_type, family)
+}
+
+fn resume_workflow_search(
+    state: &AppState,
+    repo: &str,
+    phase_type: &str,
+    family: &str,
+    reason: &str,
+    confirmed: bool,
+) -> Result<WorkflowSearchState, String> {
+    crate::services::workflows::resume_workflow_search(
+        state,
+        &repo_id(repo),
+        phase_type,
+        family,
+        reason,
+        confirmed,
+    )
+}
+
+fn list_workflows(
+    state: &AppState,
+    repo: Option<&str>,
+    phase_type: Option<&str>,
+    family: Option<&str>,
+) -> Result<Vec<Workflow>, String> {
+    let repo = repo.map(repo_id);
+    crate::services::workflows::list_workflows(state, repo.as_deref(), phase_type, family)
+}
+
 fn version_with(repo: &str, phase_type: &str, family: &str, fan_out: i64) -> NewWorkflowVersion {
     NewWorkflowVersion {
-        repo: repo.to_string(),
+        workspace_path: repo_path(repo),
         phase_type: phase_type.to_string(),
         family: family.to_string(),
         parent_id: None,
@@ -123,7 +183,7 @@ fn latest_promote_run(state: &AppState, repo: &str, phase: &str, family: &str) -
                      JOIN workflows w ON w.id = r.workflow_id \
                      WHERE w.repo = ?1 AND w.phase_type = ?2 AND w.family = ?3 \
                        AND d.kind = 'promote' ORDER BY d.seq DESC LIMIT 1",
-                    params![repo, phase, family],
+                    params![repo_id(repo), phase, family],
                     |row| row.get::<_, String>(0),
                 )
                 .ok())
@@ -388,22 +448,34 @@ fn qa_a2_the_decision_table_guards_the_resume_reason_but_not_the_halt() {
 
     assert!(insert("r1", "resume", None).is_err(), "NULL resume reason");
     assert!(insert("r2", "resume", Some("  ")).is_err(), "blank reason");
-    // **DEFECT (found by this test).** SQLite's `trim(X)` strips SPACES only — not tabs, not
-    // newlines — so the CHECK admits a reason made entirely of tabs and newlines. The Rust
-    // `require_non_blank` uses `str::trim`, which handles all Unicode whitespace, so the SERVICE is
-    // safe; the table's guard is weaker than the migration comment claims, in exactly the case the
-    // comment invokes (a future second writer). The fix is `trim(reason, char(9)||char(10)||
-    // char(13)||' ')` or a stricter predicate.
-    assert!(
-        insert("r3", "resume", Some("\t\n")).is_ok(),
-        "DEFECT PIN: a tab/newline-only reason passes the CHECK, because SQLite trim() only \
-         strips spaces. If this starts failing, the CHECK was tightened and this should be inverted."
-    );
-    assert!(
-        insert("r3b", "reject", Some("\t")).is_ok(),
-        "DEFECT PIN: same hole on the rejection reason, which is the one the design calls the \
-         only thing a halted search has to show"
-    );
+    // **FIXED, and wider than reported.** Single-argument `trim()` strips U+0020 only, so the
+    // CHECK admitted a reason made entirely of tabs and newlines. The replacement strips EVERY C0
+    // control plus DEL via the trim set, and the zero-width family, the BOM and NUL via nested
+    // `replace()` — because `trim(X, Y)` does not remove multi-byte members of Y, and a `char(…,
+    // 0, …)` argument list truncates at the zero. Both were measured, not assumed.
+    for (label, reason) in [
+        ("tab+newline", "\t\n"),
+        ("tab", "\t"),
+        ("vertical tab", "\u{0b}"),
+        ("form feed", "\u{0c}"),
+        ("DEL", "\u{7f}"),
+        ("zero width space", "\u{200b}"),
+        ("BOM", "\u{feff}"),
+        ("NUL then tab", "\0\t"),
+    ] {
+        assert!(
+            insert(&format!("r3-{label}"), "resume", Some(reason)).is_err(),
+            "a {label}-only resume reason must be refused by the CHECK"
+        );
+        assert!(
+            insert(&format!("r3b-{label}"), "reject", Some(reason)).is_err(),
+            "and on the rejection reason, which is the one the design calls the only thing a \
+             halted search has to show"
+        );
+    }
+    // Visible text with an invisible character in it is still fine: the rule is "contains
+    // something visible", not "contains nothing invisible".
+    assert!(insert("r3-ok", "reject", Some("too slow\u{200b}")).is_ok());
     assert!(insert("r4", "abstain", Some("x")).is_err(), "unknown kind");
     // A promote still may have a NULL reason — it is the one kind that needs none.
     assert!(insert("r5", "promote", None).is_ok());
@@ -689,20 +761,22 @@ fn qa_a2_a_champion_with_no_promotion_behind_it_refuses_displacement() {
     assert!(error.contains("Refusing rather than guessing"), "got: {error}");
 }
 
-/// **DEFECT (documented, not fixed).** The absent case is refused; the STALE case is not.
+/// **FIXED. Inverted from the defect pin of the same shape.** The STALE case is refused too, not
+/// just the absent one.
 ///
-/// `promotion_block` checks that `incumbent_run_id` exists, and never that it belongs to
-/// `incumbent_workflow_id`. When the champion slot and the latest `promote` row disagree — the same
-/// bypassing-writer scenario the test above covers, except that the family already HAS a
-/// promotion — the rule happily accepts a head-to-head won against a run of a completely different
-/// workflow, because that run is what `champion_promotion_run_id` returns.
+/// What was wrong: `champion_promotion_run_id` took the latest `promote` row in the FAMILY, and
+/// `promotion_block` never checked that the run it named belonged to the workflow actually holding
+/// the slot. When the two separately-stored facts disagreed, a challenger could displace the
+/// sitting champion by beating a run of a completely different workflow — and, symmetrically, a
+/// preference won against the sitting champion's OWN run was refused. The rule pointed at the wrong
+/// thing in both directions.
 ///
-/// So the displacement rule is only as strong as the agreement between two separately-stored
-/// facts, and the service verifies that agreement in neither direction. One line
-/// (`incumbent_run's workflow_id == incumbent_workflow_id`, refuse otherwise) closes it and would
-/// turn this test red.
+/// The fix is QA's one line, applied at the query instead of the comparison: the promote row is
+/// looked up BY THE INCUMBENT'S WORKFLOW, so a slot whose holder has no promotion behind it yields
+/// `None` and `promotion_block` refuses rather than guessing. Both directions now fail closed,
+/// which is the right answer for a state only a bypassing writer can produce.
 #[test]
-fn qa_a2_a_stale_promote_row_launders_a_displacement() {
+fn qa_a2_a_stale_promote_row_cannot_launder_a_displacement() {
     let (state, _root) = test_state();
     let promoted = workflow(&state, KEY.0, KEY.1, KEY.2);
     let squatter = workflow(&state, KEY.0, KEY.1, KEY.2);
@@ -747,18 +821,18 @@ fn qa_a2_a_stale_promote_row_launders_a_displacement() {
         .expect("pref");
     assert!(pref.comparable);
     let laundered = promote_workflow(&state, &challenger_run.id, Some(&pref.id), true);
+    let error = laundered.expect_err(
+        "a stale promote row must not let a challenger displace a champion by beating a run of a \
+         DIFFERENT workflow",
+    );
     assert!(
-        laundered.is_ok(),
-        "DEFECT PIN: a stale promote row lets a challenger displace a champion by beating a run \
-         of a DIFFERENT workflow. promotion_block never checks that the incumbent's recorded run \
-         belongs to the incumbent. If this starts failing, that check was added and this test \
-         should be inverted. error: {:?}",
-        laundered.err()
+        error.contains("no promotion is recorded for it"),
+        "the refusal must name the disagreement rather than guessing: {error}"
     );
     assert_eq!(
         champion_of(&state, KEY.0, KEY.1, KEY.2).as_deref(),
-        Some(challenger.id.as_str()),
-        "DEFECT PIN: and the squatter is gone, displaced on evidence about someone else"
+        Some(squatter.id.as_str()),
+        "the squatter keeps the slot — a bypassing writer's state is not evidence either way"
     );
 
     // The symmetric consequence: a preference against the ACTUAL sitting champion's own run is
@@ -782,11 +856,18 @@ fn qa_a2_a_stale_promote_row_launders_a_displacement() {
         .expect("raw swap");
     let ch_run = green_measured(&state2, &ch.id);
     let honest = record_workflow_pref(&state2, &ch_run.id, &s_run.id, None).expect("pref");
+    // The symmetric direction: still refused, but now for the RIGHT reason — the squatter has no
+    // promotion behind it, so there is no incumbent run to beat. Fail-closed in both directions.
+    let symmetric = promote_workflow(&state2, &ch_run.id, Some(&honest.id), true)
+        .expect_err("a slot with no promotion behind it cannot be displaced");
     assert!(
-        promote_workflow(&state2, &ch_run.id, Some(&honest.id), true).is_err(),
-        "DEFECT PIN: beating the run the SITTING champion actually ran is refused, because the \
-         stale promote row names a different one"
+        symmetric.contains("no promotion is recorded for it"),
+        "got: {symmetric}"
     );
+
+    // Note what is NOT asserted here: promoting the squatter's own run. `s` already holds the slot,
+    // so that is the idempotent no-op path and it succeeds — which is correct, and is how a
+    // bypassing writer's state gets a real promotion behind it again.
 }
 
 // =================================================================================================
@@ -870,10 +951,10 @@ fn qa_a2_both_comparability_rules_admit_exactly_the_same_pairs() {
     }
     // And if one ever did get in by another route, the rule fails closed. Driven at the predicate,
     // since no row can hold it.
-    assert!(!contention_is_comparable("{", "{}"));
-    assert!(!contention_is_comparable("{}", "{"));
+    assert!(!contention_was_identical("{", "{}"));
+    assert!(!contention_was_identical("{}", "{"));
     assert!(
-        !contention_is_comparable("{", "{"),
+        !contention_was_identical("{", "{"),
         "two identically-unreadable maps are not rescued by the identity escape: both rules parse \
          first and fail closed"
     );
@@ -903,9 +984,14 @@ fn qa_a2_a_run_under_foreign_contention_cannot_promote() {
         reason.contains("contention") || reason.contains("unscoreable") || reason.contains("fleet"),
         "the stored reason must name the contention: {reason}"
     );
-    assert!(promote_workflow(&state, &busy.id, Some(&pref.id), true)
-        .unwrap_err()
-        .contains("not comparable"));
+    // Round 3+: `promotion_block` refuses an unscoreable run BEFORE it looks at the preference,
+    // including on the seeding path that has no preference at all, so the refusal now names the
+    // contention directly rather than the downstream "not comparable".
+    let refusal = promote_workflow(&state, &busy.id, Some(&pref.id), true).unwrap_err();
+    assert!(
+        refusal.contains("cannot be scored") && refusal.contains("quiet fleet"),
+        "the refusal must name the contention: {refusal}"
+    );
     assert_eq!(
         champion_of(&state, KEY.0, KEY.1, KEY.2).as_deref(),
         Some(incumbent.id.as_str())

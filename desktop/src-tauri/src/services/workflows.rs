@@ -62,6 +62,36 @@ pub const REJECTION_STRIKE_LIMIT: i64 = 3;
 /// actual seat capacity and this comment should go.
 pub const MAX_FAN_OUT: i64 = 1_024;
 
+/// **The fan-out cap.** `None` means this fan-out is allowed for this family; `Some(reason)` is the
+/// refusal.
+///
+/// **This is a SEAM.** Today it is backed by the single constant [`MAX_FAN_OUT`], which is a
+/// sanity bound and not a real capacity. The real caps live in `services::leases::SeatCaps` on Dev
+/// B's branch — per family, with a database override, and an UNCAPPED family refused rather than
+/// guessed at. When the branches are joined, the body of this function becomes that lookup and
+/// nothing above it changes; `family` is already a parameter for exactly that reason, even though
+/// the constant ignores it.
+///
+/// Both writers go through here: [`create_workflow_version`], which bounds the declaration, and
+/// [`measure_run_budget`], which bounds what a run actually holds.
+pub fn fan_out_is_allowed(family: &str, fan_out: i64) -> Option<String> {
+    let _ = family; // see the doc comment: the real cap is per family, this stand-in is not.
+    if fan_out < 1 {
+        return Some(format!(
+            "a fan-out of {} holds no seat, so it cannot run",
+            fan_out
+        ));
+    }
+    if fan_out > MAX_FAN_OUT {
+        return Some(format!(
+            "a fan-out of {} exceeds the stand-in cap of {} seats; the real per-family cap is the \
+             lease pool's",
+            fan_out, MAX_FAN_OUT
+        ));
+    }
+    None
+}
+
 /// The largest `seed` a run may declare. A seed is a REPLAY INDEX — "the Nth time we ran this
 /// workflow the same way" — so it is genuinely bounded by how many times a human will ever ask.
 /// Bounded for the same wire reason as [`MAX_FAN_OUT`]: `WorkflowRun.seed` sits under
@@ -112,6 +142,13 @@ pub struct WorkflowRun {
     pub fleet_busy: String,
     pub started_at: String,
     pub ended_at: Option<String>,
+    /// DERIVED, not stored: whether this run started on a quiet fleet and can therefore be scored
+    /// at all. Computed from `fleet_busy` by [`scoreability`] in the single row mapper, so it can
+    /// never drift from the column it is derived from, and no migration adds a column that could.
+    pub scoreable: bool,
+    /// Why not, when `scoreable` is false. This is the field that turns "these two runs are
+    /// mysteriously never comparable" into something a human can read.
+    pub not_scoreable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +189,11 @@ pub struct WorkflowSearchState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewWorkflowVersion {
-    pub repo: String,
+    /// The PLAN's workspace path. `workflows.repo` is derived from it by [`repo_identity`] — it is
+    /// never accepted from a caller, because a client-supplied identity is a client-supplied
+    /// champion key.
+    pub workspace_path: String,
+    /// Must be one of [`KNOWN_PHASE_TYPES`].
     pub phase_type: String,
     pub family: String,
     /// Lineage. When set, it must name an existing workflow in the SAME
@@ -201,6 +242,170 @@ pub struct NewWorkflowRun {
 pub struct RunBudget {
     pub seats_held: String,
     pub fleet_busy: String,
+}
+
+/// How long any human-written reason may be. Rejections and resumes are read on a phone, three at
+/// a time on a halted search; nothing at any layer bounded them before, so a single paste could
+/// put a megabyte in the decision log and then serve it on every read of that family's state.
+pub const MAX_REASON_CHARS: usize = 2_000;
+
+/// How long any one prompt part (role / instruction / contract) or a hop may be. Generous — these
+/// are real prompt bodies — but not unbounded, for the same reason as above: they are served on
+/// `workflows: [Workflow!]!`, so one pathological row slows every champion listing.
+pub const MAX_PROMPT_CHARS: usize = 100_000;
+
+/// **Does this text contain anything a human can actually SEE?**
+///
+/// `str::trim` is not enough, and that was a real hole: a reason of `"\u{200b}"` (zero-width
+/// space), `"\u{feff}"` (BOM) or `"\0"` passed every blank check, because none of those is Unicode
+/// `White_Space`. So a rejection — or a resume — whose reason renders as NOTHING was accepted and
+/// stored, and that reason is the one thing a halted search has to show a human.
+///
+/// Deliberately a DENYLIST of known-invisible code points plus `char::is_control` and
+/// `char::is_whitespace`, rather than a full Unicode `Default_Ignorable_Code_Point` table: that
+/// would mean a new dependency for one predicate. It is conservative in the safe direction — text
+/// made only of characters in this set is refused, and anything it fails to recognise can only
+/// cause a reason to be ACCEPTED, never a visible one to be rejected. If this list needs to grow,
+/// growing it is the fix.
+fn has_visible_content(text: &str) -> bool {
+    text.chars().any(|c| {
+        !c.is_whitespace()
+            && !c.is_control()
+            && !matches!(c,
+                '\u{00ad}'              // soft hyphen
+                | '\u{061c}'            // arabic letter mark
+                | '\u{180e}'            // mongolian vowel separator
+                | '\u{200b}'..='\u{200f}' // zero-width space .. RTL mark
+                | '\u{202a}'..='\u{202e}' // bidi embedding/override
+                | '\u{2060}'..='\u{2064}' // word joiner .. invisible plus
+                | '\u{2066}'..='\u{2069}' // bidi isolates
+                | '\u{feff}'            // BOM / zero-width no-break space
+                | '\u{fff9}'..='\u{fffb}' // interlinear annotation
+            )
+    })
+}
+
+/// **The human-text rule.** One reader for every field a person types: it must contain something
+/// visible, and it must be bounded.
+///
+/// Returns the trimmed text. Used by every reason ([`reject_workflow_run`],
+/// [`resume_workflow_search`], [`record_workflow_pref`]) and by the four prompt parts, so there is
+/// one definition of "a human wrote something here".
+fn require_visible_text(label: &str, value: &str, max_chars: usize) -> Result<String, String> {
+    let trimmed = value.trim();
+    if !has_visible_content(trimmed) {
+        return Err(format!(
+            "{} must contain visible text: {} has no visible characters (whitespace, control \
+             characters and zero-width or formatting characters do not count)",
+            label, label
+        ));
+    }
+    let count = trimmed.chars().count();
+    if count > max_chars {
+        return Err(format!(
+            "{} is {} characters, which is over the {} limit",
+            label, count, max_chars
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// **The phase types the arena recognises.**
+///
+/// A closed set, because `phase_type` is a third of the champion key: free text there means one
+/// typo silently starts a second, empty search in a family that looks like the real one.
+///
+/// `planning-phase` and `dev-phase` are what J1 actually produces today (the client derives them
+/// from the run type and can emit nothing else). `ui-phase` is named by the design — it is the
+/// gate-less case the mock shows — and is accepted so that the design's own example is
+/// expressible; nothing produces it yet.
+///
+/// **This closes the free-text hole and does NOT close the coarseness problem**, which is the worse
+/// of the two: every dev phase in a repo still shares one champion, so a migration phase and a UI
+/// phase compete as though they were the same kind of work. Fixing that needs a finer phase_type at
+/// the point the client derives it, which is not a host change — see the report.
+pub const KNOWN_PHASE_TYPES: &[&str] = &["planning-phase", "dev-phase", "ui-phase"];
+
+/// **The phase-type rule.** One validator, so the key cannot be polluted from any writer.
+pub fn validate_phase_type(phase_type: &str) -> Result<String, String> {
+    let trimmed = phase_type.trim();
+    if KNOWN_PHASE_TYPES.contains(&trimmed) {
+        return Ok(trimmed.to_string());
+    }
+    Err(format!(
+        "'{}' is not a phase type this arena recognises ({}). A champion is keyed on \
+         (repo, phase_type, family), so free text here starts a second search that looks like the \
+         real one",
+        trimmed,
+        KNOWN_PHASE_TYPES.join(", ")
+    ))
+}
+
+/// **The repo identity rule.** What `workflows.repo` means, derived from a workspace path.
+///
+/// The client used to send `basename(workspace_path)`, which collides: `/a/johnnyone` and
+/// `/b/johnnyone` are different checkouts of possibly different repositories and shared one
+/// champion.
+///
+/// The identity is the git REMOTE when there is one, normalised, and the absolute path when there
+/// is not. The remote is the right answer and the path is only a fallback, because this project
+/// works out of git WORKTREES constantly: keying on the path alone would give a worktree of
+/// johnnyone a different champion from the main checkout, which is the same collision problem
+/// wearing the opposite sign. Normalisation (scheme, credentials, trailing `.git`, case) exists so
+/// that `git@github.com:x/y.git` and `https://github.com/x/y` are one identity rather than two.
+///
+/// Derived HOST-side from a path the host can see, never accepted from a caller — a client-supplied
+/// identity is a client-supplied champion key.
+pub fn repo_identity(workspace_path: &str) -> Result<String, String> {
+    let path = std::path::Path::new(workspace_path.trim());
+    if workspace_path.trim().is_empty() {
+        return Err("workspacePath is required to derive the repo identity".to_string());
+    }
+    if let Some(remote) = git_remote_url(path) {
+        return Ok(normalise_remote(&remote));
+    }
+    // No remote (or no git at all): the absolute path, canonicalised when the directory exists so
+    // that `/a/./b` and `/a/b` are one identity.
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    Ok(format!("path:{}", absolute.to_string_lossy()))
+}
+
+fn git_remote_url(path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// `git@github.com:owner/repo.git`, `https://user:tok@github.com/owner/repo.git` and
+/// `https://github.com/Owner/Repo` all normalise to `git:github.com/owner/repo`.
+fn normalise_remote(url: &str) -> String {
+    let mut rest = url.trim();
+    for prefix in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(stripped) = rest.strip_prefix(prefix) {
+            rest = stripped;
+            break;
+        }
+    }
+    // Strip any `user:password@` or `git@` userinfo.
+    if let Some((_, after)) = rest.split_once('@') {
+        rest = after;
+    }
+    // `host:owner/repo` (scp form) becomes `host/owner/repo`.
+    let rest = rest.replacen(':', "/", 1);
+    let rest = rest.strip_suffix('/').unwrap_or(&rest);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    format!("git:{}", rest.to_lowercase())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -252,7 +457,7 @@ pub fn parse_seat_map(raw: &str) -> Result<BTreeMap<String, i64>, String> {
 /// This is the SEAT half only. Equal seat budgets do not imply equal contention — `seats_held` is
 /// what a run was GRANTED, `fleet_busy` is what everything else was holding at the same moment —
 /// so the flag that actually gets stored is decided by [`preference_comparability`], which combines
-/// this with [`contention_is_comparable`]. Primitive, then policy; the policy has exactly one
+/// this with the per-run [`run_is_scoreable`]. Primitive, then policy; the policy has exactly one
 /// writer.
 pub fn budgets_are_comparable(left_seats_held: &str, right_seats_held: &str) -> bool {
     match (parse_seat_map(left_seats_held), parse_seat_map(right_seats_held)) {
@@ -261,24 +466,65 @@ pub fn budgets_are_comparable(left_seats_held: &str, right_seats_held: &str) -> 
     }
 }
 
-/// **The contention rule.** Two runs' fleet contention is comparable when their `fleet_busy` maps
-/// are identical.
+/// **THE `fleet_busy` CONTRACT.** `fleet_busy` records FOREIGN contention only: what everything
+/// *else* on the fleet was holding when this run started, **excluding the run's own seats**. An
+/// EMPTY map therefore means "the fleet was quiet".
 ///
-/// Same encoding and same reader as the seat budget ([`parse_seat_map`]), and the same fail-closed
-/// direction: an unreadable map on either side is not comparable.
+/// Written out as a named contract rather than left in prose because the value's producer lives on
+/// another branch (`services::leases::LeasePool::fleet_busy_json`) and the two possible readings
+/// are indistinguishable in exactly one case: a pool reporting INCLUSIVE totals would emit
+/// precisely `seats_held` for a quiet fleet, and under this contract that reads as "a foreign load
+/// exactly equal to my own" — NOT quiet. That direction is the safe one (a refusal, never a false
+/// crowning), but it means a producer using the other convention makes every run unscoreable
+/// rather than silently wrong. [`scoreability`] is the single reader and
+/// `the_fleet_busy_contract_is_foreign_contention_only` pins it, so a mismatch at integration
+/// surfaces as a named failing test instead of an arena that quietly never promotes.
 ///
-/// This exists because the design's stated reason for storing `fleet_busy` was never implemented:
-/// "Two concurrent runs contend, there is no 429 to notice, and the slower run looks like the worse
-/// workflow. Without these, the first thing a busy fleet does is promote a champion because the
-/// other box was quiet." Comparing `seats_held` alone let a run on an idle fleet beat a run on a
-/// saturated one and promote — precisely the failure the column was added to prevent.
+/// **Whether a single run can be scored at all.** `None` means yes; `Some(reason)` names the
+/// foreign contention that disqualifies it.
 ///
-/// EQUALITY, not a tolerance. A tolerance would need a threshold, a threshold is an opinion, and
-/// the whole point of this feature is that no opinion gets in. The operational consequence is
-/// real and deliberate: two runs taken under genuinely different load are NOT comparable and
-/// cannot promote, so a meaningful arena run needs a quiesced fleet (identical `fleet_busy`,
-/// commonly `{}` for both) rather than two opportunistic runs taken whenever a box was free.
-pub fn contention_is_comparable(left_fleet_busy: &str, right_fleet_busy: &str) -> bool {
+/// Two concurrent runs contend, there is no 429 to notice, and the slower one simply looks like the
+/// worse workflow — so a run that started while the fleet was busy measured the fleet, not the
+/// workflow, and cannot be scored against anything.
+///
+/// **This replaces an earlier, WRONG rule, and the history is the point.** The first ruling was
+/// that two runs are comparable iff their `fleet_busy` maps are EQUAL — equality rather than a
+/// tolerance, on the correct grounds that a tolerance needs a threshold and a threshold is an
+/// opinion. On contact with a real fleet that collapses to "never": contention is a live
+/// measurement, two runs minutes apart are never byte-identical, and the result is a feature that
+/// looks finished and promotes nothing. A feature that silently does nothing is worse than one
+/// that refuses loudly. So the rule EXCLUDES rather than compares: **the arena scores on a quiet
+/// fleet, and says so, per run, when the fleet was not quiet.**
+fn scoreability(fleet_busy: &str) -> Option<String> {
+    match parse_seat_map(fleet_busy) {
+        Err(error) => Some(format!("its fleet contention is unreadable: {}", error)),
+        Ok(foreign) if foreign.is_empty() => None,
+        Ok(foreign) => {
+            let total: i64 = foreign.values().sum();
+            Some(format!(
+                "the fleet was not quiet when it started: {} foreign {} held ({})",
+                total,
+                if total == 1 { "seat was" } else { "seats were" },
+                foreign
+                    .iter()
+                    .map(|(model, seats)| format!("{}={}", model, seats))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
+}
+
+/// [`scoreability`] for a whole run — the public form, and what `WorkflowRun.scoreable` reports so
+/// that a client can say WHY a run cannot compete instead of showing a mysteriously inert one.
+pub fn run_is_scoreable(run: &WorkflowRun) -> Option<String> {
+    scoreability(&run.fleet_busy)
+}
+
+/// Two runs saw the SAME foreign contention, which is genuinely like-for-like even when neither
+/// was quiet. It will not arise in practice — live contention does not repeat — but it is a real
+/// comparison when it does, so it is not refused.
+pub fn contention_was_identical(left_fleet_busy: &str, right_fleet_busy: &str) -> bool {
     match (parse_seat_map(left_fleet_busy), parse_seat_map(right_fleet_busy)) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
@@ -291,7 +537,9 @@ pub fn contention_is_comparable(left_fleet_busy: &str, right_fleet_busy: &str) -
 /// Three conditions, all necessary:
 ///
 /// 1. identical seat budgets ([`budgets_are_comparable`]);
-/// 2. identical fleet contention ([`contention_is_comparable`]);
+/// 2. both runs SCOREABLE — neither started under foreign contention ([`run_is_scoreable`]) — or,
+///    failing that, both having seen identical contention ([`contention_was_identical`]), which
+///    is like-for-like;
 /// 3. the same `(repo, phase_type, family)`. `family` is the design's central identity claim — a
 ///    hop tuned around one context window does not transfer to another — so a cross-family
 ///    head-to-head is not an incomparable measurement, it is a measurement of two different
@@ -314,13 +562,24 @@ pub fn preference_comparability(
     if !budgets_are_comparable(&winner.seats_held, &loser.seats_held) {
         return Some("the two runs held different seat budgets".to_string());
     }
-    if !contention_is_comparable(&winner.fleet_busy, &loser.fleet_busy) {
-        return Some(
-            "the two runs started under different fleet contention, so the comparison measured              the fleet rather than the workflow"
-                .to_string(),
-        );
+    // Exclude rather than compare: a run taken under load cannot be scored at all. The
+    // identical-contention escape keeps a genuinely like-for-like pair comparable.
+    match (run_is_scoreable(winner), run_is_scoreable(loser)) {
+        (None, None) => None,
+        (winner_block, loser_block) => {
+            if contention_was_identical(&winner.fleet_busy, &loser.fleet_busy) {
+                return None;
+            }
+            Some(match (&winner_block, &loser_block) {
+                (Some(reason), Some(_)) => {
+                    format!("both runs are unscoreable; the winning run: {}", reason)
+                }
+                (Some(reason), None) => format!("the winning run is unscoreable: {}", reason),
+                (None, Some(reason)) => format!("the losing run is unscoreable: {}", reason),
+                (None, None) => unreachable!("the all-scoreable case is handled above"),
+            })
+        }
     }
-    None
 }
 
 /// **The hop reader.** `hop` is JSON (steps, parallel groups, returns) and is validated as such on
@@ -367,6 +626,13 @@ pub struct PromotionFacts<'a> {
     /// Whether the family's search is halted. A halt must be lifted by an explicit `resume`, not by
     /// a promotion.
     pub halted: bool,
+    /// Why `run` cannot be scored, if it cannot — [`run_is_scoreable`].
+    ///
+    /// Checked even when there is NO preference, which is the one case the comparability rule
+    /// cannot reach: seeding a family's first champion needs no head-to-head, so without this a
+    /// first champion could be crowned off a run taken on a busy fleet with nothing ever looking
+    /// at its contention.
+    pub run_not_scoreable: Option<String>,
 }
 
 /// **The promotion rule.** `None` means this run may be promoted; `Some(reason)` is the refusal,
@@ -378,6 +644,9 @@ pub struct PromotionFacts<'a> {
 /// * the family's search is HALTED — a halt is the search admitting defeat, and lifting it is its
 ///   own explicit, human-confirmed `resume` decision. Promotion used to be what cleared a halt,
 ///   which made the halt escapable with no new evidence at all.
+/// * the run is not SCOREABLE — it started while the fleet was busy, so it measured the fleet.
+///   Checked here as well as inside [`preference_comparability`] because seeding a family's
+///   first champion needs no preference, and that path would otherwise never look at contention.
 /// * `gate_exit` is `NULL` — the gate never ran, so nothing was proven.
 /// * `gate_exit` is non-zero — the gate ran and failed. The exit code is the only score, and a
 ///   failing score cannot win.
@@ -401,6 +670,12 @@ pub struct PromotionFacts<'a> {
 /// `gate_collected` is not consulted. See the module docs.
 pub fn promotion_block(facts: &PromotionFacts<'_>) -> Option<String> {
     let run = facts.run;
+    if let Some(reason) = facts.run_not_scoreable.as_deref() {
+        return Some(format!(
+            "run {} cannot be scored: {}. The arena scores on a quiet fleet",
+            run.id, reason
+        ));
+    }
     if facts.halted {
         return Some(format!(
             "the search for this (repo, phase_type, family) is halted: a halt is lifted by an \
@@ -532,7 +807,19 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRun> {
         fleet_busy: row.get(7)?,
         started_at: row.get(8)?,
         ended_at: row.get(9)?,
+        scoreable: false,
+        not_scoreable_reason: None,
     })
+    .map(with_scoreability)
+}
+
+/// Fill the two derived scoreability fields. Applied by [`map_run`] alone, so every read of a run —
+/// every one, including the ones inside transactions — carries the same answer.
+fn with_scoreability(mut run: WorkflowRun) -> WorkflowRun {
+    let reason = scoreability(&run.fleet_busy);
+    run.scoreable = reason.is_none();
+    run.not_scoreable_reason = reason;
+    run
 }
 
 const PREF_COLUMNS: &str = "id, winner_run_id, loser_run_id, comparable, reason, created_at";
@@ -599,29 +886,30 @@ pub fn champion_key(workflow: &Workflow) -> (&str, &str, &str) {
     )
 }
 
-/// The run the CURRENT champion of a family was promoted on, from the decision log.
+/// The run a SPECIFIC workflow was promoted on, from the decision log.
 ///
-/// The most recent `promote` decision in the family. Since a promotion that promotes nothing no
-/// longer appends a row (see [`promote_workflow`]), the latest `promote` in a family is exactly the
-/// one that put the sitting champion in the slot — which is what makes "the displacing preference's
-/// loser must be the incumbent's run" answerable at all.
+/// The most recent `promote` decision whose run belongs to `champion_workflow_id`. That scoping is
+/// the whole point and it was missing: the query used to take the latest `promote` in the FAMILY,
+/// and `promotion_block` then never checked that the run it named belonged to the workflow actually
+/// holding the slot. When the two separately-stored facts disagreed — a writer that bypasses this
+/// service moving `is_champion` without logging — a challenger could displace the sitting champion
+/// by beating a run of a completely different workflow, and a preference against the sitting
+/// champion's OWN run was refused. The rule was pointing at the wrong thing in both directions.
 ///
-/// `None` when the family has no recorded promotion. A champion row with no promotion behind it is
-/// only reachable by a writer that bypasses this service, and [`promotion_block`] treats it as a
-/// refusal rather than a free pass.
+/// `None` when that workflow has no recorded promotion, which now covers both the absent case and
+/// the stale one. [`promotion_block`] treats it as a refusal rather than a free pass, so a champion
+/// slot with no promotion behind it cannot be displaced on anybody's evidence until a real
+/// promotion exists.
 fn champion_promotion_run_id(
     conn: &Connection,
-    repo: &str,
-    phase_type: &str,
-    family: &str,
+    champion_workflow_id: &str,
 ) -> Result<Option<String>, String> {
     conn.query_row(
         "SELECT d.run_id FROM workflow_decisions d \
          JOIN workflow_runs r ON r.id = d.run_id \
-         JOIN workflows w ON w.id = r.workflow_id \
-         WHERE w.repo = ?1 AND w.phase_type = ?2 AND w.family = ?3 AND d.kind = 'promote' \
+         WHERE r.workflow_id = ?1 AND d.kind = 'promote' \
          ORDER BY d.seq DESC LIMIT 1",
-        params![repo, phase_type, family],
+        params![champion_workflow_id],
         |row| row.get::<_, String>(0),
     )
     .optional()
@@ -688,29 +976,17 @@ pub fn create_workflow_version(
     state: &AppState,
     input: NewWorkflowVersion,
 ) -> Result<Workflow, String> {
-    let repo = require_non_blank("repo", &input.repo)?;
-    let phase_type = require_non_blank("phaseType", &input.phase_type)?;
+    let repo = repo_identity(&input.workspace_path)?;
+    let phase_type = validate_phase_type(&input.phase_type)?;
     let family = require_non_blank("family", &input.family)?;
-    let role = require_non_blank("role", &input.role)?;
-    let instruction = require_non_blank("instruction", &input.instruction)?;
-    let contract = require_non_blank("contract", &input.contract)?;
+    let role = require_visible_text("role", &input.role, MAX_PROMPT_CHARS)?;
+    let instruction = require_visible_text("instruction", &input.instruction, MAX_PROMPT_CHARS)?;
+    let contract = require_visible_text("contract", &input.contract, MAX_PROMPT_CHARS)?;
     // Validated, then stored as the caller's own text: the host does not own the Hop's shape.
     parse_hop(&input.hop)?;
-    let hop = input.hop.trim().to_string();
-    if input.fan_out < 1 {
-        return Err(format!(
-            "fanOut must be at least 1 seat (got {}): a workflow that holds no seat cannot run",
-            input.fan_out
-        ));
-    }
-    // Upper bound too. Only the lower one existed, so a fan-out of 9_007_199_254_740_991 was
-    // storable and then served on a field a client cannot represent — see [`MAX_FAN_OUT`].
-    if input.fan_out > MAX_FAN_OUT {
-        return Err(format!(
-            "fanOut must be at most {} seats (got {}): a seat cost larger than any fleet is a \
-             typo, and an unbounded integer here is served on a field that cannot represent it",
-            MAX_FAN_OUT, input.fan_out
-        ));
+    let hop = require_visible_text("hop", &input.hop, MAX_PROMPT_CHARS)?;
+    if let Some(reason) = fan_out_is_allowed(&family, input.fan_out) {
+        return Err(format!("fanOut is not allowed: {}", reason));
     }
 
     let id = Uuid::new_v4().to_string();
@@ -800,24 +1076,60 @@ pub fn measure_run_budget(
     seats: i64,
 ) -> Result<RunBudget, String> {
     let family = require_non_blank("family", family)?;
-    if seats < 1 {
-        return Err(format!(
-            "a run must hold at least 1 seat (got {}): a run that holds no seat cannot execute",
-            seats
-        ));
+    if let Some(reason) = fan_out_is_allowed(&family, seats) {
+        return Err(format!("the run's seat budget is not allowed: {}", reason));
     }
-    if seats > MAX_FAN_OUT {
-        return Err(format!(
-            "a run must hold at most {} seats (got {})",
-            MAX_FAN_OUT, seats
-        ));
-    }
-    let mut seats_held = BTreeMap::new();
-    seats_held.insert(family, seats);
-    Ok(RunBudget {
-        seats_held: serde_json::to_string(&seats_held).map_err(|e| e.to_string())?,
+    let mut requested = BTreeMap::new();
+    requested.insert(family.clone(), seats);
+    let budget = RunBudget {
+        seats_held: serde_json::to_string(&requested).map_err(|e| e.to_string())?,
         fleet_busy: "{}".to_string(),
-    })
+    };
+    // **A run must never silently proceed at a narrower width.** The design is explicit that a run
+    // QUEUES rather than shrinking, because a champion crowned on three seats and a challenger run
+    // on one are not the same experiment — and a silent reduction is indistinguishable, afterwards,
+    // from a workflow that was simply slower. Queuing is the caller's job (documented on Dev B's
+    // lease pool), so the guard here is a refusal, not a reduction.
+    //
+    // Trivially satisfied by the stand-in above, which hands back exactly what was asked for. It is
+    // written anyway because it becomes load-bearing the moment this body is replaced by a pool
+    // that can return less than it was asked for, and a guard added at the same time as the code it
+    // guards is a guard nobody wrote.
+    if let Some(reason) = budget_was_honoured(&requested, &budget.seats_held) {
+        return Err(reason);
+    }
+    Ok(budget)
+}
+
+/// **The no-shrink rule.** `None` when the fleet granted exactly the budget that was asked for;
+/// `Some(reason)` when it did not.
+///
+/// The design is explicit that a run QUEUES rather than shrinking, because a champion crowned on
+/// three seats and a challenger run on one are not the same experiment — and afterwards a silently
+/// reduced run is indistinguishable from a workflow that was simply slower. Queuing is the caller's
+/// job (documented on Dev B's lease pool), so the rule here is a refusal, not a reduction.
+///
+/// A separate named function rather than an inline comparison because the stand-in
+/// [`measure_run_budget`] always hands back exactly what it was asked for, so the branch is
+/// UNREACHABLE through the production path today and an inline check could not be tested at all.
+/// This one can be, and is — which is the difference between a guard and a comment.
+pub fn budget_was_honoured(
+    requested: &BTreeMap<String, i64>,
+    granted_seats_held: &str,
+) -> Option<String> {
+    let granted = match parse_seat_map(granted_seats_held) {
+        Ok(granted) => granted,
+        Err(error) => return Some(format!("the granted seat budget is unreadable: {}", error)),
+    };
+    if &granted == requested {
+        return None;
+    }
+    Some(format!(
+        "the fleet granted {:?} for a requested budget of {:?}: a run must queue until its full \
+         budget is available, never run narrower — a reduced run is indistinguishable afterwards \
+         from a slower workflow",
+        granted, requested
+    ))
 }
 
 /// [`start_workflow_run`] with the budget supplied instead of measured.
@@ -968,12 +1280,18 @@ fn set_gate_result(
                 ));
             }
             let workflow = read_workflow(&tx, &existing.workflow_id)?;
-            let champion_run = champion_promotion_run_id(
+            // Only the SITTING champion's evidence is locked. A promote row belonging to a
+            // workflow that has since been displaced is history, not evidence in use.
+            let sitting = champion_workflow_id(
                 &tx,
                 &workflow.repo,
                 &workflow.phase_type,
                 &workflow.family,
             )?;
+            let champion_run = match sitting.as_deref() {
+                Some(champion) => champion_promotion_run_id(&tx, champion)?,
+                None => None,
+            };
             if champion_run.as_deref() == Some(run_id) {
                 return Err(format!(
                     "run {} is the run the current champion of ({}, {}, {}) was promoted on: its \
@@ -993,6 +1311,97 @@ fn set_gate_result(
         tx.commit().map_err(|e| e.to_string())?;
         Ok(updated)
     })
+}
+
+/// **Execute an arena run's gate and record the result.** This is the step that closes the arena's
+/// loop: without it a `workflow_runs` row keeps `gate_exit = NULL` forever, so promotion is refused
+/// for having no score and comparison is impossible — which makes the design's step 7, the one
+/// human decision the whole arena exists for, unreachable.
+///
+/// An arena run IS an ordinary phase gate with a workflow attached. The run carries `plan_id`; the
+/// plan carries `workspace_path` and the phase whose `test_commands` are the score. So this
+/// delegates to [`crate::services::agent_plans::run_plan_test_gate`] — the same resolution rule
+/// (`effective_gate`) and the same shell the coordinator's own ready-check uses, so what the arena
+/// scores is what the coordinator would see — and feeds the outcome through [`set_gate_result`],
+/// so every guard that function carries still applies.
+///
+/// Refusals, each for its own reason:
+///
+/// * **no `plan_id`** — an arena run with no plan has no `workspace_path` and no phase, so there is
+///   nothing to execute. Refused rather than scored 0.
+/// * **the family's search is HALTED** — a halted search must neither start nor score a run.
+///   Scoring one would hand a halted family fresh evidence to promote on the moment it resumes,
+///   which is the halt leaking in a quieter way than the hole already closed in
+///   [`promote_workflow`].
+/// * **no gate DECLARED at either level** — and this one is the trap. `TestGateRun` reports
+///   `exit_code: 0` both for a gate that ran everything successfully AND for a phase that declares
+///   no gate at all; `gate_declared` is the field that separates them. Storing that 0 would make an
+///   ungated run look like a passing one and therefore promotable — a false pass of exactly the
+///   kind this feature's "the exit code is the only score" rule exists to prevent. A phase with no
+///   gate cannot compete, which is the design's own `ui-phase` case.
+///
+/// `exit_code` is the only thing persisted as the score. `collected` is passed through as the
+/// advisory, nullable count and nothing branches on it. A MALFORMED gate is a legitimate non-zero
+/// score (`TEST_GATE_EXIT_MALFORMED`), not a refusal: something was declared and could not be run,
+/// and that is a failure rather than an absence.
+pub async fn score_workflow_run(
+    state: &AppState,
+    run_id: &str,
+    phase_id: Option<String>,
+    rescore: bool,
+) -> Result<WorkflowRun, String> {
+    // Everything that can be decided without running anything is decided first, so a refusal never
+    // costs a test-suite execution.
+    let (plan_id, repo, phase_type, family) = state.db.with_conn(|conn| {
+        let run = read_run(conn, run_id)?;
+        let workflow = read_workflow(conn, &run.workflow_id)?;
+        // The HALT is checked first, before the run's own wiring. A halt is a property of the
+        // family, not of this run: refusing a halted family with "that run has no plan" would
+        // report the less important of the two problems, and a caller fixing the plan would then
+        // discover the halt only on the next attempt.
+        let search = search_state_on(conn, &workflow.repo, &workflow.phase_type, &workflow.family)?;
+        if search.halted {
+            return Err(format!(
+                "the search for ({}, {}, {}) is halted after {} consecutive rejections (limit \
+                 {}): a halted search neither starts nor scores runs. Lift it with an explicit, \
+                 human-confirmed resume",
+                workflow.repo,
+                workflow.phase_type,
+                workflow.family,
+                search.consecutive_rejections,
+                search.strike_limit
+            ));
+        }
+        let plan_id = run.plan_id.clone().ok_or_else(|| {
+            format!(
+                "run {} has no plan, so there is no workspace and no phase to run a gate in: an \
+                 arena run must be started against the plan that executes it",
+                run_id
+            )
+        })?;
+        Ok((
+            plan_id,
+            workflow.repo,
+            workflow.phase_type,
+            workflow.family,
+        ))
+    })?;
+    let _ = (&repo, &phase_type, &family);
+
+    let gate = crate::services::agent_plans::run_plan_test_gate(state, plan_id.clone(), phase_id)
+        .await?;
+
+    if !gate.gate_declared {
+        return Err(format!(
+            "plan {} declares no test gate at either level, so run {} has nothing to be scored \
+             on. `exit_code` is 0 both for a gate that passed and for a phase with no gate, so \
+             recording it would make an ungated run look promotable — a phase with no gate cannot \
+             compete",
+            plan_id, run_id
+        ));
+    }
+
+    set_gate_result(state, run_id, gate.exit_code as i64, gate.collected, rescore)
 }
 
 /// Record that one run beat another.
@@ -1037,14 +1446,49 @@ pub fn record_workflow_pref(
     }
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
-    let reason = reason
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty());
+    // Optional here — a preference may be recorded without commentary — but if text IS supplied it
+    // must be visible and bounded, for the same reason a rejection's is.
+    let reason = match reason {
+        Some(text) if text.trim().is_empty() => None,
+        Some(text) => Some(require_visible_text("reason", &text, MAX_REASON_CHARS)?),
+        None => None,
+    };
 
     state.db.with_conn(|conn| {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let winner = read_run(&tx, winner_run_id)?;
         let loser = read_run(&tx, loser_run_id)?;
+        // **A failing run cannot be the winner.** Only `winner != loser` was checked, so a
+        // challenger that exited 101 could be recorded as beating a champion that exited 0.
+        // Promotion stayed blocked — `promotion_block` reads the gate — but `workflow_prefs` is the
+        // table the design calls the project-level measurement, and a row in it asserting that the
+        // failing run won is a false measurement whatever the promote path does with it.
+        match winner.gate_exit {
+            None => {
+                return Err(format!(
+                    "run {} cannot be the winner: its gate never ran, so there is nothing to \
+                     prefer it on",
+                    winner.id
+                ));
+            }
+            Some(0) => {}
+            Some(exit) => {
+                return Err(format!(
+                    "run {} failed its gate (exit {}) and cannot be recorded as the winner: the \
+                     exit code is the only score, so a failing run has not beaten anything",
+                    winner.id, exit
+                ));
+            }
+        }
+        // The loser must have been SCORED too. "A beat B" where B never ran is not a comparison,
+        // and a preference is the project's measurement rather than a note.
+        if loser.gate_exit.is_none() {
+            return Err(format!(
+                "run {} has no gate result, so it cannot be the loser: a preference over a run \
+                 that never ran is not a comparison",
+                loser.id
+            ));
+        }
         // Already recorded? Hand back the same row. Checked INSIDE the transaction so the
         // read-then-insert cannot interleave with another writer.
         if let Some(existing) = tx
@@ -1153,12 +1597,9 @@ pub fn promote_workflow(
         // has to pass every other check, because the block is consulted either way.
         let displaced = incumbent.as_deref().filter(|id| *id != workflow.id);
         let incumbent_run_id = match displaced {
-            Some(_) => champion_promotion_run_id(
-                &tx,
-                &workflow.repo,
-                &workflow.phase_type,
-                &workflow.family,
-            )?,
+            // Scoped to the INCUMBENT's own workflow, not to the family: the family's latest
+            // promotion may belong to a workflow that no longer holds the slot.
+            Some(incumbent) => champion_promotion_run_id(&tx, incumbent)?,
             None => None,
         };
         let search = search_state_on(&tx, &workflow.repo, &workflow.phase_type, &workflow.family)?;
@@ -1177,6 +1618,7 @@ pub fn promote_workflow(
             incumbent_workflow_id: displaced,
             incumbent_run_id: incumbent_run_id.as_deref(),
             halted: search.halted,
+            run_not_scoreable: run_is_scoreable(&run),
         };
         if let Some(reason) = promotion_block(&facts) {
             return Err(format!("refusing to promote: {}", reason));
@@ -1224,10 +1666,12 @@ pub fn reject_workflow_run(
     run_id: &str,
     reason: &str,
 ) -> Result<WorkflowSearchState, String> {
-    let reason = require_non_blank("reason", reason).map_err(|_| {
-        "a rejection must record a reason: three of them halt the search, and the reasons are \
-         what a halted search has to show"
-            .to_string()
+    let reason = require_visible_text("reason", reason, MAX_REASON_CHARS).map_err(|detail| {
+        format!(
+            "a rejection must record a reason: three of them halt the search, and the reasons are \
+             what a halted search has to show. {}",
+            detail
+        )
     })?;
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
@@ -1279,10 +1723,12 @@ pub fn resume_workflow_search(
                 .to_string(),
         );
     }
-    let reason = require_non_blank("reason", reason).map_err(|_| {
-        "lifting a halt must record a reason: the halt is the search admitting defeat, and \
-         continuing anyway is the decision a reader will most want explained"
-            .to_string()
+    let reason = require_visible_text("reason", reason, MAX_REASON_CHARS).map_err(|detail| {
+        format!(
+            "lifting a halt must record a reason: the halt is the search admitting defeat, and \
+             continuing anyway is the decision a reader will most want explained. {}",
+            detail
+        )
     })?;
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
@@ -1537,11 +1983,71 @@ fn search_state_on(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::test_state;
+    use crate::test_support::{test_state, tmp_dir};
+
+    /// Round 3: `workflows.repo` is no longer a caller-supplied string — the host DERIVES it from a
+    /// workspace path (`repo_identity`). These tests still want to talk about "repo" and "other-repo"
+    /// as logical names, so this maps a logical name to a stable synthetic path and lets the host
+    /// derive the identity from it exactly as it would in production.
+    ///
+    /// The path deliberately does not exist: `repo_identity` then finds no git remote and falls back to
+    /// the absolute path, which is deterministic and distinct per name. No filesystem, no git, no
+    /// dependence on the machine this runs on.
+    fn repo_path(name: &str) -> String {
+        format!("/nonexistent-arena-tests/{}", name)
+    }
+
+    fn repo_id(name: &str) -> String {
+        repo_identity(&repo_path(name)).expect("derive the repo identity")
+    }
+
+    // --- Test shims over the three service functions that take the derived identity. ---
+    //
+    // They SHADOW the glob-imported originals deliberately, so that every call site in this file can go
+    // on naming the logical repo. An explicit local item wins over a glob import, so `workflow_search_state("repo", …)`
+    // below is this shim, which translates and then calls the real one. Nothing about the rule under
+    // test changes — only how the key is spelled at the call site.
+
+    fn workflow_search_state(
+        state: &AppState,
+        repo: &str,
+        phase_type: &str,
+        family: &str,
+    ) -> Result<WorkflowSearchState, String> {
+        crate::services::workflows::workflow_search_state(state, &repo_id(repo), phase_type, family)
+    }
+
+    fn resume_workflow_search(
+        state: &AppState,
+        repo: &str,
+        phase_type: &str,
+        family: &str,
+        reason: &str,
+        confirmed: bool,
+    ) -> Result<WorkflowSearchState, String> {
+        crate::services::workflows::resume_workflow_search(
+            state,
+            &repo_id(repo),
+            phase_type,
+            family,
+            reason,
+            confirmed,
+        )
+    }
+
+    fn list_workflows(
+        state: &AppState,
+        repo: Option<&str>,
+        phase_type: Option<&str>,
+        family: Option<&str>,
+    ) -> Result<Vec<Workflow>, String> {
+        let repo = repo.map(repo_id);
+        crate::services::workflows::list_workflows(state, repo.as_deref(), phase_type, family)
+    }
 
     fn new_version(repo: &str, phase_type: &str, family: &str) -> NewWorkflowVersion {
         NewWorkflowVersion {
-            repo: repo.to_string(),
+            workspace_path: repo_path(repo),
             phase_type: phase_type.to_string(),
             family: family.to_string(),
             parent_id: None,
@@ -1632,7 +2138,7 @@ mod tests {
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(params![repo, phase_type, family], |row| {
+                    .query_map(params![repo_id(repo), phase_type, family], |row| {
                         row.get::<_, String>(0)
                     })
                     .map_err(|e| e.to_string())?;
@@ -1794,7 +2300,7 @@ mod tests {
         no_seats.fan_out = 0;
         assert!(create_workflow_version(&state, no_seats)
             .expect_err("zero fan-out")
-            .contains("fanOut must be at least 1"));
+            .contains("holds no seat"));
     }
 
     // -------------------------------------------------------------------------------------
@@ -1832,6 +2338,7 @@ mod tests {
                 incumbent_workflow_id: None,
                 incumbent_run_id: None,
                 halted: false,
+                run_not_scoreable: None,
             }),
             None
         );
@@ -1987,10 +2494,13 @@ mod tests {
         assert_eq!(pref_count(&state), 1, "five calls, one row");
 
         // The REVERSE pair is a different ordered pair — a contradiction, not a duplicate — and is
-        // deliberately still recordable.
-        let reversed = record_workflow_pref(&state, &b.id, &a.id, None).expect("reverse");
-        assert_ne!(reversed.id, first.id);
-        assert_eq!(pref_count(&state), 2);
+        // deliberately still recordable. It needs a GREEN winner, because a failing run can no
+        // longer be recorded as one at all.
+        let green_b = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 0);
+        let forward = record_workflow_pref(&state, &a.id, &green_b.id, None).expect("forward");
+        let reversed = record_workflow_pref(&state, &green_b.id, &a.id, None).expect("reverse");
+        assert_ne!(reversed.id, forward.id, "opposite directions are different rows");
+        assert_eq!(pref_count(&state), 3);
     }
 
     /// The read half: a preference can be discovered without issuing a write.
@@ -2015,7 +2525,9 @@ mod tests {
         let d = scored_run(&state, &unrelated.id, r#"{"glm":3}"#, 1);
         record_workflow_pref(&state, &c.id, &d.id, None).expect("unrelated");
 
-        // Both sides count: `mine` is the winner here, and the LOSER below.
+        // Both sides count: `mine` is the winner above, and the LOSER below. The other workflow's
+        // run has to be GREEN to be a winner at all.
+        let b = rescore_workflow_run_gate(&state, &b.id, 0, None).expect("make b green");
         let lost = record_workflow_pref(&state, &b.id, &a.id, None).expect("lost");
 
         let listed: Vec<String> = list_workflow_prefs(&state, &mine.id)
@@ -2169,12 +2681,30 @@ mod tests {
         promote_workflow(&state, &old_run.id, None, true).expect("seed champion");
 
         let new = seed_workflow(&state, "repo", "dev-phase", "glm");
-        let failing = scored_run(&state, &new.id, r#"{"glm":3}"#, 2);
-        let pref = record_workflow_pref(&state, &failing.id, &old_run.id, None).expect("pref");
-        assert!(pref.comparable);
 
-        promote_workflow(&state, &failing.id, Some(&pref.id), true).expect_err("red gate");
+        // A FAILING run can no longer even be recorded as a winner, so the red-gate case is now
+        // refused one step earlier than it used to be.
+        let failing = scored_run(&state, &new.id, r#"{"glm":3}"#, 2);
+        let refused = record_workflow_pref(&state, &failing.id, &old_run.id, None)
+            .expect_err("a failing run cannot be the winner");
+        assert!(refused.contains("failed its gate (exit 2)"), "got: {}", refused);
+        // And it cannot be promoted either, with no preference to offer.
+        promote_workflow(&state, &failing.id, None, true).expect_err("red gate");
+
+        // The subject of this test: a promotion refused on a NON-COMPARABLE preference leaves the
+        // incumbent exactly as it was. Green challenger, mismatched seat budget.
+        let narrow = scored_run(&state, &new.id, r#"{"glm":1}"#, 0);
+        let pref = record_workflow_pref(&state, &narrow.id, &old_run.id, None).expect("pref");
+        assert!(!pref.comparable, "different seat budgets");
+        promote_workflow(&state, &narrow.id, Some(&pref.id), true)
+            .expect_err("a non-comparable preference cannot promote");
+
         assert_eq!(champion_ids(&state, "repo", "dev-phase", "glm"), vec![old.id]);
+        assert_eq!(
+            promote_decision_count(&state),
+            1,
+            "three refusals appended nothing to the decision log"
+        );
     }
 
     /// Re-promoting the current champion is a no-op, not a self-displacement error — and it must
@@ -2468,6 +2998,476 @@ mod tests {
     /// The insert still validates both snapshots, even though they now come from the host rather
     /// than from a caller: an unreadable `seats_held` would make every preference involving this
     /// run non-comparable, which is a silent dead end rather than an error.
+    // =========================================================================================
+    // Round 3 — the executor, the identity rules, and the human-text guards
+    // =========================================================================================
+
+    /// Insert a bare plan row whose `workspace_path` is a real directory and whose plan-level
+    /// `test_commands` are whatever the test wants the gate to be.
+    fn seed_plan(state: &AppState, workspace: &std::path::Path, test_commands: Option<&str>) -> String {
+        let id = Uuid::new_v4().to_string();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    // The column list mirrors the one the existing plan tests use
+                    // (`agent_plans.rs` `block_flips_status_and_unblock_restores_it`), plus
+                    // `test_commands`. `initiative_id` and `initiative_status` have to be set:
+                    // the plan row MAPPER reads them as non-null (migration 017), so omitting them
+                    // fails the read rather than the insert — measured, not guessed, as
+                    // "Invalid column type Null at index: 20, name: initiative_status".
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, \
+                     worker_provider, reviewer_provider, initiative_id, initiative_status, \
+                     test_commands) \
+                     VALUES (?1, 'development', 'arena', ?2, ?3, 'claude_code', 'claude_code', \
+                     ?1, 'development', ?4)",
+                    params![
+                        id,
+                        workspace.to_string_lossy(),
+                        workspace.join("plan").to_string_lossy(),
+                        test_commands
+                    ],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .expect("seed plan");
+        id
+    }
+
+    fn start_against_plan(state: &AppState, workflow_id: &str, plan_id: &str) -> WorkflowRun {
+        start_workflow_run(
+            state,
+            NewWorkflowRun {
+                workflow_id: workflow_id.to_string(),
+                plan_id: Some(plan_id.to_string()),
+                seed: 0,
+                seats: None,
+            },
+        )
+        .expect("start run")
+    }
+
+    /// **The loop closes.** This is the test the whole round turns on: an arena run goes from
+    /// `gate_exit = NULL` to a real score by EXECUTING the plan's gate, which is what makes
+    /// comparison — and therefore the one human decision the arena exists for — reachable at all.
+    ///
+    /// Before this existed, `record_workflow_run_gate` had no caller anywhere in the tree, so every
+    /// run the UI created kept a null score forever and promotion was refused for having none.
+    #[tokio::test]
+    async fn scoring_a_run_executes_the_plans_gate_and_records_the_exit_code() {
+        let (state, _root) = test_state();
+        let workspace = tmp_dir("arena-gate");
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+
+        // A gate that passes.
+        let green_plan = seed_plan(&state, &workspace, Some(r#"["true"]"#));
+        let run = start_against_plan(&state, &workflow.id, &green_plan);
+        assert_eq!(run.gate_exit, None, "nothing has run yet");
+
+        let scored = score_workflow_run(&state, &run.id, None, false)
+            .await
+            .expect("score");
+        assert_eq!(scored.gate_exit, Some(0), "the gate passed");
+        assert!(scored.ended_at.is_some(), "and the run ended");
+        // Persisted, not just returned.
+        assert_eq!(
+            get_workflow_run(&state, &run.id).unwrap().gate_exit,
+            Some(0)
+        );
+
+        // And that score is now enough to seed a champion — the loop really is closed.
+        promote_workflow(&state, &run.id, None, true).expect("promote on a measured score");
+
+        // A gate that FAILS records the failing exit code, not an error.
+        let red_plan = seed_plan(&state, &workspace, Some(r#"["exit 7"]"#));
+        let red_run = start_against_plan(&state, &workflow.id, &red_plan);
+        let red = score_workflow_run(&state, &red_run.id, None, false)
+            .await
+            .expect("a failing gate is a score, not an error");
+        assert_eq!(red.gate_exit, Some(7), "the first failing command's code");
+        assert!(
+            promotion_block(&PromotionFacts {
+                run: &red,
+                pref: None,
+                pref_loser: None,
+                pref_loser_same_key: true,
+                pref_loser_same_workflow: false,
+                incumbent_workflow_id: Some("someone-else"),
+                incumbent_run_id: Some("their-run"),
+                halted: false,
+                run_not_scoreable: None,
+            })
+            .is_some(),
+            "and a failing score cannot promote"
+        );
+    }
+
+    /// **The `gate_declared` trap.** `TestGateRun` reports `exit_code: 0` both for a gate that ran
+    /// everything successfully AND for a plan that declares no gate at all. Recording that 0 would
+    /// make an ungated run look like a passing one, and therefore promotable — a false pass of
+    /// exactly the kind "the exit code is the only score" exists to prevent.
+    ///
+    /// A phase with no gate cannot compete. That is the design's own `ui-phase` case.
+    #[tokio::test]
+    async fn a_plan_with_no_gate_cannot_be_scored_at_all() {
+        let (state, _root) = test_state();
+        let workspace = tmp_dir("arena-nogate");
+        let workflow = seed_workflow(&state, "repo", "ui-phase", "glm");
+
+        for declared in [None, Some("[]"), Some("   ")] {
+            let plan = seed_plan(&state, &workspace, declared);
+            let run = start_against_plan(&state, &workflow.id, &plan);
+            let error = score_workflow_run(&state, &run.id, None, false)
+                .await
+                .expect_err("an ungated plan must not be scored");
+            assert!(
+                error.contains("declares no test gate"),
+                "for {:?}: got {}",
+                declared,
+                error
+            );
+            assert_eq!(
+                get_workflow_run(&state, &run.id).unwrap().gate_exit,
+                None,
+                "and NO score was recorded — a 0 here would read as a pass"
+            );
+        }
+    }
+
+    /// The executor respects the guards the recorder already carries: a second score must be asked
+    /// for by name, and a sitting champion's evidence is immutable even then.
+    #[tokio::test]
+    async fn the_executor_respects_the_rescore_guards() {
+        let (state, _root) = test_state();
+        let workspace = tmp_dir("arena-rescore");
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let plan = seed_plan(&state, &workspace, Some(r#"["true"]"#));
+        let run = start_against_plan(&state, &workflow.id, &plan);
+
+        score_workflow_run(&state, &run.id, None, false)
+            .await
+            .expect("first score");
+
+        let refused = score_workflow_run(&state, &run.id, None, false)
+            .await
+            .expect_err("a silent re-score must be refused");
+        assert!(
+            refused.contains("already has a gate result"),
+            "got: {}",
+            refused
+        );
+
+        // Deliberate re-scoring goes through …
+        score_workflow_run(&state, &run.id, None, true)
+            .await
+            .expect("deliberate rescore");
+
+        // … until the run is the evidence a sitting champion rests on.
+        promote_workflow(&state, &run.id, None, true).expect("promote");
+        let locked = score_workflow_run(&state, &run.id, None, true)
+            .await
+            .expect_err("a champion's evidence must not be rewritable");
+        assert!(
+            locked.contains("cannot be rewritten underneath it"),
+            "got: {}",
+            locked
+        );
+    }
+
+    /// **An unscoreable run cannot be promoted, including when it is SEEDING a family.**
+    ///
+    /// This is the path the comparability rule cannot reach: seeding the first champion needs no
+    /// head-to-head, so without the check in `promotion_block` a first champion could be crowned
+    /// off a run taken on a busy fleet with nothing ever looking at its contention. Measured as a
+    /// gap: reverting the check left every other test green.
+    #[test]
+    fn an_unscoreable_run_cannot_be_promoted_even_when_seeding() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let contended = start_with(&state, &workflow.id, r#"{"glm":3}"#, r#"{"qwen":4}"#);
+        let contended =
+            record_workflow_run_gate(&state, &contended.id, 0, None).expect("green gate");
+        assert!(!contended.scoreable, "it started on a busy fleet");
+        assert!(contended.not_scoreable_reason.is_some());
+
+        // Green gate, no incumbent, no preference — the seeding path, and it must still refuse.
+        let error = promote_workflow(&state, &contended.id, None, true)
+            .expect_err("a run taken under load cannot be crowned");
+        assert!(error.contains("cannot be scored"), "got: {}", error);
+        assert!(error.contains("quiet fleet"), "and it must say why: {}", error);
+        assert!(champion_ids(&state, "repo", "dev-phase", "glm").is_empty());
+
+        // The same run on a quiet fleet seeds the champion, so the refusal is about contention and
+        // not about anything else in the path.
+        let quiet = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 0);
+        assert!(quiet.scoreable);
+        promote_workflow(&state, &quiet.id, None, true).expect("a quiet run may be crowned");
+    }
+
+    /// **A run must never silently proceed at a narrower width.** Tested as a unit, because the
+    /// stand-in `measure_run_budget` always grants exactly what it was asked for, so the branch is
+    /// unreachable through the production path until the lease pool lands — and an untestable guard
+    /// is a comment.
+    #[test]
+    fn a_narrower_budget_than_requested_is_refused_not_reduced() {
+        let three = BTreeMap::from([("glm".to_string(), 3_i64)]);
+        assert_eq!(budget_was_honoured(&three, r#"{"glm":3}"#), None);
+
+        for narrower in [r#"{"glm":1}"#, "{}", r#"{"qwen":3}"#, r#"{"glm":3,"qwen":1}"#] {
+            let reason = budget_was_honoured(&three, narrower)
+                .unwrap_or_else(|| panic!("{} must not be accepted as 3 glm seats", narrower));
+            assert!(reason.contains("must queue"), "for {}: {}", narrower, reason);
+        }
+        assert!(budget_was_honoured(&three, "not json")
+            .expect("unreadable")
+            .contains("unreadable"));
+
+        // And the production path still satisfies it, which is what makes the guard inert rather
+        // than wrong today.
+        let (state, _root) = test_state();
+        let budget = measure_run_budget(&state, "glm", 3).expect("measure");
+        assert_eq!(budget_was_honoured(&three, &budget.seats_held), None);
+    }
+
+    /// A run with no plan has no workspace and no phase, so there is nothing to execute. Refused
+    /// rather than scored 0 — a 0 here would read as a pass.
+    #[tokio::test]
+    async fn scoring_a_run_with_no_plan_is_refused() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+        assert_eq!(run.plan_id, None);
+
+        let error = score_workflow_run(&state, &run.id, None, false)
+            .await
+            .expect_err("no plan, nothing to run");
+        assert!(error.contains("has no plan"), "got: {}", error);
+        assert_eq!(
+            get_workflow_run(&state, &run.id).unwrap().gate_exit,
+            None,
+            "and no score was invented"
+        );
+    }
+
+    /// A halted family neither starts nor SCORES a run. Scoring one would hand a halted search
+    /// fresh evidence to promote on the moment it resumes.
+    #[tokio::test]
+    async fn a_halted_family_cannot_score_a_run() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let target = start(&state, &workflow.id, r#"{"glm":3}"#);
+        for index in 1..=3 {
+            let run = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 1);
+            reject_workflow_run(&state, &run.id, &format!("no {}", index)).expect("reject");
+        }
+        assert!(workflow_search_state(&state, "repo", "dev-phase", "glm")
+            .unwrap()
+            .halted);
+
+        let error = score_workflow_run(&state, &target.id, None, false)
+            .await
+            .expect_err("a halted search must not score");
+        assert!(error.contains("is halted"), "got: {}", error);
+        // The halt is checked BEFORE the plan, so a halted family refuses without touching a shell.
+        assert!(
+            !error.contains("has no plan"),
+            "the halt must be the first refusal: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn scoring_an_unknown_run_is_not_found() {
+        let (state, _root) = test_state();
+        assert!(score_workflow_run(&state, "nope", None, false)
+            .await
+            .expect_err("unknown run")
+            .contains("not found"));
+    }
+
+    /// **The identity rule.** `repo` is derived, and two unrelated checkouts with the same basename
+    /// must not collide.
+    #[test]
+    fn repo_identity_does_not_collide_on_the_basename() {
+        let left = repo_identity("/a/johnnyone").expect("left");
+        let right = repo_identity("/b/johnnyone").expect("right");
+        assert_ne!(
+            left, right,
+            "two unrelated checkouts called johnnyone must not share a champion"
+        );
+        assert!(left.starts_with("path:"), "got: {}", left);
+        assert!(repo_identity("   ").is_err(), "a blank path has no identity");
+    }
+
+    /// A git remote is the identity when there is one, and the spellings of one remote collapse to
+    /// a single identity — otherwise normalisation would just move the collision to a split.
+    #[test]
+    fn a_git_remote_is_one_identity_however_it_is_spelled() {
+        let repo = tmp_dir("repo-identity");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+
+        let mut seen = std::collections::BTreeSet::new();
+        for url in [
+            "git@github.com:Owner/Repo.git",
+            "https://github.com/owner/repo",
+            "https://user:token@github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+        ] {
+            git(&["config", "remote.origin.url", url]);
+            let identity = repo_identity(&repo.to_string_lossy()).expect("identity");
+            assert_eq!(identity, "git:github.com/owner/repo", "for {}", url);
+            seen.insert(identity);
+        }
+        assert_eq!(seen.len(), 1, "one repo, one identity");
+
+        // A repo with NO remote falls back to the path rather than to a shared empty identity.
+        git(&["config", "--unset", "remote.origin.url"]);
+        assert!(repo_identity(&repo.to_string_lossy())
+            .expect("fallback")
+            .starts_with("path:"));
+    }
+
+    /// **The phase-type rule.** A closed set, because the key cannot be polluted from any writer.
+    #[test]
+    fn phase_type_is_validated_against_a_closed_set() {
+        for known in KNOWN_PHASE_TYPES {
+            assert_eq!(validate_phase_type(known).unwrap(), *known);
+        }
+        assert_eq!(validate_phase_type("  dev-phase  ").unwrap(), "dev-phase");
+        for unknown in ["dev-phse", "DEV-PHASE", "", "dev phase", "migration"] {
+            let error = validate_phase_type(unknown).expect_err(unknown);
+            assert!(error.contains("not a phase type"), "got: {}", error);
+        }
+
+        // And it bites at the write, not only in isolation.
+        let (state, _root) = test_state();
+        let mut typo = new_version("repo", "dev-phase", "glm");
+        typo.phase_type = "dev-phse".to_string();
+        assert!(create_workflow_version(&state, typo)
+            .expect_err("typo")
+            .contains("not a phase type"));
+    }
+
+    /// **A failing run cannot be the winner**, and a run that never ran cannot be the loser.
+    #[test]
+    fn a_preference_needs_a_passing_winner_and_a_scored_loser() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let green = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 0);
+        let red = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 101);
+        let unscored = start(&state, &workflow.id, r#"{"glm":3}"#);
+
+        // The measured case: a challenger that exited 101 recorded as beating a champion that
+        // exited 0. Promotion was already blocked, but the row itself was a false measurement.
+        let error = record_workflow_pref(&state, &red.id, &green.id, None)
+            .expect_err("a failing winner must be refused");
+        assert!(error.contains("failed its gate (exit 101)"), "got: {}", error);
+
+        let never_ran = record_workflow_pref(&state, &unscored.id, &green.id, None)
+            .expect_err("an unscored winner must be refused");
+        assert!(never_ran.contains("its gate never ran"), "got: {}", never_ran);
+
+        let no_loser = record_workflow_pref(&state, &green.id, &unscored.id, None)
+            .expect_err("an unscored loser is not a comparison");
+        assert!(no_loser.contains("has no gate result"), "got: {}", no_loser);
+
+        assert_eq!(pref_count(&state), 0, "none of the three was written");
+
+        // The honest direction still works.
+        record_workflow_pref(&state, &green.id, &red.id, None).expect("green beats red");
+        assert_eq!(pref_count(&state), 1);
+    }
+
+    /// **Invisible characters must not satisfy a mandatory reason.** A zero-width space, a BOM and
+    /// a NUL all pass `str::trim`, because none of them is Unicode `White_Space` — so a rejection
+    /// whose reason renders as NOTHING was accepted and stored, and that reason is the one thing a
+    /// halted search has to show a human.
+    #[test]
+    fn an_invisible_reason_is_not_a_reason() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+
+        let invisible = [
+            ("zero-width space", "\u{200b}"),
+            ("BOM", "\u{feff}"),
+            ("NUL", "\0"),
+            ("soft hyphen", "\u{00ad}"),
+            ("word joiner", "\u{2060}"),
+            ("bidi override", "\u{202e}"),
+            ("mixed invisible", " \u{200b}\t\u{feff}\n"),
+        ];
+        for (label, reason) in invisible {
+            let run = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 1);
+            let error = reject_workflow_run(&state, &run.id, reason)
+                .expect_err(label);
+            assert!(
+                error.contains("must contain visible text"),
+                "{}: got {}",
+                label,
+                error
+            );
+        }
+        assert_eq!(
+            workflow_search_state(&state, "repo", "dev-phase", "glm")
+                .unwrap()
+                .consecutive_rejections,
+            0,
+            "not one of them counted as a strike"
+        );
+
+        // A reason with visible content AND an invisible character is fine — the rule is "contains
+        // something visible", not "contains nothing invisible".
+        let run = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 1);
+        reject_workflow_run(&state, &run.id, "too slow\u{200b}").expect("visible enough");
+
+        // And a resume is held to the same standard.
+        for index in 2..=3 {
+            let other = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 1);
+            reject_workflow_run(&state, &other.id, &format!("no {}", index)).expect("reject");
+        }
+        assert!(
+            resume_workflow_search(&state, "repo", "dev-phase", "glm", "\u{200b}", true)
+                .expect_err("invisible resume reason")
+                .contains("must contain visible text")
+        );
+    }
+
+    /// Human text is BOUNDED. Nothing at any layer bounded a reason, so one paste could put a
+    /// megabyte in the decision log and then serve it on every read of that family's state.
+    #[test]
+    fn human_text_is_length_bounded() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = scored_run(&state, &workflow.id, r#"{"glm":3}"#, 1);
+
+        let too_long = "x".repeat(MAX_REASON_CHARS + 1);
+        let error = reject_workflow_run(&state, &run.id, &too_long).expect_err("over the bound");
+        assert!(error.contains("over the"), "got: {}", error);
+        // The bound itself is allowed.
+        reject_workflow_run(&state, &run.id, &"x".repeat(MAX_REASON_CHARS)).expect("at the bound");
+
+        // The prompt parts are bounded too, on their own much larger limit.
+        let mut huge = new_version("repo", "dev-phase", "glm");
+        huge.instruction = "y".repeat(MAX_PROMPT_CHARS + 1);
+        assert!(create_workflow_version(&state, huge)
+            .expect_err("over the prompt bound")
+            .contains("over the"));
+
+        // And an invisible-only prompt part is refused by the same single reader.
+        let mut invisible = new_version("repo", "dev-phase", "glm");
+        invisible.role = "\u{200b}".to_string();
+        assert!(create_workflow_version(&state, invisible)
+            .expect_err("invisible role")
+            .contains("must contain visible text"));
+    }
+
     #[test]
     fn starting_a_run_refuses_an_unreadable_budget_snapshot() {
         let (state, _root) = test_state();
@@ -2606,8 +3606,8 @@ mod tests {
         )
         .expect("start");
         assert!(
-            contention_is_comparable(&a.fleet_busy, &b.fleet_busy),
-            "DEFECT PIN: every pair is contention-comparable while contention is unmeasured"
+            a.scoreable && b.scoreable,
+            "DEFECT PIN: every run reads as scoreable while contention is unmeasured"
         );
     }
 }

@@ -71,6 +71,9 @@ const SCOPE_GATED: Record<string, string> = {
   'create-workflow-version.ts': 'plans:write',
   'start-workflow-run.ts': 'plans:write',
   'record-workflow-run-gate.ts': 'plans:write',
+  'repo-identity.ts': 'plans:read',
+  // Runs an arbitrary shell command on the host, like run-agent-plan-test-gate.
+  'run-workflow-run-gate.ts': 'plans:write',
   'record-workflow-pref.ts': 'plans:write',
   'update-workflow-champion.ts': 'plans:write',
   // Lifting a halt overrules the search's own refusal, so it carries the write scope too.

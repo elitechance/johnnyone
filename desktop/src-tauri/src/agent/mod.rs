@@ -1278,12 +1278,16 @@ impl AgentService {
             "get_workflow" => Self::rpc_get_workflow(&req.params, state),
             "list_workflow_runs" => Self::rpc_list_workflow_runs(&req.params, state),
             "list_workflow_prefs" => Self::rpc_list_workflow_prefs(&req.params, state),
+            "get_repo_identity" => Self::rpc_get_repo_identity(&req.params, state),
             "get_workflow_search_state" => {
                 Self::rpc_get_workflow_search_state(&req.params, state)
             }
             "create_workflow_version" => Self::rpc_create_workflow_version(&req.params, state),
             "start_workflow_run" => Self::rpc_start_workflow_run(&req.params, state),
             "record_workflow_run_gate" => Self::rpc_record_workflow_run_gate(&req.params, state),
+            "run_workflow_run_gate" => {
+                Self::rpc_run_workflow_run_gate(&req.params, state).await
+            }
             "record_workflow_pref" => Self::rpc_record_workflow_pref(&req.params, state),
             "update_workflow_champion" => Self::rpc_update_workflow_champion(&req.params, state),
             "record_workflow_rejection" => {
@@ -1929,6 +1933,24 @@ impl AgentService {
         serde_json::to_value(prefs).map_err(|e| e.to_string())
     }
 
+    /// The repo identity for a workspace path — the one way a client can learn the value the host
+    /// derives, so it can key `list_workflows` / `get_workflow_search_state` on it without
+    /// re-implementing the derivation.
+    fn rpc_get_repo_identity(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let _ = state;
+        let workspace_path = params
+            .get("workspacePath")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workspacePath' parameter".to_string())?;
+        let repo = crate::services::workflows::repo_identity(workspace_path)?;
+        // A bare JSON string: the GraphQL field is `String!`, so there is no wrapper object for a
+        // client to unpack and no second place for the key's name to drift.
+        serde_json::to_value(repo).map_err(|e| e.to_string())
+    }
+
     fn rpc_get_workflow_search_state(
         params: &serde_json::Value,
         state: &Arc<AppState>,
@@ -1947,7 +1969,6 @@ impl AgentService {
         params: &serde_json::Value,
         state: &Arc<AppState>,
     ) -> Result<serde_json::Value, String> {
-        let (repo, phase_type, family) = Self::workflow_key(params)?;
         let required = |key: &str| -> Result<String, String> {
             params
                 .get(key)
@@ -1955,10 +1976,15 @@ impl AgentService {
                 .map(|value| value.to_string())
                 .ok_or_else(|| format!("Missing '{}' parameter", key))
         };
+        // NOTE `repo` is NOT a parameter. The client used to send it as
+        // `basename(workspace_path)`, so `/a/johnnyone` and `/b/johnnyone` shared one champion.
+        // The host derives the identity from the workspace path instead
+        // (`services::workflows::repo_identity`: the git remote, normalised, else the absolute
+        // path), because a client-supplied identity is a client-supplied champion key.
         let input = crate::services::workflows::NewWorkflowVersion {
-            repo,
-            phase_type,
-            family,
+            workspace_path: required("workspacePath")?,
+            phase_type: required("phaseType")?,
+            family: required("family")?,
             parent_id: params
                 .get("parentId")
                 .and_then(|value| value.as_str())
@@ -2049,6 +2075,37 @@ impl AgentService {
                 gate_collected,
             )
         }?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// EXECUTE an arena run's gate and record the result — the step that closes the arena's loop.
+    ///
+    /// `record_workflow_run_gate` takes a score someone else measured; this one measures it, by
+    /// running the plan's effective gate in the plan's workspace. Same `rescore` discipline: a
+    /// second result for a run is refused unless asked for.
+    async fn rpc_run_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        // Optional: absent targets the PLAN's gate, present targets that phase's — the same
+        // level-selection rule as `run_agent_plan_test_gate`.
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        let rescore = params
+            .get("rescore")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let run = crate::services::workflows::score_workflow_run(
+            state, run_id, phase_id, rescore,
+        )
+        .await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -3561,6 +3618,28 @@ mod workflow_arena_rpc_tests {
         }
     }
 
+    /// Round 3: `repo` is no longer a parameter — the host derives the identity from a workspace
+    /// path. These tests use a stable synthetic path (deliberately non-existent, so the derivation
+    /// finds no git remote and falls back to the absolute path) and ask the HOST what identity it
+    /// derived, rather than hard-coding the answer. If the derivation changes, these tests follow it
+    /// instead of pinning a stale string.
+    const WORKSPACE: &str = "/nonexistent-arena-rpc/johnnyone";
+
+    async fn derived_repo(state: &Arc<AppState>) -> String {
+        let response = AgentService::handle_rpc(
+            &rpc("get_repo_identity", json!({ "workspacePath": WORKSPACE })),
+            state,
+        )
+        .await;
+        assert!(response.success, "repo identity: {:?}", response.error);
+        response
+            .data
+            .expect("identity")
+            .as_str()
+            .expect("a bare string")
+            .to_string()
+    }
+
     /// Every arena method is REGISTERED. Proven by the error coming from the param-puller or the
     /// service rather than from the dispatch's `_ =>` arm.
     #[tokio::test]
@@ -3575,7 +3654,9 @@ mod workflow_arena_rpc_tests {
             ("list_workflow_runs", "Missing 'workflowId' parameter"),
             ("list_workflow_prefs", "Missing 'workflowId' parameter"),
             ("get_workflow_search_state", "Missing 'repo' parameter"),
-            ("create_workflow_version", "Missing 'repo' parameter"),
+            ("create_workflow_version", "Missing 'workspacePath' parameter"),
+            ("get_repo_identity", "Missing 'workspacePath' parameter"),
+            ("run_workflow_run_gate", "Missing 'runId' parameter"),
             ("start_workflow_run", "Missing 'workflowId' parameter"),
             ("record_workflow_run_gate", "Missing 'runId' parameter"),
             ("record_workflow_pref", "Missing 'winnerRunId' parameter"),
@@ -3625,7 +3706,7 @@ mod workflow_arena_rpc_tests {
                 &rpc(
                     "create_workflow_version",
                     json!({
-                        "repo": "johnnyone",
+                        "workspacePath": WORKSPACE,
                         "phaseType": "dev-phase",
                         "family": "glm-5.3-flash",
                         "role": "you are a developer",
@@ -3828,7 +3909,7 @@ mod workflow_arena_rpc_tests {
         let search = AgentService::handle_rpc(
             &rpc(
                 "get_workflow_search_state",
-                json!({ "repo": "johnnyone", "phaseType": "dev-phase", "family": "glm-5.3-flash" }),
+                json!({ "repo": derived_repo(&state).await, "phaseType": "dev-phase", "family": "glm-5.3-flash" }),
             ),
             &state,
         )
@@ -3908,7 +3989,7 @@ mod workflow_arena_rpc_tests {
             &rpc(
                 "create_workflow_version",
                 json!({
-                    "repo": "johnnyone",
+                    "workspacePath": WORKSPACE,
                     "phaseType": "ui-phase",
                     "family": "qwen",
                     "role": "r",
@@ -3991,7 +4072,7 @@ mod workflow_arena_rpc_tests {
 
         // The ONLY way out, over the relay: an explicit, human-confirmed resume with a reason.
         // Unconfirmed first, because the default must not lift a halt.
-        let key = json!({ "repo": "johnnyone", "phaseType": "ui-phase", "family": "qwen" });
+        let key = json!({ "repo": derived_repo(&state).await, "phaseType": "ui-phase", "family": "qwen" });
         let mut unconfirmed_params = key.clone();
         unconfirmed_params["reason"] = json!("let it run");
         let unconfirmed =
@@ -4040,7 +4121,7 @@ mod workflow_arena_rpc_tests {
             &rpc(
                 "create_workflow_version",
                 json!({
-                    "repo": "johnnyone",
+                    "workspacePath": WORKSPACE,
                     "phaseType": "dev-phase",
                     "family": "glm",
                     "role": "r",

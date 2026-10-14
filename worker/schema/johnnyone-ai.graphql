@@ -671,6 +671,19 @@ type WorkflowRun {
   fleetBusy: String!
   startedAt: String!
   endedAt: String
+  # DERIVED on the host from fleetBusy, not stored: whether this run started on a quiet fleet and
+  # can therefore be scored at all. The arena scores on a quiet fleet; a run taken under load
+  # measured the fleet rather than the workflow.
+  #
+  # This replaced an earlier rule that two runs are comparable iff their fleetBusy maps are EQUAL.
+  # Equality was right in principle and wrong in practice: contention is a live measurement, two
+  # runs minutes apart are never byte-identical, and the feature would have looked finished while
+  # promoting nothing. Excluding rather than comparing keeps the design's point — a champion must
+  # never be crowned because the other box happened to be idle — without collapsing to never.
+  scoreable: Boolean!
+  # Why not, when scoreable is false. This is the field that turns "these two runs are mysteriously
+  # never comparable" into something a human can read.
+  notScoreableReason: String
 }
 
 # One outcome: this run beat that run. Also the project-level measurement.
@@ -768,6 +781,15 @@ type Query {
   # measurement. recordWorkflowPref is idempotent per ordered pair now, and this is the other half:
   # discovering an existing preference no longer requires issuing a write.
   workflowPrefs(workflowId: ID!): [WorkflowPref!]!
+  # The repo identity the host derives for a workspace path — the ONE way a client learns the value
+  # to key its reads on, without re-implementing the derivation.
+  #
+  # `workflows.repo` used to be sent by the client as the basename of the workspace path, so two
+  # unrelated checkouts called johnnyone shared one champion. The host derives it now: the git
+  # remote, normalised, else the absolute path. The remote is the right identity and the path only a
+  # fallback, because this project works out of git worktrees constantly and keying on the path
+  # alone would give a worktree a different champion from its own main checkout.
+  repoIdentity(workspacePath: String!): String!
   workflowSearchState(repo: String!, phaseType: String!, family: String!): WorkflowSearchState!
 }
 
@@ -832,7 +854,13 @@ type Mutation {
   addInitiativeReferencePath(initiativeId: ID!, path: String!): AgentPlanRun!
   # --- The workflow arena (desktop migration 026) ---
   # A new version is never born champion; becoming one is updateWorkflowChampion's job.
-  createWorkflowVersion(repo: String!, phaseType: String!, family: String!, parentId: String, role: String!, instruction: String!, contract: String!, hop: String!, fanOut: Float!): Workflow!
+  # `repo` is NOT an argument — see repoIdentity. The host derives it from `workspacePath`, because
+  # a client-supplied identity is a client-supplied champion key.
+  #
+  # `phaseType` is validated against a closed set on the host: a champion is keyed on
+  # (repo, phaseType, family), so free text there starts a second search that looks like the real
+  # one.
+  createWorkflowVersion(workspacePath: String!, phaseType: String!, family: String!, parentId: String, role: String!, instruction: String!, contract: String!, hop: String!, fanOut: Float!): Workflow!
   # REFUSED while the family's search is halted — that is what "three consecutive rejections halt
   # the search" means operationally.
   #
@@ -855,6 +883,18 @@ type Mutation {
   # promoted on is refused even with `rescore: true` — editing the evidence under a promotion that
   # already happened is falsification, not correction.
   recordWorkflowRunGate(runId: ID!, gateExit: Float!, gateCollected: Float, rescore: Boolean): WorkflowRun!
+  # EXECUTE an arena run's gate and record the result — the step that closes the arena's loop.
+  #
+  # recordWorkflowRunGate takes a score someone else measured; this one MEASURES it, by running the
+  # plan's effective gate in the plan's workspace. Without it a workflow_runs row keeps a null
+  # gateExit forever, so promotion is refused for having no score and comparison is impossible,
+  # which makes the one human decision the arena exists for unreachable.
+  #
+  # Refused when the run has no plan, when the family's search is halted, and when the plan
+  # declares NO gate at either level — that last one matters most: an exit code of 0 is returned
+  # both by a gate that passed and by a phase with no gate, so recording it would make an ungated
+  # run look promotable. A phase with no gate cannot compete.
+  runWorkflowRunGate(runId: ID!, phaseId: String, rescore: Boolean): WorkflowRun!
   # There is deliberately no `comparable` argument — see WorkflowPref.comparable.
   #
   # IDEMPOTENT per ordered pair: calling it again for the same (winner, loser) returns the EXISTING

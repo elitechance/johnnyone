@@ -134,7 +134,32 @@ CREATE TABLE workflow_decisions (
   -- search nothing, and lifting a halt without one is exactly the evidence-free escape `resume` was
   -- introduced to prevent. Enforced here as well as in `reject_workflow_run` / `resume_workflow_search`
   -- so the table cannot be made useless by a future second writer.
-  reason     TEXT CHECK (kind = 'promote' OR (reason IS NOT NULL AND trim(reason) <> '')),
+  --
+  -- `trim(reason)` alone was not enough, and that was a real hole: a reason of U+200B (zero-width
+  -- space), U+FEFF (BOM) or NUL passed every blank check, because none of them is Unicode
+  -- White_Space — so a rejection whose reason renders as NOTHING was accepted and stored, and that
+  -- reason is the one thing a halted search has to show a human. The trim set below names the
+  -- characters SQLite can be told about (space, tab, LF, CR, NUL, the zero-width family, BOM, soft
+  -- hyphen); SQL cannot express Unicode visibility in general, so this catches the common cases and
+  -- `services::workflows::has_visible_content` is the real guard.
+  --
+  -- The length bound is new too: nothing at any layer bounded a reason, so one paste could put a
+  -- megabyte in the decision log and then serve it on every read of that family's search state.
+  reason     TEXT CHECK (
+               kind = 'promote' OR (
+                 reason IS NOT NULL
+                 -- Measured, not assumed: SQLite's `trim(X,Y)` does NOT remove the multi-byte
+                 -- members of Y (a reason of U+200B survived it), so the zero-width family and the
+                 -- BOM are stripped with nested `replace()`, which is UTF-8 safe, and only the
+                 -- single-byte whitespace is left to `trim`.
+                 -- NUL is stripped by replace(), NOT named in the trim set: a `char(..., 0, ...)`
+                 -- argument list TRUNCATES at the zero, which silently re-opened tab and newline
+                 -- when NUL was moved earlier in the list. Measured, twice.
+                 AND length(trim(replace(replace(replace(replace(replace(replace(replace(replace(reason, char(0), ''), char(8203), ''), char(8204), ''), char(8205), ''), char(8206), ''), char(8207), ''), char(65279), ''), char(173), ''),
+                                 char(32, 127, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31))) > 0
+                 AND length(reason) <= 2000
+               )
+             ),
   created_at TEXT NOT NULL
 );
 CREATE INDEX workflow_decisions_run ON workflow_decisions(run_id);

@@ -16,9 +16,69 @@ use crate::state::app_state::AppState;
 use crate::test_support::test_state;
 use rusqlite::params;
 
+/// Round 3: `workflows.repo` is no longer a caller-supplied string — the host DERIVES it from a
+/// workspace path (`repo_identity`). These tests still want to talk about "repo" and "other-repo"
+/// as logical names, so this maps a logical name to a stable synthetic path and lets the host
+/// derive the identity from it exactly as it would in production.
+///
+/// The path deliberately does not exist: `repo_identity` then finds no git remote and falls back to
+/// the absolute path, which is deterministic and distinct per name. No filesystem, no git, no
+/// dependence on the machine this runs on.
+fn repo_path(name: &str) -> String {
+    format!("/nonexistent-arena-tests/{}", name)
+}
+
+fn repo_id(name: &str) -> String {
+    repo_identity(&repo_path(name)).expect("derive the repo identity")
+}
+
+// --- Test shims over the three service functions that take the derived identity. ---
+//
+// They SHADOW the glob-imported originals deliberately, so that every call site in this file can go
+// on naming the logical repo. An explicit local item wins over a glob import, so `workflow_search_state("repo", …)`
+// below is this shim, which translates and then calls the real one. Nothing about the rule under
+// test changes — only how the key is spelled at the call site.
+
+fn workflow_search_state(
+    state: &AppState,
+    repo: &str,
+    phase_type: &str,
+    family: &str,
+) -> Result<WorkflowSearchState, String> {
+    crate::services::workflows::workflow_search_state(state, &repo_id(repo), phase_type, family)
+}
+
+fn resume_workflow_search(
+    state: &AppState,
+    repo: &str,
+    phase_type: &str,
+    family: &str,
+    reason: &str,
+    confirmed: bool,
+) -> Result<WorkflowSearchState, String> {
+    crate::services::workflows::resume_workflow_search(
+        state,
+        &repo_id(repo),
+        phase_type,
+        family,
+        reason,
+        confirmed,
+    )
+}
+
+fn list_workflows(
+    state: &AppState,
+    repo: Option<&str>,
+    phase_type: Option<&str>,
+    family: Option<&str>,
+) -> Result<Vec<Workflow>, String> {
+    let repo = repo.map(repo_id);
+    crate::services::workflows::list_workflows(state, repo.as_deref(), phase_type, family)
+}
+
 fn version(repo: &str, phase_type: &str, family: &str) -> NewWorkflowVersion {
     NewWorkflowVersion {
-        repo: repo.to_string(),
+        workspace_path: repo_path(repo),
         phase_type: phase_type.to_string(),
         family: family.to_string(),
         parent_id: None,
@@ -69,7 +129,7 @@ fn champion_of(state: &AppState, repo: &str, phase_type: &str, family: &str) -> 
             conn.query_row(
                 "SELECT id FROM workflows WHERE repo = ?1 AND phase_type = ?2 AND family = ?3 \
                  AND is_champion = 1",
-                params![repo, phase_type, family],
+                params![repo_id(repo), phase_type, family],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|e| e.to_string())
@@ -547,7 +607,7 @@ fn qa_a_comparable_requires_matching_fleet_contention() {
     );
     // The CONTENTION half does not.
     assert!(
-        !contention_is_comparable(&quiet.fleet_busy, &saturated.fleet_busy),
+        run_is_scoreable(&saturated).is_some(),
         "an idle fleet and a saturated one are not the same contention"
     );
 
@@ -556,12 +616,22 @@ fn qa_a_comparable_requires_matching_fleet_contention() {
         !pref.comparable,
         "a run on an idle fleet and a run on a saturated fleet must not be comparable"
     );
+    // Round 3: the rule EXCLUDES rather than compares, so the recorded reason names the
+    // unscoreable run and the contention it saw, rather than "the two differed".
     assert!(
         pref.reason
             .as_deref()
             .unwrap_or_default()
-            .contains("different fleet contention"),
-        "the recorded reason must name contention: {:?}",
+            .contains("unscoreable"),
+        "the recorded reason must name the unscoreable run: {:?}",
+        pref.reason
+    );
+    assert!(
+        pref.reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("the fleet was not quiet"),
+        "and the contention it saw: {:?}",
         pref.reason
     );
     let error = promote_workflow(&state, &quiet.id, Some(&pref.id), true)
@@ -1034,7 +1104,10 @@ fn qa_a_the_host_refuses_the_integers_it_can_bound() {
         },
     )
     .expect_err("fan_out must have an upper bound");
-    assert!(fan_out_error.contains("at most"), "got: {fan_out_error}");
+    assert!(
+        fan_out_error.contains("exceeds the stand-in cap"),
+        "got: {fan_out_error}"
+    );
     // And the bound is the documented one, not an accident.
     assert!(create_workflow_version(
         &state,
