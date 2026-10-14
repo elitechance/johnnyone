@@ -675,3 +675,438 @@ mod tests {
         assert_eq!(load_seat_caps(&state), SeatCaps::measured());
     }
 }
+
+/// QA B — adversarial tests written against the claims in this module's own doc comment.
+///
+/// These exist to try to BREAK the lease pool, not to re-state it. Where a test pins behaviour
+/// that QA believes is a GAP rather than a guarantee, its name says `documents_` and its doc
+/// comment says what a reviewer should conclude. Those are tripwires: if someone later closes
+/// the gap, the test fails and has to be updated deliberately rather than the gap closing
+/// silently in one direction or the other.
+#[cfg(test)]
+mod qa_b_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    // ── Claim 1: "no lock is held across an await" — and its CONSEQUENCE ────────────────────────
+
+    /// The module's claim is about its own internals. The consequence for a CALLER is the thing
+    /// that matters, and it rests on a property the doc comment never states: a `SeatLease` is
+    /// `Send`, so an async caller really can hold one across an `.await`. If it were not `Send`,
+    /// the arena's run starter — which holds the lease "for the life of the run" — could not be
+    /// written as an async task at all, and the design note about the earlier deadlock would be
+    /// describing an API nobody can use correctly.
+    #[test]
+    fn qa_a_lease_is_send_and_sync_so_an_async_run_starter_can_hold_one() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<SeatLease>();
+        assert_sync::<SeatLease>();
+        assert_send::<SharedLeasePool>();
+        assert_sync::<SharedLeasePool>();
+    }
+
+    /// A lease held across an `.await` whose future is CANCELLED must give the seats back.
+    ///
+    /// This is the real-world leak: an arena run is a future, a future gets dropped (a timeout, a
+    /// `select!` losing a race, `stop_plan`), and the lease's `Drop` is the only thing that can
+    /// notice. The future below is polled once — so the seats are really taken — and then dropped
+    /// while suspended inside the `await`, not allowed to run to completion.
+    #[tokio::test]
+    async fn qa_a_future_cancelled_mid_await_returns_its_seats() {
+        let pool = LeasePool::with_measured_caps();
+        let inner = Arc::clone(&pool);
+        let mut held = Box::pin(async move {
+            let lease = inner.acquire("glm-5.3-flash", 3).unwrap();
+            // Suspension point WITH the lease alive across it.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(lease);
+        });
+
+        // Poll it exactly far enough to reach the await.
+        tokio::select! {
+            _ = &mut held => unreachable!("the hour-long sleep cannot have finished"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert_eq!(
+            pool.busy_for("glm-5.3-flash"),
+            3,
+            "the future must really be suspended while holding the seats"
+        );
+
+        // Cancel it: dropping a suspended future runs the destructors of everything it owns.
+        drop(held);
+        assert_eq!(
+            pool.busy_for("glm-5.3-flash"),
+            0,
+            "a cancelled run leaked its seats; nothing can reconcile them back"
+        );
+        // The freed seats are really re-leasable, not just missing from the count.
+        let _after = pool.acquire("glm-5.3-flash", 4).unwrap();
+    }
+
+    /// The same thing through `JoinHandle::abort`, which is how a real task is cancelled.
+    #[tokio::test]
+    async fn qa_an_aborted_task_returns_its_seats() {
+        let pool = LeasePool::with_measured_caps();
+        let inner = Arc::clone(&pool);
+        let task = tokio::spawn(async move {
+            let _lease = inner.acquire("deepseek-v4.1-flash", 2).unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        // Wait for the seats to appear rather than assuming the task was scheduled.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.busy_for("deepseek-v4.1-flash") != 2 {
+            assert!(Instant::now() < deadline, "the task never took its seats");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            pool.busy_for("deepseek-v4.1-flash"),
+            0,
+            "an aborted task leaked its seats"
+        );
+    }
+
+    // ── Claim 3: a refused acquire mutates nothing, and its message is not a lie ───────────────
+
+    /// Many refusals at once, all reporting the same `free`, and then exactly that many seats
+    /// really are takeable — no more.
+    ///
+    /// Attacks two things at once: that racing refusals leave no trace (claim 3), and that
+    /// `SeatError::OverCap`'s `free` cannot name seats that do not exist. If the message said
+    /// `free: 1` and a 1-seat acquire then failed, the message would be a lie; if TWO 1-seat
+    /// acquires succeeded, the cap would be a lie.
+    #[test]
+    fn qa_racing_refusals_take_nothing_and_report_a_free_count_that_is_real() {
+        const N: usize = 24;
+        let pool = LeasePool::with_measured_caps();
+        let _held = pool.acquire("glm-5.3-flash", 3).unwrap(); // exactly 1 seat free
+
+        let start = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    // 2 cannot fit in 1 — every one of these must be refused.
+                    pool.acquire("glm-5.3-flash", 2).map(|l| l.seats())
+                })
+            })
+            .collect();
+        for h in handles {
+            let outcome = h.join().expect("no racer may panic");
+            assert_eq!(
+                outcome.unwrap_err(),
+                SeatError::OverCap {
+                    family: "glm-5.3-flash".to_string(),
+                    requested: 2,
+                    free: 1,
+                    cap: 4,
+                },
+                "a refusal under contention must report the real numbers and take nothing"
+            );
+        }
+        assert_eq!(
+            pool.busy_for("glm-5.3-flash"),
+            3,
+            "{N} refusals must not have moved the count by a single seat"
+        );
+
+        // The `free: 1` every refusal named is real...
+        let last = pool.acquire("glm-5.3-flash", 1).expect("the reported free seat must exist");
+        // ...and there was exactly one of it.
+        assert!(matches!(
+            pool.acquire("glm-5.3-flash", 1),
+            Err(SeatError::OverCap { free: 0, cap: 4, .. })
+        ));
+        drop(last);
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 3);
+    }
+
+    /// `free` must equal `cap - in_use` for every reachable `(in_use, requested)` pair, and the
+    /// exact `free` must always fit. Exhaustive over the whole 4-seat family rather than sampled.
+    #[test]
+    fn qa_over_cap_free_is_exact_for_every_reachable_state() {
+        for in_use in 0..=4u32 {
+            for requested in (5 - in_use)..=12u32 {
+                let pool = LeasePool::with_measured_caps();
+                let _pre = (in_use > 0).then(|| pool.acquire("glm-5.3-flash", in_use).unwrap());
+                let free = 4 - in_use;
+                assert_eq!(
+                    pool.acquire("glm-5.3-flash", requested).unwrap_err(),
+                    SeatError::OverCap {
+                        family: "glm-5.3-flash".to_string(),
+                        requested,
+                        free,
+                        cap: 4,
+                    },
+                    "in_use={in_use} requested={requested}"
+                );
+                assert_eq!(pool.busy_for("glm-5.3-flash"), in_use, "refusal mutated the count");
+                if free > 0 {
+                    // The refusal's own number is actionable: asking for exactly `free` works.
+                    let fits = pool.acquire("glm-5.3-flash", free).expect("free seats must fit");
+                    assert_eq!(fits.seats(), free);
+                    assert_eq!(pool.busy_for("glm-5.3-flash"), 4);
+                }
+            }
+        }
+    }
+
+    // ── Claim 2, the other direction: an interleaving the committed test cannot see ────────────
+
+    /// The committed concurrency test holds a barrier between `acquire` and `drop`, so no seat is
+    /// ever recycled while another thread is acquiring. This one deliberately removes that
+    /// barrier and mixes request widths, so `acquire` races `release` and a 3-seat request races
+    /// a 1-seat one. The pool's OWN count is sampled (not an independent mirror, which could
+    /// legitimately skew past the cap and make this flaky in the wrong direction), so a sample
+    /// above the cap can only mean the pool granted more than it has.
+    #[test]
+    fn qa_the_cap_holds_when_acquire_races_release_at_mixed_widths() {
+        const THREADS: usize = 24;
+        const ROUNDS: usize = 400;
+        const CAP: u32 = 4;
+        let pool = LeasePool::with_measured_caps();
+        let start = Arc::new(Barrier::new(THREADS));
+        let peak = Arc::new(AtomicU32::new(0));
+        let grants = Arc::new(AtomicU32::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let pool = Arc::clone(&pool);
+                let start = Arc::clone(&start);
+                let peak = Arc::clone(&peak);
+                let grants = Arc::clone(&grants);
+                std::thread::spawn(move || {
+                    // Widths 1, 2 and 3 all in flight at once.
+                    let width = (t % 3) as u32 + 1;
+                    start.wait();
+                    for _ in 0..ROUNDS {
+                        // No barrier anywhere in here: some threads are dropping leases while
+                        // others are acquiring.
+                        if let Ok(lease) = pool.acquire("glm-5.3-flash", width) {
+                            grants.fetch_add(1, Ordering::SeqCst);
+                            let seen = pool.busy_for("glm-5.3-flash");
+                            peak.fetch_max(seen, Ordering::SeqCst);
+                            assert!(
+                                seen <= CAP,
+                                "the pool itself reports {seen} seats in use against a cap of {CAP}"
+                            );
+                            assert_eq!(lease.seats(), width);
+                            drop(lease);
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("no worker may panic");
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= CAP,
+            "seats in use peaked at {} against a cap of {CAP}",
+            peak.load(Ordering::SeqCst)
+        );
+        // Not vacuous: the race really did happen, i.e. seats were granted many times over.
+        assert!(
+            grants.load(Ordering::SeqCst) > (THREADS as u32),
+            "only {} grants — the race never got going, so this test measured nothing",
+            grants.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            pool.busy_for("glm-5.3-flash"),
+            0,
+            "every lease must be released when its holder returns"
+        );
+    }
+
+    // ── Claim 8: the DB override path ─────────────────────────────────────────────────────────
+
+    /// GAP. `from_json` refuses an empty object on purpose — "seat caps object is empty" — but
+    /// the emptiness check runs on the PARSED map, before `from_pairs` drops the zero-seat
+    /// families. An override whose every value is `0` therefore passes the guard and produces
+    /// exactly the state the guard exists to prevent: a caps table with no families at all.
+    ///
+    /// What a reviewer should conclude: `seat_caps_from_db` does NOT fall back to the measured
+    /// table in this case and logs nothing, so the host comes up with a pool that refuses every
+    /// request — and refuses them as `UnknownFamily`, whose message tells the operator to "add it
+    /// to the seat-cap table" when the truth is that they set it to zero themselves.
+    #[test]
+    fn qa_documents_an_all_zero_override_bypasses_the_empty_object_guard() {
+        // The guard, working as documented.
+        assert_eq!(
+            SeatCaps::from_json("{}").unwrap_err(),
+            "seat caps object is empty"
+        );
+        // The same end state, accepted.
+        let zeroed = SeatCaps::from_json(
+            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}"#,
+        )
+        .expect("today this is accepted — see the doc comment above");
+        assert_eq!(zeroed.families().count(), 0, "no family survived the filter");
+
+        let pool = Arc::new(LeasePool::new(zeroed));
+        assert_eq!(
+            pool.acquire("glm-5.3-flash", 1).unwrap_err(),
+            SeatError::UnknownFamily {
+                family: "glm-5.3-flash".to_string()
+            },
+            "a zeroed family is indistinguishable from one nobody ever measured"
+        );
+        // The message misdirects: the operator set this to 0, they did not forget to measure it.
+        assert!(pool
+            .acquire("glm-5.3-flash", 1)
+            .unwrap_err()
+            .to_string()
+            .contains("add it to the seat-cap table"));
+        // And the snapshot column records nothing at all for any family.
+        assert_eq!(pool.fleet_busy_json(), "{}");
+    }
+
+    /// The live consequence of the gap above, through the real setting: no fallback, no warning.
+    #[test]
+    fn qa_documents_a_zeroed_setting_leaves_the_host_with_no_caps_and_no_fallback() {
+        let (state, _root) = crate::test_support::test_state();
+        crate::services::settings::set_setting(
+            &state,
+            SEAT_CAPS_SETTING_KEY.to_string(),
+            r#"{"glm-5.3-flash":0}"#.to_string(),
+        )
+        .unwrap();
+        let caps = load_seat_caps(&state);
+        assert_ne!(
+            caps,
+            SeatCaps::measured(),
+            "a zeroed override does NOT fall back to the measured table, unlike a malformed one"
+        );
+        assert_eq!(caps.families().count(), 0);
+    }
+
+    /// DISPROVES "the DB override cannot silently produce a cap above the measured one".
+    ///
+    /// Nothing clamps the override against [`MEASURED_SEAT_CAPS`] and nothing warns when it
+    /// exceeds it, so a typo of `40` for `4` is accepted in full and the pool will hand out ten
+    /// times the fleet's measured capacity — the exact invisible over-subscription this module's
+    /// doc comment says it exists to prevent. (A different fleet legitimately needs a different
+    /// number, so the fix is a log line, not a refusal.)
+    #[test]
+    fn qa_an_override_above_the_measured_cap_is_accepted_with_no_warning() {
+        let fat = SeatCaps::from_json(r#"{"glm-5.3-flash": 40}"#).unwrap();
+        assert_eq!(
+            fat.cap("glm-5.3-flash"),
+            Some(40),
+            "ten times the measured 4, accepted verbatim"
+        );
+        assert_eq!(SeatCaps::measured().cap("glm-5.3-flash"), Some(4));
+
+        let pool = Arc::new(LeasePool::new(fat));
+        let lease = pool
+            .acquire("glm-5.3-flash", 40)
+            .expect("40 seats on a 4-seat fleet are granted");
+        assert_eq!(lease.seats(), 40);
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 40);
+        // Even u32::MAX is not refused on the way in.
+        assert_eq!(
+            SeatCaps::from_json(r#"{"glm-5.3-flash": 4294967295}"#)
+                .unwrap()
+                .cap("glm-5.3-flash"),
+            Some(u32::MAX)
+        );
+    }
+
+    /// The caps table is immutable, so no family can appear or change mid-run: the one
+    /// interleaving the concurrency test could not cover is also the one that cannot happen.
+    #[test]
+    fn qa_a_family_cannot_be_added_or_resized_after_the_pool_is_built() {
+        let pool = LeasePool::with_measured_caps();
+        assert_eq!(pool.cap_for("late-arrival"), None);
+        // There is no `&mut self` on LeasePool and no setter on SeatCaps; the only way to a
+        // different cap is a different pool, which a running arena run cannot be moved onto.
+        let other = Arc::new(LeasePool::new(
+            SeatCaps::from_json(r#"{"late-arrival": 2}"#).unwrap(),
+        ));
+        let _on_other = other.acquire("late-arrival", 2).unwrap();
+        assert_eq!(
+            pool.acquire("late-arrival", 1).unwrap_err(),
+            SeatError::UnknownFamily {
+                family: "late-arrival".to_string()
+            },
+            "the original pool is unchanged by another pool's caps"
+        );
+        assert_eq!(pool.busy_for("late-arrival"), 0);
+    }
+
+    // ── Gaps a reviewer should be told about ──────────────────────────────────────────────────
+
+    /// GAP. `mock.html` step 3 says "a run that cannot get its seats QUEUES; it never proceeds at
+    /// a reduced width". The pool implements the second half and not the first: there is no
+    /// blocking or waiting acquire, so a refused caller gets an immediate error and the queue —
+    /// including its fairness — is left for the caller to build. Pinned so that "the lease pool
+    /// is done" is not read as "the mock's seat behaviour is implemented".
+    #[test]
+    fn qa_documents_there_is_no_queue_only_an_immediate_refusal() {
+        let pool = LeasePool::with_measured_caps();
+        let _full = pool.acquire("glm-5.3-flash", 4).unwrap();
+        let before = Instant::now();
+        assert!(pool.acquire("glm-5.3-flash", 1).is_err());
+        assert!(
+            before.elapsed() < Duration::from_millis(100),
+            "acquire returned after {:?} — it must refuse, not wait",
+            before.elapsed()
+        );
+    }
+
+    /// GAP. A run that needs seats on two families takes two leases, and there is no
+    /// all-or-nothing primitive across them. So a caller can hold one family's seats while being
+    /// refused the other's, and must unwind the first itself — and two such callers taking the
+    /// families in opposite orders starve each other with no queue to break the tie. The
+    /// module's atomicity guarantee is per lease, not per run.
+    #[test]
+    fn qa_documents_a_two_family_request_is_not_atomic_across_families() {
+        let pool = LeasePool::with_measured_caps();
+        let _rival = pool.acquire("deepseek-v4.1-flash", 2).unwrap();
+
+        let half = pool
+            .acquire("glm-5.3-flash", 2)
+            .expect("the first half of the run's budget is granted");
+        assert!(
+            pool.acquire("deepseek-v4.1-flash", 1).is_err(),
+            "the second half is refused"
+        );
+        // The granted half is STILL held: nothing rolled it back.
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 2);
+        assert_eq!(half.seats(), 2);
+        // `seats_held_json` can therefore only ever describe one family of a multi-family run.
+        assert_eq!(half.seats_held_json(), r#"{"glm-5.3-flash":2}"#);
+    }
+
+    /// The measured table is transcribed from the mock. Re-pinned here against the mock's own
+    /// wording so the two cannot drift silently in either direction.
+    #[test]
+    fn qa_the_measured_table_matches_the_mocks_three_rows() {
+        assert_eq!(
+            MEASURED_SEAT_CAPS,
+            &[
+                ("glm-5.3-flash", 4u32),
+                ("deepseek-v4.1-flash", 2),
+                ("qwen3.8-flash-next", 4),
+            ][..],
+            "mock.html step 3, table \"Measured caps · 2026-10-12\""
+        );
+        // Nothing branches on a family name: an unknown family is refused by the same code path
+        // that would serve a known one, not by a special case.
+        let pool = LeasePool::with_measured_caps();
+        for (family, cap) in MEASURED_SEAT_CAPS {
+            assert_eq!(pool.cap_for(family), Some(*cap));
+            let lease = pool.acquire(family, *cap).unwrap();
+            assert_eq!(pool.free_for(family), Some(0));
+            drop(lease);
+        }
+    }
+}

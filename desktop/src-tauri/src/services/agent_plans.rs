@@ -18105,3 +18105,290 @@ mod prompt_delivery_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// QA B — adversarial tests on the spec-weakening classifier's new segment rule.
+///
+/// `is_worker_writable_store_file` decides whether a diff that removed lines from a plan-store
+/// file counts as the worker doing its job (evidence being rewritten) or as the worker weakening
+/// its own spec. It is the one piece of this branch that is live on every run today, so it gets
+/// attacked on its own rather than only through `plan_artifacts`.
+#[cfg(test)]
+mod qa_b_worker_writable_tests {
+    use super::is_worker_writable_store_file;
+
+    /// Every shape QA could find that is NOT genuinely a file inside an `artifacts/` directory
+    /// and is not one of the named progress files. Any `true` here is `artifacts/` acting as a
+    /// key to the rest of the store.
+    #[test]
+    fn qa_only_a_real_artifact_or_a_named_progress_file_is_worker_writable() {
+        for refused in [
+            // Traversal, in every position.
+            "phases/01-shell/artifacts/../../overview.md",
+            "phases/01-shell/artifacts/runs/../../../overview.md",
+            "artifacts/../overview.md",
+            "artifacts/../../../../etc/passwd",
+            "phases/../decisions.md",
+            // A `..` hidden inside a longer segment.
+            "phases/01-shell/artifacts/v1..2/overview.md",
+            // Windows separators — `\` is a legal filename byte on this host, so a path shaped
+            // like a Windows one must not be read as having separators at all.
+            "phases/01-shell\\artifacts\\x.png",
+            "artifacts\\..\\overview.md",
+            "phases\\01-shell\\artifacts\\status.md",
+            // Absolute / UNC / empty and `.` segments.
+            "/artifacts/x.png",
+            "//host/artifacts/x.png",
+            "artifacts//x.png",
+            "artifacts/./x.png",
+            "./artifacts/x.png",
+            "",
+            // `artifacts` naming a FILE, not a directory above one.
+            "artifacts",
+            "phases/01-shell/artifacts",
+            // Substring, case and suffix near-misses.
+            "artifactsx/summary.md",
+            "my-artifacts/summary.md",
+            "artifacts.bak/summary.md",
+            "Artifacts/summary.md",
+            "phases/01-shell/notartifacts/x.png",
+            // The spec files themselves, which is the whole point of the classifier.
+            "phases/02-acceptance/overview.md",
+            "phases/02-acceptance/tasks/02-02/prompt.md",
+            "plan.md",
+            "brief.md",
+            // A named progress file reached through a traversal is still refused: the name is
+            // right but the path is about a different file.
+            "phases/01-shell/artifacts/../../tasks/t1/status.md",
+            "phases/../status.yml",
+        ] {
+            assert!(
+                !is_worker_writable_store_file(refused),
+                "{refused:?} must NOT be classified as worker-writable"
+            );
+        }
+    }
+
+    /// The other direction: the fix must not have stopped classifying real worker output, which
+    /// would make the coordinator bounce a phase for rewriting its own evidence. These are the
+    /// shapes the store actually contains.
+    #[test]
+    fn qa_real_worker_output_is_still_worker_writable() {
+        for allowed in [
+            "artifacts/summary.md",
+            "artifacts/mocks/seat-meter.html",
+            "artifacts/screens-to-verify/aux-open.png",
+            "phases/02-acceptance/artifacts/cargo-test-lib.txt",
+            "phases/02-acceptance/artifacts/capture-library.mjs",
+            "phases/01-shell/artifacts/screenshots/nested/deep.png",
+            // Run-scoped: the shape this branch adds.
+            "phases/04-leases/artifacts/runs/4f0821/seat-meter.html",
+            "phases/04-leases/artifacts/runs/4f0821/nested/shot.png",
+            // A file literally called `artifacts` INSIDE an artifacts dir is still output.
+            "phases/01-shell/artifacts/artifacts",
+            // Odd but legal names.
+            "phases/01-shell/artifacts/v1.2.png",
+            "phases/01-shell/artifacts/report.md ",
+        ] {
+            assert!(
+                is_worker_writable_store_file(allowed),
+                "{allowed:?} must still be classified as worker-writable"
+            );
+        }
+    }
+}
+
+/// QA B — what `{{artifacts_path}}` actually does on a live run.
+///
+/// The branch's biggest self-declared gap is that nothing writes to the run-scoped path yet. These
+/// tests measure the three halves of that claim separately, because they are not all true in the
+/// same way: the VALUE is plumbed, the DIRECTORY really is created on every live render (so the
+/// branch is NOT inert), and no shipped template consumes the value (so no worker is told about
+/// it).
+#[cfg(test)]
+mod qa_b_template_tests {
+    use super::*;
+
+    fn qa_run(plan_path: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "RUN-7fe2".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: plan_path.into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+                test_commands: None,
+                test_commands_list: Vec::new(),
+                executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn qa_phase() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "RUN-7fe2".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
+        }
+    }
+
+    fn value_of<'a>(values: &'a [(&'static str, String)], key: &str) -> &'a str {
+        values
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("no template value named {key:?}"))
+    }
+
+    /// The branch is NOT a no-op for live runs: rendering a phase's template values CREATES the
+    /// run-scoped directory on disk, as a side effect, using the plan id as the run id.
+    ///
+    /// Every prompt builder goes through `phase_template_values` — the worker prompt, the
+    /// single-reviewer prompt, the replan planner prompt and EACH lens reviewer prompt — so a
+    /// reviewed phase renders it several times per phase. Pinned so "nothing writes to the
+    /// run-scoped path yet" cannot be read as "nothing changes on disk yet".
+    #[test]
+    fn qa_rendering_a_phases_values_creates_the_run_scoped_directory_today() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-live");
+        let run = qa_run(plan.to_str().unwrap());
+        let phase = qa_phase();
+        let phase_path = plan.join("phases/01-thing");
+        let tasks_path = phase_path.join("tasks");
+
+        let expected = plan.join("phases/01-thing/artifacts/runs/RUN-7fe2");
+        assert!(!expected.exists(), "nothing exists before the render");
+
+        let values = phase_template_values(&state, &run, &phase, &phase_path, &tasks_path);
+
+        assert_eq!(
+            value_of(&values, "artifacts_path"),
+            expected.to_string_lossy(),
+            "the value must be the run-scoped directory, not the champion's"
+        );
+        assert!(
+            expected.is_dir(),
+            "rendering the values must have CREATED {}",
+            expected.display()
+        );
+        // The run id used is the plan id, exactly as the module doc says.
+        assert_eq!(value_of(&values, "run_id"), "RUN-7fe2");
+        // And the champion's bare directory is created as a by-product (it is the parent's
+        // parent), which is what a reader of the old layout will now always find present.
+        assert!(plan.join("phases/01-thing/artifacts").is_dir());
+    }
+
+    /// When the directory cannot be created the render must still produce a usable path rather
+    /// than failing the phase. Forced deterministically by putting a FILE where the artifacts
+    /// directory would go.
+    #[test]
+    fn qa_an_uncreatable_artifacts_dir_falls_back_instead_of_failing_the_phase() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-fallback");
+        std::fs::create_dir_all(plan.join("phases/01-thing")).unwrap();
+        // `artifacts` is a regular file, so `create_dir_all` under it cannot succeed.
+        std::fs::write(plan.join("phases/01-thing/artifacts"), b"not a directory").unwrap();
+
+        let run = qa_run(plan.to_str().unwrap());
+        let values = phase_template_values(
+            &state,
+            &run,
+            &qa_phase(),
+            &plan.join("phases/01-thing"),
+            &plan.join("phases/01-thing/tasks"),
+        );
+        assert_eq!(
+            value_of(&values, "artifacts_path"),
+            plan.join("phases/01-thing/artifacts").to_string_lossy(),
+            "the fallback is the champion's bare directory"
+        );
+    }
+
+    /// A hostile phase id cannot make the render escape the plan store, and still yields a value.
+    #[test]
+    fn qa_an_unsafe_phase_id_cannot_escape_the_plan_store_through_the_template() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-escape");
+        let run = qa_run(plan.to_str().unwrap());
+        let mut phase = qa_phase();
+        phase.phase_id = "../../..".into();
+        // `phase_path` is what the caller computed; the artifacts value must NOT be derived from
+        // it by string concatenation that keeps the traversal.
+        let phase_path = plan.join("phases").join(&phase.phase_id);
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let artifacts = value_of(&values, "artifacts_path");
+        // Today this falls back to `<phase_path>/artifacts`, which still contains the traversal
+        // the CALLER introduced — so the guard protects the segment this module adds, not a
+        // phase id the caller already joined. Nothing outside the store is CREATED, which is the
+        // property that matters.
+        assert!(artifacts.contains("artifacts"), "{artifacts}");
+        assert!(
+            !plan.parent().unwrap().join("artifacts").exists(),
+            "no artifacts directory may be created above the plan store"
+        );
+    }
+
+    /// No shipped template consumes `{{artifacts_path}}`, so the value reaches no agent today.
+    ///
+    /// Exhaustive over every default prompt in `PlannerPromptSettings`, via serde, so a template
+    /// added later cannot be missed by a hand-written list. This is the measured half of "the
+    /// live worker prompts are fingerprint-pinned, so nothing writes there yet".
+    #[test]
+    fn qa_no_shipped_template_consumes_the_artifacts_path_value() {
+        let defaults = planner_prompts::PlannerPromptSettings::default();
+        let as_json = serde_json::to_string(&defaults).expect("settings serialise");
+        assert!(
+            !as_json.contains("artifacts_path"),
+            "a shipped template now references {{{{artifacts_path}}}} — the fingerprint test in \
+             planner_prompts must have been updated deliberately, and this test with it"
+        );
+        // Sanity: the same search DOES find the placeholders that are wired, so the assertion
+        // above is not vacuous.
+        for wired in ["tasks_path", "phase_path", "plan_path", "run_id", "conventions_path"] {
+            assert!(as_json.contains(wired), "{wired} should be in a shipped template");
+        }
+    }
+}
