@@ -108,6 +108,8 @@ describe('ArenaApiService — the arena wire, lazy', () => {
     expect(last().op).toContain('gateExit');
     expect(last().op).toContain('gateCollected');
     expect(last().op).toContain('seatsHeld');
+    expect(last().op).toContain('scoreable');
+    expect(last().op).toContain('notScoreableReason');
   });
 
   it('READS preferences back instead of recording one to discover it', () => {
@@ -142,7 +144,7 @@ describe('ArenaApiService — the arena wire, lazy', () => {
 
   it('declares every numeric argument as Float, never Int', () => {
     gql.payload = { createWorkflowVersion: {} };
-    api.createWorkflowVersion({ repo: 'r', phaseType: 'p', family: 'f', role: 'a', instruction: 'b', contract: 'c', hop: '{}', fanOut: 2 }).subscribe();
+    api.createWorkflowVersion({ workspacePath: '/w/r', phaseType: 'p', family: 'f', role: 'a', instruction: 'b', contract: 'c', hop: '{}', fanOut: 2 }).subscribe();
     expect(last().op).toContain('$fanOut: Float!');
     gql.payload = { startWorkflowRun: {} };
     api.startWorkflowRun({ workflowId: 'w2' }).subscribe();
@@ -157,12 +159,62 @@ describe('ArenaApiService — the arena wire, lazy', () => {
     for (const sent of gql.sent) expect(sent.op).not.toMatch(/:\s*Int!?\b/);
   });
 
-  it('asks for a re-score BY NAME, so a second result cannot overwrite the first by accident', () => {
+  // The `rescore: Boolean` argument is GONE from the API: a re-score is its own field, because a
+  // flag on the recording mutation is exactly the thing a caller forgets or defaults wrong.
+  it('records a score with no rescore flag anywhere on the wire', () => {
     gql.payload = { recordWorkflowRunGate: {} };
     api.recordWorkflowRunGate('r2', 1, null).subscribe();
-    expect(last().variables).toEqual({ runId: 'r2', gateExit: 1, gateCollected: null, rescore: false });
-    api.recordWorkflowRunGate('r2', 1, null, true).subscribe();
-    expect(last().variables!['rescore']).toBe(true);
+    expect(last().variables).toEqual({ runId: 'r2', gateExit: 1, gateCollected: null });
+    expect(last().op).not.toContain('rescore');
+  });
+
+  it('replaces a score only through the separately named mutation', () => {
+    gql.payload = { recordWorkflowRunRescore: {} };
+    api.recordWorkflowRunRescore('r2', 1, 23).subscribe();
+    expect(last().op).toContain('recordWorkflowRunRescore');
+    expect(last().variables).toEqual({ runId: 'r2', gateExit: 1, gateCollected: 23 });
+  });
+
+  // THE EXECUTOR. `runWorkflowRunGate` measures the score by running the plan's gate; the re-run is
+  // a separate field for the same reason the re-score is.
+  it('EXECUTES a run\u2019s gate, and asks for the run back with its score and scoreability', () => {
+    gql.payload = { runWorkflowRunGate: {} };
+    api.runWorkflowRunGate('r2', '04-leases').subscribe();
+    expect(last().op).toContain('runWorkflowRunGate');
+    expect(last().variables).toEqual({ runId: 'r2', phaseId: '04-leases' });
+    for (const field of ['gateExit', 'gateCollected', 'scoreable', 'notScoreableReason']) {
+      expect(last().op, `the executed run must come back with ${field}`).toContain(field);
+    }
+  });
+
+  it('re-runs a gate only through the separately named mutation, never a flag', () => {
+    gql.payload = { runWorkflowRunRescore: {} };
+    api.runWorkflowRunRescore('r2', null).subscribe();
+    expect(last().op).toContain('runWorkflowRunRescore');
+    expect(last().variables).toEqual({ runId: 'r2', phaseId: null });
+    for (const sent of gql.sent) {
+      expect(sent.op, 'no arena operation may carry a rescore flag').not.toMatch(/\$rescore/);
+    }
+  });
+
+  it('asks the HOST for the repo identity instead of deriving one from a path', () => {
+    gql.payload = { repoIdentity: 'github.com/lokalcamp/johnnyone' };
+    api.repoIdentity('/home/creepy/Documents/Workspace/personal/apps/johnnyone').subscribe();
+    expect(last().op).toContain('repoIdentity');
+    expect(last().variables).toEqual({
+      workspacePath: '/home/creepy/Documents/Workspace/personal/apps/johnnyone',
+    });
+  });
+
+  it('creates a version from the WORKSPACE PATH — repo is the host\u2019s to decide', () => {
+    gql.payload = { createWorkflowVersion: {} };
+    api.createWorkflowVersion({
+      workspacePath: '/w/johnnyone', phaseType: 'dev-phase', family: 'glm',
+      role: 'a', instruction: 'b', contract: 'c', hop: '{}', fanOut: 1,
+    }).subscribe();
+    expect(last().op).toContain('$workspacePath: String!');
+    expect(last().op).not.toMatch(/\$repo\b/);
+    expect(JSON.stringify(last().variables)).not.toMatch(/"repo"/);
   });
 
   it('promotes only with an explicit confirmed flag — the arena’s one irreversible step', () => {

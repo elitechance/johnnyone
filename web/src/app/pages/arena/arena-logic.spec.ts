@@ -205,6 +205,15 @@ describe('startRunBlock — a halted search refuses a run, as the HOST decided',
     expect(b).toMatch(/halt|pause/i);
   });
 
+  // The halt used to be cleared BY a promotion, and the banner said so. It is not any more —
+  // `updateWorkflowSearchResumed` is the only thing that resets the streak — and a banner that
+  // sends an operator to a button the host refuses is worse than no banner.
+  it('does not tell a reader that promoting will lift the halt', () => {
+    const b = startRunBlock(state) ?? '';
+    expect(b).not.toMatch(/promotion is what resets|promote to resume/i);
+    expect(b).toMatch(/resuming is its own decision|does not lift/i);
+  });
+
   it('does not block when the host says not halted, even on a non-zero streak', () => {
     expect(startRunBlock({ ...state, halted: false, consecutiveRejections: 2 })).toBeNull();
   });
@@ -277,19 +286,12 @@ describe('promotionConfirmCopy — the confirm states the blast radius plainly',
 });
 
 // ── Derived values the screens need, each with ONE home here rather than inline in a template ──
-import { repoNameFromWorkspacePath, defaultPhaseType, lineageOf, changedSlots } from './arena-logic';
+import { defaultPhaseType, lineageOf, changedSlots } from './arena-logic';
 
-describe('repoNameFromWorkspacePath', () => {
-  it('names the repo from the plan’s workspace path', () => {
-    expect(repoNameFromWorkspacePath('/home/creepy/Documents/Workspace/personal/apps/johnnyone')).toBe('johnnyone');
-    expect(repoNameFromWorkspacePath('/a/b/kord/')).toBe('kord');
-  });
-  it('is empty rather than wrong when there is no path', () => {
-    expect(repoNameFromWorkspacePath('')).toBe('');
-    expect(repoNameFromWorkspacePath(null)).toBe('');
-  });
-});
-
+// The `repoNameFromWorkspacePath` block (2 tests) was REMOVED here, deliberately and with the
+// function: the host derives the repo identity now and the client asks for it (`repoIdentity`), so
+// a client-side derivation must not exist to be tested. `arena-pages.spec.ts` asserts the ask, and
+// `arena-api.spec.ts` asserts `createWorkflowVersion` sends a workspacePath and no repo at all.
 describe('defaultPhaseType', () => {
   it('suggests dev-phase for a development run and planning for a planning run', () => {
     expect(defaultPhaseType('development')).toBe('dev-phase');

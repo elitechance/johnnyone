@@ -184,7 +184,9 @@ export function startRunBlock(state: SearchStateLike | null | undefined): string
     return 'The search state for this family could not be read, so a run cannot be started. It is what says whether the search is halted.';
   }
   if (!state.halted) return null;
-  return `The search is paused: ${state.consecutiveRejections} challengers in a row passed the gate and were rejected (limit ${state.strikeLimit}). The gate is not describing what you want, so change it — a promotion is what resets the streak.`;
+  // The way out used to be a promotion; it is NOT any more, and saying so would send an operator
+  // to a button the host refuses. Lifting a halt is its own confirmed decision, carrying a reason.
+  return `The search is paused: ${state.consecutiveRejections} distinct runs in a row were rejected (limit ${state.strikeLimit}). The gate is not describing what you want, so change it. A promotion does not lift this — resuming is its own decision, and it is recorded with a reason.`;
 }
 
 export interface RunLike {
@@ -245,14 +247,11 @@ export function promotionConfirmCopy(args: {
 // Each lives here rather than inline in a template, so there is one home per rule and a spec can
 // hold it. None of them is a score.
 
-/** A champion belongs to ONE repo. J1 has no repo field, so the repo is the workspace directory's
- *  name — the same string a human would call the repo. Empty, never a guess, when there is none. */
-export function repoNameFromWorkspacePath(path: string | null | undefined): string {
-  if (!path) return '';
-  const parts = path.split('/').filter((p) => p.length > 0);
-  return parts.length > 0 ? parts[parts.length - 1] : '';
-}
-
+// `repoNameFromWorkspacePath` was DELETED in round 3, with its specs. It derived a champion's repo
+// identity from the basename of the workspace path, which gave two unrelated checkouts both called
+// `johnnyone` one shared champion — and the host now derives the identity itself (the git remote,
+// normalised, else the absolute path) and exposes it as `repoIdentity`. Keeping a second derivation
+// here would be exactly the two-homes defect this file exists to prevent, so the client asks.
 /**
  * A champion is keyed by phase TYPE, and J1 has no phase-type column anywhere today: a phase has an
  * id ('04-leases') and a title, nothing that says what KIND of phase it is. So this is a suggested

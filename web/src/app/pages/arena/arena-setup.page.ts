@@ -17,7 +17,6 @@ import {
   defaultPhaseType,
   gateAcceptance,
   hopIsJson,
-  repoNameFromWorkspacePath,
   slotsComplete,
   startRunBlock,
 } from './arena-logic';
@@ -120,6 +119,17 @@ const FAMILIES = [
       @if (step() === 'prompt') {
         <div class="a-card">
           <h2>{{ champion() ? 'v' + champion()!.version + ' · champion' : 'no champion yet' }}</h2>
+          <dl class="a-kv" data-test="champion-key">
+            <dt>repo</dt><dd class="mono">{{ repo() || '…' }}</dd>
+            <dt>phase type</dt><dd>{{ phaseType() }}</dd>
+            <dt>family</dt><dd>{{ family() }}</dd>
+          </dl>
+          <p class="a-note">
+            That repo identity is the host's, derived from the workspace — the git remote where
+            there is one, the absolute path otherwise. It is what a champion is keyed on, so two
+            checkouts of the same repo share one and two unrelated repos with the same folder name
+            do not.
+          </p>
           @if (champion()) {
             <p class="a-note" data-test="seeded-from">Seeded from v{{ champion()!.version }}, the prompt J1 runs for this phase today. Edit any part to propose a challenger.</p>
           } @else {
@@ -152,12 +162,10 @@ const FAMILIES = [
         </div>
 
         <div class="a-warn" data-test="no-executor-note">
-          <b>Nothing executes this run yet.</b> This records the challenger and a run row — it does
-          not start a worker, and nothing in J1 reports a gate result back against a run, so its
-          score stays "never ran". A run with no score cannot be promoted, which means the promotion
-          step is not reachable through this screen today. The executor that links a run to a phase's
-          execution is being built on the host; until it lands, what this button produces is a
-          recorded candidate, not a race.
+          <b>This records a challenger and a run; nothing scores it automatically.</b> The run's
+          gate reads "never ran" until someone runs it, and a run with no score cannot be promoted.
+          Scoring is one button on the arena screen this takes you to — the coordinator does not
+          trigger it, you do.
         </div>
 
         @if (blockers().length) {
@@ -220,7 +228,10 @@ export class ArenaSetupPage implements OnInit {
     this.phases().find((p) => p.phaseId === this.phaseId()) ?? null,
   );
   protected readonly commands = computed<string[]>(() => this.phase()?.effectiveTestCommands ?? []);
-  protected readonly repo = computed(() => repoNameFromWorkspacePath(this.workspacePath()));
+  /** The repo identity, as the HOST derives it (git remote, normalised, else the absolute path).
+   *  Never computed here: the client used to use the path's basename, which gave two unrelated
+   *  checkouts named `johnnyone` a single shared champion. */
+  protected readonly repo = signal('');
   protected readonly phaseType = computed(() => defaultPhaseType(this.runType()));
   protected readonly acceptance = computed(() => {
     const g = this.gate();
@@ -270,6 +281,14 @@ export class ArenaSetupPage implements OnInit {
 
   /** The champion to beat and the host's halt, for the chosen (repo, phaseType, family). */
   private async loadFamilyState(): Promise<void> {
+    if (!this.repo() && this.workspacePath()) {
+      try {
+        this.repo.set(await firstValueFrom(this.arena.repoIdentity(this.workspacePath())));
+      } catch (e) {
+        this.loadError.set(`Could not read this workspace's repo identity: ${String(e)}`);
+        return;
+      }
+    }
     const repo = this.repo();
     const phaseType = this.phaseType();
     const family = this.family();
@@ -343,7 +362,7 @@ export class ArenaSetupPage implements OnInit {
     try {
       const wf = await firstValueFrom(
         this.arena.createWorkflowVersion({
-          repo: this.repo(),
+          workspacePath: this.workspacePath(),
           phaseType: this.phaseType(),
           family: this.family(),
           parentId: this.champion()?.id ?? null,

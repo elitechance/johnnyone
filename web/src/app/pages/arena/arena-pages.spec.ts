@@ -5,7 +5,7 @@ import '@angular/compiler';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { TestBed } from '@angular/core/testing';
 import { ActivatedRoute, convertToParamMap, provideRouter, Router } from '@angular/router';
-import { of, throwError } from 'rxjs';
+import { from, of, throwError } from 'rxjs';
 import '../../../test-setup';
 import { JohnnyApiService } from '../../../../../ui/src/services/johnny-api.service';
 import { ArenaApiService } from './arena-api.service';
@@ -67,11 +67,14 @@ const RUN_PASS = {
   gateExit: 0,
   gateCollected: 23,
   seatsHeld: '{"glm-5.3-flash":2}',
-  fleetBusy: '{"glm-5.3-flash":1}',
+  fleetBusy: '{}',
+  scoreable: true,
+  notScoreableReason: null,
   startedAt: '2026-10-14T01:00:00Z',
   endedAt: '2026-10-14T01:06:40Z',
 };
 const RUN_FAIL = { ...RUN_PASS, id: 'r1', workflowId: 'w1', gateExit: 101, gateCollected: null };
+const RUN_UNSCORED = { ...RUN_PASS, gateExit: null, gateCollected: null, endedAt: null };
 const STATE_OK = {
   repo: 'johnnyone',
   phaseType: 'dev-phase',
@@ -133,6 +136,10 @@ function stubApi(over: Record<string, unknown> = {}) {
     recordWorkflowRejection: rec('recordWorkflowRejection', STATE_HALTED),
     // Reading a preference back, rather than recording one to discover it (new in the API).
     workflowPrefs: rec('workflowPrefs', []),
+    repoIdentity: rec('repoIdentity', 'github.com/lokalcamp/johnnyone'),
+    runWorkflowRunGate: rec('runWorkflowRunGate', { ...RUN_PASS, gateExit: 0, gateCollected: 23 }),
+    runWorkflowRunRescore: rec('runWorkflowRunRescore', { ...RUN_PASS, gateExit: 1, gateCollected: 23 }),
+    recordWorkflowRunRescore: rec('recordWorkflowRunRescore', RUN_PASS),
     updateWorkflowSearchResumed: rec('updateWorkflowSearchResumed', { ...STATE_OK, consecutiveRejections: 0, halted: false, recentRejections: [] }),
   };
   // Overrides are WRAPPED so they record too. They did not, which made every `api.calls` assertion
@@ -302,6 +309,32 @@ describe('ArenaSetupPage — /initiatives/:id/arena, the 3-step setup', () => {
     expect(api.calls.filter((c) => c.name === 'startWorkflowRun')).toHaveLength(1);
   });
 
+  it('asks the HOST for the repo identity and never derives one from the path', async () => {
+    // `workflows.repo` used to be the basename of the workspace path, computed in the client, so
+    // two unrelated checkouts called `johnnyone` shared one champion. The host derives it from the
+    // git remote now, and the client's job is to ASK.
+    const api = stubApi();
+    const f = await mount(ArenaSetupPage, api, { id: 'p1' }, { phaseId: '04-leases', step: 'prompt' });
+    expect(api.calls.find((c) => c.name === 'repoIdentity')!.args).toEqual([
+      '/home/creepy/Documents/Workspace/personal/apps/johnnyone',
+    ]);
+    // …and it keys its reads on what the host answered, not on a basename.
+    expect(api.calls.find((c) => c.name === 'workflows')!.args[0]).toMatchObject({
+      repo: 'github.com/lokalcamp/johnnyone',
+    });
+    expect(txt(f)).toContain('github.com/lokalcamp/johnnyone');
+  });
+
+  it('creates a version from the workspace path, with no repo argument at all', async () => {
+    const api = stubApi();
+    const f = await mount(ArenaSetupPage, api, { id: 'p1' }, { phaseId: '04-leases', step: 'prompt' });
+    click(q(f, '[data-test="start-search"]'));
+    await flush(f);
+    const args = api.calls.find((c) => c.name === 'createWorkflowVersion')!.args[0] as Record<string, unknown>;
+    expect(args['workspacePath']).toBe('/home/creepy/Documents/Workspace/personal/apps/johnnyone');
+    expect(args).not.toHaveProperty('repo');
+  });
+
   it('never invents a seat budget or a contention map — the host measures both', async () => {
     const api = stubApi();
     const f = await mount(ArenaSetupPage, api, { id: 'p1' }, { phaseId: '04-leases', step: 'prompt' });
@@ -313,16 +346,18 @@ describe('ArenaSetupPage — /initiatives/:id/arena, the 3-step setup', () => {
     expect(JSON.stringify(args)).not.toContain('seatsHeld');
   });
 
-  it('does NOT claim a run is under way that nothing will ever score', async () => {
-    // Measured hole: `recordWorkflowRunGate` has no caller outside a spec stub, and nothing on the
-    // host links a `workflow_runs` row to plan execution — so a run created here keeps
-    // `gateExit = null` forever, which blocks promotion. The screen has to say that.
+  // UPDATED in round 3: the host gained an executor, so "nothing will ever score this" became
+  // false and a panel that kept saying it would just be a stale warning. What is still true, and
+  // what this holds now, is that nothing scores a run AUTOMATICALLY — the coordinator does not
+  // trigger it — and that an unscored run cannot be promoted. The button still must not say
+  // "Start the search", because nothing starts here.
+  it('does not claim a run is under way, and says scoring is a human step', async () => {
     const api = stubApi();
     const f = await mount(ArenaSetupPage, api, { id: 'p1' }, { phaseId: '04-leases', step: 'prompt' });
     const note = q(f, '[data-test="no-executor-note"]');
     expect(note).toBeTruthy();
-    expect(note!.textContent).toMatch(/executor/i);
-    expect(note!.textContent).toMatch(/never ran|nothing (?:executes|has scored)|no worker/i);
+    expect(note!.textContent).toMatch(/nothing scores it automatically/i);
+    expect(note!.textContent).toMatch(/never ran/i);
     expect(txt(f)).not.toContain('Start the search');
   });
 
@@ -540,15 +575,19 @@ describe('WorkflowArenaPage — /workflows/:id/arena, champion vs challenger', (
     expect(q(f, '[data-test="compare"]')).toBeTruthy();
   });
 
-  it('says plainly that a run with no score is one nothing has scored yet', async () => {
+  // UPDATED in round 3, when the host gained the executor: the claim "nothing in J1 will ever score
+  // this" stopped being true, and a panel that keeps saying it is just a stale warning. What
+  // survives is the part that is still true — nothing scores a run AUTOMATICALLY — plus the
+  // consequence, which has not changed: an unscored run cannot be promoted.
+  it('says plainly that a run with no score has not been scored, and blocks promotion', async () => {
     const api = stubApi({
       workflowRuns: () => of([{ ...RUN_PASS, gateExit: null, gateCollected: null, endedAt: null }]),
     });
     const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
     const note = q(f, '[data-test="no-executor-note"]');
     expect(note).toBeTruthy();
-    expect(note!.textContent).toMatch(/executor/i);
-    expect(note!.textContent).toMatch(/never ran|nothing (?:executes|has scored)|no worker/i);
+    expect(note!.textContent).toMatch(/automatic/i);
+    expect(note!.textContent).toMatch(/never ran/i);
     expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(true);
   });
 
@@ -599,5 +638,140 @@ describe('WorkflowArenaPage — /workflows/:id/arena, champion vs challenger', (
     const read = q(f, '[data-test="read-the-work"]') as HTMLAnchorElement;
     expect(read.getAttribute('href')).toContain('/initiatives');
     expect(read.getAttribute('href')).toContain('tab=plan');
+  });
+});
+
+
+// ── The executor: the step that closes the loop (round 3) ─────────────────────────────────────
+//
+// `runWorkflowRunGate` executes the plan's declared gate in the real workspace and records the exit
+// code on the run. Until it existed, a run this UI created kept `gateExit = null` forever and the
+// one human decision the arena exists for was unreachable.
+describe('WorkflowArenaPage — scoring a recorded run', () => {
+  const unscored = (over: Record<string, unknown> = {}) =>
+    stubApi({ workflowRuns: () => of([RUN_UNSCORED]), ...over });
+
+  it('offers to run the gate on a run that has no score, naming the command it will run', async () => {
+    const api = unscored();
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    const btn = q(f, '[data-test="score-run"]') as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+    expect(txt(f)).toContain('cargo test --lib leases::');
+    expect(api.calls.some((c) => c.name === 'runWorkflowRunGate')).toBe(false);
+  });
+
+  it('NEVER renders a missing score as 0', async () => {
+    const f = await mount(WorkflowArenaPage, unscored(), { id: 'w2' });
+    const cell = q(f, '[data-test="challenger-exit"]') as HTMLElement;
+    expect(cell.textContent).toContain('never ran');
+    expect(cell.textContent).not.toMatch(/\b0\b/);
+    expect((q(f, '[data-test="challenger-collected"]') as HTMLElement).textContent).toContain('not reported');
+    // …and the one thing a null score must never do is enable the irreversible step.
+    expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('says it is running while the gate runs, and claims no result', async () => {
+    let settle: (v: unknown) => void = () => undefined;
+    const pending = new Promise((r) => (settle = r));
+    const api = unscored({ runWorkflowRunGate: () => from(pending) as never });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="score-run"]'));
+    await flush(f);
+    const btn = q(f, '[data-test="score-run"]') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.textContent).toMatch(/running/i);
+    expect(txt(f)).toMatch(/can take minutes|still running/i);
+    // Nothing on screen may claim a verdict that has not arrived.
+    expect(txt(f)).not.toMatch(/exit 0 · pass/);
+    settle({ ...RUN_PASS, gateExit: 0, gateCollected: 23 });
+    await flush(f);
+    expect((q(f, '[data-test="challenger-exit"]') as HTMLElement).textContent).toContain('exit 0');
+  });
+
+  it('shows the exit code as the score when it comes back, count still advisory', async () => {
+    const api = unscored({
+      runWorkflowRunGate: () => of({ ...RUN_UNSCORED, gateExit: 101, gateCollected: null }),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="score-run"]'));
+    await flush(f);
+    expect(api.calls.find((c) => c.name === 'runWorkflowRunGate')!.args).toEqual(['r2', '04-leases']);
+    expect((q(f, '[data-test="challenger-exit"]') as HTMLElement).textContent).toContain('exit 101');
+    expect((q(f, '[data-test="challenger-collected"]') as HTMLElement).textContent).toContain('not reported');
+  });
+
+  it('does not offer to score a phase with NO declared gate, and says why', async () => {
+    const api = unscored({
+      getAgentPlan: () => of({
+        plan: { id: 'p1', runType: 'development', workspacePath: '/w/johnnyone', currentPhaseId: '08-polish' },
+        phases: [{ id: 'ph3', phaseId: '08-polish', phaseTitle: 'Plan-tab polish', effectiveTestCommands: [] }],
+        tasks: [], events: [],
+      }),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    expect(q(f, '[data-test="score-run"]')).toBeNull();
+    const note = q(f, '[data-test="no-gate-to-score"]') as HTMLElement;
+    expect(note).toBeTruthy();
+    expect(note.textContent).toMatch(/no test command|nothing to compete/i);
+  });
+
+  it('a halted family cannot score, matching the host rather than re-deriving the rule', async () => {
+    const api = unscored({ workflowSearchState: () => of(STATE_HALTED) });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    const btn = q(f, '[data-test="score-run"]') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    click(btn);
+    await flush(f);
+    expect(api.calls.some((c) => c.name === 'runWorkflowRunGate')).toBe(false);
+  });
+
+  it('re-running a gate needs its own affordance AND an explicit confirm', async () => {
+    const api = stubApi({ workflowRuns: () => of([RUN_PASS]) });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    // A run that already has a score does not offer the plain score control.
+    expect(q(f, '[data-test="score-run"]')).toBeNull();
+    const again = q(f, '[data-test="rescore-run"]') as HTMLButtonElement;
+    expect(again).toBeTruthy();
+    click(again);
+    await flush(f);
+    // Opening the confirm must not run anything.
+    expect(api.calls.some((c) => c.name === 'runWorkflowRunRescore')).toBe(false);
+    const confirm = q(f, '[data-test="rescore-confirm"]') as HTMLElement;
+    expect(confirm).toBeTruthy();
+    expect(confirm.textContent).toMatch(/replace/i);
+    click(q(f, '[data-test="rescore-do"]'));
+    await flush(f);
+    expect(api.calls.find((c) => c.name === 'runWorkflowRunRescore')!.args).toEqual(['r2', '04-leases']);
+    // And never through a flag on the ordinary path.
+    expect(api.calls.some((c) => c.name === 'runWorkflowRunGate')).toBe(false);
+  });
+
+  it('no longer claims nothing scores a run — it says nothing scores one AUTOMATICALLY', async () => {
+    const f = await mount(WorkflowArenaPage, unscored(), { id: 'w2' });
+    const note = q(f, '[data-test="no-executor-note"]');
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toMatch(/automatic/i);
+    expect(note!.textContent).not.toMatch(/nothing in J1 will|no worker executes it/i);
+  });
+
+  it('surfaces the host\u2019s refusal instead of leaving the run looking scored', async () => {
+    const api = unscored({
+      runWorkflowRunGate: () => throwError(() => new Error('the plan declares no gate at either level')),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="score-run"]'));
+    await flush(f);
+    expect(txt(f)).toContain('declares no gate');
+    expect((q(f, '[data-test="challenger-exit"]') as HTMLElement).textContent).toContain('never ran');
+  });
+
+  it('shows the host\u2019s scoreability verdict, and never re-derives it', async () => {
+    const api = unscored({
+      workflowRuns: () => of([{ ...RUN_UNSCORED, scoreable: false, notScoreableReason: 'the fleet was busy when this run started' }]),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    expect(txt(f)).toContain('the fleet was busy when this run started');
+    expect((q(f, '[data-test="score-run"]') as HTMLButtonElement).disabled).toBe(true);
   });
 });

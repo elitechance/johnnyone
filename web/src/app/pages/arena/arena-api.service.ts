@@ -57,6 +57,12 @@ export interface WorkflowRun {
   fleetBusy: string;
   startedAt: string;
   endedAt?: string | null;
+  /** DERIVED by the host from `fleetBusy`: whether this run started on a quiet enough fleet to be
+   *  scored at all. A run taken under load measured the fleet, not the workflow. */
+  scoreable: boolean;
+  /** Why not, when `scoreable` is false — the field that turns "these two are mysteriously never
+   *  comparable" into something a human can read. */
+  notScoreableReason?: string | null;
 }
 
 /** One outcome: this run beat that run. `comparable` is the host's, not an argument. */
@@ -103,6 +109,7 @@ export class ArenaApiService {
    *  asked for the count cannot tell "not reported" from "the field was not requested". */
   private readonly workflowRunFields = `
     id workflowId planId seed gateExit gateCollected seatsHeld fleetBusy startedAt endedAt
+    scoreable notScoreableReason
   `;
   private readonly workflowPrefFields = `
     id winnerRunId loserRunId comparable reason createdAt
@@ -176,7 +183,10 @@ export class ArenaApiService {
   }
 
   createWorkflowVersion(input: {
-    repo: string;
+    /** The PLAN's workspace, not a repo name. The host derives the identity (`repoIdentity`): a
+     *  client-supplied identity is a client-supplied champion key, and the basename of a path gave
+     *  two unrelated checkouts called `johnnyone` one shared champion. */
+    workspacePath: string;
     phaseType: string;
     family: string;
     parentId?: string | null;
@@ -188,8 +198,8 @@ export class ArenaApiService {
   }): Observable<Workflow> {
     return this.gql
       .mutate<{ createWorkflowVersion: Workflow }>(
-        `mutation CreateWorkflowVersion($repo: String!, $phaseType: String!, $family: String!, $parentId: String, $role: String!, $instruction: String!, $contract: String!, $hop: String!, $fanOut: Float!) {
-          createWorkflowVersion(repo: $repo, phaseType: $phaseType, family: $family, parentId: $parentId, role: $role, instruction: $instruction, contract: $contract, hop: $hop, fanOut: $fanOut) {
+        `mutation CreateWorkflowVersion($workspacePath: String!, $phaseType: String!, $family: String!, $parentId: String, $role: String!, $instruction: String!, $contract: String!, $hop: String!, $fanOut: Float!) {
+          createWorkflowVersion(workspacePath: $workspacePath, phaseType: $phaseType, family: $family, parentId: $parentId, role: $role, instruction: $instruction, contract: $contract, hop: $hop, fanOut: $fanOut) {
             ${this.workflowFields}
           }
         }`,
@@ -230,25 +240,87 @@ export class ArenaApiService {
       .pipe(map((data) => data.startWorkflowRun));
   }
 
-  /** `gateExit` is non-null: a missing score must be an error, not a 0 that reads as a pass.
-   *  `rescore` must be asked for BY NAME — a second result for a run is refused without it, because
-   *  an unconditional overwrite could turn a promoted champion's green run red after the fact. */
-  recordWorkflowRunGate(
-    runId: string,
-    gateExit: number,
-    gateCollected?: number | null,
-    rescore = false,
-  ): Observable<WorkflowRun> {
+  /** Record a score someone else measured. `gateExit` is non-null: a missing score must be an
+   *  error, not a 0 that reads as a pass. There is no `rescore` flag — replacing a result is
+   *  `recordWorkflowRunRescore`, a separate name, because a flag is what a caller forgets. */
+  recordWorkflowRunGate(runId: string, gateExit: number, gateCollected?: number | null): Observable<WorkflowRun> {
     return this.gql
       .mutate<{ recordWorkflowRunGate: WorkflowRun }>(
-        `mutation RecordWorkflowRunGate($runId: ID!, $gateExit: Float!, $gateCollected: Float, $rescore: Boolean) {
-          recordWorkflowRunGate(runId: $runId, gateExit: $gateExit, gateCollected: $gateCollected, rescore: $rescore) {
+        `mutation RecordWorkflowRunGate($runId: ID!, $gateExit: Float!, $gateCollected: Float) {
+          recordWorkflowRunGate(runId: $runId, gateExit: $gateExit, gateCollected: $gateCollected) {
             ${this.workflowRunFields}
           }
         }`,
-        { runId, gateExit, gateCollected: gateCollected ?? null, rescore }
+        { runId, gateExit, gateCollected: gateCollected ?? null }
       )
       .pipe(map((data) => data.recordWorkflowRunGate));
+  }
+
+  /** Replace a recorded score with one measured elsewhere, deliberately. The sitting champion's
+   *  promoting run is refused by the host either way — editing the evidence under a promotion that
+   *  already happened is falsification, not correction. */
+  recordWorkflowRunRescore(runId: string, gateExit: number, gateCollected?: number | null): Observable<WorkflowRun> {
+    return this.gql
+      .mutate<{ recordWorkflowRunRescore: WorkflowRun }>(
+        `mutation RecordWorkflowRunRescore($runId: ID!, $gateExit: Float!, $gateCollected: Float) {
+          recordWorkflowRunRescore(runId: $runId, gateExit: $gateExit, gateCollected: $gateCollected) {
+            ${this.workflowRunFields}
+          }
+        }`,
+        { runId, gateExit, gateCollected: gateCollected ?? null }
+      )
+      .pipe(map((data) => data.recordWorkflowRunRescore));
+  }
+
+  /**
+   * EXECUTE this run's gate and record the result — the step that closes the arena's loop.
+   *
+   * The host runs the plan's effective gate in the plan's workspace, so this can take minutes. It
+   * refuses a run with no plan, a halted family, and a plan that declares NO gate at either level —
+   * that last one because an exit code of 0 comes back both from a gate that passed and from a
+   * phase with no gate, and recording it would make an ungated run look promotable.
+   */
+  runWorkflowRunGate(runId: string, phaseId?: string | null): Observable<WorkflowRun> {
+    return this.gql
+      .mutate<{ runWorkflowRunGate: WorkflowRun }>(
+        `mutation RunWorkflowRunGate($runId: ID!, $phaseId: String) {
+          runWorkflowRunGate(runId: $runId, phaseId: $phaseId) {
+            ${this.workflowRunFields}
+          }
+        }`,
+        { runId, phaseId: phaseId ?? null }
+      )
+      .pipe(map((data) => data.runWorkflowRunGate));
+  }
+
+  /** Execute the gate AGAIN for a run that already has a score, replacing it. Its own field, so
+   *  there is no flag to forget and no default to get wrong. */
+  runWorkflowRunRescore(runId: string, phaseId?: string | null): Observable<WorkflowRun> {
+    return this.gql
+      .mutate<{ runWorkflowRunRescore: WorkflowRun }>(
+        `mutation RunWorkflowRunRescore($runId: ID!, $phaseId: String) {
+          runWorkflowRunRescore(runId: $runId, phaseId: $phaseId) {
+            ${this.workflowRunFields}
+          }
+        }`,
+        { runId, phaseId: phaseId ?? null }
+      )
+      .pipe(map((data) => data.runWorkflowRunRescore));
+  }
+
+  /** The repo identity the HOST derives for a workspace path: the git remote, normalised, else the
+   *  absolute path. The one way a client learns the value to key its reads on without
+   *  re-implementing the derivation — the client used to use the path's basename, which gave two
+   *  unrelated checkouts named `johnnyone` a single shared champion. */
+  repoIdentity(workspacePath: string): Observable<string> {
+    return this.gql
+      .query<{ repoIdentity: string }>(
+        `query RepoIdentity($workspacePath: String!) {
+          repoIdentity(workspacePath: $workspacePath)
+        }`,
+        { workspacePath }
+      )
+      .pipe(map((data) => data.repoIdentity));
   }
 
   /** No `comparable` argument exists, deliberately: the host computes it from the two runs.

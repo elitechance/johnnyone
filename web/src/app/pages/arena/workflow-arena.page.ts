@@ -1,6 +1,10 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { ActivatedRoute, RouterLink } from '@angular/router';
-import { firstValueFrom } from 'rxjs';
+import { catchError, firstValueFrom, of } from 'rxjs';
+import {
+  JohnnyApiService,
+  type AgentPlanPhase,
+} from '../../../../../ui/src/services/johnny-api.service';
 import {
   ArenaApiService,
   type Workflow,
@@ -70,16 +74,79 @@ import {
         </div>
       }
 
-      @if (runUnscored()) {
-        <div class="a-warn" data-test="no-executor-note">
-          <b>Nothing has scored this run, and nothing in J1 will.</b> A run is created here, but no
-          worker executes it and nothing reports a gate result back against it, so its score stays
-          "never ran" — which is not a pass, and cannot be promoted. The executor that links a run to
-          a phase's execution is being built on the host. Until it lands, this screen can show you a
-          comparison but the decision below is out of reach, and saying otherwise would be the
-          "looks like it is working" failure the halt rule exists to prevent.
-        </div>
-      }
+      <div class="a-card">
+        <h2>score this run</h2>
+        @if (runUnscored()) {
+          <p class="a-note" data-test="no-executor-note">
+            Nothing scores a run <b>automatically</b>. The coordinator does not trigger this — you
+            do, here. Until it is scored the run's gate reads "never ran", which is not a pass and
+            cannot be promoted.
+          </p>
+        }
+        @if (hasGateToScore()) {
+          @if (phases().length > 1) {
+            <label class="a-note" for="scorephase">which phase's gate</label>
+            <select id="scorephase" class="a-input" data-test="score-phase" [value]="scorePhaseId()" (change)="scorePhaseId.set($any($event.target).value)">
+              @for (ph of phases(); track ph.phaseId) {
+                <option [value]="ph.phaseId">{{ ph.phaseId }} — {{ ph.phaseTitle }}</option>
+              }
+            </select>
+          }
+          <div class="mono" data-test="score-commands">
+            @for (c of scoreCommands(); track c) {<div>{{ c }}</div>}
+          </div>
+          <p class="a-note">
+            The host runs this in the plan's workspace. It is a real test command and
+            <b>can take minutes</b>; the exit code it returns is the whole score.
+          </p>
+          @if (scoreBlock(); as block) {
+            <div class="a-block" data-test="score-block">{{ block }}</div>
+          }
+          @if (runUnscored()) {
+            <button
+              type="button"
+              class="a-btn primary"
+              data-test="score-run"
+              [disabled]="scoring() || scoreBlock() !== null"
+              (click)="scoreRun()"
+            >{{ scoring() ? 'Running the gate…' : 'Run the gate on this run' }}</button>
+            @if (scoring()) {
+              <p class="a-note" data-test="score-running">Still running. No result has arrived, and none is shown until it does.</p>
+            }
+          } @else {
+            @if (!rescoring()) {
+              <button
+                type="button"
+                class="a-btn"
+                data-test="rescore-run"
+                [disabled]="scoring() || scoreBlock() !== null"
+                (click)="rescoring.set(true)"
+              >Run the gate again</button>
+            } @else {
+              <div class="a-warn" data-test="rescore-confirm">
+                <b>This will REPLACE the recorded score for this run.</b> The run a sitting champion
+                was promoted on cannot be re-scored at all — editing the evidence under a promotion
+                that already happened is falsification, not correction.
+                <div class="a-row">
+                  <button type="button" class="a-btn" (click)="rescoring.set(false)">Keep the recorded score</button>
+                  <button type="button" class="a-btn danger" data-test="rescore-do" [disabled]="scoring()" (click)="rescoreRun()">{{ scoring() ? 'Running the gate…' : 'Run it again and replace' }}</button>
+                </div>
+                @if (scoring()) {
+                  <p class="a-note" data-test="score-running">Still running. No result has arrived, and none is shown until it does.</p>
+                }
+              </div>
+            }
+          }
+        } @else {
+          <p class="a-note" data-test="no-gate-to-score">
+            No test command on this phase, at either level. The winner is decided by a command, not
+            by an opinion, so there is nothing to run and nothing to compete for yet — and an exit
+            code of 0 comes back from a phase with no gate exactly as it does from one that passed,
+            which is why this run is left unscored rather than scored 0.
+          </p>
+        }
+        @if (scoreError()) { <div class="a-block" data-test="score-error">{{ scoreError() }}</div> }
+      </div>
 
       <div class="a-cols">
         <div class="a-card">
@@ -208,6 +275,9 @@ import {
 })
 export class WorkflowArenaPage implements OnInit {
   private readonly api = inject(ArenaApiService);
+  /** The PLAN's gate, for the scoring step: `effectiveTestCommands` is the host's resolution of
+   *  phase-then-plan, and a phase with no gate must not be offered a scoring control at all. */
+  private readonly plans = inject(JohnnyApiService);
   private readonly route = inject(ActivatedRoute);
 
   protected readonly challenger = signal<Workflow | null>(null);
@@ -226,6 +296,11 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly rejectError = signal<string | null>(null);
   protected readonly reason = signal('');
   protected readonly replaying = signal(false);
+  protected readonly phases = signal<AgentPlanPhase[]>([]);
+  protected readonly scorePhaseId = signal<string | null>(null);
+  protected readonly scoring = signal(false);
+  protected readonly scoreError = signal<string | null>(null);
+  protected readonly rescoring = signal(false);
   protected readonly resuming = signal(false);
   protected readonly resumeSending = signal(false);
   protected readonly resumeReason = signal('');
@@ -259,6 +334,33 @@ export class WorkflowArenaPage implements OnInit {
     return !!run && (run.gateExit === null || run.gateExit === undefined);
   });
   protected readonly resumeReasonValid = computed(() => rejectionReasonValid(this.resumeReason()));
+  /** The phase whose gate scoring will run, and the commands it will actually run. */
+  protected readonly scorePhase = computed(
+    () => this.phases().find((p) => p.phaseId === this.scorePhaseId()) ?? null,
+  );
+  protected readonly scoreCommands = computed<string[]>(
+    () => this.scorePhase()?.effectiveTestCommands ?? [],
+  );
+  /**
+   * Why this run cannot be scored, or null when it can. Every clause reads a HOST answer:
+   *   * `scoreable` / `notScoreableReason` are derived by the host from the run's fleet contention;
+   *   * the halt is the host's and is what `runWorkflowRunGate` itself refuses on;
+   *   * `effectiveTestCommands` is the host's phase-then-plan resolution — and an exit code of 0
+   *     comes back both from a gate that passed and from a phase with no gate, so a run with no
+   *     gate must never be scored rather than scored 0.
+   */
+  protected readonly scoreBlock = computed<string | null>(() => {
+    const run = this.challengerRun();
+    if (!run) return 'There is no run to score.';
+    const halt = this.haltBlock();
+    if (halt) return halt;
+    if (run.scoreable === false) {
+      return run.notScoreableReason ?? 'The host will not score this run.';
+    }
+    return null;
+  });
+  /** True when there is a gate to run at all. No gate ⇒ no control, and a sentence saying why. */
+  protected readonly hasGateToScore = computed(() => this.scoreCommands().length > 0);
   protected readonly confirmCopy = computed(() => {
     const w = this.challenger();
     return w
@@ -301,6 +403,21 @@ export class WorkflowArenaPage implements OnInit {
       // READ any existing head-to-head rather than recording one to discover it. The pair that
       // matters is this challenger's run against the champion's; anything else in the list is about
       // other runs and must not enable a promotion.
+      // The plan behind this run, for its gate. `effectiveTestCommands` is the host's resolution;
+      // nothing here re-implements the phase-then-plan fallback.
+      const planId = this.challengerRun()?.planId;
+      if (planId) {
+        try {
+          const run = await firstValueFrom(this.plans.getAgentPlan(planId));
+          this.phases.set(run?.phases ?? []);
+          this.scorePhaseId.set(
+            run?.plan?.currentPhaseId ?? (run?.phases ?? [])[0]?.phaseId ?? null,
+          );
+        } catch {
+          // A plan that cannot be read leaves no gate to offer, which the template states.
+          this.phases.set([]);
+        }
+      }
       const prefs = await firstValueFrom(this.api.workflowPrefs(chal.id));
       const mine = this.challengerRun()?.id;
       const theirs = this.championRun()?.id;
@@ -367,6 +484,54 @@ export class WorkflowArenaPage implements OnInit {
     } finally {
       this.rejectSending.set(false);
     }
+  }
+
+  /**
+   * Run this run's gate and record the exit code. The host executes the plan's declared gate in the
+   * plan's workspace, so this can take minutes — the template says so and claims nothing until the
+   * result arrives.
+   */
+  protected async scoreRun(): Promise<void> {
+    const run = this.challengerRun();
+    if (!run || this.scoring() || this.scoreBlock() !== null || !this.hasGateToScore()) return;
+    this.scoring.set(true);
+    this.scoreError.set(null);
+    // The refusal is handled IN THE STREAM rather than as a rejected promise: a promise rejection
+    // raised inside a DOM event task is reported by zone.js/testing as an uncaught error even when
+    // it is caught, which fails a run whose assertions all pass. Same behaviour, no phantom.
+    const scored = await firstValueFrom(
+      this.api.runWorkflowRunGate(run.id, this.scorePhaseId()).pipe(
+        catchError((e: unknown) => {
+          // The run keeps whatever score it had — for a fresh run that is none, "never ran".
+          this.scoreError.set(`The host refused to score this run: ${String(e)}`);
+          return of(null);
+        }),
+      ),
+    );
+    if (scored) this.challengerRun.set(scored);
+    this.scoring.set(false);
+  }
+
+  /** Run the gate AGAIN and REPLACE the recorded result. Its own mutation and its own confirm:
+   *  there is no flag to forget, and overwriting a recorded score is not an ordinary action. */
+  protected async rescoreRun(): Promise<void> {
+    const run = this.challengerRun();
+    if (!run || this.scoring() || this.scoreBlock() !== null || !this.hasGateToScore()) return;
+    this.scoring.set(true);
+    this.scoreError.set(null);
+    const scored = await firstValueFrom(
+      this.api.runWorkflowRunRescore(run.id, this.scorePhaseId()).pipe(
+        catchError((e: unknown) => {
+          this.scoreError.set(`The host refused to re-score this run: ${String(e)}`);
+          return of(null);
+        }),
+      ),
+    );
+    if (scored) {
+      this.challengerRun.set(scored);
+      this.rescoring.set(false);
+    }
+    this.scoring.set(false);
   }
 
   /** Lift a halt — its own confirmed decision, carrying a reason, never a side effect of
