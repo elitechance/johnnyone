@@ -115,8 +115,7 @@ impl SeatCaps {
     /// families. The host then refused every request as `UnknownFamily`, whose message tells the
     /// operator to add the family to the table when they are the one who zeroed it.
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let parsed: BTreeMap<String, u32> = serde_json::from_str(raw.trim())
-            .map_err(|e| format!("seat caps must be a JSON object of family -> seats: {}", e))?;
+        let parsed = Self::parse_override_map(raw)?;
         let zeroed: Vec<&str> = parsed
             .iter()
             .filter(|(_, n)| **n == 0)
@@ -138,6 +137,79 @@ impl SeatCaps {
         Ok(caps)
     }
 
+    /// The raw `{"family": seats}` object, with nothing dropped. One parser, two callers.
+    fn parse_override_map(raw: &str) -> Result<BTreeMap<String, u32>, String> {
+        serde_json::from_str(raw.trim())
+            .map_err(|e| format!("seat caps must be a JSON object of family -> seats: {}", e))
+    }
+
+    /// Apply a host override ON TOP OF the measured table, and report everything questionable
+    /// about it.
+    ///
+    /// **A partial override MERGES; it does not replace.** It used to replace, and that was the
+    /// bug: `{"glm-5.3-flash": 4}` left the other two measured families with no cap at all, so
+    /// they could not be leased — two thirds of the harm the all-zero guard was added to
+    /// prevent, with no error and no warning. It also shrank `fleet_busy` to one row, which is
+    /// precisely the "a quiet fleet versus a snapshot that never recorded that family"
+    /// ambiguity [`LeasePool::busy`]'s own doc comment says it exists to avoid — and that column
+    /// is what decides whether two arena runs are comparable at all.
+    ///
+    /// So an omitted family keeps its measured cap, and that is now the documented default
+    /// rather than an implied disable. **There is deliberately no way to disable a family here.**
+    /// A zero entry does not do it (it is reported and ignored, see [`CapNote::ZeroIgnored`]),
+    /// because "disable" has to be explicit and warned rather than inferred from an absence, and
+    /// nothing today needs it. When something does, it should arrive as its own key with its own
+    /// warning — not as a second meaning for `0`.
+    ///
+    /// Returns the merged table plus every [`CapNote`]; `seat_caps_from_db` is what logs them.
+    pub fn from_override_json(raw: &str) -> Result<(Self, Vec<CapNote>), String> {
+        let parsed = Self::parse_override_map(raw)?;
+        // The all-zero / empty refusal still runs on the override AS WRITTEN, so its message
+        // keeps naming what the operator typed. Merging would hide it: an all-zero override
+        // merges to exactly the measured table, so it would look like success.
+        let _ = Self::from_json(raw)?;
+
+        let mut notes: Vec<CapNote> = Vec::new();
+        let mut merged = Self::measured().caps;
+        for (family, seats) in &parsed {
+            if *seats == 0 {
+                notes.push(CapNote::ZeroIgnored {
+                    family: family.clone(),
+                });
+                continue;
+            }
+            if !MEASURED_SEAT_CAPS.iter().any(|(m, _)| m == family) {
+                // A different fleet may legitimately have a family nobody here measured — but a
+                // CASE typo of a measured name is the far likelier cause, and it is invisible
+                // otherwise: the operator's intended family keeps its old cap while a new one
+                // appears beside it.
+                match MEASURED_SEAT_CAPS
+                    .iter()
+                    .find(|(m, _)| m.eq_ignore_ascii_case(family))
+                {
+                    Some((measured, _)) => notes.push(CapNote::CaseMismatch {
+                        configured: family.clone(),
+                        measured: (*measured).to_string(),
+                    }),
+                    None => notes.push(CapNote::UnmeasuredFamily {
+                        family: family.clone(),
+                    }),
+                }
+            }
+            merged.insert(family.clone(), *seats);
+        }
+        let caps = Self { caps: merged };
+        // A family the override REPLACED still gets the over-cap warning it always got.
+        for (family, configured, measured) in caps.exceedances_vs_measured() {
+            notes.push(CapNote::AboveMeasured {
+                family,
+                configured,
+                measured,
+            });
+        }
+        Ok((caps, notes))
+    }
+
     /// This family's cap, or `None` when the family is not in the table.
     pub fn cap(&self, family: &str) -> Option<u32> {
         self.caps.get(family).copied()
@@ -149,7 +221,11 @@ impl SeatCaps {
     }
 
     /// Families whose cap here is HIGHER than the measured one, as
-    /// `(family, configured, measured)`, ascending.
+    /// `(family, configured, measured)`, **in [`MEASURED_SEAT_CAPS`] order** — which is the
+    /// fleet's own ordering (glm, deepseek, qwen), not alphabetical and not this table's
+    /// `BTreeMap` order. The doc comment said "ascending", which was wrong and QA pinned it in
+    /// `qa_the_exceedance_order_is_the_measured_tables_not_alphabetical`; the order is stable,
+    /// which is all a log line needs, so the comment is what was fixed.
     ///
     /// A different fleet legitimately needs a different number, so this is **not** a refusal and
     /// not a clamp — it is the thing that makes the difference visible. Without it a typo of `40`
@@ -171,6 +247,68 @@ impl SeatCaps {
 /// Render a family list for the all-zero error message.
 fn zeroed_list(families: &[&str]) -> String {
     families.join(", ")
+}
+
+/// Something questionable about a host seat-cap override. Never fatal — every one of these is a
+/// configuration a different fleet might legitimately want — but never silent either, which is
+/// the whole point of this module.
+///
+/// Returned as DATA rather than logged where it is found, so it can be asserted on: "it warns"
+/// is not a testable claim about a `tracing::warn!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapNote {
+    /// The configured cap is above the measured capacity for that family.
+    AboveMeasured {
+        family: String,
+        configured: u32,
+        measured: u32,
+    },
+    /// The key differs from a measured family only by case, so it did not apply to it.
+    CaseMismatch { configured: String, measured: String },
+    /// The key matches no measured family at all, not even ignoring case.
+    UnmeasuredFamily { family: String },
+    /// A zero entry. Zero is not a way to disable a family; the measured cap is kept.
+    ZeroIgnored { family: String },
+}
+
+impl fmt::Display for CapNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CapNote::AboveMeasured {
+                family,
+                configured,
+                measured,
+            } => write!(
+                f,
+                "configured seat cap for {:?} is {}, ABOVE the measured capacity of {}; the \
+                 fleet reports no error when over-subscribed, so this will show up only as \
+                 latency",
+                family, configured, measured
+            ),
+            CapNote::CaseMismatch {
+                configured,
+                measured,
+            } => write!(
+                f,
+                "seat-cap key {:?} differs only in case from the measured family {:?}, so it did \
+                 NOT change that family's cap — {:?} keeps its measured value and {:?} was added \
+                 beside it. Family names are matched exactly; fix the case if this was a typo",
+                configured, measured, measured, configured
+            ),
+            CapNote::UnmeasuredFamily { family } => write!(
+                f,
+                "seat-cap key {:?} matches no measured family; it is accepted as a new family, \
+                 but nothing here has measured its real capacity",
+                family
+            ),
+            CapNote::ZeroIgnored { family } => write!(
+                f,
+                "seat-cap entry {:?} is 0, which does NOT disable the family — the measured cap \
+                 is kept. Remove the key instead; there is deliberately no disable switch",
+                family
+            ),
+        }
+    }
 }
 
 /// Why a seat request was refused. Every variant names the numbers, because the point of this
@@ -398,22 +536,14 @@ pub fn seat_caps_from_db(db: &crate::db::Database) -> SeatCaps {
     if raw.trim().is_empty() {
         return SeatCaps::measured();
     }
-    match SeatCaps::from_json(&raw) {
-        Ok(caps) => {
-            // An override ABOVE the measured cap is allowed — a different fleet needs a
-            // different number — but it is never silent. One line per family, naming all three
-            // numbers, so "we are running at 40 on a fleet measured at 4" is readable in a log
-            // rather than being inferred from latency months later.
-            for (family, configured, measured) in caps.exceedances_vs_measured() {
-                tracing::warn!(
-                    key = SEAT_CAPS_SETTING_KEY,
-                    %family,
-                    configured,
-                    measured,
-                    "configured seat cap is ABOVE the measured capacity for this family; the \
-                     fleet reports no error when over-subscribed, so this will show up only as \
-                     latency"
-                );
+    match SeatCaps::from_override_json(&raw) {
+        Ok((caps, notes)) => {
+            // Nothing here is fatal — a different fleet needs different numbers — but nothing
+            // here is silent either. One line per note, each naming the family and the numbers,
+            // so "we are running at 40 on a fleet measured at 4" or "your key was a case typo"
+            // is readable in a log rather than inferred from latency months later.
+            for note in notes {
+                tracing::warn!(key = SEAT_CAPS_SETTING_KEY, note = %note, "seat-cap override");
             }
             caps
         }
@@ -688,17 +818,21 @@ mod tests {
     /// The same race across families: the per-family totals must stay independent.
     ///
     /// **No thread in here may panic, and that is a property of the test, not an accident.**
-    /// The first version of this test asserted the cap INSIDE the worker thread, before
-    /// `gate.wait()`. When the assertion tripped, that thread unwound without ever reaching the
-    /// barrier, the other 29 blocked on `Barrier::new(30)` forever and the main thread blocked
-    /// in `join()` — so the test HUNG instead of failing. QA measured 5 timeouts in 6 runs
-    /// against a deliberately raced `acquire`, one of them sitting for 10m34s. A test that
-    /// cannot report the failure it detects is worse than no test: in CI it is a job timeout,
-    /// not a red test, and the defect reads as infrastructure flake.
+    /// The first version asserted the cap INSIDE the worker thread, before `gate.wait()`. When
+    /// the assertion tripped, that thread unwound without reaching the barrier, the other 29
+    /// blocked on `Barrier::new(30)` forever and the main thread blocked in `join()` — so the
+    /// test HUNG instead of failing, and non-deterministically: it reported correctly 2 runs in
+    /// 4, so on a lucky CI run it looked like a working test. Workers therefore only RECORD, and
+    /// every assertion happens after `join`.
     ///
-    /// So the workers only ever RECORD — `fetch_max` into a per-family peak — and every
-    /// assertion happens after `join`. There is no `unwrap`, no `assert` and no indexing panic
-    /// on the path to either barrier.
+    /// **And it must assert that seats were GRANTED, not only that none were over-granted.** The
+    /// rewrite checked `peak <= cap` and nothing else, which is true of a pool that refuses
+    /// everything: QA measured that `if true || seats > free` left this test green while 17 of
+    /// the 24 lease tests went red around it. A test whose unique job is "families do not bleed
+    /// into each other" says nothing at all unless seats really are handed out, so the strong
+    /// form is `won == cap == peak`, per family. 10 threads race for each family's seats and
+    /// exactly that family's cap is won — which is also what rules out pooling, since a pooled
+    /// implementation would hand glm's spare seats to deepseek's losers.
     #[test]
     fn concurrent_families_do_not_bleed_into_each_other() {
         const FAMILIES: [&str; 3] = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
@@ -706,8 +840,11 @@ mod tests {
         let pool = LeasePool::with_measured_caps();
         let start = Arc::new(Barrier::new(THREADS));
         let gate = Arc::new(Barrier::new(THREADS));
-        // Peak seats observed in use per family, by the same index as FAMILIES.
+        // Per-family, by the same index as FAMILIES: peak seats observed in use, and how many
+        // threads were granted a lease.
         let peaks: Arc<[AtomicU32; 3]> =
+            Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
+        let wins: Arc<[AtomicU32; 3]> =
             Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
 
         let handles: Vec<_> = (0..THREADS)
@@ -716,13 +853,17 @@ mod tests {
                 let start = Arc::clone(&start);
                 let gate = Arc::clone(&gate);
                 let peaks = Arc::clone(&peaks);
+                let wins = Arc::clone(&wins);
                 let slot = i % FAMILIES.len();
                 let family = FAMILIES[slot];
                 std::thread::spawn(move || {
                     start.wait();
                     let lease = pool.acquire(family, 1);
-                    // Record only. Observe the count whether or not this thread won, so an
-                    // over-admission caused by someone else is still seen.
+                    if lease.is_ok() {
+                        wins[slot].fetch_add(1, Ordering::SeqCst);
+                    }
+                    // Observe the count whether or not this thread won, so an over-admission
+                    // caused by someone else is still seen.
                     peaks[slot].fetch_max(pool.busy_for(family), Ordering::SeqCst);
                     gate.wait();
                     drop(lease);
@@ -737,11 +878,24 @@ mod tests {
         for (slot, family) in FAMILIES.iter().enumerate() {
             let cap = pool.cap_for(family).expect("every family in FAMILIES is capped");
             let peak = peaks[slot].load(Ordering::SeqCst);
+            let won = wins[slot].load(Ordering::SeqCst);
             assert!(
                 peak <= cap,
                 "{family} went over its cap of {cap}: peak {peak} seats in use"
             );
+            assert_eq!(
+                won, cap,
+                "{family}: {won} of {cap} seats granted — 10 threads raced for them, so anything \
+                 less means this race measured nothing, and a pool that refuses everything would \
+                 satisfy the cap assertion above on its own"
+            );
+            assert_eq!(
+                peak, cap,
+                "{family}: peak {peak} must REACH the cap {cap}, or no seat was ever really held"
+            );
         }
+        // All three families back to idle — not just the one, so a release that credited the
+        // wrong family would show here.
         assert_eq!(
             pool.busy(),
             BTreeMap::from([
@@ -1382,61 +1536,126 @@ mod qa_b_r2_tests {
         );
     }
 
-    /// FINDING. The diagnostic is one-directional: a cap ABOVE the measured one is reported, and
-    /// a measured family simply OMITTED is not reported at all.
+    /// FIXED (was `qa_documents_an_override_that_omits_a_measured_family_is_silent`, QA round 3).
+    /// A partial override now MERGES over the measured table, so an omitted family keeps its
+    /// measured cap instead of becoming unleasable.
     ///
-    /// Omitting a key has the same effect as zeroing it — that family cannot be leased — and the
-    /// all-zero refusal only fires when EVERY key is zero. So `{"glm-5.3-flash": 4}` silently
-    /// takes two of the three measured families out of service, which is two thirds of the harm
-    /// the all-zero guard was added to prevent, with no error and no warning. It also silently
-    /// shrinks `fleet_busy`, the column whose whole job is making two runs comparable: a run
-    /// recorded under this override has no row for the families it could not use, which is the
-    /// "older snapshot that did not record that family" ambiguity the `busy()` doc comment says
-    /// it is avoiding.
+    /// QA's finding, verbatim: omitting a key had the same effect as zeroing it, and the all-zero
+    /// refusal only fired when EVERY key was zero — so `{"glm-5.3-flash": 4}` silently took two
+    /// of the three measured families out of service, two thirds of the harm the all-zero guard
+    /// was added to prevent. It also shrank `fleet_busy` to one row, the exact ambiguity
+    /// `busy()`'s doc comment says it exists to avoid, in the column that decides comparability.
     ///
-    /// What a reviewer should conclude: the override is all-or-nothing by family and nothing says
-    /// so. Either a partial override should merge over the measured table, or omission should get
-    /// the same one-line warning an excess gets. Both are the author's call.
+    /// Same fixture, inverted. The coordinator ruled merge-over-measured; I agree, and the
+    /// alternative (omission disables) is argued against in `from_override_json`'s doc comment:
+    /// a disable has to be its own explicit, warned key, not an absence.
     #[test]
-    fn qa_documents_an_override_that_omits_a_measured_family_is_silent() {
-        let subset = SeatCaps::from_json(r#"{"glm-5.3-flash": 4}"#).unwrap();
-        // Accepted, with no exceedance to report...
+    fn qa_an_override_that_omits_a_measured_family_keeps_its_measured_cap() {
+        let (subset, notes) = SeatCaps::from_override_json(r#"{"glm-5.3-flash": 4}"#).unwrap();
+        // The omitted families are still leasable, at their measured caps.
+        assert_eq!(subset.cap("glm-5.3-flash"), Some(4));
+        assert_eq!(subset.cap("deepseek-v4.1-flash"), Some(2));
+        assert_eq!(subset.cap("qwen3.8-flash-next"), Some(4));
+        // 4 is exactly the measured cap, so there is nothing to report about this override.
+        assert!(notes.is_empty(), "{notes:?}");
         assert!(subset.exceedances_vs_measured().is_empty());
-        // ...and two measured families are now unleasable.
-        assert_eq!(subset.cap("deepseek-v4.1-flash"), None);
-        assert_eq!(subset.cap("qwen3.8-flash-next"), None);
+
         let pool = Arc::new(LeasePool::new(subset));
+        let lease = pool
+            .acquire("deepseek-v4.1-flash", 2)
+            .expect("an omitted family must still be leasable");
+        assert_eq!(lease.seats(), 2);
+
+        // And the comparability snapshot keeps all three rows, so a run recorded under this
+        // override is comparable with one recorded under the measured table.
+        drop(lease);
         assert_eq!(
-            pool.acquire("deepseek-v4.1-flash", 1).unwrap_err(),
-            SeatError::UnknownFamily {
-                family: "deepseek-v4.1-flash".to_string()
-            },
-            "an omitted family is indistinguishable from one nobody measured"
+            pool.fleet_busy_json(),
+            r#"{"deepseek-v4.1-flash":0,"glm-5.3-flash":0,"qwen3.8-flash-next":0}"#
         );
-        // And the comparability snapshot silently loses those rows.
-        assert_eq!(pool.fleet_busy_json(), r#"{"glm-5.3-flash":0}"#);
         assert_eq!(
+            pool.fleet_busy_json(),
             Arc::new(LeasePool::new(SeatCaps::measured())).fleet_busy_json(),
-            r#"{"deepseek-v4.1-flash":0,"glm-5.3-flash":0,"qwen3.8-flash-next":0}"#,
-            "the measured table records all three, so the difference is real"
+            "a partial override must not change the SHAPE of the snapshot"
         );
+
+        // A partial override that really does change a cap still changes only that one, and is
+        // still reported when it exceeds the measured value.
+        let (raised, notes) = SeatCaps::from_override_json(r#"{"glm-5.3-flash": 8}"#).unwrap();
+        assert_eq!(raised.cap("glm-5.3-flash"), Some(8));
+        assert_eq!(raised.cap("deepseek-v4.1-flash"), Some(2));
+        assert_eq!(
+            notes,
+            vec![CapNote::AboveMeasured {
+                family: "glm-5.3-flash".to_string(),
+                configured: 8,
+                measured: 4,
+            }]
+        );
+        // A cap LOWERED below the measured one is a legitimate, unremarkable override.
+        let (lowered, notes) = SeatCaps::from_override_json(r#"{"glm-5.3-flash": 1}"#).unwrap();
+        assert_eq!(lowered.cap("glm-5.3-flash"), Some(1));
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
-    /// FINDING (minor). Family matching is exact and case-sensitive, so a case typo is not an
-    /// over-subscription warning — it is a silently disabled family.
+    /// FIXED (was `qa_documents_a_case_typo_in_a_family_name_is_not_reported`, QA round 3). A key
+    /// that differs from a measured family only in case is now reported.
+    ///
+    /// Matching stays exact and case-sensitive — lowering the key would be a guess about a name
+    /// the fleet owns — so `{"GLM-5.3-Flash": 40}` still does not raise glm's cap. What changed
+    /// is that it no longer does so silently: under merge the operator's intended family keeps
+    /// its measured 4, a new family appears beside it, and the note says exactly that.
     #[test]
-    fn qa_documents_a_case_typo_in_a_family_name_is_not_reported() {
-        let typo = SeatCaps::from_json(r#"{"GLM-5.3-Flash": 40}"#).unwrap();
-        // 40 on a 4-seat fleet, and `exceedances_vs_measured` has nothing to say, because the
-        // key does not match the measured family it was obviously meant to be.
-        assert!(typo.exceedances_vs_measured().is_empty());
+    fn qa_a_case_typo_in_a_family_name_is_reported() {
+        let (typo, notes) = SeatCaps::from_override_json(r#"{"GLM-5.3-Flash": 40}"#).unwrap();
+        assert_eq!(
+            notes,
+            vec![CapNote::CaseMismatch {
+                configured: "GLM-5.3-Flash".to_string(),
+                measured: "glm-5.3-flash".to_string(),
+            }]
+        );
+        let shown = notes[0].to_string();
+        assert!(shown.contains("differs only in case"), "{shown}");
+        assert!(shown.contains("glm-5.3-flash"), "{shown}");
+        assert!(shown.contains("GLM-5.3-Flash"), "{shown}");
+
+        // The intended family is unharmed — which is the point of merging — and the typo'd one
+        // exists beside it rather than replacing it.
+        assert_eq!(typo.cap("glm-5.3-flash"), Some(4));
         assert_eq!(typo.cap("GLM-5.3-Flash"), Some(40));
-        assert_eq!(typo.cap("glm-5.3-flash"), None);
         let pool = Arc::new(LeasePool::new(typo));
-        assert!(matches!(
-            pool.acquire("glm-5.3-flash", 1),
-            Err(SeatError::UnknownFamily { .. })
-        ));
+        assert!(
+            pool.acquire("glm-5.3-flash", 4).is_ok(),
+            "the real family must still be leasable at its measured cap"
+        );
+
+        // A family that matches nothing even ignoring case is a different note: it may be a
+        // genuine new family on another fleet, so it is accepted and merely flagged.
+        let (other, notes) = SeatCaps::from_override_json(r#"{"local-7b": 8}"#).unwrap();
+        assert_eq!(
+            notes,
+            vec![CapNote::UnmeasuredFamily {
+                family: "local-7b".to_string()
+            }]
+        );
+        assert_eq!(other.cap("local-7b"), Some(8));
+        assert_eq!(other.cap("glm-5.3-flash"), Some(4), "merge still applies");
+
+        // And a zero entry is reported rather than quietly dropping or disabling a family.
+        let (zeroed, notes) =
+            SeatCaps::from_override_json(r#"{"glm-5.3-flash": 0, "deepseek-v4.1-flash": 1}"#)
+                .unwrap();
+        assert!(notes.contains(&CapNote::ZeroIgnored {
+            family: "glm-5.3-flash".to_string()
+        }));
+        assert!(notes[0].to_string().contains("does NOT disable"), "{:?}", notes[0]);
+        assert_eq!(
+            zeroed.cap("glm-5.3-flash"),
+            Some(4),
+            "a zero entry keeps the MEASURED cap; zero is not a disable switch"
+        );
+        assert_eq!(zeroed.cap("deepseek-v4.1-flash"), Some(1));
     }
 
     // ── the vacuity hole in `concurrent_families_do_not_bleed_into_each_other` ─────────────────

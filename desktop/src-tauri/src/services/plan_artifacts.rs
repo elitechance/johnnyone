@@ -138,6 +138,29 @@ pub fn phase_run_artifacts_dir(plan_path: &Path, phase_id: &str, run_id: &str) -
 /// *before* anything is made), rejects `..` components, and is what the report-markdown guard
 /// uses. Reusing it is the point — two confinement rules in one codebase drift, and this one
 /// would be the junior copy.
+///
+/// ## Two residues, measured by QA round 3, deliberately left
+///
+/// **1. A DANGLING link is refused by the `mkdir`, not by this guard, so the message is wrong.**
+/// `resolve_within_root` canonicalises the deepest *existing* ancestor; a link pointing at
+/// something that does not exist is not an existing ancestor, so confinement has nothing to
+/// resolve and passes, and `create_dir_all` then fails with `File exists` / `Not a directory`.
+/// The phase is still refused — nothing is created outside the store — but the operator is told
+/// the directory could not be created rather than that something is pointing out of the store,
+/// which is the diagnosis they need. Fixing it means stat'ing each component with
+/// `symlink_metadata` before the walk.
+///
+/// **2. The check -> `mkdir` window is NARROWED, not closed.** A link planted between
+/// `confine_to_plan` and `create_dir_all` is followed by `create_dir_all` — QA measured that
+/// directly — and is caught only by the re-check afterwards. So the residual cost of losing that
+/// race is precisely: one stray empty directory outside the plan store, and a refused phase.
+/// **No evidence is ever written through it**, because the refusal happens before the path is
+/// handed to any agent. That is why this is a residue and not a hole.
+///
+/// Closing either properly needs an `openat`/`O_NOFOLLOW` component-by-component walk, which is
+/// a different and larger change than the one this guard is part of, and is left to its own
+/// ticket. Both are pinned: `qa_a_dangling_symlink_is_refused_but_by_the_mkdir_not_the_guard`
+/// and `qa_documents_the_window_between_the_check_and_the_mkdir`.
 fn confine_to_plan(plan_path: &Path, rel: &str) -> Result<PathBuf, String> {
     crate::services::settings::resolve_within_root(plan_path, rel).map_err(|reason| {
         format!(
@@ -186,23 +209,89 @@ pub fn ensure_phase_run_artifacts_dir(
     Ok(dir)
 }
 
-/// Does this directory exist, sit physically inside the plan store, and hold anything at all?
+/// What a reader can say about ONE candidate artifact directory.
 ///
-/// `is_dir()` alone was the reader's whole test, and it was wrong twice over: it follows symlinks
-/// (so it resolved outside the store), and existence is not content.
-fn usable_artifacts_dir(plan_path: &Path, rel: &str) -> Option<PathBuf> {
+/// Exists so that "there are no artifacts" and "I cannot tell whether there are artifacts" are
+/// different answers. They used to be the same `None`: `read_dir(...).ok()?` folded an I/O error
+/// into the empty case, so a directory whose permissions had gone wrong reported that the phase
+/// had delivered nothing while the evidence sat inside it — the failure this module exists to
+/// prevent, reached from the other side, and silent while the confinement branch beside it
+/// logged. QA measured it with `chmod 000`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactsState {
+    /// Confined, readable, and holds at least one entry.
+    Found(PathBuf),
+    /// Nothing here: the directory does not exist, or exists and is genuinely empty.
+    Absent,
+    /// The directory exists but could not be listed. **Not** a claim that it is empty.
+    Unreadable { dir: PathBuf, reason: String },
+    /// The directory exists but resolves physically outside the plan store — a planted symlink,
+    /// or a badly broken store. Refused, loudly.
+    Escaped { dir: PathBuf, reason: String },
+}
+
+/// Classify one candidate directory: confined, readable, non-empty?
+///
+/// `is_dir()` alone was the reader's whole test, and it was wrong three times over: it follows
+/// symlinks (so it resolved outside the store), existence is not content, and an unreadable
+/// directory is not an empty one.
+fn artifacts_state(plan_path: &Path, rel: &str) -> ArtifactsState {
     let dir = plan_path.join(rel);
     if !dir.is_dir() {
-        return None;
+        return ArtifactsState::Absent;
     }
     if let Err(reason) = confine_to_plan(plan_path, rel) {
-        // Loud: this is either a planted link or a badly broken store, and silently falling
-        // through to the champion would hide it.
+        // Loud: silently falling through to the champion would hide a planted link.
         tracing::warn!(%reason, "ignoring an artifact directory that escapes the plan store");
-        return None;
+        return ArtifactsState::Escaped { dir, reason };
     }
-    let mut entries = std::fs::read_dir(&dir).ok()?;
-    entries.next().is_some().then_some(dir)
+    let mut entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let reason = error.to_string();
+            tracing::warn!(
+                dir = %dir.display(),
+                %reason,
+                "cannot read an artifact directory that exists; this is NOT the same as the \
+                 phase having produced no evidence, and a review gate must not read it as such"
+            );
+            return ArtifactsState::Unreadable { dir, reason };
+        }
+    };
+    // An entry that cannot be stat'd still proves the directory is not empty, so `next()` is the
+    // test rather than any property of the entry.
+    if entries.next().is_some() {
+        ArtifactsState::Found(dir)
+    } else {
+        ArtifactsState::Absent
+    }
+}
+
+/// [`artifacts_state`] for the directory a phase's reader would actually use, run-scoped first.
+///
+/// The information-preserving form of [`resolve_phase_artifacts_dir`], for the arena's reader to
+/// call instead: it can tell `Absent` from `Unreadable` from `Escaped`, and so can refuse to
+/// conclude "this phase delivered no evidence" from a permissions fault. Fall-through order is
+/// the same, and only a `Found` run directory wins — an `Unreadable` or `Escaped` run directory
+/// is reported as such rather than quietly replaced by the champion's, because those two are
+/// problems to surface, not states to route around.
+pub fn phase_artifacts_state(
+    plan_path: &Path,
+    phase_id: &str,
+    run_id: Option<&str>,
+) -> ArtifactsState {
+    if let Some(run_id) = run_id {
+        if let Some(rel) = phase_run_artifacts_rel(phase_id, run_id) {
+            match artifacts_state(plan_path, &rel) {
+                ArtifactsState::Absent => {}
+                decided => return decided,
+            }
+        }
+    }
+    match phase_artifacts_rel(phase_id) {
+        Some(rel) => artifacts_state(plan_path, &rel),
+        None => ArtifactsState::Absent,
+    }
 }
 
 /// The artifact directory to READ for a phase, across both layouts.
@@ -224,14 +313,14 @@ pub fn resolve_phase_artifacts_dir(
     phase_id: &str,
     run_id: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(run_id) = run_id {
-        if let Some(rel) = phase_run_artifacts_rel(phase_id, run_id) {
-            if let Some(dir) = usable_artifacts_dir(plan_path, &rel) {
-                return Some(dir);
-            }
-        }
+    match phase_artifacts_state(plan_path, phase_id, run_id) {
+        ArtifactsState::Found(dir) => Some(dir),
+        // `Unreadable` and `Escaped` collapse to `None` here only because this signature cannot
+        // express them. That is why `phase_artifacts_state` exists and is what the arena's
+        // reader should call: a caller that treats this `None` as "the phase produced no
+        // evidence" is wrong in exactly the two cases that matter.
+        ArtifactsState::Absent | ArtifactsState::Unreadable { .. } | ArtifactsState::Escaped { .. } => None,
     }
-    usable_artifacts_dir(plan_path, &phase_artifacts_rel(phase_id)?)
 }
 
 #[cfg(test)]
@@ -1134,17 +1223,21 @@ mod qa_b_r2_tests {
         drop(f);
     }
 
-    /// FINDING. An artifacts directory that cannot be READ reports "no artifacts" — silently.
+    /// FIXED (was `qa_documents_an_unreadable_artifacts_dir_reports_no_artifacts`, QA round 3).
+    /// An unreadable artifact directory is now reported as unreadable, not as empty.
     ///
-    /// `usable_artifacts_dir` ends with `std::fs::read_dir(&dir).ok()?`, so an I/O error is
-    /// folded into the same `None` as "empty". The confinement failure next to it logs a warning
-    /// precisely because silence there would hide a planted link; this branch has no such line.
-    /// So a permissions problem, an unreadable mount or a transient I/O error on the store makes
-    /// the gate and the navigator report that a phase delivered NO evidence when its evidence is
-    /// sitting there — the failure mode this whole feature exists to prevent, arrived at from the
-    /// other side. One `tracing::warn!` closes it.
+    /// QA's finding: `read_dir(...).ok()?` folded an I/O error into the same `None` as "empty",
+    /// with no log line — so a permissions fault on a directory holding evidence made the reader
+    /// say the phase delivered none, while the evidence sat inside it. That is the failure this
+    /// module exists to prevent, reached from the other side.
+    ///
+    /// Same fixture (`chmod 000`, with the same root-safety check), extended: the Option-shaped
+    /// `resolve_phase_artifacts_dir` still answers `None`, because its signature cannot say more
+    /// — so that half of QA's assertion is KEPT verbatim rather than inverted. What is new is
+    /// `phase_artifacts_state`, which distinguishes the two, and which is what the arena's reader
+    /// must call so a gate cannot conclude "no evidence" from a fault.
     #[test]
-    fn qa_documents_an_unreadable_artifacts_dir_reports_no_artifacts() {
+    fn qa_an_unreadable_artifacts_dir_is_reported_as_unreadable_not_empty() {
         use std::os::unix::fs::PermissionsExt;
         let plan = crate::test_support::tmp_dir("qa-r2-noperm");
         let art = plan.join("phases/01-shell/artifacts");
@@ -1152,20 +1245,74 @@ mod qa_b_r2_tests {
         std::fs::write(art.join("aux-open.png"), b"real evidence").unwrap();
         // It resolves while readable.
         assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", None), Some(art.clone()));
+        assert_eq!(
+            phase_artifacts_state(&plan, "01-shell", None),
+            ArtifactsState::Found(art.clone())
+        );
+
+        // An EMPTY directory is Absent — the baseline the unreadable case must be distinct from.
+        let empty_plan = crate::test_support::tmp_dir("qa-r2-empty");
+        std::fs::create_dir_all(empty_plan.join("phases/01-shell/artifacts")).unwrap();
+        assert_eq!(
+            phase_artifacts_state(&empty_plan, "01-shell", None),
+            ArtifactsState::Absent
+        );
 
         // Make it unlistable (still present, still holding the evidence).
         std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable = std::fs::read_dir(&art).is_err();
         // Running as root would make the chmod ineffective; only assert when it really bit.
         if unreadable {
+            // QA's assertion, kept: the Option-shaped reader still says None.
             assert_eq!(
                 resolve_phase_artifacts_dir(&plan, "01-shell", None),
                 None,
-                "an unreadable dir is reported as 'no artifacts', indistinguishable from empty"
+                "the Option-shaped reader cannot express 'cannot tell'"
             );
+            // The new one: and it is NOT the same answer as empty.
+            let state = phase_artifacts_state(&plan, "01-shell", None);
+            match &state {
+                ArtifactsState::Unreadable { dir, reason } => {
+                    assert_eq!(dir, &art);
+                    assert!(!reason.is_empty(), "the reason must name the I/O error");
+                }
+                other => panic!("expected Unreadable, got {other:?}"),
+            }
+            assert_ne!(state, ArtifactsState::Absent, "unreadable must not read as empty");
         }
         // Always restore, so the fixture can be cleaned up.
         std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", None), Some(art));
+    }
+
+    /// An unreadable RUN directory is surfaced, not routed around into the champion's.
+    ///
+    /// The regression guard for the fix above: if `phase_artifacts_state` treated a fault as
+    /// `Absent` it would fall through to the champion and the phase would look fine, which is
+    /// the same silence in a new place.
+    #[test]
+    fn qa_an_unreadable_run_dir_is_surfaced_not_replaced_by_the_champion() {
+        use std::os::unix::fs::PermissionsExt;
+        let plan = crate::test_support::tmp_dir("qa-r2-noperm-run");
+        let champion = plan.join("phases/01-shell/artifacts");
+        let run = champion.join("runs/4f0821");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(champion.join("aux-open.png"), b"champion").unwrap();
+        std::fs::write(run.join("seat-meter.html"), b"challenger").unwrap();
+        assert_eq!(
+            phase_artifacts_state(&plan, "01-shell", Some("4f0821")),
+            ArtifactsState::Found(run.clone())
+        );
+
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&run).is_err() {
+            let state = phase_artifacts_state(&plan, "01-shell", Some("4f0821"));
+            assert!(
+                matches!(state, ArtifactsState::Unreadable { .. }),
+                "an unreadable run dir must be surfaced, not silently replaced by the \
+                 champion's; got {state:?}"
+            );
+        }
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

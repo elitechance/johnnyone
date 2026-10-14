@@ -11192,21 +11192,11 @@ mod store_tests {
     use super::*;
     use crate::db::migrations::run_migrations;
     use crate::db::Database;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    /// Unique temp dir. `Date::now`/random are unavailable in this environment, so make the
-    /// suffix unique with the pid + a static counter.
+    /// Delegates to the ONE fixture factory, so these fixtures land in this process's single
+    /// fixture root and are reclaimed with it. This was a second private copy that built a
+    /// top-level `j1-p1-*` directory in the system temp dir and never removed it.
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "j1-p1-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::test_support::tmp_dir(&format!("p1-{tag}"))
     }
 
     /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the rest
