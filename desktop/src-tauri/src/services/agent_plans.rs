@@ -8708,7 +8708,13 @@ fn phase_template_values(
             "falling back to the unscoped artifacts directory"
         );
         plan_artifacts::phase_artifacts_dir(plan_root, &phase.phase_id)
-            .unwrap_or_else(|| phase_path.join(plan_artifacts::ARTIFACTS_DIR))
+            // Last resort: the PLAN-level `artifacts/` directory, not `phase_path.join(...)`.
+            // `phase_path` is computed by the caller from the raw phase id, so joining onto it
+            // carries any traversal the caller already introduced into a value handed to an
+            // agent. Reachable only with a phase id that is not a safe segment, which
+            // host-generated slugs are not; the plan-level directory is the nearest thing that
+            // is always inside the store.
+            .unwrap_or_else(|| plan_root.join(plan_artifacts::ARTIFACTS_DIR))
     });
     vec![
         ("run_id", run.plan.id.clone()),

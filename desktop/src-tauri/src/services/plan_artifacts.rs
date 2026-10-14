@@ -48,6 +48,21 @@ pub const RUNS_DIR: &str = "runs";
 /// inside a longer name), and anything containing a forward or back slash. The backslash matters
 /// on its own terms: on this host `\` is a legal character *in a filename*, so a Windows-shaped
 /// `01-shell\artifacts\x.png` would otherwise be accepted as one long, odd name.
+///
+/// **This is a BYTE rule, and that has a limit worth stating.** A percent-encoded (`%2e%2e`) or
+/// unicode look-alike (`‥` U+2025, `．．` U+FF0E) traversal passes it, because to this function
+/// they are ordinary literal names — and staying literal names is exactly what makes them
+/// harmless: the host joins these bytes straight onto the plan dir, where `%2e%2e` is a directory
+/// *called* `%2e%2e`. The canonicalisation in [`confine_to_plan`] does **not** make this moot; it
+/// closes real symlink and `..` escapes, and an encoded segment was never one.
+///
+/// What it depends on is that **nothing between this guard and the filesystem URL-decodes the
+/// path** — and the arena API is an HTTP surface, where decoding is the default. So any HTTP
+/// handler in front of these builders must decode BEFORE calling them, never after: a handler
+/// that passes `%2e%2e` through and lets a lower layer decode it turns a literal name back into a
+/// traversal on the far side of the only guard that would have caught it. QA pinned the current
+/// behaviour in `qa_documents_encoded_and_lookalike_traversals_stay_literal_segments`, with the
+/// containment assertion attached, so this stays a stated assumption, not a surprise.
 pub fn is_safe_segment(seg: &str) -> bool {
     !seg.is_empty() && seg != "." && !seg.contains("..") && !seg.contains('/') && !seg.contains('\\')
 }
@@ -109,46 +124,114 @@ pub fn phase_run_artifacts_dir(plan_path: &Path, phase_id: &str, run_id: &str) -
     Some(plan_path.join(phase_run_artifacts_rel(phase_id, run_id)?))
 }
 
+/// Is `dir` PHYSICALLY inside `plan_path`, with every symlink on the existing prefix resolved?
+///
+/// The segment guard above confines the path *string*. This confines the path. A worker is the
+/// process that writes the plan store, so a worker is the process that can plant
+/// `phases/<id>/artifacts/runs -> /somewhere/else`: after that, `create_dir_all` follows the link
+/// and creates a directory physically outside the store, `is_dir()` follows it and reads from
+/// there, and the path this module returns still *looks* confined — which is what made it
+/// invisible. QA pinned exactly that escape.
+///
+/// Deliberately NOT a second confinement rule: [`settings::resolve_within_root`] already
+/// canonicalises the deepest existing ancestor (so a not-yet-created target is still checked
+/// *before* anything is made), rejects `..` components, and is what the report-markdown guard
+/// uses. Reusing it is the point — two confinement rules in one codebase drift, and this one
+/// would be the junior copy.
+fn confine_to_plan(plan_path: &Path, rel: &str) -> Result<PathBuf, String> {
+    crate::services::settings::resolve_within_root(plan_path, rel).map_err(|reason| {
+        format!(
+            "Refusing the artifact path {:?}: it does not resolve inside the plan store at {} \
+             ({}). A symlink or junction on that path would put the worker's evidence outside \
+             the store while the path still looked confined.",
+            rel,
+            plan_path.display(),
+            reason
+        )
+    })
+}
+
 /// Create and return a phase's per-run artifact directory.
 ///
-/// The directory is created so the worker is handed a path that exists; `create_dir_all` is
-/// idempotent, so a re-entered phase lands in the same place rather than a second one.
+/// Three gates, in this order, because each one can only be checked once the previous passed:
+/// 1. `phase_id` and `run_id` are single safe segments (string-level),
+/// 2. the joined path resolves physically inside `plan_path` (symlink-level, BEFORE any mkdir),
+/// 3. after `create_dir_all`, the directory is re-checked — closing the window in which a link
+///    is planted between the check and the create.
+///
+/// `create_dir_all` is idempotent, so a re-entered phase lands in the same place rather than a
+/// second one, and nothing already in the directory is disturbed.
 pub fn ensure_phase_run_artifacts_dir(
     plan_path: &Path,
     phase_id: &str,
     run_id: &str,
 ) -> Result<PathBuf, String> {
-    let dir = phase_run_artifacts_dir(plan_path, phase_id, run_id).ok_or_else(|| {
+    let rel = phase_run_artifacts_rel(phase_id, run_id).ok_or_else(|| {
         format!(
             "Refusing to build an artifact path from phase {:?} / run {:?}: both must be one safe \
              path segment (no empty name, no `.`, no `..`, no `/` or `\\`).",
             phase_id, run_id
         )
     })?;
+    confine_to_plan(plan_path, &rel)?;
+    // The path handed back is the plain join, not the canonicalised form: callers (and the
+    // prompt) should see the store-relative shape they asked for, and `..`/symlinks have already
+    // been ruled out. `create` is the prefix QA pinned for an OS-level refusal such as a name
+    // too long for the filesystem.
+    let dir = plan_path.join(&rel);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+    // Re-check what now exists. Between the gate above and this line the tree was created, so a
+    // link planted in that window would only be visible now.
+    confine_to_plan(plan_path, &rel)?;
     Ok(dir)
+}
+
+/// Does this directory exist, sit physically inside the plan store, and hold anything at all?
+///
+/// `is_dir()` alone was the reader's whole test, and it was wrong twice over: it follows symlinks
+/// (so it resolved outside the store), and existence is not content.
+fn usable_artifacts_dir(plan_path: &Path, rel: &str) -> Option<PathBuf> {
+    let dir = plan_path.join(rel);
+    if !dir.is_dir() {
+        return None;
+    }
+    if let Err(reason) = confine_to_plan(plan_path, rel) {
+        // Loud: this is either a planted link or a badly broken store, and silently falling
+        // through to the champion would hide it.
+        tracing::warn!(%reason, "ignoring an artifact directory that escapes the plan store");
+        return None;
+    }
+    let mut entries = std::fs::read_dir(&dir).ok()?;
+    entries.next().is_some().then_some(dir)
 }
 
 /// The artifact directory to READ for a phase, across both layouts.
 ///
-/// Order: the run's own directory when a `run_id` is given and that directory exists, then the
-/// bare champion directory, then `None`. The middle step is the back-compat case and it is the
-/// common one — every plan in the store today has only the bare directory, and this reader must
-/// keep finding it without any migration of files on disk.
+/// Order: the run's own directory when a `run_id` is given and that directory holds something,
+/// then the bare champion directory, then `None`. Both candidates must be physically inside the
+/// plan store.
+///
+/// **Non-empty, not merely present.** `ensure_phase_run_artifacts_dir` is called on every phase
+/// prompt render, so every pre-existing plan acquires an empty `artifacts/runs/<run_id>/` the
+/// first time a phase runs. Preferring the run directory on existence alone therefore made the
+/// champion's artifacts unreachable for any reader that passed a run id — on every plan in the
+/// store, as soon as the arena wired a reader up. One condition, no migration.
+///
+/// The back-compat step is the common one: every plan on disk today has only the bare directory,
+/// and this reader finds it with nothing moved.
 pub fn resolve_phase_artifacts_dir(
     plan_path: &Path,
     phase_id: &str,
     run_id: Option<&str>,
 ) -> Option<PathBuf> {
     if let Some(run_id) = run_id {
-        if let Some(dir) = phase_run_artifacts_dir(plan_path, phase_id, run_id) {
-            if dir.is_dir() {
+        if let Some(rel) = phase_run_artifacts_rel(phase_id, run_id) {
+            if let Some(dir) = usable_artifacts_dir(plan_path, &rel) {
                 return Some(dir);
             }
         }
     }
-    let bare = phase_artifacts_dir(plan_path, phase_id)?;
-    bare.is_dir().then_some(bare)
+    usable_artifacts_dir(plan_path, &phase_artifacts_rel(phase_id)?)
 }
 
 #[cfg(test)]
@@ -493,20 +576,20 @@ mod qa_b_tests {
         }
     }
 
-    /// GAP, and the sharpest one in this module. Nothing here canonicalises, so a SYMLINK planted
-    /// inside the plan store redirects both the writer and the reader outside it.
+    /// FIXED (was `qa_documents_a_symlinked_run_dir_escapes_the_plan_store`, QA round 2). A
+    /// symlink planted inside the plan store is refused by both the writer and the reader.
     ///
-    /// `ensure_phase_run_artifacts_dir` calls `create_dir_all`, which follows a symlinked parent,
-    /// and `resolve_phase_artifacts_dir` tests `is_dir()`, which follows too. The worker is the
-    /// process that writes the plan store, so the worker is the process that can plant the link —
-    /// and `phase_template_values` calls the writer on every live prompt.
+    /// This was the sharpest gap in the module: nothing canonicalised, `create_dir_all` followed
+    /// a symlinked parent, `is_dir()` followed one too, and the path handed back still *looked*
+    /// confined. The worker is the process that writes the plan store, so the worker is the
+    /// process that can plant the link — and `phase_template_values` calls the writer on every
+    /// live prompt render. The segment guard confined the path STRING, not the path.
     ///
-    /// What a reviewer should conclude: the segment guard confines the path STRING, not the path.
-    /// Closing it needs a `canonicalize` + prefix check (or `O_NOFOLLOW`-equivalent) that this
-    /// module does not have, and that is a decision for the author, not a QA edit. Pinned so it
-    /// cannot be reported as closed without this test changing.
+    /// Closed by routing both sides through `settings::resolve_within_root`, which canonicalises
+    /// the deepest existing ancestor before anything is created. The assertions below are the
+    /// inverse of QA's, name for name.
     #[test]
-    fn qa_documents_a_symlinked_run_dir_escapes_the_plan_store() {
+    fn qa_a_symlinked_run_dir_is_refused_by_both_the_writer_and_the_reader() {
         let plan = crate::test_support::tmp_dir("qa-symlink-plan");
         let outside = crate::test_support::tmp_dir("qa-symlink-outside");
         std::fs::write(outside.join("stolen.txt"), b"not in the plan store").unwrap();
@@ -516,27 +599,63 @@ mod qa_b_tests {
         std::fs::create_dir_all(runs.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&outside, &runs).unwrap();
 
-        // The WRITER follows it and creates a directory outside the plan store.
-        let made = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
-            .expect("create_dir_all follows the link rather than refusing");
+        // The WRITER refuses, loudly, and creates nothing.
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a symlinked run dir must be refused, not followed");
+        assert!(err.contains("Refusing the artifact path"), "{err}");
+        assert!(err.contains("does not resolve inside the plan store"), "{err}");
         assert!(
-            outside.join("4f0821").is_dir(),
-            "a directory was created outside the plan store at {}",
+            !outside.join("4f0821").exists(),
+            "nothing may be created outside the plan store at {}",
             outside.join("4f0821").display()
         );
-        // The returned path still LOOKS confined, which is what makes this invisible.
-        assert!(made.starts_with(&plan));
-        assert_eq!(made, plan.join("phases/01-shell/artifacts/runs/4f0821"));
 
-        // And the READER resolves to it, so the review gate would read evidence from there.
-        std::fs::write(outside.join("4f0821/evidence.png").as_path(), b"x").unwrap();
-        let resolved = resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821"))
-            .expect("the symlinked run dir resolves");
-        assert!(resolved.join("evidence.png").is_file());
+        // The READER does not resolve to it either. Plant the evidence by hand, through the
+        // link, and the reader must still not hand it back.
+        std::fs::create_dir_all(outside.join("4f0821")).unwrap();
+        std::fs::write(outside.join("4f0821/evidence.png"), b"x").unwrap();
+        let resolved = resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821"));
+        assert_ne!(
+            resolved,
+            Some(plan.join("phases/01-shell/artifacts/runs/4f0821")),
+            "the escaping run dir must not be resolved"
+        );
+        if let Some(dir) = &resolved {
+            assert!(
+                dir.canonicalize().unwrap().starts_with(plan.canonicalize().unwrap()),
+                "resolved {} is outside the plan store",
+                dir.display()
+            );
+            assert!(
+                !dir.join("evidence.png").is_file(),
+                "the reader reached evidence planted outside the store"
+            );
+        }
+    }
+
+    /// A symlink one level UP is refused too: the escape does not have to be the leaf.
+    ///
+    /// The regression guard for the fix above — it fails if `confine_to_plan` is dropped from
+    /// either the writer or the reader, and it covers a link the `runs/` leaf check alone would
+    /// miss, because here `artifacts` itself is the link.
+    #[test]
+    fn qa_a_symlink_higher_up_the_artifact_path_is_refused_too() {
+        let plan = crate::test_support::tmp_dir("qa-symlink-mid");
+        let outside = crate::test_support::tmp_dir("qa-symlink-mid-out");
+        std::fs::create_dir_all(plan.join("phases/01-shell")).unwrap();
+        std::os::unix::fs::symlink(&outside, plan.join("phases/01-shell/artifacts")).unwrap();
+
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a symlinked artifacts dir must be refused");
+        assert!(err.contains("does not resolve inside the plan store"), "{err}");
+        assert!(!outside.join("runs").exists(), "nothing created outside");
+
+        // And the champion fallback does not read through it either.
+        std::fs::write(outside.join("aux-open.png"), b"planted").unwrap();
         assert_eq!(
-            resolved.canonicalize().unwrap(),
-            outside.canonicalize().unwrap().join("4f0821"),
-            "the resolved directory is physically outside the plan store"
+            resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")),
+            None,
+            "neither the run dir nor the champion may resolve through an escaping link"
         );
     }
 
@@ -596,24 +715,19 @@ mod qa_b_tests {
         assert_eq!(resolve_phase_artifacts_dir(&plan, "99-absent", Some("4f0821")), None);
     }
 
-    /// GAP. An EMPTY run directory wins over the champion's, so the champion's evidence becomes
-    /// invisible to any reader that passes a run id.
+    /// FIXED (was `qa_documents_an_empty_run_dir_hides_the_champions_artifacts`, QA round 2).
+    /// An empty run directory does NOT hide the champion's artifacts.
     ///
-    /// `resolve_phase_artifacts_dir` prefers the run directory on `is_dir()` — existence, not
-    /// content — and `ensure_phase_run_artifacts_dir` creates that directory unconditionally.
-    /// Since `phase_template_values` now calls the creator for EVERY phase of EVERY run, with
-    /// `run.plan.id` as the run id, every plan in the store acquires an empty
-    /// `artifacts/runs/<plan_id>/` as soon as a phase prompt is rendered. A reader that then asks
-    /// for that run id sees an artifact directory with nothing in it, while the phase's real
-    /// artifacts sit one level up.
+    /// `resolve_phase_artifacts_dir` preferred the run directory on `is_dir()` — existence, not
+    /// content — while `ensure_phase_run_artifacts_dir` creates that directory unconditionally on
+    /// every phase prompt render. So every pre-existing plan acquired an empty
+    /// `artifacts/runs/<plan_id>/`, and a reader passing that run id saw an empty artifact
+    /// directory with the phase's real artifacts one level up. Latent only because the resolver
+    /// had no production caller; a live regression on every existing plan the moment one appears.
     ///
-    /// What a reviewer should conclude: harmless TODAY and only today, because
-    /// `resolve_phase_artifacts_dir` has no production caller (QA grepped: the only references
-    /// outside this file are in this module's own tests). It becomes a live regression on every
-    /// pre-existing plan the moment the arena wires the reader up. The fix is one condition —
-    /// prefer the run directory only when it is non-empty — not a migration.
+    /// Fixed with one condition — non-empty, not merely present — and no migration.
     #[test]
-    fn qa_documents_an_empty_run_dir_hides_the_champions_artifacts() {
+    fn qa_an_empty_run_dir_does_not_hide_the_champions_artifacts() {
         let plan = crate::test_support::tmp_dir("qa-empty-run");
         write(&plan, "phases/01-shell/artifacts/aux-open.png", b"champion pixels");
 
@@ -622,13 +736,40 @@ mod qa_b_tests {
         assert_eq!(std::fs::read_dir(&created).unwrap().count(), 0, "created empty");
 
         let resolved = resolve_phase_artifacts_dir(&plan, "01-shell", Some("plan-7fe2")).unwrap();
-        assert_eq!(resolved, created, "the EMPTY run dir wins over the champion's");
-        assert!(
-            !resolved.join("aux-open.png").exists(),
-            "the champion's only artifact is now unreachable through this reader"
+        assert_eq!(
+            resolved,
+            plan.join("phases/01-shell/artifacts"),
+            "an EMPTY run dir must fall through to the champion's"
         );
-        // The file itself is fine — it is the reader that cannot see it.
-        assert!(plan.join("phases/01-shell/artifacts/aux-open.png").is_file());
+        assert!(
+            resolved.join("aux-open.png").is_file(),
+            "the champion's artifact must stay reachable through this reader"
+        );
+
+        // And the moment that run delivers anything, it wins — the preference is not lost,
+        // it is conditioned.
+        std::fs::write(created.join("seat-meter.html"), b"run output").unwrap();
+        assert_eq!(
+            resolve_phase_artifacts_dir(&plan, "01-shell", Some("plan-7fe2")),
+            Some(created),
+            "a run that has delivered must read its own directory"
+        );
+    }
+
+    /// The same rule on the champion's side: an empty `artifacts/` is "no artifacts", not a path
+    /// to an empty directory. The regression guard for the condition above — it fails if the
+    /// emptiness test is reverted to a bare `is_dir()`.
+    #[test]
+    fn qa_an_empty_champion_dir_is_reported_as_no_artifacts() {
+        let plan = crate::test_support::tmp_dir("qa-empty-champion");
+        std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
+        assert!(plan.join("phases/01-shell/artifacts").is_dir());
+        assert_eq!(
+            resolve_phase_artifacts_dir(&plan, "01-shell", None),
+            None,
+            "an empty champion dir must not be offered as an artifact directory"
+        );
+        assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")), None);
     }
 
     /// Creating a run directory twice is idempotent and destroys nothing already in it — the

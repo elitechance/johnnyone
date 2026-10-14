@@ -35,6 +35,27 @@
 //! preference recorded across mismatched seat budgets is measuring scheduling luck. There is
 //! deliberately **no GraphQL surface here**: the arena API is owned elsewhere, and this is an
 //! in-process API for it to call.
+//!
+//! ## Two things this pool does NOT do, which that caller must
+//!
+//! Both are stated here because "the lease pool is done" must not be read as "the mock's seat
+//! behaviour is implemented". QA pinned each as a tripwire
+//! (`qa_documents_there_is_no_queue_only_an_immediate_refusal`,
+//! `qa_documents_a_two_family_request_is_not_atomic_across_families`).
+//!
+//! 1. **There is no queue, and no fairness.** `mock.html` step 3 says a run that cannot get its
+//!    seats *queues*, and never proceeds at a reduced width. Only the second clause lives here:
+//!    [`LeasePool::acquire`] refuses immediately and never blocks. So a wide request can starve
+//!    behind a stream of narrow ones, indefinitely, and nothing in this module will notice. The
+//!    arena's run starter owns the queue — including its ordering policy, because the fair
+//!    answer ("the run that asked first") is not derivable from anything the pool knows.
+//! 2. **Atomicity is per lease, not per run.** A run needing seats on two families takes two
+//!    [`SeatLease`]es, and there is no all-or-nothing primitive across them. So the caller can
+//!    hold one family's seats while being refused the other's, and must unwind the first itself;
+//!    two such callers taking the families in opposite orders deadlock-by-starvation with no
+//!    queue to break the tie. `seats_held_json` can likewise only ever describe one family.
+//!    This is not an oversight to fix here: a cross-family primitive needs a wait policy, which
+//!    is item 1, which belongs to the caller.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -85,13 +106,36 @@ impl SeatCaps {
     /// Parse a `{"family": seats}` object. Errors are returned, never defaulted away — a host
     /// that set this meant something by it, and silently running on different caps than the
     /// operator configured is exactly the invisible-contention failure this module exists for.
+    ///
+    /// **Emptiness is checked AFTER normalisation, and that ordering is the fix for a real
+    /// bypass.** The check used to run on the parsed map, before [`from_pairs`](Self::from_pairs)
+    /// drops zero-seat families — so `{}` was refused while
+    /// `{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}` was accepted and
+    /// produced the identical end state the guard exists to prevent: a caps table with no
+    /// families. The host then refused every request as `UnknownFamily`, whose message tells the
+    /// operator to add the family to the table when they are the one who zeroed it.
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let parsed: BTreeMap<String, u32> = serde_json::from_str(raw.trim())
             .map_err(|e| format!("seat caps must be a JSON object of family -> seats: {}", e))?;
-        if parsed.is_empty() {
-            return Err("seat caps object is empty".to_string());
+        let zeroed: Vec<&str> = parsed
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(f, _)| f.as_str())
+            .collect();
+        let caps = Self::from_pairs(parsed.clone());
+        if caps.caps.is_empty() {
+            // Two spellings of one state, so they get one answer. The `{}` wording is unchanged
+            // because it is the honest description of the empty object.
+            if parsed.is_empty() {
+                return Err("seat caps object is empty".to_string());
+            }
+            return Err(format!(
+                "every family in the seat caps object is set to zero ({}), so no family could be \
+                 leased at all; remove the key to use the measured caps instead",
+                zeroed_list(&zeroed)
+            ));
         }
-        Ok(Self::from_pairs(parsed))
+        Ok(caps)
     }
 
     /// This family's cap, or `None` when the family is not in the table.
@@ -103,6 +147,30 @@ impl SeatCaps {
     pub fn families(&self) -> impl Iterator<Item = &str> {
         self.caps.keys().map(String::as_str)
     }
+
+    /// Families whose cap here is HIGHER than the measured one, as
+    /// `(family, configured, measured)`, ascending.
+    ///
+    /// A different fleet legitimately needs a different number, so this is **not** a refusal and
+    /// not a clamp — it is the thing that makes the difference visible. Without it a typo of `40`
+    /// for `4` was accepted in full and the pool handed out ten times the fleet's measured
+    /// capacity with no log line: precisely the invisible over-subscription this module's own doc
+    /// comment says it exists to prevent. Returned as DATA rather than logged in place so it can
+    /// be asserted on; [`seat_caps_from_db`] is what turns each row into a warning.
+    pub fn exceedances_vs_measured(&self) -> Vec<(String, u32, u32)> {
+        MEASURED_SEAT_CAPS
+            .iter()
+            .filter_map(|(family, measured)| {
+                let configured = self.cap(family)?;
+                (configured > *measured).then(|| ((*family).to_string(), configured, *measured))
+            })
+            .collect()
+    }
+}
+
+/// Render a family list for the all-zero error message.
+fn zeroed_list(families: &[&str]) -> String {
+    families.join(", ")
 }
 
 /// Why a seat request was refused. Every variant names the numbers, because the point of this
@@ -331,8 +399,27 @@ pub fn seat_caps_from_db(db: &crate::db::Database) -> SeatCaps {
         return SeatCaps::measured();
     }
     match SeatCaps::from_json(&raw) {
-        Ok(caps) => caps,
+        Ok(caps) => {
+            // An override ABOVE the measured cap is allowed — a different fleet needs a
+            // different number — but it is never silent. One line per family, naming all three
+            // numbers, so "we are running at 40 on a fleet measured at 4" is readable in a log
+            // rather than being inferred from latency months later.
+            for (family, configured, measured) in caps.exceedances_vs_measured() {
+                tracing::warn!(
+                    key = SEAT_CAPS_SETTING_KEY,
+                    %family,
+                    configured,
+                    measured,
+                    "configured seat cap is ABOVE the measured capacity for this family; the \
+                     fleet reports no error when over-subscribed, so this will show up only as \
+                     latency"
+                );
+            }
+            caps
+        }
         Err(reason) => {
+            // Covers the all-zero override too, which used to slip past `from_json` and leave
+            // the host with no capped families, no fallback and no log line.
             tracing::warn!(
                 key = SEAT_CAPS_SETTING_KEY,
                 %reason,
@@ -373,11 +460,24 @@ mod tests {
         let caps = SeatCaps::from_json(r#"{"local-7b": 8, "glm-5.3-flash": 1}"#).unwrap();
         assert_eq!(caps.cap("local-7b"), Some(8));
         assert_eq!(caps.cap("glm-5.3-flash"), Some(1));
-        // A zero cap is "cannot be leased", which is the same as absent.
-        assert_eq!(SeatCaps::from_json(r#"{"x": 0}"#).unwrap().cap("x"), None);
+        // A zero cap is "cannot be leased", so it is dropped from the table...
+        assert_eq!(
+            SeatCaps::from_json(r#"{"local-7b": 8, "x": 0}"#).unwrap().cap("x"),
+            None
+        );
+        // ...but an override in which EVERY family is zero is refused, not accepted as a table
+        // with no families. This assertion is the inverse of the one that was here in round 1:
+        // I had written `{"x": 0}` -> Ok as if it were correct, which encoded the bypass QA
+        // then found. The guard has to fire on the state, not on the spelling.
+        let err = SeatCaps::from_json(r#"{"x": 0}"#).expect_err("an all-zero table is refused");
+        assert!(err.contains("set to zero"), "{err}");
+        assert!(err.contains("x"), "{err}");
         // Bad configuration is an error, not a silent fallback to different numbers.
         assert!(SeatCaps::from_json("not json").is_err());
-        assert!(SeatCaps::from_json("{}").is_err());
+        assert_eq!(
+            SeatCaps::from_json("{}").unwrap_err(),
+            "seat caps object is empty"
+        );
         assert!(SeatCaps::from_json(r#"{"x": -1}"#).is_err());
     }
 
@@ -586,28 +686,44 @@ mod tests {
     }
 
     /// The same race across families: the per-family totals must stay independent.
+    ///
+    /// **No thread in here may panic, and that is a property of the test, not an accident.**
+    /// The first version of this test asserted the cap INSIDE the worker thread, before
+    /// `gate.wait()`. When the assertion tripped, that thread unwound without ever reaching the
+    /// barrier, the other 29 blocked on `Barrier::new(30)` forever and the main thread blocked
+    /// in `join()` — so the test HUNG instead of failing. QA measured 5 timeouts in 6 runs
+    /// against a deliberately raced `acquire`, one of them sitting for 10m34s. A test that
+    /// cannot report the failure it detects is worse than no test: in CI it is a job timeout,
+    /// not a red test, and the defect reads as infrastructure flake.
+    ///
+    /// So the workers only ever RECORD — `fetch_max` into a per-family peak — and every
+    /// assertion happens after `join`. There is no `unwrap`, no `assert` and no indexing panic
+    /// on the path to either barrier.
     #[test]
     fn concurrent_families_do_not_bleed_into_each_other() {
+        const FAMILIES: [&str; 3] = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
+        const THREADS: usize = 30;
         let pool = LeasePool::with_measured_caps();
-        let families = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
-        let start = Arc::new(Barrier::new(30));
-        let gate = Arc::new(Barrier::new(30));
-        let handles: Vec<_> = (0..30)
+        let start = Arc::new(Barrier::new(THREADS));
+        let gate = Arc::new(Barrier::new(THREADS));
+        // Peak seats observed in use per family, by the same index as FAMILIES.
+        let peaks: Arc<[AtomicU32; 3]> =
+            Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
+
+        let handles: Vec<_> = (0..THREADS)
             .map(|i| {
                 let pool = Arc::clone(&pool);
                 let start = Arc::clone(&start);
                 let gate = Arc::clone(&gate);
-                let family = families[i % families.len()];
+                let peaks = Arc::clone(&peaks);
+                let slot = i % FAMILIES.len();
+                let family = FAMILIES[slot];
                 std::thread::spawn(move || {
                     start.wait();
                     let lease = pool.acquire(family, 1);
-                    if lease.is_ok() {
-                        let cap = pool.cap_for(family).unwrap();
-                        assert!(
-                            pool.busy_for(family) <= cap,
-                            "{family} went over its cap of {cap}"
-                        );
-                    }
+                    // Record only. Observe the count whether or not this thread won, so an
+                    // over-admission caused by someone else is still seen.
+                    peaks[slot].fetch_max(pool.busy_for(family), Ordering::SeqCst);
                     gate.wait();
                     drop(lease);
                 })
@@ -615,6 +731,16 @@ mod tests {
             .collect();
         for h in handles {
             h.join().expect("no worker may panic");
+        }
+
+        // Every judgement is made here, on the main thread, where a failure is a RED TEST.
+        for (slot, family) in FAMILIES.iter().enumerate() {
+            let cap = pool.cap_for(family).expect("every family in FAMILIES is capped");
+            let peak = peaks[slot].load(Ordering::SeqCst);
+            assert!(
+                peak <= cap,
+                "{family} went over its cap of {cap}: peak {peak} seats in use"
+            );
         }
         assert_eq!(
             pool.busy(),
@@ -928,50 +1054,45 @@ mod qa_b_tests {
 
     // ── Claim 8: the DB override path ─────────────────────────────────────────────────────────
 
-    /// GAP. `from_json` refuses an empty object on purpose — "seat caps object is empty" — but
-    /// the emptiness check runs on the PARSED map, before `from_pairs` drops the zero-seat
-    /// families. An override whose every value is `0` therefore passes the guard and produces
-    /// exactly the state the guard exists to prevent: a caps table with no families at all.
+    /// FIXED (was `qa_documents_an_all_zero_override_bypasses_the_empty_object_guard`, QA round
+    /// 2). An all-zero override is refused exactly like an empty object, because it is the same
+    /// state.
     ///
-    /// What a reviewer should conclude: `seat_caps_from_db` does NOT fall back to the measured
-    /// table in this case and logs nothing, so the host comes up with a pool that refuses every
-    /// request — and refuses them as `UnknownFamily`, whose message tells the operator to "add it
-    /// to the seat-cap table" when the truth is that they set it to zero themselves.
+    /// The emptiness check used to run on the PARSED map, before `from_pairs` drops zero-seat
+    /// families, so `{}` was refused while `{"glm":0,…}` was accepted — and produced the very
+    /// state the guard exists to prevent: a caps table with no families, every request then
+    /// refused as `UnknownFamily`, whose message tells the operator to add the family to the
+    /// table when they are the one who zeroed it. The check now runs after normalisation.
     #[test]
-    fn qa_documents_an_all_zero_override_bypasses_the_empty_object_guard() {
-        // The guard, working as documented.
+    fn qa_an_all_zero_override_is_refused_like_an_empty_object() {
+        // The empty object's wording is unchanged — it is the honest description of `{}`.
         assert_eq!(
             SeatCaps::from_json("{}").unwrap_err(),
             "seat caps object is empty"
         );
-        // The same end state, accepted.
-        let zeroed = SeatCaps::from_json(
+        // The same END STATE, now refused, with a message that names the real cause and the
+        // families involved rather than misdirecting the operator.
+        let err = SeatCaps::from_json(
             r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}"#,
         )
-        .expect("today this is accepted — see the doc comment above");
-        assert_eq!(zeroed.families().count(), 0, "no family survived the filter");
+        .expect_err("an override that zeroes every family must be refused");
+        assert!(err.contains("set to zero"), "{err}");
+        assert!(err.contains("glm-5.3-flash"), "{err}");
+        assert!(err.contains("deepseek-v4.1-flash"), "{err}");
+        assert!(err.contains("remove the key to use the measured caps"), "{err}");
 
-        let pool = Arc::new(LeasePool::new(zeroed));
-        assert_eq!(
-            pool.acquire("glm-5.3-flash", 1).unwrap_err(),
-            SeatError::UnknownFamily {
-                family: "glm-5.3-flash".to_string()
-            },
-            "a zeroed family is indistinguishable from one nobody ever measured"
-        );
-        // The message misdirects: the operator set this to 0, they did not forget to measure it.
-        assert!(pool
-            .acquire("glm-5.3-flash", 1)
-            .unwrap_err()
-            .to_string()
-            .contains("add it to the seat-cap table"));
-        // And the snapshot column records nothing at all for any family.
-        assert_eq!(pool.fleet_busy_json(), "{}");
+        // A partial zero is NOT refused: the surviving families are a usable table.
+        let partial = SeatCaps::from_json(r#"{"glm-5.3-flash":4,"qwen3.8-flash-next":0}"#)
+            .expect("one real family is enough");
+        assert_eq!(partial.cap("glm-5.3-flash"), Some(4));
+        assert_eq!(partial.cap("qwen3.8-flash-next"), None);
     }
 
-    /// The live consequence of the gap above, through the real setting: no fallback, no warning.
+    /// FIXED (was `qa_documents_a_zeroed_setting_leaves_the_host_with_no_caps_and_no_fallback`,
+    /// QA round 2). Through the real setting: a zeroed override now falls back to the measured
+    /// table, exactly as a malformed one does, instead of leaving the host with no caps at all.
     #[test]
-    fn qa_documents_a_zeroed_setting_leaves_the_host_with_no_caps_and_no_fallback() {
+    fn qa_a_zeroed_setting_falls_back_to_the_measured_table() {
         let (state, _root) = crate::test_support::test_state();
         crate::services::settings::set_setting(
             &state,
@@ -980,43 +1101,78 @@ mod qa_b_tests {
         )
         .unwrap();
         let caps = load_seat_caps(&state);
-        assert_ne!(
+        assert_eq!(
             caps,
             SeatCaps::measured(),
-            "a zeroed override does NOT fall back to the measured table, unlike a malformed one"
+            "a zeroed override must fall back to the measured table, like a malformed one"
         );
-        assert_eq!(caps.families().count(), 0);
+        assert_eq!(caps.families().count(), 3);
+        // And the host is usable rather than refusing everything as UnknownFamily.
+        let pool = Arc::new(LeasePool::new(caps));
+        assert!(pool.acquire("glm-5.3-flash", 4).is_ok());
     }
 
-    /// DISPROVES "the DB override cannot silently produce a cap above the measured one".
+    /// FIXED (was `qa_an_override_above_the_measured_cap_is_accepted_with_no_warning`, QA round
+    /// 2). An override above the measured cap is still ACCEPTED — a different fleet legitimately
+    /// needs a different number — but it is no longer silent.
     ///
-    /// Nothing clamps the override against [`MEASURED_SEAT_CAPS`] and nothing warns when it
-    /// exceeds it, so a typo of `40` for `4` is accepted in full and the pool will hand out ten
-    /// times the fleet's measured capacity — the exact invisible over-subscription this module's
-    /// doc comment says it exists to prevent. (A different fleet legitimately needs a different
-    /// number, so the fix is a log line, not a refusal.)
+    /// `exceedances_vs_measured` names the family, the configured value and the measured one, and
+    /// `seat_caps_from_db` logs one warning per row. Returned as data precisely so this can be
+    /// asserted: "it warns" is not a testable claim about a `tracing::warn!`.
     #[test]
-    fn qa_an_override_above_the_measured_cap_is_accepted_with_no_warning() {
+    fn qa_an_override_above_the_measured_cap_is_accepted_but_reported() {
         let fat = SeatCaps::from_json(r#"{"glm-5.3-flash": 40}"#).unwrap();
         assert_eq!(
             fat.cap("glm-5.3-flash"),
             Some(40),
-            "ten times the measured 4, accepted verbatim"
+            "ten times the measured 4, still accepted verbatim — this is a warning, not a clamp"
         );
         assert_eq!(SeatCaps::measured().cap("glm-5.3-flash"), Some(4));
 
+        // The difference is now reported, with all three numbers.
+        assert_eq!(
+            fat.exceedances_vs_measured(),
+            vec![("glm-5.3-flash".to_string(), 40, 4)]
+        );
+
+        // Still granted in full, so the operator's intent is honoured.
         let pool = Arc::new(LeasePool::new(fat));
         let lease = pool
             .acquire("glm-5.3-flash", 40)
-            .expect("40 seats on a 4-seat fleet are granted");
+            .expect("40 seats are granted on an explicitly configured 40-seat cap");
         assert_eq!(lease.seats(), 40);
         assert_eq!(pool.busy_for("glm-5.3-flash"), 40);
-        // Even u32::MAX is not refused on the way in.
+
+        // A cap at or BELOW the measured one is not reported — only an excess is news.
+        assert!(SeatCaps::measured().exceedances_vs_measured().is_empty());
+        assert!(SeatCaps::from_json(r#"{"glm-5.3-flash": 1}"#)
+            .unwrap()
+            .exceedances_vs_measured()
+            .is_empty());
+        // A family nobody measured has nothing to exceed, so it is not reported either.
+        assert!(SeatCaps::from_json(r#"{"local-7b": 99}"#)
+            .unwrap()
+            .exceedances_vs_measured()
+            .is_empty());
+        // u32::MAX is still accepted on the way in, and reported.
+        let huge = SeatCaps::from_json(r#"{"glm-5.3-flash": 4294967295}"#).unwrap();
+        assert_eq!(huge.cap("glm-5.3-flash"), Some(u32::MAX));
         assert_eq!(
-            SeatCaps::from_json(r#"{"glm-5.3-flash": 4294967295}"#)
-                .unwrap()
-                .cap("glm-5.3-flash"),
-            Some(u32::MAX)
+            huge.exceedances_vs_measured(),
+            vec![("glm-5.3-flash".to_string(), u32::MAX, 4)]
+        );
+        // Every measured family is checked, not just the first.
+        let all = SeatCaps::from_json(
+            r#"{"glm-5.3-flash":5,"deepseek-v4.1-flash":3,"qwen3.8-flash-next":5}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            all.exceedances_vs_measured(),
+            vec![
+                ("glm-5.3-flash".to_string(), 5, 4),
+                ("deepseek-v4.1-flash".to_string(), 3, 2),
+                ("qwen3.8-flash-next".to_string(), 5, 4),
+            ]
         );
     }
 

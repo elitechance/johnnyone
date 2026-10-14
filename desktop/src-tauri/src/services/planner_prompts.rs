@@ -681,10 +681,6 @@ planning:
     /// move both sides of the equality above. Update the constants only when
     /// a commercial-prompt change is intentional.
     #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
     fn commercial_templates_match_pinned_fingerprints() {
         // Ten shipped DEFAULT_* strings. Not workerNudge (no shipped default).
         assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x57b8ba3c4843e8a7);
