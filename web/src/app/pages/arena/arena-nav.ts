@@ -113,16 +113,67 @@ export function arenaBackTarget(
   };
 }
 
+/** The same URL with any `from` removed. Everything else — path, order, other params — is kept. */
+export function stripReturnParam(url: string): string {
+  if (!url) return url;
+  const hash = url.includes('#') ? url.slice(url.indexOf('#')) : '';
+  const noHash = hash ? url.slice(0, url.indexOf('#')) : url;
+  const qAt = noHash.indexOf('?');
+  if (qAt === -1) return noHash + hash;
+  const kept = noHash
+    .slice(qAt + 1)
+    .split('&')
+    .filter((pair) => pair && decodeURIComponent(pair.split('=')[0]) !== ARENA_RETURN_PARAM);
+  return noHash.slice(0, qAt) + (kept.length ? `?${kept.join('&')}` : '') + hash;
+}
+
+/** The decoded `from` a URL already carries, or null. */
+export function readReturnParam(url: string): string | null {
+  const qAt = (url ?? '').indexOf('?');
+  if (qAt === -1) return null;
+  for (const pair of url.slice(qAt + 1).split('&')) {
+    const eq = pair.indexOf('=');
+    if (eq === -1) continue;
+    if (decodeURIComponent(pair.slice(0, eq)) === ARENA_RETURN_PARAM) {
+      return decodeURIComponent(pair.slice(eq + 1));
+    }
+  }
+  return null;
+}
+
 /**
- * The `queryParams` an arena-ward link must carry so the page it opens can come back here.
- * Existing params on the link are merged in by the caller; this only adds `from`.
+ * The `queryParams` an arena-ward link must carry so the page it opens can come back where the
+ * person came FROM. Other params on the link are merged in by the caller; this only adds `from`.
  *
- * It CHAINS: a departure URL that itself carries a `from` is kept whole, so console -> workflows ->
- * detail -> arena walks back the way it came rather than collapsing to the console in one jump.
+ * IT PASSES THE ORIGIN THROUGH, AND IT NEVER NESTS. Two measured failures shaped this:
+ *
+ *  1. NESTING. The first version used the current URL whole, `from` and all, so every hop
+ *     re-encoded the entire previous address into the next one and the escaping gained a level each
+ *     time (%2F -> %252F -> %25252F). Measured in Chrome, phone width, entering by the global Arena
+ *     item: 51 chars, then 78 after "the four parts", then 119 after "Open the arena" — growing
+ *     faster than linearly, into a history entry and anything the person pastes to someone else.
+ *
+ *  2. A ONE-LEVEL `from` THAT POINTS AT THE PREDECESSOR cannot retrace. Pointing `from` at the page
+ *     you are leaving bounds the length, but back then lands on that page with NO `from` of its
+ *     own, so its link falls back to its static parent and the next step up falls back to a bare
+ *     `/initiatives` — losing the initiative, which is the defect this whole mechanism exists to
+ *     fix. Bounded length and a surviving origin are not the same property and a predecessor
+ *     pointer only buys the first.
+ *
+ * So `from` means THE ORIGIN, not the previous step: once a page carries one, every link out of it
+ * forwards that same value unchanged, and only a page without one puts its own identity there
+ * (minus any `from`, so the value is one level deep by construction). The origin therefore survives
+ * a wander of any length at constant cost, and back goes to the console from anywhere in the arena
+ * rather than making the person click up through pages they are finished with. The back LABEL names
+ * the destination (`returnLabel`), so that jump is never a surprise.
  */
 export function arenaReturnParams(currentUrl: string): Record<string, string> {
   if (!currentUrl || !currentUrl.startsWith('/')) return {};
-  return { [ARENA_RETURN_PARAM]: currentUrl };
+  // An origin already pinned to this page wins — forwarded verbatim, never re-encoded. It is
+  // re-validated because it arrived in a query string and a link someone sends can set it.
+  const origin = readReturnParam(currentUrl);
+  if (origin && parseReturnUrl(origin)) return { [ARENA_RETURN_PARAM]: origin };
+  return { [ARENA_RETURN_PARAM]: stripReturnParam(currentUrl) };
 }
 
 /**

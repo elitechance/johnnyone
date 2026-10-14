@@ -8,6 +8,8 @@
 //   * its GraphQL stub answers with the SAME workflow for every id, so it structurally cannot see
 //     an id-routing bug or an unknown id, and it has exactly ONE initiative, so it cannot see the
 //     initiative-context loss, which is only visible once two initiatives exist;
+//   * it has no notion of a click CHAIN, so it cannot see a `from` trail that nests and grows the
+//     address by a level of URL-encoding per hop (measured: 51 -> 78 -> 119 chars over three hops);
 //   * it runs at 400x860 only, and the biggest seam is on the DESKTOP: measured at 1440x900 the
 //     console is rail 64 + list 216 + centre 886 + validation 262, and the arena was a single
 //     1100px column — crossing discarded 478px of persistent chrome.
@@ -281,6 +283,107 @@ for (const v of WIDTHS) {
     ok(`${v.w}px: departed ${departedFrom} via ${JSON.stringify(inward.trail)} -> ${landed} -> back in ${steps} step(s), and a RELOAD of that URL still shows "${after.selected}" on its "${after.tab}" tab`);
   } else {
     fail(`${v.w}px: back put ${back} in the address bar, but RELOADING it shows initiative ${JSON.stringify(after.selected)} on tab ${JSON.stringify(after.tab)} — expected "${DEPART_FROM.title}" on Arena. The view was right only because the component never unmounted.`);
+  }
+}
+
+// ============ 4b. A LONG WANDER. The URL must not grow as the person moves around inside the
+// arena, and the origin must still be there at the end of it.
+//
+// MEASURED on c24c54d, phone width, entering by the global Arena item: 51 chars, then 78 after "the
+// four parts", then 119 after "Open the arena". Each hop URL-encoded the whole previous address,
+// `from` and all, into the next one, so the escaping gained a level every time (%2F -> %252F ->
+// %25252F) and the length grew faster than linearly. SIX hops, not two: the bug needs room to show
+// itself, and a two-hop check would have passed at 78 characters.
+//
+// Both halves are asserted, because they are different properties and a predecessor-pointer fix
+// buys only the first: the length stays under a stated constant, AND clicking back at the end of
+// the wander still lands on the initiative the person started from, after a reload.
+//
+// ON THE NUMBER OF HOPS, because a bound is only as good as the depth it is tested at. The request
+// was 5 or 6. The SHIPPED UI cannot be walked that far forward: the forward graph inside the arena
+// is list -> detail -> arena, the arena page is a leaf (its only forward link is the Plan tab, on
+// /initiatives), and detail-to-detail links are the LINEAGE, which is an ancestor chain and so
+// always terminates at a root with no ancestors. Measured here: 2 hops is the maximum, and 2 is
+// also exactly the depth the nesting bug was measured at (51 -> 78 -> 119 chars). So the depth is
+// split: this check walks the real maximum and ASSERTS it is still the maximum, and the 6-hop
+// bound lives in `arena-nav.spec.ts`, which feeds the function the chain the UI cannot yet produce.
+// If someone adds a deeper forward link, EXPECTED_HOPS fails and says to raise it here too.
+const MAX_URL = 128;
+const HOPS = 8;
+const EXPECTED_HOPS = 2;
+for (const v of WIDTHS) {
+  await setVw(v);
+  await go('/initiatives');
+  if (!(await selectInitiativeByClick(DEPART_FROM.title))) { fail(`${v.w}px wander: could not select "${DEPART_FROM.title}"`); continue; }
+  if (!(await clickTab('arena'))) { fail(`${v.w}px wander: no Arena tab after selecting "${DEPART_FROM.title}"`); continue; }
+  await settle(1300);
+  const origin = at();
+  const inward = await clickToward(/workflow|arena/, 4);
+  if (!inward.reached) { fail(`${v.w}px wander: could not click into the arena from ${origin}`); continue; }
+
+  // Wander forward inside the arena by clicking workflow links, never the same URL twice in a row.
+  const seen = [at()];
+  for (let hop = 0; hop < HOPS; hop++) {
+    const moved = await page.evaluate(() => {
+      const here = location.pathname;
+      // The PAGE's own links, not the global nav's. The rail and the bottom bar both link to
+      // `/workflows`, and clicking one of those is a context-free jump to the area's root that
+      // deliberately resets the origin — real behaviour, but not a hop in a trail, and including it
+      // made this check report a reset as a nesting bug.
+      const links = [...document.querySelectorAll('a[href^="/workflows"]')]
+        .filter((a) => !a.closest('.gnav') && !a.closest('nav.botnav'))
+        .filter((a) => a.getClientRects().length && (a.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ?? true))
+        .filter((a) => new URL(a.href, location.origin).pathname !== here);
+      // PREFER A DESTINATION THAT CAN BE LEFT AGAIN. `/workflows/:id/arena` is a leaf — its only
+      // forward link is the Plan tab, on /initiatives — so taking it early ends the wander after
+      // two hops, which is exactly the length the measured nesting bug survived. The detail pages
+      // link to each other through the lineage, so alternating between them loops as long as
+      // needed; revisiting a path is fine, because every visit re-renders `from` from the CURRENT
+      // URL and a compounding bug would compound again.
+      const link = links.find((a) => !new URL(a.href, location.origin).pathname.endsWith('/arena')) ?? links[0];
+      if (!link) return null;
+      const label = (link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 30);
+      link.click();
+      return label;
+    });
+    if (!moved) break;
+    await settle(1400);
+    seen.push(at());
+  }
+  const over = seen.filter((u) => u.length > MAX_URL);
+  const queries = [...new Set(seen.slice(1).map((u) => (u.includes('?') ? u.slice(u.indexOf('?')) : '')))];
+  if (over.length) {
+    fail(`${v.w}px wander: ${over.length} of ${seen.length} URLs exceeded ${MAX_URL} chars over ${seen.length - 1} hops — longest ${Math.max(...seen.map((u) => u.length))} chars: ${JSON.stringify(over[over.length - 1])}`);
+  } else if (queries.length > 1) {
+    fail(`${v.w}px wander: the query changed from hop to hop (${queries.length} distinct) instead of forwarding one origin — ${JSON.stringify(queries)}`);
+  } else if (seen.length - 1 !== EXPECTED_HOPS) {
+    // Judged AFTER length and query, so a compounding trail is diagnosed as a compounding trail.
+    // (It is not a theoretical ordering: under the nesting bug the detail page's own back link
+    // became a `/workflows?from=…` URL, which made it a forward candidate, and the walk bounced
+    // between two pages for all 8 hops. Checked first, this branch blamed the link graph.)
+    fail(`${v.w}px wander: the arena offered ${seen.length - 1} forward hop(s), not the ${EXPECTED_HOPS} this check is calibrated to. If a deeper link was ADDED, raise EXPECTED_HOPS here and the hop count in arena-nav.spec.ts with it; if one was LOST, the trail is no longer being exercised. ${JSON.stringify(seen)}`);
+  } else {
+    // AND the origin still works at the end of it.
+    let steps = 0;
+    for (let i = 0; i < 8; i++) {
+      const clicked = await page.evaluate(() => { const b = document.querySelector('a.a-back'); if (!b) return false; b.click(); return true; });
+      if (!clicked) break;
+      steps++;
+      await settle(1200);
+      if (at().startsWith('/initiatives')) break;
+    }
+    const back = at();
+    await page.reload({ waitUntil: 'networkidle2' });
+    await settle(1800);
+    const after = await page.evaluate(() => ({
+      selected: (document.querySelector('.init-row.sel .t') ?? document.querySelector('button.init.sel .t'))?.textContent?.trim() ?? null,
+      tab: [...document.querySelectorAll('.pane-tab')].find((b) => b.classList.contains('on'))?.innerText?.trim() ?? null,
+    }));
+    if (back === origin && after.selected === DEPART_FROM.title && /arena/i.test(after.tab ?? '')) {
+      ok(`${v.w}px wander: ${seen.length - 1} hops (the UI's maximum), every URL <= ${Math.max(...seen.map((u) => u.length))} chars with ONE unchanging query ${JSON.stringify(queries[0])}, and back (${steps} step(s)) + reload still shows "${after.selected}" on "${after.tab}" — the 6-hop bound is in arena-nav.spec.ts`);
+    } else {
+      fail(`${v.w}px wander: ${seen.length - 1} hops stayed short, but back (${steps} step(s)) put ${back} in the address bar and a reload shows ${JSON.stringify(after.selected)} on ${JSON.stringify(after.tab)} — expected ${origin} and "${DEPART_FROM.title}" on Arena. A bounded trail that loses the origin is half a fix.`);
+    }
   }
 }
 

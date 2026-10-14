@@ -8,6 +8,11 @@
  * (`app.routes.ts`); no new routes are added. `icon` names must be registered via
  * `addIcons` in `app.component.ts`.
  */
+// `arena-nav.ts` is pure — no Angular, no service, no GraphQL document — so naming the parameter
+// and the strip in one place costs this eagerly-loaded module a few hundred bytes and removes the
+// chance of the global entry and the arena pages disagreeing about what `from` is called.
+import { ARENA_RETURN_PARAM, stripReturnParam } from './pages/arena/arena-nav';
+
 export interface NavItem {
   id: 'work' | 'arena' | 'files' | 'shells' | 'settings';
   /** Caption shown under the icon (rail `.cap` / bottom-nav label). */
@@ -79,6 +84,11 @@ export function litNavItemIds(url: string): NavItem['id'][] {
  * The query the GLOBAL arena entry carries, so tapping it from the console does not throw away
  * which initiative you were on.
  *
+ * The console URL is stripped of any `from` of its own before being used as one: entering from the
+ * console makes the CONSOLE the origin, and carrying a stale origin forward is how a `from` trail
+ * starts nesting and re-encoding itself (measured: 51 -> 78 -> 119 chars over three hops, the
+ * escaping gaining a level each time).
+ *
  * Measured at 1440x900 on a 3-initiative fixture, with the global entry added and this function
  * NOT yet written: on initiative p2's Arena tab, tapping the rail's Arena item and then the arena's
  * back link put a bare `/initiatives` in the address bar; reloading that landed on p1's Raw
@@ -94,5 +104,6 @@ export function navLinkQueryParams(item: NavItem, url: string): Record<string, s
   if (item.id !== 'arena') return {};
   const pathOnly = url.split('#')[0].split('?')[0];
   const inConsole = pathOnly === '/initiatives' || pathOnly.startsWith('/initiatives/');
-  return inConsole && url.startsWith('/') ? { from: url } : {};
+  if (!inConsole || !url.startsWith('/')) return {};
+  return { [ARENA_RETURN_PARAM]: stripReturnParam(url) };
 }

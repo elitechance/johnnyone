@@ -44,6 +44,8 @@ import puppeteer from 'puppeteer';
 // `nx build web` has to have run; pointing it at anything else is how a previous version of this
 // file produced seven screenshots of a 404 body.
 //
+// PORT defaults to 8177, not 8099 — see the constant.
+//
 // OUT DIR defaults OUTSIDE the repository, and that is deliberate: the screenshots are read as
 // local files on a phone and must never land in a diff. The reviewer's own folder is passed
 // explicitly — the convention on this machine is
@@ -52,7 +54,10 @@ const ROOT = process.argv[2] || 'dist/web/browser';
 const OUT =
   process.argv[3] || process.env.ARENA_HARNESS_OUT || join(tmpdir(), 'arena-phone-harness');
 const LABEL = process.argv[4] || 'after';
-const PORT = Number(process.argv[5] || 8099);
+// NOT 8099: that is a port a human's preview server has sat on more than once while this harness
+// was being run, and the collision reads as a harness crash rather than a port clash. Pass one if
+// you need a specific port.
+const PORT = Number(process.argv[5] || 8177);
 /**
  * `errors` makes EVERY GraphQL operation fail. It exists to prove the marker check is not satisfied
  * by static template copy: with it, a route whose marker is a hard-coded string in the template
