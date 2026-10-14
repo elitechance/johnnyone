@@ -158,6 +158,13 @@ type AgentPlan {
   executorConfig: String
   # Host consecutive_non_pass_planning_rounds for the initiative. Nullable for deploy-skew.
   consecutiveNonPassPlanningRounds: Int
+  # The coordinator's own test gate (migration 023): shell commands it runs itself, from
+  # workspacePath, when a phase reports ready. The host parses the stored JSON array and serves
+  # this list, so no client ever handles the encoding. NULLABLE for the same deploy-skew reason as
+  # validationConfig: a worker deploy against a pre-migration-023 desktop returns JSON without the
+  # key, and nullable degrades to null instead of failing non-null coercion on every
+  # AgentPlan-returning operation. Null or empty = no plan-level gate (opt-in).
+  testCommands: [String!]
   createdAt: String!
   updatedAt: String!
 }
@@ -179,6 +186,45 @@ type AgentPlanPhase {
   findingsJson: String!
   createdAt: String!
   updatedAt: String!
+  # This phase's OWN gate (migration 025). Nullable for deploy-skew, like the plan's above.
+  # Null or empty means this phase declares no gate and inherits the plan's — see
+  # effectiveTestCommands, which is the field to render and the field to trust.
+  testCommands: [String!]
+  # The gate that ACTUALLY applies to this phase: its own commands when it declares any, else the
+  # plan's. Resolved on the host by `services::agent_plans::effective_test_commands`, the single
+  # place that precedence lives, so no UI re-implements the fallback and no two clients can
+  # disagree about what a phase is held to. Non-null: an empty list is the honest answer when
+  # there is no gate at either level.
+  #
+  # Note the deploy-skew asymmetry with the nullable fields above is deliberate — a pre-025
+  # desktop omits the key and a non-null list coerces to [] via the default, which is exactly the
+  # correct "no gate" reading.
+  effectiveTestCommands: [String!]!
+}
+
+# One run of a phase's (or a plan's) effective test gate — see the runAgentPlanTestGate mutation.
+type TestGateRun {
+  # The score. Zero means the gate passed; anything else is the exit code of the FIRST command
+  # that failed (-1 when a signal killed it and no code was reported). This is the ONLY score the
+  # gate has, by design: a numeric quality score would need a scale, a writer and an interpreter,
+  # and each is a place for a false pass to hide.
+  exitCode: Int!
+  # How many tests the run reported, parsed best-effort from its output.
+  #
+  # NULLABLE BY DESIGN, and null is NOT an error. A gate that prints nothing a parser recognises —
+  # a lint, a build, a bespoke script, a runner whose summary format the host has never seen — is a
+  # perfectly legitimate gate with a perfectly well-known exit code. Treat this as a display hint
+  # only: never gate on it, never compare it across runs, never store it.
+  collected: Int
+  # The command whose exitCode is reported: the first failure, or the last command on success.
+  # Null when the phase has no gate at either level.
+  command: String
+  # Commands actually executed — fewer than the gate declares when one failed and stopped the run.
+  commandsRun: Int!
+  # Captured stdout+stderr of the reported command, size-capped on the host (128 KiB per stream).
+  output: String!
+  # True when the cap discarded earlier output, so this is a tail window rather than the whole run.
+  truncated: Boolean!
 }
 
 type AgentPlanTask {
@@ -610,6 +656,16 @@ type Mutation {
   # Overhaul phase 7 (D1). Persist the Initiative's ordered validation-lens array as a JSON string;
   # a null/empty config clears it (→ desktop resolves the default product/qa/lead template).
   updateAgentPlanValidationConfig(id: ID!, config: String): AgentPlanRun!
+  # Set the coordinator's test gate (migrations 023 / 025). `phaseId` picks the level: null writes
+  # the PLAN's gate, a phase id writes that phase's. An absent or empty `commands` CLEARS the gate
+  # at that level, which is what makes it opt-in — a cleared phase falls back to the plan, a
+  # cleared plan means no gate at all.
+  updateAgentPlanTestCommands(id: ID!, phaseId: String, commands: [String!]): AgentPlanRun!
+  # Run a phase's (or the plan's) effective gate ONCE and report the outcome, without bouncing the
+  # worker. Same resolution rule and same shell as the coordinator's automatic ready-check, so
+  # what this reports is what the coordinator would see. Commands run sequentially from the plan's
+  # workspacePath and stop at the first non-zero exit.
+  runAgentPlanTestGate(id: ID!, phaseId: String): TestGateRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!

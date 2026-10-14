@@ -1259,6 +1259,13 @@ impl AgentService {
             "update_agent_plan_validation_config" => {
                 Self::rpc_update_agent_plan_validation_config(&req.params, state)
             }
+            // --- the test gate (migration 023 plan-level, 025 phase-level) ---
+            "update_agent_plan_test_commands" => {
+                Self::rpc_update_agent_plan_test_commands(&req.params, state)
+            }
+            "run_agent_plan_test_gate" => {
+                Self::rpc_run_agent_plan_test_gate(&req.params, state).await
+            }
             "refresh_agent_plan_phases" => {
                 Self::rpc_refresh_agent_plan_phases(&req.params, state)
             },
@@ -1761,6 +1768,68 @@ impl AgentService {
             config,
         )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    // --- the test gate ---
+    // Thin param-pullers mirroring rpc_update_agent_plan_validation_config: read typed params,
+    // call the service, serialize. The phase-over-plan resolution rule is NOT here — it lives in
+    // `services::agent_plans::effective_test_commands` and nowhere else.
+
+    fn rpc_update_agent_plan_test_commands(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        // Optional: absent/null targets the PLAN's gate, present targets that phase's.
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        // Optional: absent or empty CLEARS the gate at the chosen level.
+        let commands: Vec<String> = params
+            .get("commands")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let run = crate::services::agent_plans::update_test_commands(
+            state,
+            id.to_string(),
+            phase_id,
+            commands,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_run_agent_plan_test_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        let result = crate::services::agent_plans::run_plan_test_gate(
+            state,
+            id.to_string(),
+            phase_id,
+        )
+        .await?;
+        serde_json::to_value(result).map_err(|e| e.to_string())
     }
 
     fn rpc_refresh_agent_plan_phases(

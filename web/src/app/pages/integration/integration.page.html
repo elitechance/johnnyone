@@ -180,6 +180,8 @@
       <tr><td>Stop</td><td><code>updateAgentPlanStopped(id: ID!): AgentPlanRun!</code></td></tr>
       <tr><td>App scope</td><td><code>updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!</code></td></tr>
       <tr><td>Block</td><td><code>updateAgentPlanBlocked(id: ID!, reason: String!): AgentPlanRun!</code></td></tr>
+      <tr><td>Test gate (set)</td><td><code>updateAgentPlanTestCommands(id: ID!, phaseId: String, commands: [String!]): AgentPlanRun!</code></td></tr>
+      <tr><td>Test gate (run once)</td><td><code>runAgentPlanTestGate(id: ID!, phaseId: String): TestGateRun!</code></td></tr>
       <tr><td>Delete</td><td><code>deleteAgentPlan(id: ID!): Boolean!</code></td></tr>
     </table>
     <p>

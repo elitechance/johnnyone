@@ -46,6 +46,12 @@ const SCOPE_GATED: Record<string, string> = {
   // gated too rather than left on identity alone.
   'get-setting.ts': 'settings:read',
 
+  // ── The coordinator's test gate (migrations 023 / 025) ──
+  // Setting the gate decides what a phase is held to, and RUNNING it executes an arbitrary shell
+  // command on the host. Both are writes; the run is deliberately NOT a read scope.
+  'update-agent-plan-test-commands.ts': 'plans:write',
+  'run-agent-plan-test-gate.ts': 'plans:write',
+
   // ── Host plan-workspace file read ──
   // The host path-confines read_host_file to the plan's workspace_path, so the
   // residual exposure is purely "which identity may ask" — a file read.

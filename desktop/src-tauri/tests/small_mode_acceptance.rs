@@ -292,6 +292,7 @@ fn dummy_run_for(
             dev_worker_provider: None,
             dev_reviewer_provider: None,
             test_commands: None,
+            test_commands_list: Vec::new(),
         },
         phases: vec![AgentPlanPhase {
             id: format!("{plan_id}-{phase}"),
@@ -310,6 +311,9 @@ fn dummy_run_for(
             findings_json: "[]".into(),
             created_at: String::new(),
             updated_at: String::new(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
         }],
         tasks: vec![],
         events: vec![],

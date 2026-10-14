@@ -75,7 +75,7 @@ Cheap mechanical checks that run **before** a review round is spent. Each return
 |---|---|---|
 | `planning_deliverable_missing` | planning | the store has no `overview.md` or an empty `phases/` |
 | `acceptance_not_executable` | planning | a phase states no acceptance criteria, or states one that does not name what decides it |
-| `failing_test_command` | phase | the plan's declared `test_commands` do not pass, run by the coordinator itself |
+| `failing_test_command` | phase | the phase's **effective** declared `test_commands` do not pass, run by the coordinator itself. The effective gate is the phase's own `test_commands` (migration 025) when it declares any, else the plan's (migration 023) — resolved in one place, `services::agent_plans::effective_test_commands`, and exposed to clients as `AgentPlanPhase.effectiveTestCommands`. `runAgentPlanTestGate` runs the same gate once on demand and reports its exit code (authoritative) plus an advisory, nullable collected-test count. |
 | `spec_weakened_reason` | phase | spec lines were removed from the plan store during development |
 | `evidence_provenance_reason` | phase | screenshots are byte-identical to each other, or nothing describes them |
 | `unfinished_tasks_reason` | phase | task `status.yml` files are not `done` |

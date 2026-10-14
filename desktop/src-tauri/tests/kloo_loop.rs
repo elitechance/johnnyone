@@ -169,6 +169,7 @@ fn dummy_run(ws: &Path, plan: &Path, plan_id: &str, initiative: &str) -> AgentPl
             dev_worker_provider: None,
             dev_reviewer_provider: None,
             test_commands: None,
+            test_commands_list: Vec::new(),
         },
         phases: vec![phase],
         tasks: vec![],
@@ -194,6 +195,9 @@ fn dummy_phase(plan_id: &str, phase_id: &str) -> AgentPlanPhase {
         findings_json: "[]".into(),
         created_at: String::new(),
         updated_at: String::new(),
+        test_commands: None,
+        test_commands_list: Vec::new(),
+        effective_test_commands: Vec::new(),
     }
 }
 

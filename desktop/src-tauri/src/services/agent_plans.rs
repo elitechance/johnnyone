@@ -831,6 +831,12 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
         tasks,
         events,
     };
+    // The single place a phase's effective gate is materialised for the API. One emitter, one
+    // rule: `effective_test_commands`. No consumer re-implements the phase-over-plan fallback.
+    for index in 0..run.phases.len() {
+        let resolved = effective_test_commands(&run.plan, Some(&run.phases[index]));
+        run.phases[index].effective_test_commands = resolved;
+    }
     run.plan.consecutive_non_pass_planning_rounds = Some(
         consecutive_non_pass_planning_rounds_for_initiative(state, &run.plan.initiative_id)?,
     );
@@ -1212,6 +1218,86 @@ pub fn update_plan_app_scope(
 /// (a malformed string is rejected, not silently written) and each lens's `provider` must be a
 /// real `CliProvider` (D13 — a typo/hostile config can't smuggle an unrunnable provider into the
 /// review fan-out). An empty array is allowed and stored as-is (→ resolve falls back to default).
+/// Set the test gate on a plan, or on ONE of its phases.
+///
+/// `phase_id` picks the level: `None` writes the plan's gate, `Some(phase_id)` writes that phase's.
+/// `commands` is the gate as a list; an empty list (or all-blank entries) CLEARS it to NULL, which
+/// is what makes the gate opt-in at both levels — a cleared phase falls back to the plan, and a
+/// cleared plan means no gate at all. Mirrors `update_plan_validation_config`: validate, confirm
+/// the row exists, write, record an event, return the fresh run.
+///
+/// The list is serialized to the storage encoding here and parsed back by the row mappers, so the
+/// JSON-array shape stays an implementation detail of this file.
+pub fn update_test_commands(
+    state: &AppState,
+    id: String,
+    phase_id: Option<String>,
+    commands: Vec<String>,
+) -> Result<AgentPlanRun, String> {
+    let commands: Vec<String> = commands
+        .into_iter()
+        .filter(|command| !command.trim().is_empty())
+        .collect();
+    // Empty = clear. NULL and "[]" both resolve to "no gate at this level", and NULL is the shape
+    // migrations 023/025 default to, so clearing returns the column to its pristine state.
+    let stored: Option<String> = if commands.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&commands).map_err(|e| e.to_string())?)
+    };
+    // Ensure the plan exists (clear error if not) before writing.
+    get_plan(state, &id)?;
+    match phase_id.as_deref() {
+        Some(phase_id) => {
+            let changed = state.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plan_phases SET test_commands = ?1, updated_at = datetime('now') WHERE plan_id = ?2 AND phase_id = ?3",
+                    params![stored, id, phase_id],
+                )
+                .map_err(|e| e.to_string())
+            })?;
+            if changed == 0 {
+                return Err(format!("Phase not found: {}", phase_id));
+            }
+        }
+        None => {
+            state.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET test_commands = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    params![stored, id],
+                )
+                .map_err(|e| e.to_string())
+            })?;
+        }
+    }
+    append_event(
+        state,
+        &id,
+        phase_id.as_deref(),
+        "agent_plan_test_commands_updated",
+        json!({ "phaseId": phase_id, "commands": commands.len() }),
+    )?;
+    get_plan(state, &id)
+}
+
+/// Run a plan's or phase's effective test gate ONCE, on request, and report the outcome.
+///
+/// Resolves the gate with [`effective_test_commands`] — the same rule the coordinator's automatic
+/// ready-check uses — so what this reports is what the coordinator would see. `phase_id` is
+/// optional: `None` runs the plan-level gate.
+pub async fn run_plan_test_gate(
+    state: &AppState,
+    id: String,
+    phase_id: Option<String>,
+) -> Result<TestGateRun, String> {
+    let run = get_plan(state, &id)?;
+    let phase = match phase_id.as_deref() {
+        Some(phase_id) => Some(find_phase(&run, phase_id)?),
+        None => None,
+    };
+    run_test_gate(&run.plan, phase.as_ref()).await
+}
+
 pub fn update_plan_validation_config(
     state: &AppState,
     id: String,
@@ -2676,6 +2762,259 @@ fn collect_prose(dir: &Path, out: &mut String) {
     }
 }
 
+/// Hard ceiling on the output a single gate command may buffer, per stream (stdout, stderr).
+///
+/// A gate is an arbitrary shell command; a chatty or looping suite can emit gigabytes. This repo
+/// has already been OOM-killed once by an unbounded read of workspace bytes, so the capture is a
+/// bounded TAIL window: bytes past the cap push the oldest bytes out instead of growing the buffer.
+/// Peak memory is therefore `cap + read-buffer` per stream, whatever the command prints, and the
+/// kept window is the END of the output — where every test runner puts its summary.
+pub const TEST_GATE_STREAM_CAP_BYTES: usize = 128 * 1024;
+
+/// Read `reader` to EOF but keep only the last `cap` bytes.
+///
+/// Draining to EOF (rather than stopping at the cap) is deliberate: a reader that stops reading
+/// fills the pipe buffer and the child blocks on write forever, which would turn an over-chatty
+/// gate into a hung coordinator instead of a reported exit code.
+async fn drain_capped_tail<R>(mut reader: R, cap: usize) -> (String, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > cap {
+                    let overflow = kept.len() - cap;
+                    kept.drain(..overflow);
+                    truncated = true;
+                }
+            }
+        }
+    }
+    (String::from_utf8_lossy(&kept).into_owned(), truncated)
+}
+
+/// The shell a gate command is run with. One place, so the gate runner and the coordinator's
+/// ready-check can never disagree about how a command is interpreted.
+fn gate_shell() -> (&'static str, &'static str) {
+    if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    }
+}
+
+/// Parse one `test_commands` payload: a JSON array of shell strings.
+///
+/// Anything unparseable yields an EMPTY list, never an error. A malformed gate is a configuration
+/// mistake, not a test failure, and failing a phase over it would punish the wrong thing.
+fn parse_test_commands(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Vec::new();
+    };
+    let parsed: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+    parsed
+        .into_iter()
+        .filter(|command| !command.trim().is_empty())
+        .collect()
+}
+
+/// **The resolution rule.** The test gate that actually applies to a phase: the phase's own
+/// `test_commands` when it declares any, otherwise the plan's.
+///
+/// Migration 023 put the gate on the plan, 025 put it on the phase. Both levels exist because one
+/// command for a whole Initiative is the wrong grain — an early schema phase and a late UI phase
+/// do not share a suite. The precedence between them is one line of logic and therefore exactly
+/// one function: this repo has already been bitten by three independent writers of one SQL clause
+/// drifting apart (see `DETACH_TERMINAL_SET` in `terminal.rs`, hoisted for that reason), and a
+/// gate that resolves differently in the coordinator than in the UI is a false pass waiting to
+/// happen. Every caller — the coordinator's ready-check, the run-once host command, and the
+/// `effectiveTestCommands` the API exposes — goes through here. Do not inline the fallback.
+///
+/// An empty result means there is no gate at either level, which is the opt-in default: NULL or
+/// empty preserves the pre-023 behaviour of trusting the agent's own report.
+pub fn effective_test_commands(plan: &AgentPlan, phase: Option<&AgentPlanPhase>) -> Vec<String> {
+    let from_phase = parse_test_commands(phase.and_then(|phase| phase.test_commands.as_deref()));
+    if !from_phase.is_empty() {
+        return from_phase;
+    }
+    parse_test_commands(plan.test_commands.as_deref())
+}
+
+/// Outcome of running a phase's effective gate once.
+///
+/// `exit_code` is authoritative and is the ONLY score this feature has: zero means the gate
+/// passed, anything else means it failed. `collected` is advisory — see its doc comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestGateRun {
+    /// Exit code of the run: `0` when every command succeeded, otherwise the code of the FIRST
+    /// command that failed (`-1` when the process was killed by a signal and reported no code).
+    pub exit_code: i32,
+    /// How many tests the run reported, parsed best-effort from its output — see
+    /// [`parse_collected_count`].
+    ///
+    /// **Nullable by design, and `None` is not an error.** A gate that prints nothing a parser
+    /// recognises (a lint, a build, a bespoke script, a runner whose summary format we have never
+    /// seen) is a perfectly legitimate gate with a perfectly well-known exit code. Callers MUST
+    /// treat this as a display hint only and MUST NOT gate on it, compare it, or persist it.
+    pub collected: Option<i64>,
+    /// The command whose exit code is reported: the first failure, or the last command on success.
+    /// `None` when the phase has no gate at all.
+    pub command: Option<String>,
+    /// Commands actually executed. Fewer than the gate declares when one failed and stopped the run.
+    pub commands_run: i64,
+    /// Captured stdout+stderr tail of the reported command, bounded by
+    /// [`TEST_GATE_STREAM_CAP_BYTES`] per stream.
+    pub output: String,
+    /// True when the cap discarded earlier output, so a reader knows the window is a tail.
+    pub truncated: bool,
+}
+
+/// Best-effort count of the tests a gate run reported.
+///
+/// There is no portable way to ask an arbitrary shell command how many tests it ran, so this reads
+/// the output. It scans every line for `<number> <keyword>` pairs (`passed`, `passing`, `failed`,
+/// `failing`, `skipped`, `ignored`, `pending`, `todo`) and sums them, and understands two common
+/// summary idioms specially: an explicit `N total` (jest) wins over the sum on its line, and
+/// `Executed N of M` (karma) reports `M`.
+///
+/// The LARGEST per-line candidate wins, not the last. Runners print per-file or per-crate lines
+/// alongside a grand total, and the grand total is the biggest of them — cargo emits one
+/// `test result:` line per test binary, vitest prints `Test Files` before `Tests`, karma repeats
+/// an incrementing `Executed N of M`. Last-wins got mocha wrong, which prints `12 passing` and
+/// `1 failing` on separate lines and so reported 1. Taking the max costs precision in that one
+/// case (mocha reports 12, not 13) and that is an acceptable trade for an advisory number.
+///
+/// Returns `None` whenever nothing matched. That is a normal outcome, not a failure: the exit code
+/// is the score. Never make a decision on this number.
+pub fn parse_collected_count(output: &str) -> Option<i64> {
+    const COUNTED: [&str; 8] = [
+        "passed", "passing", "failed", "failing", "skipped", "ignored", "pending", "todo",
+    ];
+    let mut best: Option<i64> = None;
+    for line in output.lines() {
+        let tokens: Vec<String> = line
+            .split_whitespace()
+            .map(|token| {
+                token
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let mut sum: Option<i64> = None;
+        let mut total: Option<i64> = None;
+        let mut executed_of: Option<i64> = None;
+        for (index, token) in tokens.iter().enumerate() {
+            let Ok(number) = token.parse::<i64>() else {
+                continue;
+            };
+            // `Executed 288 of 293` — the denominator is what was collected.
+            if index >= 1
+                && tokens[index - 1] == "executed"
+                && tokens.get(index + 1).map(String::as_str) == Some("of")
+            {
+                executed_of = tokens.get(index + 2).and_then(|t| t.parse::<i64>().ok());
+            }
+            match tokens.get(index + 1).map(String::as_str) {
+                Some("total") => total = Some(number),
+                Some(next) if COUNTED.contains(&next) => {
+                    sum = Some(sum.unwrap_or(0) + number);
+                }
+                _ => {}
+            }
+        }
+        if let Some(found) = executed_of.or(total).or(sum) {
+            best = Some(best.map_or(found, |previous: i64| previous.max(found)));
+        }
+    }
+    best
+}
+
+/// Run a phase's effective gate ONCE and report its exit code (plus an advisory collected count).
+///
+/// This is the on-demand counterpart to the coordinator's automatic ready-check: same resolution
+/// rule ([`effective_test_commands`]), same shell, same sequential stop-at-first-failure
+/// semantics, but it reports instead of bouncing the worker. Commands run from the plan's
+/// `workspace_path` — phases have no workspace of their own.
+///
+/// A phase with no gate at either level is not an error: it reports `exit_code: 0` with
+/// `commands_run: 0` and no command, which says truthfully "nothing to run, nothing failed".
+pub async fn run_test_gate(
+    plan: &AgentPlan,
+    phase: Option<&AgentPlanPhase>,
+) -> Result<TestGateRun, String> {
+    let commands = effective_test_commands(plan, phase);
+    let (shell, flag) = gate_shell();
+    let mut last = TestGateRun {
+        exit_code: 0,
+        collected: None,
+        command: None,
+        commands_run: 0,
+        output: String::new(),
+        truncated: false,
+    };
+    for command in commands {
+        tracing::info!(plan_id = %plan.id, %command, "running declared test command on request");
+        let mut child = tokio::process::Command::new(shell)
+            .arg(flag)
+            .arg(&command)
+            .current_dir(&plan.workspace_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "Could not run the test command `{}` in {}: {}",
+                    command, plan.workspace_path, error
+                )
+            })?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let cap = TEST_GATE_STREAM_CAP_BYTES;
+        // BOTH pipes must be drained concurrently. Draining stdout to EOF first deadlocks as soon
+        // as the child fills the stderr pipe buffer: it blocks on write, stdout never reaches EOF,
+        // and the gate hangs forever instead of reporting an exit code.
+        let ((out, out_truncated), (err, err_truncated)) = tokio::join!(
+            async {
+                match stdout {
+                    Some(pipe) => drain_capped_tail(pipe, cap).await,
+                    None => (String::new(), false),
+                }
+            },
+            async {
+                match stderr {
+                    Some(pipe) => drain_capped_tail(pipe, cap).await,
+                    None => (String::new(), false),
+                }
+            },
+        );
+        let status = child.wait().await.map_err(|error| {
+            format!("Could not wait on the test command `{}`: {}", command, error)
+        })?;
+        let combined = format!("{}\n{}", out, err);
+        last = TestGateRun {
+            exit_code: status.code().unwrap_or(-1),
+            collected: parse_collected_count(&combined),
+            command: Some(command.clone()),
+            commands_run: last.commands_run + 1,
+            output: combined,
+            truncated: out_truncated || err_truncated,
+        };
+        // Sequential, stop at the first non-zero: a later command cannot un-fail an earlier one.
+        if last.exit_code != 0 {
+            break;
+        }
+    }
+    Ok(last)
+}
+
 /// Run the plan's declared test commands and return the first failure, if any.
 ///
 /// "All three test layers green" is the project's phase rule, but the coordinator only ever learned
@@ -2686,18 +3025,21 @@ fn collect_prose(dir: &Path, out: &mut String) {
 ///
 /// Opt-in: `test_commands` is a JSON array of shell strings run from `workspace_path`. NULL or empty
 /// keeps the previous behaviour exactly, so existing plans are unaffected.
+///
+/// Which commands those are is NOT decided here — it is [`effective_test_commands`], the one place
+/// the phase-over-plan fallback lives. Pass the phase that reported ready so a phase declaring its
+/// own gate is held to its own gate.
 async fn failing_test_command(
     plan: &AgentPlan,
+    phase: Option<&AgentPlanPhase>,
 ) -> Option<String> {
-    let raw = plan.test_commands.as_deref()?.trim().to_string();
-    if raw.is_empty() {
+    let commands = effective_test_commands(plan, phase);
+    if commands.is_empty() {
         return None;
     }
-    let commands: Vec<String> = serde_json::from_str(&raw).ok()?;
-    let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
-    let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+    let (shell, flag) = gate_shell();
 
-    for command in commands.iter().filter(|c| !c.trim().is_empty()) {
+    for command in commands.iter() {
         tracing::info!(plan_id = %plan.id, %command, "coordinator running declared test command");
         let output = tokio::process::Command::new(shell)
             .arg(flag)
@@ -2813,7 +3155,7 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
     wait_for_worker_ready(state, &session_id, &run.plan.id, Some(&phase.phase_id)).await?;
     // Phase-ready gates (main's SDLC false-pass defenses): verify the phase's own claims before
     // spending a three-lens review round. Each bounces the worker and re-polls on the next tick.
-    if let Some(reason) = failing_test_command(&run.plan).await {
+    if let Some(reason) = failing_test_command(&run.plan, Some(&phase)).await {
         tracing::warn!(plan_id = %run.plan.id, phase = %phase.phase_id, "declared tests failed on a ready report");
         bounce_ready_or_escalate(state, run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_tests_failed", &reason).await?;
         return Ok(());
@@ -8340,7 +8682,7 @@ fn find_phase(run: &AgentPlanRun, phase_id: &str) -> Result<AgentPlanPhase, Stri
 fn list_phases(state: &AppState, plan_id: &str) -> Result<Vec<AgentPlanPhase>, String> {
     state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, plan_id, phase_id, phase_title, phase_index, status, worker_started_at, worker_idle_at, reviewer_started_at, reviewer_idle_at, gate_verdict, clarification_attempts, summary, findings_json, created_at, updated_at FROM agent_plan_phases WHERE plan_id = ?1 ORDER BY phase_index",
+            "SELECT id, plan_id, phase_id, phase_title, phase_index, status, worker_started_at, worker_idle_at, reviewer_started_at, reviewer_idle_at, gate_verdict, clarification_attempts, summary, findings_json, created_at, updated_at, test_commands FROM agent_plan_phases WHERE plan_id = ?1 ORDER BY phase_index",
         ).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![plan_id], agent_plan_phase_from_row)
@@ -9051,6 +9393,10 @@ pub(crate) fn is_text_content_type(content_type: &str) -> bool {
 }
 
 fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
+    // Parse the gate encoding once, at the SQL boundary. Every consumer above the host reads the
+    // parsed list, never the JSON string.
+    let test_commands: Option<String> = row.get(29)?;
+    let test_commands_list = parse_test_commands(test_commands.as_deref());
     Ok(AgentPlan {
         id: row.get(0)?,
         run_type: row.get(1)?,
@@ -9084,12 +9430,16 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         executor_config: row.get(26)?,
         dev_worker_provider: row.get(27)?,
         dev_reviewer_provider: row.get(28)?,
-        test_commands: row.get(29)?,
+        test_commands,
+        test_commands_list,
         consecutive_non_pass_planning_rounds: None,
     })
 }
 
 fn agent_plan_phase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlanPhase> {
+    // Migration 025, appended last — SELECT order is load-bearing and must match this index.
+    let test_commands: Option<String> = row.get(16)?;
+    let test_commands_list = parse_test_commands(test_commands.as_deref());
     Ok(AgentPlanPhase {
         id: row.get(0)?,
         plan_id: row.get(1)?,
@@ -9107,6 +9457,11 @@ fn agent_plan_phase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentP
         findings_json: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+        test_commands,
+        test_commands_list,
+        // Resolved against the plan when the run is assembled (`get_plan`) — a phase row alone
+        // cannot know the plan's fallback. Empty here, never a second copy of the rule.
+        effective_test_commands: Vec::new(),
     })
 }
 
@@ -9189,7 +9544,12 @@ fn event_actor(event_type: &str) -> &'static str {
         | "agent_plan_blocked"
         | "planning_started"
         | "planning_amend_requested"
-        | "agent_plan_phases_refreshed" => "user",
+        | "agent_plan_phases_refreshed"
+        // Config edits are human actions. `agent_plan_validation_config_updated` was never listed
+        // and so fell through to "coordinator", which misattributes a person's edit to the engine;
+        // both belong here.
+        | "agent_plan_validation_config_updated"
+        | "agent_plan_test_commands_updated" => "user",
         _ => "coordinator",
     }
 }
@@ -9459,6 +9819,21 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             }
         }
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
+        "agent_plan_test_commands_updated" => {
+            let count = payload
+                .get("commands")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let scope = match payload_str(payload, "phaseId") {
+                Some(phase_id) if !phase_id.is_empty() => format!("phase {phase_id}"),
+                _ => "the plan".to_string(),
+            };
+            if count == 0 {
+                format!("Cleared the test gate on {scope}")
+            } else {
+                format!("Set {count} test command(s) on {scope}")
+            }
+        }
         _ => humanize_event_type(&event.event_type),
     }
 }
@@ -10302,6 +10677,7 @@ mod store_tests {
             validation_config: None,
             dev_worker_provider: dev_worker.map(str::to_string),
             test_commands: None,
+            test_commands_list: Vec::new(),
             dev_reviewer_provider: dev_reviewer.map(str::to_string),
             executor_config: None,
             consecutive_non_pass_planning_rounds: None,
@@ -10882,11 +11258,11 @@ diff --git a/two.md b/two.md
         let dir = tmp_dir("tests-optin");
         let w = dir.to_string_lossy().to_string();
         // Unset and empty both preserve the previous behaviour: no gate, no failure.
-        assert!(failing_test_command(&plan_with_test_commands(&w, None)).await.is_none());
-        assert!(failing_test_command(&plan_with_test_commands(&w, Some(""))).await.is_none());
-        assert!(failing_test_command(&plan_with_test_commands(&w, Some("[]"))).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, None), None).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("")), None).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("[]")), None).await.is_none());
         // Malformed JSON must not fail a phase — it is a config error, not a test failure.
-        assert!(failing_test_command(&plan_with_test_commands(&w, Some("not json"))).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("not json")), None).await.is_none());
     }
 
     #[tokio::test]
@@ -10894,7 +11270,7 @@ diff --git a/two.md b/two.md
         let dir = tmp_dir("tests-pass");
         let w = dir.to_string_lossy().to_string();
         let plan = plan_with_test_commands(&w, Some(r#"["true","exit 0"]"#));
-        assert!(failing_test_command(&plan).await.is_none());
+        assert!(failing_test_command(&plan, None).await.is_none());
     }
 
     #[tokio::test]
@@ -10910,7 +11286,7 @@ diff --git a/two.md b/two.md
                 marker.to_string_lossy()
             )),
         );
-        let reason = failing_test_command(&plan).await.expect("must fail");
+        let reason = failing_test_command(&plan, None).await.expect("must fail");
         assert!(reason.contains("exit 3"), "{reason}");
         assert!(reason.contains("boom-on-stdout"), "output tail must be included: {reason}");
         assert!(
@@ -10920,10 +11296,315 @@ diff --git a/two.md b/two.md
         assert!(!marker.exists(), "commands after the first failure must not run");
     }
 
+    /// End-to-end through the REAL database: migration 025's column, the `list_phases` SELECT, the
+    /// row mapper's parse, and `get_plan`'s single resolution pass. The pure-function test above
+    /// proves the rule; this proves the rule is actually WIRED — a correct helper nothing calls is
+    /// the failure mode this feature started from (`test_commands` existed in SQLite and Rust and
+    /// was invisible to everything above the host).
+    #[tokio::test]
+    async fn get_plan_serves_the_stored_and_effective_test_commands() {
+        let (state, root) = test_state();
+        let plan_path = root.join("plan");
+        scaffold_plan(&plan_path, "test gate wiring");
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .expect("create plan");
+        let plan_id = run.plan.id.clone();
+
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status)
+                     VALUES ('phA', ?1, '01-own', 'Declares its own gate', 0, 'locked')",
+                    params![plan_id],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status)
+                     VALUES ('phB', ?1, '02-inherits', 'Inherits the plan gate', 1, 'locked')",
+                    params![plan_id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        // Set the gate through the public setter at both levels — the same path the API uses.
+        update_test_commands(&state, plan_id.clone(), None, vec!["npm run plan-gate".into()])
+            .expect("set the plan gate");
+        let run = update_test_commands(
+            &state,
+            plan_id.clone(),
+            Some("01-own".into()),
+            vec!["npm run phase-gate".into(), "  ".into()],
+        )
+        .expect("set the phase gate");
+
+        assert_eq!(run.plan.test_commands_list, vec!["npm run plan-gate".to_string()]);
+        let own = run.phases.iter().find(|p| p.phase_id == "01-own").unwrap();
+        let inherits = run.phases.iter().find(|p| p.phase_id == "02-inherits").unwrap();
+        // Blank entries are dropped on write, so the stored list is exactly the real commands.
+        assert_eq!(own.test_commands_list, vec!["npm run phase-gate".to_string()]);
+        assert_eq!(own.effective_test_commands, vec!["npm run phase-gate".to_string()]);
+        // A phase that declares nothing reports nothing of its own but still shows the gate it is
+        // actually held to. This is the field a UI renders; it never re-derives the fallback.
+        assert!(inherits.test_commands_list.is_empty());
+        assert_eq!(inherits.effective_test_commands, vec!["npm run plan-gate".to_string()]);
+
+        // Clearing the phase gate returns it to inheriting — the column goes back to NULL.
+        let run = update_test_commands(&state, plan_id.clone(), Some("01-own".into()), vec![])
+            .expect("clear the phase gate");
+        let own = run.phases.iter().find(|p| p.phase_id == "01-own").unwrap();
+        assert_eq!(own.test_commands, None, "clearing must write NULL, not \"[]\"");
+        assert_eq!(own.effective_test_commands, vec!["npm run plan-gate".to_string()]);
+
+        // Clearing the plan gate leaves no gate anywhere — the opt-in default.
+        let run = update_test_commands(&state, plan_id.clone(), None, vec![])
+            .expect("clear the plan gate");
+        assert!(run.plan.test_commands_list.is_empty());
+        assert!(run
+            .phases
+            .iter()
+            .all(|phase| phase.effective_test_commands.is_empty()));
+
+        // Writing to a phase that does not exist is an error, not a silent no-op.
+        let err = update_test_commands(&state, plan_id, Some("99-nope".into()), vec!["x".into()])
+            .expect_err("unknown phase must be rejected");
+        assert!(err.contains("Phase not found"), "{err}");
+    }
+
+    /// The host→worker→ui camelCase contract for the gate fields. GraphQL declares
+    /// `testCommands: [String!]` and `effectiveTestCommands: [String!]!`, so the host MUST emit
+    /// those exact keys as LISTS. A silent rename or a raw JSON string here is the deploy-skew
+    /// null the plan's own naming test was written to catch.
+    #[test]
+    fn the_gate_fields_serialize_under_the_names_graphql_declares() {
+        let mut phase = phase_with_test_commands(Some(r#"["a","b"]"#));
+        phase.test_commands_list = vec!["a".into(), "b".into()];
+        phase.effective_test_commands = vec!["a".into(), "b".into()];
+        let json = serde_json::to_value(&phase).expect("serialize phase");
+        assert_eq!(json["testCommands"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["effectiveTestCommands"], serde_json::json!(["a", "b"]));
+        // The storage encoding is served under its own key, never as `testCommands`.
+        assert_eq!(json["testCommandsRaw"], serde_json::json!(r#"["a","b"]"#));
+
+        let mut plan = plan_with_test_commands("/w", Some(r#"["c"]"#));
+        plan.test_commands_list = vec!["c".into()];
+        let json = serde_json::to_value(&plan).expect("serialize plan");
+        assert_eq!(json["testCommands"], serde_json::json!(["c"]));
+        assert_eq!(json["testCommandsRaw"], serde_json::json!(r#"["c"]"#));
+    }
+
+    fn phase_with_test_commands(commands: Option<&str>) -> crate::db::models::AgentPlanPhase {
+        let mut phase = sample_phase_for_prompt();
+        phase.test_commands = commands.map(str::to_string);
+        phase
+    }
+
+    #[test]
+    fn effective_test_commands_prefers_the_phase_then_falls_back_to_the_plan() {
+        // THE resolution rule, in one place. Every caller goes through this function.
+        let plan = plan_with_test_commands("/w", Some(r#"["plan-gate"]"#));
+
+        // A phase that declares its own gate is held to its own gate.
+        assert_eq!(
+            effective_test_commands(&plan, Some(&phase_with_test_commands(Some(r#"["phase-gate"]"#)))),
+            vec!["phase-gate".to_string()],
+        );
+        // NULL, empty-string and empty-array on the phase all fall back to the plan.
+        for empty in [None, Some(""), Some("[]"), Some(r#"["  "]"#)] {
+            assert_eq!(
+                effective_test_commands(&plan, Some(&phase_with_test_commands(empty))),
+                vec!["plan-gate".to_string()],
+                "phase test_commands {:?} must fall back to the plan",
+                empty
+            );
+        }
+        // No phase at all (plan-level callers) still resolves the plan's gate.
+        assert_eq!(
+            effective_test_commands(&plan, None),
+            vec!["plan-gate".to_string()]
+        );
+        // Neither level set = no gate. This is the opt-in default.
+        let bare = plan_with_test_commands("/w", None);
+        assert!(effective_test_commands(&bare, Some(&phase_with_test_commands(None))).is_empty());
+        // A malformed gate is a config error, not a failure: it resolves to nothing at that level
+        // and falls through, exactly like an absent one.
+        assert_eq!(
+            effective_test_commands(&plan, Some(&phase_with_test_commands(Some("not json")))),
+            vec!["plan-gate".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_gates_on_the_phase_commands_when_the_phase_declares_them() {
+        // The coordinator's ready-check must use the SAME resolution rule as everything else.
+        // Before migration 025 it only ever saw the plan's commands, so a phase declaring a
+        // stricter gate was silently ignored — the exact false pass this feature exists to stop.
+        let dir = tmp_dir("tests-phase-override");
+        let w = dir.to_string_lossy().to_string();
+        // The plan's gate PASSES; the phase's gate FAILS. A phase-aware check must fail.
+        let plan = plan_with_test_commands(&w, Some(r#"["true"]"#));
+        let phase = phase_with_test_commands(Some(r#"["echo phase-gate-ran && exit 7"]"#));
+        let reason = failing_test_command(&plan, Some(&phase))
+            .await
+            .expect("the phase's own gate must be the one that runs");
+        assert!(reason.contains("exit 7"), "{reason}");
+        assert!(reason.contains("phase-gate-ran"), "{reason}");
+
+        // And the converse: a phase with no gate of its own is still held to the plan's.
+        let plan = plan_with_test_commands(&w, Some(r#"["exit 9"]"#));
+        let reason = failing_test_command(&plan, Some(&phase_with_test_commands(None)))
+            .await
+            .expect("plan gate must still apply to a phase that declares none");
+        assert!(reason.contains("exit 9"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_reports_the_exit_code_and_stops_at_the_first_failure() {
+        let dir = tmp_dir("gate-run-exit");
+        let w = dir.to_string_lossy().to_string();
+        let marker = dir.join("third-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["true","echo boom && exit 5","touch {}"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        // Exit code is authoritative, and it is the FIRST failure's code.
+        assert_eq!(run.exit_code, 5);
+        assert_eq!(run.commands_run, 2, "must stop at the first non-zero");
+        assert!(!marker.exists(), "commands after the first failure must not run");
+        assert!(run.output.contains("boom"), "output must be captured: {}", run.output);
+        assert_eq!(run.command.as_deref(), Some("echo boom && exit 5"));
+
+        // All green: exit 0, every command run.
+        let plan = plan_with_test_commands(&w, Some(r#"["true","exit 0"]"#));
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.commands_run, 2);
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_uses_the_phase_gate_and_is_a_no_op_without_one() {
+        let dir = tmp_dir("gate-run-phase");
+        let w = dir.to_string_lossy().to_string();
+        // Same resolution rule as the coordinator: the phase wins.
+        let plan = plan_with_test_commands(&w, Some(r#"["true"]"#));
+        let phase = phase_with_test_commands(Some(r#"["exit 4"]"#));
+        let run = run_test_gate(&plan, Some(&phase)).await.expect("gate must run");
+        assert_eq!(run.exit_code, 4);
+
+        // No gate at either level is not an error — it is "nothing to run, nothing failed".
+        let bare = plan_with_test_commands(&w, None);
+        let run = run_test_gate(&bare, None).await.expect("no gate is not an error");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.commands_run, 0);
+        assert_eq!(run.command, None);
+        assert_eq!(run.collected, None);
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_collected_count_is_advisory_and_nullable() {
+        let dir = tmp_dir("gate-run-collected");
+        let w = dir.to_string_lossy().to_string();
+        // A cargo-shaped summary parses.
+        let plan = plan_with_test_commands(
+            &w,
+            Some(r#"["echo 'test result: ok. 642 passed; 1 failed; 0 ignored; 0 measured'"]"#),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.collected, Some(643));
+
+        // A gate that prints nothing parseable is a LEGITIMATE gate with a known exit code, not an
+        // error: exit code present, collected None.
+        let plan = plan_with_test_commands(&w, Some(r#"["echo tsc --noEmit clean"]"#));
+        let run = run_test_gate(&plan, None).await.expect("unparseable output is not an error");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.collected, None);
+
+        // Unparseable AND failing: the exit code still comes through.
+        let plan = plan_with_test_commands(&w, Some(r#"["echo 'segmentation fault' && exit 139"]"#));
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 139);
+        assert_eq!(run.collected, None);
+    }
+
+    #[test]
+    fn parse_collected_count_reads_the_common_runner_summaries() {
+        // Each case is a real summary line from a runner this repo actually uses or has used.
+        let cases: Vec<(&str, Option<i64>)> = vec![
+            ("test result: ok. 642 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out", Some(643)),
+            ("      Tests  178 passed (178)", Some(178)),
+            ("Tests:       5 passed, 5 total", Some(5)),
+            // mocha splits its summary over two lines; max-wins reports the passing count
+            // only. Documented imprecision — this number is advisory, never a gate.
+            ("  12 passing (2s)\n  1 failing", Some(12)),
+            ("===== 5 passed, 1 failed in 0.12s =====", Some(6)),
+            ("Executed 288 of 293 SUCCESS", Some(293)),
+            ("tsc --noEmit", None),
+            ("", None),
+            // The LARGEST candidate wins — a runner's grand total is bigger than its per-file
+            // lines. (Real vitest output: Test Files before Tests.)
+            (" Test Files  30 passed (30)\n      Tests  178 passed (178)", Some(178)),
+            // ...and the order of those two lines must not change the answer.
+            ("      Tests  178 passed (178)\n Test Files  30 passed (30)", Some(178)),
+        ];
+        for (output, expected) in cases {
+            assert_eq!(
+                parse_collected_count(output),
+                expected,
+                "parse_collected_count({:?})",
+                output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_caps_captured_output_without_hanging() {
+        // A chatty gate must not be able to grow the buffer: this repo has already been OOM-killed
+        // by an unbounded read. The capture is a bounded TAIL, and draining both pipes concurrently
+        // is what keeps a command that floods stderr from blocking forever on a full pipe.
+        let dir = tmp_dir("gate-run-cap");
+        let w = dir.to_string_lossy().to_string();
+        let bytes = TEST_GATE_STREAM_CAP_BYTES * 3;
+        let plan = plan_with_test_commands(
+            &w,
+            // Flood BOTH streams, well past the cap, then end with a recognisable marker.
+            Some(&format!(
+                r#"["head -c {bytes} /dev/zero | tr '\\0' 'x' ; head -c {bytes} /dev/zero | tr '\\0' 'y' 1>&2 ; echo TAIL-MARKER ; echo 7 passed"]"#
+            )),
+        );
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("a flooding gate must not hang the runner")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.truncated, "the cap must report that it discarded output");
+        // Two streams, each capped, plus the separator — never the 3x flood.
+        assert!(
+            run.output.len() <= 2 * TEST_GATE_STREAM_CAP_BYTES + 16,
+            "captured {} bytes, cap is {} per stream",
+            run.output.len(),
+            TEST_GATE_STREAM_CAP_BYTES
+        );
+        // It is a TAIL: the end of the output survives, which is where summaries live.
+        assert!(run.output.contains("TAIL-MARKER"), "the kept window must be the tail");
+        assert_eq!(run.collected, Some(7));
+    }
+
     #[tokio::test]
     async fn failing_test_command_reports_an_unrunnable_command() {
         let plan = plan_with_test_commands("/nonexistent-workspace-xyz", Some(r#"["true"]"#));
-        let reason = failing_test_command(&plan).await.expect("must report");
+        let reason = failing_test_command(&plan, None).await.expect("must report");
         assert!(reason.contains("could not run"), "{reason}");
     }
 
@@ -11729,6 +12410,7 @@ diff --git a/two.md b/two.md
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
+                test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
             },
@@ -11756,6 +12438,9 @@ diff --git a/two.md b/two.md
             findings_json: "[]".into(),
             created_at: "".into(),
             updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
         }
     }
 
@@ -11844,6 +12529,7 @@ mod validation_lens_tests {
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
+                test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
             },
@@ -13362,6 +14048,7 @@ mod small_mode_tests {
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
+                test_commands_list: Vec::new(),
             },
             phases: vec![],
             tasks: vec![],
