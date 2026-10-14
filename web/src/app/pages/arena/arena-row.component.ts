@@ -10,6 +10,11 @@ import { ARENA_CSS } from './arena-ui.css';
  *
  * When the phase has no gate the control STAYS ON SCREEN, disabled, with its reason in text beside
  * it, and a way out (set a gate). A hidden control teaches nobody why this phase cannot compete.
+ *
+ * The mock draws a crossed-swords glyph on this control. It is not here: in the console's font
+ * stack it falls back to a mark that renders as ✕ (measured —
+ * `.johnnyone/reports/arena-screens/before-console-arena-tab.png`), so the ENABLED button read as a
+ * close button and the disabled one read as "✕ Enter the arena ✕". The words carry it.
  */
 @Component({
   selector: 'johnny-arena-row',
@@ -25,7 +30,7 @@ import { ARENA_CSS } from './arena-ui.css';
               data-test="enter-arena"
               [routerLink]="['/initiatives', initiativeId, 'arena']"
               [queryParams]="{ phaseId: phase.phaseId }"
-            >⚔ Enter the arena</a>
+            >Enter the arena</a>
             <span class="a-muted ar-sub">search for a better prompt for this phase</span>
           </div>
           <div class="mono a-muted ar-cmds">
@@ -33,7 +38,7 @@ import { ARENA_CSS } from './arena-ui.css';
           </div>
         } @else {
           <div class="a-row">
-            <button type="button" class="a-btn" data-test="enter-arena-disabled" disabled>⚔ Enter the arena ✕</button>
+            <button type="button" class="a-btn" data-test="enter-arena-disabled" disabled>Enter the arena · no gate</button>
             <a
               class="ar-set"
               data-test="set-gate"

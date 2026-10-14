@@ -98,14 +98,50 @@ export interface OverflowRisk {
   declaration: string;
 }
 
-/** Declarations that force a box wider than the viewport, which is the other way a phone loses a
- *  surface: it is on screen but off to the right, with the page scrolling sideways. */
+/**
+ * Declarations that force a box wider than the viewport, which is the other way a phone loses a
+ * surface: it is on screen but off to the right, with the page scrolling sideways.
+ *
+ * Both unit families are checked, because both have been injected into this project's own
+ * stylesheet and gone unnoticed: absolute `px` wider than the viewport, and viewport-relative
+ * widths over 100vw (`120vw` is 20% off-screen at EVERY width, so no `width` argument saves you).
+ */
 export function overflowRisks(css: string, width = 400): OverflowRisk[] {
   const out: OverflowRisk[] = [];
   for (const b of blocks(css)) {
     if (b.query !== '' && !mediaQueryMatches(b.query, width)) continue;
-    for (const m of b.body.matchAll(/(min-width|width)\s*:\s*(\d+(?:\.\d+)?)px/gi)) {
-      if (Number(m[2]) > width) out.push({ selector: b.selector, declaration: m[0] });
+    for (const m of b.body.matchAll(/(?:^|[;{\s])(min-width|width)\s*:\s*(\d+(?:\.\d+)?)px/gi)) {
+      if (Number(m[2]) > width) out.push({ selector: b.selector, declaration: m[0].trim() });
+    }
+    for (const m of b.body.matchAll(/(?:^|[;{\s])(min-width|width)\s*:\s*(\d+(?:\.\d+)?)(vw|vmin|vmax)/gi)) {
+      if (Number(m[2]) > 100) out.push({ selector: b.selector, declaration: m[0].trim() });
+    }
+  }
+  return out;
+}
+
+export interface ClipRisk {
+  selector: string;
+  declaration: string;
+}
+
+/**
+ * Rules that CLIP their own content: a fixed `height`/`max-height` together with a hidden overflow.
+ * This is the third way a phone loses a surface and the subtlest — the element is on screen, at the
+ * right width, and simply ends, with no scrollbar and nothing to drag.
+ *
+ * A fixed height with `auto`/`scroll` overflow is fine and is how `pre.a-out` shows a gate's output,
+ * so the pair is what is flagged, never either half alone.
+ */
+export function clipRisks(css: string, width = 400): ClipRisk[] {
+  const out: ClipRisk[] = [];
+  for (const b of blocks(css)) {
+    if (b.query !== '' && !mediaQueryMatches(b.query, width)) continue;
+    const bounded = /(?:^|[;{\s])(max-height|height)\s*:\s*(\d+(?:\.\d+)?)(px|rem|em)/i.exec(b.body);
+    if (!bounded) continue;
+    const hidden = /(?:^|[;{\s])overflow(?:-x|-y)?\s*:\s*(?:hidden|clip)\b/i.exec(b.body);
+    if (hidden) {
+      out.push({ selector: b.selector, declaration: `${bounded[0].trim()} + ${hidden[0].trim()}` });
     }
   }
   return out;

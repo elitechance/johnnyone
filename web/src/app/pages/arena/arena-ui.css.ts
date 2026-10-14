@@ -12,6 +12,16 @@
  *
  * Colours come from the Ionic theme variables the rest of the console already uses, so the arena
  * inherits light/dark instead of defining a second palette.
+ *
+ * TWO VALUES ARE COPIES, and they are copies because a string cannot `@include` a Sass partial.
+ * Their source of truth is `web/src/app/styles/_workspace-responsive.scss`:
+ *   * the mobile breakpoint, `$mobile-breakpoint: 900px` (also `WORKSPACE_MOBILE_BREAKPOINT_PX` in
+ *     `web/src/app/workspace-responsive.ts`) — this file used 760px, which is drift, not a choice;
+ *   * the safe-area insets, `$safe-top` / `$safe-bottom` = `env(safe-area-inset-*)`, which that
+ *     partial's `safe-bottom-padding` mixin applies and which nothing here was applying at all, so
+ *     on a notched phone the last row of a page sat under the gesture bar.
+ * `arena-phone.spec.ts` asserts both against the partial's own text, so the copies cannot drift
+ * silently.
  */
 export const ARENA_CSS = `
 :host {
@@ -22,7 +32,13 @@ export const ARENA_CSS = `
 }
 .aw {
   box-sizing: border-box;
-  padding: 12px 16px 48px;
+  /* Side gutters respect a notch in landscape; the bottom clears the gesture bar, so the promote
+     and reject controls are never under it. */
+  padding-top: 12px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-bottom: calc(48px + env(safe-area-inset-bottom, 0px));
+  scroll-padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px));
   max-width: 1100px;
   margin: 0 auto;
 }
@@ -49,6 +65,20 @@ export const ARENA_CSS = `
   background: var(--ion-card-background, rgba(255,255,255,0.03));
 }
 .a-card h2 { font-size: 14px; margin: 0 0 6px; font-weight: 600; }
+.a-note,
+.a-block,
+.a-warn,
+.a-list li,
+.a-kv dd,
+.a-head h1,
+.slot {
+  /* These four render text nobody here chose: an operator's rejection reason, a raw String(e)
+     host error (routinely one unbroken line), a workspace path, a pasted URL or stack trace. Without
+     this, one long token forces the whole page to scroll sideways on a phone. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
 .a-note { font-size: 12.5px; opacity: 0.8; margin: 6px 0 0; }
 .a-warn {
   border-left: 3px solid var(--ion-color-warning, #e0a030);
@@ -74,7 +104,8 @@ export const ARENA_CSS = `
 }
 /* Two columns ONLY when there is room. One column is the default, so a phone loses nothing. */
 .a-cols { display: grid; grid-template-columns: 1fr; gap: 12px; }
-@media (min-width: 760px) { .a-cols { grid-template-columns: 1fr 1fr; } }
+/* 900px: the repo's $mobile-breakpoint. Above it there is room for two columns. */
+@media (min-width: 900px) { .a-cols { grid-template-columns: 1fr 1fr; } }
 .a-row {
   display: flex;
   flex-wrap: wrap;

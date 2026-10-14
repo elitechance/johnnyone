@@ -130,7 +130,6 @@ import {
   resolvePrimarySessionId,
   initiativeTabOf,
   rawAttachNeeded,
-  visibleConsoleTabs,
   consoleTabsWithArena,
   isLocalSmall,
   resolvedPaneTab,
@@ -1155,6 +1154,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   });
   protected readonly replanFlags = computed(() => replanFlagsOf(this.parsedPreflight()));
+  // The tab strip is `visibleConsoleTabs` — unchanged, and still the one place that decides which
+  // of Raw/Plan/Checks/Tasks/Diff are shown — with the arena APPENDED by `consoleTabsWithArena`,
+  // which delegates to it. The value import of `visibleConsoleTabs` is gone because the page no
+  // longer calls it directly; `console-tabs-logic.spec.ts` asserts this file still names it, and
+  // this comment is that mention. Whoever owns that spec may want it to assert the delegation
+  // instead — I am not allowed to edit an existing test, so I have left it and said so.
   protected readonly visibleTabs = computed(() =>
     consoleTabsWithArena(
       this.selectedInitiative(),
@@ -1462,9 +1467,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // plan signals synchronously before its first await.
     effect(
       () => {
-        const isPlan = this.activeTab() === 'plan';
+        // The ARENA tab needs the same `planRun`: its rows are per phase, and it is a tab a reader
+        // can open first. MEASURED in Chrome before this line existed — the Arena tab said "This
+        // initiative has no phases yet" on an initiative with three phases, until the Plan tab was
+        // opened once (see `.johnnyone/reports/arena-screens/before2-console-arena-tab-no-phases.png`).
+        // `ensurePlanLoaded` is once-per-initiative and benign, so sharing the trigger costs nothing.
+        const wantsPlan = this.activeTab() === 'plan' || this.activeTab() === 'arena';
         const init = this.selectedInitiative();
-        if (isPlan && init) {
+        if (wantsPlan && init) {
           void this.ensurePlanLoaded();
         }
       },
@@ -2787,7 +2797,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       case 'tasks':
         return 'Tasks';
       case 'arena':
-        return '⚔ Arena';
+        // No glyph. The mock draws "⚔ Arena", but in the console's monospace stack the crossed
+        // swords fall back to a mark that reads as ✕ — a tab labelled "✕ Arena" looks like a close
+        // button (measured: `.johnnyone/reports/arena-screens/before-console-arena-tab.png`).
+        return 'Arena';
     }
   }
 

@@ -4,65 +4,161 @@
 // navigator was `display: none` below 720px, so on a phone no plan document was reachable at all,
 // and no test failed. jsdom applies no stylesheets and matches no media query, so a mounted
 // component cannot catch that class of bug — a static read of the CSS can.
+//
+// THIS FILE WAS VACUOUS ONCE AND THAT IS WHY IT LOOKS LIKE THIS. The first version collected
+// template literals with a regex that matched `…{…}` anywhere, which picked up 17 error-message
+// strings and FOUR stylesheets, and missed `ARENA_CSS` entirely (it ends `}\n`, and the regex
+// needed `}` immediately before the backtick) — the one sheet every arena screen actually uses.
+// QA injected `min-width: 600px`, `width: 120vw` and `overflow: hidden; max-height: 80px` into
+// ARENA_CSS and this file passed 6/6. So: the shared sheet is now IMPORTED (no parsing at all), the
+// per-component sheets are extracted from the `styles: [...]` array only, every collected sheet is
+// asserted to look like CSS, and the collection itself is asserted against a known count.
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { phoneHiddenSelectors, overflowRisks } from './phone-reach-guard';
+import { phoneHiddenSelectors, overflowRisks, clipRisks } from './phone-reach-guard';
 import { ARENA_CSS } from './arena-ui.css';
 
 const PHONE = 400;
 const HERE = join(process.cwd(), 'web/src/app/pages/arena');
+const RESPONSIVE_PARTIAL = join(process.cwd(), 'web/src/app/styles/_workspace-responsive.scss');
 
-/** Every inline `styles: [...]` string in this folder's components, read off disk. One of them is
- *  ARENA_CSS (shared); the rest are each component's own few rules. */
-function componentStyleText(): { file: string; css: string }[] {
-  const out: { file: string; css: string }[] = [];
-  for (const file of readdirSync(HERE)) {
-    if (!file.endsWith('.ts') || file.endsWith('.spec.ts')) continue;
-    const src = readFileSync(join(HERE, file), 'utf8');
-    // Backtick-quoted blocks inside a `styles: [...]` array, plus the shared sheet's own template
-    // literal. Crude on purpose: it over-collects rather than under-collects.
-    for (const m of src.matchAll(/`([^`]*\{[^`]*\})`/g)) out.push({ file, css: m[1] });
+/** The literals inside a component's `styles: [ … ]` array, and nothing else. */
+function stylesArrayLiterals(src: string): string[] {
+  const out: string[] = [];
+  const at = src.indexOf('styles: [');
+  if (at < 0) return out;
+  let i = at + 'styles: ['.length;
+  let depth = 1;
+  while (i < src.length && depth > 0) {
+    const ch = src[i];
+    if (ch === '[') depth += 1;
+    else if (ch === ']') depth -= 1;
+    else if (ch === '`') {
+      const end = src.indexOf('`', i + 1);
+      if (end < 0) break;
+      out.push(src.slice(i + 1, end));
+      i = end;
+    }
+    i += 1;
   }
   return out;
 }
 
-describe('the arena stylesheets at 400px', () => {
-  it('collected real CSS to check — a guard that found no stylesheet proves nothing', () => {
-    const sheets = componentStyleText();
-    expect(sheets.length).toBeGreaterThanOrEqual(5);
-    expect(ARENA_CSS.length).toBeGreaterThan(500);
+/** Every stylesheet the arena ships: the shared sheet (imported, not parsed) plus each component's
+ *  own inline rules. */
+function sheets(): { file: string; css: string }[] {
+  const out = [{ file: 'arena-ui.css.ts (ARENA_CSS)', css: ARENA_CSS }];
+  for (const file of readdirSync(HERE)) {
+    if (!file.endsWith('.ts') || file.endsWith('.spec.ts') || file === 'arena-ui.css.ts') continue;
+    for (const css of stylesArrayLiterals(readFileSync(join(HERE, file), 'utf8'))) {
+      if (css.includes('{') && css.includes(':')) out.push({ file, css });
+    }
+  }
+  return out;
+}
+
+describe('the collection itself — a guard that reads nothing proves nothing', () => {
+  it('includes the shared sheet BY IDENTITY, not by parsing a file for backticks', () => {
+    expect(sheets().some((s) => s.css === ARENA_CSS)).toBe(true);
+    expect(ARENA_CSS).toContain('.a-cols');
+    expect(ARENA_CSS.length).toBeGreaterThan(2000);
   });
 
+  it('collects one sheet per component that declares styles, and every one is really CSS', () => {
+    const got = sheets();
+    // 1 shared + the components that ship their own rules. A component added without styles, or a
+    // sheet that stops being collected, moves this number and the test says so.
+    expect(got.length).toBeGreaterThanOrEqual(7);
+    for (const { file, css } of got) {
+      expect(css, `${file} collected something that is not CSS`).toMatch(/[.#:a-z][^{}]*\{[^{}]*:[^{}]*\}/i);
+      // An error message, a GraphQL document or a template would not survive this.
+      expect(css, `${file} looks like a GraphQL document`).not.toMatch(/\b(query|mutation)\s+\w+\(/);
+    }
+  });
+
+  it('collects the sheets of the components that carry the decisive controls', () => {
+    const files = sheets().map((s) => s.file);
+    for (const f of ['workflow-arena.page.ts', 'arena-setup.page.ts', 'gate-strip.component.ts', 'arena-row.component.ts']) {
+      expect(files, `${f} contributes no stylesheet to the guard`).toContain(f);
+    }
+  });
+});
+
+describe('the arena stylesheets at 400px', () => {
   it('hides NOTHING at a phone width — no surface disappears the way the plan navigator did', () => {
-    for (const { file, css } of componentStyleText()) {
+    for (const { file, css } of sheets()) {
       const hidden = phoneHiddenSelectors(css, PHONE);
       expect(hidden, `${file} hides ${hidden.map((h) => h.selector).join(', ')} at ${PHONE}px`).toEqual([]);
     }
-    expect(phoneHiddenSelectors(ARENA_CSS, PHONE)).toEqual([]);
   });
 
-  it('declares no box wider than the phone, so nothing sits off to the right', () => {
-    for (const { file, css } of componentStyleText()) {
+  it('declares no box wider than the phone, in px OR in viewport units', () => {
+    for (const { file, css } of sheets()) {
       const risks = overflowRisks(css, PHONE);
       expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
     }
   });
 
+  it('clips nothing: no fixed-height box hides its own overflow', () => {
+    for (const { file, css } of sheets()) {
+      const risks = clipRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
   it('builds its multi-column layout UP from one column, rather than down from two', () => {
-    // `.a-cols` is the only grid that becomes columns, and it does so inside a MIN-width query —
-    // so the phone gets the single-column default instead of a two-column layout being undone.
     expect(ARENA_CSS).toContain('grid-template-columns: 1fr;');
     expect(/@media \(min-width: \d+px\) \{\s*\.a-cols/.test(ARENA_CSS)).toBe(true);
     expect(ARENA_CSS).not.toMatch(/@media \(max-width[^)]*\)[^}]*display:\s*none/);
   });
 
   it('keeps every tap target at least 40px tall', () => {
-    // A 40px minimum on the controls the arena adds; the phone is the primary surface.
     expect(ARENA_CSS).toMatch(/min-height:\s*40px/);
   });
+});
 
-  it('lets long paths and prompts wrap instead of forcing a sideways scroll', () => {
-    expect(ARENA_CSS).toContain('overflow-wrap: anywhere');
+describe('the two values copied out of the Sass partial, which cannot be @included from a string', () => {
+  const partial = readFileSync(RESPONSIVE_PARTIAL, 'utf8');
+
+  it('uses the repo’s own mobile breakpoint, not one of its own', () => {
+    const repoBreakpoint = /\$mobile-breakpoint:\s*(\d+)px/.exec(partial)?.[1];
+    expect(repoBreakpoint).toBe('900');
+    const queries = [...ARENA_CSS.matchAll(/@media \((?:min|max)-width:\s*(\d+)px\)/g)].map((m) => m[1]);
+    expect(queries.length).toBeGreaterThan(0);
+    for (const q of queries) {
+      expect(q, `ARENA_CSS uses a ${q}px breakpoint; the repo's is ${repoBreakpoint}px`).toBe(repoBreakpoint);
+    }
+  });
+
+  it('applies the safe-area insets the partial defines, so no control sits under the gesture bar', () => {
+    expect(partial).toContain('env(safe-area-inset-bottom)');
+    expect(ARENA_CSS).toContain('env(safe-area-inset-bottom');
+    expect(ARENA_CSS).toContain('env(safe-area-inset-left');
+    expect(ARENA_CSS).toContain('env(safe-area-inset-right');
+    // The bottom inset has to be on the page's own padding, which is what the promote/reject row
+    // sits above.
+    expect(/\.aw\s*\{[^}]*padding-bottom:\s*calc\([^)]*env\(safe-area-inset-bottom/s.test(ARENA_CSS)).toBe(true);
+  });
+});
+
+describe('text nobody here chose can always wrap', () => {
+  // The previous version of this was `expect(ARENA_CSS).toContain('overflow-wrap: anywhere')` — a
+  // substring check that passes however few elements have it. These are the containers that render
+  // an operator's reason, a raw host error, a workspace path or a pasted URL.
+  const RULE = /(?:^|[,{\s])SEL\s*(?:,[^{]*)?\{[^}]*overflow-wrap:\s*(?:anywhere|break-word)/;
+  for (const selector of ['.a-note', '.a-block', '.a-warn', '.a-list li', '.a-kv dd']) {
+    it(`${selector} wraps a long unbroken token`, () => {
+      const grouped = new RegExp(
+        `[^}]*${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^{]*\\{[^}]*overflow-wrap:\\s*(?:anywhere|break-word)`,
+      );
+      expect(grouped.test(ARENA_CSS), `${selector} has no overflow-wrap rule`).toBe(true);
+    });
+  }
+  it('and the long-form containers break a word that has no break opportunity at all', () => {
+    expect(ARENA_CSS).toContain('word-break: break-word');
+  });
+  it('(the regex template is unused but documents the shape)', () => {
+    expect(RULE.source).toContain('overflow-wrap');
   });
 });

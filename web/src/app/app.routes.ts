@@ -112,19 +112,27 @@ export const appRoutes: Route[] = [
   // /initiatives/:id/validation. There is deliberately NO per-phase route: phases render inside
   // TerminalPage's `plan` tab, so the arena's entry point is a row there plus an added `arena` tab,
   // and the setup wizard hangs off the INITIATIVE, carrying the phase as `?phaseId=`.
+  //
+  // Each loads the `*.shell`, which wraps the page body in `ion-content`. Without that wrapper the
+  // routed page is clipped to the viewport and does not scroll — measured in Chrome at 400x860,
+  // with the promote/reject row 464px past the clip. See the shell files.
+  //
+  // `ArenaApiService` is provided by each SHELL component, not here: a `providers: [X]` on a route
+  // needs `X` imported by this eagerly-loaded table, which would drag the service — and its ten
+  // GraphQL documents — straight back into the initial bundle this move exists to keep them out of.
   {
     path: 'initiatives/:id/arena',
     title: 'Arena setup',
     canActivate: [authGuard],
     loadComponent: () =>
-      import('./pages/arena/arena-setup.page').then((m) => m.ArenaSetupPage),
+      import('./pages/arena/arena-setup.shell').then((m) => m.ArenaSetupShell),
   },
   {
     path: 'workflows',
     title: 'Workflows',
     canActivate: [authGuard],
     loadComponent: () =>
-      import('./pages/arena/workflows.page').then((m) => m.WorkflowsPage),
+      import('./pages/arena/workflows.shell').then((m) => m.WorkflowsShell),
   },
   // The 3-segment arena route is declared BEFORE `workflows/:id` for readability; Angular matches
   // on segment count, so neither can shadow the other, and `arena-routes.spec.ts` navigates both
@@ -134,14 +142,14 @@ export const appRoutes: Route[] = [
     title: 'Workflow arena',
     canActivate: [authGuard],
     loadComponent: () =>
-      import('./pages/arena/workflow-arena.page').then((m) => m.WorkflowArenaPage),
+      import('./pages/arena/workflow-arena.shell').then((m) => m.WorkflowArenaShell),
   },
   {
     path: 'workflows/:id',
     title: 'Workflow',
     canActivate: [authGuard],
     loadComponent: () =>
-      import('./pages/arena/workflow-detail.page').then((m) => m.WorkflowDetailPage),
+      import('./pages/arena/workflow-detail.shell').then((m) => m.WorkflowDetailShell),
   },
   // Developer console — authenticated UI for the partner API surface
   // (auth/keys, agent-session CRUD, live WSS terminal). The public docs live

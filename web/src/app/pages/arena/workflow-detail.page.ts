@@ -1,7 +1,7 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
-import { JohnnyApiService, type Workflow } from '../../../../../ui/src/services/johnny-api.service';
+import { ArenaApiService, type Workflow } from './arena-api.service';
 import { ARENA_CSS } from './arena-ui.css';
 import { lineageOf } from './arena-logic';
 
@@ -68,7 +68,7 @@ import { lineageOf } from './arena-logic';
   styles: [ARENA_CSS, `.slot { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; } a { margin-left: 6px; }`],
 })
 export class WorkflowDetailPage implements OnInit {
-  private readonly api = inject(JohnnyApiService);
+  private readonly api = inject(ArenaApiService);
   private readonly route = inject(ActivatedRoute);
   protected readonly wf = signal<Workflow | null>(null);
   protected readonly siblings = signal<Workflow[]>([]);

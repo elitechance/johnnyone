@@ -14,6 +14,7 @@ import {
   promotionBlock,
   promotionConfirmCopy,
   NO_GATE_REASON,
+  MAX_REJECTION_REASON,
 } from './arena-logic';
 
 describe('arenaEntryRow — step 1, the entry point', () => {
@@ -111,6 +112,38 @@ describe('rejectionReasonValid — there is no bare no', () => {
   });
   it('accepts a real reason', () => {
     expect(rejectionReasonValid('the gate never touches the cashier path').ok).toBe(true);
+  });
+
+  // `trim()` only strips Unicode White_Space. None of these is White_Space, so each one passed a
+  // `trim().length > 0` check while rendering as NOTHING — and a rejection's reason is the only
+  // thing a halted search has to show a human.
+  it('refuses a reason that renders as nothing', () => {
+    for (const invisible of [
+      '\u200b',             // zero-width space
+      '\u200b\u200c\u200d', // zero-width space / non-joiner / joiner
+      '\ufeff',             // BOM
+      '\u0000',             // NUL
+      '\u00ad',             // soft hyphen
+      '\u2060',             // word joiner
+      '\u3164',             // Hangul filler
+      ' \u200b \ufeff ',    // mixed with real whitespace
+    ]) {
+      const v = rejectionReasonValid(invisible);
+      expect(v.ok, JSON.stringify(invisible)).toBe(false);
+      expect(v.message).toMatch(/reason/i);
+    }
+  });
+
+  it('keeps a reason that merely CONTAINS an invisible character', () => {
+    expect(rejectionReasonValid('coverage\u200bthreshold missing').ok).toBe(true);
+  });
+
+  it('caps the length, which nothing capped at either layer', () => {
+    const long = 'x'.repeat(MAX_REJECTION_REASON + 1);
+    const v = rejectionReasonValid(long);
+    expect(v.ok).toBe(false);
+    expect(v.message).toMatch(/too long|characters/i);
+    expect(rejectionReasonValid('x'.repeat(MAX_REJECTION_REASON)).ok).toBe(true);
   });
 });
 

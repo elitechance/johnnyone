@@ -1,11 +1,14 @@
-// The arena's client wire. Drives the REAL JohnnyApiService with a stub GraphQLClient and inspects
-// the operation text and variables it sends, which is the only place a missing field or a renamed
-// argument shows up before a deploy. Two things it exists to hold:
+// The arena's client wire. Drives the REAL services with a stub GraphQLClient and inspects the
+// operation text and variables they send, which is the only place a missing field or a renamed
+// argument shows up before a deploy. What it holds:
 //   * the selection sets are HOISTED (the sessionFields / agentPlanRunFields precedent) — one copy,
 //     so a field added for one screen cannot be missing on another;
 //   * `gateCollected` and `effectiveTestCommands` are actually ASKED FOR. A UI that renders "not
 //     reported" because it never requested the field is indistinguishable from a gate that reported
-//     nothing, which is exactly the confusion the count exists to prevent.
+//     nothing, which is exactly the confusion the count exists to prevent;
+//   * the ten ARENA-ONLY operations live on `ArenaApiService`, which only the lazy arena chunk
+//     injects, so they cost nothing on an initial bundle that is already ~1 MB over budget. The two
+//     gate operations stay on the eager service because the console's Checks tab reaches them.
 import '@angular/compiler';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { TestBed } from '@angular/core/testing';
@@ -13,14 +16,10 @@ import { of } from 'rxjs';
 import '../../../test-setup';
 import { JohnnyApiService } from '../../../../../ui/src/services/johnny-api.service';
 import { GraphQLClient } from '../../../../../ui/src/services/graphql-client';
-
-interface Sent {
-  op: string;
-  variables: Record<string, unknown> | undefined;
-}
+import { ArenaApiService } from './arena-api.service';
 
 class StubClient {
-  sent: Sent[] = [];
+  sent: { op: string; variables: Record<string, unknown> | undefined }[] = [];
   payload: unknown = {};
   query<T>(op: string, variables?: Record<string, unknown>) {
     this.sent.push({ op, variables });
@@ -36,7 +35,7 @@ class StubClient {
   }
 }
 
-describe('JohnnyApiService — the arena wire', () => {
+describe('JohnnyApiService — the gate, which the console itself reaches', () => {
   let api: JohnnyApiService;
   let gql: StubClient;
 
@@ -69,14 +68,37 @@ describe('JohnnyApiService — the arena wire', () => {
     expect(last().variables).toEqual({ id: 'p1', phaseId: '04-leases' });
   });
 
+  it('carries NO arena operation — those belong to the lazy chunk', () => {
+    const service = api as unknown as Record<string, unknown>;
+    for (const name of [
+      'workflows', 'workflow', 'workflowRuns', 'workflowPrefs', 'workflowSearchState',
+      'createWorkflowVersion', 'startWorkflowRun', 'recordWorkflowRunGate', 'recordWorkflowPref',
+      'updateWorkflowChampion', 'recordWorkflowRejection', 'updateWorkflowSearchResumed',
+    ]) {
+      expect(service[name], `${name} is still on the eager service`).toBeUndefined();
+    }
+  });
+});
+
+describe('ArenaApiService — the arena wire, lazy', () => {
+  let api: ArenaApiService;
+  let gql: StubClient;
+
+  beforeEach(() => {
+    gql = new StubClient();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [ArenaApiService, { provide: GraphQLClient, useValue: gql }],
+    });
+    api = TestBed.inject(ArenaApiService);
+  });
+
+  const last = () => gql.sent[gql.sent.length - 1];
+
   it('lists workflows with the three independent filters', () => {
     gql.payload = { workflows: [] };
     api.workflows({ repo: 'johnnyone', phaseType: 'dev-phase' }).subscribe();
-    expect(last().variables).toEqual({
-      repo: 'johnnyone',
-      phaseType: 'dev-phase',
-      family: undefined,
-    });
+    expect(last().variables).toEqual({ repo: 'johnnyone', phaseType: 'dev-phase', family: undefined });
     expect(last().op).toContain('isChampion');
   });
 
@@ -88,6 +110,14 @@ describe('JohnnyApiService — the arena wire', () => {
     expect(last().op).toContain('seatsHeld');
   });
 
+  it('READS preferences back instead of recording one to discover it', () => {
+    gql.payload = { workflowPrefs: [] };
+    api.workflowPrefs('w2').subscribe();
+    expect(last().op).toContain('workflowPrefs');
+    expect(last().op).toContain('comparable');
+    expect(last().variables).toEqual({ workflowId: 'w2' });
+  });
+
   it('reads the halt as data, with the reasons a halted search owes a human', () => {
     gql.payload = { workflowSearchState: {} };
     api.workflowSearchState('johnnyone', 'dev-phase', 'glm').subscribe();
@@ -95,6 +125,44 @@ describe('JohnnyApiService — the arena wire', () => {
     expect(last().op).toContain('consecutiveRejections');
     expect(last().op).toContain('recentRejections');
     expect(last().op).toContain('strikeLimit');
+  });
+
+  it('starts a run WITHOUT inventing a seat budget or a contention map', () => {
+    gql.payload = { startWorkflowRun: {} };
+    api.startWorkflowRun({ workflowId: 'w2', planId: 'p1', seed: 1 }).subscribe();
+    const sent = last();
+    // The host measures both. A browser cannot, and sending `{}` made `comparable` mean
+    // "did two clients type the same numbers".
+    expect(JSON.stringify(sent.variables)).not.toContain('seatsHeld');
+    expect(JSON.stringify(sent.variables)).not.toContain('fleetBusy');
+    expect(sent.op).not.toContain('$seatsHeld');
+    expect(sent.op).not.toContain('$fleetBusy');
+    expect(sent.variables).toEqual({ workflowId: 'w2', planId: 'p1', seed: 1, seats: null });
+  });
+
+  it('declares every numeric argument as Float, never Int', () => {
+    gql.payload = { createWorkflowVersion: {} };
+    api.createWorkflowVersion({ repo: 'r', phaseType: 'p', family: 'f', role: 'a', instruction: 'b', contract: 'c', hop: '{}', fanOut: 2 }).subscribe();
+    expect(last().op).toContain('$fanOut: Float!');
+    gql.payload = { startWorkflowRun: {} };
+    api.startWorkflowRun({ workflowId: 'w2' }).subscribe();
+    expect(last().op).toContain('$seed: Float');
+    expect(last().op).toContain('$seats: Float');
+    gql.payload = { recordWorkflowRunGate: {} };
+    api.recordWorkflowRunGate('r2', 0, 23).subscribe();
+    expect(last().op).toContain('$gateExit: Float!');
+    expect(last().op).toContain('$gateCollected: Float');
+    // No operation may declare an Int — Int is 32-bit and a non-null Int that cannot serialise
+    // nulls the whole response, which this project has already shipped once.
+    for (const sent of gql.sent) expect(sent.op).not.toMatch(/:\s*Int!?\b/);
+  });
+
+  it('asks for a re-score BY NAME, so a second result cannot overwrite the first by accident', () => {
+    gql.payload = { recordWorkflowRunGate: {} };
+    api.recordWorkflowRunGate('r2', 1, null).subscribe();
+    expect(last().variables).toEqual({ runId: 'r2', gateExit: 1, gateCollected: null, rescore: false });
+    api.recordWorkflowRunGate('r2', 1, null, true).subscribe();
+    expect(last().variables!['rescore']).toBe(true);
   });
 
   it('promotes only with an explicit confirmed flag — the arena’s one irreversible step', () => {
@@ -107,11 +175,18 @@ describe('JohnnyApiService — the arena wire', () => {
   it('rejects with a reason and returns the resulting search state', () => {
     gql.payload = { recordWorkflowRejection: {} };
     api.recordWorkflowRejection('r2', 'the gate never touches the cashier path').subscribe();
-    expect(last().variables).toEqual({
-      runId: 'r2',
-      reason: 'the gate never touches the cashier path',
-    });
+    expect(last().variables).toEqual({ runId: 'r2', reason: 'the gate never touches the cashier path' });
     expect(last().op).toContain('halted');
+  });
+
+  it('resumes a halted search as its own confirmed decision, never as a side effect of promoting', () => {
+    gql.payload = { updateWorkflowSearchResumed: {} };
+    api.updateWorkflowSearchResumed('johnnyone', 'dev-phase', 'glm', 'added a coverage threshold', true).subscribe();
+    expect(last().op).toContain('updateWorkflowSearchResumed');
+    expect(last().variables).toEqual({
+      repo: 'johnnyone', phaseType: 'dev-phase', family: 'glm',
+      reason: 'added a coverage threshold', confirmed: true,
+    });
   });
 
   it('never sends a `comparable` argument — the host computes it from the runs', () => {

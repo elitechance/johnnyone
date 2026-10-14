@@ -7,7 +7,7 @@
 // never prove CSS reachability. This guard is therefore a STATIC analysis of the stylesheet text,
 // and it is run against the arena components' real styles in `arena-phone.spec.ts`.
 import { describe, it, expect } from 'vitest';
-import { phoneHiddenSelectors, overflowRisks, mediaQueryMatches } from './phone-reach-guard';
+import { phoneHiddenSelectors, overflowRisks, clipRisks, mediaQueryMatches } from './phone-reach-guard';
 
 describe('mediaQueryMatches', () => {
   it('matches a max-width query at or below the width', () => {
@@ -70,5 +70,37 @@ describe('overflowRisks — nothing wider than the phone', () => {
   });
   it('allows a wide width inside a media query the phone never matches', () => {
     expect(overflowRisks(`@media (min-width: 900px) { .a { min-width: 640px; } }`, 400)).toEqual([]);
+  });
+});
+
+
+// QA's three mutations, as unit cases. Each one was injected into the REAL ARENA_CSS and passed the
+// first version of this guard 6/6, because the guard was reading 17 error-message strings and no
+// stylesheet at all.
+describe('the three mutations that used to pass', () => {
+  it('catches a 600px minimum width', () => {
+    expect(overflowRisks('.a-card { min-width: 600px; }', 400)).toHaveLength(1);
+  });
+
+  it('catches a viewport-relative width wider than the viewport', () => {
+    expect(overflowRisks('.aw { width: 120vw; }', 400)).toHaveLength(1);
+    expect(overflowRisks('.aw { width: 100vw; }', 400)).toEqual([]);
+    expect(overflowRisks('.aw { max-width: 90vw; }', 400)).toEqual([]);
+  });
+
+  it('catches a fixed-height box that hides its own overflow', () => {
+    const risks = clipRisks('.a-card { overflow: hidden; max-height: 80px; }');
+    expect(risks).toHaveLength(1);
+    expect(risks[0].selector).toBe('.a-card');
+  });
+
+  it('does not flag a scrollable fixed-height box, which is how `pre.a-out` works', () => {
+    expect(clipRisks('pre.a-out { max-height: 220px; overflow: auto; }')).toEqual([]);
+    expect(clipRisks('.x { overflow: hidden; }')).toEqual([]);
+    expect(clipRisks('.y { max-height: 80px; }')).toEqual([]);
+  });
+
+  it('catches `height` as well as `max-height`, and `overflow-y`', () => {
+    expect(clipRisks('.z { height: 80px; overflow-y: hidden; }')).toHaveLength(1);
   });
 });

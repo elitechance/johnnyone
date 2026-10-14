@@ -5,9 +5,12 @@ import {
   JohnnyApiService,
   type AgentPlanPhase,
   type TestGateRun,
+} from '../../../../../ui/src/services/johnny-api.service';
+import {
+  ArenaApiService,
   type Workflow,
   type WorkflowSearchState,
-} from '../../../../../ui/src/services/johnny-api.service';
+} from './arena-api.service';
 import { GateStripComponent } from './gate-strip.component';
 import { ARENA_CSS } from './arena-ui.css';
 import {
@@ -148,6 +151,15 @@ const FAMILIES = [
           <p class="a-note">width {{ fanOut() }} — the seat cost of this prompt. Contract and hop are where detail migrates to as the search progresses.</p>
         </div>
 
+        <div class="a-warn" data-test="no-executor-note">
+          <b>Nothing executes this run yet.</b> This records the challenger and a run row — it does
+          not start a worker, and nothing in J1 reports a gate result back against a run, so its
+          score stays "never ran". A run with no score cannot be promoted, which means the promotion
+          step is not reachable through this screen today. The executor that links a run to a phase's
+          execution is being built on the host; until it lands, what this button produces is a
+          recorded candidate, not a race.
+        </div>
+
         @if (blockers().length) {
           <div class="a-block" data-test="prompt-blockers">
             <ul class="a-list">@for (b of blockers(); track b) {<li>{{ b }}</li>}</ul>
@@ -158,7 +170,7 @@ const FAMILIES = [
         <div class="a-row">
           <button type="button" class="a-btn" (click)="go('seats')">Back</button>
           <button type="button" class="a-btn primary" data-test="start-search" [disabled]="blockers().length > 0 || starting()" (click)="startSearch()">
-            {{ starting() ? 'Starting…' : champion() ? 'Start the search' : 'Create v1 as the baseline' }}
+            {{ starting() ? 'Recording…' : champion() ? 'Record the challenger and its run' : 'Record v1 as the baseline' }}
           </button>
         </div>
       }
@@ -175,6 +187,9 @@ const FAMILIES = [
 })
 export class ArenaSetupPage implements OnInit {
   private readonly api = inject(JohnnyApiService);
+  /** The arena's own wire, provided by the ROUTE (see app.routes.ts), so it ships in the lazy
+   *  arena chunk instead of the initial bundle. */
+  private readonly arena = inject(ArenaApiService);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
 
@@ -259,7 +274,7 @@ export class ArenaSetupPage implements OnInit {
     const phaseType = this.phaseType();
     const family = this.family();
     try {
-      const all = await firstValueFrom(this.api.workflows({ repo, phaseType, family }));
+      const all = await firstValueFrom(this.arena.workflows({ repo, phaseType, family }));
       const champ = all.find((w) => w.isChampion) ?? null;
       this.champion.set(champ);
       if (champ) {
@@ -273,7 +288,7 @@ export class ArenaSetupPage implements OnInit {
       this.loadError.set(`Could not read this family's workflows: ${String(e)}`);
     }
     try {
-      this.searchState.set(await firstValueFrom(this.api.workflowSearchState(repo, phaseType, family)));
+      this.searchState.set(await firstValueFrom(this.arena.workflowSearchState(repo, phaseType, family)));
     } catch (e) {
       // A state that cannot be read is itself a block (`startRunBlock(null)`), not an empty state.
       this.searchState.set(null);
@@ -327,7 +342,7 @@ export class ArenaSetupPage implements OnInit {
     this.startError.set(null);
     try {
       const wf = await firstValueFrom(
-        this.api.createWorkflowVersion({
+        this.arena.createWorkflowVersion({
           repo: this.repo(),
           phaseType: this.phaseType(),
           family: this.family(),
@@ -340,14 +355,16 @@ export class ArenaSetupPage implements OnInit {
         }),
       );
       await firstValueFrom(
-        this.api.startWorkflowRun({
+        this.arena.startWorkflowRun({
           workflowId: wf.id,
           planId: this.initiativeId(),
           seed: 0,
-          // The seat budget this run HOLDS, recorded on the run. It is a declaration, not a
-          // measurement: see the step-2 note — there is no lease pool to read.
-          seatsHeld: JSON.stringify({ [this.family()]: this.fanOut() }),
-          fleetBusy: JSON.stringify({}),
+          // `seats` only OVERRIDES the workflow's own fanOut, and the workflow already carries it,
+          // so this sends nothing. The seat budget and the fleet contention are MEASURED BY THE
+          // HOST: a browser can measure neither, and the previous version sent a declared budget
+          // plus an empty contention map, which reduced `comparable` to "did two clients type the
+          // same numbers".
+          seats: null,
         }),
       );
       void this.router.navigate(['/workflows', wf.id, 'arena']).catch(() => undefined);

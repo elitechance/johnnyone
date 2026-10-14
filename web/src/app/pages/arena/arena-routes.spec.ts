@@ -5,6 +5,8 @@ import '@angular/compiler';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { TestBed } from '@angular/core/testing';
 import { provideRouter, Route, Router } from '@angular/router';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import '../../../test-setup';
 import { appRoutes } from '../../app.routes';
 import { AuthService } from '../../services/auth.service';
@@ -29,6 +31,34 @@ describe('appRoutes — the arena routes', () => {
   });
 
   const find = (path: string) => appRoutes.find((r) => r.path === path);
+
+  // The route table is EAGER. Anything it imports by value — a `providers: [X]` entry, say — ships
+  // in the initial bundle, which is already ~1 MB over its budget, so the arena's service is
+  // provided by the (lazy) shell components instead. This asserts the table stays free of it.
+  it('imports no arena code by value — the table is in the initial bundle', () => {
+    const src = readFileSync(join(process.cwd(), 'web/src/app/app.routes.ts'), 'utf8');
+    const imports = src.slice(0, src.indexOf('export const appRoutes'));
+    expect(imports).not.toMatch(/^import .*pages\/arena/m);
+    for (const r of appRoutes) {
+      expect(r.providers, `${r.path} declares route providers`).toBeUndefined();
+    }
+  });
+
+  it('loads the ion-content SHELL for each arena route, not the bare page body', () => {
+    const src = readFileSync(join(process.cwd(), 'web/src/app/app.routes.ts'), 'utf8');
+    for (const [path, shell] of [
+      ['initiatives/:id/arena', 'ArenaSetupShell'],
+      ['workflows', 'WorkflowsShell'],
+      ['workflows/:id/arena', 'WorkflowArenaShell'],
+      ['workflows/:id', 'WorkflowDetailShell'],
+    ] as const) {
+      expect(appRoutes.find((r) => r.path === path)).toBeTruthy();
+      expect(src, `${path} should load ${shell}`).toContain(`m.${shell}`);
+    }
+    // A routed page WITHOUT ion-content is clipped and unscrollable — measured in Chrome at
+    // 400x860, with the promote control 464px past the clip.
+    expect(src).not.toMatch(/arena\/(?:arena-setup|workflows|workflow-detail|workflow-arena)\.page'/);
+  });
 
   it('declares all four, lazily and behind the auth guard', () => {
     for (const path of ['initiatives/:id/arena', 'workflows', 'workflows/:id', 'workflows/:id/arena']) {

@@ -94,15 +94,45 @@ export function gateAcceptance(result: {
   };
 }
 
-/** Saying no always carries a reason — there is no bare no (mock step 8). */
+/** A reason longer than this is refused. Nothing capped it at either layer; a megabyte of text in
+ *  a halt banner is its own denial of service, on a phone most of all. */
+export const MAX_REJECTION_REASON = 2000;
+
+/**
+ * Characters that are NOT Unicode `White_Space` — so `trim()` keeps them — and yet render as
+ * nothing: zero-width spaces and joiners, the BOM, the word joiner, the soft hyphen, the Hangul
+ * fillers, and the C0/C1 controls (NUL among them). A reason made only of these passed a
+ * `trim().length > 0` check and then appeared in the halt banner as an empty line.
+ */
+const INVISIBLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb]/g;
+
+/** What a reason actually SHOWS: whitespace trimmed and every invisible character removed. */
+export function visibleText(value: string): string {
+  return value.replace(INVISIBLE, '').trim();
+}
+
+/**
+ * Saying no always carries a reason — there is no bare no (mock step 8), and "a reason that renders
+ * as nothing" is a bare no with extra steps. Checked here rather than left to the host: the host is
+ * being fixed in parallel, and a client that submits something it knows is empty is wrong either
+ * way.
+ */
 export function rejectionReasonValid(reason: string): { ok: boolean; message: string | null } {
-  return reason.trim().length > 0
-    ? { ok: true, message: null }
-    : {
-        ok: false,
-        message:
-          'Write a reason. A challenger that passed every check and was rejected anyway means the gate is missing something, and the reason is the only record of what.',
-      };
+  const visible = visibleText(reason);
+  if (visible.length === 0) {
+    return {
+      ok: false,
+      message:
+        'Write a reason that is actually visible. A challenger that passed every check and was rejected anyway means the gate is missing something, and the reason is the only record of what — an empty line in the halt banner tells the next reader nothing.',
+    };
+  }
+  if (reason.length > MAX_REJECTION_REASON) {
+    return {
+      ok: false,
+      message: `That reason is too long: ${reason.length} characters against a limit of ${MAX_REJECTION_REASON}. It has to be readable in a halt banner on a phone.`,
+    };
+  }
+  return { ok: true, message: null };
 }
 
 export interface SearchStateLike {

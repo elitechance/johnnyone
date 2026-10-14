@@ -2,12 +2,12 @@ import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
 import {
-  JohnnyApiService,
+  ArenaApiService,
   type Workflow,
   type WorkflowPref,
   type WorkflowRun,
   type WorkflowSearchState,
-} from '../../../../../ui/src/services/johnny-api.service';
+} from './arena-api.service';
 import { ARENA_CSS } from './arena-ui.css';
 import {
   changedSlots,
@@ -29,10 +29,8 @@ import {
  *    There is no composite, no rating and no percentage anywhere on it.
  *  * COMPARABILITY IS THE HOST'S. `WorkflowPref.comparable` is computed by the host from the two
  *    runs' seat budgets and is not an argument, so this screen cannot assert it — it asks the host
- *    to record the head-to-head (the explicit "Compare" control) and then reads the verdict. There
- *    is no `workflowPrefs` QUERY in the schema, so a preference recorded in an earlier visit cannot
- *    be read back; recording it is the only way to hold one. That is a real gap, reported rather
- *    than worked around by re-deriving comparability here.
+ *    to READ the preference back (`workflowPrefs`) and, only when there is none, offers an explicit
+ *    "Compare" control to record one. It never records a row merely because a page was opened.
  *  * READING IS NOT SCORING. The documents live in the Plan tab, which this links to. No second
  *    document browser, no second markdown renderer, no second iframe sandbox.
  */
@@ -57,6 +55,29 @@ import {
           @if (searchState()?.recentRejections?.length) {
             <ul class="a-list">@for (r of searchState()!.recentRejections; track r) {<li>{{ r }}</li>}</ul>
           }
+          @if (!resuming()) {
+            <button type="button" class="a-btn" data-test="resume" (click)="resuming.set(true)">Lift the halt</button>
+          } @else {
+            <p class="a-note">Lifting the halt is its own decision and it is recorded with a reason. A promotion does not lift it — that is how a halt used to be escaped with no new evidence.</p>
+            <textarea class="a-input" data-test="resume-reason" [value]="resumeReason()" (input)="resumeReason.set($any($event.target).value)"></textarea>
+            @if (!resumeReasonValid().ok) { <p class="a-note" data-test="resume-hint">{{ resumeReasonValid().message }}</p> }
+            <div class="a-row">
+              <button type="button" class="a-btn" (click)="resuming.set(false)">Cancel</button>
+              <button type="button" class="a-btn primary" data-test="resume-send" [disabled]="!resumeReasonValid().ok || resumeSending()" (click)="resume()">{{ resumeSending() ? 'Recording…' : 'Resume the search' }}</button>
+            </div>
+            @if (resumeError()) { <div class="a-block" data-test="resume-error">{{ resumeError() }}</div> }
+          }
+        </div>
+      }
+
+      @if (runUnscored()) {
+        <div class="a-warn" data-test="no-executor-note">
+          <b>Nothing has scored this run, and nothing in J1 will.</b> A run is created here, but no
+          worker executes it and nothing reports a gate result back against it, so its score stays
+          "never ran" — which is not a pass, and cannot be promoted. The executor that links a run to
+          a phase's execution is being built on the host. Until it lands, this screen can show you a
+          comparison but the decision below is out of reach, and saying otherwise would be the
+          "looks like it is working" failure the halt rule exists to prevent.
         </div>
       }
 
@@ -186,7 +207,7 @@ import {
   ],
 })
 export class WorkflowArenaPage implements OnInit {
-  private readonly api = inject(JohnnyApiService);
+  private readonly api = inject(ArenaApiService);
   private readonly route = inject(ActivatedRoute);
 
   protected readonly challenger = signal<Workflow | null>(null);
@@ -205,6 +226,10 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly rejectError = signal<string | null>(null);
   protected readonly reason = signal('');
   protected readonly replaying = signal(false);
+  protected readonly resuming = signal(false);
+  protected readonly resumeSending = signal(false);
+  protected readonly resumeReason = signal('');
+  protected readonly resumeError = signal<string | null>(null);
   protected readonly replayError = signal<string | null>(null);
 
   protected readonly haltBlock = computed(() => startRunBlock(this.searchState()));
@@ -222,8 +247,18 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly promoteBlock = computed(() => {
     const run = this.challengerRun();
     if (!run) return 'This challenger has no run yet, so there is nothing to promote.';
+    // A halted search refuses a promotion as well as a run: a promotion used to be the way OUT of
+    // a halt, which made the halt escapable with no new evidence. Lifting it is its own decision.
+    const halt = this.haltBlock();
+    if (halt) return halt;
     return promotionBlock({ run, pref: this.pref(), incumbentExists: this.champion() !== null });
   });
+  /** True while a run exists but carries no score — which, today, is every run this UI creates. */
+  protected readonly runUnscored = computed(() => {
+    const run = this.challengerRun();
+    return !!run && (run.gateExit === null || run.gateExit === undefined);
+  });
+  protected readonly resumeReasonValid = computed(() => rejectionReasonValid(this.resumeReason()));
   protected readonly confirmCopy = computed(() => {
     const w = this.challenger();
     return w
@@ -262,6 +297,15 @@ export class WorkflowArenaPage implements OnInit {
       }
       this.searchState.set(
         await firstValueFrom(this.api.workflowSearchState(chal.repo, chal.phaseType, chal.family)),
+      );
+      // READ any existing head-to-head rather than recording one to discover it. The pair that
+      // matters is this challenger's run against the champion's; anything else in the list is about
+      // other runs and must not enable a promotion.
+      const prefs = await firstValueFrom(this.api.workflowPrefs(chal.id));
+      const mine = this.challengerRun()?.id;
+      const theirs = this.championRun()?.id;
+      this.pref.set(
+        prefs.find((pr) => pr.winnerRunId === mine && (theirs ? pr.loserRunId === theirs : true)) ?? null,
       );
     } catch (e) {
       this.loadError.set(`Could not read this arena: ${String(e)}`);
@@ -325,6 +369,28 @@ export class WorkflowArenaPage implements OnInit {
     }
   }
 
+  /** Lift a halt — its own confirmed decision, carrying a reason, never a side effect of
+   *  promoting. Guarded by the same visible-reason rule a rejection is. */
+  protected async resume(): Promise<void> {
+    const w = this.challenger();
+    if (!w || !this.resumeReasonValid().ok || this.resumeSending()) return;
+    this.resumeSending.set(true);
+    this.resumeError.set(null);
+    try {
+      this.searchState.set(
+        await firstValueFrom(
+          this.api.updateWorkflowSearchResumed(w.repo, w.phaseType, w.family, this.resumeReason(), true),
+        ),
+      );
+      this.resuming.set(false);
+      this.resumeReason.set('');
+    } catch (e) {
+      this.resumeError.set(`The host refused to resume the search: ${String(e)}`);
+    } finally {
+      this.resumeSending.set(false);
+    }
+  }
+
   protected async replay(): Promise<void> {
     const w = this.challenger();
     const run = this.challengerRun();
@@ -337,8 +403,9 @@ export class WorkflowArenaPage implements OnInit {
           workflowId: w.id,
           planId: run?.planId ?? null,
           seed: (run?.seed ?? 0) + 1,
-          seatsHeld: run?.seatsHeld ?? JSON.stringify({ [w.family]: w.fanOut }),
-          fleetBusy: JSON.stringify({}),
+          // No seat budget and no contention map: the host measures both, and a replay that
+          // declared its own would be measuring the client's opinion of the fleet.
+          seats: null,
         }),
       );
       this.challengerRun.set(next);

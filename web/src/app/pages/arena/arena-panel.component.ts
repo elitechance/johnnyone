@@ -45,7 +45,28 @@ import { ARENA_CSS } from './arena-ui.css';
       }
     </div>
   `,
-  styles: [ARENA_CSS, `.arena-panel { padding: 12px 14px 32px; }`],
+  styles: [
+    ARENA_CSS,
+    `
+      /* The console's \`.terminal-surface\` is \`height: 100%; overflow: hidden\` — it gives each tab
+         a box and expects the TAB to scroll inside it. Measured in Chrome at 400x860: without this
+         the third phase card was cut off with no way to reach it, the same clip the routed pages
+         had (before3-console-arena-tab-clipped.png). It lives here, in the component's own sheet,
+         because terminal.page.scss is ~150 bytes under a budget that FAILS the build. */
+      :host {
+        display: block;
+        height: 100%;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .arena-panel {
+        padding-top: 12px;
+        padding-left: max(14px, env(safe-area-inset-left, 0px));
+        padding-right: max(14px, env(safe-area-inset-right, 0px));
+        padding-bottom: calc(32px + env(safe-area-inset-bottom, 0px));
+      }
+    `,
+  ],
 })
 export class ArenaPanelComponent {
   @Input() initiativeId = '';

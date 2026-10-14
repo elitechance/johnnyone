@@ -1,7 +1,7 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { RouterLink } from '@angular/router';
 import { firstValueFrom } from 'rxjs';
-import { JohnnyApiService, type Workflow } from '../../../../../ui/src/services/johnny-api.service';
+import { ArenaApiService, type Workflow } from './arena-api.service';
 import { ARENA_CSS } from './arena-ui.css';
 
 /** Same three families as the setup screen, with the caps MEASURED on 2026-10-12. */
@@ -70,7 +70,7 @@ const FAMILIES = ['glm-5.3-flash', 'deepseek-v4.1-flash', 'qwen3.8-flash-next'];
   styles: [ARENA_CSS, `.wf-when { font-size: 12px; } a { margin-right: 4px; }`],
 })
 export class WorkflowsPage implements OnInit {
-  private readonly api = inject(JohnnyApiService);
+  private readonly api = inject(ArenaApiService);
   protected readonly families = FAMILIES;
   protected readonly all = signal<Workflow[]>([]);
   protected readonly loading = signal(true);

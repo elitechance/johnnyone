@@ -8,6 +8,7 @@ import { ActivatedRoute, convertToParamMap, provideRouter, Router } from '@angul
 import { of, throwError } from 'rxjs';
 import '../../../test-setup';
 import { JohnnyApiService } from '../../../../../ui/src/services/johnny-api.service';
+import { ArenaApiService } from './arena-api.service';
 import { ArenaSetupPage } from './arena-setup.page';
 import { WorkflowsPage } from './workflows.page';
 import { WorkflowDetailPage } from './workflow-detail.page';
@@ -65,8 +66,8 @@ const RUN_PASS = {
   seed: 0,
   gateExit: 0,
   gateCollected: 23,
-  seatsHeld: '{"glm":2}',
-  fleetBusy: '{"glm":0}',
+  seatsHeld: '{"glm-5.3-flash":2}',
+  fleetBusy: '{"glm-5.3-flash":1}',
   startedAt: '2026-10-14T01:00:00Z',
   endedAt: '2026-10-14T01:06:40Z',
 };
@@ -130,8 +131,21 @@ function stubApi(over: Record<string, unknown> = {}) {
     recordWorkflowPref: rec('recordWorkflowPref', PREF_OK),
     updateWorkflowChampion: rec('updateWorkflowChampion', { ...WF, isChampion: true }),
     recordWorkflowRejection: rec('recordWorkflowRejection', STATE_HALTED),
-    ...over,
+    // Reading a preference back, rather than recording one to discover it (new in the API).
+    workflowPrefs: rec('workflowPrefs', []),
+    updateWorkflowSearchResumed: rec('updateWorkflowSearchResumed', { ...STATE_OK, consecutiveRejections: 0, halted: false, recentRejections: [] }),
   };
+  // Overrides are WRAPPED so they record too. They did not, which made every `api.calls` assertion
+  // in a test that overrode the method it was asserting about silently vacuous — found while
+  // writing the preference test, which passed a non-recording stub and then asked whether the call
+  // had been recorded.
+  for (const [name, impl] of Object.entries(over)) {
+    const fn = impl as (...a: unknown[]) => unknown;
+    (api as Record<string, unknown>)[name] = (...args: unknown[]) => {
+      calls.push({ name, args });
+      return fn(...args);
+    };
+  }
   return api as typeof api & Record<string, (...a: unknown[]) => unknown>;
 }
 
@@ -141,7 +155,9 @@ async function flush(f: { detectChanges: () => void }): Promise<void> {
   // Microtasks only. A bare `setTimeout` here never settles under zone.js/testing's ProxyZone
   // outside fakeAsync (measured: every spec hit the 5s timeout), and the stub API is synchronous,
   // so a handful of microtask turns is all the awaited chain needs.
-  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  // Each awaited API call costs a few microtask turns and these pages make up to six in
+  // sequence, so the budget is generous rather than exact.
+  for (let i = 0; i < 60; i += 1) await Promise.resolve();
   f.detectChanges();
 }
 
@@ -151,7 +167,11 @@ async function mount<T>(cmp: new (...a: never[]) => T, api: unknown, params: Rec
   TestBed.configureTestingModule({
     providers: [
       provideRouter([]),
+      // One stub object behind both services: the split is about what ships in which bundle, not
+      // about two different fakes, and a test that can see every call in one list is easier to
+      // read than two.
       { provide: JohnnyApiService, useValue: api },
+      { provide: ArenaApiService, useValue: api },
       {
         provide: ActivatedRoute,
         useValue: {
@@ -280,6 +300,30 @@ describe('ArenaSetupPage — /initiatives/:id/arena, the 3-step setup', () => {
     await flush(f);
     expect(api.calls.filter((c) => c.name === 'createWorkflowVersion')).toHaveLength(1);
     expect(api.calls.filter((c) => c.name === 'startWorkflowRun')).toHaveLength(1);
+  });
+
+  it('never invents a seat budget or a contention map — the host measures both', async () => {
+    const api = stubApi();
+    const f = await mount(ArenaSetupPage, api, { id: 'p1' }, { phaseId: '04-leases', step: 'prompt' });
+    click(q(f, '[data-test="start-search"]'));
+    await flush(f);
+    const args = api.calls.find((c) => c.name === 'startWorkflowRun')!.args[0] as Record<string, unknown>;
+    expect(Object.keys(args).sort()).toEqual(['planId', 'seats', 'seed', 'workflowId']);
+    expect(JSON.stringify(args)).not.toContain('fleetBusy');
+    expect(JSON.stringify(args)).not.toContain('seatsHeld');
+  });
+
+  it('does NOT claim a run is under way that nothing will ever score', async () => {
+    // Measured hole: `recordWorkflowRunGate` has no caller outside a spec stub, and nothing on the
+    // host links a `workflow_runs` row to plan execution — so a run created here keeps
+    // `gateExit = null` forever, which blocks promotion. The screen has to say that.
+    const api = stubApi();
+    const f = await mount(ArenaSetupPage, api, { id: 'p1' }, { phaseId: '04-leases', step: 'prompt' });
+    const note = q(f, '[data-test="no-executor-note"]');
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toMatch(/executor/i);
+    expect(note!.textContent).toMatch(/never ran|nothing (?:executes|has scored)|no worker/i);
+    expect(txt(f)).not.toContain('Start the search');
   });
 
   it('shows a host refusal instead of pretending the run started', async () => {
@@ -460,6 +504,94 @@ describe('WorkflowArenaPage — /workflows/:id/arena, champion vs challenger', (
     click(q(f, '[data-test="replay"]'));
     await flush(f);
     expect(api.calls.some((c) => c.name === 'startWorkflowRun')).toBe(false);
+  });
+
+  it('a replay asks the host for a run and invents no budget', async () => {
+    const api = stubApi({ workflowRuns: (id: unknown) => of(id === 'w1' ? [RUN_FAIL] : [RUN_PASS]) });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="replay"]'));
+    await flush(f);
+    const args = api.calls.find((c) => c.name === 'startWorkflowRun')!.args[0] as Record<string, unknown>;
+    expect(args['seed']).toBe(1);
+    expect(Object.keys(args).sort()).toEqual(['planId', 'seats', 'seed', 'workflowId']);
+  });
+
+  it('READS the preference back on load — no write is needed to discover one', async () => {
+    const api = stubApi({
+      workflowRuns: (id: unknown) => of(id === 'w1' ? [RUN_FAIL] : [RUN_PASS]),
+      workflowPrefs: () => of([PREF_OK]),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    expect(api.calls.some((c) => c.name === 'workflowPrefs')).toBe(true);
+    // Promotion is available without recording anything first…
+    expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(false);
+    expect(api.calls.some((c) => c.name === 'recordWorkflowPref')).toBe(false);
+    // …and the Compare control is not offered, because there is nothing left to record.
+    expect(q(f, '[data-test="compare"]')).toBeNull();
+  });
+
+  it('ignores a preference that is about other runs', async () => {
+    const api = stubApi({
+      workflowRuns: (id: unknown) => of(id === 'w1' ? [RUN_FAIL] : [RUN_PASS]),
+      workflowPrefs: () => of([{ ...PREF_OK, id: 'pfX', winnerRunId: 'rZZ', loserRunId: 'rYY' }]),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(true);
+    expect(q(f, '[data-test="compare"]')).toBeTruthy();
+  });
+
+  it('says plainly that a run with no score is one nothing has scored yet', async () => {
+    const api = stubApi({
+      workflowRuns: () => of([{ ...RUN_PASS, gateExit: null, gateCollected: null, endedAt: null }]),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    const note = q(f, '[data-test="no-executor-note"]');
+    expect(note).toBeTruthy();
+    expect(note!.textContent).toMatch(/executor/i);
+    expect(note!.textContent).toMatch(/never ran|nothing (?:executes|has scored)|no worker/i);
+    expect((q(f, '[data-test="promote"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('lifts a halt only through its own confirmed decision, with a visible reason', async () => {
+    const api = stubApi({ workflowSearchState: () => of(STATE_HALTED) });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    expect(q(f, '[data-test="halt-block"]')).toBeTruthy();
+    click(q(f, '[data-test="resume"]'));
+    await flush(f);
+    const send = q(f, '[data-test="resume-send"]') as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    // A reason made only of invisible characters is not a reason.
+    type(q(f, '[data-test="resume-reason"]'), '\u200b\ufeff');
+    await flush(f);
+    expect((q(f, '[data-test="resume-send"]') as HTMLButtonElement).disabled).toBe(true);
+    click(q(f, '[data-test="resume-send"]'));
+    await flush(f);
+    expect(api.calls.some((c) => c.name === 'updateWorkflowSearchResumed')).toBe(false);
+
+    type(q(f, '[data-test="resume-reason"]'), 'added a coverage threshold to the gate');
+    await flush(f);
+    click(q(f, '[data-test="resume-send"]'));
+    await flush(f);
+    expect(api.calls.find((c) => c.name === 'updateWorkflowSearchResumed')!.args).toEqual([
+      'johnnyone', 'dev-phase', 'glm-5.3-flash', 'added a coverage threshold to the gate', true,
+    ]);
+    // The host's new state comes back un-halted, so the banner goes.
+    expect(q(f, '[data-test="halt-block"]')).toBeNull();
+  });
+
+  it('refuses to promote while the search is halted, as the host now does', async () => {
+    const api = stubApi({
+      workflowSearchState: () => of(STATE_HALTED),
+      workflowRuns: (id: unknown) => of(id === 'w1' ? [RUN_FAIL] : [RUN_PASS]),
+      workflowPrefs: () => of([PREF_OK]),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    const promote = q(f, '[data-test="promote"]') as HTMLButtonElement;
+    expect(promote.disabled).toBe(true);
+    click(promote);
+    await flush(f);
+    expect(q(f, '[data-test="promote-confirm"]')).toBeNull();
+    expect(api.calls.some((c) => c.name === 'updateWorkflowChampion')).toBe(false);
   });
 
   it('links back to the Plan tab to read the work, rather than cloning the document browser', async () => {
