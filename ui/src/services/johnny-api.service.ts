@@ -149,6 +149,9 @@ export interface AgentPlan {
   executorConfig?: string | null;
   /** Host consecutive non-pass planning rounds for this initiative. */
   consecutiveNonPassPlanningRounds?: number | null;
+  /** The coordinator's own test gate at PLAN level (migration 023). Nullable for deploy skew; null
+   *  or empty = no plan-level gate. Prefer `AgentPlanPhase.effectiveTestCommands` for display. */
+  testCommands?: string[] | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -168,6 +171,12 @@ export interface AgentPlanPhase {
   clarificationAttempts: number;
   summary?: string;
   findingsJson: string;
+  /** This phase's OWN gate (migration 025). Null/empty = inherits the plan's. */
+  testCommands?: string[] | null;
+  /** The gate that ACTUALLY applies: this phase's commands when it declares any, else the plan's.
+   *  Resolved by the host's `effective_test_commands` — the single place that precedence lives, so
+   *  no client re-implements the fallback. Non-null; `[]` is the honest "no gate at either level". */
+  effectiveTestCommands?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -373,6 +382,23 @@ export interface ChatAttachment {
   localPath?: string;
 }
 
+/** One run of a phase's (or a plan's) effective gate — `runAgentPlanTestGate`. */
+export interface TestGateRun {
+  /** Whether a gate was DECLARED at all, at either level. `exitCode === 0` alone only means
+   *  "nothing failed": a phase with no gate also exits 0. Ask this first. */
+  gateDeclared: boolean;
+  /** The score, and the only one. 0 = pass. Negative values are reserved outcomes with no real
+   *  exit code (-1 signal, -2 gate unreadable, -3 timeout) — all of them failures. */
+  exitCode: number;
+  /** ADVISORY AND NULLABLE, and null is NOT an error (a lint or a build reports no count). Never
+   *  branch on it; render it through `gateCollectedLabel` so null never shows as 0. */
+  collected?: number | null;
+  command?: string | null;
+  commandsRun: number;
+  output: string;
+  truncated: boolean;
+}
+
 @Injectable({ providedIn: 'root' })
 export class JohnnyApiService {
   private readonly gql = inject(GraphQLClient);
@@ -396,13 +422,13 @@ export class JohnnyApiService {
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
       brief appScope docsScope referencePaths amendBrief validationConfig executorConfig phaseRunMode
       initiativeId initiativeStatus health briefingSessionId
-      consecutiveNonPassPlanningRounds
+      consecutiveNonPassPlanningRounds testCommands
       createdAt updatedAt
     }
     phases {
       id planId phaseId phaseTitle phaseIndex status workerStartedAt workerIdleAt
       reviewerStartedAt reviewerIdleAt gateVerdict clarificationAttempts summary
-      findingsJson createdAt updatedAt
+      findingsJson testCommands effectiveTestCommands createdAt updatedAt
     }
     tasks {
       id planId phaseId taskId taskTitle taskIndex promptPath statusPath
@@ -1524,5 +1550,41 @@ export class JohnnyApiService {
         variables
       )
       .pipe(map((data) => data[field]));
+  }
+
+  // ── The test gate (migrations 023 / 025) ──────────────────────────────
+
+  /** Set — or with `clear`, remove — the gate at one level. `phaseId` null writes the PLAN's. */
+  updateAgentPlanTestCommands(
+    id: string,
+    phaseId: string | null,
+    commands: string[],
+    clear = false,
+  ): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updateAgentPlanTestCommands: AgentPlanRun }>(
+        `mutation UpdateAgentPlanTestCommands($id: ID!, $phaseId: String, $commands: [String!]!, $clear: Boolean) {
+          updateAgentPlanTestCommands(id: $id, phaseId: $phaseId, commands: $commands, clear: $clear) {
+            ${this.agentPlanRunFields}
+          }
+        }`,
+        { id, phaseId, commands, clear }
+      )
+      .pipe(map((data) => data.updateAgentPlanTestCommands));
+  }
+
+  /** Run a phase's (or the plan's) effective gate ONCE, synchronously, and report the outcome.
+   *  Both numbers come back: the exit code (the score) and the advisory collected count. */
+  runAgentPlanTestGate(id: string, phaseId?: string | null): Observable<TestGateRun> {
+    return this.gql
+      .mutate<{ runAgentPlanTestGate: TestGateRun }>(
+        `mutation RunAgentPlanTestGate($id: ID!, $phaseId: String) {
+          runAgentPlanTestGate(id: $id, phaseId: $phaseId) {
+            gateDeclared exitCode collected command commandsRun output truncated
+          }
+        }`,
+        { id, phaseId: phaseId ?? null }
+      )
+      .pipe(map((data) => data.runAgentPlanTestGate));
   }
 }

@@ -63,6 +63,9 @@ export type {
   GitDiffView,
   WorkspaceFileDiff,
   WorkspaceValidation,
+  // The test gate (migrations 023/025). The ARENA's own types are not here: they belong to
+  // `web/src/app/pages/arena/arena-api.service.ts`, which only the lazy arena chunk injects.
+  TestGateRun,
 } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
 export type {
