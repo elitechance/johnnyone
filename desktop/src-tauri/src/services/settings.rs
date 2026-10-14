@@ -841,6 +841,15 @@ mod tests {
         let root = guard_tmp_root();
         // Absolute path outside the root escapes containment even without a `..` segment.
         assert!(resolve_within_root(&root, "/etc/passwd").is_err());
+        // The WORDING is load-bearing, not just the Err: the console's Plan tab matches this exact
+        // phrase to tell the reader their plan store sits outside `files_root` (an independently
+        // configurable setting) instead of silently showing "no artifacts". Pinned on the other
+        // side by `artifactListError` in web/src/app/pages/terminal/plan-tab-logic.spec.ts — if you
+        // reword this, that test fails and tells you where to look.
+        assert_eq!(
+            resolve_within_root(&root, "/etc/passwd").unwrap_err(),
+            "Path is outside the configured files_root"
+        );
     }
 
     #[test]

@@ -489,14 +489,14 @@
                   <!-- Artifacts (mass-artifacts): the plan's and each phase's `artifacts/` dir,
                        listed via the existing `filesListDir`. Renders nothing when there are none. -->
                   @if (planArtifacts().length || planArtifactsBlocked()) {
-                    <div class="dn dir art-head"><span class="ic">▾</span>artifacts</div>
+                    <div class="dn dir art-head">documents</div>
                   }
                   @if (planArtifactsBlocked()) {
                     <div class="dn art-note">{{ planArtifactsBlocked() }}</div>
                   }
                   @for (g of planArtifacts(); track g.dirRel) {
                     <div class="dn dir indent-1" [title]="g.dirRel">
-                      <span class="ic">▾</span><span class="lbl">{{ g.label }}</span>
+                      <span class="lbl">{{ g.label }}</span>
                     </div>
                     @for (n of g.nodes; track n.id) {
                       <button

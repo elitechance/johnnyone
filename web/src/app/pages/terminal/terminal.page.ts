@@ -156,14 +156,18 @@ import {
   planDocPath,
   taskStatusLabel,
   artifactGroups,
-  artifactDirsFor,
   artifactOpenMode,
+  artifactListError,
+  isDocDir,
+  phaseDir,
+  emptyArtifactCache,
+  mergeArtifactListings,
   PlanCounts,
   DocNavEntry,
   PhaseCard,
   TaskStatusView,
   ArtifactGroup,
-  ArtifactListings,
+  ArtifactCache,
   ArtifactNode,
 } from './plan-tab-logic';
 import {
@@ -419,13 +423,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   planError = signal<string | null>(null);
   /**
    * Artifacts section (mass-artifacts): cached `filesListDir` results keyed by the dir's path
-   * RELATIVE to the plan dir (`artifacts`, `phases/<id>/artifacts`, and any expanded subdir).
-   * Relative keys, not host-absolute ones, so the cache survives a planPath that differs only in
-   * its prefix and so the keys are exactly what `planDocPath` validates.
+   * RELATIVE to the plan dir (`artifacts`, `mocks`, `phases/<id>/artifacts`, any expanded subdir).
+   * Relative keys, not host-absolute ones, so the keys are exactly what `planDocPath` validates —
+   * which is also why the cache is TAGGED with the initiative it belongs to (D3): the same relative
+   * key means a stale fan-out would otherwise show one initiative's filenames under another's.
    */
-  planArtifactListings = signal<ArtifactListings>({});
+  planArtifactCache = signal<ArtifactCache>(emptyArtifactCache(''));
   /** Which artifact subdirectories the reader has opened (plan-relative keys). */
   planArtifactExpanded = signal<Record<string, boolean>>({});
+  /** Phase dirs whose document dirs have been discovered, so each phase is probed at most once. */
+  private readonly phasesArtifactsLoaded = new Set<string>();
   /**
    * Why the artifacts of this plan cannot be listed at all, when that is a CONFIGURATION fact
    * rather than "there are none". `files_root` and `initiatives_dir` are independent user settings,
@@ -1019,7 +1026,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   );
   /** Artifacts navigator section — pure projection over the cached listings (mass-artifacts). */
   protected readonly planArtifacts = computed<ArtifactGroup[]>(() =>
-    artifactGroups(this.planRun(), this.planArtifactListings(), this.planArtifactExpanded()),
+    artifactGroups(this.planRun(), this.planArtifactCache().listings, this.planArtifactExpanded()),
   );
 
   // Run/Resume panel (console-features P01) — all decisions come from the pure `run-resume-logic`
@@ -2801,9 +2808,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.planSelectedDoc.set('plan.md');
     this.planDocMarkdown.set('');
     this.planError.set(null);
-    this.planArtifactListings.set({});
+    this.planArtifactCache.set(emptyArtifactCache(init.id));
     this.planArtifactExpanded.set({});
     this.planArtifactsBlocked.set(null);
+    this.phasesArtifactsLoaded.clear();
     if (!init.planPath?.trim()) return; // benign empty (no plan to read)
     this.planLoading.set(true);
     try {
@@ -2811,10 +2819,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.applyPlanRun(run ?? null);
       // Stage-aware default: overview.md when the plan has phases (development), else plan.md (planning).
       await this.loadPlanDoc(defaultPlanDoc(run));
-      // Artifacts are listed AFTER the doc is on screen and are not awaited: a plan with ten phases
-      // means ten `filesListDir` round-trips over the relay, and none of them should delay the text
-      // the reader came for. The section simply appears when the listings land.
-      void this.loadPlanArtifacts(run ?? null);
+      // Artifacts are listed AFTER the doc is on screen and are NOT awaited: nothing about the
+      // artifacts should delay the text the reader opened the tab for.
+      void this.loadPlanArtifacts(init.id, init.planPath);
     } catch {
       this.applyPlanRun(null); // benign empty state, no crash
     } finally {
@@ -2823,53 +2830,97 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   /**
-   * List every artifacts dir of the plan (its own + one per phase), in parallel, best-effort.
+   * Is `initiativeId` still the one whose plan we are loading?
    *
-   * Uses the EXISTING `filesListDir` host API, which is rooted at `files_root` and guards every
-   * path. A dir that does not exist simply fails and contributes nothing — that is the common case
-   * and is NOT an error worth showing. The one failure that IS worth showing is a confinement
-   * refusal (the initiatives dir configured outside `files_root`), surfaced via
-   * `planArtifactsBlocked` so the reader learns why instead of concluding there are no artifacts.
+   * Every artifact listing is an await, and the reader can switch initiative mid-flight. Without
+   * this check a slow fan-out for initiative A lands AFTER `ensurePlanLoaded` has reset the signals
+   * for initiative B, and because `'artifacts'` is the same literal cache key for every plan, B's
+   * navigator renders A's filenames — and clicking one joins B's `planPath` to A's filename.
+   * `planLoadedForInitiative` already encodes exactly this ownership, so it is the authority.
    */
-  private async loadPlanArtifacts(run: AgentPlanRun | null): Promise<void> {
-    const planPath = this.selectedInitiative()?.planPath;
-    if (!planPath?.trim()) return;
-    const dirs = artifactDirsFor(run);
-    const results = await Promise.all(dirs.map((dir) => this.listArtifactDir(planPath, dir)));
-    const listings: ArtifactListings = {};
-    let blocked: string | null = null;
-    for (const r of results) {
-      if (r.entries) listings[r.dirRel] = r.entries;
-      if (r.blocked && !blocked) blocked = r.blocked;
-    }
-    this.planArtifactListings.set(listings);
-    // Only claim a configuration problem when NOTHING could be listed; a single phase dir refusing
-    // while others worked is not a config fact.
-    this.planArtifactsBlocked.set(Object.keys(listings).length ? null : blocked);
+  private stillLoadingPlanFor(initiativeId: string): boolean {
+    return this.planLoadedForInitiative === initiativeId;
   }
 
-  /** One guarded `filesListDir`, classified into entries / "absent" / "blocked by configuration". */
+  /**
+   * Discover and list the plan's document directories (`artifacts/`, `mocks/`,
+   * `screens-to-verify/`, …), best-effort, through the EXISTING `filesListDir` host API.
+   *
+   * ONE call lists the plan dir itself; whichever of the allowlisted names it reports back are then
+   * listed for their contents. That replaces probing all seven names blind, and it is why phases
+   * are not touched here at all: the previous version listed the plan dir plus EVERY phase dir on
+   * every Plan-tab open, measured at 243 `filesListDir` calls over the real store with 146 of them
+   * (60%) for directories that do not exist, worst case 15 parallel relay RPCs for one initiative.
+   * This repo throttles terminal screen-publishes specifically to limit Durable Object traffic, so
+   * a 15-way burst that is 60% waste cuts against an existing constraint. Re-measured after this
+   * change: 113 calls total, worst case 3 for one initiative, nothing wasted. A phase's documents
+   * are listed when that phase is opened (`loadPhaseArtifacts`).
+   */
+  private async loadPlanArtifacts(initiativeId: string, planPath: string): Promise<void> {
+    if (!planPath.trim()) return;
+    const probe = await this.listArtifactDir(planPath, '', planPath);
+    if (!this.stillLoadingPlanFor(initiativeId)) return;
+    if (probe.blocked) {
+      this.planArtifactsBlocked.set(probe.blocked);
+      return;
+    }
+    // (`planArtifactsBlocked` is reset per initiative and only written behind the same ownership
+    // check, so a stale refusal cannot be shown against another initiative's plan.)
+    const present = (probe.entries ?? [])
+      .filter((e) => e.kind === 'dir' && isDocDir(e.name))
+      .map((e) => e.name);
+    if (!present.length) return;
+    const results = await Promise.all(
+      present.map((dir) => this.listArtifactDir(planPath, dir)),
+    );
+    this.planArtifactCache.update((c) => mergeArtifactListings(c, initiativeId, results));
+  }
+
+  /**
+   * The same one-call discovery for a single phase, run when that phase row is opened.
+   *
+   * Idempotent and at most once per phase: `phasesArtifactsLoaded` is reset with the rest of the
+   * per-initiative plan state, so switching initiative and coming back re-reads.
+   */
+  private async loadPhaseArtifacts(initiativeId: string, phaseId: string): Promise<void> {
+    const planPath = this.selectedInitiative()?.planPath;
+    if (!planPath?.trim()) return;
+    const dir = phaseDir(phaseId);
+    if (!dir || this.phasesArtifactsLoaded.has(dir)) return;
+    this.phasesArtifactsLoaded.add(dir);
+    const probe = await this.listArtifactDir(planPath, dir);
+    if (!this.stillLoadingPlanFor(initiativeId)) return;
+    const present = (probe.entries ?? [])
+      .filter((e) => e.kind === 'dir' && isDocDir(e.name))
+      .map((e) => `${dir}/${e.name}`);
+    if (!present.length) return;
+    const results = await Promise.all(present.map((d) => this.listArtifactDir(planPath, d)));
+    this.planArtifactCache.update((c) => mergeArtifactListings(c, initiativeId, results));
+  }
+
+  /**
+   * One guarded `filesListDir`, classified into entries / absent / refused-by-configuration.
+   *
+   * `dirRel` is resolved through `planDocPath` — the single allowlist — so nothing here can address
+   * a path the navigator is not allowed to reach. `absOverride` exists for the one listing whose
+   * target is the plan dir itself, which is the allowlist's own base rather than a selection under
+   * it.
+   */
   private async listArtifactDir(
     planPath: string,
     dirRel: string,
+    absOverride?: string,
   ): Promise<{ dirRel: string; entries?: FileEntry[]; blocked?: string }> {
-    const abs = planDocPath(planPath, dirRel);
+    const abs = absOverride ?? planDocPath(planPath, dirRel);
     if (!abs) return { dirRel };
     try {
       const listing = await firstValueFrom(this.api.listDir(abs));
       return { dirRel, entries: listing?.entries ?? [] };
     } catch (err) {
-      const msg = String((err as { message?: string })?.message ?? err ?? '');
-      // The host's own wording for a containment refusal (`resolve_within_root`).
-      if (/outside the configured files_root/i.test(msg)) {
-        return {
-          dirRel,
-          blocked:
-            'Artifacts cannot be listed: this plan store is outside the configured file-browsing root. ' +
-            'Point Settings → files root at a directory that contains the initiatives store.',
-        };
-      }
-      return { dirRel }; // absent / unreadable → no artifacts, no noise
+      // Absent/unreadable → no artifacts and no noise; a confinement refusal → an explanation.
+      // Classification lives in the pure `artifactListError`, over the shared `normalizeFileError`.
+      const blocked = artifactListError(err);
+      return blocked ? { dirRel, blocked } : { dirRel };
     }
   }
 
@@ -2885,13 +2936,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (node.kind === 'dir') {
       const willOpen = !this.planArtifactExpanded()[node.id];
       this.planArtifactExpanded.update((m) => ({ ...m, [node.id]: willOpen }));
-      if (willOpen && !this.planArtifactListings()[node.id]) {
-        const planPath = this.selectedInitiative()?.planPath;
-        if (!planPath?.trim()) return;
-        const r = await this.listArtifactDir(planPath, node.id);
-        if (r.entries) {
-          this.planArtifactListings.update((m) => ({ ...m, [node.id]: r.entries }));
-        }
+      if (willOpen && !this.planArtifactCache().listings[node.id]) {
+        const init = this.selectedInitiative();
+        if (!init?.planPath?.trim()) return;
+        const r = await this.listArtifactDir(init.planPath, node.id);
+        // Same ownership check as the fan-out: the reader may have switched initiative while this
+        // listing was in flight, and this cache is keyed by a plan-RELATIVE path.
+        this.planArtifactCache.update((c) => mergeArtifactListings(c, init.id, [r]));
       }
       return;
     }
@@ -2925,9 +2976,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  /** Doc-navigator click: switch the rendered doc (overview.md / status.md / a phase's overview). */
+  /**
+   * Doc-navigator click: switch the rendered doc (overview.md / status.md / a phase's overview).
+   *
+   * Opening a PHASE also discovers that phase's document dirs (R3). Listing them here rather than
+   * up-front is what keeps a Plan-tab open at ~2 host calls instead of one per phase: you pay for
+   * a phase's artifacts when you ask for that phase.
+   */
   openPlanDoc(sel: string): void {
     void this.loadPlanDoc(sel);
+    const init = this.selectedInitiative();
+    const isPhase = (this.planRun()?.phases ?? []).some((ph) => ph.phaseId === sel);
+    if (init && isPhase) void this.loadPhaseArtifacts(init.id, sel);
   }
 
   /**

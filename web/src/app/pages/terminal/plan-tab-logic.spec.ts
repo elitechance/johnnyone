@@ -14,6 +14,12 @@ import {
   artifactGroups,
   artifactDirsFor,
   artifactOpenMode,
+  artifactListError,
+  isDocDir,
+  docDirNames,
+  phaseDir,
+  emptyArtifactCache,
+  mergeArtifactListings,
 } from './plan-tab-logic';
 
 // Pure spec (no Angular/Ionic/DOM) — runs under the plugin-less web/vitest.config.ts. Pins the Plan
@@ -291,7 +297,8 @@ describe('artifactGroups', () => {
       {},
     );
     expect(groups).toHaveLength(1);
-    expect(groups[0].label).toBe('plan');
+    expect(groups[0].label).toBe('artifacts');
+    expect(groups[0].docDir).toBe('artifacts');
     expect(groups[0].dirRel).toBe('artifacts');
     expect(groups[0].nodes).toEqual([
       { id: 'artifacts/mocks', name: 'mocks', kind: 'dir', depth: 0, expanded: false },
@@ -344,8 +351,8 @@ describe('artifactGroups', () => {
       {},
     );
     expect(groups.map((g) => [g.dirRel, g.label])).toEqual([
-      ['phases/00-backend/artifacts', 'Backend run-from-phase'],
-      ['phases/01-console/artifacts', 'Console run/resume UI'],
+      ['phases/00-backend/artifacts', 'Backend run-from-phase / artifacts'],
+      ['phases/01-console/artifacts', 'Console run/resume UI / artifacts'],
     ]);
     expect(groups[1].nodes[0].id).toBe('phases/01-console/artifacts/vitest.log');
   });
@@ -378,27 +385,97 @@ describe('artifactGroups', () => {
 
   it('is null-safe on the run', () => {
     expect(artifactGroups(null, { artifacts: [{ name: 'a.md', kind: 'file' }] }, {})).toEqual([
-      { label: 'plan', dirRel: 'artifacts', nodes: [
+      { label: 'artifacts', dirRel: 'artifacts', docDir: 'artifacts', nodes: [
         { id: 'artifacts/a.md', name: 'a.md', kind: 'file', depth: 0, expanded: false },
       ] },
     ]);
   });
 });
 
+const DOC = [
+  'artifacts', 'mocks', 'screens-to-verify', 'decisions', 'gates', 'conventions', 'proposed',
+];
+
 describe('artifactDirsFor', () => {
-  it('is the plan artifacts dir plus one per phase', () => {
+  it('is the plan document dirs, then each phase\'s, in host order', () => {
     expect(artifactDirsFor(SAMPLE)).toEqual([
-      'artifacts',
-      'phases/P1-schema/artifacts',
-      'phases/P2-runner/artifacts',
+      ...DOC,
+      ...DOC.map((d) => `phases/P1-schema/${d}`),
+      ...DOC.map((d) => `phases/P2-runner/${d}`),
     ]);
   });
-  it('is just the plan artifacts dir for a null/phase-less run', () => {
-    expect(artifactDirsFor(null)).toEqual(['artifacts']);
+  it('is just the plan document dirs for a null/phase-less run', () => {
+    expect(artifactDirsFor(null)).toEqual(DOC);
+    expect(docDirNames()).toEqual(DOC);
   });
   it('skips a phase id that would not survive the allowlist', () => {
     const bad = run({ phases: [phase({ phaseId: '../escape' }), phase({ phaseId: 'ok' })] });
-    expect(artifactDirsFor(bad)).toEqual(['artifacts', 'phases/ok/artifacts']);
+    expect(artifactDirsFor(bad)).toEqual([...DOC, ...DOC.map((d) => `phases/ok/${d}`)]);
+  });
+  it('never enumerates `tasks` or `.git`', () => {
+    const dirs = artifactDirsFor(SAMPLE);
+    expect(dirs.some((d) => d.endsWith('tasks'))).toBe(false);
+    expect(dirs.some((d) => d.endsWith('.git'))).toBe(false);
+  });
+});
+
+describe('isDocDir / phaseDir (R2 — the closed name list)', () => {
+  it('accepts exactly the seven names, case-sensitively', () => {
+    for (const d of DOC) expect(isDocDir(d)).toBe(true);
+    for (const n of ['tasks', '.git', 'Mocks', 'MOCKS', 'mocksx', 'mocks ', '', 'phases']) {
+      expect(isDocDir(n), n).toBe(false);
+    }
+  });
+  it('resolves a plan-level and a phase-level doc dir through the ONE allowlist', () => {
+    const B = '/p/plan';
+    expect(planDocPath(B, 'mocks/connections.html')).toBe(`${B}/mocks/connections.html`);
+    expect(planDocPath(B, 'screens-to-verify/s.png')).toBe(`${B}/screens-to-verify/s.png`);
+    expect(planDocPath(B, 'phases/P1/mocks/a.html')).toBe(`${B}/phases/P1/mocks/a.html`);
+    // excluded + near-miss names are not doc dirs; they fall through to the bare-phase-id shape
+    // (single segment) or are refused outright (multi-segment).
+    expect(planDocPath(B, 'tasks/t.md')).toBe(null);
+    expect(planDocPath(B, 'phases/P1/tasks/t.md')).toBe(null);
+    expect(planDocPath(B, 'Mocks/a.html')).toBe(null);
+    expect(planDocPath(B, 'mocksx/a.html')).toBe(null);
+  });
+  it('resolves a phase dir itself, for the one-call existence probe', () => {
+    expect(planDocPath('/p/plan', 'phases/P1')).toBe('/p/plan/phases/P1');
+    expect(phaseDir('P1')).toBe('phases/P1');
+    expect(phaseDir('../x')).toBe(null);
+    expect(phaseDir('')).toBe(null);
+  });
+});
+
+describe('artifactListError (R1 — the confinement message, pinned to the host wording)', () => {
+  // The literal is `resolve_within_root`'s own Err text in
+  // desktop/src-tauri/src/services/settings.rs, pinned there too by
+  // `resolve_within_root_rejects_above_root`. If either side is reworded, one of the two fails.
+  const HOST = 'Path is outside the configured files_root';
+
+  it('explains a confinement refusal, through every error shape graphql-client can throw', () => {
+    for (const err of [
+      HOST,
+      new Error(HOST),
+      { errors: [{ message: HOST }] },
+      { errors: [{ message: 'other' }, { message: HOST }] },
+      new Error(`Backend RPC failed: ${HOST}`),
+    ]) {
+      expect(artifactListError(err), JSON.stringify(err)).toMatch(/outside the configured/);
+    }
+  });
+  it('is silent for an absent dir, a cap, or anything else — no noise for the common case', () => {
+    for (const err of [
+      new Error('Failed to inspect path: No such file or directory (os error 2)'),
+      new Error('Path is not a directory'),
+      new Error('File exceeds 5 MiB read cap'),
+      { errors: [{ message: 'UNAUTHENTICATED' }] },
+      'No online backend app found. Start the backend app and connect it to the Worker.',
+      null,
+      undefined,
+      {},
+    ]) {
+      expect(artifactListError(err), JSON.stringify(err)).toBe(null);
+    }
   });
 });
 
@@ -413,5 +490,56 @@ describe('artifactOpenMode', () => {
     expect(artifactOpenMode('artifacts/ui/a.png')).toBe('viewer');
     expect(artifactOpenMode('phases/P1/artifacts/verify.txt')).toBe('viewer');
     expect(artifactOpenMode('artifacts/noext')).toBe('viewer');
+  });
+});
+
+describe('ArtifactCache (D3 — the cross-initiative race)', () => {
+  const A = 'init-A';
+  const B = 'init-B';
+  const aEntries = [{ name: 'A-only.html', kind: 'file' }];
+  const bEntries = [{ name: 'B-only.html', kind: 'file' }];
+
+  it('accepts a listing from the owner', () => {
+    const c = mergeArtifactListings(emptyArtifactCache(A), A, [
+      { dirRel: 'artifacts', entries: aEntries },
+    ]);
+    expect(c.listings['artifacts']).toEqual(aEntries);
+  });
+
+  it("DISCARDS initiative A's in-flight fan-out once B owns the cache", () => {
+    // The exact sequence from the defect: A's fan-out starts, the reader switches to B (reset →
+    // a cache owned by B), then A's listings land. They must not become B's rows.
+    let cache = emptyArtifactCache(A);
+    cache = emptyArtifactCache(B); // ensurePlanLoaded reset for B
+    cache = mergeArtifactListings(cache, A, [{ dirRel: 'artifacts', entries: aEntries }]);
+    expect(cache.listings['artifacts']).toBeUndefined();
+    expect(artifactGroups(null, cache.listings, {})).toEqual([]);
+    // ...and B's own listing still lands normally afterwards.
+    cache = mergeArtifactListings(cache, B, [{ dirRel: 'artifacts', entries: bEntries }]);
+    expect(cache.listings['artifacts']).toEqual(bEntries);
+    expect(artifactGroups(null, cache.listings, {})[0].nodes[0].id).toBe('artifacts/B-only.html');
+  });
+
+  it("never lets A's filename be joined to B's planPath", () => {
+    let cache = emptyArtifactCache(B);
+    cache = mergeArtifactListings(cache, A, [{ dirRel: 'artifacts', entries: aEntries }]);
+    const ids = artifactGroups(null, cache.listings, {}).flatMap((g) => g.nodes.map((n) => n.id));
+    expect(ids).toEqual([]);
+    // the only path that could have been built from the stale row
+    expect(ids.map((id) => planDocPath('/store/B/plan', id))).toEqual([]);
+  });
+
+  it('is identity when nothing lands, so a signal holding it does not re-notify', () => {
+    const c0 = emptyArtifactCache(A);
+    expect(mergeArtifactListings(c0, A, [])).toBe(c0);
+    expect(mergeArtifactListings(c0, A, [{ dirRel: 'artifacts' }])).toBe(c0);
+    expect(mergeArtifactListings(c0, B, [{ dirRel: 'artifacts', entries: aEntries }])).toBe(c0);
+  });
+
+  it('merges across several calls without losing earlier dirs', () => {
+    let cache = emptyArtifactCache(A);
+    cache = mergeArtifactListings(cache, A, [{ dirRel: 'artifacts', entries: aEntries }]);
+    cache = mergeArtifactListings(cache, A, [{ dirRel: 'mocks', entries: bEntries }]);
+    expect(Object.keys(cache.listings).sort()).toEqual(['artifacts', 'mocks']);
   });
 });

@@ -2012,6 +2012,12 @@ ion-modal.workspace-picker .picker-empty {
     border-bottom: 1px solid var(--jo-border, #263241);
     max-height: 38vh;
     overflow-y: auto;
+
+    // The foot prints the full absolute planPath with `word-break: break-all`; inside a 38vh box
+    // that is several lines of the very space this cap exists to free. The path is desktop detail.
+    .docnav-foot {
+      display: none;
+    }
   }
 }
 

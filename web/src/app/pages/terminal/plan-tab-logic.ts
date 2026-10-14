@@ -5,6 +5,9 @@
 // (rendering is `johnny-markdown-view`). Types are `import type` only (erased at build), so no
 // `@johnnyone/ui` / Angular runtime dependency leaks into the plugin-less vitest.
 import type { AgentPlanRun, AgentPlanTask } from '../../../../../ui/src/services/johnny-api.service';
+// The ONLY value import here: a pure, Angular-free helper (`files-page-logic.ts` has no imports at
+// all), so the plugin-less web vitest can still load this module.
+import { normalizeFileError } from '../files/files-page-logic';
 
 /** Normalize a task/phase status the same way the host does (`normalize_task_status`): trim, lower,
  *  `_`→`-`. Kept local so a raw/un-normalized value (deploy skew, direct markdown) still classifies. */
@@ -120,15 +123,56 @@ export function phaseCards(run: AgentPlanRun | null | undefined): PhaseCard[] {
 const FIXED_PLAN_DOCS = ['brief.md', 'plan.md', 'overview.md', 'status.md'] as const;
 
 /**
+ * The document directories a plan (or a phase) may expose, by EXACT name.
+ *
+ * Deliberately a closed, explicit list rather than a wildcard or "any directory": the whole guard
+ * rests on the set of reachable shapes being finite and reviewable, so widening it is a decision
+ * someone has to make here, in one place, on purpose.
+ *
+ * Measured over the real store (71 plans): `artifacts` x29, `mocks` x4, `decisions` x3, `gates` x2,
+ * `screens-to-verify` x2, `conventions` x1, `proposed` x1 at plan level; `artifacts` x68 at phase
+ * level. `mocks/` and `screens-to-verify/` hold exactly the HTML mocks and PNG captures this
+ * feature exists to surface, so leaving them out made the feature miss most of its payload.
+ *
+ * `tasks/` is EXCLUDED on purpose (172 instances, phase level): it is plan structure, which the
+ * navigator already renders as phase + task rows. `.git/` (41 instances) is excluded by the same
+ * closed-list rule, without needing a special case.
+ */
+const DOC_DIRS: readonly string[] = [
+  'artifacts',
+  'mocks',
+  'screens-to-verify',
+  'decisions',
+  'gates',
+  'conventions',
+  'proposed',
+];
+
+/** Is `name` one of the allowlisted document directories? Exact match — `Mocks`/`mocksx` are not. */
+export function isDocDir(name: string): boolean {
+  return DOC_DIRS.includes(name);
+}
+
+/** The allowlisted document directory names, for the caller that probes which ones exist. */
+export function docDirNames(): readonly string[] {
+  return DOC_DIRS;
+}
+
+/**
  * Is `seg` a safe single path segment?
  *
  * Rejects the empty segment (which is what a leading `/`, a trailing `/`, a `//` and a UNC `//host`
- * all decompose into), `.`, `..`, and anything containing a backslash — a Windows separator or
- * drive-qualified name (`C:\x`) must never reach the host, where `\` is a legal filename character
- * and would therefore be silently accepted as part of a name.
+ * all decompose into), `.`, anything CONTAINING `..`, and anything containing a slash or backslash
+ * — a Windows separator or drive-qualified name (`C:\x`) must never reach the host, where `\` is a
+ * legal filename character and would therefore be silently accepted as part of a name.
+ *
+ * `..` is rejected as a SUBSTRING, not just as the whole segment, so that this predicate agrees
+ * exactly with the re-check at the end of [`planDocPath`]. When it did not agree, a host entry
+ * named `v1..2.png` became a navigator row that `planDocPath` then refused — a button that did
+ * nothing at all. The cost is that such a file is not offered; an omission beats a dead button.
  */
 function isSafeSegment(seg: string): boolean {
-  if (!seg || seg === '.' || seg === '..') return false;
+  if (!seg || seg === '.' || seg.includes('..')) return false;
   if (seg.includes('\\') || seg.includes('/')) return false;
   return true;
 }
@@ -143,45 +187,65 @@ function safeSegments(id: string): string[] | null {
 }
 
 /**
- * Is this selection an ARTIFACT sub-path — the one nested shape the navigator is allowed to address?
+ * Is this selection a DOCUMENT-DIRECTORY sub-path — the nested shapes the navigator may address?
  *
- * Exactly two forms, both relative to the plan dir:
- *   - `artifacts` / `artifacts/<...>`                     (the plan's own artifacts tree)
- *   - `phases/<phaseId>/artifacts` / `.../artifacts/<...>` (a phase's artifacts tree)
+ * Three forms, all relative to the plan dir, where `<doc>` is one of [`DOC_DIRS`]:
+ *   - `<doc>` / `<doc>/<...>`                           (a plan-level document tree)
+ *   - `phases/<phaseId>/<doc>` / `.../<doc>/<...>`       (a phase-level document tree)
+ *   - `phases/<phaseId>`                                (a phase dir, so the caller can discover
+ *                                                        WHICH document dirs it has in one call
+ *                                                        instead of probing all seven)
  *
  * Every segment must pass [`isSafeSegment`] first, so `..`, `.`, empty segments (absolute/UNC/double
  * slash) and backslashes are gone before the shape is even considered. Nothing else nested is
- * allowed: `phases/<id>/notes/x.md` and `secrets/key.pem` are NOT artifact paths.
+ * allowed: `phases/<id>/tasks/x`, `phases/<id>/notes/x.md` and `secrets/key.pem` are all refused.
  *
- * Known, accepted edge: a phase whose `phaseId` is literally `artifacts` would have the selection
- * `artifacts` read as the plan's artifacts dir rather than that phase's overview. Phase ids are
- * host-generated slugs (`00-backend-run-from-phase`, `P2-plan-tab`), so this is not reachable in
- * practice, and the consequence is a wrong-but-still-confined path either way.
+ * Known, accepted edge: a phase whose `phaseId` is literally one of [`DOC_DIRS`] would have the
+ * bare selection read as the plan-level dir of that name rather than that phase's overview. Phase
+ * ids are host-generated slugs (`00-backend-run-from-phase`, `P2-plan-tab`) and the real store has
+ * ZERO such collisions across every phase of all 71 plans; either way the path stays confined.
  */
-function artifactSegments(id: string): string[] | null {
+function docDirSegments(id: string): string[] | null {
   const segs = safeSegments(id);
   if (!segs) return null;
-  if (segs[0] === 'artifacts') return segs;
-  if (segs.length >= 3 && segs[0] === 'phases' && segs[2] === 'artifacts') return segs;
+  if (isDocDir(segs[0])) return segs;
+  if (segs[0] !== 'phases') return null;
+  if (segs.length === 2) return segs; // the phase dir itself, for the one-call probe
+  if (segs.length >= 3 && isDocDir(segs[2])) return segs;
   return null;
 }
 
-/** The plan-relative artifacts dir for a phase id, or `null` if the id is not a safe segment. */
-export function phaseArtifactsDir(phaseId: string | null | undefined): string | null {
+/** The plan-relative path of a phase's directory, or `null` if the id is not a safe segment. */
+export function phaseDir(phaseId: string | null | undefined): string | null {
   const id = (phaseId ?? '').trim();
-  return isSafeSegment(id) ? `phases/${id}/artifacts` : null;
+  return isSafeSegment(id) ? `phases/${id}` : null;
+}
+
+/**
+ * The plan-relative path of a phase's document dir (default `artifacts`), or `null` when either the
+ * phase id is not a safe segment or `docDir` is not allowlisted.
+ */
+export function phaseArtifactsDir(
+  phaseId: string | null | undefined,
+  docDir = 'artifacts',
+): string | null {
+  const dir = phaseDir(phaseId);
+  return dir && isDocDir(docDir) ? `${dir}/${docDir}` : null;
 }
 
 /**
  * Build the file path for a navigator selection, joined to the server-provided `planPath`.
  *
- * THE single allowlist for everything the Plan tab can open (requirement: one function). A selection
- * is resolvable only if it is one of [`FIXED_PLAN_DOCS`], a safe bare phase id (→ that phase's
- * `overview.md`), or an artifact sub-path per [`artifactSegments`]. Anything else → `null`.
+ * THE single allowlist for everything the Plan tab can open or list (requirement: one decision
+ * point). A selection resolves only if it is one of [`FIXED_PLAN_DOCS`], a safe bare phase id (→
+ * that phase's `overview.md`), or a document-dir sub-path per [`docDirSegments`]. Anything else →
+ * `null`, and `null` for an empty `planPath`.
  *
- * Returns `null` for an empty `planPath`. Defense-in-depth even though ids are server data: a phase
- * id containing `/`, `\` or `..` is rejected, and the assembled path is re-checked to be inside
- * `<planPath>/` with no `..` and no backslash before it is handed back.
+ * Defense-in-depth even though ids are server data: EVERY segment of the assembled suffix is
+ * re-validated with the same segment guard, and the result is re-checked to start with
+ * `<planPath>/` with no `..` and no backslash. A future branch that forgets to validate therefore
+ * still fails closed — including on an empty or `.` segment, which the earlier substring-only
+ * re-check would have let through as `artifacts//x` / `artifacts/./x`.
  */
 export function planDocPath(
   planPath: string | null | undefined,
@@ -191,27 +255,36 @@ export function planDocPath(
   if (!base) return null;
   const rel = relPlanDocPath(sel);
   if (!rel) return null;
+  if (!safeSegments(rel)) return null;
   const full = `${base}/${rel}`;
-  // Belt and braces: whatever the branches above produced must still be a plain descendant of the
-  // plan dir. A future branch that forgets to validate fails here rather than reaching the host.
   if (full.includes('..') || full.includes('\\')) return null;
   if (!full.startsWith(`${base}/`)) return null;
   return full;
 }
 
-/** The plan-dir-RELATIVE suffix a selection resolves to, or `null` if it is not allowed. */
+/**
+ * The plan-dir-RELATIVE suffix a selection resolves to, or `null` if it is not allowed.
+ *
+ * Trimming happens ONLY on the fixed-doc branch, where the selection is compared against four
+ * literals this code owns. A document-dir selection is assembled from host entry NAMES, and a file
+ * really can be called `report.md ` with a trailing space — trimming it there read a path that does
+ * not exist, and turned a file named `' '` into a row that could never open.
+ */
 function relPlanDocPath(sel: string | null | undefined): string | null {
-  const id = (sel ?? '').trim();
-  if (!id) return null;
-  // Fixed top-level docs: planning artifacts (brief.md, plan.md) + development artifacts.
-  if ((FIXED_PLAN_DOCS as readonly string[]).includes(id)) return id;
-  // The one nested shape: a plan or phase artifacts tree, validated segment by segment.
-  const art = artifactSegments(id);
-  if (art) return art.join('/');
-  // Legacy shape: a bare phase id → that phase's overview. `isSafeSegment` already rejects a `/`,
-  // so a multi-segment selection that is not an artifact path cannot reach here.
-  if (!isSafeSegment(id)) return null;
-  return `phases/${id}/overview.md`;
+  const raw = sel ?? '';
+  // Fixed top-level docs: planning artifacts (brief.md, plan.md) + development artifacts. These
+  // four are literals, so trimming the selection is safe and keeps the pre-existing behaviour.
+  const trimmed = raw.trim();
+  if ((FIXED_PLAN_DOCS as readonly string[]).includes(trimmed)) return trimmed;
+  if (!trimmed) return null;
+  // The nested shapes: a plan or phase document tree. NOT trimmed — every segment past the first
+  // is a real filename.
+  const doc = docDirSegments(raw);
+  if (doc) return doc.join('/');
+  // Legacy shape: a bare phase id → that phase's overview. Trimmed, because the baseline trimmed
+  // and a phase id is a host-generated slug rather than a filename.
+  if (!isSafeSegment(trimmed)) return null;
+  return `phases/${trimmed}/overview.md`;
 }
 
 /** Display label + class token for a task-row status chip (§03 taskrow states). */
@@ -268,12 +341,14 @@ export interface ArtifactNode {
   expanded: boolean;
 }
 
-/** The Artifacts section, one group per artifacts dir that actually has entries. */
+/** The Artifacts section, one group per document dir that actually has entries. */
 export interface ArtifactGroup {
-  /** `'plan'` for the plan's own dir, else the phase title. */
+  /** What to display: the dir name for a plan-level dir, `'<phase title> / <dir>'` for a phase. */
   label: string;
   /** The dir's path relative to the plan dir — the `filesListDir` cache key. */
   dirRel: string;
+  /** Which allowlisted document dir this group is (`artifacts`, `mocks`, …). */
+  docDir: string;
   nodes: ArtifactNode[];
 }
 
@@ -283,15 +358,21 @@ export type ArtifactListings = Record<string, ArtifactEntryLike[] | undefined>;
 export type ArtifactExpanded = Record<string, boolean | undefined>;
 
 /**
- * Every artifacts dir that COULD exist for a run, plan-relative: the plan's own, then one per phase
- * in host order. A phase id that would not survive the path allowlist is skipped rather than
- * silently producing a path the host would reject.
+ * Every document dir that COULD exist for a run, plan-relative and in render order: the plan's own
+ * seven, then each phase's seven in host order. A phase id that would not survive the path
+ * allowlist is skipped rather than silently producing a path the host would reject.
+ *
+ * This enumerates CANDIDATES for rendering, not a fetch plan — the loader discovers which of these
+ * actually exist with one `filesListDir` of the parent dir (see `terminal.page.ts`), and a
+ * candidate with no listing contributes nothing.
  */
 export function artifactDirsFor(run: AgentPlanRun | null | undefined): string[] {
-  const dirs = ['artifacts'];
+  const dirs: string[] = [...DOC_DIRS];
   for (const ph of run?.phases ?? []) {
-    const dir = phaseArtifactsDir(ph.phaseId);
-    if (dir) dirs.push(dir);
+    for (const docDir of DOC_DIRS) {
+      const dir = phaseArtifactsDir(ph.phaseId, docDir);
+      if (dir) dirs.push(dir);
+    }
   }
   return dirs;
 }
@@ -336,11 +417,53 @@ export function artifactGroups(
   for (const dirRel of artifactDirsFor(run)) {
     const nodes = artifactNodes(dirRel, listings, expanded, 0);
     if (!nodes.length) continue;
-    const phaseId = dirRel.startsWith('phases/') ? dirRel.split('/')[1] : null;
-    const label = phaseId ? (titleByPhase.get(phaseId) ?? phaseId) : 'plan';
-    groups.push({ label, dirRel, nodes });
+    const segs = dirRel.split('/');
+    const isPhase = segs[0] === 'phases';
+    const docDir = isPhase ? segs[2] : segs[0];
+    const label = isPhase ? `${titleByPhase.get(segs[1]) ?? segs[1]} / ${docDir}` : docDir;
+    groups.push({ label, dirRel, docDir, nodes });
   }
   return groups;
+}
+
+/**
+ * The listing cache, tagged with the initiative it belongs to.
+ *
+ * D3 was a cross-initiative race: every listing is an await, `'artifacts'` is the same literal
+ * cache key for every plan, and a slow fan-out for initiative A landed after the reader had
+ * switched to B — so B's navigator rendered A's filenames, and clicking one joined B's `planPath`
+ * to A's filename. Tagging the cache with its owner makes that unrepresentable rather than
+ * merely guarded: a merge names the owner it believes it is writing for, and a mismatch is
+ * discarded. A per-call-site `if` would have had to be remembered at every future call site.
+ */
+export interface ArtifactCache {
+  /** The initiative id these listings were fetched for. */
+  ownerId: string;
+  listings: ArtifactListings;
+}
+
+/** A fresh, empty cache owned by `ownerId`. */
+export function emptyArtifactCache(ownerId: string): ArtifactCache {
+  return { ownerId, listings: {} };
+}
+
+/**
+ * Fold successful listings into the cache — but ONLY if `ownerId` still owns it.
+ *
+ * A stale fan-out is dropped whole, and absent/refused dirs stay absent (so they contribute no
+ * group). Returns the SAME object when nothing changes, so a signal holding it does not re-notify.
+ */
+export function mergeArtifactListings(
+  cache: ArtifactCache,
+  ownerId: string,
+  results: ReadonlyArray<{ dirRel: string; entries?: ArtifactEntryLike[] }>,
+): ArtifactCache {
+  if (ownerId !== cache.ownerId) return cache;
+  const landed = results.filter((r) => r.entries);
+  if (!landed.length) return cache;
+  const listings: ArtifactListings = { ...cache.listings };
+  for (const r of landed) listings[r.dirRel] = r.entries;
+  return { ownerId: cache.ownerId, listings };
 }
 
 /**
@@ -352,4 +475,31 @@ export function artifactGroups(
  */
 export function artifactOpenMode(id: string): 'markdown' | 'viewer' {
   return /\.(md|markdown)$/i.test(id) ? 'markdown' : 'viewer';
+}
+
+/**
+ * Classify a failed `filesListDir` into the one message worth showing the reader, or `null`.
+ *
+ * A document dir that simply does not exist is the COMMON case (most plans have only `artifacts/`),
+ * and reporting it as an error would bury the feature in noise. The one failure that is worth
+ * saying out loud is a confinement refusal: `files_root` and `initiatives_dir` are independent user
+ * settings, so a plan store configured outside the browse root is reachable config, and the host
+ * then refuses every listing. Silence there would read as "this plan has no artifacts", which is a
+ * lie — so it gets an explanation instead, and the guard is NOT relaxed to work around it.
+ *
+ * Pure (hence testable under the plugin-less vitest) and routed through the shared
+ * `normalizeFileError`, which knows all three error shapes `graphql-client.ts` can throw — the
+ * hand-rolled `String(err.message)` this replaces only understood one of them.
+ *
+ * The matched literal is the host's own wording from `resolve_within_root`
+ * (`desktop/src-tauri/src/services/settings.rs`). It is pinned on BOTH sides: by
+ * `plan-tab-logic.spec.ts` here and by `resolve_within_root_rejects_above_root` there, because a
+ * reword with nothing pinning it would silently downgrade this explanation back to silence.
+ */
+export function artifactListError(err: unknown): string | null {
+  if (!/outside the configured files_root/i.test(normalizeFileError(err))) return null;
+  return (
+    'Artifacts cannot be listed: this plan store is outside the configured file-browsing root. ' +
+    'Point Settings → files root at a directory that contains the initiatives store.'
+  );
 }

@@ -45,6 +45,18 @@ const ATTACKS: string[] = [
   'brief.md/../../../etc/passwd', 'brief.md ', ' brief.md', ' brief.md ', 'brief.md/x',
   // misc
   'secrets/key.pem', '.ssh/id_rsa', 'artifacts/../../../../../../../../etc/passwd',
+  // R2: the doc-dir allowlist grew from one name to seven. Near-misses must still be refused as
+  // doc dirs (they may fall through to the bare-phase-id shape, which the sweep also confines).
+  'mocks', 'mocks/a.html', 'Mocks', 'Mocks/a.html', 'MOCKS/a.html', 'mocksx', 'mocksx/a.html',
+  'mocks x/a.html', 'mocks.x/y', 'screens-to-verify', 'screens-to-verify/s.png',
+  'screens-to-verify/../x', 'screens-to-verify/..', 'Screens-To-Verify/x', 'screens_to_verify/x',
+  'screensToVerify/x', 'decisions/d.md', 'gates/g.md', 'conventions/c.md', 'proposed/p.md',
+  'decisionsx/x', 'gates/../../x', 'conventions\\x', 'proposed//x', 'proposed/./x',
+  // `tasks/` is deliberately NOT a doc dir (plan structure, 172 instances in the real store)
+  'tasks', 'tasks/t.md', 'phases/P1/tasks', 'phases/P1/tasks/t.md', 'phases/P1/tasks/../../../x',
+  '.git', '.git/config', 'phases/P1/.git/config',
+  // the phase dir itself is listable (one-call probe); its traversals are not
+  'phases/P1', 'phases/P1/', 'phases/P1/..', 'phases/P1/../P2', 'phases/P1/../../../etc',
 ];
 
 describe('planDocPath — QA adversarial sweep', () => {
@@ -78,6 +90,10 @@ describe('phase id edge cases', () => {
     expect(phaseArtifactsDir(null)).toBe(null);
     expect(phaseArtifactsDir('a/b')).toBe(null);
     expect(phaseArtifactsDir('artifacts')).toBe('phases/artifacts/artifacts');
+    expect(phaseArtifactsDir('P1', 'mocks')).toBe('phases/P1/mocks');
+    expect(phaseArtifactsDir('P1', 'tasks')).toBe(null);
+    expect(phaseArtifactsDir('P1', '..')).toBe(null);
+    expect(phaseArtifactsDir('P1', 'Mocks')).toBe(null);
     expect(planDocPath(BASE, 'phases/artifacts/artifacts')).toBe(
       `${BASE}/phases/artifacts/artifacts`,
     );
@@ -88,26 +104,60 @@ describe('phase id edge cases', () => {
   });
 });
 
-describe('DEAD ROW: a name offered by artifactGroups that planDocPath rejects', () => {
+// Was QA's "DEAD ROW" block: these three inputs characterised defects D1/D2 (a row the allowlist
+// then refused, and a trimmed id that read the wrong path). The INPUTS are unchanged and the
+// invariant is now the fixed contract: every row a group offers must resolve, and resolve to the
+// name the host actually reported. A row that cannot open must not be offered at all.
+describe('NO DEAD ROW: every offered row resolves, and resolves to the host-reported name', () => {
   const RUN = { plan: {}, phases: [], tasks: [], events: [] } as unknown as AgentPlanRun;
-  it('offers a row for a file whose name contains .. but cannot open it', () => {
-    const groups = artifactGroups(RUN, { artifacts: [{ name: 'v1..2.png', kind: 'file' }] }, {});
-    expect(groups[0].nodes.map((n) => n.id)).toEqual(['artifacts/v1..2.png']);
-    // the row exists, but the allowlist refuses the path → a dead button
+
+  it('omits a name containing `..` instead of offering a button that does nothing (D1)', () => {
+    const groups = artifactGroups(
+      RUN,
+      { artifacts: [{ name: 'v1..2.png', kind: 'file' }, { name: 'ok.png', kind: 'file' }] },
+      {},
+    );
+    expect(groups[0].nodes.map((n) => n.id)).toEqual(['artifacts/ok.png']);
+    // and the allowlist still refuses it, so filter and allowlist now agree
     expect(planDocPath(BASE, 'artifacts/v1..2.png')).toBe(null);
   });
-  it('offers a row for a trailing-space name that resolves to the WRONG path', () => {
+
+  it('omits a directory containing `..` rather than failing silently to expand (D1)', () => {
+    const groups = artifactGroups(RUN, { artifacts: [{ name: 'a..b', kind: 'dir' }] }, {});
+    expect(groups).toEqual([]);
+    expect(planDocPath(BASE, 'artifacts/a..b')).toBe(null);
+  });
+
+  it('keeps a trailing space, because the real file has one (D2)', () => {
     const groups = artifactGroups(RUN, { artifacts: [{ name: 'report.md ', kind: 'file' }] }, {});
     expect(groups[0].nodes[0].id).toBe('artifacts/report.md ');
-    // trim() in relPlanDocPath silently drops the trailing space the real file has
-    expect(planDocPath(BASE, 'artifacts/report.md ')).toBe(`${BASE}/artifacts/report.md`);
+    expect(planDocPath(BASE, 'artifacts/report.md ')).toBe(`${BASE}/artifacts/report.md `);
   });
-  it('offers a row for a space-only name that is a DEAD button', () => {
+
+  it('a space-only name is a live row, not a dead one (D2)', () => {
     const groups = artifactGroups(RUN, { artifacts: [{ name: ' ', kind: 'file' }] }, {});
     expect(groups[0].nodes[0].id).toBe('artifacts/ ');
-    // trim() turns this into 'artifacts/', which has an empty segment → rejected. Dead row.
-    expect(planDocPath(BASE, 'artifacts/ ')).toBe(null);
+    expect(planDocPath(BASE, 'artifacts/ ')).toBe(`${BASE}/artifacts/ `);
     expect(artifactOpenMode('artifacts/ ')).toBe('viewer');
+  });
+
+  it('EVERY row of EVERY group resolves, over a hostile listing', () => {
+    const hostile = [
+      'ok.md', 'report.md ', ' ', 'v1..2.png', 'a..b', '..', '.', 'a/b', 'a\\b', '',
+      'x\u0000y', 'e\u0301.md', '\uFF0E\uFF0E', 'C:x', 'très long' + 'g'.repeat(200),
+    ].map((name) => ({ name, kind: 'file' }));
+    const groups = artifactGroups(RUN, { artifacts: hostile, mocks: hostile }, {});
+    expect(groups.length).toBe(2);
+    let rows = 0;
+    for (const g of groups) {
+      for (const n of g.nodes) {
+        const p = planDocPath(BASE, n.id);
+        expect(p, `dead row: ${JSON.stringify(n.id)}`).not.toBe(null);
+        expect(p).toBe(`${BASE}/${g.dirRel}/${n.name}`);
+        rows++;
+      }
+    }
+    expect(rows).toBeGreaterThan(0);
   });
 });
 
@@ -117,9 +167,16 @@ describe('artifactDirsFor — duplicate phase ids', () => {
       plan: {}, tasks: [], events: [],
       phases: [{ phaseId: 'P1' }, { phaseId: 'P1' }],
     } as unknown as AgentPlanRun;
+    const PLAN = [
+      'artifacts', 'mocks', 'screens-to-verify', 'decisions', 'gates', 'conventions', 'proposed',
+    ];
     expect(artifactDirsFor(r)).toEqual([
-      'artifacts', 'phases/P1/artifacts', 'phases/P1/artifacts',
+      ...PLAN,
+      ...PLAN.map((d) => `phases/P1/${d}`),
+      ...PLAN.map((d) => `phases/P1/${d}`),
     ]);
+    // the point QA pinned: a repeated phase id is NOT deduped
+    expect(artifactDirsFor(r).filter((d) => d === 'phases/P1/artifacts')).toHaveLength(2);
   });
   it('artifactGroups then renders that dir twice (duplicate track key)', () => {
     const r = {
