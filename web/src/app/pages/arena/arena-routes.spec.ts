@@ -44,20 +44,65 @@ describe('appRoutes — the arena routes', () => {
     }
   });
 
+  // REWRITTEN in round 3. The first version had three holes QA found: `toContain('m.ArenaSetupShell')`
+  // is a substring over the WHOLE file, so a comment satisfied it; the negative regex required a
+  // trailing single quote, so `import("…/arena-setup.page")` with double quotes evaded it; and
+  // nothing asserted a shell actually contains `ion-content` or still declares
+  // `providers: [ArenaApiService]` — a shell that lost either passed every test, and a dropped
+  // provider shows up only as a runtime injector error on a page nothing can mount.
   it('loads the ion-content SHELL for each arena route, not the bare page body', () => {
     const src = readFileSync(join(process.cwd(), 'web/src/app/app.routes.ts'), 'utf8');
-    for (const [path, shell] of [
-      ['initiatives/:id/arena', 'ArenaSetupShell'],
-      ['workflows', 'WorkflowsShell'],
-      ['workflows/:id/arena', 'WorkflowArenaShell'],
-      ['workflows/:id', 'WorkflowDetailShell'],
+    // Comments cannot satisfy this: the match is the route's own loadComponent expression.
+    const loaders = [...src.matchAll(/path:\s*['"]([^'"]+)['"][\s\S]*?import\(\s*['"]([^'"]+)['"]\s*\)\.then\(\s*\(m\)\s*=>\s*m\.(\w+)/g)]
+      .map((m) => ({ path: m[1], specifier: m[2], symbol: m[3] }));
+    for (const [path, specifier, symbol] of [
+      ['initiatives/:id/arena', './pages/arena/arena-setup.shell', 'ArenaSetupShell'],
+      ['workflows', './pages/arena/workflows.shell', 'WorkflowsShell'],
+      ['workflows/:id/arena', './pages/arena/workflow-arena.shell', 'WorkflowArenaShell'],
+      ['workflows/:id', './pages/arena/workflow-detail.shell', 'WorkflowDetailShell'],
     ] as const) {
-      expect(appRoutes.find((r) => r.path === path)).toBeTruthy();
-      expect(src, `${path} should load ${shell}`).toContain(`m.${shell}`);
+      const loader = loaders.find((l) => l.path === path);
+      expect(loader, `no loadComponent parsed for ${path}`).toBeTruthy();
+      expect(loader!.specifier).toBe(specifier);
+      expect(loader!.symbol).toBe(symbol);
     }
     // A routed page WITHOUT ion-content is clipped and unscrollable — measured in Chrome at
-    // 400x860, with the promote control 464px past the clip.
-    expect(src).not.toMatch(/arena\/(?:arena-setup|workflows|workflow-detail|workflow-arena)\.page'/);
+    // 400x860, with the promote control 464px past the clip. Quote-agnostic.
+    for (const l of loaders) {
+      expect(l.specifier, `${l.path} loads a page body directly`).not.toMatch(
+        /arena\/(?:arena-setup|workflows|workflow-detail|workflow-arena)\.page$/,
+      );
+    }
+  });
+
+  it('every shell really supplies ion-content and really provides the arena wire', () => {
+    // These four files are the layer no unit test can mount (importing Ionic collects zero tests
+    // under this vitest config), and they are the layer the whole scroll fix lives in. Asserted as
+    // source here, and exercised for real by the browser harness, which now fails the build if a
+    // route does not render or does not scroll.
+    for (const file of [
+      'arena-setup.shell.ts',
+      'workflows.shell.ts',
+      'workflow-detail.shell.ts',
+      'workflow-arena.shell.ts',
+    ]) {
+      const src = readFileSync(join(process.cwd(), 'web/src/app/pages/arena', file), 'utf8');
+      const template = /template:\s*`([^`]*)`/.exec(src)?.[1] ?? '';
+      expect(template, `${file} has no <ion-content> in its template`).toContain('<ion-content');
+      expect(template, `${file} does not close its <ion-content>`).toContain('</ion-content>');
+      // The body must be INSIDE the scroller, not beside it.
+      expect(
+        /<ion-content[^>]*>\s*<app-[a-z-]+\s*\/>\s*<\/ion-content>/.test(template),
+        `${file} does not place its page body inside the ion-content`,
+      ).toBe(true);
+      expect(src, `${file} imports IonContent`).toMatch(/import\s*\{[^}]*\bIonContent\b[^}]*\}\s*from\s*'@ionic\/angular\/standalone'/);
+      expect(src, `${file} no longer provides ArenaApiService`).toMatch(
+        /providers:\s*\[\s*ArenaApiService\s*\]/,
+      );
+      expect(src, `${file} does not import ArenaApiService`).toMatch(
+        /import\s*\{\s*ArenaApiService\s*\}\s*from\s*'\.\/arena-api\.service'/,
+      );
+    }
   });
 
   it('declares all four, lazily and behind the auth guard', () => {

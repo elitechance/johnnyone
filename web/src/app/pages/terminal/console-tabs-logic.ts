@@ -88,3 +88,17 @@ export function consoleTabsWithArena(
 export function rawAttachNeeded(primarySessionId: string | null | undefined, hasScreen: boolean): boolean {
   return !primarySessionId || !hasScreen;
 }
+
+/**
+ * Which tabs need the initiative's `planRun` loaded.
+ *
+ * ONE home for a condition the console used to spell out inline. The Plan tab has always needed it;
+ * the ARENA tab needs the same rows (its entry points are per phase, and it is a tab a reader can
+ * open first) and did not get them — measured in Chrome: the tab said "This initiative has no
+ * phases yet" on an initiative with three, until the Plan tab had been opened once. A function
+ * rather than a condition in an effect, because that condition is otherwise untestable: the console
+ * page uses `templateUrl` and cannot be mounted under this project's vitest.
+ */
+export function tabNeedsPlanRun(tab: PaneTab): boolean {
+  return tab === 'plan' || tab === 'arena';
+}

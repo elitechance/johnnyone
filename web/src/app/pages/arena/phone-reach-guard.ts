@@ -137,11 +137,86 @@ export function clipRisks(css: string, width = 400): ClipRisk[] {
   const out: ClipRisk[] = [];
   for (const b of blocks(css)) {
     if (b.query !== '' && !mediaQueryMatches(b.query, width)) continue;
-    const bounded = /(?:^|[;{\s])(max-height|height)\s*:\s*(\d+(?:\.\d+)?)(px|rem|em)/i.exec(b.body);
+    // EVERY length unit, not px|rem|em. The rule that caused this whole round is Ionic's own
+    // `.ion-page { contain: size …; overflow: hidden }` at a PERCENTAGE height, and the arena's own
+    // console-tab scroller is `height: 100%` — one word (`auto` → `hidden`) from being the bug the
+    // guard exists to catch. A unit allow-list that excludes `%` and `vh` excludes the real cases.
+    const bounded =
+      /(?:^|[;{\s])(max-height|height)\s*:\s*(\d+(?:\.\d+)?)(px|rem|em|%|vh|dvh|svh|lvh|vmin|vmax|ch|ex)/i.exec(
+        b.body,
+      );
     if (!bounded) continue;
     const hidden = /(?:^|[;{\s])overflow(?:-x|-y)?\s*:\s*(?:hidden|clip)\b/i.exec(b.body);
     if (hidden) {
       out.push({ selector: b.selector, declaration: `${bounded[0].trim()} + ${hidden[0].trim()}` });
+    }
+  }
+  return out;
+}
+
+export interface OverlayRisk {
+  selector: string;
+  declaration: string;
+}
+
+/**
+ * An element pinned over the whole viewport: `position: fixed|absolute` with all four sides at 0
+ * (as `inset: 0` or as the four longhands). It covers everything beneath it, so on a phone the page
+ * is there, is the right size, scrolls — and cannot be touched.
+ *
+ * Only a FULL cover is flagged. A pinned chip or a sticky bar is normal and is not.
+ */
+export function overlayRisks(css: string, width = 400): OverlayRisk[] {
+  const out: OverlayRisk[] = [];
+  for (const b of blocks(css)) {
+    if (b.query !== '' && !mediaQueryMatches(b.query, width)) continue;
+    const pinned = /(?:^|[;{\s])position\s*:\s*(fixed|absolute)\b/i.exec(b.body);
+    if (!pinned) continue;
+    const insetZero = /(?:^|[;{\s])inset\s*:\s*0(?:px)?\s*(?:;|$|\})/i.test(b.body);
+    const sides = ['top', 'right', 'bottom', 'left'].every((side) =>
+      new RegExp(`(?:^|[;{\\s])${side}\\s*:\\s*0(?:px)?\\s*(?:;|$|\\})`, 'i').test(b.body),
+    );
+    if (insetZero || sides) {
+      out.push({ selector: b.selector, declaration: `${pinned[0].trim()} + inset 0` });
+    }
+  }
+  return out;
+}
+
+export interface TransformRisk {
+  selector: string;
+  declaration: string;
+}
+
+/**
+ * A transform that moves content away from where the layout put it, by enough to matter: a scale
+ * other than ~1, or a percentage translate large enough to push a box off its own parent. The
+ * element is laid out correctly and painted somewhere else, so neither a width check nor a height
+ * check can see it.
+ *
+ * OUT OF SCOPE, deliberately, and said here rather than implied: rotations, 3-D transforms,
+ * `clip-path`, `mask`, `opacity: 0`, an ancestor's `overflow` clipping a descendant, and anything
+ * that depends on the CASCADE — this file reads one stylesheet's text, never the computed style of
+ * a rendered tree, so a defect that only exists once two sheets combine belongs to the browser
+ * harness, not here.
+ */
+export function transformRisks(css: string, width = 400): TransformRisk[] {
+  const out: TransformRisk[] = [];
+  for (const b of blocks(css)) {
+    if (b.query !== '' && !mediaQueryMatches(b.query, width)) continue;
+    for (const m of b.body.matchAll(/transform\s*:\s*([^;}]+)/gi)) {
+      const value = m[1].trim();
+      for (const scale of value.matchAll(/scale[XY3d]*\(\s*([\d.]+)/gi)) {
+        const n = Number(scale[1]);
+        if (Number.isFinite(n) && (n > 1.05 || n < 0.95)) {
+          out.push({ selector: b.selector, declaration: `transform: ${value}` });
+        }
+      }
+      for (const tr of value.matchAll(/translate[XY]?\(\s*(-?[\d.]+)%/gi)) {
+        if (Math.abs(Number(tr[1])) >= 100) {
+          out.push({ selector: b.selector, declaration: `transform: ${value}` });
+        }
+      }
     }
   }
   return out;

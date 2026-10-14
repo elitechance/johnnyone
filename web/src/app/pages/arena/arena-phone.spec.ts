@@ -16,7 +16,13 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { phoneHiddenSelectors, overflowRisks, clipRisks } from './phone-reach-guard';
+import {
+  phoneHiddenSelectors,
+  overflowRisks,
+  clipRisks,
+  overlayRisks,
+  transformRisks,
+} from './phone-reach-guard';
 import { ARENA_CSS } from './arena-ui.css';
 
 const PHONE = 400;
@@ -105,6 +111,29 @@ describe('the arena stylesheets at 400px', () => {
       const risks = clipRisks(css, PHONE);
       expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
     }
+  });
+
+  it('covers nothing with a full-viewport overlay', () => {
+    for (const { file, css } of sheets()) {
+      const risks = overlayRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
+  it('moves nothing out from under the finger with a transform', () => {
+    for (const { file, css } of sheets()) {
+      const risks = transformRisks(css, PHONE);
+      expect(risks, `${file}: ${risks.map((r) => r.selector + ' ' + r.declaration).join('; ')}`).toEqual([]);
+    }
+  });
+
+  it('the arena\u2019s own scrollers are scrollers, not clips', () => {
+    // The console-tab panel is `height: 100%; overflow-y: auto` — one word from being the bug this
+    // guard exists for, and a unit allow-list of px|rem|em used to make the whole shape invisible.
+    const panel = sheets().find((s) => s.file === 'arena-panel.component.ts' && s.css.includes(':host'));
+    expect(panel, 'the panel sheet is not being collected').toBeTruthy();
+    expect(panel!.css).toMatch(/:host\s*\{[^}]*overflow-y:\s*auto/);
+    expect(clipRisks(panel!.css, PHONE)).toEqual([]);
   });
 
   it('builds its multi-column layout UP from one column, rather than down from two', () => {

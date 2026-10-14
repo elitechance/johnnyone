@@ -7,7 +7,14 @@
 // never prove CSS reachability. This guard is therefore a STATIC analysis of the stylesheet text,
 // and it is run against the arena components' real styles in `arena-phone.spec.ts`.
 import { describe, it, expect } from 'vitest';
-import { phoneHiddenSelectors, overflowRisks, clipRisks, mediaQueryMatches } from './phone-reach-guard';
+import {
+  phoneHiddenSelectors,
+  overflowRisks,
+  clipRisks,
+  overlayRisks,
+  transformRisks,
+  mediaQueryMatches,
+} from './phone-reach-guard';
 
 describe('mediaQueryMatches', () => {
   it('matches a max-width query at or below the width', () => {
@@ -102,5 +109,47 @@ describe('the three mutations that used to pass', () => {
 
   it('catches `height` as well as `max-height`, and `overflow-y`', () => {
     expect(clipRisks('.z { height: 80px; overflow-y: hidden; }')).toHaveLength(1);
+  });
+});
+
+
+// QA's SECOND set of mutations. The first `clipRisks` restricted the height unit to px|rem|em,
+// which excluded the exact rule that caused this whole round — Ionic's `.ion-page` is
+// `overflow: hidden` with a PERCENTAGE height — and excluded the shipped console-tab fix's own
+// shape, `:host { height: 100%; overflow-y: auto }`, which is one word from being the bug.
+describe('the second set of mutations: the units and shapes that were invisible', () => {
+  it('catches a percentage height with hidden overflow — Ionic\u2019s own .ion-page rule', () => {
+    expect(clipRisks('.ion-page { overflow: hidden; height: 100%; }')).toHaveLength(1);
+    expect(clipRisks('.panel { height: 100%; overflow: hidden; }')).toHaveLength(1);
+  });
+
+  it('catches viewport-relative heights', () => {
+    for (const h of ['50vh', '80dvh', '40vmin', '40vmax', '60svh', '60lvh']) {
+      expect(clipRisks(`.x { max-height: ${h}; overflow: hidden; }`), h).toHaveLength(1);
+    }
+  });
+
+  it('still allows the scrollable shapes the arena actually ships', () => {
+    expect(clipRisks(':host { height: 100%; overflow-y: auto; }')).toEqual([]);
+    expect(clipRisks('pre.a-out { max-height: 220px; overflow: auto; }')).toEqual([]);
+    expect(clipRisks('.s { height: 100%; overflow-y: scroll; }')).toEqual([]);
+  });
+
+  it('catches a fixed or absolute overlay pinned over the whole viewport', () => {
+    expect(overlayRisks('.veil { position: fixed; inset: 0; }')).toHaveLength(1);
+    expect(overlayRisks('.veil { position: fixed; top: 0; left: 0; right: 0; bottom: 0; }')).toHaveLength(1);
+    expect(overlayRisks('.veil { position: absolute; inset: 0; }')).toHaveLength(1);
+  });
+
+  it('does not flag a pinned element that is not covering the viewport', () => {
+    expect(overlayRisks('.chip { position: absolute; top: 4px; right: 4px; }')).toEqual([]);
+    expect(overlayRisks('.bar { position: sticky; top: 0; }')).toEqual([]);
+  });
+
+  it('catches a scale transform, which moves content out from under the finger', () => {
+    expect(transformRisks('.x { transform: scale(3); }')).toHaveLength(1);
+    expect(transformRisks('.x { transform: translateX(-200%); }')).toHaveLength(1);
+    expect(transformRisks('.x { transform: none; }')).toEqual([]);
+    expect(transformRisks('.x { transform: translateY(-1px); }')).toEqual([]);
   });
 });

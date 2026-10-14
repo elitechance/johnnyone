@@ -202,3 +202,61 @@ describe('ArenaPanelComponent — the Arena tab’s own body', () => {
     expect(el.textContent).toMatch(/no phases/i);
   });
 });
+
+// ── The two console fixes, each with a test that fails when the fix is reverted ────────────────
+//
+// Round 2 shipped both of these held by a screenshot and nothing else: QA reverted each one and the
+// full suite stayed green, 60 files / 1030 passed, twice. These are the guards. Each was proven red
+// by reverting the fix it covers — the failures are in the round-3 report.
+import { tabNeedsPlanRun } from '../terminal/console-tabs-logic';
+import { ArenaPanelComponent } from './arena-panel.component';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+describe('the Arena tab needs the plan loaded, exactly as the Plan tab does', () => {
+  it('names both tabs, and only those two', () => {
+    expect(tabNeedsPlanRun('plan')).toBe(true);
+    expect(tabNeedsPlanRun('arena')).toBe(true);
+    for (const tab of ['raw', 'diff', 'checks', 'tasks'] as PaneTab[]) {
+      expect(tabNeedsPlanRun(tab), `${tab} should not trigger a plan load`).toBe(false);
+    }
+  });
+
+  it('is what the console actually calls — the effect does not re-spell the condition', () => {
+    // MEASURED defect this guards: the Arena tab read `planRun`, which only the PLAN tab's effect
+    // ever loaded, so the tab said "This initiative has no phases yet" on an initiative with three
+    // until the Plan tab had been opened once
+    // (.johnnyone/reports/arena-screens/before2-console-arena-tab-no-phases.png).
+    const ts = readFileSync(join(process.cwd(), 'web/src/app/pages/terminal/terminal.page.ts'), 'utf8');
+    expect(ts).toContain('tabNeedsPlanRun(this.activeTab())');
+    // …and the condition is not ALSO written out by hand next to it, which is how two spellings
+    // drift apart.
+    expect(ts).not.toMatch(/activeTab\(\) === 'plan'\s*\|\|\s*this\.activeTab\(\) === 'arena'/);
+  });
+});
+
+describe('the Arena tab panel is its own scroller', () => {
+  it('computes to a scrollable, full-height host', () => {
+    // The console's `.terminal-surface` is `height: 100%; overflow: hidden` — it hands each tab a
+    // box and expects the TAB to scroll inside it. Without this the third phase card was cut off
+    // with no way to reach it (before3-console-arena-tab-clipped.png). jsdom applies a component's
+    // own inline styles, so this is a COMPUTED value, not a source grep.
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({ providers: [provideRouter([])] });
+    const f = TestBed.createComponent(ArenaPanelComponent);
+    f.detectChanges();
+    const cs = getComputedStyle(f.nativeElement as HTMLElement);
+    expect(cs.overflowY, 'the panel must scroll inside the console surface').toBe('auto');
+    expect(cs.height).toBe('100%');
+    expect(cs.display).toBe('block');
+  });
+
+  it('keeps the bottom padding clear of the gesture bar', () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({ providers: [provideRouter([])] });
+    const f = TestBed.createComponent(ArenaPanelComponent);
+    f.detectChanges();
+    const panel = (f.nativeElement as HTMLElement).querySelector('.arena-panel') as HTMLElement;
+    expect(getComputedStyle(panel).paddingBottom).toContain('safe-area-inset-bottom');
+  });
+});

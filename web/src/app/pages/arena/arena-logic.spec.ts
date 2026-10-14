@@ -15,6 +15,7 @@ import {
   promotionConfirmCopy,
   NO_GATE_REASON,
   MAX_REJECTION_REASON,
+  visibleText,
 } from './arena-logic';
 
 describe('arenaEntryRow — step 1, the entry point', () => {
@@ -132,6 +133,44 @@ describe('rejectionReasonValid — there is no bare no', () => {
       expect(v.ok, JSON.stringify(invisible)).toBe(false);
       expect(v.message).toMatch(/reason/i);
     }
+  });
+
+  // Four more classes QA found, each of which rendered as nothing and passed:
+  //   * COMBINING MARKS with no base character (U+0301 …) — they have nothing to combine with;
+  //   * U+2800 BRAILLE PATTERN BLANK, the classic blank-that-is-not-whitespace;
+  //   * the astral VARIATION SELECTORS U+E0100–E01EF and TAG characters U+E0000–E007F, which the
+  //     first version could not match at all because the regex had no `u` flag.
+  it('refuses combining marks, the braille blank, and the astral invisibles', () => {
+    for (const invisible of [
+      '\u0301',                     // combining acute, no base
+      '\u0301\u0300\u0327',         // a pile of them
+      '\u2800',                     // BRAILLE PATTERN BLANK
+      '\u2800\u2800\u2800',
+      '\u{E0100}',                  // variation selector-17 (astral)
+      '\u{E01EF}',                  // variation selector-256
+      '\u{E0001}',                  // language tag
+      '\u{E007F}',                  // cancel tag
+      ' \u2800 \u{E0100} \u0301 ',   // mixed with real whitespace
+    ]) {
+      const v = rejectionReasonValid(invisible);
+      expect(v.ok, JSON.stringify(invisible)).toBe(false);
+    }
+  });
+
+  it('keeps a combining mark that is actually combining with a letter', () => {
+    expect(rejectionReasonValid('the cashier pathe\u0301 is untested').ok).toBe(true);
+    expect(visibleText('e\u0301')).toBe('e\u0301');
+  });
+
+  // The cap read the RAW string while emptiness read the visible text, so padding a real reason
+  // with zero-width characters could push it over a limit it was nowhere near.
+  it('caps what a reader sees, not what the padding adds', () => {
+    const padded = 'x'.repeat(MAX_REJECTION_REASON - 10) + '\u200b'.repeat(500);
+    const v = rejectionReasonValid(padded);
+    expect(v.ok, 'padding must not count against the cap').toBe(true);
+    const genuinelyLong = 'x'.repeat(MAX_REJECTION_REASON + 1);
+    expect(rejectionReasonValid(genuinelyLong).ok).toBe(false);
+    expect(rejectionReasonValid(genuinelyLong).message).toMatch(/2001|too long/);
   });
 
   it('keeps a reason that merely CONTAINS an invisible character', () => {

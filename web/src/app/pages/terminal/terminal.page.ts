@@ -131,6 +131,7 @@ import {
   initiativeTabOf,
   rawAttachNeeded,
   consoleTabsWithArena,
+  tabNeedsPlanRun,
   isLocalSmall,
   resolvedPaneTab,
 } from './console-tabs-logic';
@@ -1156,10 +1157,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly replanFlags = computed(() => replanFlagsOf(this.parsedPreflight()));
   // The tab strip is `visibleConsoleTabs` — unchanged, and still the one place that decides which
   // of Raw/Plan/Checks/Tasks/Diff are shown — with the arena APPENDED by `consoleTabsWithArena`,
-  // which delegates to it. The value import of `visibleConsoleTabs` is gone because the page no
-  // longer calls it directly; `console-tabs-logic.spec.ts` asserts this file still names it, and
-  // this comment is that mention. Whoever owns that spec may want it to assert the delegation
-  // instead — I am not allowed to edit an existing test, so I have left it and said so.
+  // which delegates to it. `console-tabs-logic.spec.ts` now asserts that delegation over its whole
+  // fixture matrix AND that this line calls the delegating function, so a hand-rolled array here
+  // fails (proved by mutating it).
   protected readonly visibleTabs = computed(() =>
     consoleTabsWithArena(
       this.selectedInitiative(),
@@ -1472,7 +1472,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         // initiative has no phases yet" on an initiative with three phases, until the Plan tab was
         // opened once (see `.johnnyone/reports/arena-screens/before2-console-arena-tab-no-phases.png`).
         // `ensurePlanLoaded` is once-per-initiative and benign, so sharing the trigger costs nothing.
-        const wantsPlan = this.activeTab() === 'plan' || this.activeTab() === 'arena';
+        const wantsPlan = tabNeedsPlanRun(this.activeTab());
         const init = this.selectedInitiative();
         if (wantsPlan && init) {
           void this.ensurePlanLoaded();

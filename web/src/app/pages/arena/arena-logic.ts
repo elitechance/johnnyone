@@ -100,15 +100,38 @@ export const MAX_REJECTION_REASON = 2000;
 
 /**
  * Characters that are NOT Unicode `White_Space` — so `trim()` keeps them — and yet render as
- * nothing: zero-width spaces and joiners, the BOM, the word joiner, the soft hyphen, the Hangul
- * fillers, and the C0/C1 controls (NUL among them). A reason made only of these passed a
- * `trim().length > 0` check and then appeared in the halt banner as an empty line.
+ * nothing or as nothing-on-their-own. A reason made only of these passed a `trim().length > 0`
+ * check and then appeared in the halt banner as an empty line.
+ *
+ * The classes, and why each is here:
+ *   * C0/C1 controls (NUL among them), the BOM, zero-width space/joiners, bidi controls, the word
+ *     joiner, the soft hyphen, the Hangul fillers, Mongolian vowel separator;
+ *   * U+2800 BRAILLE PATTERN BLANK — a printing character whose glyph is empty, which is exactly
+ *     why it is the one people reach for;
+ *   * COMBINING MARKS (`\p{M}`) — they are stripped only when nothing precedes them to combine
+ *     with, which `visibleText` handles by removing marks that follow nothing visible, so
+ *     "pathe\u0301" keeps its accent while a bare "\u0301" does not survive;
+ *   * the astral VARIATION SELECTORS U+E0100–E01EF and TAG characters U+E0000–E007F, which need the
+ *     `u` flag to be matched at all — without it these ranges are unmatchable as written, which is
+ *     how they got through the first version.
  */
-const INVISIBLE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb]/g;
+const INVISIBLE =
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb]|[\u{E0000}-\u{E007F}]|[\u{E0100}-\u{E01EF}]/gu;
 
-/** What a reason actually SHOWS: whitespace trimmed and every invisible character removed. */
+/** A combining mark that follows NOTHING — nothing to combine with, so nothing is drawn. */
+const ORPHAN_MARK = /(?<![\p{L}\p{N}\p{S}\p{P}])\p{M}+/gu;
+
+/**
+ * What a reason actually SHOWS: every invisible character removed, then combining marks that have
+ * nothing to combine with, then whitespace trimmed. Run twice, because removing an invisible can
+ * leave a mark orphaned ("\u200b\u0301" is two characters that draw nothing between them).
+ */
 export function visibleText(value: string): string {
-  return value.replace(INVISIBLE, '').trim();
+  let out = value;
+  for (let pass = 0; pass < 2; pass += 1) {
+    out = out.replace(INVISIBLE, '').replace(ORPHAN_MARK, '');
+  }
+  return out.trim();
 }
 
 /**
@@ -126,10 +149,14 @@ export function rejectionReasonValid(reason: string): { ok: boolean; message: st
         'Write a reason that is actually visible. A challenger that passed every check and was rejected anyway means the gate is missing something, and the reason is the only record of what — an empty line in the halt banner tells the next reader nothing.',
     };
   }
-  if (reason.length > MAX_REJECTION_REASON) {
+  // The cap counts what a READER sees, for the same reason emptiness does. Checking the raw string
+  // here while checking the visible text above meant 1,990 real characters padded with zero-width
+  // ones were refused as "2010 against a limit of 2000" — one end of the same rule measured one way
+  // and the other end the other.
+  if (visible.length > MAX_REJECTION_REASON) {
     return {
       ok: false,
-      message: `That reason is too long: ${reason.length} characters against a limit of ${MAX_REJECTION_REASON}. It has to be readable in a halt banner on a phone.`,
+      message: `That reason is too long: ${visible.length} characters against a limit of ${MAX_REJECTION_REASON}. It has to be readable in a halt banner on a phone.`,
     };
   }
   return { ok: true, message: null };
