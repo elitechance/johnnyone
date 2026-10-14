@@ -5581,7 +5581,7 @@ fn lens_reviewer_prompt(
     let brief_path = Path::new(&run.plan.plan_path).join("brief.md");
     format!(
         "You are the {name} reviewer for phase {phase_id} of a development run. Run ONLY the {name} lens — do not run the other lenses.\n\n\
-Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
+Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}; and the evidence this run delivered under {artifacts}, which is where T1 was told to write it. Then inspect the actual delivered work for this phase.\n\n\
 Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
         phase_id = phase.phase_id,
@@ -5591,6 +5591,11 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
         plan = get("plan_path"),
         phase_path = get("phase_path"),
         tasks = get("tasks_path"),
+        // The RUN-SCOPED artifacts directory, the same value the worker prompt names. The live
+        // development reviewer is this `format!`, not `DEFAULT_DEVELOPMENT_REVIEWER` (which is
+        // `#[allow(dead_code)]`, superseded by this fan-out) — so pointing the reviewer at the
+        // evidence has to happen here or it does not happen at all.
+        artifacts = get("artifacts_path"),
         extras = lens_prompt_extras(lens),
         report = lens_report_instruction(session_id, lens_name),
     )
@@ -18377,24 +18382,91 @@ mod qa_b_template_tests {
         );
     }
 
-    /// No shipped template consumes `{{artifacts_path}}`, so the value reaches no agent today.
+    /// THE revert-guard for turning the run-scoped path on: the prompt an agent actually
+    /// receives names the run's real directory.
     ///
-    /// Exhaustive over every default prompt in `PlannerPromptSettings`, via serde, so a template
-    /// added later cannot be missed by a hand-written list. This is the measured half of "the
-    /// live worker prompts are fingerprint-pinned, so nothing writes there yet".
+    /// Renders the shipped worker template against real phase values, so it fails if ANY link in
+    /// the chain is removed — the template line, the `artifacts_path` value in
+    /// `phase_template_values`, or the placeholder's spelling drifting between the two. Checking
+    /// the template alone would miss the last two: an unrendered `{{artifacts_path}}` reaching an
+    /// agent is worse than no instruction, because the agent would create a directory with that
+    /// literal name.
     #[test]
-    fn qa_no_shipped_template_consumes_the_artifacts_path_value() {
+    fn qa_the_rendered_worker_prompt_names_this_runs_artifact_directory() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-rendered");
+        let run = qa_run(plan.to_str().unwrap());
+        let phase = qa_phase();
+        let phase_path = plan.join("phases/01-thing");
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let rendered =
+            planner_prompts::render_template(planner_prompts::DEFAULT_DEVELOPMENT_WORKER, &values);
+
+        let expected = plan.join("phases/01-thing/artifacts/runs/RUN-7fe2");
+        assert!(
+            rendered.contains(&*expected.to_string_lossy()),
+            "the rendered worker prompt must name {}; got:\n{}",
+            expected.display(),
+            rendered
+        );
+        // The reason travels with the path.
+        assert!(rendered.contains("overwrite each other's evidence"), "{rendered}");
+        // No placeholder may survive rendering — an agent handed a literal `{{artifacts_path}}`
+        // would create a directory called that.
+        assert!(
+            !rendered.contains("{{"),
+            "an unrendered placeholder reached the prompt:\n{rendered}"
+        );
+        // And the directory the prompt names really exists by the time the agent reads it.
+        assert!(expected.is_dir(), "{} was named but not created", expected.display());
+    }
+
+    /// FIXED (was `qa_no_shipped_template_consumes_the_artifacts_path_value`, QA round 2). The
+    /// shipped development worker template now DOES consume `{{artifacts_path}}`, so the value
+    /// reaches a live agent.
+    ///
+    /// QA's test was the measured half of "the live worker prompts are fingerprint-pinned, so
+    /// nothing writes there yet", and it was true until the coordinator carried the
+    /// commercial-prompt decision on 2026-10-14. Same fixture — exhaustive over every default
+    /// prompt in `PlannerPromptSettings` via serde, so a template added later cannot be missed
+    /// by a hand-written list — with the assertion inverted.
+    ///
+    /// **QA's non-vacuity half is kept and is still load-bearing**, now in both directions: the
+    /// same search must find the placeholders that were already wired (otherwise a `contains`
+    /// over this JSON proves nothing), and it must NOT find a placeholder that exists nowhere
+    /// (otherwise the positive assertion above would pass against any string at all).
+    #[test]
+    fn qa_the_shipped_worker_template_consumes_the_artifacts_path_value() {
         let defaults = planner_prompts::PlannerPromptSettings::default();
         let as_json = serde_json::to_string(&defaults).expect("settings serialise");
         assert!(
-            !as_json.contains("artifacts_path"),
-            "a shipped template now references {{{{artifacts_path}}}} — the fingerprint test in \
-             planner_prompts must have been updated deliberately, and this test with it"
+            as_json.contains("artifacts_path"),
+            "the shipped worker template must reference {{{{artifacts_path}}}} — without it the \
+             run-scoped directory is created on every phase and written to by nobody"
         );
-        // Sanity: the same search DOES find the placeholders that are wired, so the assertion
-        // above is not vacuous.
+        // It is the WORKER template specifically, and it carries the reason, not just the path.
+        assert!(
+            planner_prompts::DEFAULT_DEVELOPMENT_WORKER.contains("{{artifacts_path}}"),
+            "the development worker template is the one that had to change"
+        );
+        assert!(
+            planner_prompts::DEFAULT_DEVELOPMENT_WORKER.contains("overwrite each other's evidence"),
+            "the instruction must say WHY, or the next editor will drop it as redundant"
+        );
+        // Not sprayed: the planning templates have no phase and no run-scoped directory.
+        assert!(!planner_prompts::DEFAULT_PLANNING_PLANNER.contains("artifacts_path"));
+        assert!(!planner_prompts::DEFAULT_PLANNING_REVIEWER.contains("artifacts_path"));
+
+        // Sanity, kept from QA: the same search DOES find the placeholders that are wired, so
+        // the assertion above is not vacuous...
         for wired in ["tasks_path", "phase_path", "plan_path", "run_id", "conventions_path"] {
             assert!(as_json.contains(wired), "{wired} should be in a shipped template");
         }
+        // ...and does NOT find one that is wired nowhere, so `contains` is really discriminating.
+        assert!(
+            !as_json.contains("fleet_busy_path"),
+            "a placeholder no template defines must not be found, or the search means nothing"
+        );
     }
 }

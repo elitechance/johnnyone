@@ -288,10 +288,13 @@ Plan: {{plan_path}}
 Current phase: {{phase_id}}
 Phase path: {{phase_path}}
 Tasks path: {{tasks_path}}
+Artifacts path (this run): {{artifacts_path}}
 Methodology: {{methodology_path}}
 Conventions: {{conventions_path}}
 
 Read methodology, project conventions (every file under {{conventions_path}}), plan overview, phase overview, discoveries, and current-phase task files directly from those paths on the host. Work only on this phase. Do not start later phases. Update task status/decisions/artifacts as you work. The task and phase files under {{phase_path}} are the spec you are being measured against, not working notes — do not edit or delete them. If a requirement is wrong or impossible, record that in the task's decisions file and leave the requirement standing, so the change is a decision someone made rather than one that happened quietly; the coordinator rejects a ready report that removed spec lines.
+
+Write every artifact you produce — screenshots, captured test output, capture scripts, single-page mocks — into {{artifacts_path}}, which is this run's own directory, because two runs of the same phase share one plan store and would otherwise overwrite each other's evidence. Read the phase's existing artifacts from wherever they already are; write only there.
 
 This phase will be reviewed against the three lenses in {{conventions_path}}/review-lenses.md, so prepare the evidence each needs:
 - Product (no code): for every screen in the plan's screens-to-verify inventory, capture a final screenshot of the delivered screen so it can be matched against the agreed mock.
@@ -685,7 +688,12 @@ planning:
         // Ten shipped DEFAULT_* strings. Not workerNudge (no shipped default).
         assert_eq!(fnv1a64(DEFAULT_PLANNING_PLANNER), 0x57b8ba3c4843e8a7);
         assert_eq!(fnv1a64(DEFAULT_PLANNING_REVIEWER), 0x42e3b3d0e4178fe5);
-        assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_WORKER), 0xe0e0b581211ea700);
+        // Changed DELIBERATELY on 2026-10-14 (was 0xe0e0b581211ea700): the worker is now told to
+        // write this phase's evidence into the run-scoped `{{artifacts_path}}` directory. Two
+        // runs of the same phase share one plan store, so the bare `artifacts/` directory had
+        // them silently overwriting each other's screenshots and captured output. This is the
+        // "update the constants only when a commercial-prompt change is intentional" case.
+        assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_WORKER), 0x6c1b7330271a6ab6);
         assert_eq!(fnv1a64(DEFAULT_DEVELOPMENT_REVIEWER), 0x882713aa907d5d7f);
         assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_PLANNER), 0x7f841cf263c8c761);
         assert_eq!(fnv1a64(DEFAULT_AMEND_PLANNING_REVIEWER), 0xea96c82d6fcfac66);
