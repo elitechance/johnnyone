@@ -2875,6 +2875,10 @@ pub const TEST_GATE_EXIT_TIMEOUT: i32 = -3;
 /// Returns the kept text, whether the cap discarded anything, and the read error if one ended the
 /// drain. A read error is NOT the same as EOF: it also yields a short capture, and reporting it
 /// separately stops a truncated-by-failure window from reading as a complete one.
+/// Test-only convenience over [`drain_capped_tail_into`]: run a drain to completion and return the
+/// capture as a tuple. The runner does not use it — it needs the capture to be readable WHILE the
+/// drain is still running — so it is `#[cfg(test)]` rather than dead code in the shipped binary.
+#[cfg(test)]
 async fn drain_capped_tail<R>(reader: R, cap: usize) -> (String, bool, Option<String>)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -3271,7 +3275,7 @@ async fn run_one_gate_command_with_timeout(
     // over what it read. See `GateCapture`.
     let out_capture = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
     let err_capture = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
-    let drain_stdout = tokio::spawn({
+    let mut drain_stdout = tokio::spawn({
         let shared = out_capture.clone();
         async move {
             if let Some(pipe) = stdout {
@@ -3279,7 +3283,7 @@ async fn run_one_gate_command_with_timeout(
             }
         }
     });
-    let drain_stderr = tokio::spawn({
+    let mut drain_stderr = tokio::spawn({
         let shared = err_capture.clone();
         async move {
             if let Some(pipe) = stderr {
@@ -3288,41 +3292,48 @@ async fn run_one_gate_command_with_timeout(
         }
     });
 
-    let collect = async {
-        // Wait for the COMMAND to exit, not for its pipes to close.
-        //
-        // A gate's own exit tells us the result. Pipe EOF does not, because a background job the
-        // gate started INHERITS the pipes and holds them open after the gate exits — so EOF waits
-        // on the background job, not on the gate. Measured: a shell that exited 0 in milliseconds
-        // took 3.157s to return because it left a `sleep 3` running. In production a gate like
-        // `npm test` that leaves a watcher or a dev server behind would have waited the FULL
-        // deadline and then been reported as a timeout, i.e. the right answer (it passed) replaced
-        // by a wrong diagnosis blaming the command for being slow.
-        let status = child.wait().await;
-        // The command is gone; now give its output a brief, bounded moment to arrive. This is a
-        // flush window, not a wait on the background job: whatever the gate itself wrote is
-        // already in the pipe, and a reader that stops instantly can still race the last write.
-        // Both graces run CONCURRENTLY: awaited one after the other, a background job holding both
-        // pipes costs two full grace windows instead of one.
-        let _ = tokio::join!(
-            tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, drain_stdout),
-            tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, drain_stderr),
-        );
-        // Read the SHARED captures, not the tasks' return values. Whether a drain finished at EOF
-        // or was cut short by the grace window, what it read is here.
-        let (out, out_truncated, out_err) = GateCapture::take(&out_capture);
-        let (err, err_truncated, err_err) = GateCapture::take(&err_capture);
-        (
-            out,
-            err,
-            out_truncated || err_truncated,
-            out_err.or(err_err),
-            status,
-        )
-    };
+    // THE DEADLINE BOUNDS THE COMMAND, AND ONLY THE COMMAND.
+    //
+    // Wait for the COMMAND to exit, not for its pipes to close. A gate's own exit tells us the
+    // result; pipe EOF does not, because a background job the gate started INHERITS the pipes and
+    // holds them open after the gate exits — so EOF waits on the background job, not on the gate.
+    // Measured: a shell that exited 0 in milliseconds took 3.157s to return because it left a
+    // `sleep 3` running. In production a gate like `npm test` that leaves a watcher or a dev server
+    // behind would have waited the FULL deadline and then been reported as a timeout: the right
+    // answer (it passed) replaced by a wrong diagnosis blaming the command for being slow.
+    //
+    // The flush grace below is deliberately OUTSIDE this timeout. When the deadline covered
+    // `wait()` plus the grace, a command that exited 0 within one grace-width of the deadline was
+    // reported `-3`, and — the worse half — the group-kill block's safety argument became false in
+    // that window, because it assumes the shell has NOT been reaped while the negative-pid kill
+    // runs. Keeping the grace outside means the deadline measures exactly what it claims to, and
+    // the timeout branch is reached only with the child un-waited.
+    let wait_result = tokio::time::timeout(deadline, child.wait()).await;
 
-    match tokio::time::timeout(deadline, collect).await {
-        Ok((out, err, truncated, read_error, status)) => {
+    match wait_result {
+        Ok(status) => {
+            // The command is gone; now give its output a brief, bounded moment to arrive. This is
+            // a flush window, not a wait on the background job: whatever the gate itself wrote is
+            // already in the pipe, and a reader that stops instantly can still race the last write.
+            // Both graces run CONCURRENTLY — awaited one after the other, a background job holding
+            // both pipes would cost two full grace windows instead of one.
+            let _ = tokio::join!(
+                tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, &mut drain_stdout),
+                tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, &mut drain_stderr),
+            );
+            // ABORT rather than detach. Dropping a `JoinHandle` detaches the task, so a gate that
+            // leaves a daemon holding its pipes would leave two drains alive until that daemon
+            // exits, each pinning up to `cap` bytes — bounded per gate, unbounded across a long
+            // coordinator session. The capture is already shared, so nothing is lost by stopping
+            // them: everything read so far is in `out_capture`/`err_capture` below.
+            drain_stdout.abort();
+            drain_stderr.abort();
+            // Read the SHARED captures, not the tasks' return values. Whether a drain finished at
+            // EOF or was cut short by the grace window, what it read is here.
+            let (out, out_truncated, out_err) = GateCapture::take(&out_capture);
+            let (err, err_truncated, err_err) = GateCapture::take(&err_capture);
+            let truncated = out_truncated || err_truncated;
+            let read_error = out_err.or(err_err);
             let mut combined = format!("{}\n{}", out, err);
             // A read error also produces a short capture. Saying so stops a window truncated by
             // failure from reading as a complete one.
@@ -3355,6 +3366,13 @@ async fn run_one_gate_command_with_timeout(
             // kill processes belonging to someone else. Reordering these two statements is a
             // kill-the-wrong-thing bug, not a tidiness question, and
             // `the_group_kill_runs_before_the_child_is_reaped` pins the order.
+            //
+            // THE PRECONDITION IS STRUCTURAL, and it has been false once. This branch is reached
+            // only from `timeout(deadline, child.wait())` expiring, so the child is un-waited here
+            // by construction. When the deadline also covered the flush grace, a command could
+            // exit and be reaped INSIDE the bounded region and still land in this branch — the pid
+            // was then already released and the argument above did not hold. That is why the grace
+            // now sits outside the timeout: it keeps this precondition true, not merely likely.
             #[cfg(unix)]
             if let Some(pid) = child_pid {
                 // This crate has neither `libc` nor `nix`, so the group is signalled via kill(1).
@@ -13143,6 +13161,38 @@ diff --git a/two.md b/two.md
             runner.contains("process_group(0)"),
             "the gate must lead its own process group for the negative-pid kill to be correct"
         );
+
+        // The drain tasks must be ABORTED, not left to detach.
+        //
+        // Dropping a `JoinHandle` detaches the task. For a gate that leaves a daemon holding its
+        // pipes, two drains would then live until that daemon exits, each pinning up to the cap —
+        // bounded per gate, unbounded across a long coordinator session. Nothing is lost by
+        // aborting, because the capture is shared and already read by this point.
+        //
+        // Source-level because tokio exposes no stable way to observe that a task is gone: there
+        // is no live-task count to assert on, and a detached drain's only symptom is memory that
+        // nothing in a unit test can attribute. Structural, and labelled as such.
+        for handle in ["drain_stdout.abort()", "drain_stderr.abort()"] {
+            assert!(
+                runner.contains(handle),
+                "the runner must abort its drain tasks rather than detaching them: missing {handle}"
+            );
+        }
+
+        // The deadline must bound the COMMAND only, with the flush grace outside it. Inside, a
+        // command that exited and was reaped within one grace-width of the deadline reported a
+        // timeout AND falsified the un-reaped precondition the group kill above depends on.
+        //
+        // This one matches a literal SHAPE, so it also trips on a semantically harmless refactor
+        // (binding the future to a local first). That is a deliberate trade: the property is "the
+        // deadline covers the wait and nothing else", which is not observable from outside without
+        // racing a 500ms window, and a false alarm that makes someone re-read this comment is
+        // cheaper than a silent return to the version where the group-kill precondition was false.
+        assert!(
+            runner.contains("timeout(deadline, child.wait())"),
+            "the deadline must bound child.wait() alone, not the wait plus the flush grace. \
+             (If you refactored the call shape without changing that, update this assertion.)"
+        );
     }
 
     /// The three reserved codes are distinct, negative, and non-zero, and no real UNIX exit status
@@ -13518,19 +13568,23 @@ diff --git a/two.md b/two.md
         // `qa_c1_a_large_final_write_survives_a_pipe_held_open_by_a_background_job` pins.
     }
 
-    /// RISK, pinned: the deadline now bounds `child.wait()` PLUS the flush grace, so a command
-    /// that exits successfully inside the last [`TEST_GATE_PIPE_FLUSH_GRACE`] of the deadline is
-    /// reported as a TIMEOUT.
+    /// The deadline bounds the COMMAND, not the command plus the flush grace.
     ///
-    /// Two consequences. The reported outcome is wrong (`-3` for a command that exited 0), and the
-    /// precondition in the group-kill comment — "the shell is alive or an unreaped zombie" — no
-    /// longer holds, because `child.wait()` has already reaped it. With the real 20-minute
-    /// deadline this is a 500ms window in 1,200,000ms and only for gates that hold their pipes
-    /// open, so it is a sharp edge rather than an operational problem; it matters for anyone
-    /// driving the runner with a short deadline. The fix is to bound `child.wait()` and run the
-    /// grace outside that bound.
+    /// QA pinned the defect here: the deadline used to cover `child.wait()` AND the 500ms flush
+    /// grace, so a command that exited 0 within one grace-width of the deadline was reported `-3`
+    /// with a message blaming it for being slow. The worse half was not the wrong outcome but the
+    /// false safety argument: the group-kill block asserts the kernel still owns the shell's pid
+    /// because it has not been reaped, and that is what makes the negative-pid kill unable to
+    /// signal a RECYCLED group. In that window `child.wait()` had already reaped it, so the
+    /// precondition the comment relies on was false.
+    ///
+    /// Fixed by bounding `child.wait()` alone and running the grace outside it. The timeout branch
+    /// is now reachable only with the child un-waited, which is exactly what the group-kill
+    /// argument requires. QA's note that this was a 500ms window in 1,200,000ms was why it did not
+    /// block the merge; it is fixed anyway, because the next person to shorten the deadline would
+    /// inherit a safety argument that is quietly untrue.
     #[tokio::test]
-    async fn qa_c1_a_command_that_exits_inside_the_grace_window_is_misreported_as_a_timeout() {
+    async fn qa_c1_a_command_that_exits_inside_the_grace_window_is_not_a_timeout() {
         let dir = tmp_dir("qa-c1-edge");
         let w = dir.to_string_lossy().to_string();
         let ticks = dir.join("ticks.txt");
@@ -13546,14 +13600,31 @@ diff --git a/two.md b/two.md
         .expect("gate must report");
         assert!(tick_len(&ticks) > 0, "the background writer never ran");
         assert_eq!(
-            exit_code, TEST_GATE_EXIT_TIMEOUT,
-            "if this now reports 0, the deadline was moved off the grace window — \
-             good, and this test should be inverted"
+            exit_code, 0,
+            "a command that EXITED 0 before the deadline must report 0; reporting \
+             {} means the flush grace is being counted against the deadline again",
+            TEST_GATE_EXIT_TIMEOUT
         );
         assert!(
-            output.contains("did not finish"),
-            "and the message blames the command for being slow: {output}"
+            !output.contains("did not finish"),
+            "and it must not be described as a timeout: {output}"
         );
+        // The command's own line survives: it was written before the background flood, and here
+        // the flood stays under the cap.
+        assert!(output.contains("done-early"), "{output}");
+
+        // The other side of the same boundary: a command that genuinely overruns the deadline is
+        // still a timeout. Moving the grace out must not have moved the deadline out with it.
+        let slow = format!("sh -c '{}' & sleep 5 ; echo too-late", tick_loop(&dir.join("t2.txt")));
+        let (exit_code, output, _) = run_one_gate_command_with_timeout(
+            &slow,
+            &w,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("gate must report");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT, "{output}");
+        assert!(output.contains("did not finish"), "{output}");
     }
 
     #[tokio::test]
