@@ -17,6 +17,7 @@ pub mod task_replan;
 pub mod task_spec;
 pub mod task_state;
 pub mod verify_policy;
+pub mod workflows;
 pub mod workspace_git;
 #[cfg(test)]
 mod fixture_spine;

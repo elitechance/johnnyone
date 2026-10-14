@@ -1269,6 +1269,25 @@ impl AgentService {
             "refresh_agent_plan_phases" => {
                 Self::rpc_refresh_agent_plan_phases(&req.params, state)
             },
+            // --- the workflow arena (migration 026) ---
+            // Reads first, then the writes. Every one of these is a thin param-puller: the rules
+            // (comparability, the promotion refusals, the three-strike halt) live in
+            // `services::workflows`, never here, so the relay and a future local caller cannot
+            // disagree about them.
+            "list_workflows" => Self::rpc_list_workflows(&req.params, state),
+            "get_workflow" => Self::rpc_get_workflow(&req.params, state),
+            "list_workflow_runs" => Self::rpc_list_workflow_runs(&req.params, state),
+            "get_workflow_search_state" => {
+                Self::rpc_get_workflow_search_state(&req.params, state)
+            }
+            "create_workflow_version" => Self::rpc_create_workflow_version(&req.params, state),
+            "start_workflow_run" => Self::rpc_start_workflow_run(&req.params, state),
+            "record_workflow_run_gate" => Self::rpc_record_workflow_run_gate(&req.params, state),
+            "record_workflow_pref" => Self::rpc_record_workflow_pref(&req.params, state),
+            "update_workflow_champion" => Self::rpc_update_workflow_champion(&req.params, state),
+            "record_workflow_rejection" => {
+                Self::rpc_record_workflow_rejection(&req.params, state)
+            }
             "amend_agent_plan" => Self::rpc_amend_agent_plan(&req.params, state).await,
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
@@ -1815,6 +1834,266 @@ impl AgentService {
             clear,
         )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    // --- the workflow arena (migration 026) ---
+    //
+    // Thin param-pullers mirroring `rpc_update_agent_plan_test_commands`: read typed params from
+    // the JSON value, call `services::workflows`, serialize the result. camelCase keys match the
+    // worker resolvers and the GraphQL arguments.
+    //
+    // NOTHING here decides anything. The comparability rule, the promotion refusals and the
+    // three-strike halt are all in the service, behind one named function each, because this layer
+    // will eventually have a second caller (a local Tauri command) and two copies of a rule is how
+    // this repo has already produced a false pass.
+
+    fn workflow_key(
+        params: &serde_json::Value,
+    ) -> Result<(String, String, String), String> {
+        let repo = params
+            .get("repo")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'repo' parameter".to_string())?;
+        let phase_type = params
+            .get("phaseType")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'phaseType' parameter".to_string())?;
+        let family = params
+            .get("family")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'family' parameter".to_string())?;
+        Ok((repo.to_string(), phase_type.to_string(), family.to_string()))
+    }
+
+    fn rpc_list_workflows(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        // All three filters are optional and independent — absent means "any".
+        let optional = |key: &str| {
+            params
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty())
+        };
+        let repo = optional("repo");
+        let phase_type = optional("phaseType");
+        let family = optional("family");
+        let workflows = crate::services::workflows::list_workflows(
+            state,
+            repo.as_deref(),
+            phase_type.as_deref(),
+            family.as_deref(),
+        )?;
+        serde_json::to_value(workflows).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_workflow(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let workflow = crate::services::workflows::get_workflow(state, id)?;
+        serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_list_workflow_runs(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let workflow_id = params
+            .get("workflowId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        let runs = crate::services::workflows::list_workflow_runs(state, workflow_id)?;
+        serde_json::to_value(runs).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_workflow_search_state(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (repo, phase_type, family) = Self::workflow_key(params)?;
+        let search = crate::services::workflows::workflow_search_state(
+            state,
+            &repo,
+            &phase_type,
+            &family,
+        )?;
+        serde_json::to_value(search).map_err(|e| e.to_string())
+    }
+
+    fn rpc_create_workflow_version(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (repo, phase_type, family) = Self::workflow_key(params)?;
+        let required = |key: &str| -> Result<String, String> {
+            params
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .ok_or_else(|| format!("Missing '{}' parameter", key))
+        };
+        let input = crate::services::workflows::NewWorkflowVersion {
+            repo,
+            phase_type,
+            family,
+            parent_id: params
+                .get("parentId")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty()),
+            role: required("role")?,
+            instruction: required("instruction")?,
+            contract: required("contract")?,
+            hop: required("hop")?,
+            // No default. A fan-out the caller did not state is not "1 seat" — it is a bug, and a
+            // silent default here would let a workflow compete on a seat budget nobody chose.
+            fan_out: params
+                .get("fanOut")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| "Missing 'fanOut' parameter".to_string())?,
+        };
+        let workflow = crate::services::workflows::create_workflow_version(state, input)?;
+        serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_start_workflow_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let workflow_id = params
+            .get("workflowId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        let input = crate::services::workflows::NewWorkflowRun {
+            workflow_id: workflow_id.to_string(),
+            plan_id: params
+                .get("planId")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty()),
+            seed: params.get("seed").and_then(|value| value.as_i64()).unwrap_or(0),
+            // Required, and validated by the service: an unreadable seat budget makes every
+            // preference involving this run non-comparable, which is a silent dead end.
+            seats_held: params
+                .get("seatsHeld")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "Missing 'seatsHeld' parameter".to_string())?
+                .to_string(),
+            fleet_busy: params
+                .get("fleetBusy")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "Missing 'fleetBusy' parameter".to_string())?
+                .to_string(),
+        };
+        let run = crate::services::workflows::start_workflow_run(state, input)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_record_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        // `gateExit` is REQUIRED: it is the score, and a missing score must be an error rather
+        // than a 0 that reads as a pass.
+        let gate_exit = params
+            .get("gateExit")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| "Missing 'gateExit' parameter".to_string())?;
+        // `gateCollected` is ADVISORY and genuinely optional: absent and explicit null both mean
+        // "the gate printed nothing a parser recognised", which is a normal result for a lint, a
+        // build or a bespoke script. It is never an error and nothing branches on it.
+        let gate_collected = params.get("gateCollected").and_then(|value| value.as_i64());
+        let run = crate::services::workflows::record_workflow_run_gate(
+            state,
+            run_id,
+            gate_exit,
+            gate_collected,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_record_workflow_pref(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let winner_run_id = params
+            .get("winnerRunId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'winnerRunId' parameter".to_string())?;
+        let loser_run_id = params
+            .get("loserRunId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'loserRunId' parameter".to_string())?;
+        // NOTE there is deliberately no `comparable` parameter. The service computes it from the
+        // two runs' own seat budgets, so a client cannot assert a comparability it does not have.
+        let reason = params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let pref = crate::services::workflows::record_workflow_pref(
+            state,
+            winner_run_id,
+            loser_run_id,
+            reason,
+        )?;
+        serde_json::to_value(pref).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_workflow_champion(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        let pref_id = params
+            .get("prefId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        // Defaults to FALSE, so a call that forgot its arguments cannot promote. Promotion is the
+        // arena's one irreversible, human-confirmed step.
+        let confirmed = params
+            .get("confirmed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let workflow = crate::services::workflows::promote_workflow(
+            state,
+            run_id,
+            pref_id.as_deref(),
+            confirmed,
+        )?;
+        serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_record_workflow_rejection(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        // Required. The service rejects a blank one too — three rejections halt the search and the
+        // reasons are the only thing a halted search has to show.
+        let reason = params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'reason' parameter".to_string())?;
+        let search = crate::services::workflows::reject_workflow_run(state, run_id, reason)?;
+        serde_json::to_value(search).map_err(|e| e.to_string())
     }
 
     async fn rpc_run_agent_plan_test_gate(
@@ -3202,5 +3481,349 @@ mod liveness_watchdog_tests {
             (HEARTBEAT_LIVENESS_CHECK_SECS as i64) * 3 <= HEARTBEAT_STALE_AFTER_SECS,
             "liveness check should run at least 3x per staleness window"
         );
+    }
+}
+
+/// The workflow arena's relay-RPC wiring (migration 026).
+///
+/// A separate module from `files_rpc_tests` for the same reason that one exists: nothing else in
+/// the tree drives a JSON-RPC request through these arms, so a renamed match arm or a renamed
+/// param key would compile, pass every other gate, and fail only in production — against a phone.
+///
+/// These tests are about WIRING, not rules. The rules (comparability, the promotion refusals, the
+/// three-strike halt) are pinned where they live, in `services::workflows`.
+#[cfg(test)]
+mod workflow_arena_rpc_tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use serde_json::json;
+
+    fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
+        RpcRequest {
+            request_id: "req-1".to_string(),
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    /// Every arena method is REGISTERED. Proven by the error coming from the param-puller or the
+    /// service rather than from the dispatch's `_ =>` arm.
+    #[tokio::test]
+    async fn handle_rpc_registers_every_arena_method() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        // A deliberately empty payload: each arm must reject it with ITS OWN missing-parameter
+        // message, which can only happen if the arm is wired to the right puller.
+        let cases: &[(&str, &str)] = &[
+            ("get_workflow", "Missing 'id' parameter"),
+            ("list_workflow_runs", "Missing 'workflowId' parameter"),
+            ("get_workflow_search_state", "Missing 'repo' parameter"),
+            ("create_workflow_version", "Missing 'repo' parameter"),
+            ("start_workflow_run", "Missing 'workflowId' parameter"),
+            ("record_workflow_run_gate", "Missing 'runId' parameter"),
+            ("record_workflow_pref", "Missing 'winnerRunId' parameter"),
+            ("update_workflow_champion", "Missing 'runId' parameter"),
+            ("record_workflow_rejection", "Missing 'runId' parameter"),
+        ];
+        for (method, expected) in cases {
+            let response = AgentService::handle_rpc(&rpc(method, json!({})), &state).await;
+            assert!(!response.success, "{method} with no params must fail");
+            let error = response.error.unwrap_or_default();
+            assert!(
+                !error.contains("Unknown RPC method"),
+                "{method} is NOT registered in handle_rpc"
+            );
+            assert_eq!(&error, expected, "{method}: wrong param-puller");
+        }
+
+        // `list_workflows` takes no required parameter — an empty payload is the "list everything"
+        // call, so it must SUCCEED. That is also what proves it is registered.
+        let listed = AgentService::handle_rpc(&rpc("list_workflows", json!({})), &state).await;
+        assert!(listed.success, "list_workflows: {:?}", listed.error);
+        assert_eq!(listed.data.and_then(|data| data.as_array().map(|a| a.len())), Some(0));
+
+        // And the unknown-method arm still works, so the assertions above are not vacuous.
+        let bogus = AgentService::handle_rpc(&rpc("workflow_bogus", json!({})), &state).await;
+        assert!(!bogus.success);
+        assert!(bogus
+            .error
+            .unwrap_or_default()
+            .contains("Unknown RPC method"));
+    }
+
+    /// The whole arena, end to end, through `handle_rpc` only — the surface a phone actually
+    /// reaches. Also pins the camelCase JSON keys both ways: the params the resolvers send and the
+    /// field names they read back.
+    #[tokio::test]
+    async fn handle_rpc_drives_the_arena_end_to_end() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let created = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "repo": "johnnyone",
+                    "phaseType": "dev-phase",
+                    "family": "glm-5.3-flash",
+                    "role": "you are a developer",
+                    "instruction": "implement the phase",
+                    "contract": "the gate must pass",
+                    "hop": "{\"steps\":[\"edit\",\"verify\"]}",
+                    "fanOut": 3
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(created.success, "create: {:?}", created.error);
+        let workflow = created.data.expect("workflow");
+        assert_eq!(workflow.get("version").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(
+            workflow.get("isChampion").and_then(|v| v.as_bool()),
+            Some(false),
+            "a new version is never born champion"
+        );
+        let workflow_id = workflow
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("id")
+            .to_string();
+
+        // Two runs on the SAME seat budget, so the preference between them is comparable.
+        let mut run_ids = Vec::new();
+        for _ in 0..2 {
+            let started = AgentService::handle_rpc(
+                &rpc(
+                    "start_workflow_run",
+                    json!({
+                        "workflowId": workflow_id,
+                        "seed": 0,
+                        "seatsHeld": "{\"glm\":3}",
+                        "fleetBusy": "{\"glm\":1}"
+                    }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(started.success, "start: {:?}", started.error);
+            let run = started.data.expect("run");
+            assert!(
+                run.get("gateExit").map(|v| v.is_null()).unwrap_or(false),
+                "a fresh run has no score: {run}"
+            );
+            run_ids.push(run.get("id").and_then(|v| v.as_str()).unwrap().to_string());
+        }
+
+        // The winner's gate passes and reports no collected count — `gateCollected` ABSENT is a
+        // normal result, not an error.
+        let scored = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[0], "gateExit": 0 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(scored.success, "gate: {:?}", scored.error);
+        let scored = scored.data.expect("scored run");
+        assert_eq!(scored.get("gateExit").and_then(|v| v.as_i64()), Some(0));
+        assert!(
+            scored.get("gateCollected").map(|v| v.is_null()).unwrap_or(false),
+            "an absent gateCollected must stay null, not become 0: {scored}"
+        );
+
+        let loser_scored = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[1], "gateExit": 1, "gateCollected": 12 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(loser_scored.success, "gate: {:?}", loser_scored.error);
+        let loser_scored = loser_scored.data.expect("loser run");
+        assert_eq!(loser_scored.get("gateExit").and_then(|v| v.as_i64()), Some(1));
+        // The advisory count must ROUND-TRIP when it is supplied. Asserting only "the call
+        // succeeded" let a renamed param key (`gateCollected` → `collected`) pass this test —
+        // measured, not imagined: that mutation was green here until this assertion was added.
+        assert_eq!(
+            loser_scored.get("gateCollected").and_then(|v| v.as_i64()),
+            Some(12),
+            "a supplied gateCollected must arrive: {loser_scored}"
+        );
+
+        let pref = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_pref",
+                json!({
+                    "winnerRunId": run_ids[0],
+                    "loserRunId": run_ids[1],
+                    "reason": "green gate"
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(pref.success, "pref: {:?}", pref.error);
+        let pref = pref.data.expect("pref");
+        assert_eq!(pref.get("comparable").and_then(|v| v.as_bool()), Some(true));
+        let pref_id = pref.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+        // Promotion without `confirmed` must be refused — the default is the safe one.
+        let unconfirmed = AgentService::handle_rpc(
+            &rpc(
+                "update_workflow_champion",
+                json!({ "runId": run_ids[0], "prefId": pref_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!unconfirmed.success, "an unconfirmed promote must fail");
+        assert!(unconfirmed
+            .error
+            .unwrap_or_default()
+            .contains("human-confirmed"));
+
+        let promoted = AgentService::handle_rpc(
+            &rpc(
+                "update_workflow_champion",
+                json!({ "runId": run_ids[0], "prefId": pref_id, "confirmed": true }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(promoted.success, "promote: {:?}", promoted.error);
+        assert_eq!(
+            promoted
+                .data
+                .expect("promoted")
+                .get("isChampion")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let search = AgentService::handle_rpc(
+            &rpc(
+                "get_workflow_search_state",
+                json!({ "repo": "johnnyone", "phaseType": "dev-phase", "family": "glm-5.3-flash" }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(search.success, "search state: {:?}", search.error);
+        let search = search.data.expect("search state");
+        assert_eq!(
+            search.get("championWorkflowId").and_then(|v| v.as_str()),
+            Some(workflow_id.as_str())
+        );
+        assert_eq!(search.get("halted").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(search.get("strikeLimit").and_then(|v| v.as_i64()), Some(3));
+
+        let runs = AgentService::handle_rpc(
+            &rpc("list_workflow_runs", json!({ "workflowId": workflow_id })),
+            &state,
+        )
+        .await;
+        assert!(runs.success);
+        assert_eq!(
+            runs.data
+                .and_then(|data| data.as_array().map(|rows| rows.len())),
+            Some(2)
+        );
+    }
+
+    /// The halt, over the relay: three rejections and the next `start_workflow_run` is refused,
+    /// with the halt visible as DATA on `get_workflow_search_state`.
+    #[tokio::test]
+    async fn handle_rpc_reports_and_enforces_the_three_strike_halt() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let workflow_id = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "repo": "johnnyone",
+                    "phaseType": "ui-phase",
+                    "family": "qwen",
+                    "role": "r",
+                    "instruction": "i",
+                    "contract": "c",
+                    "hop": "{}",
+                    "fanOut": 1
+                }),
+            ),
+            &state,
+        )
+        .await
+        .data
+        .expect("workflow")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+        for index in 1..=3 {
+            let run_id = AgentService::handle_rpc(
+                &rpc(
+                    "start_workflow_run",
+                    json!({ "workflowId": workflow_id, "seatsHeld": "{}", "fleetBusy": "{}" }),
+                ),
+                &state,
+            )
+            .await
+            .data
+            .expect("run")
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+            // A blank reason must be refused: the reasons are the point of the halt.
+            let blank = AgentService::handle_rpc(
+                &rpc(
+                    "record_workflow_rejection",
+                    json!({ "runId": run_id, "reason": "  " }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(!blank.success, "a blank rejection reason must be refused");
+
+            let rejected = AgentService::handle_rpc(
+                &rpc(
+                    "record_workflow_rejection",
+                    json!({ "runId": run_id, "reason": format!("strike {index}") }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(rejected.success, "reject: {:?}", rejected.error);
+            let search = rejected.data.expect("search state");
+            assert_eq!(
+                search.get("consecutiveRejections").and_then(|v| v.as_i64()),
+                Some(index)
+            );
+            assert_eq!(
+                search.get("halted").and_then(|v| v.as_bool()),
+                Some(index >= 3),
+                "halt state at strike {index}"
+            );
+        }
+
+        let blocked = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id, "seatsHeld": "{}", "fleetBusy": "{}" }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!blocked.success, "a halted search must refuse a new run");
+        let error = blocked.error.unwrap_or_default();
+        assert!(error.contains("is halted after 3 consecutive rejections"), "got: {error}");
+        assert!(error.contains("strike 3"), "the halt must name its reasons: {error}");
     }
 }

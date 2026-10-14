@@ -32,6 +32,7 @@ const MIGRATION_022: &str = include_str!("../../migrations/022_add_dev_stage_pro
 const MIGRATION_023: &str = include_str!("../../migrations/023_add_test_commands.sql");
 const MIGRATION_024: &str = include_str!("../../migrations/024_add_session_reports.sql");
 const MIGRATION_025: &str = include_str!("../../migrations/025_add_phase_test_commands.sql");
+const MIGRATION_026: &str = include_str!("../../migrations/026_add_workflow_arena.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -97,6 +98,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (23, "023_add_test_commands", MIGRATION_023),
         (24, "024_add_session_reports", MIGRATION_024),
         (25, "025_add_phase_test_commands", MIGRATION_025),
+        (26, "026_add_workflow_arena", MIGRATION_026),
     ];
 
     // Guard the shared version namespace. Versions are hand-assigned integers, and branches that
