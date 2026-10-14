@@ -3797,6 +3797,96 @@ mod tests {
         }
     }
 
+    /// **THE `fleet_busy` CONTRACT, pinned.** The test the rule's own doc comment cites.
+    ///
+    /// `fleet_busy` records FOREIGN contention only — what everything *else* held when the run
+    /// started, excluding the run's own seats — so an EMPTY map means the fleet was quiet.
+    ///
+    /// This exists because the producer lives on another branch
+    /// (`services::leases::LeasePool::fleet_busy_json`) and the two possible conventions are
+    /// indistinguishable in exactly one case: a pool reporting INCLUSIVE totals emits precisely
+    /// `seats_held` for a quiet fleet, which under this contract reads as "a foreign load exactly
+    /// equal to my own" and is NOT quiet. The direction is safe — a refusal, never a false
+    /// crowning — but it turns the arena into a feature that never promotes, so the mismatch has to
+    /// surface as a named failing test rather than as silence. That is this test's whole job, and
+    /// it is the first thing to read when the branches are joined.
+    ///
+    /// **It was missing.** The doc comment cited it by name from round 3 and I repeated the citation
+    /// in three reports as the guard that would catch an integration mismatch; the guard did not
+    /// exist. A comment pointing at a test that was never written is worse than no comment, because
+    /// it reads as coverage.
+    #[test]
+    fn the_fleet_busy_contract_is_foreign_contention_only() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let seats = r#"{"glm":3}"#;
+
+        // 1. EMPTY means quiet. This is what a contract-compliant pool emits on an idle fleet, and
+        //    it is the only input on which the arena can score anything at all.
+        let quiet = start_with(&state, &workflow.id, seats, "{}");
+        assert!(quiet.scoreable, "an empty snapshot is a quiet fleet");
+        assert_eq!(quiet.not_scoreable_reason, None);
+
+        // 2. ALL-ZERO means quiet too. The lease pool deliberately keeps idle families at 0 rather
+        //    than omitting them, so a quiet fleet arrives as `{"glm":0,"qwen":0}` from a pool that
+        //    enumerates every family. `parse_seat_map` drops zero entries, which is exactly why
+        //    that works — see its doc comment on erasing a distinction the pool preserves.
+        let enumerated = start_with(&state, &workflow.id, seats, r#"{"glm":0,"qwen":0}"#);
+        assert!(
+            enumerated.scoreable,
+            "a pool that enumerates idle families at zero still reports a quiet fleet"
+        );
+
+        // 3. THE MISMATCH CASE, and the reason this test exists. A snapshot equal to the run's OWN
+        //    seats is what an INCLUSIVE-totals producer emits for a quiet fleet. Under this
+        //    contract it is foreign load, so the run is unscoreable — a loud, named failure rather
+        //    than a silently wrong comparison. If this assertion starts failing because the
+        //    snapshot now excludes the caller's own lease, the contract is satisfied and this
+        //    branch of the test should be inverted.
+        let inclusive = start_with(&state, &workflow.id, seats, seats);
+        assert!(
+            !inclusive.scoreable,
+            "a snapshot equal to the run's own seats must NOT read as quiet: that is the \
+             inclusive-totals convention, and treating it as quiet would silently compare runs \
+             that contended"
+        );
+        let reason = inclusive
+            .not_scoreable_reason
+            .as_deref()
+            .expect("an unscoreable run must say why");
+        assert!(
+            reason.contains("the fleet was not quiet"),
+            "the mismatch must be legible, not a silent zero: {reason}"
+        );
+        assert!(
+            reason.contains("glm=3"),
+            "and must name the load it saw, so a human can tell a convention mismatch from real \
+             contention: {reason}"
+        );
+
+        // 4. Real foreign load is unscoreable, which is the rule working as intended rather than a
+        //    convention problem — the two look the same here on purpose, because the host cannot
+        //    tell them apart and must refuse either way.
+        let busy = start_with(&state, &workflow.id, seats, r#"{"qwen":4}"#);
+        assert!(!busy.scoreable);
+
+        // 5. And the consequence that makes the contract load-bearing: under the wrong convention
+        //    NOTHING is comparable, so nothing is ever promotable. This is the "inert feature"
+        //    failure, asserted rather than described.
+        let a = record_workflow_run_gate(&state, &inclusive.id, 0, None).expect("gate");
+        let other = start_with(&state, &workflow.id, seats, seats);
+        let b = record_workflow_run_gate(&state, &other.id, 1, None).expect("gate");
+        let pref = record_workflow_pref(&state, &a.id, &b.id, None).expect("pref");
+        assert!(
+            !pref.comparable,
+            "two runs from an inclusive-totals pool are never comparable, so the arena would \
+             promote nothing at all"
+        );
+        assert!(promote_workflow(&state, &a.id, None, true)
+            .expect_err("and nothing can be crowned")
+            .contains("cannot be scored"));
+    }
+
     /// **A DEFECT PIN of my own, in QA's style.** Until the lease pool is wired in,
     /// `measure_run_budget` reports `{}` for contention on EVERY run, so
     /// `contention_is_comparable` compares `{}` with `{}` and always answers true — comparability

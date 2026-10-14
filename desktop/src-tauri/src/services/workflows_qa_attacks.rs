@@ -586,7 +586,8 @@ fn qa_a_a_workflow_cannot_displace_the_champion_by_beating_itself() {
 ///
 /// `budgets_are_comparable` keeps its name and its meaning (the SEAT half, and these two runs do
 /// pass it). The flag that gets stored is now decided by `preference_comparability`, which also
-/// consults `contention_is_comparable`. Equality, not a tolerance — a tolerance needs a threshold
+/// consults the per-run scoreability rule (`run_is_scoreable`; the helper this sentence used to
+/// name, `contention_is_comparable`, no longer exists — the rule became exclude-not-compare)
 /// and a threshold is an opinion.
 #[test]
 fn qa_a_comparable_requires_matching_fleet_contention() {

@@ -147,8 +147,28 @@ async fn qa_a3_a_halt_arriving_during_the_gate_run_discards_the_score() {
     let (state, _root) = test_state();
     let workspace = tmp_dir("arena-r3-toctou");
     let w = workflow(&state, KEY.0, KEY.1, KEY.2);
-    // A gate slow enough to reject three runs underneath it, fast enough for a test.
-    let plan = seed_plan(&state, &workspace, Some(r#"["sleep 1"]"#));
+    // **Round 5, Dev A: the timing assumption is replaced by a SENTINEL, and the reason is a
+    // measured flake.** The fixture was `["sleep 1"]` raced against rejections at +250ms, and under
+    // full-suite load (`--test-threads=1`, 806 other tests) the rejections landed AFTER the gate's
+    // write once in two runs: the family was not halted at write time, the score landed, and the
+    // test failed — for the wrong reason, because a score landing on a family that has not halted
+    // yet is correct behaviour. Measured: 8/8 alone, 1 failure in 2 full-suite runs.
+    //
+    // The gate now BLOCKS until the rejecting side touches a file, so the three rejections are
+    // guaranteed to have committed before the gate can finish and therefore before the write. That
+    // is strictly stronger than the original: it proves the halt is read at WRITE time with no
+    // assumption about scheduling at all, which is the only thing this test is for. The wait is
+    // bounded at ~10s and exits non-zero if the sentinel never arrives, so a regression here fails
+    // loudly instead of hanging the suite.
+    let sentinel = workspace.join("rejections-committed");
+    let plan = seed_plan(
+        &state,
+        &workspace,
+        Some(&format!(
+            r#"["for _ in $(seq 1 200); do [ -f {} ] && exit 0; sleep 0.05; done; exit 1"]"#,
+            sentinel.to_string_lossy()
+        )),
+    );
     let run = start_against(&state, &w.id, Some(&plan));
     assert_eq!(run.gate_exit, None);
 
@@ -166,11 +186,19 @@ async fn qa_a3_a_halt_arriving_during_the_gate_run_discards_the_score() {
 
     let scoring = score_workflow_run(&state, &run.id, None);
     let rejecting = async {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         for (index, victim) in victims.iter().enumerate() {
             reject_workflow_run(&state, victim, &format!("mid-gate strike {index}"))
                 .expect("reject");
         }
+        // The family is halted NOW, and only now is the gate allowed to finish. Everything after
+        // this point is the write racing nothing.
+        assert!(
+            workflow_search_state(&state, KEY.0, KEY.1, KEY.2)
+                .expect("state")
+                .halted,
+            "the fixture must halt the family BEFORE releasing the gate"
+        );
+        std::fs::write(&sentinel, b"go").expect("release the gate");
     };
     let (scored, ()) = tokio::join!(scoring, rejecting);
 
