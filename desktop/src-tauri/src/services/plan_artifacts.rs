@@ -53,7 +53,7 @@ pub const RUNS_DIR: &str = "runs";
 /// unicode look-alike (`‥` U+2025, `．．` U+FF0E) traversal passes it, because to this function
 /// they are ordinary literal names — and staying literal names is exactly what makes them
 /// harmless: the host joins these bytes straight onto the plan dir, where `%2e%2e` is a directory
-/// *called* `%2e%2e`. The canonicalisation in [`confine_to_plan`] does **not** make this moot; it
+/// *called* `%2e%2e`. The canonicalisation in `confine_to_plan` does **not** make this moot; it
 /// closes real symlink and `..` escapes, and an encoded segment was never one.
 ///
 /// What it depends on is that **nothing between this guard and the filesystem URL-decodes the
@@ -133,8 +133,9 @@ pub fn phase_run_artifacts_dir(plan_path: &Path, phase_id: &str, run_id: &str) -
 /// there, and the path this module returns still *looks* confined — which is what made it
 /// invisible. QA pinned exactly that escape.
 ///
-/// Deliberately NOT a second confinement rule: [`settings::resolve_within_root`] already
-/// canonicalises the deepest existing ancestor (so a not-yet-created target is still checked
+/// Deliberately NOT a second confinement rule: [`crate::services::settings::resolve_within_root`]
+/// already canonicalises the deepest existing ancestor (so a not-yet-created target is still
+/// checked
 /// *before* anything is made), rejects `..` components, and is what the report-markdown guard
 /// uses. Reusing it is the point — two confinement rules in one codebase drift, and this one
 /// would be the junior copy.
@@ -400,7 +401,7 @@ fn artifacts_state(plan_path: &Path, rel: &str, ignore_scaffolding: bool) -> Art
     }
 }
 
-/// [`artifacts_state`] for the directory a phase's reader would actually use, run-scoped first.
+/// `artifacts_state` for the directory a phase's reader would actually use, run-scoped first.
 ///
 /// **This is the reader to call.** It can tell `Absent` from `Unreadable` from `Escaped` from
 /// `NotADirectory` from `Unaddressable`, and so can refuse to conclude "this phase delivered no
