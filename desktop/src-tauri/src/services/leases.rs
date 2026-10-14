@@ -1725,3 +1725,287 @@ mod qa_b_r2_tests {
         assert_eq!(pool.busy_for("glm-5.3-flash"), 0);
     }
 }
+
+/// QA B round 3 — attacking the merge semantics, the note taxonomy, and the strong test shape.
+#[cfg(test)]
+mod qa_b_r3_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Barrier;
+
+    fn notes(raw: &str) -> Vec<CapNote> {
+        SeatCaps::from_override_json(raw).expect(raw).1
+    }
+    fn caps_of(raw: &str) -> SeatCaps {
+        SeatCaps::from_override_json(raw).expect(raw).0
+    }
+
+    // ── the merge, and the cost that was ruled acceptable ─────────────────────────────────────
+
+    /// A partial override MERGES over the measured table, and the stated cost is real: the two
+    /// families the operator did not mention keep their measured caps and stay leasable.
+    ///
+    /// This is the round-2 finding's agreed resolution, pinned so the cost is visible in the
+    /// suite rather than only in a commit message: a fleet that genuinely lacks `deepseek` will
+    /// be told it has two seats there.
+    #[test]
+    fn qa_a_partial_override_merges_and_keeps_the_unmentioned_families() {
+        let caps = caps_of(r#"{"glm-5.3-flash": 6}"#);
+        assert_eq!(caps.cap("glm-5.3-flash"), Some(6), "the override wins where it speaks");
+        assert_eq!(caps.cap("deepseek-v4.1-flash"), Some(2), "measured, kept — the stated cost");
+        assert_eq!(caps.cap("qwen3.8-flash-next"), Some(4));
+        assert_eq!(caps.families().count(), 3);
+
+        // The round-2 finding is closed: the snapshot keeps all three rows.
+        let pool = Arc::new(LeasePool::new(caps));
+        assert_eq!(
+            pool.fleet_busy_json(),
+            r#"{"deepseek-v4.1-flash":0,"glm-5.3-flash":0,"qwen3.8-flash-next":0}"#
+        );
+        assert!(pool.acquire("deepseek-v4.1-flash", 2).is_ok());
+    }
+
+    /// The all-zero refusal runs on the override AS WRITTEN, before the merge.
+    ///
+    /// This is the ordering that matters: under merge semantics an all-zero override would merge
+    /// to exactly the measured table and look like success, so the guard has to see the raw
+    /// object. Checked through `from_override_json`, not only through `from_json`.
+    #[test]
+    fn qa_the_all_zero_refusal_runs_before_the_merge() {
+        for raw in [
+            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}"#,
+            r#"{"glm-5.3-flash":0}"#,
+            r#"{"local-7b":0}"#,
+            "{}",
+        ] {
+            let err = SeatCaps::from_override_json(raw).expect_err(raw);
+            assert!(
+                err.contains("set to zero") || err == "seat caps object is empty",
+                "{raw} -> {err}"
+            );
+        }
+        // And it is not merely `from_json` being called first by accident: the merged result for
+        // an all-zero override WOULD have been the measured table, i.e. indistinguishable from
+        // success. This is what the ordering prevents.
+        assert!(SeatCaps::from_override_json(
+            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}"#
+        )
+        .is_err());
+    }
+
+    /// FINDING. The all-zero refusal and the `ZeroIgnored` note disagree about what a zero means,
+    /// so the same intent gets two different outcomes depending on whether another key is present.
+    ///
+    /// `{"glm-5.3-flash":0}` is REFUSED outright (the host falls back to the measured table).
+    /// `{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}` is ACCEPTED, glm keeps its measured 4, and a
+    /// `ZeroIgnored` note is emitted. Both end with glm at 4, by different routes and with
+    /// different diagnostics — and only one of them tells the operator that zero does not disable
+    /// a family. Under merge semantics the all-zero case is no longer dangerous (it merges to the
+    /// measured table), so the refusal is now stricter than it needs to be and inconsistent with
+    /// the note beside it.
+    #[test]
+    fn qa_documents_zero_is_refused_alone_but_noted_in_company() {
+        // Alone: refused.
+        assert!(SeatCaps::from_override_json(r#"{"glm-5.3-flash":0}"#).is_err());
+        // In company: accepted, glm at its MEASURED value, with a note.
+        let (caps, ns) = SeatCaps::from_override_json(
+            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}"#,
+        )
+        .expect("accepted once another key is present");
+        assert_eq!(caps.cap("glm-5.3-flash"), Some(4), "zero did not disable it");
+        assert!(ns.contains(&CapNote::ZeroIgnored {
+            family: "glm-5.3-flash".to_string()
+        }));
+    }
+
+    /// FINDING. `ZeroIgnored`'s message is false for a family that was never measured: it says
+    /// "the measured cap is kept" when there is no measured cap to keep.
+    ///
+    /// And because the zero branch `continue`s before the unmeasured-family check, such a key
+    /// gets NO `UnmeasuredFamily` note either — so the one note the operator receives is the one
+    /// that misinforms them.
+    #[test]
+    fn qa_documents_zero_ignored_misinforms_for_an_unmeasured_family() {
+        let (caps, ns) = SeatCaps::from_override_json(r#"{"local-7b":0,"glm-5.3-flash":4}"#)
+            .expect("accepted");
+        // Nothing is "kept": the family simply is not there.
+        assert_eq!(caps.cap("local-7b"), None);
+        let zero = ns
+            .iter()
+            .find(|n| matches!(n, CapNote::ZeroIgnored { family } if family == "local-7b"))
+            .expect("a ZeroIgnored note is emitted for it");
+        let shown = zero.to_string();
+        assert!(
+            shown.contains("the measured cap is kept"),
+            "the wording under test: {shown}"
+        );
+        // ...which is untrue for this family, and no second note corrects it.
+        assert!(
+            !ns.iter().any(|n| matches!(n, CapNote::UnmeasuredFamily { family } if family == "local-7b")),
+            "an unmeasured ZERO family gets no UnmeasuredFamily note, because the zero branch \
+             returns first — so the only note it gets is the misleading one"
+        );
+    }
+
+    /// The note taxonomy, over every shape QA could construct.
+    #[test]
+    fn qa_the_note_taxonomy_is_complete_for_every_override_shape() {
+        // Equal to measured: nothing to say.
+        assert!(notes(r#"{"glm-5.3-flash":4}"#).is_empty());
+        // Below measured: the operator's explicit intent, nothing to say.
+        assert!(notes(r#"{"glm-5.3-flash":1}"#).is_empty());
+        // Above measured: one note, all three numbers.
+        assert_eq!(
+            notes(r#"{"glm-5.3-flash":40}"#),
+            vec![CapNote::AboveMeasured {
+                family: "glm-5.3-flash".to_string(),
+                configured: 40,
+                measured: 4
+            }]
+        );
+        // A new family nobody measured: accepted, and said so.
+        assert_eq!(
+            notes(r#"{"local-7b":8,"glm-5.3-flash":4}"#),
+            vec![CapNote::UnmeasuredFamily { family: "local-7b".to_string() }]
+        );
+        // A case typo: named as such, and the note says what actually happened.
+        let case = notes(r#"{"GLM-5.3-Flash":40,"glm-5.3-flash":4}"#);
+        assert!(case.contains(&CapNote::CaseMismatch {
+            configured: "GLM-5.3-Flash".to_string(),
+            measured: "glm-5.3-flash".to_string()
+        }));
+        let shown = case.iter().find(|n| matches!(n, CapNote::CaseMismatch { .. })).unwrap().to_string();
+        assert!(shown.contains("did NOT change that family's cap"), "{shown}");
+        // The case-variant key really is a FOURTH family, as the note says.
+        let c = caps_of(r#"{"GLM-5.3-Flash":40,"glm-5.3-flash":4}"#);
+        assert_eq!(c.cap("GLM-5.3-Flash"), Some(40));
+        assert_eq!(c.cap("glm-5.3-flash"), Some(4));
+        assert_eq!(c.families().count(), 4);
+        // Every note's Display is non-empty and names its family.
+        for raw in [
+            r#"{"glm-5.3-flash":40}"#,
+            r#"{"local-7b":8,"glm-5.3-flash":4}"#,
+            r#"{"GLM-5.3-Flash":40,"glm-5.3-flash":4}"#,
+            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}"#,
+        ] {
+            for n in notes(raw) {
+                let s = n.to_string();
+                assert!(s.len() > 40, "a note must explain itself: {s}");
+            }
+        }
+    }
+
+    /// FINDING (gap in the taxonomy). A key that differs from a measured family only by
+    /// SURROUNDING WHITESPACE gets the generic `UnmeasuredFamily` note, not the specific
+    /// `CaseMismatch`-style one — although it is the same class of hand-edit typo and at least as
+    /// likely in JSON, and it silently adds a fourth family whose cap does nothing.
+    #[test]
+    fn qa_documents_a_whitespace_typo_gets_only_the_generic_note() {
+        let (caps, ns) = SeatCaps::from_override_json(r#"{" glm-5.3-flash":40,"qwen3.8-flash-next":4}"#)
+            .expect("accepted");
+        assert_eq!(caps.cap(" glm-5.3-flash"), Some(40), "a fourth family, with a space");
+        assert_eq!(caps.cap("glm-5.3-flash"), Some(4), "the real one is untouched");
+        assert_eq!(
+            ns,
+            vec![CapNote::UnmeasuredFamily { family: " glm-5.3-flash".to_string() }],
+            "only the generic note — nothing points at the family it was obviously meant to be"
+        );
+        // A trailing newline behaves the same way.
+        assert_eq!(
+            notes("{\"glm-5.3-flash\\n\":40,\"qwen3.8-flash-next\":4}"),
+            vec![CapNote::UnmeasuredFamily { family: "glm-5.3-flash\n".to_string() }]
+        );
+    }
+
+    // ── item 5: does the strong shape really rule out pooling? ───────────────────────────────
+
+    /// The third failure shape QA could find that BOTH cap tests miss: more than one lease held
+    /// per thread, at different widths, concurrently.
+    ///
+    /// Both existing tests take exactly one 1-seat lease per thread, so a `Drop` that decrements
+    /// by the wrong amount when two leases of different sizes coexist on one family is invisible
+    /// to them — single-threaded `acquire_then_release_restores_the_previous_count` is the only
+    /// cover, and it is not concurrent. Here each thread holds a 1-seat AND a 2-seat lease on the
+    /// same family, so the per-family total must be exact at every moment and zero at the end.
+    #[test]
+    fn qa_two_leases_of_different_widths_per_thread_stay_exact() {
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 300;
+        let pool = Arc::new(LeasePool::new(
+            SeatCaps::from_json(r#"{"glm-5.3-flash": 9}"#).unwrap(),
+        ));
+        let start = Arc::new(Barrier::new(THREADS));
+        let over = Arc::new(AtomicU32::new(0));
+        let both = Arc::new(AtomicU32::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let start = Arc::clone(&start);
+                let over = Arc::clone(&over);
+                let both = Arc::clone(&both);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..ROUNDS {
+                        // Record only; nothing here panics.
+                        let a = pool.acquire("glm-5.3-flash", 1);
+                        let b = pool.acquire("glm-5.3-flash", 2);
+                        if a.is_ok() && b.is_ok() {
+                            both.fetch_add(1, Ordering::SeqCst);
+                        }
+                        over.fetch_max(pool.busy_for("glm-5.3-flash"), Ordering::SeqCst);
+                        // Dropped in the opposite order to acquisition, which is where a
+                        // width-confused release would show up.
+                        drop(a);
+                        drop(b);
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("no worker may panic");
+        }
+        assert!(
+            over.load(Ordering::SeqCst) <= 9,
+            "seats in use reached {} against a cap of 9",
+            over.load(Ordering::SeqCst)
+        );
+        // Non-vacuity: threads really did hold two leases at once, many times.
+        assert!(
+            both.load(Ordering::SeqCst) > THREADS as u32,
+            "only {} rounds held both leases — the test measured nothing",
+            both.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            pool.busy_for("glm-5.3-flash"),
+            0,
+            "a release of the wrong width leaves the count non-zero"
+        );
+        // And the cap is still exactly enforceable afterwards.
+        let all = pool.acquire("glm-5.3-flash", 9).expect("the whole cap must be free again");
+        assert_eq!(all.seats(), 9);
+        assert!(pool.acquire("glm-5.3-flash", 1).is_err());
+    }
+
+    /// Neither cap test can see starvation, and that is the honest limit of the shape.
+    ///
+    /// Both hold a barrier and request equal widths, so "who got the seats" is never asked. With
+    /// no queue in the pool (documented), a wide request can be refused indefinitely while narrow
+    /// ones succeed — pinned here as a property of the design rather than a bug, so that
+    /// `won == cap` is not read as covering fairness.
+    #[test]
+    fn qa_documents_the_cap_tests_cannot_see_starvation() {
+        let pool = LeasePool::with_measured_caps();
+        let _narrow: Vec<_> = (0..4).map(|_| pool.acquire("glm-5.3-flash", 1).unwrap()).collect();
+        // A 4-seat request can never be satisfied while four 1-seat holders cycle, and nothing
+        // in the pool records that it was asked, let alone orders it first.
+        for _ in 0..50 {
+            assert!(matches!(
+                pool.acquire("glm-5.3-flash", 4),
+                Err(SeatError::OverCap { free: 0, .. })
+            ));
+        }
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 4);
+    }
+}

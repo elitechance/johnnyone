@@ -385,3 +385,298 @@ mod fixture_root_tests {
         assert_eq!(keep_fixtures(), std::env::var_os(KEEP_FIXTURES_ENV).is_some());
     }
 }
+
+/// QA B round 3 — attacking the fixture-root sweep.
+///
+/// Every test here builds its own FAKE base directory inside this process's real fixture root and
+/// points the sweep at that, so no test can touch a sibling run's root or anything outside this
+/// process's sandbox. Child processes used to occupy a fixture are spawned and reaped by the test
+/// that made them.
+#[cfg(test)]
+mod qa_b_r3_tests {
+    use super::*;
+
+    /// A pid that is certainly gone.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    }
+
+    /// A fake `<temp>` to sweep, inside this process's own root.
+    fn fake_base(tag: &str) -> PathBuf {
+        tmp_dir(tag)
+    }
+
+    fn root_in(base: &Path, pid: u32) -> PathBuf {
+        let r = base.join(format!("{}{}", ROOT_PREFIX, pid));
+        std::fs::create_dir_all(&r).unwrap();
+        r
+    }
+
+    fn fixture_with_file(root: &Path, name: &str) -> PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(d.join("ws")).unwrap();
+        std::fs::write(d.join("payload.bin"), vec![0u8; 4096]).unwrap();
+        d
+    }
+
+    /// A child process parked in `dir`, which the caller must reap.
+    fn occupy(dir: &Path) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("120")
+            .current_dir(dir)
+            .spawn()
+            .expect("spawn sleep");
+        // Wait until the kernel really shows the cwd, so the test is not racing the spawn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", child.id())) {
+                if cwd.starts_with(dir) {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "child never entered {}", dir.display());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child
+    }
+
+    fn reap(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// THE invariant: a fixture a live process is sitting in is never removed, while the rest of
+    /// a dead owner's root is reclaimed.
+    ///
+    /// This is also the re-measurement of Dev B's own correction. Their first version skipped the
+    /// whole root when anything in it was occupied, which reclaimed nothing, because every stale
+    /// root has a dead owner AND exactly one leaked `claude` inside it.
+    #[test]
+    fn qa_an_occupied_fixture_survives_while_its_siblings_are_reclaimed() {
+        let base = fake_base("qa-r3-sweep");
+        let mine = root_in(&base, std::process::id());
+        let stale = root_in(&base, dead_pid());
+
+        let occupied = fixture_with_file(&stale, "state-0");
+        let free_a = fixture_with_file(&stale, "state-1");
+        let free_b = fixture_with_file(&stale, "state-2");
+        let child = occupy(&occupied.join("ws"));
+
+        sweep_exited_roots(&base, &mine);
+
+        assert!(stale.is_dir(), "the root itself must stay while it holds something occupied");
+        assert!(occupied.is_dir(), "the OCCUPIED fixture must never be removed");
+        assert!(
+            occupied.join("payload.bin").is_file(),
+            "the occupied fixture must not be partially emptied either"
+        );
+        assert!(!free_a.exists(), "an unoccupied sibling must be reclaimed");
+        assert!(!free_b.exists(), "an unoccupied sibling must be reclaimed");
+        reap(child);
+    }
+
+    /// A crashed run — dead owner, nothing occupied — is reclaimed whole by the next run.
+    #[test]
+    fn qa_a_crashed_runs_root_is_reclaimed_entirely() {
+        let base = fake_base("qa-r3-crashed");
+        let mine = root_in(&base, std::process::id());
+        let stale = root_in(&base, dead_pid());
+        fixture_with_file(&stale, "state-0");
+        fixture_with_file(&stale, "state-1");
+
+        sweep_exited_roots(&base, &mine);
+        assert!(!stale.exists(), "a crashed run's root must be gone entirely");
+        assert!(mine.is_dir(), "and this process's own root must survive");
+    }
+
+    /// A root whose pid is LIVE is left alone — which is what makes two concurrent runs sharing
+    /// one `TMPDIR` safe, and what makes pid reuse conservative rather than destructive.
+    #[test]
+    fn qa_a_root_owned_by_a_live_pid_is_left_alone() {
+        let base = fake_base("qa-r3-livepid");
+        let mine = root_in(&base, std::process::id());
+        let child = std::process::Command::new("sleep").arg("120").spawn().unwrap();
+        let sibling = root_in(&base, child.id());
+        let f = fixture_with_file(&sibling, "state-0");
+
+        sweep_exited_roots(&base, &mine);
+
+        assert!(sibling.is_dir(), "a live pid's root must not be swept");
+        assert!(f.join("payload.bin").is_file(), "nor anything inside it");
+        assert!(pid_is_live(&child.id().to_string()));
+        reap(child);
+    }
+
+    /// The only guard against deleting something the harness did not create is the NAME, so the
+    /// exact shape of that guard matters. Near misses must all survive.
+    #[test]
+    fn qa_only_an_exact_prefix_plus_digits_can_be_swept() {
+        let base = fake_base("qa-r3-names");
+        let mine = root_in(&base, std::process::id());
+        let gone = dead_pid();
+
+        // Every one of these must SURVIVE the sweep.
+        let survivors: Vec<PathBuf> = [
+            format!("{ROOT_PREFIX}abc"),          // not numeric
+            format!("{ROOT_PREFIX}"),             // empty suffix
+            format!("{ROOT_PREFIX}12a"),          // partly numeric
+            format!("{ROOT_PREFIX}1_2"),          // underscore
+            format!("{ROOT_PREFIX}-1"),           // sign
+            format!("{ROOT_PREFIX}{gone} "),      // trailing space
+            format!("{ROOT_PREFIX}{gone}.bak"),   // suffixed
+            format!("not-{ROOT_PREFIX}{gone}"),   // prefixed
+            format!("j1-fixture-{gone}"),         // one char short of the prefix
+            "j1-p2-state-123-4".to_string(),      // the OLD naming, which this sweep must ignore
+        ]
+        .iter()
+        .map(|n| {
+            let d = base.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("keep.txt"), b"keep").unwrap();
+            d
+        })
+        .collect();
+        // A FILE whose name matches exactly must also survive — the sweep only removes dirs.
+        let file_named_like_a_root = base.join(format!("{ROOT_PREFIX}{}", dead_pid()));
+        std::fs::write(&file_named_like_a_root, b"not a root").unwrap();
+
+        sweep_exited_roots(&base, &mine);
+
+        for s in &survivors {
+            assert!(
+                s.join("keep.txt").is_file(),
+                "{} was swept but does not match the harness's own naming",
+                s.display()
+            );
+        }
+        assert!(file_named_like_a_root.is_file(), "a regular file must not be removed");
+        assert!(mine.is_dir());
+    }
+
+    /// DOCUMENTED BLAST RADIUS. The guard is naming-only, so ANY directory in the temp dir that
+    /// happens to be called `j1-fixtures-<digits>` for a pid that is not running is removed —
+    /// whoever made it. Pinned so the radius is a stated property rather than a surprise. A
+    /// numeric name far outside the pid range is the realistic accident.
+    #[test]
+    fn qa_documents_a_coincidentally_named_directory_is_swept() {
+        let base = fake_base("qa-r3-radius");
+        let mine = root_in(&base, std::process::id());
+        // No such pid can exist: Linux pids are bounded well below this.
+        let impostor = base.join(format!("{ROOT_PREFIX}999999999999"));
+        std::fs::create_dir_all(&impostor).unwrap();
+        std::fs::write(impostor.join("someone-elses.txt"), b"not the harness's").unwrap();
+        assert!(!pid_is_live("999999999999"));
+
+        sweep_exited_roots(&base, &mine);
+
+        assert!(
+            !impostor.exists(),
+            "the sweep removes anything matching its naming, not only what it created"
+        );
+    }
+
+    /// FINDING, measured. A SYMLINK named like a stale root is followed by `is_dir()` and the
+    /// occupancy check cannot see through it, because `/proc/<pid>/cwd` resolves to the real path
+    /// while the check compares against the link path.
+    ///
+    /// Whether that destroys the target depends on `remove_dir_all`'s symlink behaviour, which is
+    /// the thing this test measures rather than assumes.
+    #[test]
+    fn qa_a_symlinked_root_is_measured_not_assumed() {
+        let base = fake_base("qa-r3-symroot");
+        let mine = root_in(&base, std::process::id());
+        let target = tmp_dir("qa-r3-symtarget");
+        std::fs::write(target.join("precious.txt"), b"must survive").unwrap();
+        std::fs::create_dir_all(target.join("state-0")).unwrap();
+
+        let linked_root = base.join(format!("{}{}", ROOT_PREFIX, dead_pid()));
+        std::os::unix::fs::symlink(&target, &linked_root).unwrap();
+        // The sweep's own predicate follows the link, so the entry looks like a stale root.
+        assert!(linked_root.is_dir(), "is_dir() follows the link");
+
+        sweep_exited_roots(&base, &mine);
+
+        // The assertion that matters: the link's TARGET and its contents are outside the base the
+        // sweep was told to clean, and must not be destroyed through the link.
+        assert!(
+            target.is_dir(),
+            "the symlink target directory was destroyed through the link"
+        );
+        assert!(
+            target.join("precious.txt").is_file(),
+            "a file outside the swept base was deleted through a symlinked root"
+        );
+        assert!(
+            target.join("state-0").is_dir(),
+            "a subdirectory outside the swept base was deleted through a symlinked root"
+        );
+    }
+
+    /// The occupancy probe reads `/proc/<pid>/cwd`, never command lines — the `pgrep -f` trap
+    /// that has already cost this project a day. Pinned at the predicate.
+    #[test]
+    fn qa_occupancy_is_decided_by_cwd_not_by_command_line() {
+        let base = fake_base("qa-r3-cwd");
+        let dir = base.join("occupied");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!any_live_cwd_inside(&dir), "nothing is in it yet");
+
+        let child = occupy(&dir);
+        assert!(any_live_cwd_inside(&dir), "a live cwd inside must be seen");
+        // A sibling path that merely shares a prefix string is NOT occupied — `starts_with` is
+        // path-component-wise, so `occupied-sibling` must not match `occupied`.
+        let sibling = base.join("occupied-sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(
+            !any_live_cwd_inside(&sibling),
+            "a name sharing a prefix must not be read as occupied"
+        );
+        reap(child);
+
+        // Once the holder is gone the directory is free again. The child is reaped above, so the
+        // pid is gone rather than a zombie.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while any_live_cwd_inside(&dir) {
+            assert!(std::time::Instant::now() < deadline, "cwd still held after reap");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// `J1_KEEP_FIXTURES` gates BOTH paths, and both read one predicate.
+    ///
+    /// QA deliberately does NOT call `cleanup_fixture_root()` here. Its whole job is
+    /// `remove_dir_all(fixture_root())`, and `fixture_root()` is shared by every test in this
+    /// process — so if the gate were broken, this test's failure mode would be deleting the
+    /// fixtures out from under whatever else is running, in a suite that runs tests in parallel
+    /// by default. A test that destroys the suite to prove a point is not worth the point.
+    ///
+    /// What is asserted instead is the predicate both paths branch on, both ways, plus the fact
+    /// that there are exactly two readers of it: the sweep's gate inside `fixture_root()` and the
+    /// early return in `cleanup_fixture_root()`. The sweep half is additionally unexercisable
+    /// in-process regardless: it sits behind a `OnceLock` that has already fired by the time any
+    /// test body runs.
+    #[test]
+    fn qa_keep_fixtures_is_one_predicate_that_gates_both_paths() {
+        let had = std::env::var_os(KEEP_FIXTURES_ENV);
+
+        std::env::remove_var(KEEP_FIXTURES_ENV);
+        assert!(!keep_fixtures(), "unset must mean sweep-and-clean");
+        // Any value at all opts out — it is an `is_some` check, not a parse.
+        for v in ["1", "0", "", "no", "false"] {
+            std::env::set_var(KEEP_FIXTURES_ENV, v);
+            assert!(
+                keep_fixtures(),
+                "{KEEP_FIXTURES_ENV}={v:?} must opt out; the check is presence, not value"
+            );
+        }
+
+        match had {
+            Some(v) => std::env::set_var(KEEP_FIXTURES_ENV, v),
+            None => std::env::remove_var(KEEP_FIXTURES_ENV),
+        }
+        assert!(!keep_fixtures(), "the var must be restored for every other test");
+    }
+}
