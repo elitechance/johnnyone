@@ -612,8 +612,17 @@ type Workflow {
   # hop tuned around one context window does not transfer to another, and treating the model as
   # environment is how a champion gets promoted that is worse everywhere it is actually used.
   family: String!
+  # NOTE on Float. Every numeric field in this feature is `Float`, not `Int`, and that is
+  # deliberate: GraphQL `Int` is 32-bit, and an `Int!` that cannot serialise does not degrade to a
+  # bad value — the null propagates up every non-null link to the RESPONSE ROOT, so the client gets
+  # `data: null` and loses every other field in the same document too. This project has already
+  # shipped that outage: one AI session's token count passed 2^31-1 and `listAiSessions` returned
+  # null, which emptied the terminal tab bar on every device with nothing saying why. The fix there
+  # was Int! -> Float!, and this follows it. The host additionally BOUNDS what is genuinely bounded
+  # (fanOut, seed, gateExit); gateCollected is advisory and deliberately unbounded, which is exactly
+  # why it must not sit on a 32-bit field.
   # Monotonic WITHIN (repo, phaseType, family), starting at 1. Independent across families.
-  version: Int!
+  version: Float!
   # Lineage. Always within the same (repo, phaseType, family) — the host refuses a cross-family
   # parent.
   parentId: String
@@ -623,8 +632,8 @@ type Workflow {
   # JSON: steps, parallel groups, returns. Served as the stored string; the host validates that it
   # IS JSON on write but deliberately does not model its shape.
   hop: String!
-  # Seat cost, bounded by the fleet. At least 1.
-  fanOut: Int!
+  # Seat cost, bounded by the fleet: at least 1 and at most the host's MAX_FAN_OUT.
+  fanOut: Float!
   # Exactly one workflow per (repo, phaseType, family) can be true, enforced by a PARTIAL unique
   # index in the database, not only by the service.
   isChampion: Boolean!
@@ -637,19 +646,23 @@ type WorkflowRun {
   workflowId: String!
   # The Initiative this run executed as, if any. Set to null if that plan is later deleted.
   planId: String
-  # Replay index.
-  seed: Int!
+  # Replay index. Bounded by the host's MAX_SEED.
+  seed: Float!
   # THE SCORE, and the only one. Zero means the gate passed. NULL means the gate never ran, which
   # is NOT a pass — `updateWorkflowChampion` refuses it. There is deliberately no numeric quality
   # score anywhere in this feature: a score needs a scale, a writer and an interpreter, and each is
   # a place for a false pass to hide.
-  gateExit: Int
+  gateExit: Float
   # How many tests the gate reported. ADVISORY AND NULLABLE, and null is NOT an error: a gate that
   # prints nothing a parser recognises (a lint, a build, a bespoke script) is a perfectly
   # legitimate gate with a perfectly well-known exit code. Never gate on it, never rank on it. Its
   # one job is to let a human notice a suite that collects NOTHING — such a suite exits 0 and
   # scores every workflow identically, so the search would follow pure noise unreported.
-  gateCollected: Int
+  # DELIBERATELY UNBOUNDED on the host, and therefore `Float`: refusing a real gate result because
+  # an advisory count was large would be the wrong trade, and on a 32-bit field an over-range count
+  # would arrive as `null` — which this field already defines as "nothing was parseable", the
+  # inverse claim, delivered silently.
+  gateCollected: Float
   # JSON object, model → seats. The seat budget this run held; the comparability rule reads this.
   seatsHeld: String!
   # JSON object: fleet contention when the run started. Two concurrent runs contend, there is no
@@ -678,12 +691,16 @@ type WorkflowSearchState {
   repo: String!
   phaseType: String!
   family: String!
-  # Rejections since the last promotion in this family, counted from the end of the decision log.
-  consecutiveRejections: Int!
+  # DISTINCT runs refused since the last `resume` in this family, counted from the end of the
+  # decision log. Distinct RUNS, not rejection rows: a retried call or a double-submitting button
+  # used to halt a search on one human verdict.
+  consecutiveRejections: Float!
   # consecutiveRejections >= strikeLimit. While true the host REFUSES to start another run in this
-  # family; the way out is a promotion, which resets the streak.
+  # family AND refuses to promote one. The only way out is `updateWorkflowSearchResumed`: an
+  # explicit, human-confirmed decision carrying a reason. A promotion used to clear a halt, which
+  # made the halt escapable with no new evidence at all.
   halted: Boolean!
-  strikeLimit: Int!
+  strikeLimit: Float!
   # The trailing rejections' reasons, newest first — the one thing a halted search owes a human.
   recentRejections: [String!]!
   championWorkflowId: String
@@ -743,6 +760,14 @@ type Query {
   # A missing workflow is an ERROR here, not an empty list: "no runs yet" and "no such workflow"
   # are different answers and an empty arena cannot tell them apart.
   workflowRuns(workflowId: ID!): [WorkflowRun!]!
+  # Every preference involving this workflow's runs, as winner or loser, newest first.
+  #
+  # There was no way to read a preference back at all, so a client that recorded one and reloaded
+  # could not recover the `prefId` that updateWorkflowChampion requires — the only route forward was
+  # to record it again, which duplicated rows in the table the design calls the project-level
+  # measurement. recordWorkflowPref is idempotent per ordered pair now, and this is the other half:
+  # discovering an existing preference no longer requires issuing a write.
+  workflowPrefs(workflowId: ID!): [WorkflowPref!]!
   workflowSearchState(repo: String!, phaseType: String!, family: String!): WorkflowSearchState!
 }
 
@@ -807,14 +832,35 @@ type Mutation {
   addInitiativeReferencePath(initiativeId: ID!, path: String!): AgentPlanRun!
   # --- The workflow arena (desktop migration 026) ---
   # A new version is never born champion; becoming one is updateWorkflowChampion's job.
-  createWorkflowVersion(repo: String!, phaseType: String!, family: String!, parentId: String, role: String!, instruction: String!, contract: String!, hop: String!, fanOut: Int!): Workflow!
+  createWorkflowVersion(repo: String!, phaseType: String!, family: String!, parentId: String, role: String!, instruction: String!, contract: String!, hop: String!, fanOut: Float!): Workflow!
   # REFUSED while the family's search is halted — that is what "three consecutive rejections halt
   # the search" means operationally.
-  startWorkflowRun(workflowId: ID!, planId: String, seed: Int, seatsHeld: String!, fleetBusy: String!): WorkflowRun!
+  #
+  # `seatsHeld` and `fleetBusy` are NOT arguments, and used to be. The caller is a browser, which
+  # can measure neither: the UI was sending the declared budget and an EMPTY contention map, which
+  # reduced `comparable` to "did two clients type the same numbers" — the exact failure those two
+  # columns exist to prevent. The HOST takes both snapshots now
+  # (`services::workflows::measure_run_budget`, whose intended source is the lease pool).
+  #
+  # `seats` optionally overrides the workflow's own `fanOut`. The model family is never an argument:
+  # it is the workflow's, read from the workflow row.
+  startWorkflowRun(workflowId: ID!, planId: String, seed: Float, seats: Float): WorkflowRun!
   # `gateExit` is NON-NULL: it is the score, and a missing score must be an error rather than a 0
   # that reads as a pass. `gateCollected` is advisory and omitting it is a NORMAL result.
-  recordWorkflowRunGate(runId: ID!, gateExit: Int!, gateCollected: Int): WorkflowRun!
+  #
+  # `rescore` defaults to FALSE and a second result for a run is REFUSED without it. This was an
+  # unconditional overwrite: a second call silently replaced a green score with a red one and erased
+  # the advisory count, leaving only `endedAt` to say it had happened twice, so a promoted
+  # champion's own run could be re-scored red after the fact. The run a SITTING CHAMPION was
+  # promoted on is refused even with `rescore: true` — editing the evidence under a promotion that
+  # already happened is falsification, not correction.
+  recordWorkflowRunGate(runId: ID!, gateExit: Float!, gateCollected: Float, rescore: Boolean): WorkflowRun!
   # There is deliberately no `comparable` argument — see WorkflowPref.comparable.
+  #
+  # IDEMPOTENT per ordered pair: calling it again for the same (winner, loser) returns the EXISTING
+  # preference instead of inserting a second one. If the second call carries a different `reason`,
+  # the first reason wins and the stored row comes back unchanged — a recorded outcome is not
+  # editable, and erroring would turn a page reload into a failure.
   recordWorkflowPref(winnerRunId: ID!, loserRunId: ID!, reason: String): WorkflowPref!
   # PROMOTE: make this run's workflow the one champion of its (repo, phaseType, family), demoting
   # the incumbent in the SAME host transaction.
@@ -832,6 +878,17 @@ type Mutation {
   # three consecutive rejections halt the search and the reasons are all a halted search has to
   # show. Returns the resulting search state so the halt is data the caller already holds.
   recordWorkflowRejection(runId: ID!, reason: String!): WorkflowSearchState!
+  # RESUME: lift a halt. The ONLY thing that resets the rejection streak.
+  #
+  # It exists because a PROMOTION used to be what cleared a halt, and that made the halt escapable
+  # with no new evidence: re-promoting the sitting champion was a row-level no-op that still
+  # appended a decision and reset the count, and promoting the very run a human had rejected three
+  # times overturned the search's own refusal using the operation it was refusing.
+  #
+  # `reason` and `confirmed` are both non-null: continuing past a halt is the decision a reader will
+  # most want explained, and it must not be something a client reaches by forgetting an argument.
+  # Refused when the family is NOT halted — a resume with nothing to resume is a free streak reset.
+  updateWorkflowSearchResumed(repo: String!, phaseType: String!, family: String!, reason: String!, confirmed: Boolean!): WorkflowSearchState!
 }
 
 # --- Subscriptions ---

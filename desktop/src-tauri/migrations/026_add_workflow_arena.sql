@@ -89,10 +89,9 @@ CREATE TABLE workflow_prefs (
 -- The human's decisions, in order. NOT in plans/johnnyone/mass/schema.md — see the deviation note
 -- below.
 --
--- Why a fourth table was needed. The arena has one human-confirmed step (promote) and one human
--- refusal (reject), and "THREE CONSECUTIVE REJECTIONS FOR THE SAME (repo, phase_type, family) HALT
--- THE SEARCH" is a requirement about the ORDER of those two events. The three tables above cannot
--- express it:
+-- Why a fourth table was needed. The arena has three human decisions — promote, reject and resume
+-- — and "THREE CONSECUTIVE REJECTIONS FOR THE SAME (repo, phase_type, family) HALT THE SEARCH" is
+-- a requirement about the ORDER of them. The three tables above cannot express it:
 --   * `workflow_prefs` has a `reason`, but a rejection has no winner. Encoding one as a row with
 --     winner_run_id = loser_run_id would corrupt the table the design calls "the project-level
 --     measurement" — a self-preference poisons any pairwise ranking computed from it later.
@@ -100,22 +99,42 @@ CREATE TABLE workflow_prefs (
 --     there is no event to reset a streak against.
 --   * `workflow_runs` has nowhere to put a free-text reason.
 -- Adding a `promoted_at`/`rejected_reason` column would have meant editing the three tables the
--- design specifies verbatim, which is worse. So the two decisions share one append-only log, and
--- "consecutive" means exactly "trailing, in `seq` order" — see
+-- design specifies verbatim, which is worse. So the decisions share one append-only log, and
+-- "consecutive" means exactly "trailing, in `seq` order, counting DISTINCT runs" — see
 -- `services::workflows::workflow_search_state`, the single reader of this rule.
 --
 -- `seq` exists because `created_at` ties. Two decisions recorded in the same second are
 -- indistinguishable by timestamp, and "consecutive" is precisely an ordering question, so the
 -- order is an explicit monotonic integer rather than a timestamp or an implicit rowid.
+--
+-- CONCURRENCY. Every arena write goes through `Database::with_conn`, which holds one
+-- `std::sync::Mutex` around ONE `rusqlite::Connection` for the whole closure, so today every
+-- promote, reject and resume is fully serialised and no two can interleave. The
+-- `workflows_one_champion` partial index is therefore defence-in-depth rather than the thing
+-- holding the invariant. If J1 ever opens a second connection to this database — a second process,
+-- a pool, or a read replica promoted to writer — then the read-then-write pairs in
+-- `promote_workflow` (check the halt, read the incumbent, then swap) and in
+-- `workflow_search_state` become genuinely racy, and they will need `BEGIN IMMEDIATE` plus a
+-- re-check inside the transaction rather than the ambient serialisation they rely on now.
 CREATE TABLE workflow_decisions (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
   id         TEXT NOT NULL UNIQUE,
   run_id     TEXT NOT NULL REFERENCES workflow_runs(id),
-  kind       TEXT NOT NULL CHECK (kind IN ('promote', 'reject')),
-  -- Mandatory on a rejection: "saying no" with no reason recorded teaches the search nothing, and
-  -- the one thing a halted search needs is the three reasons it halted on. Enforced here as well
-  -- as in `reject_workflow_run` so the table cannot be made useless by a future second writer.
-  reason     TEXT CHECK (kind <> 'reject' OR (reason IS NOT NULL AND trim(reason) <> '')),
+  -- 'promote' makes a workflow champion. 'reject' is a human saying no to a run, with a reason.
+  -- 'resume' is a human explicitly lifting a halt, with a reason.
+  --
+  -- `resume` exists because a PROMOTION used to be what cleared a halt, and that made the halt
+  -- escapable with no new evidence at all: re-promoting the sitting champion changed no row but
+  -- appended a 'promote', and the streak counted back only to the last one. Clearing a halt is now
+  -- its own explicit, human-confirmed decision — "the search is halted until a human says why it
+  -- should continue" is one event, not a side effect of an unrelated operation. A 'promote' row is
+  -- SKIPPED by the streak walk; only 'resume' resets it.
+  kind       TEXT NOT NULL CHECK (kind IN ('promote', 'reject', 'resume')),
+  -- Mandatory on a rejection AND on a resume: "saying no" with no reason recorded teaches the
+  -- search nothing, and lifting a halt without one is exactly the evidence-free escape `resume` was
+  -- introduced to prevent. Enforced here as well as in `reject_workflow_run` / `resume_workflow_search`
+  -- so the table cannot be made useless by a future second writer.
+  reason     TEXT CHECK (kind = 'promote' OR (reason IS NOT NULL AND trim(reason) <> '')),
   created_at TEXT NOT NULL
 );
 CREATE INDEX workflow_decisions_run ON workflow_decisions(run_id);

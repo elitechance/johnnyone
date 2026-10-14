@@ -1277,6 +1277,7 @@ impl AgentService {
             "list_workflows" => Self::rpc_list_workflows(&req.params, state),
             "get_workflow" => Self::rpc_get_workflow(&req.params, state),
             "list_workflow_runs" => Self::rpc_list_workflow_runs(&req.params, state),
+            "list_workflow_prefs" => Self::rpc_list_workflow_prefs(&req.params, state),
             "get_workflow_search_state" => {
                 Self::rpc_get_workflow_search_state(&req.params, state)
             }
@@ -1287,6 +1288,9 @@ impl AgentService {
             "update_workflow_champion" => Self::rpc_update_workflow_champion(&req.params, state),
             "record_workflow_rejection" => {
                 Self::rpc_record_workflow_rejection(&req.params, state)
+            }
+            "update_workflow_search_resumed" => {
+                Self::rpc_update_workflow_search_resumed(&req.params, state)
             }
             "amend_agent_plan" => Self::rpc_amend_agent_plan(&req.params, state).await,
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
@@ -1913,6 +1917,18 @@ impl AgentService {
         serde_json::to_value(runs).map_err(|e| e.to_string())
     }
 
+    fn rpc_list_workflow_prefs(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let workflow_id = params
+            .get("workflowId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        let prefs = crate::services::workflows::list_workflow_prefs(state, workflow_id)?;
+        serde_json::to_value(prefs).map_err(|e| e.to_string())
+    }
+
     fn rpc_get_workflow_search_state(
         params: &serde_json::Value,
         state: &Arc<AppState>,
@@ -1971,6 +1987,12 @@ impl AgentService {
             .get("workflowId")
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        // NOTE what is NOT read here: `seatsHeld` and `fleetBusy`. They used to be relayed
+        // parameters, and the caller is a browser that can measure neither — so `comparable`
+        // degraded to "did two clients type the same numbers", which is the exact failure those two
+        // columns exist to prevent. The host measures both now
+        // (`services::workflows::measure_run_budget`), and the model family comes from the workflow
+        // row rather than from the caller.
         let input = crate::services::workflows::NewWorkflowRun {
             workflow_id: workflow_id.to_string(),
             plan_id: params
@@ -1979,18 +2001,9 @@ impl AgentService {
                 .map(|value| value.to_string())
                 .filter(|value| !value.trim().is_empty()),
             seed: params.get("seed").and_then(|value| value.as_i64()).unwrap_or(0),
-            // Required, and validated by the service: an unreadable seat budget makes every
-            // preference involving this run non-comparable, which is a silent dead end.
-            seats_held: params
-                .get("seatsHeld")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| "Missing 'seatsHeld' parameter".to_string())?
-                .to_string(),
-            fleet_busy: params
-                .get("fleetBusy")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| "Missing 'fleetBusy' parameter".to_string())?
-                .to_string(),
+            // Optional override of the workflow's own `fan_out`. Absent means "whatever the
+            // workflow declares", which is the normal case.
+            seats: params.get("seats").and_then(|value| value.as_i64()),
         };
         let run = crate::services::workflows::start_workflow_run(state, input)?;
         serde_json::to_value(run).map_err(|e| e.to_string())
@@ -2014,12 +2027,28 @@ impl AgentService {
         // "the gate printed nothing a parser recognised", which is a normal result for a lint, a
         // build or a bespoke script. It is never an error and nothing branches on it.
         let gate_collected = params.get("gateCollected").and_then(|value| value.as_i64());
-        let run = crate::services::workflows::record_workflow_run_gate(
-            state,
-            run_id,
-            gate_exit,
-            gate_collected,
-        )?;
+        // Re-scoring defaults to FALSE. A second call used to silently replace a green score with a
+        // red one and erase the advisory count, so the default here is the one that refuses rather
+        // than the one that overwrites the only score the arena has.
+        let rescore = params
+            .get("rescore")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let run = if rescore {
+            crate::services::workflows::rescore_workflow_run_gate(
+                state,
+                run_id,
+                gate_exit,
+                gate_collected,
+            )
+        } else {
+            crate::services::workflows::record_workflow_run_gate(
+                state,
+                run_id,
+                gate_exit,
+                gate_collected,
+            )
+        }?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -2076,6 +2105,32 @@ impl AgentService {
             confirmed,
         )?;
         serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_workflow_search_resumed(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (repo, phase_type, family) = Self::workflow_key(params)?;
+        // Both required. Lifting a halt is the decision a reader will most want explained, and the
+        // `confirmed` default is false so a call that forgot its arguments cannot lift one.
+        let reason = params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'reason' parameter".to_string())?;
+        let confirmed = params
+            .get("confirmed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let search = crate::services::workflows::resume_workflow_search(
+            state,
+            &repo,
+            &phase_type,
+            &family,
+            reason,
+            confirmed,
+        )?;
+        serde_json::to_value(search).map_err(|e| e.to_string())
     }
 
     fn rpc_record_workflow_rejection(
@@ -3518,6 +3573,7 @@ mod workflow_arena_rpc_tests {
         let cases: &[(&str, &str)] = &[
             ("get_workflow", "Missing 'id' parameter"),
             ("list_workflow_runs", "Missing 'workflowId' parameter"),
+            ("list_workflow_prefs", "Missing 'workflowId' parameter"),
             ("get_workflow_search_state", "Missing 'repo' parameter"),
             ("create_workflow_version", "Missing 'repo' parameter"),
             ("start_workflow_run", "Missing 'workflowId' parameter"),
@@ -3525,6 +3581,7 @@ mod workflow_arena_rpc_tests {
             ("record_workflow_pref", "Missing 'winnerRunId' parameter"),
             ("update_workflow_champion", "Missing 'runId' parameter"),
             ("record_workflow_rejection", "Missing 'runId' parameter"),
+            ("update_workflow_search_resumed", "Missing 'repo' parameter"),
         ];
         for (method, expected) in cases {
             let response = AgentService::handle_rpc(&rpc(method, json!({})), &state).await;
@@ -3560,48 +3617,65 @@ mod workflow_arena_rpc_tests {
         let (state, _root) = test_state();
         let state = Arc::new(state);
 
-        let created = AgentService::handle_rpc(
-            &rpc(
-                "create_workflow_version",
-                json!({
-                    "repo": "johnnyone",
-                    "phaseType": "dev-phase",
-                    "family": "glm-5.3-flash",
-                    "role": "you are a developer",
-                    "instruction": "implement the phase",
-                    "contract": "the gate must pass",
-                    "hop": "{\"steps\":[\"edit\",\"verify\"]}",
-                    "fanOut": 3
-                }),
-            ),
-            &state,
-        )
-        .await;
-        assert!(created.success, "create: {:?}", created.error);
-        let workflow = created.data.expect("workflow");
-        assert_eq!(workflow.get("version").and_then(|v| v.as_i64()), Some(1));
-        assert_eq!(
-            workflow.get("isChampion").and_then(|v| v.as_bool()),
-            Some(false),
-            "a new version is never born champion"
-        );
-        let workflow_id = workflow
-            .get("id")
-            .and_then(|v| v.as_str())
-            .expect("id")
-            .to_string();
+        // TWO workflows, because a displacing head-to-head must be against the INCUMBENT's run:
+        // the incumbent (v1) seeds the champion slot, the challenger (v2) takes it from there.
+        let mut workflow_ids = Vec::new();
+        for expected_version in [1_i64, 2] {
+            let created = AgentService::handle_rpc(
+                &rpc(
+                    "create_workflow_version",
+                    json!({
+                        "repo": "johnnyone",
+                        "phaseType": "dev-phase",
+                        "family": "glm-5.3-flash",
+                        "role": "you are a developer",
+                        "instruction": "implement the phase",
+                        "contract": "the gate must pass",
+                        "hop": "{\"steps\":[\"edit\",\"verify\"]}",
+                        "fanOut": 3
+                    }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(created.success, "create: {:?}", created.error);
+            let workflow = created.data.expect("workflow");
+            assert_eq!(
+                workflow.get("version").and_then(|v| v.as_i64()),
+                Some(expected_version)
+            );
+            assert_eq!(
+                workflow.get("isChampion").and_then(|v| v.as_bool()),
+                Some(false),
+                "a new version is never born champion"
+            );
+            workflow_ids.push(
+                workflow
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .expect("id")
+                    .to_string(),
+            );
+        }
+        let workflow_id = workflow_ids[0].clone();
+        let challenger_id = workflow_ids[1].clone();
 
-        // Two runs on the SAME seat budget, so the preference between them is comparable.
+        // One run each, on the SAME seat budget AND the same fleet contention, so the preference
+        // between them is comparable on both halves of the rule.
         let mut run_ids = Vec::new();
-        for _ in 0..2 {
+        for owner in [&workflow_id, &challenger_id] {
+            // NOTE the payload deliberately ALSO sends `seatsHeld` and `fleetBusy`, which used to
+            // be the real parameters. They must be ignored: the caller here is a browser and the
+            // host is the only thing that can measure either. If a future edit reads them again,
+            // the assertions below fail.
             let started = AgentService::handle_rpc(
                 &rpc(
                     "start_workflow_run",
                     json!({
-                        "workflowId": workflow_id,
+                        "workflowId": owner,
                         "seed": 0,
-                        "seatsHeld": "{\"glm\":3}",
-                        "fleetBusy": "{\"glm\":1}"
+                        "seatsHeld": "{\"attacker\":999}",
+                        "fleetBusy": "{\"attacker\":999}"
                     }),
                 ),
                 &state,
@@ -3612,6 +3686,16 @@ mod workflow_arena_rpc_tests {
             assert!(
                 run.get("gateExit").map(|v| v.is_null()).unwrap_or(false),
                 "a fresh run has no score: {run}"
+            );
+            assert_eq!(
+                run.get("seatsHeld").and_then(|v| v.as_str()),
+                Some(r#"{"glm-5.3-flash":3}"#),
+                "the HOST measured the budget from the workflow row, not from the caller: {run}"
+            );
+            assert_eq!(
+                run.get("fleetBusy").and_then(|v| v.as_str()),
+                Some("{}"),
+                "and the contention snapshot is the host's too: {run}"
             );
             run_ids.push(run.get("id").and_then(|v| v.as_str()).unwrap().to_string());
         }
@@ -3637,14 +3721,14 @@ mod workflow_arena_rpc_tests {
         let loser_scored = AgentService::handle_rpc(
             &rpc(
                 "record_workflow_run_gate",
-                json!({ "runId": run_ids[1], "gateExit": 1, "gateCollected": 12 }),
+                json!({ "runId": run_ids[1], "gateExit": 0, "gateCollected": 12 }),
             ),
             &state,
         )
         .await;
         assert!(loser_scored.success, "gate: {:?}", loser_scored.error);
         let loser_scored = loser_scored.data.expect("loser run");
-        assert_eq!(loser_scored.get("gateExit").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(loser_scored.get("gateExit").and_then(|v| v.as_i64()), Some(0));
         // The advisory count must ROUND-TRIP when it is supplied. Asserting only "the call
         // succeeded" let a renamed param key (`gateCollected` → `collected`) pass this test —
         // measured, not imagined: that mutation was green here until this assertion was added.
@@ -3654,12 +3738,49 @@ mod workflow_arena_rpc_tests {
             "a supplied gateCollected must arrive: {loser_scored}"
         );
 
+        // A second score for the same run is refused unless `rescore` is asked for.
+        let silent = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[1], "gateExit": 1 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!silent.success, "a silent re-score must be refused");
+        assert!(silent
+            .error
+            .unwrap_or_default()
+            .contains("already has a gate result"));
+        let deliberate = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[1], "gateExit": 0, "gateCollected": 12, "rescore": true }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(deliberate.success, "rescore: {:?}", deliberate.error);
+
+        // The incumbent takes the slot first, with no preference (nothing to displace).
+        let seeded = AgentService::handle_rpc(
+            &rpc(
+                "update_workflow_champion",
+                json!({ "runId": run_ids[0], "confirmed": true }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(seeded.success, "seed champion: {:?}", seeded.error);
+
+        // Now the challenger's head-to-head — against the INCUMBENT's run, which is the only loser
+        // that can displace it.
         let pref = AgentService::handle_rpc(
             &rpc(
                 "record_workflow_pref",
                 json!({
-                    "winnerRunId": run_ids[0],
-                    "loserRunId": run_ids[1],
+                    "winnerRunId": run_ids[1],
+                    "loserRunId": run_ids[0],
                     "reason": "green gate"
                 }),
             ),
@@ -3675,7 +3796,7 @@ mod workflow_arena_rpc_tests {
         let unconfirmed = AgentService::handle_rpc(
             &rpc(
                 "update_workflow_champion",
-                json!({ "runId": run_ids[0], "prefId": pref_id }),
+                json!({ "runId": run_ids[1], "prefId": pref_id }),
             ),
             &state,
         )
@@ -3689,7 +3810,7 @@ mod workflow_arena_rpc_tests {
         let promoted = AgentService::handle_rpc(
             &rpc(
                 "update_workflow_champion",
-                json!({ "runId": run_ids[0], "prefId": pref_id, "confirmed": true }),
+                json!({ "runId": run_ids[1], "prefId": pref_id, "confirmed": true }),
             ),
             &state,
         )
@@ -3716,21 +3837,63 @@ mod workflow_arena_rpc_tests {
         let search = search.data.expect("search state");
         assert_eq!(
             search.get("championWorkflowId").and_then(|v| v.as_str()),
-            Some(workflow_id.as_str())
+            Some(challenger_id.as_str()),
+            "the challenger displaced the incumbent"
         );
         assert_eq!(search.get("halted").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(search.get("strikeLimit").and_then(|v| v.as_i64()), Some(3));
 
-        let runs = AgentService::handle_rpc(
-            &rpc("list_workflow_runs", json!({ "workflowId": workflow_id })),
+        for owner in [&workflow_id, &challenger_id] {
+            let runs = AgentService::handle_rpc(
+                &rpc("list_workflow_runs", json!({ "workflowId": owner })),
+                &state,
+            )
+            .await;
+            assert!(runs.success);
+            assert_eq!(
+                runs.data
+                    .and_then(|data| data.as_array().map(|rows| rows.len())),
+                Some(1)
+            );
+
+            // The preference is readable back without issuing a write — the gap that forced a
+            // reloaded client to record a duplicate.
+            let prefs = AgentService::handle_rpc(
+                &rpc("list_workflow_prefs", json!({ "workflowId": owner })),
+                &state,
+            )
+            .await;
+            assert!(prefs.success, "prefs: {:?}", prefs.error);
+            let rows = prefs.data.expect("prefs");
+            let rows = rows.as_array().expect("array");
+            assert_eq!(rows.len(), 1, "both sides of the head-to-head see it");
+            assert_eq!(rows[0].get("id").and_then(|v| v.as_str()), Some(pref_id.as_str()));
+        }
+
+        // And re-recording the SAME ordered pair returns the SAME row rather than a duplicate.
+        let again = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_pref",
+                json!({
+                    "winnerRunId": run_ids[1],
+                    "loserRunId": run_ids[0],
+                    "reason": "a different explanation"
+                }),
+            ),
             &state,
         )
         .await;
-        assert!(runs.success);
+        assert!(again.success, "re-record: {:?}", again.error);
+        let again = again.data.expect("pref");
         assert_eq!(
-            runs.data
-                .and_then(|data| data.as_array().map(|rows| rows.len())),
-            Some(2)
+            again.get("id").and_then(|v| v.as_str()),
+            Some(pref_id.as_str()),
+            "the same ordered pair must not create a second row"
+        );
+        assert_eq!(
+            again.get("reason").and_then(|v| v.as_str()),
+            Some("green gate"),
+            "the FIRST reason wins: a recorded outcome is not editable"
         );
     }
 
@@ -3769,7 +3932,7 @@ mod workflow_arena_rpc_tests {
             let run_id = AgentService::handle_rpc(
                 &rpc(
                     "start_workflow_run",
-                    json!({ "workflowId": workflow_id, "seatsHeld": "{}", "fleetBusy": "{}" }),
+                    json!({ "workflowId": workflow_id }),
                 ),
                 &state,
             )
@@ -3816,7 +3979,7 @@ mod workflow_arena_rpc_tests {
         let blocked = AgentService::handle_rpc(
             &rpc(
                 "start_workflow_run",
-                json!({ "workflowId": workflow_id, "seatsHeld": "{}", "fleetBusy": "{}" }),
+                json!({ "workflowId": workflow_id }),
             ),
             &state,
         )
@@ -3825,5 +3988,121 @@ mod workflow_arena_rpc_tests {
         let error = blocked.error.unwrap_or_default();
         assert!(error.contains("is halted after 3 consecutive rejections"), "got: {error}");
         assert!(error.contains("strike 3"), "the halt must name its reasons: {error}");
+
+        // The ONLY way out, over the relay: an explicit, human-confirmed resume with a reason.
+        // Unconfirmed first, because the default must not lift a halt.
+        let key = json!({ "repo": "johnnyone", "phaseType": "ui-phase", "family": "qwen" });
+        let mut unconfirmed_params = key.clone();
+        unconfirmed_params["reason"] = json!("let it run");
+        let unconfirmed =
+            AgentService::handle_rpc(&rpc("update_workflow_search_resumed", unconfirmed_params), &state)
+                .await;
+        assert!(!unconfirmed.success, "an unconfirmed resume must be refused");
+        assert!(unconfirmed
+            .error
+            .unwrap_or_default()
+            .contains("human-confirmed"));
+
+        let mut resume_params = key.clone();
+        resume_params["reason"] = json!("the gate itself was broken");
+        resume_params["confirmed"] = json!(true);
+        let resumed =
+            AgentService::handle_rpc(&rpc("update_workflow_search_resumed", resume_params), &state)
+                .await;
+        assert!(resumed.success, "resume: {:?}", resumed.error);
+        let resumed = resumed.data.expect("search state");
+        assert_eq!(resumed.get("halted").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            resumed.get("consecutiveRejections").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+
+        let allowed = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(allowed.success, "after a resume a run must start: {:?}", allowed.error);
+    }
+
+    /// Three rejections of ONE run are ONE strike over the relay. The rule counts distinct
+    /// candidates, not rows, so a retried call or a double-submitting button cannot halt a search
+    /// on a single human verdict.
+    #[tokio::test]
+    async fn handle_rpc_counts_distinct_runs_not_rejection_rows() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let workflow_id = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "repo": "johnnyone",
+                    "phaseType": "dev-phase",
+                    "family": "glm",
+                    "role": "r",
+                    "instruction": "i",
+                    "contract": "c",
+                    "hop": "{}",
+                    "fanOut": 1
+                }),
+            ),
+            &state,
+        )
+        .await
+        .data
+        .expect("workflow")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+        let run_id = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await
+        .data
+        .expect("run")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+        for attempt in 1..=5 {
+            let rejected = AgentService::handle_rpc(
+                &rpc(
+                    "record_workflow_rejection",
+                    json!({ "runId": run_id, "reason": format!("tap {attempt}") }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(rejected.success, "reject: {:?}", rejected.error);
+            let search = rejected.data.expect("search state");
+            assert_eq!(
+                search.get("consecutiveRejections").and_then(|v| v.as_i64()),
+                Some(1),
+                "attempt {attempt}: one candidate is one strike however many times it is rejected"
+            );
+            assert_eq!(search.get("halted").and_then(|v| v.as_bool()), Some(false));
+        }
+
+        // And the search is still runnable, which is what makes the dedup meaningful.
+        let allowed = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(allowed.success, "start: {:?}", allowed.error);
     }
 }

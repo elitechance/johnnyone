@@ -6,9 +6,15 @@ interface WorkerEnv { CHAT_RELAY_DO: DurableObjectNamespace; [key: string]: unkn
 
 // Start a run of a workflow (desktop migration 026).
 //
-// `seatsHeld` and `fleetBusy` are both required JSON objects and both are validated by the host
-// before the insert. An unreadable seatsHeld is not a cosmetic problem: it makes EVERY preference
-// involving this run non-comparable, which is a silent dead end rather than an error.
+// `seatsHeld` and `fleetBusy` are NOT relayed, and used to be. The caller here is a browser, which
+// can measure neither — the UI was sending the declared budget and `{}` for contention, honestly
+// labelled as a declaration in its own code, which reduced `comparable` to "did two clients type
+// the same numbers". That is the exact failure `schema.md` says those two columns exist to prevent:
+// "the first thing a busy fleet does is promote a champion because the other box was quiet."
+//
+// The HOST measures both (`services::workflows::measure_run_budget`, whose intended source is
+// `services::leases::LeasePool`). `seats` optionally overrides the workflow's own `fanOut`; the
+// model family is never an argument, because it is the workflow's and the workflow row holds it.
 //
 // REFUSED by the host while the family's search is halted. That refusal is the whole meaning of
 // "three consecutive rejections halt the search" — the client does not have to check first.
@@ -18,8 +24,7 @@ export default async function startWorkflowRun(
     workflowId: string;
     planId?: string | null;
     seed?: number | null;
-    seatsHeld: string;
-    fleetBusy: string;
+    seats?: number | null;
   },
   ctx: ResolverContext,
 ) {
@@ -28,7 +33,6 @@ export default async function startWorkflowRun(
     workflowId: args.workflowId,
     planId: args.planId ?? null,
     seed: args.seed ?? 0,
-    seatsHeld: args.seatsHeld,
-    fleetBusy: args.fleetBusy,
+    seats: args.seats ?? null,
   });
 }

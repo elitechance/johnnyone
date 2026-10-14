@@ -34,13 +34,21 @@ fn workflow(state: &AppState, repo: &str, phase_type: &str, family: &str) -> Wor
     create_workflow_version(state, version(repo, phase_type, family)).expect("create workflow")
 }
 
+/// Round 2: `seats_held` / `fleet_busy` are no longer caller parameters — the HOST measures both,
+/// because the caller is a browser that can measure neither. Tests still need to construct specific
+/// contention in order to exercise the comparability rule at all, so this helper goes through
+/// `start_workflow_run_with_budget`, the host-internal seam the lease pool will fill. That seam is
+/// deliberately NOT reachable over RPC or GraphQL.
 fn run_with(state: &AppState, workflow_id: &str, seats: &str, fleet: &str) -> WorkflowRun {
-    start_workflow_run(
+    start_workflow_run_with_budget(
         state,
         NewWorkflowRun {
             workflow_id: workflow_id.to_string(),
             plan_id: None,
             seed: 0,
+            seats: None,
+        },
+        RunBudget {
             seats_held: seats.to_string(),
             fleet_busy: fleet.to_string(),
         },
@@ -101,20 +109,20 @@ fn decision_log(state: &AppState) -> Vec<(String, String)> {
 // CLAIM 3 — "three consecutive rejections halt the search"
 // =================================================================================================
 
-/// **DEFECT (documented, not fixed).** A halt is escaped by re-promoting the workflow that is
-/// ALREADY champion, with no preference, no new run and no new evidence of any kind.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** Re-promoting the workflow
+/// that is already champion does NOT escape a halt.
 ///
-/// `promote_workflow` filters the incumbent out when the incumbent IS the run's own workflow
-/// (`incumbent.as_deref().filter(|id| *id != workflow.id)`), so `promotion_block` sees
-/// `incumbent = None` and `pref = None` and returns `None` — the "seeding the first champion"
-/// branch. The row change is a no-op, but a `promote` decision is appended, and
-/// `workflow_search_state` counts rejections only back to the last `promote`. One phantom
-/// promotion therefore resets a three-strike halt.
+/// What was wrong: `promote_workflow` filtered the incumbent out when the incumbent IS the run's
+/// own workflow, so `promotion_block` saw `incumbent = None, pref = None` and took the "seeding the
+/// first champion" branch. The row change was a no-op but a `promote` decision was appended, and
+/// the streak walk counted rejections only back to the last `promote` — so one phantom promotion
+/// reset a three-strike halt. The halt was a speed bump any caller holding one already-green
+/// champion run could step over in a single call.
 ///
-/// The halt is meant to be the search admitting defeat. As implemented it is a speed bump that any
-/// caller holding one already-green champion run can step over in a single call.
+/// Two independent changes close it, and this test pins both: a promotion is REFUSED while a halt
+/// is in force, and only an explicit, human-confirmed `resume` resets the streak.
 #[test]
-fn qa_a_halt_is_escaped_by_repromoting_the_sitting_champion() {
+fn qa_a_repromoting_the_sitting_champion_does_not_escape_the_halt() {
     let (state, _root) = test_state();
     let champion = workflow(&state, "repo", "dev-phase", "glm");
     let champion_run = green(&state, &champion.id, r#"{"glm":1}"#);
@@ -134,43 +142,75 @@ fn qa_a_halt_is_escaped_by_repromoting_the_sitting_champion() {
                 workflow_id: champion.id.clone(),
                 plan_id: None,
                 seed: 0,
-                seats_held: r#"{"glm":1}"#.to_string(),
-                fleet_busy: "{}".to_string(),
+                seats: None,
             },
         )
         .is_err(),
         "a halted family must refuse a new run"
     );
 
-    // THE HOLE: re-promote the sitting champion using the SAME run that seeded it. No preference,
-    // no new gate, nothing proven — and the halt is gone.
+    // THE CLOSED HOLE: re-promote the sitting champion using the SAME run that seeded it. No
+    // preference, no new gate, nothing proven — and it is refused.
     let repromoted = promote_workflow(&state, &champion_run.id, None, true);
+    let error = repromoted.expect_err(
+        "re-promoting the sitting champion must not be a way out of a halt",
+    );
     assert!(
-        repromoted.is_ok(),
-        "DEFECT PIN: re-promoting the sitting champion is currently accepted. If this line starts \
-         failing, promote_workflow has been tightened and this test should be inverted. error: {:?}",
-        repromoted.err()
+        error.contains("is halted"),
+        "the refusal must name the halt as the reason: {error}"
     );
     let after = workflow_search_state(&state, "repo", "dev-phase", "glm").expect("state");
     assert_eq!(
-        after.consecutive_rejections, 0,
-        "DEFECT PIN: a no-op re-promotion resets the rejection streak"
+        after.consecutive_rejections, 3,
+        "the streak survives a refused promotion"
     );
+    assert!(after.halted, "and so does the halt");
+    // The search really is still blocked, which is what makes this more than a counter.
     assert!(
-        !after.halted,
-        "DEFECT PIN: the three-strike halt is escapable with no new evidence"
+        start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: champion.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: None,
+            },
+        )
+        .is_err(),
+        "still halted, so still no new runs"
     );
-    // And the search really is runnable again, which is what makes this a defect rather than a
-    // cosmetic counter reset.
+    // The champion is untouched: a refused promotion changes nothing.
+    assert_eq!(
+        champion_of(&state, "repo", "dev-phase", "glm").as_deref(),
+        Some(champion.id.as_str())
+    );
+
+    // And the ONE way out: an explicit, human-confirmed resume carrying a reason.
+    let resumed = resume_workflow_search(
+        &state,
+        "repo",
+        "dev-phase",
+        "glm",
+        "the gate was misconfigured for all three",
+        true,
+    )
+    .expect("resume");
+    assert!(!resumed.halted && resumed.consecutive_rejections == 0);
     run_with(&state, &champion.id, r#"{"glm":1}"#, "{}");
 }
 
-/// **DEFECT (documented, not fixed).** The same run can be rejected three times and that counts as
-/// three strikes. Nothing in `reject_workflow_run` or `workflow_search_state` deduplicates by
-/// `run_id`, so "three consecutive rejections" is really "three rejection ROWS", and a caller that
-/// retries a rejection — or a UI with a double-submitting button — halts the search on one verdict.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** Rejecting ONE run three
+/// times is ONE strike.
+///
+/// What was wrong: nothing deduplicated by `run_id`, so "three consecutive rejections" was really
+/// "three rejection ROWS" — a caller that retried a rejection, or a UI with a double-submitting
+/// button, halted the search on a single human verdict. `workflow_search_state` now counts DISTINCT
+/// `run_id`s in the trailing rejections.
+///
+/// The rows are still all written: the log records that the human pressed three times, which is
+/// true and worth keeping. It is the COUNTING that changed, not the audit trail.
 #[test]
-fn qa_a_rejecting_one_run_three_times_halts_the_search() {
+fn qa_a_rejecting_one_run_three_times_is_one_strike() {
     let (state, _root) = test_state();
     let w = workflow(&state, "repo", "dev-phase", "glm");
     let run = run_with(&state, &w.id, "{}", "{}");
@@ -179,19 +219,42 @@ fn qa_a_rejecting_one_run_three_times_halts_the_search() {
         let state_after =
             reject_workflow_run(&state, &run.id, &format!("same run, strike {strike}"))
                 .expect("reject");
-        assert_eq!(state_after.consecutive_rejections, strike);
+        assert_eq!(
+            state_after.consecutive_rejections, 1,
+            "strike {strike}: one candidate is one strike however many times it is rejected"
+        );
+        assert!(!state_after.halted);
     }
     let after = workflow_search_state(&state, "repo", "dev-phase", "glm").expect("state");
     assert!(
-        after.halted,
-        "DEFECT PIN: three rejections of ONE run halt the search — the rule counts rows, not \
-         candidates"
+        !after.halted,
+        "three rejections of ONE run must not halt the search"
     );
+    assert_eq!(
+        after.recent_rejections.len(),
+        1,
+        "and the reasons are per candidate, not per tap: {:?}",
+        after.recent_rejections
+    );
+    // Every row is still recorded — the audit trail keeps all three taps.
     let log = decision_log(&state);
     assert_eq!(log.len(), 3);
     assert!(
         log.iter().all(|(kind, id)| kind == "reject" && id == &run.id),
-        "all three strikes are the same run: {log:?}"
+        "all three rows are the same run: {log:?}"
+    );
+    // THREE DISTINCT candidates do halt it, which is what makes the dedup a fix and not a hole.
+    for strike in 2..=3 {
+        let other = run_with(&state, &w.id, "{}", "{}");
+        let after = reject_workflow_run(&state, &other.id, &format!("candidate {strike}"))
+            .expect("reject");
+        assert_eq!(after.consecutive_rejections, strike);
+    }
+    assert!(
+        workflow_search_state(&state, "repo", "dev-phase", "glm")
+            .expect("state")
+            .halted,
+        "three DISTINCT candidates must halt the search"
     );
 }
 
@@ -227,17 +290,29 @@ fn qa_a_rejections_do_not_cross_family_or_repo_boundaries() {
 
 /// Forced `created_at` TIES. The author's argument is that `seq AUTOINCREMENT` makes ordering safe
 /// when timestamps collide; this proves it by rewriting every `created_at` to one identical value
-/// and checking that a promotion recorded LAST still resets the streak.
+/// and checking that the decision recorded LAST still ends the streak.
+///
+/// **Round 2: rewritten, because the round-1 version became VACUOUS.** It rejected ONE run three
+/// times with a promotion in the middle, and asserted a count of 1. Once rejections were counted by
+/// DISTINCT run and a promotion stopped ending a streak, that count was still 1 — but for an
+/// entirely different reason (dedup, not ordering), so the test no longer touched `seq` at all. It
+/// now uses three DISTINCT runs and a `resume`, which is the decision that ends a streak, so the
+/// assertion is load-bearing on the ordering again.
 #[test]
 fn qa_a_identical_created_at_does_not_break_the_consecutive_rule() {
     let (state, _root) = test_state();
     let w = workflow(&state, "repo", "dev-phase", "glm");
-    let run = green(&state, &w.id, "{}");
+    let a = run_with(&state, &w.id, "{}", "{}");
+    let b = run_with(&state, &w.id, "{}", "{}");
+    let c = run_with(&state, &w.id, "{}", "{}");
 
-    reject_workflow_run(&state, &run.id, "a").expect("reject");
-    reject_workflow_run(&state, &run.id, "b").expect("reject");
-    promote_workflow(&state, &run.id, None, true).expect("promote");
-    reject_workflow_run(&state, &run.id, "c").expect("reject");
+    reject_workflow_run(&state, &a.id, "a").expect("reject");
+    reject_workflow_run(&state, &b.id, "b").expect("reject");
+    reject_workflow_run(&state, &c.id, "c").expect("reject");
+    // Three distinct candidates: halted, so there is something to resume.
+    resume_workflow_search(&state, "repo", "dev-phase", "glm", "resumed", true).expect("resume");
+    let d = run_with(&state, &w.id, "{}", "{}");
+    reject_workflow_run(&state, &d.id, "d").expect("reject");
 
     // Every decision now shares one timestamp — the exact tie `seq` exists for.
     state
@@ -266,9 +341,9 @@ fn qa_a_identical_created_at_does_not_break_the_consecutive_rule() {
     let s = workflow_search_state(&state, "repo", "dev-phase", "glm").expect("state");
     assert_eq!(
         s.consecutive_rejections, 1,
-        "with all timestamps identical, only the rejection AFTER the promotion may count"
+        "with all timestamps identical, only the rejection AFTER the resume may count"
     );
-    assert_eq!(s.recent_rejections, vec!["c".to_string()]);
+    assert_eq!(s.recent_rejections, vec!["d".to_string()]);
 }
 
 /// Creating a new workflow VERSION is not a way out of a halt: the halt is keyed on
@@ -300,8 +375,7 @@ fn qa_a_a_new_version_does_not_escape_the_halt() {
             workflow_id: v2.id.clone(),
             plan_id: None,
             seed: 0,
-            seats_held: "{}".to_string(),
-            fleet_busy: "{}".to_string(),
+            seats: None,
         },
     );
     assert!(
@@ -315,20 +389,22 @@ fn qa_a_a_new_version_does_not_escape_the_halt() {
 // CLAIM 2 / 5 — champion uniqueness and "not comparable cannot promote"
 // =================================================================================================
 
-/// **DEFECT (documented, not fixed).** The incumbent champion is displaced by a preference whose
-/// loser is a run of an entirely DIFFERENT `(repo, phase_type, family)`.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** A preference whose loser is
+/// a run of a DIFFERENT `(repo, phase_type, family)` cannot displace the incumbent.
 ///
-/// `promotion_block` checks three things about the preference — it exists, it names this run as
-/// winner, and it is `comparable`. It never checks what the LOSER was. `record_workflow_pref`
-/// does not check it either: it reads both runs and compares their seat maps, nothing more. So the
-/// documented rule "displacing an incumbent needs a comparable head-to-head" is satisfied by a
-/// head-to-head against a run that was never the incumbent, in a family the design says is a
-/// different IDENTITY.
+/// What was wrong: `promotion_block` checked three things about the preference — it exists, it names
+/// this run as winner, and it is `comparable` — and never what the LOSER was.
+/// `record_workflow_pref` only compared seat maps. So "displacing an incumbent needs a comparable
+/// head-to-head" was satisfied by a head-to-head against a run that was never the incumbent, in a
+/// family the design says is a different IDENTITY. `family` is the design's central claim: a hop
+/// tuned for one context window does not transfer, so a challenger that beat a Qwen run must not
+/// thereby become the GLM champion.
 ///
-/// This matters because `family` is the design's central claim: a hop tuned for one context window
-/// does not transfer. A challenger that beat a Qwen run must not thereby become the GLM champion.
+/// Closed in two independent places, and this test pins both: `preference_comparability` marks a
+/// cross-key pair NOT comparable when the preference is recorded, and `promotion_block` refuses a
+/// loser outside the run's own key even if something else had set the flag.
 #[test]
-fn qa_a_a_pref_against_another_family_displaces_the_champion() {
+fn qa_a_a_pref_against_another_family_cannot_displace_the_champion() {
     let (state, _root) = test_state();
     let seats = r#"{"glm":2}"#;
     let incumbent = workflow(&state, "repo", "dev-phase", "glm");
@@ -342,41 +418,66 @@ fn qa_a_a_pref_against_another_family_displaces_the_champion() {
     let unrelated = workflow(&state, "repo", "dev-phase", "qwen");
     let unrelated_run = green(&state, &unrelated.id, seats);
 
-    let pref = record_workflow_pref(
-        &state,
-        &challenger_run.id,
-        &unrelated_run.id,
-        Some("beat a qwen run".to_string()),
-    )
-    .expect("DEFECT PIN: a cross-family preference is currently recordable");
+    // A cross-family preference is still RECORDABLE — it happened, and `workflow_prefs` is the
+    // project-level measurement — but it is not comparable, and the reason says why.
+    let pref = record_workflow_pref(&state, &challenger_run.id, &unrelated_run.id, None)
+        .expect("a cross-family preference is still data");
     assert!(
-        pref.comparable,
-        "DEFECT PIN: comparability is seat-map equality only, so a cross-family pair is comparable"
+        !pref.comparable,
+        "a cross-key pair measures two different things rather than comparing one"
+    );
+    assert!(
+        pref.reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("different (repo, phase_type, family)"),
+        "the recorded reason must say why it is not comparable: {:?}",
+        pref.reason
     );
 
-    let promoted = promote_workflow(&state, &challenger_run.id, Some(&pref.id), true);
+    let error = promote_workflow(&state, &challenger_run.id, Some(&pref.id), true)
+        .expect_err("beating a QWEN run must not make a workflow the GLM champion");
+    assert!(error.contains("not comparable"), "got: {error}");
+    assert_eq!(
+        champion_of(&state, "repo", "dev-phase", "glm").as_deref(),
+        Some(incumbent.id.as_str()),
+        "the incumbent keeps the slot"
+    );
+
+    // And the second, independent gate: even with the flag forced to 1 behind the service's back,
+    // `promotion_block` still refuses a loser outside the run's own champion key. Belt and braces
+    // on the design's central identity claim.
+    state
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_prefs SET comparable = 1 WHERE id = ?1",
+                rusqlite::params![pref.id],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .expect("force the flag");
+    let forced = promote_workflow(&state, &challenger_run.id, Some(&pref.id), true)
+        .expect_err("the loser's key is checked independently of the flag");
     assert!(
-        promoted.is_ok(),
-        "DEFECT PIN: the GLM champion is displaced on the strength of beating a QWEN run. If this \
-         starts failing, promotion_block has gained a same-family check on the loser and this test \
-         should be inverted. error: {:?}",
-        promoted.err()
+        forced.contains("different (repo, phase_type, family)"),
+        "got: {forced}"
     );
     assert_eq!(
         champion_of(&state, "repo", "dev-phase", "glm").as_deref(),
-        Some(challenger.id.as_str()),
-        "DEFECT PIN: the displacement really happened"
+        Some(incumbent.id.as_str())
     );
 }
 
-/// **DEFECT (documented, not fixed).** A workflow displaces the champion by beating ITSELF: two
-/// runs of the same workflow, on the same seat budget, make a `comparable` preference, and
-/// `promotion_block` accepts it.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** A workflow cannot displace
+/// the champion by beating ITSELF.
 ///
-/// This is the sharpest form of the hole above. "A comparable head-to-head" is supposed to mean
-/// the challenger out-performed the incumbent. Here the incumbent is not involved at all.
+/// This was the sharpest form of the hole above: two runs of the same workflow on the same seat
+/// budget made a `comparable` preference and `promotion_block` accepted it, with the incumbent not
+/// involved at all. `promotion_block` now refuses a loser that is a run of the same workflow, and
+/// separately requires a displacing loser to be the run the incumbent was promoted on.
 #[test]
-fn qa_a_a_workflow_displaces_the_champion_by_beating_itself() {
+fn qa_a_a_workflow_cannot_displace_the_champion_by_beating_itself() {
     let (state, _root) = test_state();
     let seats = r#"{"glm":2}"#;
     let incumbent = workflow(&state, "repo", "dev-phase", "glm");
@@ -386,36 +487,49 @@ fn qa_a_a_workflow_displaces_the_champion_by_beating_itself() {
     let challenger = workflow(&state, "repo", "dev-phase", "glm");
     let win = green(&state, &challenger.id, seats);
     let lose = green(&state, &challenger.id, seats);
+    // Two runs of one workflow in one key ARE comparable as measurements — same seats, same
+    // contention, same family. What they are not is a head-to-head.
     let pref = record_workflow_pref(&state, &win.id, &lose.id, None).expect("self head-to-head");
-    assert!(pref.comparable);
+    assert!(pref.comparable, "the two measurements really are comparable");
 
-    assert!(
-        promote_workflow(&state, &win.id, Some(&pref.id), true).is_ok(),
-        "DEFECT PIN: a workflow beating its own other run is accepted as the head-to-head that \
-         displaces the incumbent"
+    let error = promote_workflow(&state, &win.id, Some(&pref.id), true)
+        .expect_err("a workflow beating its own other run is not a head-to-head");
+    assert!(error.contains("SAME workflow"), "got: {error}");
+    assert_eq!(
+        champion_of(&state, "repo", "dev-phase", "glm").as_deref(),
+        Some(incumbent.id.as_str()),
+        "the incumbent keeps the slot"
     );
+    assert!(get_workflow(&state, &incumbent.id).unwrap().is_champion);
+
+    // The legitimate route still works: beat the INCUMBENT's run.
+    let honest = record_workflow_pref(&state, &win.id, &incumbent_run.id, None).expect("pref");
+    assert!(honest.comparable);
+    promote_workflow(&state, &win.id, Some(&honest.id), true).expect("a real head-to-head");
     assert_eq!(
         champion_of(&state, "repo", "dev-phase", "glm").as_deref(),
         Some(challenger.id.as_str())
     );
-    // The old champion is correctly demoted — the atomic swap itself works.
+    // And now the atomic swap is visible: the old champion is demoted in the same transaction.
     assert!(!get_workflow(&state, &incumbent.id).unwrap().is_champion);
 }
 
-/// **DEFECT (documented, not fixed).** `comparable` ignores `fleet_busy` entirely.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** `comparable` now requires
+/// matching `fleet_busy` as well as matching `seats_held`.
 ///
 /// The design's stated reason for `fleet_busy` is: "Two concurrent runs contend, there is no 429 to
 /// notice, and the slower run looks like the worse workflow. Without these, the first thing a busy
-/// fleet does is promote a champion because the other box was quiet." `budgets_are_comparable`
-/// compares `seats_held` ONLY, so two runs that held the same seats — one on an idle fleet, one on
-/// a saturated one — are `comparable: true` and the preference between them promotes.
+/// fleet does is promote a champion because the other box was quiet." The rule read `seats_held`
+/// ONLY, so two runs that held the same seats — one on an idle fleet, one on a saturated one —
+/// were `comparable: true` and the preference between them promoted: exactly the failure the column
+/// was added to prevent.
 ///
-/// Identical seat budgets do not imply identical contention: `seats_held` is what a run was
-/// GRANTED, `fleet_busy` is what everything else was holding at the same moment. The column is
-/// stored and served, so a human can see it; the rule the design says it enables is not
-/// implemented.
+/// `budgets_are_comparable` keeps its name and its meaning (the SEAT half, and these two runs do
+/// pass it). The flag that gets stored is now decided by `preference_comparability`, which also
+/// consults `contention_is_comparable`. Equality, not a tolerance — a tolerance needs a threshold
+/// and a threshold is an opinion.
 #[test]
-fn qa_a_comparable_ignores_fleet_contention() {
+fn qa_a_comparable_requires_matching_fleet_contention() {
     let (state, _root) = test_state();
     let seats = r#"{"glm":2}"#;
     let w = workflow(&state, "repo", "dev-phase", "glm");
@@ -425,20 +539,45 @@ fn qa_a_comparable_ignores_fleet_contention() {
     let saturated = run_with(&state, &w.id, seats, r#"{"glm":4096,"qwen":512}"#);
     let saturated = record_workflow_run_gate(&state, &saturated.id, 1, None).expect("gate");
 
+    // The SEAT half still passes: both runs held the same seats. That is the point — seat equality
+    // was never the thing that was missing.
     assert!(
         budgets_are_comparable(&quiet.seats_held, &saturated.seats_held),
-        "DEFECT PIN: the comparability rule reads seats_held alone"
+        "the seat budgets really are identical"
     );
+    // The CONTENTION half does not.
+    assert!(
+        !contention_is_comparable(&quiet.fleet_busy, &saturated.fleet_busy),
+        "an idle fleet and a saturated one are not the same contention"
+    );
+
     let pref = record_workflow_pref(&state, &quiet.id, &saturated.id, None).expect("pref");
     assert!(
-        pref.comparable,
-        "DEFECT PIN: a run on an idle fleet and a run on a saturated fleet are 'comparable', which \
-         is the exact failure the design says fleet_busy exists to prevent"
+        !pref.comparable,
+        "a run on an idle fleet and a run on a saturated fleet must not be comparable"
     );
     assert!(
-        promote_workflow(&state, &quiet.id, Some(&pref.id), true).is_ok(),
-        "DEFECT PIN: and that preference promotes"
+        pref.reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("different fleet contention"),
+        "the recorded reason must name contention: {:?}",
+        pref.reason
     );
+    let error = promote_workflow(&state, &quiet.id, Some(&pref.id), true)
+        .expect_err("and that preference must not promote");
+    assert!(error.contains("not comparable"), "got: {error}");
+    assert_eq!(champion_of(&state, "repo", "dev-phase", "glm"), None);
+
+    // Under EQUAL contention the same pair is comparable again, so the rule discriminates on
+    // contention rather than simply refusing everything.
+    let a = run_with(&state, &w.id, seats, r#"{"glm":4}"#);
+    let a = record_workflow_run_gate(&state, &a.id, 0, None).expect("gate");
+    let b = run_with(&state, &w.id, seats, r#"{"glm":4}"#);
+    let b = record_workflow_run_gate(&state, &b.id, 1, None).expect("gate");
+    assert!(record_workflow_pref(&state, &a.id, &b.id, None)
+        .expect("pref")
+        .comparable);
 }
 
 /// A promotion that is REFUSED must leave the incumbent intact and write nothing — no demotion, no
@@ -557,16 +696,18 @@ fn qa_a_promotion_cannot_cross_a_champion_key_boundary() {
 // CLAIM 1 — the fourth table, and whether the log can disagree with `is_champion`
 // =================================================================================================
 
-/// **DEFECT (documented, not fixed).** The decision log and `workflows.is_champion` disagree about
-/// whether anything happened.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** The decision log records
+/// only promotions that actually promoted something, so it cannot disagree with
+/// `workflows.is_champion` about how many there were.
 ///
-/// Re-promoting the sitting champion changes no row — `is_champion` was already 1 and the demote
-/// matches the same row the promote then sets — but it appends a `promote` decision. The log
-/// therefore records promotions that never promoted anything, and `workflow_search_state` cannot
-/// tell them apart from real ones. That is the drift the fourth table introduces: it is a second
-/// representation of the same fact, and the two can diverge.
+/// What was wrong: re-promoting the sitting champion changed no row — `is_champion` was already 1
+/// and the demote matched the same row the promote then set — but it appended a `promote` decision.
+/// QA measured five rows for one promotion. That is the drift a second representation of one fact
+/// invites, and while a promotion still cleared a halt, each phantom row was a free escape from
+/// one. `promote_workflow` now returns early, writing nothing, when the run's workflow already
+/// holds the slot.
 #[test]
-fn qa_a_the_decision_log_records_promotions_that_promoted_nothing() {
+fn qa_a_the_decision_log_records_only_promotions_that_promoted() {
     let (state, _root) = test_state();
     let w = workflow(&state, "repo", "dev-phase", "glm");
     let run = green(&state, &w.id, "{}");
@@ -587,9 +728,9 @@ fn qa_a_the_decision_log_records_promotions_that_promoted_nothing() {
         .filter(|(kind, _)| kind == "promote")
         .count();
     assert_eq!(
-        promotes, 5,
-        "DEFECT PIN: five promote decisions, one actual promotion. The log and is_champion \
-         disagree about how many promotions there were, and each phantom one resets a halt."
+        promotes, 1,
+        "five calls, one actual promotion, ONE row: the log and is_champion must agree about how \
+         many promotions there were"
     );
 }
 
@@ -808,28 +949,53 @@ fn qa_a_gate_collected_round_trips_none_and_zero_distinctly() {
     }
 }
 
-/// A recorded gate result is overwritable, including back to `None`. Pinned because
-/// `record_workflow_run_gate` is an unconditional UPDATE with no "already scored" guard, so a
-/// second call silently replaces a green score with a red one — or erases the advisory count.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** A second gate result has to
+/// be asked for by NAME.
+///
+/// What was wrong: `record_workflow_run_gate` was an unconditional UPDATE with no "already scored"
+/// guard, so a second call silently replaced a green score with a red one and erased the advisory
+/// count, with only `ended_at` recording that it had happened twice. There are now two entry
+/// points over one core: `record_workflow_run_gate` refuses a run that already has a score, and
+/// `rescore_workflow_run_gate` is the deliberate one. The separate name IS the guard — there is no
+/// flag to forget and no default to get wrong.
 #[test]
-fn qa_a_a_second_gate_record_silently_overwrites_the_first() {
+fn qa_a_a_second_gate_record_is_refused_unless_asked_for_by_name() {
     let (state, _root) = test_state();
     let w = workflow(&state, "repo", "dev-phase", "glm");
     let run = run_with(&state, &w.id, "{}", "{}");
 
     let first = record_workflow_run_gate(&state, &run.id, 0, Some(400)).expect("gate");
     assert_eq!((first.gate_exit, first.gate_collected), (Some(0), Some(400)));
-    let second = record_workflow_run_gate(&state, &run.id, 1, None).expect("re-record");
-    assert_eq!(
-        (second.gate_exit, second.gate_collected),
-        (Some(1), None),
-        "DEFECT PIN: re-recording a gate overwrites the score and erases the collected count, \
-         with no guard and no audit trail. A promoted champion's run can be rescored to red after \
-         the fact."
+
+    let refused = record_workflow_run_gate(&state, &run.id, 1, None)
+        .expect_err("a silent overwrite must be refused");
+    assert!(
+        refused.contains("already has a gate result (exit 0)"),
+        "got: {refused}"
     );
+    // The refusal leaves the original score completely intact, advisory count included.
+    let kept = get_workflow_run(&state, &run.id).expect("read back");
+    assert_eq!((kept.gate_exit, kept.gate_collected), (Some(0), Some(400)));
+    assert_eq!(kept.ended_at, first.ended_at, "and does not even touch ended_at");
+
+    // The deliberate form goes through, and is the only thing that does.
+    let second = rescore_workflow_run_gate(&state, &run.id, 1, None).expect("deliberate rescore");
+    assert_eq!((second.gate_exit, second.gate_collected), (Some(1), None));
     assert!(
         second.ended_at.is_some() && second.ended_at != first.ended_at,
-        "only ended_at records that it happened twice"
+        "ended_at still records that it happened twice"
+    );
+
+    // And a promoted champion's own evidence cannot be rewritten at all — not even deliberately.
+    let promoted_w = workflow(&state, "repo", "ui-phase", "glm");
+    let promoted_run = green(&state, &promoted_w.id, "{}");
+    promote_workflow(&state, &promoted_run.id, None, true).expect("seed champion");
+    let locked = rescore_workflow_run_gate(&state, &promoted_run.id, 1, None)
+        .expect_err("a champion's evidence must not be rewritable underneath it");
+    assert!(locked.contains("cannot be rewritten underneath it"), "got: {locked}");
+    assert_eq!(
+        get_workflow_run(&state, &promoted_run.id).unwrap().gate_exit,
+        Some(0)
     );
 }
 
@@ -837,65 +1003,112 @@ fn qa_a_a_second_gate_record_silently_overwrites_the_first() {
 // CLAIM 7 — Int32. This project has already shipped an outage from an i64 served as GraphQL `Int`.
 // =================================================================================================
 
-/// Every arena integer the host will serve is an `i64` with no upper bound, while the GraphQL
-/// schema declares `seed: Int!`, `fanOut: Int!`, `version: Int!`, `gateExit: Int` and
-/// `gateCollected: Int` — all 32-bit. This test measures the HOST half: values above
-/// `i32::MAX` are accepted, stored, re-read and serialised intact, so nothing on this side stops
-/// them reaching the GraphQL layer.
+/// **FIXED (round 2). Inverted from the defect pin of the same shape.** The host refuses the
+/// integers it can genuinely bound, and the wire fields are `Float` for the one it cannot.
+///
+/// What was wrong: every arena integer was an unbounded `i64` on the host while the schema typed
+/// them as 32-bit `Int`, and one over-i32 `seed` inside `workflowRuns: [WorkflowRun!]!` nulled the
+/// response ROOT — worse than the `listAiSessions` outage, because unrelated fields in the same
+/// document went with it.
+///
+/// Two halves to the fix, and this test covers the host half:
+///
+/// * `fan_out` is bounded by `MAX_FAN_OUT` (it is a seat cost), `seed` by `MAX_SEED` (it is a
+///   replay index), and `gate_exit` to 32 bits (it is a process exit code).
+/// * `gate_collected` is deliberately NOT bounded. It is advisory, and refusing a real gate result
+///   because an advisory count is large would be the wrong trade — so it stays unbounded here and
+///   the schema carries it as `Float`.
+///
+/// The GraphQL half is `worker/lib/ai-scope-tests/workflow-arena-int32-qa.test.ts`.
 #[test]
-fn qa_a_the_host_accepts_and_serves_integers_above_i32_max() {
+fn qa_a_the_host_refuses_the_integers_it_can_bound() {
     let (state, _root) = test_state();
     let over: i64 = i32::MAX as i64 + 1; // 2147483648
     let way_over: i64 = 9_007_199_254_740_991; // Number.MAX_SAFE_INTEGER
 
-    let w = create_workflow_version(
+    let fan_out_error = create_workflow_version(
         &state,
         NewWorkflowVersion {
             fan_out: way_over,
             ..version("repo", "dev-phase", "glm")
         },
     )
-    .expect("DEFECT PIN: fan_out has no upper bound — only `< 1` is refused");
-    assert_eq!(w.fan_out, way_over);
+    .expect_err("fan_out must have an upper bound");
+    assert!(fan_out_error.contains("at most"), "got: {fan_out_error}");
+    // And the bound is the documented one, not an accident.
+    assert!(create_workflow_version(
+        &state,
+        NewWorkflowVersion {
+            fan_out: MAX_FAN_OUT + 1,
+            ..version("repo", "dev-phase", "glm")
+        },
+    )
+    .is_err());
+    let w = create_workflow_version(
+        &state,
+        NewWorkflowVersion {
+            fan_out: MAX_FAN_OUT,
+            ..version("repo", "dev-phase", "glm")
+        },
+    )
+    .expect("the bound itself is allowed");
+
+    let seed_error = start_workflow_run(
+        &state,
+        NewWorkflowRun {
+            workflow_id: w.id.clone(),
+            plan_id: None,
+            seed: way_over,
+            seats: None,
+        },
+    )
+    .expect_err("seed must have an upper bound");
+    assert!(seed_error.contains("at most"), "got: {seed_error}");
 
     let run = start_workflow_run(
         &state,
         NewWorkflowRun {
             workflow_id: w.id.clone(),
             plan_id: None,
-            seed: way_over,
-            seats_held: "{}".to_string(),
-            fleet_busy: "{}".to_string(),
+            seed: MAX_SEED,
+            seats: None,
         },
     )
-    .expect("DEFECT PIN: seed has no upper bound — only negatives are refused");
-    assert_eq!(run.seed, way_over);
+    .expect("the bound itself is allowed");
 
-    let scored = record_workflow_run_gate(&state, &run.id, over, Some(way_over)).expect("gate");
-    assert_eq!(scored.gate_exit, Some(over));
+    // A gate exit outside 32 bits is not a process exit code.
+    let exit_error = record_workflow_run_gate(&state, &run.id, over, None)
+        .expect_err("gate_exit must be bounded to a process exit code");
+    assert!(
+        exit_error.contains("outside the range of a process exit code"),
+        "got: {exit_error}"
+    );
+
+    // `gate_collected` stays UNBOUNDED on purpose: it is advisory, and the wire field is Float.
+    let scored = record_workflow_run_gate(&state, &run.id, 0, Some(way_over))
+        .expect("an advisory count must never cost a real score");
     assert_eq!(scored.gate_collected, Some(way_over));
 
-    // Re-read, then serialise exactly as the RPC layer does. Every one of these lands on a
-    // 32-bit GraphQL `Int`.
+    // Everything the host DOES serve now fits i32, except the deliberately-unbounded advisory one.
     let reread = list_workflow_runs(&state, &w.id).expect("list").remove(0);
     let run_json = serde_json::to_value(&reread).expect("serialise run");
     let workflow_json = serde_json::to_value(get_workflow(&state, &w.id).unwrap()).expect("wf");
     for (field, value) in [
         ("seed", run_json["seed"].as_i64()),
         ("gateExit", run_json["gateExit"].as_i64()),
-        ("gateCollected", run_json["gateCollected"].as_i64()),
         ("fanOut", workflow_json["fanOut"].as_i64()),
+        ("version", workflow_json["version"].as_i64()),
     ] {
-        let value = value.unwrap_or_default();
+        let value = value.expect("a value");
         assert!(
-            value > i32::MAX as i64,
-            "{field} = {value} must exceed i32::MAX for this measurement to mean anything"
+            value <= i32::MAX as i64,
+            "{field} = {value} must fit i32 now that the host bounds it"
         );
     }
     assert_eq!(
-        run_json["seed"].as_i64(),
+        run_json["gateCollected"].as_i64(),
         Some(way_over),
-        "DEFECT PIN: the host serves seed = {way_over} on a field the schema types as Int (32-bit)"
+        "and the advisory count is still served whole, on a Float field"
     );
 }
 
@@ -952,8 +1165,7 @@ fn qa_a_a_failed_transaction_rolls_back_and_releases_the_connection() {
             workflow_id: "no-such-workflow".to_string(),
             plan_id: None,
             seed: 0,
-            seats_held: "{}".to_string(),
-            fleet_busy: "{}".to_string(),
+            seats: None,
         },
     )
     .is_err());
@@ -1017,36 +1229,71 @@ fn qa_a_versions_are_dense_and_unique_within_a_family_under_interleaving() {
 ///
 /// `promote_workflow` never consults `workflow_search_state`. Only `start_workflow_run` does.
 #[test]
-fn qa_a_a_thrice_rejected_green_run_can_still_be_promoted_and_clears_the_halt() {
+fn qa_a_a_thrice_rejected_green_run_cannot_be_promoted_while_halted() {
     let (state, _root) = test_state();
     let w = workflow(&state, "repo", "dev-phase", "glm");
-    let run = green(&state, &w.id, r#"{"glm":1}"#);
-    assert_eq!(run.gate_exit, Some(0), "the run's gate is green");
+    assert_eq!(REJECTION_STRIKE_LIMIT, 3, "this test is written for three strikes");
 
+    // THREE DISTINCT green candidates, each refused by a human. A rejection carries a reason
+    // precisely because a human says no to a GREEN run, so every one of these is promotable on its
+    // gate alone — which is what made the hole reachable.
+    let mut last = None;
     for strike in 1..=3 {
+        let run = green(&state, &w.id, r#"{"glm":1}"#);
+        assert_eq!(run.gate_exit, Some(0), "the run's gate is green");
         reject_workflow_run(&state, &run.id, &format!("rejected despite a green gate #{strike}"))
             .expect("reject");
+        last = Some(run);
     }
+    let run = last.expect("a run");
     let halted = workflow_search_state(&state, "repo", "dev-phase", "glm").expect("state");
     assert!(halted.halted && halted.champion_workflow_id.is_none());
 
-    let promoted = promote_workflow(&state, &run.id, None, true);
-    assert!(
-        promoted.is_ok(),
-        "DEFECT PIN: promote_workflow never consults the halt, so a thrice-rejected run is \
-         promotable. error: {:?}",
-        promoted.err()
-    );
+    let error = promote_workflow(&state, &run.id, None, true)
+        .expect_err("a halted search must refuse to promote the run it just refused");
+    assert!(error.contains("is halted"), "got: {error}");
     let after = workflow_search_state(&state, "repo", "dev-phase", "glm").expect("state");
     assert!(
-        !after.halted && after.consecutive_rejections == 0,
-        "DEFECT PIN: the halt is cleared by promoting the very run that was rejected three times"
+        after.halted && after.consecutive_rejections == 3,
+        "the refused promotion changed nothing about the halt"
     );
     assert_eq!(
-        after.champion_workflow_id.as_deref(),
-        Some(w.id.as_str()),
-        "DEFECT PIN: and the thrice-rejected workflow is now what J1 executes"
+        after.champion_workflow_id, None,
+        "and the thrice-rejected workflow is NOT what J1 executes"
     );
-    // The search is genuinely runnable again.
+    assert!(
+        decision_log(&state).iter().all(|(kind, _)| kind == "reject"),
+        "a refused promotion appends nothing: {:?}",
+        decision_log(&state)
+    );
+    // The search is still blocked.
+    assert!(start_workflow_run(
+        &state,
+        NewWorkflowRun {
+            workflow_id: w.id.clone(),
+            plan_id: None,
+            seed: 0,
+            seats: None,
+        },
+    )
+    .is_err());
+
+    // A human can still overrule the search — but only by SAYING SO, with a reason, as its own
+    // auditable decision. That is the whole point of `resume`.
+    let resumed = resume_workflow_search(
+        &state,
+        "repo",
+        "dev-phase",
+        "glm",
+        "all three were refused for a reason that no longer applies",
+        true,
+    )
+    .expect("resume");
+    assert!(!resumed.halted);
+    promote_workflow(&state, &run.id, None, true).expect("now it may be promoted");
+    assert_eq!(
+        champion_of(&state, "repo", "dev-phase", "glm").as_deref(),
+        Some(w.id.as_str())
+    );
     run_with(&state, &w.id, r#"{"glm":1}"#, "{}");
 }

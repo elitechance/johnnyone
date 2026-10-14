@@ -87,15 +87,26 @@ describe('workflow arena resolver seam', () => {
       [
         '../../resolvers/ai/start-workflow-run',
         'start_workflow_run',
-        { workflowId: 'w1', seatsHeld: '{"glm":3}', fleetBusy: '{}' },
+        // The payload deliberately still carries seatsHeld/fleetBusy — the parameters this
+        // mutation used to take. They must NOT be relayed: the caller is a browser and cannot
+        // measure either, so the host takes both snapshots. If they reappear below, the UI can
+        // declare its own contention again and `comparable` goes back to "did two clients type the
+        // same numbers".
+        { workflowId: 'w1', seatsHeld: '{"attacker":999}', fleetBusy: '{"attacker":999}' } as any,
         {
           workflowId: 'w1',
           planId: null,
           // An omitted seed is the first replay index, not "unset".
           seed: 0,
-          seatsHeld: '{"glm":3}',
-          fleetBusy: '{}',
+          // An omitted seats override means "whatever the workflow declares".
+          seats: null,
         },
+      ],
+      [
+        '../../resolvers/ai/workflow-prefs',
+        'list_workflow_prefs',
+        { workflowId: 'w1' },
+        { workflowId: 'w1' },
       ],
       [
         '../../resolvers/ai/record-workflow-run-gate',
@@ -103,7 +114,9 @@ describe('workflow arena resolver seam', () => {
         { runId: 'r1', gateExit: 0 },
         // The advisory count relays as NULL when omitted — never as 0, which would be the
         // different and much stronger claim "this gate collected nothing".
-        { runId: 'r1', gateExit: 0, gateCollected: null },
+        // `rescore` relays as FALSE when omitted: a second result for a run must be refused by
+        // default, not silently overwrite the only score the arena has.
+        { runId: 'r1', gateExit: 0, gateCollected: null, rescore: false },
       ],
       [
         '../../resolvers/ai/record-workflow-pref',
@@ -122,6 +135,18 @@ describe('workflow arena resolver seam', () => {
         'record_workflow_rejection',
         { runId: 'r1', reason: 'too slow' },
         { runId: 'r1', reason: 'too slow' },
+      ],
+      [
+        '../../resolvers/ai/update-workflow-search-resumed',
+        'update_workflow_search_resumed',
+        { repo: 'r', phaseType: 'dev-phase', family: 'glm', reason: 'retrying', confirmed: true },
+        {
+          repo: 'r',
+          phaseType: 'dev-phase',
+          family: 'glm',
+          reason: 'retrying',
+          confirmed: true,
+        },
       ],
     ];
 
@@ -176,16 +201,39 @@ describe('workflow arena resolver seam', () => {
 
     // `gateExit` NON-NULL: it is the score, and a missing score must not arrive as a 0 that reads
     // as a pass. `gateCollected` NULLABLE: unparseable output is a normal result.
+    // Float, not Int, on every numeric: a 32-bit `Int!` that cannot serialise nulls the whole
+    // non-null chain up to the response root. `gateExit` stays NON-NULL (it is the score, and a
+    // missing score must not arrive as a 0 that reads as a pass) and `gateCollected` stays NULLABLE
+    // (unparseable output is a normal result).
     const gate = fieldLine('recordWorkflowRunGate');
-    expect(gate).toContain('gateExit: Int!');
-    expect(gate).toContain('gateCollected: Int');
-    expect(gate).not.toContain('gateCollected: Int!');
+    expect(gate).toContain('gateExit: Float!');
+    expect(gate).toContain('gateCollected: Float');
+    expect(gate).not.toContain('gateCollected: Float!');
+    expect(gate, 'a re-score must be an explicit argument').toContain('rescore: Boolean');
 
-    // No `comparable` argument anywhere: the host computes it from the two runs' own seat budgets,
-    // so a client cannot assert a comparability it does not have.
+    // Lifting a halt is its own mutation, with both of its arguments non-null. A promotion must
+    // never be the thing that clears a halt again.
+    const resume = fieldLine('updateWorkflowSearchResumed');
+    expect(resume, 'updateWorkflowSearchResumed must exist').toBeTruthy();
+    expect(resume).toContain('reason: String!');
+    expect(resume).toContain('confirmed: Boolean!');
+
+    // No `comparable` argument anywhere: the host computes it from the two runs themselves, so a
+    // client cannot assert a comparability it does not have.
     const pref = fieldLine('recordWorkflowPref');
     expect(pref).toBeTruthy();
     expect(pref).not.toContain('comparable');
+
+    // And no seat/contention arguments on startWorkflowRun: those are the host's measurement.
+    const start = fieldLine('startWorkflowRun');
+    expect(start, 'startWorkflowRun must exist').toBeTruthy();
+    expect(start, 'seatsHeld must not be a client argument').not.toContain('seatsHeld');
+    expect(start, 'fleetBusy must not be a client argument').not.toContain('fleetBusy');
+    expect(start, 'and the family is the workflow\'s, never the caller\'s').not.toContain('family');
+    expect(start).toContain('seats: Float');
+
+    // The read that makes a recorded preference discoverable without issuing a write.
+    expect(fieldLine('workflowPrefs')).toContain('workflowId: ID!');
 
     // A rejection's reason is non-null: three of them halt the search and the reasons are all a
     // halted search has to show.
@@ -222,7 +270,9 @@ describe('workflow arena resolver seam', () => {
       'record_workflow_pref',
       'update_workflow_champion',
       'record_workflow_rejection',
+      'update_workflow_search_resumed',
     ];
+    reads.push('list_workflow_prefs');
     for (const read of reads) {
       expect(
         isReadRpcCacheable(read),

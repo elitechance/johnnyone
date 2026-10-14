@@ -63,6 +63,7 @@ const SCOPE_GATED: Record<string, string> = {
   'workflows.ts': 'plans:read',
   'workflow.ts': 'plans:read',
   'workflow-runs.ts': 'plans:read',
+  'workflow-prefs.ts': 'plans:read',
   'workflow-search-state.ts': 'plans:read',
   // The writes decide what J1 executes. `update-workflow-champion.ts` is the one that CHANGES what
   // every later run of a phase-type uses, so it must never be reachable by a key that was granted
@@ -72,6 +73,8 @@ const SCOPE_GATED: Record<string, string> = {
   'record-workflow-run-gate.ts': 'plans:write',
   'record-workflow-pref.ts': 'plans:write',
   'update-workflow-champion.ts': 'plans:write',
+  // Lifting a halt overrules the search's own refusal, so it carries the write scope too.
+  'update-workflow-search-resumed.ts': 'plans:write',
   'record-workflow-rejection.ts': 'plans:write',
 };
 
