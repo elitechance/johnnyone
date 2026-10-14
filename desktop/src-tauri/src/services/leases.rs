@@ -27,14 +27,41 @@
 //!
 //! ## The caller this is for
 //!
-//! One, today: the arena's run starter. It will
-//! [`acquire`](LeasePool::acquire) `fan_out` seats on the workflow's family, snapshot
-//! [`fleet_busy_json`](LeasePool::fleet_busy_json) and [`SeatLease::seats_held_json`] into the
-//! `workflow_runs` row's `fleet_busy` / `seats_held` columns at start, and hold the lease for the
-//! life of the run. Those two columns are what makes a comparison between two runs honest — a
-//! preference recorded across mismatched seat budgets is measuring scheduling luck. There is
-//! deliberately **no GraphQL surface here**: the arena API is owned elsewhere, and this is an
-//! in-process API for it to call.
+//! One, today: the arena's run starter. It holds the lease for the life of the run and records
+//! two columns on the `workflow_runs` row, which together are what makes a comparison between
+//! two runs honest — a preference recorded across mismatched seat budgets is measuring
+//! scheduling luck, not prompt quality.
+//!
+//! ### The order is load-bearing, and it is three steps, not two
+//!
+//! ```text
+//! 1. fleet_busy  = pool.fleet_busy_json();                 // BEFORE acquiring
+//! 2. let lease   = pool.acquire(family, fan_out)?;          // then take the seats
+//! 3. seats_held  = lease.seats_held_json();                 // from the returned lease
+//! ```
+//!
+//! **Why:** `fleet_busy` is meant to record the contention this run started against — *another*
+//! run's seats belong in it, this run's own do not. Snapshot it after `acquire` and the run
+//! counts its own `fan_out` as foreign contention.
+//!
+//! **The failure mode of getting it wrong**, which is why this is spelled out rather than left
+//! to the reader: every run then reports inflated contention, no two runs ever look like they
+//! ran under comparable budgets, `workflow_prefs.comparable` is 0 for every pair, and **no
+//! champion can ever be promoted.** Not a crash and not a wrong number anybody would notice —
+//! an arena that simply never concludes anything.
+//!
+//! **And it cannot be collapsed into two steps.** `seats_held_json` is a method on the lease, so
+//! it exists only after `acquire`, while `fleet_busy` has to be read before it. The two columns
+//! cannot be taken at one moment; the order above is the only one that gives both the right
+//! value.
+//!
+//! An earlier version of this header prescribed acquire-then-snapshot. Dev A's branch had
+//! independently written down the same wrong sequence — two branches that cannot see each other
+//! arriving at one mistake — and QA caught it by reading both. Recorded rather than quietly
+//! corrected, because the next person to wire this up will follow the doc.
+//!
+//! There is deliberately **no GraphQL surface here**: the arena API is owned elsewhere, and this
+//! is an in-process API for it to call.
 //!
 //! ## Two things this pool does NOT do, which that caller must
 //!
@@ -131,13 +158,17 @@ impl SeatCaps {
             // Why an all-zero override is refused when a partial one is merely noted, since
             // under merge semantics both end at the measured caps for every family:
             //
-            // `from_json` is a PUBLIC constructor with its own contract — produce a usable caps
-            // table or fail — and it has a direct caller shape that never merges
-            // (`LeasePool::new(SeatCaps::from_json(..)?)`). For THAT caller an all-zero table is
-            // exactly the empty-table state this guard exists to prevent: the pool refuses every
-            // request as `UnknownFamily`, whose message tells the operator to add a family they
-            // themselves zeroed. The merge path is one of two callers and cannot be the only one
-            // considered.
+            // This is an API-CONTRACT argument, not a live-caller one, and the distinction
+            // matters because "there is a caller" is the kind of sentence that gets trusted
+            // later: `from_json` has NO production caller today either — QA checked, and its
+            // callers are tests plus the merge path below.
+            //
+            // It is a PUBLIC constructor, and its contract is "produce a usable caps table or
+            // fail". An all-zero table is not usable: a pool built from it refuses every request
+            // as `UnknownFamily`, whose message tells the operator to add a family they
+            // themselves zeroed. Honouring that contract at the constructor is worth more than
+            // the symmetry of accepting it, because the next caller to arrive will be written
+            // against the signature, not against this comment.
             //
             // What WAS inconsistent is the diagnostic, and that is fixed here: both routes now
             // state the same rule in the same words, so an operator learns it either way.
@@ -202,16 +233,26 @@ impl SeatCaps {
                 // stays EXACT — lowering or trimming the key would be a guess about a name the
                 // fleet owns — so a near miss is reported, never silently corrected.
                 notes.push(match near_miss(family) {
-                    Some((measured_name, case_too)) if !family.trim().eq(family.as_str()) => {
+                    Some(NearMiss::Invisible {
+                        measured,
+                        characters,
+                        case_too,
+                    }) => CapNote::InvisibleCharacter {
+                        configured: family.clone(),
+                        measured,
+                        characters,
+                        case_too,
+                    },
+                    Some(NearMiss::Whitespace { measured, case_too }) => {
                         CapNote::WhitespaceMismatch {
                             configured: family.clone(),
-                            measured: measured_name,
+                            measured,
                             case_too,
                         }
                     }
-                    Some((measured_name, _)) => CapNote::CaseMismatch {
+                    Some(NearMiss::Case { measured }) => CapNote::CaseMismatch {
                         configured: family.clone(),
-                        measured: measured_name,
+                        measured,
                     },
                     None => CapNote::UnmeasuredFamily {
                         family: family.clone(),
@@ -280,18 +321,78 @@ fn zeroed_list(families: &[&str]) -> String {
     families.join(", ")
 }
 
-/// Did `key` nearly name a measured family? Returns `(the measured name, case also differs)`.
+/// Zero-width and byte-order format characters that are not `char::is_whitespace`.
 ///
-/// Trimmed and case-folded, in that order, because both are what hand-edited JSON actually gets
-/// wrong — a leading space in `{" glm-5.3-flash": 40}` is at least as likely as a capital, and it
-/// used to earn only the generic "nobody measured this family" note with nothing pointing at the
-/// family the operator meant. Reporting, never correcting: see the loop in `from_override_json`.
-fn near_miss(key: &str) -> Option<(String, bool)> {
-    let trimmed = key.trim();
-    MEASURED_SEAT_CAPS
+/// `str::trim` recognises `char::is_whitespace`, and U+200B and friends are **format** characters
+/// (category Cf), so they are not whitespace and `"glm-5.3-flash\u{200b}".trim()` is itself.
+/// That left the most invisible of the invisible characters as the one that got no help at all —
+/// the operator saw only "nobody measured this family" — which is the opposite of the reason
+/// [`CapNote::WhitespaceMismatch`] exists. Each is listed with its name so a note can say WHICH
+/// one to delete; "there is an invisible character somewhere" is not an actionable message.
+const INVISIBLE_CHARS: &[(char, &str)] = &[
+    ('\u{200b}', "U+200B ZERO WIDTH SPACE"),
+    ('\u{200c}', "U+200C ZERO WIDTH NON-JOINER"),
+    ('\u{200d}', "U+200D ZERO WIDTH JOINER"),
+    ('\u{2060}', "U+2060 WORD JOINER"),
+    ('\u{feff}', "U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)"),
+];
+
+/// How `key` nearly named a measured family.
+#[derive(Debug)]
+enum NearMiss {
+    /// Differs only in case.
+    Case { measured: String },
+    /// Differs by surrounding whitespace `str::trim` can see, and possibly case.
+    Whitespace { measured: String, case_too: bool },
+    /// Differs by one or more zero-width format characters, and possibly whitespace/case.
+    Invisible {
+        measured: String,
+        characters: String,
+        case_too: bool,
+    },
+}
+
+/// Did `key` nearly name a measured family?
+///
+/// Compares with surrounding whitespace removed, the zero-width format characters of
+/// [`INVISIBLE_CHARS`] removed, and case folded — because all three are what hand-edited JSON
+/// actually gets wrong, and each used to earn only the generic "nobody measured this family"
+/// note with nothing pointing at the family the operator meant.
+///
+/// **Reporting, never correcting.** The key itself is never trimmed or rewritten: matching stays
+/// exact, so the note tells the operator what to fix rather than silently accepting a different
+/// key than was written. See the loop in `from_override_json`.
+///
+/// Case folding is `eq_ignore_ascii_case`, so a NON-ASCII case variant would not match. Every
+/// measured family name is ASCII today; if one ever is not, this needs a Unicode case fold, and
+/// the symptom would be a near miss falling through to `UnmeasuredFamily`.
+fn near_miss(key: &str) -> Option<NearMiss> {
+    let found: Vec<&str> = INVISIBLE_CHARS
         .iter()
-        .find(|(m, _)| m.eq_ignore_ascii_case(trimmed))
-        .map(|(m, _)| ((*m).to_string(), !m.eq(&trimmed)))
+        .filter(|(c, _)| key.contains(*c))
+        .map(|(_, name)| *name)
+        .collect();
+    let stripped: String = key
+        .chars()
+        .filter(|c| !INVISIBLE_CHARS.iter().any(|(bad, _)| bad == c))
+        .collect();
+    let trimmed = stripped.trim();
+    let (measured, _) = MEASURED_SEAT_CAPS
+        .iter()
+        .find(|(m, _)| m.eq_ignore_ascii_case(trimmed))?;
+    let measured = (*measured).to_string();
+    let case_too = measured != trimmed;
+    if !found.is_empty() {
+        return Some(NearMiss::Invisible {
+            measured,
+            characters: found.join(", "),
+            case_too,
+        });
+    }
+    if trimmed != stripped.as_str() {
+        return Some(NearMiss::Whitespace { measured, case_too });
+    }
+    Some(NearMiss::Case { measured })
 }
 
 /// Something questionable about a host seat-cap override. Never fatal — every one of these is a
@@ -318,7 +419,20 @@ pub enum CapNote {
         measured: String,
         case_too: bool,
     },
-    /// The key matches no measured family at all, not even trimmed and case-folded.
+    /// The key differs from a measured family by one or more ZERO-WIDTH format characters, which
+    /// `str::trim` cannot see at all because they are not `char::is_whitespace`.
+    ///
+    /// Its own variant rather than a `WhitespaceMismatch` because the message has to name the
+    /// character: an operator cannot find a U+200B by looking, and "there is whitespace in your
+    /// key" would send them hunting for a space that is not there.
+    InvisibleCharacter {
+        configured: String,
+        measured: String,
+        /// Human-readable names of the characters found, e.g. `U+200B ZERO WIDTH SPACE`.
+        characters: String,
+        case_too: bool,
+    },
+    /// The key matches no measured family at all, not even stripped, trimmed and case-folded.
     UnmeasuredFamily { family: String },
     /// A zero entry. Zero is not a way to disable a family.
     ///
@@ -371,6 +485,23 @@ impl fmt::Display for CapNote {
                 if *case_too { " and case" } else { "" },
                 measured,
                 configured
+            ),
+            CapNote::InvisibleCharacter {
+                configured,
+                measured,
+                characters,
+                case_too,
+            } => write!(
+                f,
+                "seat-cap key {:?} contains {} and so does NOT name the measured family {:?}{} \
+                 — {:?} keeps its measured value and the key was added beside it as a family of \
+                 its own. The character is invisible in an editor; delete it. Family names are \
+                 matched exactly and the key is NOT trimmed or rewritten",
+                configured,
+                characters,
+                measured,
+                if *case_too { " (its case differs too)" } else { "" },
+                measured
             ),
             CapNote::UnmeasuredFamily { family } => write!(
                 f,
@@ -1011,6 +1142,73 @@ mod tests {
                 ("qwen3.8-flash-next".to_string(), 0),
             ])
         );
+    }
+
+    /// The ORDER the module header prescribes, measured against the order it used to prescribe.
+    ///
+    /// There is no code here to get wrong — the sequence lives in the caller, which does not
+    /// exist yet — so this test exists to make the cost of the wrong order a number rather than
+    /// a paragraph. It is the only guard the doc has until Dev A writes those three lines.
+    #[test]
+    fn the_snapshot_order_decides_whether_two_runs_are_ever_comparable() {
+        let pool = LeasePool::with_measured_caps();
+        // A rival run already holds 1 glm seat: that is the contention this run starts against,
+        // and it is what `fleet_busy` is for.
+        let _rival = pool.acquire("glm-5.3-flash", 1).unwrap();
+
+        // RIGHT: snapshot, then acquire, then take seats_held from the lease.
+        let fleet_busy_right = pool.fleet_busy_json();
+        let lease = pool.acquire("glm-5.3-flash", 2).unwrap();
+        let seats_held = lease.seats_held_json();
+
+        // WRONG: the order the header used to prescribe, and that Dev A's branch had too.
+        let fleet_busy_wrong = pool.fleet_busy_json();
+
+        assert!(
+            fleet_busy_right.contains(r#""glm-5.3-flash":1"#),
+            "the rival's 1 seat is the contention this run started against: {fleet_busy_right}"
+        );
+        assert!(
+            fleet_busy_wrong.contains(r#""glm-5.3-flash":3"#),
+            "snapshotting after acquire counts this run's own 2 seats as foreign contention: \
+             {fleet_busy_wrong}"
+        );
+        assert_ne!(
+            fleet_busy_right, fleet_busy_wrong,
+            "the two orders are not interchangeable"
+        );
+        // And this run's OWN seats are the other column, which is why nothing is lost by
+        // excluding them from the first one.
+        assert_eq!(seats_held, r#"{"glm-5.3-flash":2}"#);
+
+        // The failure mode, concretely. A run ALONE on an idle fleet, under the wrong order,
+        // reports contention that does not exist — its own seats.
+        //
+        // (A correction to this test, kept because it is the same mistake in miniature: the
+        // first version asserted the quiet run's snapshot was IDENTICAL to the contended one's.
+        // It is not — 2 against 3 — because the wrong order adds a per-run offset rather than
+        // erasing the difference. The real cost is that every run's snapshot is inflated by its
+        // own `fan_out`, so a budget comparison between two runs of different widths is wrong by
+        // the difference of their widths, which is exactly the quantity it is trying to control
+        // for.)
+        let quiet = LeasePool::with_measured_caps();
+        let quiet_lease = quiet.acquire("glm-5.3-flash", 2).unwrap();
+        let quiet_wrong = quiet.fleet_busy_json();
+        assert!(
+            quiet_wrong.contains(r#""glm-5.3-flash":2"#),
+            "a run alone on an idle fleet reports 2 seats of contention that do not exist: \
+             {quiet_wrong}"
+        );
+        drop(quiet_lease);
+        // Under the RIGHT order the same run would have recorded an idle fleet.
+        let quiet = LeasePool::with_measured_caps();
+        let quiet_right = quiet.fleet_busy_json();
+        let _quiet_lease = quiet.acquire("glm-5.3-flash", 2).unwrap();
+        assert!(
+            quiet_right.contains(r#""glm-5.3-flash":0"#),
+            "the truth is that the fleet was idle: {quiet_right}"
+        );
+        assert_ne!(quiet_right, quiet_wrong, "the two orders disagree about an idle fleet");
     }
 
     /// The two JSON columns a run snapshots at start.
@@ -2295,30 +2493,86 @@ mod qa_b_r4_tests {
         assert!(matches!(note_for("GLM-5.3-Flash"), CapNote::CaseMismatch { .. }));
     }
 
-    /// FINDING (residual, narrow). A ZERO-WIDTH SPACE is not `char::is_whitespace`, so
-    /// `str::trim` leaves it and the near-miss lookup fails — the key falls to the generic
-    /// `UnmeasuredFamily` note, which is the one case `WhitespaceMismatch` exists to improve on.
+    /// FIXED (was `qa_documents_a_zero_width_space_gets_only_the_generic_note`, QA round 5). A
+    /// zero-width format character now gets a note that NAMES the character and the family the
+    /// key was meant to be.
     ///
-    /// It is the most invisible of the invisible characters and the hardest for an operator to
-    /// find by eye, and it is the one that gets no pointer to the family it was meant to be. Same
-    /// for a zero-width non-joiner and a BOM. Narrow — nothing types these on purpose — but the
-    /// variant's own justification ("the operator has to be told WHICH invisible character to
-    /// delete") applies most strongly here, so this is the gap the fix did not close.
+    /// QA's finding: `str::trim` recognises `char::is_whitespace`, and U+200B and friends are
+    /// format characters (category Cf), so `"glm-5.3-flash\u{200b}".trim()` is itself, the
+    /// near-miss check failed, and the most invisible of the invisible characters was the one
+    /// that got no help at all — the opposite of the reason `WhitespaceMismatch` exists.
+    ///
+    /// Same fixture, inverted. The key is still **not** trimmed or rewritten, for the reason
+    /// already documented on `near_miss`: matching stays exact, so the note tells the operator
+    /// what to delete instead of silently accepting a different key than was written.
     #[test]
-    fn qa_documents_a_zero_width_space_gets_only_the_generic_note() {
-        for (label, key) in [
-            ("zero-width space", "glm-5.3-flash\u{200b}"),
-            ("zero-width non-joiner", "\u{200c}glm-5.3-flash"),
-            ("BOM / zero-width no-break space", "\u{feff}glm-5.3-flash"),
+    fn qa_a_zero_width_character_names_itself_and_the_family_it_was_meant_to_be() {
+        for (label, key, expected_char) in [
+            ("zero-width space", "glm-5.3-flash\u{200b}", "U+200B ZERO WIDTH SPACE"),
+            (
+                "zero-width non-joiner",
+                "\u{200c}glm-5.3-flash",
+                "U+200C ZERO WIDTH NON-JOINER",
+            ),
+            (
+                "BOM / zero-width no-break space",
+                "\u{feff}glm-5.3-flash",
+                "U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)",
+            ),
+            ("word joiner", "glm-5.3-flash\u{2060}", "U+2060 WORD JOINER"),
+            ("zero-width joiner", "glm-\u{200d}5.3-flash", "U+200D ZERO WIDTH JOINER"),
         ] {
-            // Not trimmable, so the key is genuinely a different name...
+            // QA's observation, kept: trim really cannot see these.
             assert_eq!(key.trim(), key, "{label}: trim leaves it");
             match note_for(key) {
-                CapNote::UnmeasuredFamily { family } => assert_eq!(family, key, "{label}"),
-                other => panic!("{label}: expected UnmeasuredFamily, got {other:?}"),
+                CapNote::InvisibleCharacter {
+                    configured,
+                    measured,
+                    characters,
+                    case_too,
+                } => {
+                    assert_eq!(configured, key, "{label}");
+                    assert_eq!(measured, "glm-5.3-flash", "{label}");
+                    assert_eq!(characters, expected_char, "{label}");
+                    assert!(!case_too, "{label}");
+                }
+                other => panic!("{label}: expected InvisibleCharacter, got {other:?}"),
             }
+            // The note has to name the character, or it is not actionable: nobody finds a
+            // U+200B by looking at it.
+            let shown = note_for(key).to_string();
+            assert!(shown.contains(expected_char), "{label}: {shown}");
+            assert!(shown.contains("invisible in an editor"), "{label}: {shown}");
+            assert!(shown.contains("NOT trimmed"), "{label}: {shown}");
         }
-        // ...and the real family keeps its measured cap, as the note for the trimmable cases says.
+
+        // Several at once are all named, and a case difference is called out as well.
+        match note_for("\u{feff}GLM-5.3-Flash\u{200b}") {
+            CapNote::InvisibleCharacter {
+                characters,
+                case_too,
+                ..
+            } => {
+                assert!(characters.contains("U+200B"), "{characters}");
+                assert!(characters.contains("U+FEFF"), "{characters}");
+                assert!(case_too, "the case difference must be reported too");
+            }
+            other => panic!("expected InvisibleCharacter, got {other:?}"),
+        }
+        // Whitespace AND a zero-width character: reported as the invisible one, because that is
+        // the half the operator cannot see.
+        assert!(matches!(
+            note_for(" glm-5.3-flash\u{200b}"),
+            CapNote::InvisibleCharacter { .. }
+        ));
+        // A key near nothing still gets the generic note.
+        assert!(matches!(
+            note_for("local-7b"),
+            CapNote::UnmeasuredFamily { .. }
+        ));
+
+        // QA's second half, unchanged: the real family keeps its measured cap and the odd key is
+        // a family of its own — the note describes what happened, it does not change it.
         let mut map: BTreeMap<String, u32> = BTreeMap::new();
         map.insert("glm-5.3-flash\u{200b}".to_string(), 40);
         map.insert("qwen3.8-flash-next".to_string(), 4);
