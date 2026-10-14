@@ -1288,6 +1288,12 @@ impl AgentService {
             "run_workflow_run_gate" => {
                 Self::rpc_run_workflow_run_gate(&req.params, state).await
             }
+            "rescore_workflow_run_gate" => {
+                Self::rpc_rescore_workflow_run_gate(&req.params, state).await
+            }
+            "record_workflow_run_rescore" => {
+                Self::rpc_record_workflow_run_rescore(&req.params, state)
+            }
             "record_workflow_pref" => Self::rpc_record_workflow_pref(&req.params, state),
             "update_workflow_champion" => Self::rpc_update_workflow_champion(&req.params, state),
             "record_workflow_rejection" => {
@@ -2053,28 +2059,40 @@ impl AgentService {
         // "the gate printed nothing a parser recognised", which is a normal result for a lint, a
         // build or a bespoke script. It is never an error and nothing branches on it.
         let gate_collected = params.get("gateCollected").and_then(|value| value.as_i64());
-        // Re-scoring defaults to FALSE. A second call used to silently replace a green score with a
-        // red one and erase the advisory count, so the default here is the one that refuses rather
-        // than the one that overwrites the only score the arena has.
-        let rescore = params
-            .get("rescore")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let run = if rescore {
-            crate::services::workflows::rescore_workflow_run_gate(
-                state,
-                run_id,
-                gate_exit,
-                gate_collected,
-            )
-        } else {
-            crate::services::workflows::record_workflow_run_gate(
-                state,
-                run_id,
-                gate_exit,
-                gate_collected,
-            )
-        }?;
+        let run = crate::services::workflows::record_workflow_run_gate(
+            state,
+            run_id,
+            gate_exit,
+            gate_collected,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Replace a run's gate result with one measured elsewhere, DELIBERATELY.
+    ///
+    /// There is no `rescore` flag on `record_workflow_run_gate` any more. The service's own
+    /// rationale was "the separate name IS the guard: there is no flag to forget and no default to
+    /// get wrong" — and the wire API still took a boolean, so on the only surface a client can
+    /// reach, the guard WAS the flag that rationale rejected. Now it is the method.
+    fn rpc_record_workflow_run_rescore(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        let gate_exit = params
+            .get("gateExit")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| "Missing 'gateExit' parameter".to_string())?;
+        let gate_collected = params.get("gateCollected").and_then(|value| value.as_i64());
+        let run = crate::services::workflows::rescore_workflow_run_gate(
+            state,
+            run_id,
+            gate_exit,
+            gate_collected,
+        )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -2083,29 +2101,48 @@ impl AgentService {
     /// `record_workflow_run_gate` takes a score someone else measured; this one measures it, by
     /// running the plan's effective gate in the plan's workspace. Same `rescore` discipline: a
     /// second result for a run is refused unless asked for.
-    async fn rpc_run_workflow_run_gate(
+    /// `runId` plus the optional `phaseId` level selector, shared by the first-score and the
+    /// deliberate-rescore methods. There is no `rescore` parameter on either: the METHOD NAME is
+    /// the guard, which is what the recorder's own rationale asked for and what the wire API did
+    /// not yet honour.
+    fn gate_run_params(
         params: &serde_json::Value,
-        state: &Arc<AppState>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<(String, Option<String>), String> {
         let run_id = params
             .get("runId")
             .and_then(|value| value.as_str())
             .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
-        // Optional: absent targets the PLAN's gate, present targets that phase's — the same
-        // level-selection rule as `run_agent_plan_test_gate`.
+        // Absent targets the PLAN's gate, present targets that phase's — the same level-selection
+        // rule as `run_agent_plan_test_gate`.
         let phase_id = params
             .get("phaseId")
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
             .filter(|value| !value.trim().is_empty());
-        let rescore = params
-            .get("rescore")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let run = crate::services::workflows::score_workflow_run(
-            state, run_id, phase_id, rescore,
-        )
-        .await?;
+        Ok((run_id.to_string(), phase_id))
+    }
+
+    async fn rpc_run_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (run_id, phase_id) = Self::gate_run_params(params)?;
+        let run =
+            crate::services::workflows::score_workflow_run(state, &run_id, phase_id).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Execute the gate again for a run that already has a score, and REPLACE it.
+    ///
+    /// Its own method rather than a flag on the one above. A sitting champion's promoting run is
+    /// refused here too — that is in the service, not in the choice of door.
+    async fn rpc_rescore_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (run_id, phase_id) = Self::gate_run_params(params)?;
+        let run =
+            crate::services::workflows::rescore_workflow_run(state, &run_id, phase_id).await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -3657,6 +3694,8 @@ mod workflow_arena_rpc_tests {
             ("create_workflow_version", "Missing 'workspacePath' parameter"),
             ("get_repo_identity", "Missing 'workspacePath' parameter"),
             ("run_workflow_run_gate", "Missing 'runId' parameter"),
+            ("rescore_workflow_run_gate", "Missing 'runId' parameter"),
+            ("record_workflow_run_rescore", "Missing 'runId' parameter"),
             ("start_workflow_run", "Missing 'workflowId' parameter"),
             ("record_workflow_run_gate", "Missing 'runId' parameter"),
             ("record_workflow_pref", "Missing 'winnerRunId' parameter"),
@@ -3833,10 +3872,11 @@ mod workflow_arena_rpc_tests {
             .error
             .unwrap_or_default()
             .contains("already has a gate result"));
+        // The deliberate replacement is its OWN method, not a flag on the one above.
         let deliberate = AgentService::handle_rpc(
             &rpc(
-                "record_workflow_run_gate",
-                json!({ "runId": run_ids[1], "gateExit": 0, "gateCollected": 12, "rescore": true }),
+                "record_workflow_run_rescore",
+                json!({ "runId": run_ids[1], "gateExit": 0, "gateCollected": 12 }),
             ),
             &state,
         )

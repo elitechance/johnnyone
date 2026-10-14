@@ -204,22 +204,26 @@ describe('QA A r2 — the Float fix and 2^53', () => {
    * `qa_a2_the_rescore_lock_holds_and_releases_correctly`), but any holder of `plans:write` can
    * re-score any other run by passing one extra argument.
    */
-  it('the schema exposes rescore as a flag, which is what the host rationale argued against', () => {
+  it('a rescore is its own mutation, not a flag — matching the host rationale', () => {
     const line = schemaSource
       .split('\n')
       .map((l) => l.trim())
       .filter((l) => !l.startsWith('#'))
       .find((l) => l.startsWith('recordWorkflowRunGate('));
     expect(line, 'recordWorkflowRunGate must exist').toBeTruthy();
-    expect(
-      line,
-      'DEFECT PIN: a rescore flag on the wire. If this stops matching, the flag was removed in ' +
-        'favour of a separate mutation and this test should be inverted.',
-    ).toContain('rescore: Boolean');
-    expect(line, 'at least it is nullable, so the default is the refusing one').not.toContain(
-      'rescore: Boolean!',
-    );
-    // There is no separately-named rescore mutation, which is what would match the rationale.
-    expect(schemaSource).not.toContain('rescoreWorkflowRunGate');
+    // FIXED. The flag is gone from the wire: a second result for a run goes through its own
+    // mutation, so the separate NAME is the guard — there is no flag to forget and no default to
+    // get wrong, which is exactly what the host's rationale asked for and what the wire API had not
+    // yet honoured.
+    expect(line, 'the rescore flag must be gone').not.toContain('rescore');
+    // Both doors exist, one per intent, on both the recorder and the executor.
+    expect(schemaSource).toContain('recordWorkflowRunRescore(');
+    expect(schemaSource).toContain('runWorkflowRunRescore(');
+    const execute = schemaSource
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => !l.startsWith('#'))
+      .find((l) => l.startsWith('runWorkflowRunGate('));
+    expect(execute, 'and not on the executor either').not.toContain('rescore');
   });
 });

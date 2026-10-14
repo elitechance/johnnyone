@@ -16,17 +16,17 @@ interface WorkerEnv { CHAT_RELAY_DO: DurableObjectNamespace; [key: string]: unkn
 // This EXECUTES an arbitrary shell command on the host, so it carries plans:write — the same
 // authority as `runAgentPlanTestGate`, and deliberately not a read scope.
 //
-// `rescore` defaults to FALSE: a second result for a run replaces the only score the arena has, so
-// it must be asked for. A sitting champion's run is refused even with it.
+// There is NO `rescore` flag: executing the gate again for a run that already has a score goes
+// through `rescoreWorkflowRunGate`, its own mutation. A sitting champion's run is refused either
+// way.
 export default async function runWorkflowRunGate(
   _parent: unknown,
-  args: { runId: string; phaseId?: string | null; rescore?: boolean | null },
+  args: { runId: string; phaseId?: string | null },
   ctx: ResolverContext,
 ) {
   await authorizeForAltToken(ctx, 'plans:write');
   return desktopRpc<unknown>(ctx, 'run_workflow_run_gate', {
     runId: args.runId,
     phaseId: args.phaseId ?? null,
-    rescore: args.rescore ?? false,
   });
 }

@@ -892,17 +892,25 @@ fn qa_a2_a_stale_promote_row_cannot_launder_a_displacement() {
 /// | `{"qwen":9}` vs `{"qwen":9}`| equal -> comparable     | both unscoreable BUT identical -> escape -> comparable |
 /// | unreadable, either side     | refuse (fail closed)    | refuse (fail closed) |
 ///
-/// The identity escape re-admits exactly the pairs equality admitted and no others, so the rewrite
-/// does not change a single comparability outcome. The stated reason for it was that equality
-/// "collapses to never once contention is real" — and the replacement collapses to never in
-/// precisely the same cases. What actually changed is the refusal TEXT and a new per-run
-/// `scoreable` reason a client can display. Both are worth having; neither is the behavioural
-/// change the rewrite was asked for.
+/// The identity escape re-admitted exactly the pairs equality admitted and no others, so that
+/// rewrite changed not a single comparability outcome — the refusal TEXT and the per-run
+/// `scoreable` reason were the whole delta.
 ///
-/// This test therefore asserts outcomes only, and passing against both implementations IS the
-/// evidence.
+/// **ROUND 4 — that finding was accepted and the escape is GONE.** The third and final rule is "a
+/// run that saw ANY foreign contention is not scoreable, full stop", which flips the last row of
+/// the table below from comparable to refused. That one row IS the behavioural difference, and this
+/// test now pins it rather than demonstrating its absence.
+///
+/// | winner / loser `fleet_busy`  | equality | exclude + escape | exclude, NO escape |
+/// |---|---|---|---|
+/// | `{}` vs `{}`                 | comparable | comparable | comparable |
+/// | `{}` vs `{"qwen":0}`         | comparable | comparable | comparable |
+/// | `{}` vs `{"qwen":1}`         | refuse     | refuse     | refuse |
+/// | `{"qwen":1}` vs `{"qwen":2}` | refuse     | refuse     | refuse |
+/// | `{"qwen":9}` vs `{"qwen":9}` | comparable | comparable | **refuse** |
+/// | unreadable, either side      | unreachable through the service — both maps are validated |
 #[test]
-fn qa_a2_both_comparability_rules_admit_exactly_the_same_pairs() {
+fn qa_a2_the_no_escape_rule_refuses_identical_contention_too() {
     let (state, _root) = test_state();
     let w = workflow(&state, KEY.0, KEY.1, KEY.2);
     let seats = r#"{"glm":2}"#;
@@ -923,10 +931,16 @@ fn qa_a2_both_comparability_rules_admit_exactly_the_same_pairs() {
     assert!(!pair(r#"{"qwen":1}"#, "{}"), "and symmetrically");
     assert!(!pair(r#"{"qwen":1}"#, r#"{"qwen":2}"#), "different loads");
     assert!(
-        pair(r#"{"qwen":4096,"glm":77}"#, r#"{"glm":77,"qwen":4096}"#),
-        "identical heavy contention is comparable under BOTH rules — key order is normalised, and \
-         this is the row that shows the rewrite changed no outcome"
+        !pair(r#"{"qwen":4096,"glm":77}"#, r#"{"glm":77,"qwen":4096}"#),
+        "identical heavy contention is REFUSED under the no-escape rule: this is the one row that \
+         differs from both earlier rules, and therefore the whole behavioural change"
     );
+    // Key-order normalisation still holds where it matters — the two maps above ARE equal as
+    // budgets, which is why this row could only ever have been decided by the escape.
+    assert!(contention_was_identical(
+        r#"{"qwen":4096,"glm":77}"#,
+        r#"{"glm":77,"qwen":4096}"#
+    ));
     // The unreadable rows of the table are UNREACHABLE through the service, which is a stronger
     // guarantee than failing closed: `start_workflow_run_with_budget` validates both maps before
     // the insert, so no run can be stored with a contention map that cannot be parsed.
@@ -955,8 +969,8 @@ fn qa_a2_both_comparability_rules_admit_exactly_the_same_pairs() {
     assert!(!contention_was_identical("{}", "{"));
     assert!(
         !contention_was_identical("{", "{"),
-        "two identically-unreadable maps are not rescued by the identity escape: both rules parse \
-         first and fail closed"
+        "two identically-unreadable maps are not treated as equal: the predicate parses first and \
+         fails closed, which is why no version of the rule could ever have used them"
     );
 }
 
@@ -1156,7 +1170,7 @@ fn qa_a2_the_rescore_lock_holds_and_releases_correctly() {
 /// bounded by the host; `gate_collected` is deliberately NOT, which is the field that then has to
 /// survive the wire.
 #[test]
-fn qa_a2_the_host_bounds_everything_except_gate_collected() {
+fn qa_a2_the_host_bounds_every_numeric_including_gate_collected() {
     let (state, _root) = test_state();
 
     // fan_out
@@ -1243,22 +1257,39 @@ fn qa_a2_the_host_bounds_everything_except_gate_collected() {
         .expect("the boundary is allowed");
     assert_eq!(scored.gate_exit, Some(i32::MAX as i64));
 
-    // gate_collected: deliberately unbounded, and it round-trips as an i64 beyond 2^53 — where a
-    // JSON number stops being exactly representable as an IEEE-754 double. The wire consequence is
-    // measured in worker/lib/ai-scope-tests/workflow-arena-int32-qa.test.ts.
+    // **ROUND 4: gate_collected is bounded too, and this test is inverted from the pin that said
+    // it was not.** It was left unbounded on the grounds that refusing a real gate result over an
+    // advisory number is the wrong trade — which made it the ONE field able to carry a value an
+    // IEEE-754 double cannot hold. The corruption was silent and happened before GraphQL: the host
+    // stored and serialised an exact i64, and `JSON.parse` rounded it in the worker. No error, no
+    // null, no log. A refusal beats a wrong number that looks healthy.
     let run2 = measured_run(&state, &normal.id);
-    let huge = 9_007_199_254_740_993_i64; // 2^53 + 1, the first integer a double cannot hold
-    let scored2 =
-        record_workflow_run_gate(&state, &run2.id, 0, Some(huge)).expect("unbounded on purpose");
-    assert_eq!(
-        scored2.gate_collected,
-        Some(huge),
-        "the host stores 2^53+1 exactly"
-    );
+    for bad in [
+        9_007_199_254_740_992_i64, // 2^53 — the first value whose +1 is unrepresentable
+        9_007_199_254_740_993_i64, // 2^53 + 1 — the first integer a double cannot hold
+        i64::MAX,
+        -1,
+    ] {
+        let error = record_workflow_run_gate(&state, &run2.id, 0, Some(bad))
+            .expect_err("an unrepresentable or negative collected count must be refused");
+        assert!(
+            error.contains("gateCollected"),
+            "for {bad}: the refusal must name the field: {error}"
+        );
+    }
+    // MAX_SAFE_INTEGER itself is allowed and round-trips exactly — the bound is the last value a
+    // double holds, not one short of it.
+    let scored2 = record_workflow_run_gate(&state, &run2.id, 0, Some(MAX_GATE_COLLECTED))
+        .expect("the boundary is allowed");
+    assert_eq!(scored2.gate_collected, Some(MAX_GATE_COLLECTED));
     let json = serde_json::to_value(&scored2).expect("serialise");
     assert_eq!(
         json["gateCollected"].as_i64(),
-        Some(huge),
-        "and serialises it exactly: the precision is lost later, on the wire, not here"
+        Some(MAX_GATE_COLLECTED),
+        "and serialises exactly, with nothing left for the wire to round"
+    );
+    assert_eq!(
+        MAX_GATE_COLLECTED, 9_007_199_254_740_991,
+        "the bound is Number.MAX_SAFE_INTEGER, so no client can round what the host accepts"
     );
 }

@@ -100,6 +100,8 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/ai/record-workflow-pref.ts',
   'resolvers/ai/record-workflow-rejection.ts',
   'resolvers/ai/record-workflow-run-gate.ts',
+  'resolvers/ai/record-workflow-run-rescore.ts',
+  'resolvers/ai/run-workflow-run-rescore.ts',
   'resolvers/ai/repo-identity.ts',
   'resolvers/ai/run-workflow-run-gate.ts',
   'resolvers/ai/start-workflow-run.ts',

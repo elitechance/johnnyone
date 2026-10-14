@@ -163,3 +163,19 @@ CREATE TABLE workflow_decisions (
   created_at TEXT NOT NULL
 );
 CREATE INDEX workflow_decisions_run ON workflow_decisions(run_id);
+
+-- WHAT THIS TABLE CANNOT ENFORCE, stated so nobody mistakes the guards above for the whole rule.
+--
+-- A `resume` is only legitimate when the family is actually HALTED — three distinct rejected
+-- candidates with no later resume. That is a question about the preceding ROWS of this table, and
+-- SQLite CHECK constraints may not contain subqueries, so no CHECK can express it. A writer that
+-- bypasses `services::workflows::resume_workflow_search` can therefore insert a well-formed
+-- `resume` with one strike on the board, and the streak walk will honour it: a free reset.
+--
+-- The service refuses exactly that (`resume_workflow_search` reads the state first and errors when
+-- nothing is halted), so the only reachable path is correct. What the table CAN express it now
+-- does: the allowed `kind` values, a reason that is present, visible and bounded, and the foreign
+-- key to a real run. The remaining gap is a trigger or an application-level invariant check, and
+-- neither is worth a migration until a second writer actually exists.
+--
+-- The same is true of "three consecutive rejections": it is a property of a sequence, not of a row.

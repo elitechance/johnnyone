@@ -249,6 +249,20 @@ pub struct RunBudget {
 /// put a megabyte in the decision log and then serve it on every read of that family's state.
 pub const MAX_REASON_CHARS: usize = 2_000;
 
+/// The largest advisory collected-test count the arena will accept: `Number.MAX_SAFE_INTEGER`.
+///
+/// This field was DELIBERATELY left unbounded — refusing a real gate result because an advisory
+/// number is large is the wrong trade — and that made it the one field able to carry a value an
+/// IEEE double cannot hold. The corruption happens BEFORE GraphQL: the host serialises an exact
+/// `i64` and `JSON.parse` rounds it in the worker. No error, no null, no log — a wrong number that
+/// looks healthy, which is worse than either a refusal or a visible gap. The input side rounds too,
+/// so a client sending 2^53+1 has the rounded value reach the resolver.
+///
+/// A collected test count cannot legitimately exceed nine quadrillion, so the bound costs nothing
+/// real and a loud refusal beats a quiet wrong number. `gate_exit` is bounded separately and far
+/// more tightly: it is a process exit code.
+pub const MAX_GATE_COLLECTED: i64 = 9_007_199_254_740_991;
+
 /// How long any one prompt part (role / instruction / contract) or a hop may be. Generous — these
 /// are real prompt bodies — but not unbounded, for the same reason as above: they are served on
 /// `workflows: [Workflow!]!`, so one pathological row slows every champion listing.
@@ -521,9 +535,13 @@ pub fn run_is_scoreable(run: &WorkflowRun) -> Option<String> {
     scoreability(&run.fleet_busy)
 }
 
-/// Two runs saw the SAME foreign contention, which is genuinely like-for-like even when neither
-/// was quiet. It will not arise in practice — live contention does not repeat — but it is a real
-/// comparison when it does, so it is not refused.
+/// Whether two runs saw the SAME foreign contention.
+///
+/// **Not part of any rule.** It was briefly the "like-for-like" escape in
+/// [`preference_comparability`], and that escape is gone: it re-admitted exactly the pairs the
+/// previous rule admitted, so it changed no outcome at all. Kept as a public predicate because the
+/// audit suite drives it directly to show that two identically-UNREADABLE maps are not treated as
+/// equal — a property of [`parse_seat_map`] worth pinning somewhere.
 pub fn contention_was_identical(left_fleet_busy: &str, right_fleet_busy: &str) -> bool {
     match (parse_seat_map(left_fleet_busy), parse_seat_map(right_fleet_busy)) {
         (Ok(left), Ok(right)) => left == right,
@@ -538,8 +556,8 @@ pub fn contention_was_identical(left_fleet_busy: &str, right_fleet_busy: &str) -
 ///
 /// 1. identical seat budgets ([`budgets_are_comparable`]);
 /// 2. both runs SCOREABLE — neither started under foreign contention ([`run_is_scoreable`]) — or,
-///    failing that, both having seen identical contention ([`contention_was_identical`]), which
-///    is like-for-like;
+///    There is NO escape for two runs that saw identical contention — see the rule's own
+///    history in the match below;
 /// 3. the same `(repo, phase_type, family)`. `family` is the design's central identity claim — a
 ///    hop tuned around one context window does not transfer to another — so a cross-family
 ///    head-to-head is not an incomparable measurement, it is a measurement of two different
@@ -555,30 +573,37 @@ pub fn preference_comparability(
 ) -> Option<String> {
     if !same_champion_key {
         return Some(
-            "the two runs are in different (repo, phase_type, family) keys: a champion is keyed on              that triple, and a hop tuned for one model family does not transfer to another, so              this pair measures two different things rather than comparing one"
+            "the two runs are in different (repo, phase_type, family) keys: a champion is keyed on that triple, and a hop tuned for one model family does not transfer to another, so this pair measures two different things rather than comparing one"
                 .to_string(),
         );
     }
     if !budgets_are_comparable(&winner.seats_held, &loser.seats_held) {
         return Some("the two runs held different seat budgets".to_string());
     }
-    // Exclude rather than compare: a run taken under load cannot be scored at all. The
-    // identical-contention escape keeps a genuinely like-for-like pair comparable.
+    // **No escape.** A run that saw ANY foreign contention is not scoreable, full stop — even
+    // against another run that saw identical contention.
+    //
+    // Three rules have been written here, and the first two were wrong for the same reason.
+    // (1) "comparable iff the `fleet_busy` maps are EQUAL": right in principle, but contention is a
+    // live measurement and two runs minutes apart are never byte-identical, so it collapses to
+    // "never" and the feature looks finished while promoting nothing. (2) "exclude the contended,
+    // with an escape for two runs that saw IDENTICAL contention": the full truth table admits
+    // exactly the pairs equality admitted, row for row — a rule that admits the same set is not a
+    // new rule, it is a better error message. (3) this one, which flips the
+    // identical-but-contended row from comparable to REFUSED. That is a real behavioural
+    // difference, it is enforceable, and it says one honest thing: the arena scores on a quiet
+    // fleet.
+    //
+    // The per-run reason survives all three and is the part worth keeping: a client can say WHY a
+    // run cannot compete instead of showing a mysteriously inert one.
     match (run_is_scoreable(winner), run_is_scoreable(loser)) {
         (None, None) => None,
-        (winner_block, loser_block) => {
-            if contention_was_identical(&winner.fleet_busy, &loser.fleet_busy) {
-                return None;
-            }
-            Some(match (&winner_block, &loser_block) {
-                (Some(reason), Some(_)) => {
-                    format!("both runs are unscoreable; the winning run: {}", reason)
-                }
-                (Some(reason), None) => format!("the winning run is unscoreable: {}", reason),
-                (None, Some(reason)) => format!("the losing run is unscoreable: {}", reason),
-                (None, None) => unreachable!("the all-scoreable case is handled above"),
-            })
-        }
+        (Some(reason), Some(_)) => Some(format!(
+            "both runs are unscoreable; the winning run: {}",
+            reason
+        )),
+        (Some(reason), None) => Some(format!("the winning run is unscoreable: {}", reason)),
+        (None, Some(reason)) => Some(format!("the losing run is unscoreable: {}", reason)),
     }
 }
 
@@ -1053,6 +1078,25 @@ pub fn start_workflow_run(state: &AppState, input: NewWorkflowRun) -> Result<Wor
     start_workflow_run_with_budget(state, input, budget)
 }
 
+/// **A DESIGN LIMIT, written down because nothing else writes it down: the arena cannot search over
+/// `fan_out`.**
+///
+/// `seats_held` is derived here from the workflow's OWN `fan_out`. Comparability requires identical
+/// `seats_held` ([`budgets_are_comparable`]). Therefore two workflows that declare different widths
+/// can never produce a comparable preference, and a cheaper or wider challenger can never displace
+/// the champion. What CAN be searched over is the four prompt parts — role, instruction, contract,
+/// hop — and the model family, each within one fixed width.
+///
+/// The only workaround is to run the challenger on the incumbent's budget via the `seats` override,
+/// and that is not a search over width: the width being tested is then not the width that ran.
+///
+/// This follows from the design rather than contradicting it — `schema.md` is explicit that
+/// mismatched budgets cannot promote, and the reason is sound (a champion crowned on three seats
+/// and a challenger run on one are not the same experiment). But the mock's own step 5 shows width
+/// 1 against width 2 and step 7 promotes it, so the spec and the schema disagree about whether
+/// width is searchable. Resolving that is a product decision, not a host one; this paragraph exists
+/// so that whoever meets the limit meets the explanation with it.
+///
 /// **The budget measurement.** The one function that produces a run's `seats_held` and
 /// `fleet_busy` snapshots.
 ///
@@ -1265,6 +1309,22 @@ fn set_gate_result(
             gate_exit
         ));
     }
+    // See [`MAX_GATE_COLLECTED`]. Left unbounded on purpose, which made it the only field that
+    // could carry a value a double silently ROUNDS — in `JSON.parse`, before GraphQL ever sees it.
+    if let Some(collected) = gate_collected {
+        if collected < 0 {
+            return Err(format!(
+                "gateCollected {} is negative: a test count cannot be",
+                collected
+            ));
+        }
+        if collected > MAX_GATE_COLLECTED {
+            return Err(format!(
+                "gateCollected {} is above {} (Number.MAX_SAFE_INTEGER) and would be silently ROUNDED on its way to any client, by JSON.parse before GraphQL sees it. A collected test count cannot legitimately be that large, and a refusal beats a wrong number that looks healthy",
+                collected, MAX_GATE_COLLECTED
+            ));
+        }
+    }
     let ended_at = Utc::now().to_rfc3339();
     state.db.with_conn(|conn| {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -1345,6 +1405,29 @@ fn set_gate_result(
 /// score (`TEST_GATE_EXIT_MALFORMED`), not a refusal: something was declared and could not be run,
 /// and that is a failure rather than an absence.
 pub async fn score_workflow_run(
+    state: &AppState,
+    run_id: &str,
+    phase_id: Option<String>,
+) -> Result<WorkflowRun, String> {
+    execute_gate(state, run_id, phase_id, false).await
+}
+
+/// [`score_workflow_run`] for a run that already HAS a score: execute the gate again and replace
+/// it, deliberately.
+///
+/// A separate entry point rather than a `rescore: bool`, for the reason the recorder's own doc
+/// comment gives and the wire API had not yet honoured: the separate NAME is the guard. There is no
+/// flag to forget, no default to get wrong, and a reader of a call site can see which was meant.
+/// The sitting champion's promoting run is still refused here, whichever door is used.
+pub async fn rescore_workflow_run(
+    state: &AppState,
+    run_id: &str,
+    phase_id: Option<String>,
+) -> Result<WorkflowRun, String> {
+    execute_gate(state, run_id, phase_id, true).await
+}
+
+async fn execute_gate(
     state: &AppState,
     run_id: &str,
     phase_id: Option<String>,
@@ -3064,7 +3147,7 @@ mod tests {
         let run = start_against_plan(&state, &workflow.id, &green_plan);
         assert_eq!(run.gate_exit, None, "nothing has run yet");
 
-        let scored = score_workflow_run(&state, &run.id, None, false)
+        let scored = score_workflow_run(&state, &run.id, None)
             .await
             .expect("score");
         assert_eq!(scored.gate_exit, Some(0), "the gate passed");
@@ -3081,7 +3164,7 @@ mod tests {
         // A gate that FAILS records the failing exit code, not an error.
         let red_plan = seed_plan(&state, &workspace, Some(r#"["exit 7"]"#));
         let red_run = start_against_plan(&state, &workflow.id, &red_plan);
-        let red = score_workflow_run(&state, &red_run.id, None, false)
+        let red = score_workflow_run(&state, &red_run.id, None)
             .await
             .expect("a failing gate is a score, not an error");
         assert_eq!(red.gate_exit, Some(7), "the first failing command's code");
@@ -3117,7 +3200,7 @@ mod tests {
         for declared in [None, Some("[]"), Some("   ")] {
             let plan = seed_plan(&state, &workspace, declared);
             let run = start_against_plan(&state, &workflow.id, &plan);
-            let error = score_workflow_run(&state, &run.id, None, false)
+            let error = score_workflow_run(&state, &run.id, None)
                 .await
                 .expect_err("an ungated plan must not be scored");
             assert!(
@@ -3144,11 +3227,11 @@ mod tests {
         let plan = seed_plan(&state, &workspace, Some(r#"["true"]"#));
         let run = start_against_plan(&state, &workflow.id, &plan);
 
-        score_workflow_run(&state, &run.id, None, false)
+        score_workflow_run(&state, &run.id, None)
             .await
             .expect("first score");
 
-        let refused = score_workflow_run(&state, &run.id, None, false)
+        let refused = score_workflow_run(&state, &run.id, None)
             .await
             .expect_err("a silent re-score must be refused");
         assert!(
@@ -3158,13 +3241,13 @@ mod tests {
         );
 
         // Deliberate re-scoring goes through …
-        score_workflow_run(&state, &run.id, None, true)
+        rescore_workflow_run(&state, &run.id, None)
             .await
             .expect("deliberate rescore");
 
         // … until the run is the evidence a sitting champion rests on.
         promote_workflow(&state, &run.id, None, true).expect("promote");
-        let locked = score_workflow_run(&state, &run.id, None, true)
+        let locked = rescore_workflow_run(&state, &run.id, None)
             .await
             .expect_err("a champion's evidence must not be rewritable");
         assert!(
@@ -3238,7 +3321,7 @@ mod tests {
         let run = start(&state, &workflow.id, r#"{"glm":3}"#);
         assert_eq!(run.plan_id, None);
 
-        let error = score_workflow_run(&state, &run.id, None, false)
+        let error = score_workflow_run(&state, &run.id, None)
             .await
             .expect_err("no plan, nothing to run");
         assert!(error.contains("has no plan"), "got: {}", error);
@@ -3264,7 +3347,7 @@ mod tests {
             .unwrap()
             .halted);
 
-        let error = score_workflow_run(&state, &target.id, None, false)
+        let error = score_workflow_run(&state, &target.id, None)
             .await
             .expect_err("a halted search must not score");
         assert!(error.contains("is halted"), "got: {}", error);
@@ -3279,7 +3362,7 @@ mod tests {
     #[tokio::test]
     async fn scoring_an_unknown_run_is_not_found() {
         let (state, _root) = test_state();
-        assert!(score_workflow_run(&state, "nope", None, false)
+        assert!(score_workflow_run(&state, "nope", None)
             .await
             .expect_err("unknown run")
             .contains("not found"));

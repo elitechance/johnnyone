@@ -658,10 +658,11 @@ type WorkflowRun {
   # legitimate gate with a perfectly well-known exit code. Never gate on it, never rank on it. Its
   # one job is to let a human notice a suite that collects NOTHING — such a suite exits 0 and
   # scores every workflow identically, so the search would follow pure noise unreported.
-  # DELIBERATELY UNBOUNDED on the host, and therefore `Float`: refusing a real gate result because
-  # an advisory count was large would be the wrong trade, and on a 32-bit field an over-range count
-  # would arrive as `null` — which this field already defines as "nothing was parseable", the
-  # inverse claim, delivered silently.
+  # `Float`, and BOUNDED on the host at Number.MAX_SAFE_INTEGER. It was left unbounded on the
+  # grounds that refusing a real gate result over an advisory number is the wrong trade — which made
+  # it the one field able to carry a value an IEEE-754 double cannot hold. The corruption was silent
+  # and happened BEFORE GraphQL: the host serialised an exact i64 and JSON.parse rounded it in the
+  # worker. No error, no null, no log. A refusal beats a wrong number that looks healthy.
   gateCollected: Float
   # JSON object, model → seats. The seat budget this run held; the comparability rule reads this.
   seatsHeld: String!
@@ -882,7 +883,15 @@ type Mutation {
   # champion's own run could be re-scored red after the fact. The run a SITTING CHAMPION was
   # promoted on is refused even with `rescore: true` — editing the evidence under a promotion that
   # already happened is falsification, not correction.
-  recordWorkflowRunGate(runId: ID!, gateExit: Float!, gateCollected: Float, rescore: Boolean): WorkflowRun!
+  recordWorkflowRunGate(runId: ID!, gateExit: Float!, gateCollected: Float): WorkflowRun!
+  # Replace a run's gate result with one measured elsewhere, DELIBERATELY.
+  #
+  # Its own field rather than a `rescore: Boolean` on the one above. The host's rationale for two
+  # entry points was "the separate name IS the guard: there is no flag to forget and no default to
+  # get wrong" — and the wire API still took a boolean, so on the only surface a client can reach,
+  # the guard WAS the flag that rationale rejected. The sitting champion's promoting run is refused
+  # through either field.
+  recordWorkflowRunRescore(runId: ID!, gateExit: Float!, gateCollected: Float): WorkflowRun!
   # EXECUTE an arena run's gate and record the result — the step that closes the arena's loop.
   #
   # recordWorkflowRunGate takes a score someone else measured; this one MEASURES it, by running the
@@ -894,7 +903,14 @@ type Mutation {
   # declares NO gate at either level — that last one matters most: an exit code of 0 is returned
   # both by a gate that passed and by a phase with no gate, so recording it would make an ungated
   # run look promotable. A phase with no gate cannot compete.
-  runWorkflowRunGate(runId: ID!, phaseId: String, rescore: Boolean): WorkflowRun!
+  runWorkflowRunGate(runId: ID!, phaseId: String): WorkflowRun!
+  # Execute the gate AGAIN for a run that already has a score, and replace it. Its own field, for
+  # the same reason as recordWorkflowRunRescore.
+  #
+  # Named runWorkflowRunRescore rather than rescoreWorkflowRunGate because lokal infers the field
+  # type from the resolver filename's leading verb and `rescore-` is not a mutation prefix, so the
+  # other spelling auto-wires as a Query.
+  runWorkflowRunRescore(runId: ID!, phaseId: String): WorkflowRun!
   # There is deliberately no `comparable` argument — see WorkflowPref.comparable.
   #
   # IDEMPOTENT per ordered pair: calling it again for the same (winner, loser) returns the EXISTING

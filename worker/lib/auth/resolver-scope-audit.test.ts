@@ -71,6 +71,8 @@ const SCOPE_GATED: Record<string, string> = {
   'create-workflow-version.ts': 'plans:write',
   'start-workflow-run.ts': 'plans:write',
   'record-workflow-run-gate.ts': 'plans:write',
+  'record-workflow-run-rescore.ts': 'plans:write',
+  'run-workflow-run-rescore.ts': 'plans:write',
   'repo-identity.ts': 'plans:read',
   // Runs an arbitrary shell command on the host, like run-agent-plan-test-gate.
   'run-workflow-run-gate.ts': 'plans:write',

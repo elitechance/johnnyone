@@ -639,13 +639,26 @@ fn qa_a_comparable_requires_matching_fleet_contention() {
     assert!(error.contains("not comparable"), "got: {error}");
     assert_eq!(champion_of(&state, "repo", "dev-phase", "glm"), None);
 
-    // Under EQUAL contention the same pair is comparable again, so the rule discriminates on
-    // contention rather than simply refusing everything.
+    // ROUND 4: identical contention is NO LONGER an escape. Two runs that saw the same foreign
+    // load are both unscoreable and the pair is REFUSED — this is the one row that differs from
+    // both earlier rules, and therefore the whole behavioural change the final ruling asked for.
     let a = run_with(&state, &w.id, seats, r#"{"glm":4}"#);
     let a = record_workflow_run_gate(&state, &a.id, 0, None).expect("gate");
     let b = run_with(&state, &w.id, seats, r#"{"glm":4}"#);
     let b = record_workflow_run_gate(&state, &b.id, 1, None).expect("gate");
-    assert!(record_workflow_pref(&state, &a.id, &b.id, None)
+    assert!(
+        !record_workflow_pref(&state, &a.id, &b.id, None)
+            .expect("pref")
+            .comparable,
+        "identical foreign contention is not a like-for-like escape: the arena scores on a QUIET fleet"
+    );
+    // And a QUIET pair IS comparable, so the rule discriminates on contention rather than simply
+    // refusing everything.
+    let quiet_a = run_with(&state, &w.id, seats, "{}");
+    let quiet_a = record_workflow_run_gate(&state, &quiet_a.id, 0, None).expect("gate");
+    let quiet_b = run_with(&state, &w.id, seats, "{}");
+    let quiet_b = record_workflow_run_gate(&state, &quiet_b.id, 1, None).expect("gate");
+    assert!(record_workflow_pref(&state, &quiet_a.id, &quiet_b.id, None)
         .expect("pref")
         .comparable);
 }
@@ -992,7 +1005,10 @@ fn qa_a_gate_collected_round_trips_none_and_zero_distinctly() {
     let (state, _root) = test_state();
     let w = workflow(&state, "repo", "dev-phase", "glm");
 
-    for expected in [None, Some(0), Some(1), Some(i64::MAX)] {
+    // Round 4: `i64::MAX` is refused now — above MAX_GATE_COLLECTED a count would be silently
+    // ROUNDED by JSON.parse before GraphQL saw it. The boundary value itself still round-trips,
+    // which keeps this test about NULLABILITY rather than about the bound.
+    for expected in [None, Some(0), Some(1), Some(MAX_GATE_COLLECTED)] {
         let run = run_with(&state, &w.id, "{}", "{}");
         let scored = record_workflow_run_gate(&state, &run.id, 0, expected).expect("gate");
         assert_eq!(scored.gate_collected, expected, "the write's return value");

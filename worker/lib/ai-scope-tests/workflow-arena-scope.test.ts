@@ -120,8 +120,19 @@ describe('workflow arena resolver seam', () => {
         '../../resolvers/ai/run-workflow-run-gate',
         'run_workflow_run_gate',
         { runId: 'r1' },
-        // Same rescore discipline as the recorder: the default must refuse, not overwrite.
-        { runId: 'r1', phaseId: null, rescore: false },
+        { runId: 'r1', phaseId: null },
+      ],
+      [
+        '../../resolvers/ai/record-workflow-run-rescore',
+        'record_workflow_run_rescore',
+        { runId: 'r1', gateExit: 1 },
+        { runId: 'r1', gateExit: 1, gateCollected: null },
+      ],
+      [
+        '../../resolvers/ai/run-workflow-run-rescore',
+        'rescore_workflow_run_gate',
+        { runId: 'r1' },
+        { runId: 'r1', phaseId: null },
       ],
       [
         '../../resolvers/ai/record-workflow-run-gate',
@@ -129,9 +140,10 @@ describe('workflow arena resolver seam', () => {
         { runId: 'r1', gateExit: 0 },
         // The advisory count relays as NULL when omitted — never as 0, which would be the
         // different and much stronger claim "this gate collected nothing".
-        // `rescore` relays as FALSE when omitted: a second result for a run must be refused by
-        // default, not silently overwrite the only score the arena has.
-        { runId: 'r1', gateExit: 0, gateCollected: null, rescore: false },
+        // No `rescore` key at all: a second result goes through its own mutation, because the
+        // separate NAME is the guard and a boolean on this field was the guard the host's own
+        // rationale rejected.
+        { runId: 'r1', gateExit: 0, gateCollected: null },
       ],
       [
         '../../resolvers/ai/record-workflow-pref',
@@ -224,7 +236,10 @@ describe('workflow arena resolver seam', () => {
     expect(gate).toContain('gateExit: Float!');
     expect(gate).toContain('gateCollected: Float');
     expect(gate).not.toContain('gateCollected: Float!');
-    expect(gate, 'a re-score must be an explicit argument').toContain('rescore: Boolean');
+    // A re-score is its OWN field, not an argument. The separate name is the guard.
+    expect(gate, 'rescore must not be an argument').not.toContain('rescore');
+    expect(fieldLine('recordWorkflowRunRescore')).toContain('gateExit: Float!');
+    expect(fieldLine('runWorkflowRunRescore')).toContain('phaseId: String');
 
     // Lifting a halt is its own mutation, with both of its arguments non-null. A promotion must
     // never be the thing that clears a halt again.
@@ -261,7 +276,7 @@ describe('workflow arena resolver seam', () => {
     // The executor that closes the loop, with the same rescore argument as the recorder.
     const execute = fieldLine('runWorkflowRunGate');
     expect(execute, 'runWorkflowRunGate must exist').toBeTruthy();
-    expect(execute).toContain('rescore: Boolean');
+    expect(execute, 'rescore must not be an argument here either').not.toContain('rescore');
 
     // Scoreability is served per run, so a client can say WHY a run cannot compete.
     expect(schemaSource).toContain('scoreable: Boolean!');
@@ -305,7 +320,7 @@ describe('workflow arena resolver seam', () => {
       'update_workflow_search_resumed',
     ];
     reads.push('list_workflow_prefs', 'get_repo_identity');
-    writes.push('run_workflow_run_gate');
+    writes.push('run_workflow_run_gate', 'rescore_workflow_run_gate', 'record_workflow_run_rescore');
     for (const read of reads) {
       expect(
         isReadRpcCacheable(read),
