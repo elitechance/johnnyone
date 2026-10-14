@@ -1241,13 +1241,22 @@ pub fn update_test_commands(
     commands: Vec<String>,
     clear: bool,
 ) -> Result<AgentPlanRun, String> {
+    // Judge the CONTRADICTION on what the caller actually sent, before blanks are filtered.
+    //
+    // Filtering first made the rule inconsistent: `clear: true` with `["npm test"]` was rejected,
+    // but `clear: true` with `["   "]` was accepted and silently cleared, because the blank was
+    // removed before the check ran. Same contradictory intent, two different outcomes, decided by
+    // whitespace. A caller who passed any command alongside `clear` has said two things at once and
+    // should hear about it either way.
+    let sent_any_command = !commands.is_empty();
     let commands: Vec<String> = commands
         .into_iter()
         .filter(|command| !command.trim().is_empty())
         .collect();
-    if clear && !commands.is_empty() {
+    if clear && sent_any_command {
         return Err(
-            "Pass either `commands` to set the test gate or `clear: true` to remove it, not both."
+            "Pass either `commands` to set the test gate or `clear: true` to remove it, not both. \
+             (A blank or whitespace-only command still counts as passing one.)"
                 .to_string(),
         );
     }
@@ -2811,6 +2820,16 @@ pub const TEST_GATE_STREAM_CAP_BYTES: usize = 128 * 1024;
 /// saying so beats hanging.
 pub const TEST_GATE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
+/// How long the gate waits for output to arrive AFTER the command itself has exited.
+///
+/// The capture stops at the command's exit, not at pipe EOF, because a background job the gate
+/// started inherits the pipes and holds them open (see `run_one_gate_command_with_timeout`). This
+/// short window is the flush allowance: whatever the gate itself wrote is already in the pipe, and
+/// a reader that stops instantly can still race the final write. It is deliberately far shorter
+/// than any plausible test-runner runtime, because it is not waiting for work — only for bytes
+/// already in flight.
+pub const TEST_GATE_PIPE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Reserved `TestGateRun::exit_code` values for outcomes where the command produced no code.
 ///
 /// All are NON-ZERO, so any caller correctly treating "zero passed, non-zero failed" refuses them
@@ -2828,56 +2847,119 @@ pub const TEST_GATE_EXIT_TIMEOUT: i32 = -3;
 /// fills the pipe buffer and the child blocks on write forever, which would turn an over-chatty
 /// gate into a hung coordinator instead of a reported exit code.
 ///
-/// The window is a `VecDeque` ring, not a `Vec` that gets `drain(..overflow)`ed. The `Vec` shape
-/// memmoves the whole retained window on every read once past the cap — O(output x cap), roughly
-/// 16 GiB of memmove for a gate printing 1 GiB. The ring is O(output). Memory was already bounded;
-/// this bounds the CPU too.
+/// The window is a `Vec` with `drain(..overflow)` once past the cap. That shape memmoves `cap`
+/// bytes per read, which sounds quadratic and is not: it is O(output) with a constant factor of
+/// `cap / read_size` = 16, done by a vectorised `memmove` over a cache-resident 128 KiB buffer.
+///
+/// An earlier revision replaced this with a `VecDeque` ring on the theory that the `Vec` form was
+/// O(output x cap). **That theory was wrong**, and the ring measured far SLOWER: `extend(iter()
+/// .copied())` plus per-byte `pop_front()` is ~2 operations per byte of the whole stream, where
+/// this form is two memcpy intrinsics. Best of 3, 128 KiB cap, same harness, DEBUG profile (the
+/// profile the test suite runs):
+///
+/// | output | `VecDeque` ring | this `Vec` form |
+/// |--------|-----------------|-----------------|
+/// |  6 MiB |   75.8 ms       |   1.10 ms       |
+/// | 24 MiB |  305.6 ms       |   5.04 ms       |
+/// | 96 MiB | 1227.0 ms       |  19.78 ms       |
+///
+/// Both are linear — ratios 4.03/4.02 for the ring, 4.58/3.92 for this — the ring simply has a
+/// ~60x worse constant. In release the gap narrows to ~2.5x as the per-byte loop vectorises, so
+/// the ring loses in both profiles.
+///
+/// A fixed-size ring with bulk `copy_from_slice` does beat this (0.22 / 1.68 / 7.16 ms) and was
+/// deliberately NOT taken: it needs modular arithmetic and a split copy, and reassembling the
+/// window in the wrong order would silently corrupt the tail — the one thing this function exists
+/// to deliver correctly. 19.78 ms to absorb 96 MiB does not buy that risk.
 ///
 /// Returns the kept text, whether the cap discarded anything, and the read error if one ended the
 /// drain. A read error is NOT the same as EOF: it also yields a short capture, and reporting it
 /// separately stops a truncated-by-failure window from reading as a complete one.
-async fn drain_capped_tail<R>(mut reader: R, cap: usize) -> (String, bool, Option<String>)
+async fn drain_capped_tail<R>(reader: R, cap: usize) -> (String, bool, Option<String>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
+    drain_capped_tail_into(reader, cap, shared.clone()).await;
+    GateCapture::take(&shared)
+}
+
+/// A gate stream's capture, published after every read.
+///
+/// The runner may stop waiting on a drain before it reaches EOF (a background job holding the pipe
+/// open — see `run_one_gate_command_with_timeout`), and when it does, whatever was read so far must
+/// survive. Publishing incrementally is what makes that possible: an earlier version awaited the
+/// drain task with a timeout and discarded the task's value on expiry, which threw away the gate's
+/// own output. Measured: a gate whose only output was `echo started` reported an EMPTY capture
+/// because a background writer kept the pipe open past the grace window.
+#[derive(Default)]
+struct GateCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    error: Option<String>,
+}
+
+impl GateCapture {
+    /// Snapshot as `(text, truncated, read_error)`. A poisoned lock yields an empty capture rather
+    /// than panicking: losing output is bad, failing the whole gate run over it is worse.
+    fn take(shared: &std::sync::Mutex<Self>) -> (String, bool, Option<String>) {
+        match shared.lock() {
+            Ok(capture) => (
+                String::from_utf8_lossy(&capture.bytes).into_owned(),
+                capture.truncated,
+                capture.error.clone(),
+            ),
+            Err(_) => (String::new(), false, Some("capture lock poisoned".to_string())),
+        }
+    }
+}
+
+/// [`drain_capped_tail`]'s loop, publishing into `shared` after every read.
+async fn drain_capped_tail_into<R>(
+    mut reader: R,
+    cap: usize,
+    shared: std::sync::Arc<std::sync::Mutex<GateCapture>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
-    let mut kept: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(0);
     let mut buf = [0u8; 8192];
-    let mut truncated = false;
-    let mut error = None;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
-                kept.extend(buf[..n].iter().copied());
-                while kept.len() > cap {
-                    // Ring pop, not a memmove of the window.
-                    kept.pop_front();
-                    truncated = true;
+                let Ok(mut capture) = shared.lock() else { break };
+                capture.bytes.extend_from_slice(&buf[..n]);
+                if capture.bytes.len() > cap {
+                    let overflow = capture.bytes.len() - cap;
+                    capture.bytes.drain(..overflow);
+                    capture.truncated = true;
                 }
             }
             Err(err) => {
-                error = Some(err.to_string());
+                if let Ok(mut capture) = shared.lock() {
+                    capture.error = Some(err.to_string());
+                }
                 break;
             }
         }
     }
-    let bytes: Vec<u8> = kept.into_iter().collect();
-    (
-        String::from_utf8_lossy(&bytes).into_owned(),
-        truncated,
-        error,
-    )
 }
 
 /// The shell a gate command is run with. One place, so the gate runner and the coordinator's
 /// ready-check can never disagree about how a command is interpreted.
+///
+/// **POSIX only, deliberately.** This used to return `("cmd", "/C")` under
+/// `cfg!(target_os = "windows")`, which was worse than having no Windows path at all: the process
+/// group and the group kill are `#[cfg(unix)]`, so a Windows gate had no containment, and — the
+/// part that actually misreports — Windows exit codes are a full `u32` surfaced through `i32`, so a
+/// command exiting `-3` would have been reported as a TIMEOUT and `-2` as a malformed gate. The
+/// three reserved codes are only unreachable because `ExitStatus::code()` is 0..=255 on unix. A
+/// half-implemented platform that silently lies about why a gate failed is worse than an absent
+/// one, so the branch is gone. Nothing in this project runs on Windows; if that changes, the
+/// outcome needs its own field rather than an overloaded exit code.
 fn gate_shell() -> (&'static str, &'static str) {
-    if cfg!(target_os = "windows") {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
-    }
+    ("sh", "-c")
 }
 
 /// What one stored `test_commands` payload declares.
@@ -3155,10 +3237,15 @@ async fn run_one_gate_command_with_timeout(
     //
     // `kill_on_drop` and `Child::kill` only reach the DIRECT child, the shell. A gate command is a
     // shell script, and a shell that does not `exec` its last command forks it as a grandchild:
-    // killing the shell then orphans the grandchild, which is reparented and keeps running. Measured
-    // exactly that — a timed-out `sh -c "sleep 45"` left a live `sleep` with a reparented ppid. A
-    // gate must not be able to leave work running on the host after its deadline, so the group
-    // leader is the shell and the timeout path signals the group.
+    // killing the shell then orphans the grandchild, which is reparented and keeps running. The
+    // group leader is the shell, so the TIMEOUT path can signal the whole tree.
+    //
+    // Scope of the guarantee, precisely: a gate that EXCEEDS ITS DEADLINE does not leave work
+    // running. A gate that SUCCEEDS is never signalled, so a background job it started survives it
+    // — deliberately, because killing a passing gate's children would break setups that start a
+    // service on purpose. `qa_gate_background_job_outlives_a_successful_gate` pins that. The
+    // earlier wording here claimed the host was protected from leftover work in general; it is only
+    // protected on the deadline path.
     #[cfg(unix)]
     builder.process_group(0);
     let mut child = builder.spawn().map_err(|error| {
@@ -3172,26 +3259,59 @@ async fn run_one_gate_command_with_timeout(
     let stderr = child.stderr.take();
     let cap = TEST_GATE_STREAM_CAP_BYTES;
 
-    // BOTH pipes must be drained concurrently. Draining stdout to EOF first deadlocks as soon as
-    // the child fills the stderr pipe buffer: it blocks on write, stdout never reaches EOF, and
-    // the gate hangs forever instead of reporting an exit code. (QA reproduced this by replacing
-    // the join! with sequential drains: both flood tests then time out at 60s.)
+    // BOTH pipes must be drained concurrently, and concurrently with waiting on the child.
+    //
+    // Draining stdout to EOF first deadlocks as soon as the child fills the stderr pipe buffer: it
+    // blocks on write, stdout never reaches EOF, and the gate hangs forever instead of reporting an
+    // exit code. (QA reproduced this by replacing the join! with sequential drains: both flood
+    // tests then time out at 60s.) They run as spawned tasks rather than a `join!` so that the
+    // child's exit can be observed WITHOUT waiting for the pipes to close — see the grace period
+    // below for why that distinction matters.
+    // The captures are shared, not returned: a drain the runner stops waiting on must still hand
+    // over what it read. See `GateCapture`.
+    let out_capture = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
+    let err_capture = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
+    let drain_stdout = tokio::spawn({
+        let shared = out_capture.clone();
+        async move {
+            if let Some(pipe) = stdout {
+                drain_capped_tail_into(pipe, cap, shared).await;
+            }
+        }
+    });
+    let drain_stderr = tokio::spawn({
+        let shared = err_capture.clone();
+        async move {
+            if let Some(pipe) = stderr {
+                drain_capped_tail_into(pipe, cap, shared).await;
+            }
+        }
+    });
+
     let collect = async {
-        let ((out, out_truncated, out_err), (err, err_truncated, err_err)) = tokio::join!(
-            async {
-                match stdout {
-                    Some(pipe) => drain_capped_tail(pipe, cap).await,
-                    None => (String::new(), false, None),
-                }
-            },
-            async {
-                match stderr {
-                    Some(pipe) => drain_capped_tail(pipe, cap).await,
-                    None => (String::new(), false, None),
-                }
-            },
-        );
+        // Wait for the COMMAND to exit, not for its pipes to close.
+        //
+        // A gate's own exit tells us the result. Pipe EOF does not, because a background job the
+        // gate started INHERITS the pipes and holds them open after the gate exits — so EOF waits
+        // on the background job, not on the gate. Measured: a shell that exited 0 in milliseconds
+        // took 3.157s to return because it left a `sleep 3` running. In production a gate like
+        // `npm test` that leaves a watcher or a dev server behind would have waited the FULL
+        // deadline and then been reported as a timeout, i.e. the right answer (it passed) replaced
+        // by a wrong diagnosis blaming the command for being slow.
         let status = child.wait().await;
+        // The command is gone; now give its output a brief, bounded moment to arrive. This is a
+        // flush window, not a wait on the background job: whatever the gate itself wrote is
+        // already in the pipe, and a reader that stops instantly can still race the last write.
+        // Both graces run CONCURRENTLY: awaited one after the other, a background job holding both
+        // pipes costs two full grace windows instead of one.
+        let _ = tokio::join!(
+            tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, drain_stdout),
+            tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, drain_stderr),
+        );
+        // Read the SHARED captures, not the tasks' return values. Whether a drain finished at EOF
+        // or was cut short by the grace window, what it read is here.
+        let (out, out_truncated, out_err) = GateCapture::take(&out_capture);
+        let (err, err_truncated, err_err) = GateCapture::take(&err_capture);
         (
             out,
             err,
@@ -3225,26 +3345,59 @@ async fn run_one_gate_command_with_timeout(
         Err(_) => {
             // Kill the whole GROUP, not just the shell, then reap. Dropping `child` alone would
             // SIGKILL the shell and orphan whatever it forked.
+            //
+            // ORDER IS LOAD-BEARING: the group kill MUST come before `child.kill()`.
+            //
+            // The negative-pid form signals "the process group whose id is this pid", and the pgid
+            // equals the shell's pid only while the kernel still owns that pid — which it does
+            // while the shell is alive or an unreaped zombie. `child.kill()` reaps it and releases
+            // the pid for reuse, after which `kill -KILL -<pid>` could signal a RECYCLED group, i.e.
+            // kill processes belonging to someone else. Reordering these two statements is a
+            // kill-the-wrong-thing bug, not a tidiness question, and
+            // `the_group_kill_runs_before_the_child_is_reaped` pins the order.
             #[cfg(unix)]
             if let Some(pid) = child_pid {
-                // No libc/nix dependency in this crate, so signal the group via kill(1). A
-                // negative pid is "the process group with this id" — the group we created above.
-                let _ = tokio::process::Command::new("kill")
+                // This crate has neither `libc` nor `nix`, so the group is signalled via kill(1).
+                // The status is CHECKED: discarding it meant that on a box without that binary the
+                // group kill no-opped silently and a timed-out gate orphaned its grandchildren
+                // exactly as it did before the group was introduced — the defect, invisibly back.
+                match tokio::process::Command::new("kill")
                     .arg("-KILL")
                     .arg(format!("-{}", pid))
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
-                    .await;
+                    .await
+                {
+                    Ok(status) if status.success() => {}
+                    // `kill` ran and refused: almost always ESRCH because the whole group already
+                    // exited between the deadline and here, which is the common, harmless case.
+                    Ok(status) => tracing::debug!(
+                        pgid = pid,
+                        ?status,
+                        "gate group kill reported no such process group (it had already exited)"
+                    ),
+                    // `kill` could not be EXECUTED. This is the silent-no-op case: containment is
+                    // gone and the gate's descendants are still running. Loud, because the only
+                    // other symptom is work quietly outliving its deadline on the user's host.
+                    Err(error) => tracing::error!(
+                        pgid = pid,
+                        %error,
+                        "gate group kill could not run `kill`; the timed-out gate's process group \
+                         was NOT signalled and its descendants may still be running"
+                    ),
+                }
             }
-            // Reap the shell itself so it does not linger as a zombie.
+            // Reap the shell itself so it does not linger as a zombie. AFTER the group kill above.
             let _ = child.kill().await;
             Ok((
                 TEST_GATE_EXIT_TIMEOUT,
                 format!(
-                    "[gate] the command `{}` did not finish within {} seconds and was killed. \
-                     A gate slower than that is a misconfiguration, not a result — no output was \
-                     collected because the command never completed.",
+                    "[gate] the command `{}` did not finish within {} seconds and was killed, \
+                     along with every process it started. No output was collected because it never \
+                     completed. Two things cause this: a gate that genuinely takes longer than the \
+                     deadline, or a gate that finished but left a background process (a watcher, a \
+                     dev server) running — the second is a misconfigured gate, not a slow one.",
                     command,
                     deadline.as_secs()
                 ),
@@ -12477,43 +12630,36 @@ diff --git a/two.md b/two.md
              whole per-phase gate to plan-only gating with every gate passing"
         );
 
-        // And across the implementation: one core, one caller of it.
-        let impl_src = {
-            // Drop every `#[cfg(test)] mod ... { ... }` tail rather than cutting at the first one.
-            let mut out = String::new();
-            let mut rest = src.as_str();
-            while let Some(at) = rest.find("#[cfg(test)]") {
-                out.push_str(&rest[..at]);
-                // Skip to the end of that test module by brace matching from its first `{`.
-                let after = &rest[at..];
-                let Some(open) = after.find('{') else { break };
-                let mut depth = 0i32;
-                let mut idx = open;
-                for (offset, ch) in after[open..].char_indices() {
-                    if ch == '{' {
-                        depth += 1;
-                    } else if ch == '}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            idx = open + offset + 1;
-                            break;
-                        }
-                    }
-                }
-                rest = &after[idx..];
-            }
-            out.push_str(rest);
-            out
-        };
+        // And across the implementation: one core, and the wrapper is what calls it.
+        //
+        // These use COLUMN-0 anchors and a function-body slice rather than the hand-rolled
+        // `#[cfg(test)]` stripper this test used to carry. That stripper brace-matched from every
+        // `#[cfg(test)]`, including the one on `pub(crate) fn set_executor_config`, and it also
+        // tripped over `#[cfg(test)]` appearing inside this very test's own comments and string
+        // literals — it reported 2 definitions where there is 1. It was removed rather than
+        // tightened: a test module's code is always indented, so `"\nasync fn "` already
+        // distinguishes a real top-level definition from a mention of one, with nothing to get
+        // wrong.
         assert_eq!(
-            impl_src.matches("async fn failing_test_command(").count(),
+            src.matches("\nasync fn failing_test_command(").count(),
             1,
-            "one definition of the gate ready-check core"
+            "one top-level definition of the gate ready-check core"
         );
-        assert_eq!(
-            impl_src.matches("failing_test_command(plan, Some(phase))").count(),
-            1,
-            "the wrapper must be the only implementation-side caller of the core"
+
+        // The wrapper's own body must be what calls the core.
+        let wrapper_at = src
+            .find("async fn failing_phase_test_command")
+            .expect("the phase-required wrapper must exist");
+        let wrapper_body = &src[wrapper_at..];
+        let wrapper_end = wrapper_body[1..]
+            .find("\n/// ")
+            .or_else(|| wrapper_body[1..].find("\nasync fn "))
+            .or_else(|| wrapper_body[1..].find("\nfn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(wrapper_body.len());
+        assert!(
+            wrapper_body[..wrapper_end].contains("failing_test_command(plan, Some(phase))"),
+            "the wrapper must delegate to the core with the phase it was given"
         );
     }
 
@@ -12571,29 +12717,46 @@ diff --git a/two.md b/two.md
         );
     }
 
-    /// The tail window is a ring, not a repeatedly-drained `Vec`.
+    /// The tail window stays exactly `cap` bytes and holds the END of the stream, however much
+    /// output passes through it.
     ///
-    /// The `Vec::drain(..overflow)` shape memmoves the whole retained window on every 8 KiB read
-    /// once past the cap — O(output x cap), roughly 16 GiB of memmove for a gate printing 1 GiB.
-    /// Memory was bounded; CPU was not. This drives far more output than the cap through the real
-    /// drain under a time budget a quadratic implementation cannot meet.
+    /// This replaces `drain_capped_tail_is_linear_in_the_output`, which asserted a 5-second budget
+    /// to "prove" the window was a ring rather than a repeatedly-drained `Vec`. That test was
+    /// VACUOUS: QA reverted the implementation under it and it passed in 0.02s, because BOTH shapes
+    /// are linear — the `Vec` form was never quadratic (`drain_capped_tail`'s doc has the measured
+    /// numbers). A budget 250x looser than the thing it measures cannot distinguish anything.
+    ///
+    /// So this asserts the properties that actually matter and are actually checkable: the window's
+    /// size, and that it is the TAIL — which is where every test runner prints its summary, and
+    /// therefore the whole reason the cap keeps the end rather than the beginning.
     #[tokio::test]
-    async fn drain_capped_tail_is_linear_in_the_output() {
-        let cap = 128 * 1024;
-        // 24 MiB through a 128 KiB window: ~3000 reads. Linear is milliseconds; the quadratic
-        // shape is ~3 GiB of memmove.
-        let total = 24 * 1024 * 1024;
-        let data = vec![b'z'; total];
-        let started = std::time::Instant::now();
+    async fn drain_capped_tail_keeps_exactly_the_last_cap_bytes() {
+        let cap = 64 * 1024;
+        // Far more output than the cap, ending in a marker that must survive.
+        let marker = b"THE-VERY-END";
+        let mut data = vec![b'z'; 8 * 1024 * 1024];
+        let at = data.len() - marker.len();
+        data[at..].copy_from_slice(marker);
+
         let (text, truncated, error) = drain_capped_tail(&data[..], cap).await;
-        let elapsed = started.elapsed();
-        assert_eq!(text.len(), cap, "the window is exactly the cap");
-        assert!(truncated);
+        assert_eq!(text.len(), cap, "the window must be exactly the cap");
+        assert!(truncated, "overflow must be reported");
         assert!(error.is_none());
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "draining {total} bytes took {elapsed:?} — that is the quadratic shape, not a ring"
+            text.ends_with("THE-VERY-END"),
+            "the kept window must be the TAIL, not the head"
         );
+
+        // Under the cap, nothing is dropped and nothing is flagged.
+        let (text, truncated, _) = drain_capped_tail(&b"short"[..], cap).await;
+        assert_eq!(text, "short");
+        assert!(!truncated);
+
+        // Exactly at the cap is not truncation.
+        let exact = vec![b'a'; cap];
+        let (text, truncated, _) = drain_capped_tail(&exact[..], cap).await;
+        assert_eq!(text.len(), cap);
+        assert!(!truncated, "exactly cap bytes is not an overflow");
     }
 
     // ────── QA round 2: the process-group kill, attacked ──────
@@ -12785,16 +12948,28 @@ diff --git a/two.md b/two.md
         );
     }
 
-    /// A background job started by a SUCCESSFUL gate is not killed, and — the part that bites —
-    /// if it inherits the gate's stdout/stderr pipes the gate does not return until it exits,
-    /// because the drain waits for EOF on the pipes, not for the shell.
+    /// A background job started by a SUCCESSFUL gate is not killed — and no longer blocks the gate.
+    ///
+    /// QA pinned the defect here: a background job that inherits the gate's stdout/stderr holds
+    /// those pipes open, and the capture waited for pipe EOF rather than for the command, so a
+    /// shell that exited 0 in milliseconds took 3.157s to return. In production a gate like
+    /// `npm test` leaving a watcher or dev server behind would have waited the FULL 20-minute
+    /// deadline and then been reported `exitCode: -3`, "did not finish" — a passing gate recorded
+    /// as a timeout, with the message blaming the command for being slow. The timeout bounded the
+    /// damage; the diagnosis was still wrong.
+    ///
+    /// Fixed by waiting on the COMMAND's exit and then allowing a short, bounded flush window for
+    /// output already in flight ([`TEST_GATE_PIPE_FLUSH_GRACE`]). Part (a) now asserts the gate
+    /// returns promptly; part (b) is unchanged and still pins that a successful gate's group is
+    /// never signalled, which is deliberate.
     #[tokio::test]
     async fn qa_gate_background_job_outlives_a_successful_gate() {
         let dir = tmp_dir("qa-pg-bg");
         let w = dir.to_string_lossy().to_string();
 
-        // (a) Background job INHERITS the pipes. The shell exits 0 in milliseconds; the pipes stay
-        //     open until the writer finishes, so the gate blocks on it.
+        // (a) Background job INHERITS the pipes. The shell exits 0 in milliseconds and the pipes
+        //     stay open until the writer finishes (~3s), so this measures whether the gate waits
+        //     for the COMMAND or for the pipes.
         let ticks_a = dir.join("ticks-a.txt");
         let command = format!("sh -c '{}' & echo started", tick_loop(&ticks_a));
         let started = std::time::Instant::now();
@@ -12805,14 +12980,29 @@ diff --git a/two.md b/two.md
         let inherited_elapsed = started.elapsed();
         assert_eq!(exit_code, 0, "{output}");
         eprintln!(
-            "QA: gate with a pipe-inheriting background job returned after {:?} \
-             (the shell itself exited immediately)",
+            "gate with a pipe-inheriting background job returned after {:?} \
+             (the shell itself exited immediately; the background writer runs ~3s)",
             inherited_elapsed
         );
+        // The gate must NOT wait for the background writer. One flush grace is the allowance.
         assert!(
-            inherited_elapsed >= std::time::Duration::from_millis(1500),
-            "expected the gate to block on the inherited pipes; returned in {:?}",
+            inherited_elapsed < std::time::Duration::from_millis(1500),
+            "the gate waited for an inherited pipe instead of the command: returned in {:?}. \
+             A gate that leaves a watcher running would sit until the deadline and then be \
+             misreported as a timeout",
             inherited_elapsed
+        );
+        // ...and the output the gate itself produced before exiting still arrives.
+        assert!(
+            output.contains("started"),
+            "the flush window must still capture what the command wrote: {output}"
+        );
+        // The background job is untouched by a successful gate — it is still running.
+        let during = tick_len(&ticks_a);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            tick_len(&ticks_a) > during,
+            "a successful gate must not kill a background job it started"
         );
 
         // (b) Background job REDIRECTS its stdio. Now the gate returns at once — and the job keeps
@@ -12876,9 +13066,16 @@ diff --git a/two.md b/two.md
         );
     }
 
-    /// The group kill shells out to `kill(1)` and ignores its status (`let _ = ... .status()`), so
-    /// a box without that binary loses the group kill SILENTLY — only the direct child dies. Pin
-    /// the dependency so a future minimal environment fails here loudly instead of leaking.
+    /// The group kill shells out to `kill(1)`, so a box without that binary has no containment.
+    ///
+    /// QA found this as a SILENT dependency: the call was `let _ = ... .status()`, so a missing
+    /// binary no-opped and a timed-out gate orphaned its grandchildren exactly as it did before the
+    /// process group existed — the defect invisibly restored. The status is now checked and an
+    /// un-executable `kill` logs at ERROR, so the failure is visible at runtime.
+    ///
+    /// This test stays, because a log line is not a gate: the dependency is still real, and pinning
+    /// it means a future minimal environment (a slim container, a stripped image) fails HERE rather
+    /// than leaking processes in production. The runtime log and this test cover different moments.
     #[test]
     fn the_group_kill_depends_on_the_kill_binary_being_present() {
         let found = std::process::Command::new("sh")
@@ -12892,6 +13089,58 @@ diff --git a/two.md b/two.md
             "`kill` is not on PATH: run_one_gate_command_with_timeout's group kill is a \
              `Command::new(\"kill\")` whose status is discarded, so it would no-op silently and a \
              timed-out gate would orphan its grandchildren"
+        );
+    }
+
+    /// The group kill must run BEFORE the child is reaped, and nothing else pinned that.
+    ///
+    /// `kill -KILL -<pid>` means "the process group with this id". The pgid equals the shell's pid
+    /// only while the kernel still owns that pid — true while the shell is alive or an unreaped
+    /// zombie. `child.kill()` reaps it and releases the pid for reuse, so running the reap FIRST
+    /// would leave the negative-pid form able to signal a RECYCLED group: killing processes that
+    /// belong to someone else entirely. The current order is safe; swapping two adjacent statements
+    /// silently makes it unsafe, and no behavioural test can catch that (it needs a pid-reuse race
+    /// to lose). A source-order assertion can, cheaply.
+    #[test]
+    fn the_group_kill_runs_before_the_child_is_reaped() {
+        let src = std::fs::read_to_string(file!()).expect("read own source");
+        let start = src
+            .find("async fn run_one_gate_command_with_timeout")
+            .expect("the gate runner must exist under this name");
+        // The runner's own body: stop at the next item at column 0.
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\n/// ")
+            .or_else(|| body[1..].find("\nasync fn "))
+            .or_else(|| body[1..].find("\nfn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        // Strip `//` comment lines before searching. The doc comment ABOVE the kill block
+        // discusses `child.kill()` in prose, and prose sorts before code — the first version of
+        // this test matched that sentence and reported the order as wrong. Comments are not code.
+        let runner: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let runner = runner.as_str();
+
+        let group_kill = runner
+            .find("Command::new(\"kill\")")
+            .expect("the runner must signal the process group via kill(1)");
+        let reap = runner
+            .find("let _ = child.kill().await")
+            .expect("the runner must reap the shell");
+        assert!(
+            group_kill < reap,
+            "the group kill must precede child.kill(): reaping first releases the pid, after \
+             which the negative-pid group kill can signal a recycled group and kill processes \
+             that are not ours"
+        );
+        // And the group must be created, or the negative pid addresses the wrong group entirely.
+        assert!(
+            runner.contains("process_group(0)"),
+            "the gate must lead its own process group for the negative-pid kill to be correct"
         );
     }
 
@@ -12945,6 +13194,13 @@ diff --git a/two.md b/two.md
         let err = update_test_commands(&state, id.clone(), None, vec!["x".into()], true)
             .expect_err("clear with commands must be rejected");
         assert!(err.contains("not both"), "{err}");
+        // ...including when the command is blank. This used to be ACCEPTED and silently clear,
+        // because blanks were filtered before the contradiction check, so `clear: true` with
+        // `["npm test"]` was rejected while `clear: true` with `["   "]` went through. Whitespace
+        // must not decide whether a contradictory call is an error.
+        let err = update_test_commands(&state, id.clone(), None, vec!["   ".into()], true)
+            .expect_err("clear with a whitespace-only command is still contradictory");
+        assert!(err.contains("not both"), "{err}");
         // The gate is still exactly what it was — no rejected call half-applied.
         let run = get_plan(&state, &id).expect("get plan");
         assert_eq!(run.plan.test_commands_list, vec!["npm test".to_string()]);
@@ -12955,14 +13211,26 @@ diff --git a/two.md b/two.md
         assert_eq!(run.plan.test_commands, None, "clearing must write NULL");
         assert!(run.plan.test_commands_list.is_empty());
 
-        // DOCUMENTED ASYMMETRY: `clear: true` with a whitespace-only list is ACCEPTED (the blank
-        // is filtered before the contradiction check), while `clear: true` with a real command is
-        // rejected. Pinned rather than left to be discovered.
+        // The asymmetry QA documented here is GONE. `clear: true` with a whitespace-only list was
+        // accepted while `clear: true` with a real command was rejected, because blanks were
+        // filtered before the contradiction check — so whitespace decided whether a contradictory
+        // call was an error. The contradiction is now judged on what the caller sent, and the gate
+        // SURVIVES the rejection.
         update_test_commands(&state, id.clone(), None, vec!["npm test".into()], false)
             .expect("re-set the gate");
-        let run = update_test_commands(&state, id.clone(), None, vec!["  ".into()], true)
-            .expect("clear with a blank entry is accepted");
-        assert!(run.plan.test_commands_list.is_empty());
+        let err = update_test_commands(&state, id.clone(), None, vec!["  ".into()], true)
+            .expect_err("clear with a blank entry is still a contradiction");
+        assert!(err.contains("not both"), "{err}");
+        assert!(
+            err.contains("still counts as passing one"),
+            "the message must explain why a blank counts: {err}"
+        );
+        let run = get_plan(&state, &id).expect("read back");
+        assert_eq!(
+            run.plan.test_commands_list,
+            vec!["npm test".to_string()],
+            "a rejected call must not have half-applied"
+        );
     }
 
     #[tokio::test]
