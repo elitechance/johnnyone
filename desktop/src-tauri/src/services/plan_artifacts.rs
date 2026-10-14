@@ -805,3 +805,367 @@ mod qa_b_tests {
         }
     }
 }
+
+/// QA B round 2 — attacking the confinement fix and the emptiness rule.
+///
+/// Round 2 closed the symlink escape by routing both the writer and the reader through
+/// `settings::resolve_within_root`, and made the reader require a NON-EMPTY directory. These
+/// tests go after the ordering of those checks and the edges of "empty".
+#[cfg(test)]
+mod qa_b_r2_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn link(target: &Path, at: &Path) {
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    // ── The confinement fix, attacked from every direction ────────────────────────────────────
+
+    /// A RELATIVE link out of the store is refused, not just an absolute one. `canonicalize`
+    /// resolves it, so the shape of the link text must not matter.
+    #[test]
+    fn qa_a_relative_symlink_out_of_the_store_is_refused() {
+        let plan = crate::test_support::tmp_dir("qa-r2-rel");
+        let outside = crate::test_support::tmp_dir("qa-r2-rel-out");
+        std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
+        // Relative, with enough `..` to climb out of the plan dir entirely.
+        let rel_target = Path::new("../../../..").join(outside.file_name().unwrap());
+        link(&rel_target, &plan.join("phases/01-shell/artifacts/runs"));
+
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a relative escape must be refused too");
+        assert!(err.contains("does not resolve inside the plan store"), "{err}");
+        assert!(!outside.join("4f0821").exists(), "nothing created outside");
+    }
+
+    /// A chain of links is followed to its end and judged there.
+    #[test]
+    fn qa_a_symlink_to_a_symlink_is_refused() {
+        let plan = crate::test_support::tmp_dir("qa-r2-chain");
+        let outside = crate::test_support::tmp_dir("qa-r2-chain-out");
+        let hop = crate::test_support::tmp_dir("qa-r2-chain-hop");
+        // hop/next -> outside, and artifacts/runs -> hop/next
+        link(&outside, &hop.join("next"));
+        std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
+        link(&hop.join("next"), &plan.join("phases/01-shell/artifacts/runs"));
+
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a two-hop escape must be refused");
+        assert!(err.contains("does not resolve inside the plan store"), "{err}");
+        assert!(!outside.join("4f0821").exists());
+    }
+
+    /// A link planted even HIGHER — at the phase directory — is refused. The guard is on the
+    /// whole resolved path, not on the `artifacts`/`runs` segments it knows about by name.
+    #[test]
+    fn qa_a_symlinked_phase_directory_is_refused() {
+        let plan = crate::test_support::tmp_dir("qa-r2-phase");
+        let outside = crate::test_support::tmp_dir("qa-r2-phase-out");
+        link(&outside, &plan.join("phases/01-shell"));
+
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a symlinked phase dir must be refused");
+        assert!(err.contains("does not resolve inside the plan store"), "{err}");
+        assert!(!outside.join("artifacts").exists(), "nothing created outside");
+        assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", None), None);
+    }
+
+    /// A DANGLING link, and then the same link once its target appears.
+    ///
+    /// This is the one ordering QA could find that the confinement check does NOT catch on its
+    /// own: `normalize_existing_prefix` walks up while `!exists()`, and `exists()` follows
+    /// symlinks, so a dangling link is treated as a not-yet-created component and the resolved
+    /// path looks confined. What refuses the write is `create_dir_all` hitting `EEXIST` on the
+    /// link — a correct outcome reached by a different route, and reported with the `create`
+    /// prefix rather than the confinement message. Pinned because the two spellings of "refused"
+    /// are not interchangeable: only one of them tells the operator a link was planted.
+    #[test]
+    fn qa_a_dangling_symlink_is_refused_but_by_the_mkdir_not_the_guard() {
+        let plan = crate::test_support::tmp_dir("qa-r2-dangle");
+        let outside = crate::test_support::tmp_dir("qa-r2-dangle-out");
+        let target = outside.join("not-yet");
+        assert!(!target.exists());
+        std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
+        link(&target, &plan.join("phases/01-shell/artifacts/runs"));
+
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a dangling link must still not be written through");
+        // Refused either way — the assertion that matters is that NOTHING was created outside.
+        assert!(
+            !target.exists(),
+            "the mkdir created the link's target outside the plan store at {}",
+            target.display()
+        );
+        assert!(!target.join("4f0821").exists());
+        // Record which gate fired, so a change of route is visible rather than silent.
+        assert!(
+            err.starts_with("create ") || err.contains("does not resolve inside the plan store"),
+            "unexpected refusal wording: {err}"
+        );
+
+        // Once the target EXISTS, the confinement guard itself fires, with its own message.
+        std::fs::create_dir_all(&target).unwrap();
+        let err2 = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("a resolvable escape must be refused by the guard");
+        assert!(err2.contains("does not resolve inside the plan store"), "{err2}");
+        assert!(!target.join("4f0821").exists(), "nothing created outside");
+    }
+
+    /// The check-create-recheck ORDER, exercised in that order by hand.
+    ///
+    /// The writer checks confinement, calls `create_dir_all`, then checks again. A link planted
+    /// in the window between the first check and the mkdir is therefore caught only by the
+    /// SECOND check — after `create_dir_all` has already followed it. This test performs the
+    /// three steps in exactly the order the function does, with the link planted in the window,
+    /// to show what that costs: the call still fails (so no evidence is written through the
+    /// link), but a directory HAS been created outside the store by the time it does.
+    ///
+    /// What a reviewer should conclude: the re-check makes the window non-exploitable for
+    /// writing, not inert. Closing it completely needs an `openat`/`O_NOFOLLOW` walk rather than
+    /// `create_dir_all`, which is a bigger change than this round; the residue is a stray empty
+    /// directory and a refused phase, not leaked or planted evidence.
+    #[test]
+    fn qa_documents_the_window_between_the_check_and_the_mkdir() {
+        let plan = crate::test_support::tmp_dir("qa-r2-window");
+        let outside = crate::test_support::tmp_dir("qa-r2-window-out");
+        let rel = phase_run_artifacts_rel("01-shell", "4f0821").unwrap();
+        std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
+
+        // Step 1: the pre-mkdir confinement check, on a clean tree — passes.
+        assert!(
+            crate::services::settings::resolve_within_root(&plan, &rel).is_ok(),
+            "the clean tree must pass the first gate"
+        );
+
+        // ...the window: a link is planted here.
+        link(&outside, &plan.join("phases/01-shell/artifacts/runs"));
+
+        // Step 2: the mkdir follows it.
+        let dir = plan.join(&rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            outside.join("4f0821").is_dir(),
+            "create_dir_all followed the link — this is the cost of the window"
+        );
+
+        // Step 3: the re-check catches it, so the function returns an error and the caller never
+        // treats the path as usable.
+        assert!(
+            crate::services::settings::resolve_within_root(&plan, &rel).is_err(),
+            "the re-check must catch what the mkdir created"
+        );
+        // And the real function, called now, refuses — it does not hand back the escaped path.
+        let err = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821")
+            .expect_err("the escaped directory must never be handed back");
+        assert!(err.contains("does not resolve inside the plan store"), "{err}");
+        // The READER refuses it too, so nothing downstream reads through the link.
+        std::fs::write(outside.join("4f0821/planted.png"), b"x").unwrap();
+        let resolved = resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821"));
+        assert!(
+            resolved.is_none() || !resolved.unwrap().join("planted.png").is_file(),
+            "the reader reached evidence planted through the link"
+        );
+    }
+
+    /// A HARDLINK cannot be detected by canonicalisation, because a hardlink has no target.
+    ///
+    /// A worker can hardlink an out-of-store FILE into its artifacts directory and the reader
+    /// will read it: `canonicalize` sees an ordinary file at an in-store path, which is what it
+    /// is. Pinned with the reasoning that bounds it: the worker already has the file's contents
+    /// to hardlink it, so copying achieves exactly the same thing. This is therefore a property
+    /// of "the worker writes the store", not an escalation the confinement check should be
+    /// expected to stop — and no amount of path resolution can stop it.
+    #[test]
+    fn qa_documents_a_hardlink_is_not_and_cannot_be_detected() {
+        let plan = crate::test_support::tmp_dir("qa-r2-hard");
+        let outside = crate::test_support::tmp_dir("qa-r2-hard-out");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"out of store").unwrap();
+
+        let dir = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821").unwrap();
+        std::fs::hard_link(&secret, dir.join("evidence.txt")).unwrap();
+
+        // The directory still resolves — correctly, it is genuinely inside the store.
+        let resolved = resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")).unwrap();
+        assert_eq!(resolved, dir);
+        assert_eq!(std::fs::read(resolved.join("evidence.txt")).unwrap(), b"out of store");
+        // And the in-store name canonicalises to itself, so there is nothing for a path guard to
+        // notice: a directory hardlink is impossible on Linux, so the DIRECTORY stays confined.
+        assert_eq!(
+            dir.join("evidence.txt").canonicalize().unwrap(),
+            dir.canonicalize().unwrap().join("evidence.txt")
+        );
+    }
+
+    /// Two writers racing on the same phase+run must both succeed, idempotently.
+    ///
+    /// `create_dir_all` is idempotent, but the fix added two confinement checks around it, and a
+    /// concurrent creator is exactly the case where the second check sees a tree the first
+    /// caller did not create. Neither may fail, and neither may lose a file.
+    #[test]
+    fn qa_concurrent_writers_on_one_run_dir_both_succeed() {
+        let plan = Arc::new(crate::test_support::tmp_dir("qa-r2-race"));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let plan = Arc::clone(&plan);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let dir = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821");
+                    // Record only — assert after join, so a failure cannot hang the others.
+                    dir.map(|d| {
+                        std::fs::write(d.join(format!("w{i}.txt")), b"x").ok();
+                        d
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "writer {i} failed: {:?}", r.as_ref().err());
+        }
+        let dir = results[0].as_ref().unwrap();
+        for r in &results {
+            assert_eq!(r.as_ref().unwrap(), dir, "writers disagreed on the directory");
+        }
+        for i in 0..8 {
+            assert!(dir.join(format!("w{i}.txt")).is_file(), "writer {i} lost its file");
+        }
+    }
+
+    /// The declared behaviour change: the guard needs the plan path to resolve, where
+    /// `create_dir_all` would previously have created a missing tree outright.
+    ///
+    /// Dev B believed this unreachable and did not test it. It IS reachable — a plan row whose
+    /// directory has been deleted renders a phase prompt with a `plan_path` that does not exist —
+    /// so this pins what now happens: a refusal rather than a silently fabricated plan store.
+    /// That is the better behaviour of the two, and `phase_template_values` falls back rather
+    /// than failing the phase, but it is a change and it is now measured rather than assumed.
+    #[test]
+    fn qa_a_plan_path_that_does_not_exist_is_refused_not_fabricated() {
+        let parent = crate::test_support::tmp_dir("qa-r2-missing");
+        let missing_plan = parent.join("deleted-initiative/plan");
+        assert!(!missing_plan.exists());
+
+        let err = ensure_phase_run_artifacts_dir(&missing_plan, "01-shell", "4f0821")
+            .expect_err("a plan store that is not there must not be invented");
+        assert!(err.contains("Refusing the artifact path"), "{err}");
+        assert!(
+            !missing_plan.exists(),
+            "the old create_dir_all would have fabricated {}",
+            missing_plan.display()
+        );
+        // The reader says "no artifacts", not an error and not a path.
+        assert_eq!(resolve_phase_artifacts_dir(&missing_plan, "01-shell", Some("4f0821")), None);
+
+        // A plan path that DOES exist works, so the refusal is about existence and nothing else.
+        std::fs::create_dir_all(&missing_plan).unwrap();
+        assert!(ensure_phase_run_artifacts_dir(&missing_plan, "01-shell", "4f0821").is_ok());
+    }
+
+    // ── The emptiness rule, at its edges ──────────────────────────────────────────────────────
+
+    /// What counts as "has artifacts" is ANY directory entry, which includes entries a reader
+    /// cannot show. Pinned so the rule's edges are stated rather than discovered later.
+    #[test]
+    fn qa_documents_what_counts_as_a_non_empty_artifacts_dir() {
+        // 1. A hidden file only — counts as non-empty.
+        let a = crate::test_support::tmp_dir("qa-r2-hidden");
+        std::fs::create_dir_all(a.join("phases/01-shell/artifacts")).unwrap();
+        std::fs::write(a.join("phases/01-shell/artifacts/.gitkeep"), b"").unwrap();
+        assert_eq!(
+            resolve_phase_artifacts_dir(&a, "01-shell", None),
+            Some(a.join("phases/01-shell/artifacts")),
+            "a `.gitkeep` makes an otherwise-empty dir resolve; the navigator will show no rows"
+        );
+
+        // 2. Only an empty SUBDIRECTORY — counts as non-empty, with no files anywhere under it.
+        let b = crate::test_support::tmp_dir("qa-r2-subdir");
+        std::fs::create_dir_all(b.join("phases/01-shell/artifacts/screenshots")).unwrap();
+        assert_eq!(
+            resolve_phase_artifacts_dir(&b, "01-shell", None),
+            Some(b.join("phases/01-shell/artifacts")),
+            "the rule is one level deep: an empty subdir counts"
+        );
+
+        // 3. A DANGLING symlink as the only entry — counts as non-empty, and reads as nothing.
+        let c = crate::test_support::tmp_dir("qa-r2-dangle-entry");
+        std::fs::create_dir_all(c.join("phases/01-shell/artifacts")).unwrap();
+        std::os::unix::fs::symlink(
+            c.join("nowhere"),
+            c.join("phases/01-shell/artifacts/ghost.png"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_phase_artifacts_dir(&c, "01-shell", None),
+            Some(c.join("phases/01-shell/artifacts")),
+            "read_dir sees the link entry even though it resolves to nothing"
+        );
+
+        // 4. A truly empty dir — the case the rule exists for.
+        let d = crate::test_support::tmp_dir("qa-r2-trulyempty");
+        std::fs::create_dir_all(d.join("phases/01-shell/artifacts")).unwrap();
+        assert_eq!(resolve_phase_artifacts_dir(&d, "01-shell", None), None);
+    }
+
+    /// A file appearing concurrently flips the answer, and never produces a wrong path.
+    #[test]
+    fn qa_a_run_dir_becomes_usable_the_moment_it_has_content() {
+        let plan = crate::test_support::tmp_dir("qa-r2-flip");
+        std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
+        std::fs::write(plan.join("phases/01-shell/artifacts/champion.png"), b"c").unwrap();
+        let run = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821").unwrap();
+
+        // Empty: the champion wins.
+        assert_eq!(
+            resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")),
+            Some(plan.join("phases/01-shell/artifacts"))
+        );
+        // A partially-written file is still a file, so the run wins from the first byte.
+        let f = std::fs::File::create(run.join("half-written.png")).unwrap();
+        assert_eq!(
+            resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")),
+            Some(run.clone()),
+            "a zero-length file in progress must already count as this run's evidence"
+        );
+        drop(f);
+    }
+
+    /// FINDING. An artifacts directory that cannot be READ reports "no artifacts" — silently.
+    ///
+    /// `usable_artifacts_dir` ends with `std::fs::read_dir(&dir).ok()?`, so an I/O error is
+    /// folded into the same `None` as "empty". The confinement failure next to it logs a warning
+    /// precisely because silence there would hide a planted link; this branch has no such line.
+    /// So a permissions problem, an unreadable mount or a transient I/O error on the store makes
+    /// the gate and the navigator report that a phase delivered NO evidence when its evidence is
+    /// sitting there — the failure mode this whole feature exists to prevent, arrived at from the
+    /// other side. One `tracing::warn!` closes it.
+    #[test]
+    fn qa_documents_an_unreadable_artifacts_dir_reports_no_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+        let plan = crate::test_support::tmp_dir("qa-r2-noperm");
+        let art = plan.join("phases/01-shell/artifacts");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("aux-open.png"), b"real evidence").unwrap();
+        // It resolves while readable.
+        assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", None), Some(art.clone()));
+
+        // Make it unlistable (still present, still holding the evidence).
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&art).is_err();
+        // Running as root would make the chmod ineffective; only assert when it really bit.
+        if unreadable {
+            assert_eq!(
+                resolve_phase_artifacts_dir(&plan, "01-shell", None),
+                None,
+                "an unreadable dir is reported as 'no artifacts', indistinguishable from empty"
+            );
+        }
+        // Always restore, so the fixture can be cleaned up.
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", None), Some(art));
+    }
+}

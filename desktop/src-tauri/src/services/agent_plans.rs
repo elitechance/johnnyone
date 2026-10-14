@@ -18470,3 +18470,333 @@ mod qa_b_template_tests {
         );
     }
 }
+
+/// QA B round 2 — the end-to-end claim: with the prompt wired, does a real phase render write
+/// its evidence where every reader looks for it?
+///
+/// Round 1 measured that the value was plumbed and the directory created; round 3 wired the
+/// shipped worker prompt. Nobody had joined the two ends. The chain has SIX links and they are
+/// written by four different modules, so agreement between them is a property to measure, not to
+/// assume:
+///
+/// 1. the worker prompt the agent is handed NAMES a directory,
+/// 2. that directory exists when the agent reads the prompt,
+/// 3. a file the worker writes there is found by `resolve_phase_artifacts_dir`,
+/// 4. the LENS REVIEWER prompt names the same directory (the live reviewer is the `format!` in
+///    `lens_reviewer_prompt`, not `DEFAULT_DEVELOPMENT_REVIEWER`),
+/// 5. `is_worker_writable_store_file` classifies it as worker output, so the coordinator does
+///    not bounce the phase for writing there,
+/// 6. the review gate's evidence walk reaches it.
+///
+/// The path is taken OUT OF THE RENDERED PROMPT TEXT rather than recomputed, because what the
+/// agent is told is the only thing that actually determines where the bytes land.
+#[cfg(test)]
+mod qa_b_r2_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git must be available")
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    /// A plan store that looks like a real one: a phase, a task with a spec, and a git commit, so
+    /// the evidence walk's "untracked files under this phase" question has a meaningful answer.
+    fn committed_plan_store(tag: &str) -> PathBuf {
+        let dir = crate::test_support::tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-thing/tasks/t1")).unwrap();
+        std::fs::write(
+            dir.join("phases/01-thing/tasks/t1/prompt.md"),
+            "# Task\n- The seat meter must render\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("phases/01-thing/tasks/t1/status.yml"), "status: todo\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "qa@example.com"]);
+        git(&dir, &["config", "user.name", "qa"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    fn run_for(plan_path: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "RUN-e2e".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: plan_path.into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+                test_commands: None,
+                test_commands_list: Vec::new(),
+                executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn phase_for() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "RUN-e2e".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
+        }
+    }
+
+    /// The path the WORKER is told to write to, read back out of the rendered prompt.
+    ///
+    /// Parsed from the text rather than recomputed: a test that recomputes the value is testing
+    /// the same expression twice, and would stay green if the template named a different one.
+    fn artifacts_dir_the_prompt_names(rendered: &str) -> PathBuf {
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("Artifacts path"))
+            .expect("the worker prompt must carry an `Artifacts path` line");
+        let (_, value) = line.split_once(':').expect("`<label>: <path>`");
+        PathBuf::from(value.trim())
+    }
+
+    /// THE end-to-end test. All six links, one directory.
+    #[test]
+    fn qa_the_worker_writes_where_every_reader_looks() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = committed_plan_store("qa-e2e-chain");
+        let run = run_for(plan.to_str().unwrap());
+        let phase = phase_for();
+        let phase_path = plan.join("phases/01-thing");
+
+        // ── 1. the prompt the agent is handed ─────────────────────────────────────────────────
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let rendered =
+            planner_prompts::render_template(planner_prompts::DEFAULT_DEVELOPMENT_WORKER, &values);
+        let told = artifacts_dir_the_prompt_names(&rendered);
+
+        // It is this RUN's directory, not the champion's shared one — the whole point.
+        assert!(
+            told.ends_with("phases/01-thing/artifacts/runs/RUN-e2e"),
+            "the worker was told to write to {}",
+            told.display()
+        );
+        assert!(told.starts_with(&plan), "{} escapes the plan store", told.display());
+
+        // ── 2. it exists before the agent reads the prompt ────────────────────────────────────
+        assert!(told.is_dir(), "{} was named but not created", told.display());
+
+        // ── 3. the worker writes there; the reader finds it ───────────────────────────────────
+        std::fs::write(told.join("seat-meter.html"), b"<html>delivered</html>").unwrap();
+        let read_back = plan_artifacts::resolve_phase_artifacts_dir(
+            &plan,
+            &phase.phase_id,
+            Some(&run.plan.id),
+        )
+        .expect("the reader must resolve the directory the worker was told to use");
+        assert_eq!(
+            read_back, told,
+            "the writer and the reader disagree about where this run's evidence lives"
+        );
+        assert_eq!(
+            std::fs::read(read_back.join("seat-meter.html")).unwrap(),
+            b"<html>delivered</html>"
+        );
+
+        // ── 4. the LIVE reviewer is pointed at the same directory ─────────────────────────────
+        let lens = ValidationLens {
+            name: "Product".into(),
+            provider: "claude_code".into(),
+            model: None,
+            prompt: None,
+            vision: false,
+            blocking: true,
+        };
+        let reviewer = lens_reviewer_prompt(&state, &run, &phase, &lens, "SESSION-1");
+        assert!(
+            reviewer.contains(&*told.to_string_lossy()),
+            "the {} lens reviewer was not told where the evidence is; prompt:\n{}",
+            lens.name,
+            reviewer
+        );
+
+        // ── 5. the coordinator treats it as worker output, not spec-weakening ─────────────────
+        let rel = told
+            .strip_prefix(&plan)
+            .unwrap()
+            .join("seat-meter.html")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(rel, "phases/01-thing/artifacts/runs/RUN-e2e/seat-meter.html");
+        assert!(
+            is_worker_writable_store_file(&rel),
+            "{rel} must classify as worker output, or rewriting its own evidence parks the phase"
+        );
+
+        // ── 6. the review gate's evidence walk reaches it ─────────────────────────────────────
+        // An image nobody describes must still be CAUGHT when it is run-scoped, or every
+        // competing run passes the evidence check by having no evidence the gate can see.
+        std::fs::write(told.join("mystery.png"), b"undescribed pixels").unwrap();
+        let reason = evidence_provenance_reason(&plan.to_string_lossy(), "01-thing")
+            .expect("a run-scoped image nobody describes must be caught by the gate");
+        assert!(
+            reason.contains("runs/RUN-e2e/mystery.png"),
+            "the gate named something else: {reason}"
+        );
+
+        // And once described, it passes — same as the flat layout.
+        std::fs::write(
+            plan.join("phases/01-thing/tasks/t1/decisions.md"),
+            "mystery.png — the seat meter at width 2.\nseat-meter.html — the delivered page.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_provenance_reason(&plan.to_string_lossy(), "01-thing"),
+            None,
+            "described run-scoped evidence must pass the gate"
+        );
+    }
+
+    /// The chain must not depend on the CHAMPION directory existing or being empty.
+    ///
+    /// A first-ever run of a phase has no champion artifacts at all; a later run has some. Both
+    /// must land in their own directory and be read back from it, because the emptiness rule
+    /// added in round 2 changes which directory the reader prefers.
+    #[test]
+    fn qa_the_chain_holds_whether_or_not_the_champion_has_artifacts() {
+        let (state, _root) = crate::test_support::test_state();
+
+        for champion_has_artifacts in [false, true] {
+            let plan = committed_plan_store("qa-e2e-champ");
+            if champion_has_artifacts {
+                std::fs::create_dir_all(plan.join("phases/01-thing/artifacts")).unwrap();
+                std::fs::write(
+                    plan.join("phases/01-thing/artifacts/old-champion.png"),
+                    b"previous winner",
+                )
+                .unwrap();
+            }
+            let run = run_for(plan.to_str().unwrap());
+            let phase = phase_for();
+            let phase_path = plan.join("phases/01-thing");
+            let values = phase_template_values(
+                &state,
+                &run,
+                &phase,
+                &phase_path,
+                &phase_path.join("tasks"),
+            );
+            let told = artifacts_dir_the_prompt_names(&planner_prompts::render_template(
+                planner_prompts::DEFAULT_DEVELOPMENT_WORKER,
+                &values,
+            ));
+            std::fs::write(told.join("mine.png"), b"this run").unwrap();
+
+            let read_back = plan_artifacts::resolve_phase_artifacts_dir(
+                &plan,
+                &phase.phase_id,
+                Some(&run.plan.id),
+            )
+            .expect("resolves");
+            assert_eq!(
+                read_back, told,
+                "champion_has_artifacts={champion_has_artifacts}: writer and reader disagree"
+            );
+            assert!(read_back.join("mine.png").is_file());
+            // This run must NOT read the champion's file as its own.
+            assert!(
+                !read_back.join("old-champion.png").exists(),
+                "champion_has_artifacts={champion_has_artifacts}: this run read the champion's \
+                 evidence as its own"
+            );
+        }
+    }
+
+    /// Two runs of one phase, both wired end-to-end: the defect the branch exists to close,
+    /// measured through the real prompt rather than through the path builder.
+    #[test]
+    fn qa_two_runs_told_by_the_prompt_do_not_clobber_each_other() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = committed_plan_store("qa-e2e-two");
+        let phase = phase_for();
+        let phase_path = plan.join("phases/01-thing");
+
+        let mut told = Vec::new();
+        for run_id in ["RUN-a", "RUN-b"] {
+            let mut run = run_for(plan.to_str().unwrap());
+            run.plan.id = run_id.to_string();
+            let values = phase_template_values(
+                &state,
+                &run,
+                &phase,
+                &phase_path,
+                &phase_path.join("tasks"),
+            );
+            let dir = artifacts_dir_the_prompt_names(&planner_prompts::render_template(
+                planner_prompts::DEFAULT_DEVELOPMENT_WORKER,
+                &values,
+            ));
+            // Both runs deliver the SAME filename, which is the realistic arena case.
+            std::fs::write(dir.join("seat-meter.html"), run_id.as_bytes()).unwrap();
+            told.push(dir);
+        }
+
+        assert_ne!(told[0], told[1], "two runs were told to use one directory");
+        assert_eq!(std::fs::read(told[0].join("seat-meter.html")).unwrap(), b"RUN-a");
+        assert_eq!(std::fs::read(told[1].join("seat-meter.html")).unwrap(), b"RUN-b");
+        // And each run reads back its own.
+        for (i, run_id) in ["RUN-a", "RUN-b"].iter().enumerate() {
+            let dir = plan_artifacts::resolve_phase_artifacts_dir(&plan, "01-thing", Some(run_id))
+                .expect("resolves");
+            assert_eq!(dir, told[i]);
+            assert_eq!(
+                std::fs::read(dir.join("seat-meter.html")).unwrap(),
+                run_id.as_bytes()
+            );
+        }
+    }
+}

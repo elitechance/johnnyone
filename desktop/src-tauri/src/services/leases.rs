@@ -1266,3 +1266,243 @@ mod qa_b_tests {
         }
     }
 }
+
+/// QA B round 2 — attacking the all-zero refusal and the exceedance report.
+#[cfg(test)]
+mod qa_b_r2_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Barrier;
+    use std::sync::Arc;
+
+    // ── `exceedances_vs_measured` — every shape ───────────────────────────────────────────────
+
+    /// The report's contents for each shape an override can take.
+    #[test]
+    fn qa_exceedances_are_right_for_every_override_shape() {
+        let caps = |s: &str| SeatCaps::from_json(s).unwrap();
+
+        // Exactly equal to measured → nothing to report.
+        assert!(caps(r#"{"glm-5.3-flash":4,"deepseek-v4.1-flash":2,"qwen3.8-flash-next":4}"#)
+            .exceedances_vs_measured()
+            .is_empty());
+        // One over, by one.
+        assert_eq!(
+            caps(r#"{"glm-5.3-flash":5}"#).exceedances_vs_measured(),
+            vec![("glm-5.3-flash".to_string(), 5, 4)]
+        );
+        // All three over.
+        assert_eq!(
+            caps(r#"{"glm-5.3-flash":9,"deepseek-v4.1-flash":9,"qwen3.8-flash-next":9}"#)
+                .exceedances_vs_measured(),
+            vec![
+                ("glm-5.3-flash".to_string(), 9, 4),
+                ("deepseek-v4.1-flash".to_string(), 9, 2),
+                ("qwen3.8-flash-next".to_string(), 9, 4),
+            ]
+        );
+        // Below measured → not news.
+        assert!(caps(r#"{"glm-5.3-flash":1}"#).exceedances_vs_measured().is_empty());
+        // A family not in the measured table has nothing to exceed.
+        assert!(caps(r#"{"local-7b":999}"#).exceedances_vs_measured().is_empty());
+        // A mixed override reports only the family that exceeds.
+        assert_eq!(
+            caps(r#"{"glm-5.3-flash":1,"deepseek-v4.1-flash":7,"local-7b":999}"#)
+                .exceedances_vs_measured(),
+            vec![("deepseek-v4.1-flash".to_string(), 7, 2)]
+        );
+        // And the measured table never reports against itself.
+        assert!(SeatCaps::measured().exceedances_vs_measured().is_empty());
+    }
+
+    /// The report's ORDER is the measured table's order, not alphabetical.
+    ///
+    /// The doc comment says "ascending", which is what `families()` (a `BTreeMap`) gives and is
+    /// NOT what this gives: it iterates `MEASURED_SEAT_CAPS`, so the order is glm, deepseek,
+    /// qwen. Deterministic either way, and the order is what Dev B's own assertion depends on —
+    /// pinned here because the doc and the code disagree about which guarantee a caller has.
+    #[test]
+    fn qa_the_exceedance_order_is_the_measured_tables_not_alphabetical() {
+        let all = SeatCaps::from_json(
+            r#"{"deepseek-v4.1-flash":9,"glm-5.3-flash":9,"qwen3.8-flash-next":9}"#,
+        )
+        .unwrap();
+        let names: Vec<String> = all.exceedances_vs_measured().into_iter().map(|(f, _, _)| f).collect();
+        assert_eq!(
+            names,
+            vec!["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"],
+            "the order follows MEASURED_SEAT_CAPS"
+        );
+        // Alphabetical would be a different list, so the two really are distinguishable.
+        let mut alphabetical = names.clone();
+        alphabetical.sort();
+        assert_ne!(names, alphabetical, "if these matched, the test would prove nothing");
+        // `families()` IS ascending, which is where the doc's wording came from.
+        assert_eq!(
+            all.families().collect::<Vec<_>>(),
+            vec!["deepseek-v4.1-flash", "glm-5.3-flash", "qwen3.8-flash-next"]
+        );
+    }
+
+    // ── other doors to the all-zero state ─────────────────────────────────────────────────────
+
+    /// The all-zero refusal fires on the STATE, so every spelling of it is refused.
+    #[test]
+    fn qa_every_spelling_of_an_all_zero_override_is_refused() {
+        for raw in [
+            r#"{"x":0}"#,
+            r#"{"glm-5.3-flash":0}"#,
+            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}"#,
+            // Whitespace-only and odd keys are still keys, and still zero.
+            r#"{" ":0}"#,
+            r#"{"":0}"#,
+            // Padded JSON (from_json trims the input).
+            "   {\"glm-5.3-flash\":0}   ",
+            // A DUPLICATE key: serde takes the last value, so a trailing zero silently wins and
+            // the whole table is zeroed. Worth pinning — the first value looks authoritative.
+            r#"{"glm-5.3-flash":4,"glm-5.3-flash":0}"#,
+        ] {
+            let err = SeatCaps::from_json(raw).expect_err(raw);
+            assert!(
+                err.contains("set to zero") || err == "seat caps object is empty",
+                "{raw} -> {err}"
+            );
+        }
+        // The duplicate-key case specifically: last value wins, so this is NOT a 4-seat table.
+        assert!(
+            SeatCaps::from_json(r#"{"glm-5.3-flash":4,"glm-5.3-flash":0}"#).is_err(),
+            "a duplicate key whose last value is 0 must not be read as the first value"
+        );
+        // And the reverse order is accepted at the LAST value, not the first.
+        assert_eq!(
+            SeatCaps::from_json(r#"{"glm-5.3-flash":0,"glm-5.3-flash":4}"#)
+                .unwrap()
+                .cap("glm-5.3-flash"),
+            Some(4)
+        );
+    }
+
+    /// FINDING. The diagnostic is one-directional: a cap ABOVE the measured one is reported, and
+    /// a measured family simply OMITTED is not reported at all.
+    ///
+    /// Omitting a key has the same effect as zeroing it — that family cannot be leased — and the
+    /// all-zero refusal only fires when EVERY key is zero. So `{"glm-5.3-flash": 4}` silently
+    /// takes two of the three measured families out of service, which is two thirds of the harm
+    /// the all-zero guard was added to prevent, with no error and no warning. It also silently
+    /// shrinks `fleet_busy`, the column whose whole job is making two runs comparable: a run
+    /// recorded under this override has no row for the families it could not use, which is the
+    /// "older snapshot that did not record that family" ambiguity the `busy()` doc comment says
+    /// it is avoiding.
+    ///
+    /// What a reviewer should conclude: the override is all-or-nothing by family and nothing says
+    /// so. Either a partial override should merge over the measured table, or omission should get
+    /// the same one-line warning an excess gets. Both are the author's call.
+    #[test]
+    fn qa_documents_an_override_that_omits_a_measured_family_is_silent() {
+        let subset = SeatCaps::from_json(r#"{"glm-5.3-flash": 4}"#).unwrap();
+        // Accepted, with no exceedance to report...
+        assert!(subset.exceedances_vs_measured().is_empty());
+        // ...and two measured families are now unleasable.
+        assert_eq!(subset.cap("deepseek-v4.1-flash"), None);
+        assert_eq!(subset.cap("qwen3.8-flash-next"), None);
+        let pool = Arc::new(LeasePool::new(subset));
+        assert_eq!(
+            pool.acquire("deepseek-v4.1-flash", 1).unwrap_err(),
+            SeatError::UnknownFamily {
+                family: "deepseek-v4.1-flash".to_string()
+            },
+            "an omitted family is indistinguishable from one nobody measured"
+        );
+        // And the comparability snapshot silently loses those rows.
+        assert_eq!(pool.fleet_busy_json(), r#"{"glm-5.3-flash":0}"#);
+        assert_eq!(
+            Arc::new(LeasePool::new(SeatCaps::measured())).fleet_busy_json(),
+            r#"{"deepseek-v4.1-flash":0,"glm-5.3-flash":0,"qwen3.8-flash-next":0}"#,
+            "the measured table records all three, so the difference is real"
+        );
+    }
+
+    /// FINDING (minor). Family matching is exact and case-sensitive, so a case typo is not an
+    /// over-subscription warning — it is a silently disabled family.
+    #[test]
+    fn qa_documents_a_case_typo_in_a_family_name_is_not_reported() {
+        let typo = SeatCaps::from_json(r#"{"GLM-5.3-Flash": 40}"#).unwrap();
+        // 40 on a 4-seat fleet, and `exceedances_vs_measured` has nothing to say, because the
+        // key does not match the measured family it was obviously meant to be.
+        assert!(typo.exceedances_vs_measured().is_empty());
+        assert_eq!(typo.cap("GLM-5.3-Flash"), Some(40));
+        assert_eq!(typo.cap("glm-5.3-flash"), None);
+        let pool = Arc::new(LeasePool::new(typo));
+        assert!(matches!(
+            pool.acquire("glm-5.3-flash", 1),
+            Err(SeatError::UnknownFamily { .. })
+        ));
+    }
+
+    // ── the vacuity hole in `concurrent_families_do_not_bleed_into_each_other` ─────────────────
+
+    /// The companion assertion that test is missing: the race must actually GRANT seats.
+    ///
+    /// `concurrent_families_do_not_bleed_into_each_other` checks only that no per-family peak
+    /// exceeded its cap, and never that any seat was taken — so it passes against an `acquire`
+    /// that refuses everything. QA measured exactly that: with `acquire` hard-wired to return
+    /// `OverCap`, that test stays GREEN while both cap tests go red.
+    ///
+    /// Written as a separate test rather than an edit to Dev B's, so their shape is untouched.
+    /// With the gate barrier holding every thread before any release, the peak is not merely
+    /// positive — it is EXACTLY the cap, because there are more threads per family (10) than
+    /// seats (4, 2, 4). Asserting equality is what makes this a non-vacuity guard rather than
+    /// another way to pass.
+    #[test]
+    fn qa_the_cross_family_race_really_grants_every_seat() {
+        const FAMILIES: [&str; 3] = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
+        const THREADS: usize = 30;
+        let pool = LeasePool::with_measured_caps();
+        let start = Arc::new(Barrier::new(THREADS));
+        let gate = Arc::new(Barrier::new(THREADS));
+        let peaks: Arc<[AtomicU32; 3]> =
+            Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
+        let wins: Arc<[AtomicU32; 3]> =
+            Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let pool = Arc::clone(&pool);
+                let start = Arc::clone(&start);
+                let gate = Arc::clone(&gate);
+                let peaks = Arc::clone(&peaks);
+                let wins = Arc::clone(&wins);
+                let slot = i % FAMILIES.len();
+                std::thread::spawn(move || {
+                    // Record only; nothing on the path to either barrier can panic.
+                    start.wait();
+                    let lease = pool.acquire(FAMILIES[slot], 1);
+                    if lease.is_ok() {
+                        wins[slot].fetch_add(1, Ordering::SeqCst);
+                    }
+                    peaks[slot].fetch_max(pool.busy_for(FAMILIES[slot]), Ordering::SeqCst);
+                    gate.wait();
+                    drop(lease);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("no worker may panic");
+        }
+
+        for (slot, family) in FAMILIES.iter().enumerate() {
+            let cap = pool.cap_for(family).expect("capped");
+            let peak = peaks[slot].load(Ordering::SeqCst);
+            let won = wins[slot].load(Ordering::SeqCst);
+            assert!(peak <= cap, "{family} peaked at {peak} over a cap of {cap}");
+            // THE non-vacuity half: every seat of every family really was handed out.
+            assert_eq!(
+                won, cap,
+                "{family}: {won} of {cap} seats granted — 10 threads raced for them, so anything \
+                 less means the race measured nothing"
+            );
+            assert_eq!(peak, cap, "{family}: peak {peak} should reach the cap {cap}");
+        }
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 0);
+    }
+}
