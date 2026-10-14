@@ -13087,8 +13087,9 @@ diff --git a/two.md b/two.md
         assert!(
             found,
             "`kill` is not on PATH: run_one_gate_command_with_timeout's group kill is a \
-             `Command::new(\"kill\")` whose status is discarded, so it would no-op silently and a \
-             timed-out gate would orphan its grandchildren"
+             `Command::new(\"kill\")`, so on this box a timed-out gate cannot signal its process \
+             group and would orphan its grandchildren. The runner logs that at ERROR rather than \
+             discarding it, but a log is not containment"
         );
     }
 
@@ -13230,6 +13231,328 @@ diff --git a/two.md b/two.md
             run.plan.test_commands_list,
             vec!["npm test".to_string()],
             "a rejected call must not have half-applied"
+        );
+    }
+
+    // ────── QA round 3: the C1 shared-capture concurrency path ──────
+    //
+    // The capture is now an `Arc<Mutex<GateCapture>>` per stream, published after every read and
+    // read again from the grace-window path. These attack that: output loss, ordering, the cap and
+    // `truncated` while a writer is still active, UTF-8 cut at an arbitrary byte, lock contention,
+    // and whether the grace is concurrent or cumulative. Every writer below self-terminates so a
+    // failing assertion cannot leave a runaway process on the host.
+
+    /// The gate's OWN output must survive a pipe held open past the grace window, even when the
+    /// gate writes a lot immediately before exiting — the drain is then mid-stream when the grace
+    /// expires, which is the exact shape that lost output in the first cut of this fix.
+    #[tokio::test]
+    async fn qa_c1_a_large_final_write_survives_a_pipe_held_open_by_a_background_job() {
+        let dir = tmp_dir("qa-c1-bigwrite");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // 64 KiB of the gate's own output, then a marker, then exit — with a background job
+        // holding stdout open for ~3s afterwards.
+        let command = format!(
+            "sh -c '{}' & head -c 65536 /dev/zero | tr '\\0' 'q' ; echo END-OF-GATE-OUTPUT",
+            tick_loop(&ticks)
+        );
+        let started = std::time::Instant::now();
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let elapsed = started.elapsed();
+        assert_eq!(exit_code, 0, "{output}");
+        assert!(
+            !truncated,
+            "64 KiB is under the cap; nothing should have been discarded"
+        );
+        assert!(
+            output.contains("END-OF-GATE-OUTPUT"),
+            "the gate's final write was lost. captured {} bytes in {:?}",
+            output.len(),
+            elapsed
+        );
+        assert!(
+            output.matches('q').count() >= 65536,
+            "the bulk of the gate's output was lost: {} 'q' bytes of 65536",
+            output.matches('q').count()
+        );
+        // Non-vacuity: the background writer really was holding the pipe.
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+    }
+
+    /// A command that writes and exits immediately must never lose its output. Repeated, because
+    /// the failure mode is a race between `child.wait()` returning and the drains being polled.
+    #[tokio::test]
+    async fn qa_c1_a_fast_command_never_loses_its_output() {
+        let dir = tmp_dir("qa-c1-fast");
+        let w = dir.to_string_lossy().to_string();
+        for attempt in 0..40 {
+            let (exit_code, output, _) = run_one_gate_command_with_timeout(
+                "echo out-line ; echo err-line 1>&2",
+                &w,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .expect("gate must run");
+            assert_eq!(exit_code, 0);
+            assert!(
+                output.contains("out-line"),
+                "attempt {attempt}: lost stdout: {output:?}"
+            );
+            assert!(
+                output.contains("err-line"),
+                "attempt {attempt}: lost stderr: {output:?}"
+            );
+        }
+    }
+
+    /// A command that prints nothing yields an empty capture, not a spurious read error.
+    #[tokio::test]
+    async fn qa_c1_a_silent_command_reports_no_read_error() {
+        let dir = tmp_dir("qa-c1-silent");
+        let w = dir.to_string_lossy().to_string();
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout("true", &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        assert_eq!(exit_code, 0);
+        assert!(!truncated);
+        assert_eq!(output.trim(), "", "expected an empty capture, got {output:?}");
+        assert!(
+            !output.contains("[gate] reading"),
+            "a clean EOF must not report a read error: {output}"
+        );
+    }
+
+    /// The two flush graces run CONCURRENTLY. With a background job holding BOTH pipes, the gate
+    /// must cost one grace window, not two.
+    #[tokio::test]
+    async fn qa_c1_the_flush_grace_is_concurrent_not_cumulative() {
+        let dir = tmp_dir("qa-c1-grace");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // The background job inherits stdout AND stderr and holds both for ~3s.
+        let command = format!("sh -c '{}' 2>&1 & echo started", tick_loop(&ticks));
+        let started = std::time::Instant::now();
+        let (exit_code, output, _) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let elapsed = started.elapsed();
+        assert_eq!(exit_code, 0, "{output}");
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+        let one = TEST_GATE_PIPE_FLUSH_GRACE;
+        assert!(
+            elapsed < one + std::time::Duration::from_millis(300),
+            "two held pipes cost {elapsed:?}; one grace is {one:?}, so this looks cumulative \
+             rather than concurrent"
+        );
+        assert!(
+            output.contains("started"),
+            "the gate's own output must still arrive: {output}"
+        );
+    }
+
+    /// Within a stream, bytes must stay in order, and the two streams must not interleave into
+    /// each other. Each stream has its own capture, so this pins that they stay separate while
+    /// both drains publish concurrently.
+    #[tokio::test]
+    async fn qa_c1_each_stream_keeps_its_own_order() {
+        let dir = tmp_dir("qa-c1-order");
+        let w = dir.to_string_lossy().to_string();
+        // 4000 numbered lines on stdout and 4000 lettered lines on stderr, concurrently, far more
+        // than one 8 KiB read each so both drains loop and contend for their locks.
+        let command = "seq 1 4000 & for i in $(seq 1 4000); do echo \"E$i\" 1>&2; done; wait";
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout(command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert_eq!(exit_code, 0);
+        assert!(!truncated, "this output is well under the cap");
+
+        // stdout's numbers must be strictly increasing in the capture.
+        let numbers: Vec<i64> = output
+            .lines()
+            .filter_map(|line| line.trim().parse::<i64>().ok())
+            .collect();
+        assert!(numbers.len() > 3000, "lost stdout lines: {}", numbers.len());
+        assert!(
+            numbers.windows(2).all(|pair| pair[1] > pair[0]),
+            "stdout bytes were reordered within the stream"
+        );
+        // stderr's markers likewise.
+        let es: Vec<i64> = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('E')?.parse::<i64>().ok())
+            .collect();
+        assert!(es.len() > 3000, "lost stderr lines: {}", es.len());
+        assert!(
+            es.windows(2).all(|pair| pair[1] > pair[0]),
+            "stderr bytes were reordered within the stream"
+        );
+        // And the streams are concatenated, not interleaved: every stderr marker comes after
+        // every stdout number in the combined capture.
+        let last_number = output.rfind(&format!("\n{}\n", numbers[numbers.len() - 1]));
+        let first_e = output.find("E1\n");
+        if let (Some(last_number), Some(first_e)) = (last_number, first_e) {
+            assert!(
+                last_number < first_e,
+                "stdout and stderr interleaved in the combined capture"
+            );
+        }
+    }
+
+    /// `truncated` must be exact at the cap boundary, including while a writer is still active on
+    /// the pipe during the grace window.
+    #[tokio::test]
+    async fn qa_c1_truncated_is_exact_at_the_cap_boundary() {
+        let dir = tmp_dir("qa-c1-cap");
+        let w = dir.to_string_lossy().to_string();
+        let cap = TEST_GATE_STREAM_CAP_BYTES;
+
+        // Exactly the cap: nothing discarded.
+        let command = format!("head -c {cap} /dev/zero | tr '\\0' 'a'");
+        let (_, _, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert!(!truncated, "exactly {cap} bytes must not report truncation");
+
+        // One byte over: discarded, and reported.
+        let over = cap + 1;
+        let command = format!("head -c {over} /dev/zero | tr '\\0' 'a'");
+        let (_, _, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert!(truncated, "{over} bytes must report truncation");
+
+        // And over the cap while a background job keeps the pipe open: the flag must still be
+        // published before the grace window ends.
+        let ticks = dir.join("ticks.txt");
+        let command = format!(
+            "sh -c '{}' & head -c {over} /dev/zero | tr '\\0' 'a' ; echo TAIL",
+            tick_loop(&ticks)
+        );
+        let (_, output, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert!(truncated, "truncation during the grace window must be reported");
+        assert!(output.contains("TAIL"), "the tail must survive: kept {} bytes", output.len());
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+    }
+
+    /// The window is cut at an arbitrary BYTE — by the cap at the front and by the grace window at
+    /// the back — so a multi-byte character can be split. That must cost at most a replacement
+    /// character at each edge, never a panic and never a mangled middle.
+    #[tokio::test]
+    async fn qa_c1_a_utf8_character_split_by_the_cap_costs_one_replacement_char() {
+        let dir = tmp_dir("qa-c1-utf8");
+        let w = dir.to_string_lossy().to_string();
+        let cap = TEST_GATE_STREAM_CAP_BYTES;
+        // Snowmen are 3 bytes each; 3 does not divide the cap, so the front cut lands mid-char.
+        let count = cap / 3 + 1000;
+        let command = format!("for i in $(seq 1 {count}); do printf '\\342\\230\\203'; done");
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(60))
+                .await
+                .expect("gate must run");
+        assert_eq!(exit_code, 0);
+        assert!(truncated, "this output exceeds the cap");
+        let replacements = output.matches('\u{FFFD}').count();
+        let snowmen = output.matches('\u{2603}').count();
+        assert!(snowmen > 1000, "the characters themselves must survive: {snowmen}");
+        assert!(
+            replacements <= 2,
+            "a byte-boundary cut must cost at most one replacement char per edge, got \
+             {replacements} (snowmen: {snowmen})"
+        );
+    }
+
+    /// `GateCapture::take` runs while the drains may still hold their locks. A writer hammering the
+    /// pipe at a high rate maximises that contention; the call must still return promptly, and the
+    /// lock must never be held across an await (which would deadlock the grace window).
+    #[tokio::test]
+    async fn qa_c1_take_does_not_deadlock_against_a_hammering_drain() {
+        let dir = tmp_dir("qa-c1-contend");
+        let w = dir.to_string_lossy().to_string();
+        // A self-terminating writer that floods both streams as fast as sh can, inherited by a
+        // background job so it is still running when the grace window expires and `take` runs.
+        let command = "sh -c 'for i in $(seq 1 20000); do printf \"xxxxxxxxxxxxxxxx\"; \
+                       printf \"yyyyyyyyyyyyyyyy\" 1>&2; done' & echo started";
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run_one_gate_command_with_timeout(command, &w, std::time::Duration::from_secs(10)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let (exit_code, output, truncated) = outcome
+            .expect("take() deadlocked or blocked against a live drain")
+            .expect("gate must run");
+        assert_eq!(exit_code, 0, "{}", &output[..output.len().min(200)]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "contention cost {elapsed:?}; the lock may be held across an await"
+        );
+        // Both windows stayed exactly at the cap under concurrent publish-and-read: the
+        // contention did not corrupt a length or lose a window.
+        assert!(truncated, "this flood is well past the cap");
+        assert_eq!(
+            output.len(),
+            2 * TEST_GATE_STREAM_CAP_BYTES + 1,
+            "expected both windows full plus the separator"
+        );
+        assert!(
+            output.contains('x') && output.contains('y'),
+            "both streams must be represented"
+        );
+        // NOTE, and this is correct rather than a defect: `echo started` does NOT survive here.
+        // The window is a TAIL, the gate's own line was written FIRST, and a background job that
+        // floods past the cap during the grace window evicts it. So a gate that leaves a chatty
+        // daemon behind can have its own result pushed out of the capture by the daemon's output —
+        // `truncated` says so, but the useful bytes are gone. Under the cap it survives, which
+        // `qa_c1_a_large_final_write_survives_a_pipe_held_open_by_a_background_job` pins.
+    }
+
+    /// RISK, pinned: the deadline now bounds `child.wait()` PLUS the flush grace, so a command
+    /// that exits successfully inside the last [`TEST_GATE_PIPE_FLUSH_GRACE`] of the deadline is
+    /// reported as a TIMEOUT.
+    ///
+    /// Two consequences. The reported outcome is wrong (`-3` for a command that exited 0), and the
+    /// precondition in the group-kill comment — "the shell is alive or an unreaped zombie" — no
+    /// longer holds, because `child.wait()` has already reaped it. With the real 20-minute
+    /// deadline this is a 500ms window in 1,200,000ms and only for gates that hold their pipes
+    /// open, so it is a sharp edge rather than an operational problem; it matters for anyone
+    /// driving the runner with a short deadline. The fix is to bound `child.wait()` and run the
+    /// grace outside that bound.
+    #[tokio::test]
+    async fn qa_c1_a_command_that_exits_inside_the_grace_window_is_misreported_as_a_timeout() {
+        let dir = tmp_dir("qa-c1-edge");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // The command exits 0 at ~150ms; a background job holds the pipes so the grace runs its
+        // full 500ms, pushing completion past a 400ms deadline.
+        let command = format!("sh -c '{}' & sleep 0.15 ; echo done-early", tick_loop(&ticks));
+        let (exit_code, output, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("gate must report");
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+        assert_eq!(
+            exit_code, TEST_GATE_EXIT_TIMEOUT,
+            "if this now reports 0, the deadline was moved off the grace window — \
+             good, and this test should be inverted"
+        );
+        assert!(
+            output.contains("did not finish"),
+            "and the message blames the command for being slow: {output}"
         );
     }
 
