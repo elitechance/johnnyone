@@ -18622,12 +18622,16 @@ mod qa_b_r2_tests {
 
         // ── 3. the worker writes there; the reader finds it ───────────────────────────────────
         std::fs::write(told.join("seat-meter.html"), b"<html>delivered</html>").unwrap();
-        let read_back = plan_artifacts::resolve_phase_artifacts_dir(
-            &plan,
-            &phase.phase_id,
-            Some(&run.plan.id),
-        )
-        .expect("the reader must resolve the directory the worker was told to use");
+        // Migrated to the TYPED reader (round 5 ruling): `resolve_phase_artifacts_dir`'s `None`
+        // now means any of five things, so a caller that wants "where is the evidence" must ask
+        // the reader that can answer.
+        let artifacts =
+            plan_artifacts::phase_artifacts_state(&plan, &phase.phase_id, Some(&run.plan.id));
+        assert!(!artifacts.is_fault(), "the store must be healthy here: {artifacts:?}");
+        let read_back = artifacts
+            .found()
+            .expect("the reader must resolve the directory the worker was told to use")
+            .to_path_buf();
         assert_eq!(
             read_back, told,
             "the writer and the reader disagree about where this run's evidence lives"
@@ -18726,12 +18730,10 @@ mod qa_b_r2_tests {
             ));
             std::fs::write(told.join("mine.png"), b"this run").unwrap();
 
-            let read_back = plan_artifacts::resolve_phase_artifacts_dir(
-                &plan,
-                &phase.phase_id,
-                Some(&run.plan.id),
-            )
-            .expect("resolves");
+            let artifacts =
+                plan_artifacts::phase_artifacts_state(&plan, &phase.phase_id, Some(&run.plan.id));
+            assert!(!artifacts.is_fault(), "{artifacts:?}");
+            let read_back = artifacts.found().expect("resolves").to_path_buf();
             assert_eq!(
                 read_back, told,
                 "champion_has_artifacts={champion_has_artifacts}: writer and reader disagree"
@@ -18780,8 +18782,9 @@ mod qa_b_r2_tests {
         assert_eq!(std::fs::read(told[1].join("seat-meter.html")).unwrap(), b"RUN-b");
         // And each run reads back its own.
         for (i, run_id) in ["RUN-a", "RUN-b"].iter().enumerate() {
-            let dir = plan_artifacts::resolve_phase_artifacts_dir(&plan, "01-thing", Some(run_id))
-                .expect("resolves");
+            let artifacts = plan_artifacts::phase_artifacts_state(&plan, "01-thing", Some(run_id));
+            assert!(!artifacts.is_fault(), "{artifacts:?}");
+            let dir = artifacts.found().expect("resolves").to_path_buf();
             assert_eq!(dir, told[i]);
             assert_eq!(
                 std::fs::read(dir.join("seat-meter.html")).unwrap(),

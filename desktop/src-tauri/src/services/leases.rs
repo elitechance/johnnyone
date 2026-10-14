@@ -128,9 +128,23 @@ impl SeatCaps {
             if parsed.is_empty() {
                 return Err("seat caps object is empty".to_string());
             }
+            // Why an all-zero override is refused when a partial one is merely noted, since
+            // under merge semantics both end at the measured caps for every family:
+            //
+            // `from_json` is a PUBLIC constructor with its own contract — produce a usable caps
+            // table or fail — and it has a direct caller shape that never merges
+            // (`LeasePool::new(SeatCaps::from_json(..)?)`). For THAT caller an all-zero table is
+            // exactly the empty-table state this guard exists to prevent: the pool refuses every
+            // request as `UnknownFamily`, whose message tells the operator to add a family they
+            // themselves zeroed. The merge path is one of two callers and cannot be the only one
+            // considered.
+            //
+            // What WAS inconsistent is the diagnostic, and that is fixed here: both routes now
+            // state the same rule in the same words, so an operator learns it either way.
             return Err(format!(
                 "every family in the seat caps object is set to zero ({}), so no family could be \
-                 leased at all; remove the key to use the measured caps instead",
+                 leased at all; remove the key to use the measured caps instead. Zero does NOT \
+                 disable a family — there is deliberately no disable switch",
                 zeroed_list(&zeroed)
             ));
         }
@@ -172,29 +186,46 @@ impl SeatCaps {
         let mut notes: Vec<CapNote> = Vec::new();
         let mut merged = Self::measured().caps;
         for (family, seats) in &parsed {
+            let measured = MEASURED_SEAT_CAPS
+                .iter()
+                .find(|(m, _)| m == family)
+                .map(|(_, n)| *n);
+
+            // The key diagnostics run BEFORE the zero check, not after it. They used to be
+            // after a `continue`, so `{"local-7b":0}` skipped them and the operator's ONLY note
+            // was `ZeroIgnored` claiming "the measured cap is kept" — for a family that has no
+            // measured cap to keep. The one note they got was the one that misinformed them.
+            if measured.is_none() {
+                // A different fleet may legitimately have a family nobody here measured. But a
+                // typo of a measured name is the likelier cause and is otherwise invisible: the
+                // intended family keeps its old cap while a new one appears beside it. Matching
+                // stays EXACT — lowering or trimming the key would be a guess about a name the
+                // fleet owns — so a near miss is reported, never silently corrected.
+                notes.push(match near_miss(family) {
+                    Some((measured_name, case_too)) if !family.trim().eq(family.as_str()) => {
+                        CapNote::WhitespaceMismatch {
+                            configured: family.clone(),
+                            measured: measured_name,
+                            case_too,
+                        }
+                    }
+                    Some((measured_name, _)) => CapNote::CaseMismatch {
+                        configured: family.clone(),
+                        measured: measured_name,
+                    },
+                    None => CapNote::UnmeasuredFamily {
+                        family: family.clone(),
+                    },
+                });
+            }
             if *seats == 0 {
+                // `measured` rides along so the message can only say "the measured cap is kept"
+                // when there is one.
                 notes.push(CapNote::ZeroIgnored {
                     family: family.clone(),
+                    measured,
                 });
                 continue;
-            }
-            if !MEASURED_SEAT_CAPS.iter().any(|(m, _)| m == family) {
-                // A different fleet may legitimately have a family nobody here measured — but a
-                // CASE typo of a measured name is the far likelier cause, and it is invisible
-                // otherwise: the operator's intended family keeps its old cap while a new one
-                // appears beside it.
-                match MEASURED_SEAT_CAPS
-                    .iter()
-                    .find(|(m, _)| m.eq_ignore_ascii_case(family))
-                {
-                    Some((measured, _)) => notes.push(CapNote::CaseMismatch {
-                        configured: family.clone(),
-                        measured: (*measured).to_string(),
-                    }),
-                    None => notes.push(CapNote::UnmeasuredFamily {
-                        family: family.clone(),
-                    }),
-                }
             }
             merged.insert(family.clone(), *seats);
         }
@@ -249,6 +280,20 @@ fn zeroed_list(families: &[&str]) -> String {
     families.join(", ")
 }
 
+/// Did `key` nearly name a measured family? Returns `(the measured name, case also differs)`.
+///
+/// Trimmed and case-folded, in that order, because both are what hand-edited JSON actually gets
+/// wrong — a leading space in `{" glm-5.3-flash": 40}` is at least as likely as a capital, and it
+/// used to earn only the generic "nobody measured this family" note with nothing pointing at the
+/// family the operator meant. Reporting, never correcting: see the loop in `from_override_json`.
+fn near_miss(key: &str) -> Option<(String, bool)> {
+    let trimmed = key.trim();
+    MEASURED_SEAT_CAPS
+        .iter()
+        .find(|(m, _)| m.eq_ignore_ascii_case(trimmed))
+        .map(|(m, _)| ((*m).to_string(), !m.eq(&trimmed)))
+}
+
 /// Something questionable about a host seat-cap override. Never fatal — every one of these is a
 /// configuration a different fleet might legitimately want — but never silent either, which is
 /// the whole point of this module.
@@ -265,10 +310,25 @@ pub enum CapNote {
     },
     /// The key differs from a measured family only by case, so it did not apply to it.
     CaseMismatch { configured: String, measured: String },
-    /// The key matches no measured family at all, not even ignoring case.
+    /// The key differs from a measured family by surrounding whitespace (and possibly case too),
+    /// so it did not apply to it. Its own variant rather than a `CaseMismatch`, because the
+    /// operator has to be told WHICH invisible character to delete.
+    WhitespaceMismatch {
+        configured: String,
+        measured: String,
+        case_too: bool,
+    },
+    /// The key matches no measured family at all, not even trimmed and case-folded.
     UnmeasuredFamily { family: String },
-    /// A zero entry. Zero is not a way to disable a family; the measured cap is kept.
-    ZeroIgnored { family: String },
+    /// A zero entry. Zero is not a way to disable a family.
+    ///
+    /// `measured` is the family's measured cap, if it has one. It is carried so the message
+    /// cannot claim "the measured cap is kept" about a family that has no measured cap — the
+    /// false note an unmeasured, zeroed key used to produce as the operator's ONLY diagnostic.
+    ZeroIgnored {
+        family: String,
+        measured: Option<u32>,
+    },
 }
 
 impl fmt::Display for CapNote {
@@ -295,16 +355,46 @@ impl fmt::Display for CapNote {
                  beside it. Family names are matched exactly; fix the case if this was a typo",
                 configured, measured, measured, configured
             ),
+            CapNote::WhitespaceMismatch {
+                configured,
+                measured,
+                case_too,
+            } => write!(
+                f,
+                "seat-cap key {:?} differs from the measured family {:?} only by surrounding \
+                 whitespace{}, so it did NOT change that family's cap — {:?} keeps its measured \
+                 value and {:?} was added beside it as a family of its own. Family names are \
+                 matched exactly and the key is NOT trimmed; delete the whitespace if this was \
+                 a typo",
+                configured,
+                measured,
+                if *case_too { " and case" } else { "" },
+                measured,
+                configured
+            ),
             CapNote::UnmeasuredFamily { family } => write!(
                 f,
                 "seat-cap key {:?} matches no measured family; it is accepted as a new family, \
                  but nothing here has measured its real capacity",
                 family
             ),
-            CapNote::ZeroIgnored { family } => write!(
+            CapNote::ZeroIgnored {
+                family,
+                measured: Some(measured),
+            } => write!(
                 f,
-                "seat-cap entry {:?} is 0, which does NOT disable the family — the measured cap \
-                 is kept. Remove the key instead; there is deliberately no disable switch",
+                "seat-cap entry {:?} is 0, which does NOT disable the family — its measured cap \
+                 of {} is kept. Remove the key instead; there is deliberately no disable switch",
+                family, measured
+            ),
+            CapNote::ZeroIgnored {
+                family,
+                measured: None,
+            } => write!(
+                f,
+                "seat-cap entry {:?} is 0 and that family has no measured cap either, so the \
+                 entry does nothing at all — it neither grants seats nor disables anything. \
+                 Remove it, or give it the number of seats the family really has",
                 family
             ),
         }
@@ -828,11 +918,28 @@ mod tests {
     /// **And it must assert that seats were GRANTED, not only that none were over-granted.** The
     /// rewrite checked `peak <= cap` and nothing else, which is true of a pool that refuses
     /// everything: QA measured that `if true || seats > free` left this test green while 17 of
-    /// the 24 lease tests went red around it. A test whose unique job is "families do not bleed
-    /// into each other" says nothing at all unless seats really are handed out, so the strong
-    /// form is `won == cap == peak`, per family. 10 threads race for each family's seats and
-    /// exactly that family's cap is won — which is also what rules out pooling, since a pooled
-    /// implementation would hand glm's spare seats to deepseek's losers.
+    /// the 24 lease tests went red around it. So the strong form is `won == cap == peak`, per
+    /// family: 10 threads race for each family's 4/2/4 seats and exactly that family's cap is
+    /// won.
+    ///
+    /// **What `won == cap` does and does not isolate** — corrected, because the first version of
+    /// this comment got it wrong and a wrong reason in a test is worse than none:
+    ///
+    /// - It does NOT rule out pooling. A pooled implementation is already caught by the
+    ///   pre-existing `peak <= cap`, because `busy_for` then reports the shared total and the
+    ///   peak reaches 10 against a cap of 4 — the `won` assertion is never even reached.
+    /// - It DOES rule out always-refuse (above), and — the clean isolation — **a cap enforced one
+    ///   seat too tightly**. With `cap - 1` the peak is 3 against a cap of 4, so every peak
+    ///   assertion still passes and only the granted count fails. That matters beyond tidiness:
+    ///   an under-granting pool makes the arena silently run narrower than it was configured to,
+    ///   and a comparison between two runs at an unintended width is the exact thing this module
+    ///   exists to make valid.
+    /// - It does NOT cover **starvation**. Both cross-family tests hold a barrier and request
+    ///   equal widths, so a wide request refused fifty times behind narrow ones is invisible
+    ///   here. That is consistent with there being no queue — documented in the module header as
+    ///   the caller's job — and QA pinned it in
+    ///   `qa_documents_the_cap_tests_cannot_see_starvation` so that `won == cap` is not read as
+    ///   covering fairness.
     #[test]
     fn concurrent_families_do_not_bleed_into_each_other() {
         const FAMILIES: [&str; 3] = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
@@ -1647,7 +1754,10 @@ mod qa_b_r2_tests {
             SeatCaps::from_override_json(r#"{"glm-5.3-flash": 0, "deepseek-v4.1-flash": 1}"#)
                 .unwrap();
         assert!(notes.contains(&CapNote::ZeroIgnored {
-            family: "glm-5.3-flash".to_string()
+            family: "glm-5.3-flash".to_string(),
+            // The measured cap rides along, so the message can only promise to keep one when
+            // there IS one. QA found the unmeasured case claiming otherwise.
+            measured: Some(4),
         }));
         assert!(notes[0].to_string().contains("does NOT disable"), "{:?}", notes[0]);
         assert_eq!(
@@ -1793,58 +1903,99 @@ mod qa_b_r3_tests {
         .is_err());
     }
 
-    /// FINDING. The all-zero refusal and the `ZeroIgnored` note disagree about what a zero means,
-    /// so the same intent gets two different outcomes depending on whether another key is present.
+    /// FIXED-AS-DIAGNOSTIC (was `qa_documents_zero_is_refused_alone_but_noted_in_company`, QA
+    /// round 4). The two routes for a zero now state the SAME rule in the same words. The
+    /// behaviours stay different, and the reason is recorded in `from_json`.
     ///
-    /// `{"glm-5.3-flash":0}` is REFUSED outright (the host falls back to the measured table).
-    /// `{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}` is ACCEPTED, glm keeps its measured 4, and a
-    /// `ZeroIgnored` note is emitted. Both end with glm at 4, by different routes and with
-    /// different diagnostics — and only one of them tells the operator that zero does not disable
-    /// a family. Under merge semantics the all-zero case is no longer dangerous (it merges to the
-    /// measured table), so the refusal is now stricter than it needs to be and inconsistent with
-    /// the note beside it.
+    /// QA's analysis was right about the merge path: an all-zero override merges to exactly the
+    /// measured table, so on that path the refusal buys nothing. It is kept because `from_json`
+    /// is a public constructor with its own contract — produce a usable caps table or fail — and
+    /// has a caller shape that never merges, `LeasePool::new(SeatCaps::from_json(..)?)`. For that
+    /// caller an all-zero table IS the empty-table state the guard exists to prevent: every
+    /// request refused as `UnknownFamily`, whose message tells the operator to add a family they
+    /// zeroed themselves. One of two callers cannot be the only one considered.
+    ///
+    /// So what was actually inconsistent — the diagnostic, where only one route taught the rule
+    /// — is what changed. Both now say "zero does NOT disable a family" and both point at
+    /// removing the key.
     #[test]
-    fn qa_documents_zero_is_refused_alone_but_noted_in_company() {
-        // Alone: refused.
-        assert!(SeatCaps::from_override_json(r#"{"glm-5.3-flash":0}"#).is_err());
-        // In company: accepted, glm at its MEASURED value, with a note.
-        let (caps, ns) = SeatCaps::from_override_json(
-            r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}"#,
-        )
-        .expect("accepted once another key is present");
+    fn qa_both_routes_for_a_zero_state_the_same_rule() {
+        // Alone: still refused, and the error now teaches the rule.
+        let err = SeatCaps::from_override_json(r#"{"glm-5.3-flash":0}"#)
+            .expect_err("an all-zero override is refused; see from_json's doc comment for why");
+        assert!(err.contains("set to zero"), "{err}");
+        assert!(err.contains("remove the key to use the measured caps"), "{err}");
+        assert!(err.contains("does NOT disable a family"), "{err}");
+        assert!(err.contains("no disable switch"), "{err}");
+
+        // In company: still accepted, glm at its MEASURED value, with a note that says the same.
+        let (caps, ns) =
+            SeatCaps::from_override_json(r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":2}"#)
+                .expect("accepted once another key is present");
         assert_eq!(caps.cap("glm-5.3-flash"), Some(4), "zero did not disable it");
-        assert!(ns.contains(&CapNote::ZeroIgnored {
-            family: "glm-5.3-flash".to_string()
-        }));
+        let note = ns
+            .iter()
+            .find(|n| matches!(n, CapNote::ZeroIgnored { family, .. } if family == "glm-5.3-flash"))
+            .expect("a ZeroIgnored note is emitted for it");
+        let shown = note.to_string();
+        assert!(shown.contains("does NOT disable"), "{shown}");
+        assert!(shown.contains("no disable switch"), "{shown}");
+
+        // THE point: an operator who hits either route is taught the same rule.
+        for phrase in ["does NOT disable", "disable switch"] {
+            assert!(err.contains(phrase), "refusal is missing {phrase:?}");
+            assert!(shown.contains(phrase), "note is missing {phrase:?}");
+        }
     }
 
-    /// FINDING. `ZeroIgnored`'s message is false for a family that was never measured: it says
-    /// "the measured cap is kept" when there is no measured cap to keep.
+    /// FIXED (was `qa_documents_zero_ignored_misinforms_for_an_unmeasured_family`, QA round 4).
+    /// A zeroed key for a family nobody measured now gets a true note AND the note that was
+    /// being suppressed.
     ///
-    /// And because the zero branch `continue`s before the unmeasured-family check, such a key
-    /// gets NO `UnmeasuredFamily` note either — so the one note the operator receives is the one
-    /// that misinforms them.
+    /// The zero branch used to `continue` before the unmeasured-family check, so such a key got
+    /// no `UnmeasuredFamily` note at all — and `ZeroIgnored` claimed "the measured cap is kept"
+    /// about a family with no measured cap. The single note the operator received was the one
+    /// that misinformed them. The key diagnostics now run first, and `ZeroIgnored` carries the
+    /// measured value so its wording cannot promise something that does not exist.
     #[test]
-    fn qa_documents_zero_ignored_misinforms_for_an_unmeasured_family() {
+    fn qa_a_zeroed_unmeasured_family_gets_a_true_note_and_the_suppressed_one() {
         let (caps, ns) = SeatCaps::from_override_json(r#"{"local-7b":0,"glm-5.3-flash":4}"#)
             .expect("accepted");
         // Nothing is "kept": the family simply is not there.
         assert_eq!(caps.cap("local-7b"), None);
+
+        // The note that was suppressed now fires.
+        assert!(
+            ns.iter().any(|n| matches!(n, CapNote::UnmeasuredFamily { family } if family == "local-7b")),
+            "the UnmeasuredFamily note must no longer be swallowed by the zero branch: {ns:?}"
+        );
+        // And the zero note is TRUE for this family.
         let zero = ns
             .iter()
-            .find(|n| matches!(n, CapNote::ZeroIgnored { family } if family == "local-7b"))
+            .find(|n| matches!(n, CapNote::ZeroIgnored { family, .. } if family == "local-7b"))
             .expect("a ZeroIgnored note is emitted for it");
+        assert_eq!(
+            zero,
+            &CapNote::ZeroIgnored {
+                family: "local-7b".to_string(),
+                measured: None
+            }
+        );
         let shown = zero.to_string();
         assert!(
-            shown.contains("the measured cap is kept"),
-            "the wording under test: {shown}"
+            !shown.contains("measured cap of"),
+            "it must not promise to keep a cap that does not exist: {shown}"
         );
-        // ...which is untrue for this family, and no second note corrects it.
-        assert!(
-            !ns.iter().any(|n| matches!(n, CapNote::UnmeasuredFamily { family } if family == "local-7b")),
-            "an unmeasured ZERO family gets no UnmeasuredFamily note, because the zero branch \
-             returns first — so the only note it gets is the misleading one"
-        );
+        assert!(shown.contains("no measured cap either"), "{shown}");
+        assert!(shown.contains("does nothing at all"), "{shown}");
+
+        // The MEASURED case still says the true thing for itself, naming the number.
+        let (_, ns) = SeatCaps::from_override_json(r#"{"glm-5.3-flash":0,"local-7b":8}"#).unwrap();
+        let zero = ns
+            .iter()
+            .find(|n| matches!(n, CapNote::ZeroIgnored { family, .. } if family == "glm-5.3-flash"))
+            .unwrap();
+        assert!(zero.to_string().contains("measured cap of 4 is kept"), "{zero}");
     }
 
     /// The note taxonomy, over every shape QA could construct.
@@ -1895,25 +2046,64 @@ mod qa_b_r3_tests {
         }
     }
 
-    /// FINDING (gap in the taxonomy). A key that differs from a measured family only by
-    /// SURROUNDING WHITESPACE gets the generic `UnmeasuredFamily` note, not the specific
-    /// `CaseMismatch`-style one — although it is the same class of hand-edit typo and at least as
-    /// likely in JSON, and it silently adds a fourth family whose cap does nothing.
+    /// FIXED (was `qa_documents_a_whitespace_typo_gets_only_the_generic_note`, QA round 4). A key
+    /// that differs from a measured family by surrounding whitespace now gets a note naming the
+    /// family it was meant to be, the same quality a case typo gets.
+    ///
+    /// A leading space in hand-edited JSON is at least as likely as a capital, and it used to
+    /// earn only "nobody measured this family" — with nothing pointing at the family the
+    /// operator obviously meant. Its own variant rather than a `CaseMismatch` because the
+    /// operator has to be told WHICH invisible character to delete.
+    ///
+    /// The key is still **not trimmed**: matching stays exact, so the note reports rather than
+    /// silently accepting a different key than was written. Same fixture as QA's, inverted.
     #[test]
-    fn qa_documents_a_whitespace_typo_gets_only_the_generic_note() {
-        let (caps, ns) = SeatCaps::from_override_json(r#"{" glm-5.3-flash":40,"qwen3.8-flash-next":4}"#)
-            .expect("accepted");
+    fn qa_a_whitespace_typo_names_the_family_it_was_meant_to_be() {
+        let (caps, ns) =
+            SeatCaps::from_override_json(r#"{" glm-5.3-flash":40,"qwen3.8-flash-next":4}"#)
+                .expect("accepted");
+        // Unchanged, and deliberately so: the key is reported, not corrected.
         assert_eq!(caps.cap(" glm-5.3-flash"), Some(40), "a fourth family, with a space");
         assert_eq!(caps.cap("glm-5.3-flash"), Some(4), "the real one is untouched");
+
         assert_eq!(
             ns,
-            vec![CapNote::UnmeasuredFamily { family: " glm-5.3-flash".to_string() }],
-            "only the generic note — nothing points at the family it was obviously meant to be"
+            vec![CapNote::WhitespaceMismatch {
+                configured: " glm-5.3-flash".to_string(),
+                measured: "glm-5.3-flash".to_string(),
+                case_too: false,
+            }],
+            "the note must point at the family it was obviously meant to be"
         );
+        let shown = ns[0].to_string();
+        assert!(shown.contains("surrounding whitespace"), "{shown}");
+        assert!(shown.contains("did NOT change that family's cap"), "{shown}");
+        assert!(shown.contains("NOT trimmed"), "the note must say the key was not corrected: {shown}");
+
         // A trailing newline behaves the same way.
         assert_eq!(
             notes("{\"glm-5.3-flash\\n\":40,\"qwen3.8-flash-next\":4}"),
-            vec![CapNote::UnmeasuredFamily { family: "glm-5.3-flash\n".to_string() }]
+            vec![CapNote::WhitespaceMismatch {
+                configured: "glm-5.3-flash\n".to_string(),
+                measured: "glm-5.3-flash".to_string(),
+                case_too: false,
+            }]
+        );
+        // Whitespace AND case together is called out as both, so the operator fixes both.
+        let both = notes(r#"{" GLM-5.3-Flash":40,"qwen3.8-flash-next":4}"#);
+        assert_eq!(
+            both,
+            vec![CapNote::WhitespaceMismatch {
+                configured: " GLM-5.3-Flash".to_string(),
+                measured: "glm-5.3-flash".to_string(),
+                case_too: true,
+            }]
+        );
+        assert!(both[0].to_string().contains("whitespace and case"), "{}", both[0]);
+        // A key that is near nothing still gets the generic note, unchanged.
+        assert_eq!(
+            notes(r#"{"local-7b":8,"glm-5.3-flash":4}"#),
+            vec![CapNote::UnmeasuredFamily { family: "local-7b".to_string() }]
         );
     }
 

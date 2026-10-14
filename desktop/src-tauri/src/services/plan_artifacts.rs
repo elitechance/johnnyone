@@ -217,28 +217,94 @@ pub fn ensure_phase_run_artifacts_dir(
 /// had delivered nothing while the evidence sat inside it — the failure this module exists to
 /// prevent, reached from the other side, and silent while the confinement branch beside it
 /// logged. QA measured it with `chmod 000`.
+///
+/// **Every variant but one carries a path, and that one carries the rule it broke.** For a gate
+/// whose job is to say "this phase delivered no evidence", the first question a human asks is
+/// *which directory did you look in* — so [`ArtifactsState::Absent`] names them. It used to carry
+/// neither a path nor a reason while folding together three different situations: the directories
+/// are empty, there is no such phase, and the phase id is not addressable at all. The last is the
+/// one the *writer* refuses with a loud message naming the rule, so the reader says the same
+/// thing through [`ArtifactsState::Unaddressable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactsState {
     /// Confined, readable, and holds at least one entry.
     Found(PathBuf),
-    /// Nothing here: the directory does not exist, or exists and is genuinely empty.
-    Absent,
+    /// Nothing is there. Every candidate was missing, or present and genuinely empty.
+    ///
+    /// `looked_in` is every path that was tried, in the order they were tried, so a gate can say
+    /// where it looked instead of only that it found nothing.
+    Absent { looked_in: Vec<PathBuf> },
+    /// Something is in the way that is not a directory: a regular file, or a **dangling symlink**
+    /// — which `is_dir()` reports as simply absent, making a broken store indistinguishable from
+    /// a phase that produced nothing.
+    NotADirectory { path: PathBuf, reason: String },
     /// The directory exists but could not be listed. **Not** a claim that it is empty.
     Unreadable { dir: PathBuf, reason: String },
     /// The directory exists but resolves physically outside the plan store — a planted symlink,
     /// or a badly broken store. Refused, loudly.
     Escaped { dir: PathBuf, reason: String },
+    /// The phase id or run id is not one safe path segment, so there is no directory to even
+    /// look in. The same rule `ensure_phase_run_artifacts_dir` refuses with.
+    Unaddressable { reason: String },
 }
 
-/// Classify one candidate directory: confined, readable, non-empty?
+impl ArtifactsState {
+    /// The directory holding artifacts, if there is one. Everything else is `None` — which is
+    /// exactly why callers should match on the variants instead.
+    pub fn found(&self) -> Option<&Path> {
+        match self {
+            ArtifactsState::Found(dir) => Some(dir.as_path()),
+            _ => None,
+        }
+    }
+
+    /// Is this a FAULT — something a gate must surface rather than read as "no evidence"?
+    ///
+    /// `Absent` is not a fault: a phase legitimately produces no artifacts. The other three are,
+    /// and conflating them with `Absent` is the defect this type was introduced to end.
+    pub fn is_fault(&self) -> bool {
+        matches!(
+            self,
+            ArtifactsState::NotADirectory { .. }
+                | ArtifactsState::Unreadable { .. }
+                | ArtifactsState::Escaped { .. }
+                | ArtifactsState::Unaddressable { .. }
+        )
+    }
+}
+
+/// Classify one candidate directory: addressable, a directory at all, confined, readable,
+/// non-empty?
 ///
-/// `is_dir()` alone was the reader's whole test, and it was wrong three times over: it follows
-/// symlinks (so it resolved outside the store), existence is not content, and an unreadable
-/// directory is not an empty one.
+/// `is_dir()` alone was the reader's whole test, and it was wrong four times over: it follows
+/// symlinks (so it resolved outside the store), existence is not content, an unreadable directory
+/// is not an empty one, and a file or dangling link in the way reads as absent.
 fn artifacts_state(plan_path: &Path, rel: &str) -> ArtifactsState {
     let dir = plan_path.join(rel);
     if !dir.is_dir() {
-        return ArtifactsState::Absent;
+        // `symlink_metadata` does NOT follow the final link, so it is what tells "nothing here"
+        // apart from "something here that is not a directory", including a dangling link whose
+        // target is gone.
+        return match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => {
+                let reason = if meta.file_type().is_symlink() {
+                    "a symlink whose target is missing or is not a directory".to_string()
+                } else {
+                    format!("not a directory ({:?})", meta.file_type())
+                };
+                tracing::warn!(
+                    path = %dir.display(),
+                    %reason,
+                    "the artifact path exists but is not a directory; a broken store is not the \
+                     same as a phase that produced no evidence"
+                );
+                ArtifactsState::NotADirectory { path: dir, reason }
+            }
+            // Truly nothing at this path.
+            Err(_) => ArtifactsState::Absent {
+                looked_in: vec![dir],
+            },
+        };
     }
     if let Err(reason) = confine_to_plan(plan_path, rel) {
         // Loud: silently falling through to the champion would hide a planted link.
@@ -263,64 +329,95 @@ fn artifacts_state(plan_path: &Path, rel: &str) -> ArtifactsState {
     if entries.next().is_some() {
         ArtifactsState::Found(dir)
     } else {
-        ArtifactsState::Absent
+        ArtifactsState::Absent {
+            looked_in: vec![dir],
+        }
     }
 }
 
 /// [`artifacts_state`] for the directory a phase's reader would actually use, run-scoped first.
 ///
-/// The information-preserving form of [`resolve_phase_artifacts_dir`], for the arena's reader to
-/// call instead: it can tell `Absent` from `Unreadable` from `Escaped`, and so can refuse to
-/// conclude "this phase delivered no evidence" from a permissions fault. Fall-through order is
-/// the same, and only a `Found` run directory wins — an `Unreadable` or `Escaped` run directory
-/// is reported as such rather than quietly replaced by the champion's, because those two are
-/// problems to surface, not states to route around.
+/// **This is the reader to call.** It can tell `Absent` from `Unreadable` from `Escaped` from
+/// `NotADirectory` from `Unaddressable`, and so can refuse to conclude "this phase delivered no
+/// evidence" from a fault. Fall-through order is run-scoped then champion, and only a `Found` run
+/// directory wins: a faulting run directory is reported as such rather than quietly replaced by
+/// the champion's, because substituting the champion's evidence for a faulting run's is exactly
+/// the contamination this branch exists to stop.
+///
+/// Two `Absent` candidates merge their `looked_in` lists, so the answer names both directories
+/// that were tried rather than only the last.
 pub fn phase_artifacts_state(
     plan_path: &Path,
     phase_id: &str,
     run_id: Option<&str>,
 ) -> ArtifactsState {
+    let mut looked_in: Vec<PathBuf> = Vec::new();
     if let Some(run_id) = run_id {
-        if let Some(rel) = phase_run_artifacts_rel(phase_id, run_id) {
-            match artifacts_state(plan_path, &rel) {
-                ArtifactsState::Absent => {}
+        match phase_run_artifacts_rel(phase_id, run_id) {
+            Some(rel) => match artifacts_state(plan_path, &rel) {
+                ArtifactsState::Absent { looked_in: tried } => looked_in.extend(tried),
                 decided => return decided,
+            },
+            // A caller that passed an unusable id is told so, not quietly handed the champion's
+            // directory — the same refusal, in the same words, that the writer gives.
+            None => {
+                return ArtifactsState::Unaddressable {
+                    reason: format!(
+                        "phase {:?} / run {:?}: both must be one safe path segment (no empty \
+                         name, no `.`, no `..`, no `/` or `\\`)",
+                        phase_id, run_id
+                    ),
+                }
             }
         }
     }
     match phase_artifacts_rel(phase_id) {
-        Some(rel) => artifacts_state(plan_path, &rel),
-        None => ArtifactsState::Absent,
+        Some(rel) => match artifacts_state(plan_path, &rel) {
+            ArtifactsState::Absent { looked_in: tried } => {
+                looked_in.extend(tried);
+                ArtifactsState::Absent { looked_in }
+            }
+            decided => decided,
+        },
+        None => ArtifactsState::Unaddressable {
+            reason: format!(
+                "phase {:?} is not one safe path segment (no empty name, no `.`, no `..`, no \
+                 `/` or `\\`)",
+                phase_id
+            ),
+        },
     }
 }
 
-/// The artifact directory to READ for a phase, across both layouts.
+/// The artifact directory to READ for a phase, across both layouts — **compatibility form**.
 ///
-/// Order: the run's own directory when a `run_id` is given and that directory holds something,
-/// then the bare champion directory, then `None`. Both candidates must be physically inside the
-/// plan store.
+/// Prefer [`phase_artifacts_state`]. This signature cannot distinguish the five answers, so its
+/// `None` now means *any* of: both directories are empty or missing, the directory is unreadable,
+/// it escapes the plan store, something that is not a directory is in the way, or the ids are not
+/// addressable. A caller that reads this `None` as "the phase produced no evidence" is wrong in
+/// the four cases that matter, and those are the cases this branch exists for.
+///
+/// Kept because it is pinned as a compatibility contract, not because anything should use it.
+/// **It has no production caller** (grep: every reference outside this module is a test), and
+/// every test caller has been migrated to `phase_artifacts_state`, so the ambiguity is contained
+/// to this function's own pins.
+///
+/// Behaviour, for the record: run-scoped directory first and only when `Found`, then the bare
+/// champion directory, both of which must be physically inside the plan store and non-empty.
 ///
 /// **Non-empty, not merely present.** `ensure_phase_run_artifacts_dir` is called on every phase
 /// prompt render, so every pre-existing plan acquires an empty `artifacts/runs/<run_id>/` the
-/// first time a phase runs. Preferring the run directory on existence alone therefore made the
-/// champion's artifacts unreachable for any reader that passed a run id — on every plan in the
-/// store, as soon as the arena wired a reader up. One condition, no migration.
-///
-/// The back-compat step is the common one: every plan on disk today has only the bare directory,
-/// and this reader finds it with nothing moved.
+/// first time a phase runs. Preferring the run directory on existence alone made the champion's
+/// artifacts unreachable for any reader that passed a run id — on every plan in the store. One
+/// condition, no migration.
 pub fn resolve_phase_artifacts_dir(
     plan_path: &Path,
     phase_id: &str,
     run_id: Option<&str>,
 ) -> Option<PathBuf> {
-    match phase_artifacts_state(plan_path, phase_id, run_id) {
-        ArtifactsState::Found(dir) => Some(dir),
-        // `Unreadable` and `Escaped` collapse to `None` here only because this signature cannot
-        // express them. That is why `phase_artifacts_state` exists and is what the arena's
-        // reader should call: a caller that treats this `None` as "the phase produced no
-        // evidence" is wrong in exactly the two cases that matter.
-        ArtifactsState::Absent | ArtifactsState::Unreadable { .. } | ArtifactsState::Escaped { .. } => None,
-    }
+    phase_artifacts_state(plan_path, phase_id, run_id)
+        .found()
+        .map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -1255,7 +1352,7 @@ mod qa_b_r2_tests {
         std::fs::create_dir_all(empty_plan.join("phases/01-shell/artifacts")).unwrap();
         assert_eq!(
             phase_artifacts_state(&empty_plan, "01-shell", None),
-            ArtifactsState::Absent
+            ArtifactsState::Absent { looked_in: vec![empty_plan.join("phases/01-shell/artifacts")] }
         );
 
         // Make it unlistable (still present, still holding the evidence).
@@ -1278,11 +1375,56 @@ mod qa_b_r2_tests {
                 }
                 other => panic!("expected Unreadable, got {other:?}"),
             }
-            assert_ne!(state, ArtifactsState::Absent, "unreadable must not read as empty");
+            assert!(
+                !matches!(state, ArtifactsState::Absent { .. }),
+                "unreadable must not read as empty: {state:?}"
+            );
+            assert!(state.is_fault(), "a gate must be able to see this is a fault");
         }
         // Always restore, so the fixture can be cleaned up.
         std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(resolve_phase_artifacts_dir(&plan, "01-shell", None), Some(art));
+    }
+
+    /// An ESCAPING run directory is surfaced too — the case my round-4 pin missed.
+    ///
+    /// QA found that `resolve_phase_artifacts_dir` returns `None` for an `Escaped` run dir where
+    /// round 2 returned `Some(champion)`, and that my pin covered only `Unreadable`. The typed
+    /// behaviour is right — a planted link must not be papered over with the champion's evidence
+    /// — but it has to be pinned for BOTH faults or the next edit can reintroduce one of them.
+    #[test]
+    fn qa_an_escaping_run_dir_is_surfaced_not_replaced_by_the_champion() {
+        let plan = crate::test_support::tmp_dir("qa-r4-escape-run");
+        let outside = crate::test_support::tmp_dir("qa-r4-escape-out");
+        let champion = plan.join("phases/01-shell/artifacts");
+        std::fs::create_dir_all(champion.join("runs")).unwrap();
+        std::fs::write(champion.join("aux-open.png"), b"champion evidence").unwrap();
+        // A planted link where this run's directory belongs.
+        std::fs::create_dir_all(outside.join("4f0821")).unwrap();
+        std::fs::write(outside.join("4f0821/stolen.png"), b"outside the store").unwrap();
+        std::os::unix::fs::symlink(outside.join("4f0821"), champion.join("runs/4f0821")).unwrap();
+
+        let state = phase_artifacts_state(&plan, "01-shell", Some("4f0821"));
+        match &state {
+            ArtifactsState::Escaped { dir, reason } => {
+                assert_eq!(dir, &champion.join("runs/4f0821"));
+                assert!(reason.contains("does not resolve inside the plan store"), "{reason}");
+            }
+            other => panic!("expected Escaped, got {other:?}"),
+        }
+        assert!(state.is_fault(), "a gate must be able to see this is a fault");
+        // The champion is NOT substituted, even though it is healthy and holds evidence.
+        assert!(champion.join("aux-open.png").is_file());
+        assert_eq!(
+            resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")),
+            None,
+            "the champion's evidence must not stand in for a faulting run's"
+        );
+        // And the champion still resolves on its own, so the fault is scoped to the run.
+        assert_eq!(
+            phase_artifacts_state(&plan, "01-shell", None),
+            ArtifactsState::Found(champion)
+        );
     }
 
     /// An unreadable RUN directory is surfaced, not routed around into the champion's.
@@ -1356,7 +1498,7 @@ mod qa_b_r3_tests {
     /// migrating every caller to `phase_artifacts_state` a requirement of this change rather than
     /// an improvement available later.
     #[test]
-    fn qa_documents_an_unreadable_run_dir_masks_a_healthy_champion() {
+    fn qa_a_faulting_run_dir_is_never_replaced_by_the_champions_unreadable() {
         let plan = champion_with_evidence("qa-r3-mask");
         let champion = plan.join("phases/01-shell/artifacts");
         let run = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821").unwrap();
@@ -1378,12 +1520,15 @@ mod qa_b_r3_tests {
                 }
                 other => panic!("expected Unreadable, got {other:?}"),
             }
-            // ...and the champion is NOT consulted, so the Option reader reports nothing at all
-            // even though the champion is readable and holds evidence.
+            // ...and the champion is NOT consulted. That is the DESIGN, not a regression:
+            // substituting the champion's evidence for a faulting run's is the contamination
+            // this branch exists to stop. Through the Option form it still reads as a bare
+            // `None`, which is why every caller was migrated to the typed reader in round 5 —
+            // `resolve_phase_artifacts_dir` now has no caller outside its own pins.
             assert_eq!(
                 resolve_phase_artifacts_dir(&plan, "01-shell", Some("4f0821")),
                 None,
-                "the Option reader masks the champion"
+                "the Option form cannot express the fault; the typed reader above can"
             );
             assert!(
                 champion.join("aux-open.png").is_file(),
@@ -1400,7 +1545,7 @@ mod qa_b_r3_tests {
 
     /// The same masking for `Escaped`, which round 2 also fell through on.
     #[test]
-    fn qa_documents_an_escaping_run_dir_masks_a_healthy_champion() {
+    fn qa_a_faulting_run_dir_is_never_replaced_by_the_champions_escaped() {
         let plan = champion_with_evidence("qa-r3-mask-esc");
         let outside = crate::test_support::tmp_dir("qa-r3-mask-out");
         std::fs::create_dir_all(outside.join("4f0821")).unwrap();
@@ -1425,32 +1570,54 @@ mod qa_b_r3_tests {
     /// The classification matrix, over every filesystem failure QA could stage.
     #[test]
     fn qa_the_state_is_right_for_every_filesystem_shape() {
-        // 1. Missing entirely -> Absent.
+        // 1. Missing entirely -> Absent, NAMING the directory it looked in.
         let a = crate::test_support::tmp_dir("qa-r3-m-missing");
-        assert_eq!(phase_artifacts_state(&a, "01-shell", None), ArtifactsState::Absent);
+        assert_eq!(
+            phase_artifacts_state(&a, "01-shell", None),
+            ArtifactsState::Absent {
+                looked_in: vec![a.join("phases/01-shell/artifacts")]
+            }
+        );
 
-        // 2. Present and empty -> Absent.
+        // 2. Present and empty -> Absent, same shape.
         let b = crate::test_support::tmp_dir("qa-r3-m-empty");
         std::fs::create_dir_all(b.join("phases/01-shell/artifacts")).unwrap();
-        assert_eq!(phase_artifacts_state(&b, "01-shell", None), ArtifactsState::Absent);
+        assert_eq!(
+            phase_artifacts_state(&b, "01-shell", None),
+            ArtifactsState::Absent {
+                looked_in: vec![b.join("phases/01-shell/artifacts")]
+            }
+        );
 
-        // 3. A FILE where the directory should be -> Absent, NOT Unreadable. The store is broken,
-        //    and the state cannot say so: `is_dir()` is false, so it is indistinguishable from
-        //    "this phase has no artifacts directory". Pinned as a gap in the taxonomy.
+        // 3. A FILE where the directory should be -> NotADirectory (was Absent, QA round 4). A
+        //    broken store must not read as a phase that produced nothing.
         let c = crate::test_support::tmp_dir("qa-r3-m-file");
         std::fs::create_dir_all(c.join("phases/01-shell")).unwrap();
         std::fs::write(c.join("phases/01-shell/artifacts"), b"not a directory").unwrap();
-        assert_eq!(
-            phase_artifacts_state(&c, "01-shell", None),
-            ArtifactsState::Absent,
-            "a regular file where the artifacts dir belongs reads as Absent"
-        );
+        let state = phase_artifacts_state(&c, "01-shell", None);
+        match &state {
+            ArtifactsState::NotADirectory { path, reason } => {
+                assert_eq!(path, &c.join("phases/01-shell/artifacts"));
+                assert!(reason.contains("not a directory"), "{reason}");
+            }
+            other => panic!("a regular file in the way must be NotADirectory, got {other:?}"),
+        }
+        assert!(state.is_fault());
 
-        // 4. A DANGLING symlink where the directory should be -> Absent, same gap.
+        // 4. A DANGLING symlink where the directory should be -> NotADirectory too, and the
+        //    reason says it is a link, which `is_dir()` could never report.
         let d = crate::test_support::tmp_dir("qa-r3-m-dangle");
         std::fs::create_dir_all(d.join("phases/01-shell")).unwrap();
         std::os::unix::fs::symlink(d.join("nowhere"), d.join("phases/01-shell/artifacts")).unwrap();
-        assert_eq!(phase_artifacts_state(&d, "01-shell", None), ArtifactsState::Absent);
+        let state = phase_artifacts_state(&d, "01-shell", None);
+        match &state {
+            ArtifactsState::NotADirectory { path, reason } => {
+                assert_eq!(path, &d.join("phases/01-shell/artifacts"));
+                assert!(reason.contains("symlink"), "the reason must say it is a link: {reason}");
+            }
+            other => panic!("a dangling link must be NotADirectory, got {other:?}"),
+        }
+        assert!(state.is_fault());
 
         // 5. Listable but children cannot be stat'd (r, no x) -> Found. Listing is what the rule
         //    tests, and the names come from getdents without a stat, so this is correct.
@@ -1487,32 +1654,80 @@ mod qa_b_r3_tests {
         std::fs::set_permissions(&fart, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// FINDING (taxonomy). `Absent` is the one state that carries neither a path nor a reason, so
-    /// a caller cannot say WHERE it looked or WHICH of the two candidates was missing.
+    /// FIXED (was `qa_documents_absent_carries_neither_a_path_nor_a_reason`, QA round 4).
+    /// `Absent` now names every directory it looked in, and an unsafe phase id is its own
+    /// variant carrying the rule it broke.
     ///
-    /// Every other variant names its directory. For a review gate whose job is to report "this
-    /// phase delivered no evidence", the directory it checked is the first thing a human asks
-    /// for, and it is the one thing `Absent` cannot supply — and it cannot distinguish "the run
-    /// never wrote and the champion is empty" from "this phase id does not exist".
+    /// QA's point, which is the right one: for a review gate whose job is to report "this phase
+    /// delivered no evidence", the directory it checked is the first thing a human asks for, and
+    /// it was the one thing `Absent` could not supply — while folding together "the directories
+    /// are empty", "no such phase" and "the phase id is unsafe", the last of which the *writer*
+    /// refuses with a loud message naming the rule.
+    ///
+    /// Same fixture, inverted.
     #[test]
-    fn qa_documents_absent_carries_neither_a_path_nor_a_reason() {
+    fn qa_absent_names_every_directory_it_looked_in() {
         let plan = crate::test_support::tmp_dir("qa-r3-absent");
-        // A phase that does not exist at all, and a phase whose dirs are merely empty, are the
-        // same value — so no caller can tell them apart or report a path.
         std::fs::create_dir_all(plan.join("phases/01-shell/artifacts")).unwrap();
-        assert_eq!(phase_artifacts_state(&plan, "01-shell", None), ArtifactsState::Absent);
-        assert_eq!(phase_artifacts_state(&plan, "99-nonexistent", None), ArtifactsState::Absent);
-        // An unsafe phase id is also folded into the same value, with no reason given — where
-        // the writer refuses such an id with a loud message naming the rule.
-        assert_eq!(phase_artifacts_state(&plan, "../escape", None), ArtifactsState::Absent);
+
+        // An empty phase and a nonexistent phase are both Absent, but each says WHERE it looked,
+        // so they are no longer the same value and a gate can report the path.
+        let empty = phase_artifacts_state(&plan, "01-shell", None);
+        let missing = phase_artifacts_state(&plan, "99-nonexistent", None);
+        assert_eq!(
+            empty,
+            ArtifactsState::Absent {
+                looked_in: vec![plan.join("phases/01-shell/artifacts")]
+            }
+        );
+        assert_eq!(
+            missing,
+            ArtifactsState::Absent {
+                looked_in: vec![plan.join("phases/99-nonexistent/artifacts")]
+            }
+        );
+        assert_ne!(empty, missing, "two different phases must not be one value");
+        assert!(!empty.is_fault(), "a phase with no artifacts is not a fault");
+
+        // Both candidates are named when both were tried, not only the last.
+        let both = phase_artifacts_state(&plan, "01-shell", Some("4f0821"));
+        assert_eq!(
+            both,
+            ArtifactsState::Absent {
+                looked_in: vec![
+                    plan.join("phases/01-shell/artifacts/runs/4f0821"),
+                    plan.join("phases/01-shell/artifacts"),
+                ]
+            }
+        );
+
+        // An unsafe phase id is no longer folded into Absent: it is Unaddressable, and it states
+        // the SAME rule the writer refuses with.
+        let state = phase_artifacts_state(&plan, "../escape", None);
+        match &state {
+            ArtifactsState::Unaddressable { reason } => {
+                assert!(reason.contains("safe path segment"), "{reason}");
+                assert!(reason.contains("../escape"), "{reason}");
+            }
+            other => panic!("an unsafe phase id must be Unaddressable, got {other:?}"),
+        }
+        assert!(state.is_fault());
         assert!(ensure_phase_run_artifacts_dir(&plan, "../escape", "4f0821")
             .unwrap_err()
             .contains("Refusing to build an artifact path"));
-        // Contrast: every other variant names its dir.
+        // An unsafe RUN id is told so too, rather than being quietly handed the champion's dir.
+        assert!(matches!(
+            phase_artifacts_state(&plan, "01-shell", Some("../..")),
+            ArtifactsState::Unaddressable { .. }
+        ));
+
+        // Contrast, kept from QA: every variant names its directory or its rule.
         for state in [
             ArtifactsState::Found(plan.clone()),
             ArtifactsState::Unreadable { dir: plan.clone(), reason: "r".into() },
             ArtifactsState::Escaped { dir: plan.clone(), reason: "r".into() },
+            ArtifactsState::NotADirectory { path: plan.clone(), reason: "r".into() },
+            ArtifactsState::Absent { looked_in: vec![plan.clone()] },
         ] {
             let shown = format!("{state:?}");
             assert!(shown.contains("qa-r3-absent"), "{shown} must name its directory");
@@ -1533,7 +1748,12 @@ mod qa_b_r3_tests {
         );
         // Absent <-> None.
         assert_eq!(resolve_phase_artifacts_dir(&plan, "99-absent", None), None);
-        assert_eq!(phase_artifacts_state(&plan, "99-absent", None), ArtifactsState::Absent);
+        assert_eq!(
+            phase_artifacts_state(&plan, "99-absent", None),
+            ArtifactsState::Absent {
+                looked_in: vec![plan.join("phases/99-absent/artifacts")]
+            }
+        );
         // An empty run dir still falls through to the champion through BOTH readers — the round-2
         // fix is intact.
         let run = ensure_phase_run_artifacts_dir(&plan, "01-shell", "4f0821").unwrap();
