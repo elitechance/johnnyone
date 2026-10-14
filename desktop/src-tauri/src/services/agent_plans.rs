@@ -11406,6 +11406,40 @@ mod store_tests {
         assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
     }
 
+    /// Run-scoped evidence is still this phase's evidence.
+    ///
+    /// The provenance walk selects by the `phases/<id>/` prefix, so it reaches
+    /// `artifacts/runs/<run_id>/` with no change — which is the reason `runs/` was nested under
+    /// `artifacts/` rather than placed beside it. Pinned here because it is the claim that makes
+    /// run-scoping safe for the review gate: if the walk missed these files, every competing run
+    /// would pass the evidence check by having no evidence it could see.
+    #[test]
+    fn run_scoped_evidence_is_still_judged() {
+        let dir = approved_store("ev-runscoped");
+        shot(
+            &dir,
+            "phases/01-shell/artifacts/runs/4f0821/mystery.png",
+            b"challenger pixels",
+        );
+        let reason = evidence_provenance_reason(&dir.to_string_lossy(), "01-shell")
+            .expect("a run-scoped image nobody describes must still be caught");
+        assert!(reason.contains("runs/4f0821/mystery.png"), "{reason}");
+
+        // And described run-scoped evidence passes, same as the flat layout.
+        let ok = approved_store("ev-runscoped-ok");
+        shot(
+            &ok,
+            "phases/01-shell/artifacts/runs/4f0821/aux-open.png",
+            b"open state pixels",
+        );
+        std::fs::write(
+            ok.join("phases/01-shell/tasks/t1/decisions.md"),
+            "aux-open.png — /patients/42 with the aux layer open.\n",
+        )
+        .unwrap();
+        assert_eq!(evidence_provenance_reason(&ok.to_string_lossy(), "01-shell"), None);
+    }
+
     /// Another phase's screenshots must not decide this phase's readiness.
     #[test]
     fn evidence_is_scoped_to_the_phase_under_review() {
