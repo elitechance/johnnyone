@@ -5,6 +5,7 @@ use crate::db::models::{
 };
 use crate::providers::CliProvider;
 use crate::events::{AgentPlanRunEvent, StreamEvent};
+use crate::services::plan_artifacts;
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
@@ -2268,8 +2269,23 @@ fn is_worker_writable_store_file(path: &str) -> bool {
     // work IS producing evidence: 02-acceptance bounced three times on its own
     // `cargo-test-lib.txt` and `capture-library.mjs` and escalated to needs_attention, because a
     // fresh test run and an edited capture script both show as "removed lines" here.
-    if path.starts_with("artifacts/") || path.contains("/artifacts/") {
+    //
+    // Run-scoped artifact directories (`phases/<id>/artifacts/runs/<run_id>/…`) are the same
+    // thing one competing run at a time, so they classify identically — that is why `runs/` is
+    // nested UNDER `artifacts/` rather than beside it.
+    //
+    // The test is on path SEGMENTS, via `plan_artifacts::is_artifact_path`, not on substrings.
+    // `path.contains("/artifacts/")` was true for `phases/01-shell/artifacts/../../overview.md`,
+    // which names the spec while reading as an artifact — so `artifacts/` was a key that unlocked
+    // the rest of the store.
+    if crate::services::plan_artifacts::is_artifact_path(path) {
         return true;
+    }
+    // Same reason, for the named progress files below: a path with a `..`, an empty or a
+    // backslash-bearing segment is about a different file from the one it names, so it is not
+    // classified at all.
+    if !crate::services::plan_artifacts::is_safe_relative_path(path) {
+        return false;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
@@ -2300,6 +2316,22 @@ mod worker_writable_tests {
         assert!(!is_worker_writable_store_file("overview.md"));
         assert!(!is_worker_writable_store_file("phases/02-acceptance/tasks/02-02/prompt.md"));
         assert!(!is_worker_writable_store_file("phases/02-acceptance/overview.md"));
+    }
+
+    /// `artifacts/` must not be a key that unlocks the rest of the store.
+    ///
+    /// The classifier decides whether a diff touching a path counts as the worker doing its job
+    /// or as the worker weakening its own spec. A `..` segment anywhere makes that decision about
+    /// a DIFFERENT file than the one named, so the answer is meaningless: the path below names
+    /// `overview.md`, the spec, while reading as an artifact.
+    #[test]
+    fn a_traversing_path_is_never_worker_writable() {
+        assert!(!is_worker_writable_store_file("phases/01-shell/artifacts/../../overview.md"));
+        assert!(!is_worker_writable_store_file("artifacts/../overview.md"));
+        assert!(!is_worker_writable_store_file("phases/../decisions.md"));
+        // A backslash is a legal filename byte on the host, so a Windows-shaped path must not be
+        // read as separators either.
+        assert!(!is_worker_writable_store_file("phases/01-shell\\artifacts\\x.png"));
     }
 }
 
@@ -8655,6 +8687,29 @@ fn phase_template_values(
                     .to_string_lossy()
                     .to_string()
             });
+    // The ONE place a phase's artifact directory is derived, run-scoped
+    // (`phases/<id>/artifacts/runs/<run_id>/`). `run_id` is the identity the run already has —
+    // `run.plan.id` today, `workflow_runs.id` once the arena exists — so no column is added for
+    // it. Created here, best-effort: the prompt should name a directory that exists, and a plan
+    // store that cannot be written to is already a failure the phase reports for its own reasons.
+    // Falls back to the champion's bare `artifacts/` only if the ids are not safe path segments,
+    // which host-generated slugs and uuids are.
+    let plan_root = Path::new(&run.plan.plan_path);
+    let artifacts_path = plan_artifacts::ensure_phase_run_artifacts_dir(
+        plan_root,
+        &phase.phase_id,
+        &run.plan.id,
+    )
+    .unwrap_or_else(|reason| {
+        tracing::warn!(
+            plan_id = %run.plan.id,
+            phase_id = %phase.phase_id,
+            %reason,
+            "falling back to the unscoped artifacts directory"
+        );
+        plan_artifacts::phase_artifacts_dir(plan_root, &phase.phase_id)
+            .unwrap_or_else(|| phase_path.join(plan_artifacts::ARTIFACTS_DIR))
+    });
     vec![
         ("run_id", run.plan.id.clone()),
         ("phase_id", phase.phase_id.clone()),
@@ -8662,6 +8717,7 @@ fn phase_template_values(
         ("plan_path", run.plan.plan_path.clone()),
         ("phase_path", phase_path.to_string_lossy().to_string()),
         ("tasks_path", tasks_path.to_string_lossy().to_string()),
+        ("artifacts_path", artifacts_path.to_string_lossy().to_string()),
         ("methodology_path", methodology_path),
         ("conventions_path", conventions_path),
     ]
