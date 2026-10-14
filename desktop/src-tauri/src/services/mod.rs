@@ -27,3 +27,6 @@ mod workflows_qa_attacks;
 /// QA A round 2: the fixes for round 1, and the surfaces the fixes added.
 #[cfg(test)]
 mod workflows_qa_attacks_r2;
+/// QA A round 3: the executor, the identity key, the SQL guard, the cross-branch contract.
+#[cfg(test)]
+mod workflows_qa_attacks_r3;
