@@ -77,6 +77,15 @@
     },
     "test": {
       "command": "npx vitest run --config web/vitest.config.ts"
+    },
+    "arena-phone": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node web/tools/arena-phone-harness.mjs"
+      },
+      "metadata": {
+        "description": "Arena phone harness. Drives the built app in real headless Chrome at 400x860 against canned GraphQL, and exits NON-ZERO naming the route and the reason when a page does not render, a scroller is degenerate, content is unreachable, something overflows sideways, or a control is missing, unpainted, unhittable or present-but-unchecked. NEEDS: a Chrome binary at /usr/bin/google-chrome, puppeteer from node_modules, and a current `nx build web` (it serves dist/web/browser). Not wired to CI on purpose — that is a decision about other people's builds and needs a browser on the runner. Screenshots go OUTSIDE the repo: ARENA_HARNESS_OUT, else a temp directory."
+      }
     }
   }
 }
