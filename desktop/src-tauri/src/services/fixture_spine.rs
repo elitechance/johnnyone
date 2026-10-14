@@ -82,6 +82,20 @@ fn fixture_spine_verifies_are_narrow() {
     }
 }
 
+/// READING THIS CRATE'S TEST OUTPUT: this test shells out to the fixture workspace's own
+/// `cargo test`, whose stub crates are DELIBERATELY red — that is the whole assertion. So
+/// `cargo test -p johnnyone-desktop --lib` prints a pile of nested `FAILED` lines that mean the
+/// opposite of what they look like, and grepping `FAILED` here gives a wildly misleading answer.
+///
+/// Measured on this tree: 24 occurrences of `FAILED`, of which 22 are nested fixture noise —
+/// 11 `test <name>_works ... FAILED` plus 11 `test result: FAILED`. THE TELL: every nested result
+/// line ends `9 filtered out` (the fixture crate has 10 tests and is run one at a time), while
+/// this crate's own result line is the ONLY one saying `0 filtered out`. So:
+///
+///     cargo test -p johnnyone-desktop --lib 2>&1 | grep '0 filtered out'
+///
+/// is the real verdict; the final `test result` line is the same thing. Read one of those before
+/// concluding this crate's suite is red.
 #[test]
 fn fixture_every_verify_is_red_on_stubs() {
     let tmp = std::env::temp_dir().join(format!(
