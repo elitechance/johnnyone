@@ -12065,19 +12065,31 @@ diff --git a/two.md b/two.md
         assert!(output.contains("did not finish"), "{output}");
         assert!(output.contains("was killed"), "{output}");
 
-        // 2. kill_on_drop: the killed child must not outlive the call. `sleep 45` would still be
-        //    running if the timeout only abandoned it, so after a moment nothing matches.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let survivors = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg("sleep 45")
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default();
-        assert!(
-            survivors.is_empty(),
-            "the timed-out child leaked; pgrep found pids: {survivors}"
-        );
+        // 2. The killed child must not outlive the call. This was `pgrep -f "sleep 45"` plus
+        //    `assert!(survivors.is_empty())`, and QA showed that instrument is wrong twice over:
+        //
+        //    FALSE POSITIVES. `pgrep -f` matches the full command line of EVERY process on the
+        //    box, so it fires on anything that merely mentions `sleep 45` — including the shell
+        //    that invoked the test run. QA reproduced it: 3/3 runs in isolation failed with
+        //    `pgrep found pids: 3768750`, which was the harness's own bash wrapper, and 5/5 runs
+        //    in a full-suite batch failed the same way. A gate that goes red for reasons outside
+        //    the repo is worse than no gate.
+        //
+        //    VACUOUS GREEN. The call ended `.unwrap_or_default()`, so a missing or failing `pgrep`
+        //    yielded an empty string and the assert-empty passed. On a box without pgrep the check
+        //    proved nothing at all.
+        //
+        //    Liveness is now measured by whether a descendant's own tick file keeps growing after
+        //    the deadline, which cannot collide with another process and cannot pass vacuously:
+        //    `qa_gate_timeout_kills_the_whole_process_group_not_just_the_shell` (nested
+        //    grandchild) and `qa_gate_timeout_kills_an_orphaned_grandchild_still_in_the_group`
+        //    (double fork, reparented, same group). Both pass, so the group kill itself is sound —
+        //    it was only ever this assertion that was broken. `qa_gate_setsid_escapes_the_group_kill`
+        //    pins the one documented escape.
+        //
+        //    Note `sh -c "sleep 45"` is the EASY case: a single simple command is `exec`ed, so the
+        //    shell is replaced and there is no grandchild to orphan. The tests named above are the
+        //    ones that exercise the hard shapes.
 
         // 3. Both entry points reach the bounded runner, with a real (long) deadline, so neither
         //    can be the one that still runs a command unbounded. A fast command proves the wiring
@@ -12547,6 +12559,375 @@ diff --git a/two.md b/two.md
             elapsed < std::time::Duration::from_secs(5),
             "draining {total} bytes took {elapsed:?} — that is the quadratic shape, not a ring"
         );
+    }
+
+    // ────── QA round 2: the process-group kill, attacked ──────
+    //
+    // These avoid `pgrep` entirely. `pgrep -f "sleep 45"` is a GLOBAL cmdline match: it sees other
+    // agents' and other runs' processes, and — worse — `.unwrap_or_default()` on a missing or
+    // failing `pgrep` yields an empty string, so an assert-empty passes VACUOUSLY on any box
+    // without pgrep. Instead each gate here writes ticks to its own file in its own temp dir, and
+    // liveness is "did the file grow after the deadline". That cannot collide with another process
+    // and cannot pass vacuously: a tree that survived leaves evidence.
+    //
+    // Every loop below is BOUNDED (`seq 1 60` at 50ms ≈ 3s) so a failing assertion cannot leak a
+    // runaway process onto the user's host.
+
+    /// Bytes in `path`, or 0 when it does not exist yet.
+    fn tick_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// A bounded tick-writer shell loop appending to `path`.
+    fn tick_loop(path: &std::path::Path) -> String {
+        format!(
+            "for i in $(seq 1 60); do echo tick >> {}; sleep 0.05; done",
+            path.to_string_lossy()
+        )
+    }
+
+    /// Our own zombie children, as `/proc` sees them. Reaping bugs show up here and nowhere else.
+    fn own_zombies() -> Vec<String> {
+        let me = std::process::id();
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // `pid (comm) state ppid ...` — comm can contain spaces, so split after the last ')'.
+            let Some(close) = stat.rfind(')') else { continue };
+            let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            if fields[0] == "Z" && fields[1].parse::<u32>() == Ok(me) {
+                out.push(format!("pid {} state Z ppid {}", name, fields[1]));
+            }
+        }
+        out
+    }
+
+    /// The timeout must kill the whole PROCESS GROUP, not just the shell.
+    ///
+    /// `sh -c "<cmd>"` forks `<cmd>` as a grandchild whenever the script is not a single exec-able
+    /// command, so killing the direct child orphans the grandchild: it is reparented and keeps
+    /// running. The fix puts the gate in its own process group and signals the group. Proven here
+    /// by a GRANDCHILD that writes ticks — if it survived the deadline, its file keeps growing.
+    #[tokio::test]
+    async fn qa_gate_timeout_kills_the_whole_process_group_not_just_the_shell() {
+        let dir = tmp_dir("qa-pg-kill");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // Nested `sh -c` forces a real grandchild; the trailing `; true` stops the outer shell
+        // from `exec`ing the inner one into its own process image.
+        let command = format!("sh -c '{}' ; true", tick_loop(&ticks));
+
+        let (exit_code, _output, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("a hanging gate is a RESULT, not a runner error");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+
+        // Non-vacuity: the grandchild must actually have been running, or this proves nothing.
+        let at_deadline = tick_len(&ticks);
+        assert!(
+            at_deadline > 0,
+            "the tick writer never ran, so this test would pass even with no kill at all"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let after = tick_len(&ticks);
+        assert_eq!(
+            after, at_deadline,
+            "the grandchild SURVIVED the deadline: ticks grew {at_deadline} -> {after}. \
+             The group kill did not reach it."
+        );
+    }
+
+    /// Double fork with the intermediate exiting: the writer is orphaned (its parent is gone and
+    /// it is reparented) but stays in the gate's PROCESS GROUP, so the group kill must still reach
+    /// it. Uses script files rather than nested quoting — a `sh -c` inside a `sh -c` inside a
+    /// `sh -c` is its own source of bugs, and a broken command would make this test vacuous.
+    #[tokio::test]
+    async fn qa_gate_timeout_kills_an_orphaned_grandchild_still_in_the_group() {
+        let dir = tmp_dir("qa-pg-orphan");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        let writer = dir.join("writer.sh");
+        let spawner = dir.join("spawner.sh");
+        std::fs::write(
+            &writer,
+            "#!/bin/sh\nfor i in $(seq 1 60); do echo tick >> \"$1\"; sleep 0.05; done\n",
+        )
+        .unwrap();
+        // Backgrounds the writer and exits at once, so the writer's parent dies and it is
+        // reparented while keeping the process group it inherited.
+        std::fs::write(
+            &spawner,
+            "#!/bin/sh\nsh \"$1\" \"$2\" >/dev/null 2>&1 &\n",
+        )
+        .unwrap();
+        let command = format!(
+            "sh {} {} {} ; sleep 30",
+            spawner.to_string_lossy(),
+            writer.to_string_lossy(),
+            ticks.to_string_lossy()
+        );
+        let (exit_code, _, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(600),
+        )
+        .await
+        .expect("gate must report");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+        let at_deadline = tick_len(&ticks);
+        assert!(
+            at_deadline > 0,
+            "the orphaned writer never ran, so this test would prove nothing"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let after = tick_len(&ticks);
+        assert_eq!(
+            after, at_deadline,
+            "an orphaned but in-group descendant SURVIVED the group kill: {at_deadline} -> {after}"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION: a gate that calls `setsid` leaves the process group and the group
+    /// kill cannot reach it. Pinned so the boundary of the guarantee is a measured fact rather than
+    /// an assumption. The writer is self-limiting (~3s) so nothing is left running either way.
+    #[tokio::test]
+    async fn qa_gate_setsid_escapes_the_group_kill() {
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("QA: setsid unavailable, skipping the escape probe");
+            return;
+        }
+        let dir = tmp_dir("qa-pg-setsid");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        let command = format!(
+            "setsid sh -c '{}' >/dev/null 2>&1 & sleep 30",
+            tick_loop(&ticks)
+        );
+        let (exit_code, _, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .expect("gate must report");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+        let at_deadline = tick_len(&ticks);
+        assert!(at_deadline > 0, "the setsid writer never ran");
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let after = tick_len(&ticks);
+        eprintln!(
+            "QA: setsid escape — ticks {at_deadline} -> {after} after the group kill \
+             ({}escaped)",
+            if after > at_deadline { "" } else { "did NOT " }
+        );
+        assert!(
+            after > at_deadline,
+            "setsid no longer escapes the group kill — the guarantee got STRONGER; \
+             update this test and the docs"
+        );
+    }
+
+    /// A background job started by a SUCCESSFUL gate is not killed, and — the part that bites —
+    /// if it inherits the gate's stdout/stderr pipes the gate does not return until it exits,
+    /// because the drain waits for EOF on the pipes, not for the shell.
+    #[tokio::test]
+    async fn qa_gate_background_job_outlives_a_successful_gate() {
+        let dir = tmp_dir("qa-pg-bg");
+        let w = dir.to_string_lossy().to_string();
+
+        // (a) Background job INHERITS the pipes. The shell exits 0 in milliseconds; the pipes stay
+        //     open until the writer finishes, so the gate blocks on it.
+        let ticks_a = dir.join("ticks-a.txt");
+        let command = format!("sh -c '{}' & echo started", tick_loop(&ticks_a));
+        let started = std::time::Instant::now();
+        let (exit_code, output, _) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let inherited_elapsed = started.elapsed();
+        assert_eq!(exit_code, 0, "{output}");
+        eprintln!(
+            "QA: gate with a pipe-inheriting background job returned after {:?} \
+             (the shell itself exited immediately)",
+            inherited_elapsed
+        );
+        assert!(
+            inherited_elapsed >= std::time::Duration::from_millis(1500),
+            "expected the gate to block on the inherited pipes; returned in {:?}",
+            inherited_elapsed
+        );
+
+        // (b) Background job REDIRECTS its stdio. Now the gate returns at once — and the job keeps
+        //     running afterwards, because a successful gate's group is never signalled.
+        let ticks_b = dir.join("ticks-b.txt");
+        let command = format!("sh -c '{}' >/dev/null 2>&1 & echo started", tick_loop(&ticks_b));
+        let started = std::time::Instant::now();
+        let (exit_code, _, _) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let redirected_elapsed = started.elapsed();
+        assert_eq!(exit_code, 0);
+        assert!(
+            redirected_elapsed < std::time::Duration::from_millis(1200),
+            "a redirected background job should not block the gate; took {:?}",
+            redirected_elapsed
+        );
+        let at_return = tick_len(&ticks_b);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let after = tick_len(&ticks_b);
+        eprintln!(
+            "QA: background job after a SUCCESSFUL gate — ticks {at_return} -> {after}"
+        );
+        assert!(
+            after > at_return,
+            "a background job survived a successful gate (expected: the group is only killed on \
+             timeout). If this now fails, successful gates kill their groups too — a behaviour \
+             change worth documenting."
+        );
+    }
+
+    /// Neither the normal path nor the timeout path may leave a zombie child behind.
+    #[tokio::test]
+    async fn qa_gate_reaps_on_both_the_normal_and_the_timeout_path() {
+        let dir = tmp_dir("qa-pg-reap");
+        let w = dir.to_string_lossy().to_string();
+        let before = own_zombies();
+
+        for _ in 0..3 {
+            let (code, _, _) =
+                run_one_gate_command_with_timeout("true", &w, std::time::Duration::from_secs(10))
+                    .await
+                    .expect("fast gate");
+            assert_eq!(code, 0);
+        }
+        let (code, _, _) = run_one_gate_command_with_timeout(
+            "sleep 30",
+            &w,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .expect("timeout gate");
+        assert_eq!(code, TEST_GATE_EXIT_TIMEOUT);
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let after = own_zombies();
+        assert!(
+            after.len() <= before.len(),
+            "gate runs left zombies behind.\nbefore: {before:?}\nafter:  {after:?}"
+        );
+    }
+
+    /// The group kill shells out to `kill(1)` and ignores its status (`let _ = ... .status()`), so
+    /// a box without that binary loses the group kill SILENTLY — only the direct child dies. Pin
+    /// the dependency so a future minimal environment fails here loudly instead of leaking.
+    #[test]
+    fn the_group_kill_depends_on_the_kill_binary_being_present() {
+        let found = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v kill")
+            .output()
+            .map(|out| out.status.success() && !out.stdout.is_empty())
+            .unwrap_or(false);
+        assert!(
+            found,
+            "`kill` is not on PATH: run_one_gate_command_with_timeout's group kill is a \
+             `Command::new(\"kill\")` whose status is discarded, so it would no-op silently and a \
+             timed-out gate would orphan its grandchildren"
+        );
+    }
+
+    /// The three reserved codes are distinct, negative, and non-zero, and no real UNIX exit status
+    /// can reach them — `ExitStatus::code()` is 0..=255 on unix. (The cfg(windows) shell is a
+    /// different story; see the report.)
+    #[test]
+    fn the_reserved_gate_exit_codes_cannot_collide_with_a_unix_exit_status() {
+        let reserved = [
+            TEST_GATE_EXIT_SIGNAL,
+            TEST_GATE_EXIT_MALFORMED,
+            TEST_GATE_EXIT_TIMEOUT,
+        ];
+        for code in reserved {
+            assert!(code < 0, "{code} must be negative to be unreachable");
+            assert_ne!(code, 0, "a reserved code must never read as a pass");
+        }
+        let mut sorted = reserved.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), reserved.len(), "reserved codes must be distinct");
+    }
+
+    /// Host-side enforcement of the explicit-clear rule, exercised through the SERVICE rather than
+    /// the resolver — the stated point of moving it down was that the RPC is safe on its own.
+    #[tokio::test]
+    async fn qa_update_test_commands_enforces_explicit_clear_on_the_host() {
+        let (state, root) = test_state();
+        let plan_path = root.join("plan");
+        scaffold_plan(&plan_path, "explicit clear");
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .expect("create plan");
+        let id = run.plan.id.clone();
+
+        // Seed a real gate so a bad call has something to destroy.
+        update_test_commands(&state, id.clone(), None, vec!["npm test".into()], false)
+            .expect("set the gate");
+
+        // Empty commands WITHOUT clear: rejected, and the gate survives.
+        let err = update_test_commands(&state, id.clone(), None, vec![], false)
+            .expect_err("an empty list without clear must be rejected");
+        assert!(err.contains("clear: true"), "{err}");
+        // Whitespace-only is the same shape once blanks are dropped.
+        let err = update_test_commands(&state, id.clone(), None, vec!["   ".into()], false)
+            .expect_err("a whitespace-only list without clear must be rejected");
+        assert!(err.contains("clear: true"), "{err}");
+        // Contradictory: clear AND commands.
+        let err = update_test_commands(&state, id.clone(), None, vec!["x".into()], true)
+            .expect_err("clear with commands must be rejected");
+        assert!(err.contains("not both"), "{err}");
+        // The gate is still exactly what it was — no rejected call half-applied.
+        let run = get_plan(&state, &id).expect("get plan");
+        assert_eq!(run.plan.test_commands_list, vec!["npm test".to_string()]);
+
+        // clear: true with an empty list is the sanctioned removal, and writes NULL.
+        let run = update_test_commands(&state, id.clone(), None, vec![], true)
+            .expect("clear: true must remove the gate");
+        assert_eq!(run.plan.test_commands, None, "clearing must write NULL");
+        assert!(run.plan.test_commands_list.is_empty());
+
+        // DOCUMENTED ASYMMETRY: `clear: true` with a whitespace-only list is ACCEPTED (the blank
+        // is filtered before the contradiction check), while `clear: true` with a real command is
+        // rejected. Pinned rather than left to be discovered.
+        update_test_commands(&state, id.clone(), None, vec!["npm test".into()], false)
+            .expect("re-set the gate");
+        let run = update_test_commands(&state, id.clone(), None, vec!["  ".into()], true)
+            .expect("clear with a blank entry is accepted");
+        assert!(run.plan.test_commands_list.is_empty());
     }
 
     #[tokio::test]
