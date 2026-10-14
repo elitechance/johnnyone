@@ -20,6 +20,8 @@ import {
   phaseDir,
   emptyArtifactCache,
   mergeArtifactListings,
+  planBasePath,
+  planListPath,
 } from './plan-tab-logic';
 
 // Pure spec (no Angular/Ionic/DOM) — runs under the plugin-less web/vitest.config.ts. Pins the Plan
@@ -541,5 +543,51 @@ describe('ArtifactCache (D3 — the cross-initiative race)', () => {
     cache = mergeArtifactListings(cache, A, [{ dirRel: 'artifacts', entries: aEntries }]);
     cache = mergeArtifactListings(cache, A, [{ dirRel: 'mocks', entries: bEntries }]);
     expect(Object.keys(cache.listings).sort()).toEqual(['artifacts', 'mocks']);
+  });
+});
+
+describe('planBasePath / planListPath (D3-a — every listing passes a validator)', () => {
+  const BASE = '/store/.johnnyone/initiatives/abc/plan';
+
+  it('normalises the plan dir exactly as planDocPath does', () => {
+    expect(planBasePath(BASE)).toBe(BASE);
+    expect(planBasePath(`${BASE}/`)).toBe(BASE);
+    expect(planBasePath(`${BASE}///`)).toBe(BASE);
+    expect(planBasePath(`  ${BASE}  `)).toBe(BASE);
+  });
+
+  it('rejects what planDocPath rejects as a base — they share the one implementation', () => {
+    for (const bad of ['', '   ', '/', '///', null, undefined]) {
+      expect(planBasePath(bad), JSON.stringify(bad)).toBe(null);
+      // planDocPath agrees for every selection
+      expect(planDocPath(bad, 'overview.md')).toBe(null);
+      expect(planDocPath(bad, 'artifacts/x.md')).toBe(null);
+    }
+  });
+
+  it('planListPath resolves `""` to the plan dir and anything else through the allowlist', () => {
+    expect(planListPath(BASE, '')).toBe(BASE);
+    expect(planListPath(`${BASE}/`, '')).toBe(BASE);
+    expect(planListPath(BASE, 'artifacts')).toBe(`${BASE}/artifacts`);
+    expect(planListPath(BASE, 'mocks')).toBe(`${BASE}/mocks`);
+    expect(planListPath(BASE, 'phases/P1')).toBe(`${BASE}/phases/P1`);
+    expect(planListPath(BASE, 'phases/P1/artifacts')).toBe(`${BASE}/phases/P1/artifacts`);
+  });
+
+  it('planListPath refuses every shape the allowlist refuses, and never escapes the base', () => {
+    for (const bad of [
+      '..', '../x', 'artifacts/..', 'artifacts/../../etc', '/etc/passwd', 'artifacts\\x',
+      'tasks', 'phases/P1/tasks', 'Mocks', 'secrets/key.pem', 'artifacts//x', 'artifacts/./x',
+      '.git', 'phases/..', 'phases/./P1',
+    ]) {
+      const p = planListPath(BASE, bad);
+      if (p === null) continue;
+      expect(p.startsWith(`${BASE}/`), `escaped: ${bad} -> ${p}`).toBe(true);
+      expect(p.includes('..'), bad).toBe(false);
+      expect(p.includes('\\'), bad).toBe(false);
+    }
+    // and with no plan path there is nothing to list at all
+    expect(planListPath('', '')).toBe(null);
+    expect(planListPath(null, 'artifacts')).toBe(null);
   });
 });

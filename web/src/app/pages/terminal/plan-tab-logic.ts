@@ -234,6 +234,35 @@ export function phaseArtifactsDir(
 }
 
 /**
+ * The plan directory itself, normalised — or `null` when there is no plan path.
+ *
+ * This is the base every selection is joined to, and [`planDocPath`] runs on exactly this: trim,
+ * drop trailing slashes, reject empty. Exported because the loader has one listing whose target IS
+ * the base (the single call that discovers WHICH document dirs a plan has), and that call used to
+ * take a raw path straight from the caller — the one `listDir` in the feature that never passed a
+ * validator from this module. Routing it through here keeps "one allowlist, one decision point"
+ * literally true instead of true-with-a-footnote, and keeps the two from drifting apart since
+ * `planDocPath` now calls it too.
+ */
+export function planBasePath(planPath: string | null | undefined): string | null {
+  const base = (planPath ?? '').trim().replace(/\/+$/, '');
+  return base || null;
+}
+
+/**
+ * Resolve a LISTABLE document dir, where `''` means the plan dir itself.
+ *
+ * The loader's single entry point for turning a plan-relative dir into a host path, so no path
+ * arithmetic survives in the page component at all.
+ */
+export function planListPath(
+  planPath: string | null | undefined,
+  dirRel: string,
+): string | null {
+  return dirRel ? planDocPath(planPath, dirRel) : planBasePath(planPath);
+}
+
+/**
  * Build the file path for a navigator selection, joined to the server-provided `planPath`.
  *
  * THE single allowlist for everything the Plan tab can open or list (requirement: one decision
@@ -251,7 +280,7 @@ export function planDocPath(
   planPath: string | null | undefined,
   sel: string | null | undefined,
 ): string | null {
-  const base = (planPath ?? '').trim().replace(/\/+$/, '');
+  const base = planBasePath(planPath);
   if (!base) return null;
   const rel = relPlanDocPath(sel);
   if (!rel) return null;

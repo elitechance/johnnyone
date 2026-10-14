@@ -160,6 +160,7 @@ import {
   artifactListError,
   isDocDir,
   phaseDir,
+  planListPath,
   emptyArtifactCache,
   mergeArtifactListings,
   PlanCounts,
@@ -431,7 +432,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   planArtifactCache = signal<ArtifactCache>(emptyArtifactCache(''));
   /** Which artifact subdirectories the reader has opened (plan-relative keys). */
   planArtifactExpanded = signal<Record<string, boolean>>({});
-  /** Phase dirs whose document dirs have been discovered, so each phase is probed at most once. */
+  /**
+   * `<initiativeId>|<phase dir>` claims for phases whose document dirs have been ANSWERED, so each
+   * phase is probed at most once per selection while a failed probe stays retryable.
+   */
   private readonly phasesArtifactsLoaded = new Set<string>();
   /**
    * Why the artifacts of this plan cannot be listed at all, when that is a CONFIGURATION fact
@@ -2858,7 +2862,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    */
   private async loadPlanArtifacts(initiativeId: string, planPath: string): Promise<void> {
     if (!planPath.trim()) return;
-    const probe = await this.listArtifactDir(planPath, '', planPath);
+    const probe = await this.listArtifactDir(planPath, '');
     if (!this.stillLoadingPlanFor(initiativeId)) return;
     if (probe.blocked) {
       this.planArtifactsBlocked.set(probe.blocked);
@@ -2879,16 +2883,31 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /**
    * The same one-call discovery for a single phase, run when that phase row is opened.
    *
-   * Idempotent and at most once per phase: `phasesArtifactsLoaded` is reset with the rest of the
-   * per-initiative plan state, so switching initiative and coming back re-reads.
+   * At most once per phase per initiative selection — the claim is taken BEFORE the await, so a
+   * fast double tap cannot start two probes. A probe that FAILS releases the claim, so a second tap
+   * retries: the claim marks "answered", not "attempted", because a dropped relay would otherwise
+   * leave that phase's documents permanently invisible with no recovery but switching initiative
+   * and coming back. A probe that succeeds keeps the claim even when the phase turns out to have no
+   * document dirs — that is an answer, not a failure, and re-asking costs a call per tap.
+   *
+   * The claim key is scoped to the initiative so that a stale release can only ever remove the
+   * entry it added, never a claim the newly-selected initiative has just taken for a phase that
+   * happens to share an id.
    */
   private async loadPhaseArtifacts(initiativeId: string, phaseId: string): Promise<void> {
     const planPath = this.selectedInitiative()?.planPath;
     if (!planPath?.trim()) return;
     const dir = phaseDir(phaseId);
-    if (!dir || this.phasesArtifactsLoaded.has(dir)) return;
-    this.phasesArtifactsLoaded.add(dir);
+    if (!dir) return;
+    const claim = `${initiativeId}|${dir}`;
+    if (this.phasesArtifactsLoaded.has(claim)) return;
+    this.phasesArtifactsLoaded.add(claim);
     const probe = await this.listArtifactDir(planPath, dir);
+    if (!probe.entries) {
+      // The listing did not answer (dir absent, host down, relay drop). Release so a tap retries.
+      this.phasesArtifactsLoaded.delete(claim);
+      return;
+    }
     if (!this.stillLoadingPlanFor(initiativeId)) return;
     const present = (probe.entries ?? [])
       .filter((e) => e.kind === 'dir' && isDocDir(e.name))
@@ -2901,17 +2920,15 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /**
    * One guarded `filesListDir`, classified into entries / absent / refused-by-configuration.
    *
-   * `dirRel` is resolved through `planDocPath` — the single allowlist — so nothing here can address
-   * a path the navigator is not allowed to reach. `absOverride` exists for the one listing whose
-   * target is the plan dir itself, which is the allowlist's own base rather than a selection under
-   * it.
+   * `dirRel` is resolved through `planListPath` — which is `planDocPath`, the single allowlist, or
+   * `planBasePath` for the one listing whose target IS the plan dir. So EVERY listing in this
+   * feature passes a validator from `plan-tab-logic`, with no exceptions and no raw paths.
    */
   private async listArtifactDir(
     planPath: string,
     dirRel: string,
-    absOverride?: string,
   ): Promise<{ dirRel: string; entries?: FileEntry[]; blocked?: string }> {
-    const abs = absOverride ?? planDocPath(planPath, dirRel);
+    const abs = planListPath(planPath, dirRel);
     if (!abs) return { dirRel };
     try {
       const listing = await firstValueFrom(this.api.listDir(abs));
