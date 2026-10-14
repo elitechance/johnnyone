@@ -62,6 +62,52 @@ const READY_NUDGE_IDLE_MS: u64 = 180_000;
 /// How many times to re-request a report before escalating to needs_attention,
 /// so a run can never hang forever waiting on a report that won't arrive.
 const MAX_READY_NUDGES: u32 = 5;
+/// The longest a single turn may run WITHOUT its report, however alive the pane looks.
+///
+/// `MAX_READY_NUDGES` counts CONSECUTIVE UNANSWERED reminders — any movement in the agent's pane
+/// resets it — so an agent that is working, or that answers "still working", is never escalated
+/// merely for taking a long time. It used to count every reminder sent in one wait, which escalated
+/// runs that were working perfectly: phase `01-test-tab` of development run `51e640a8` was dropped
+/// on 2026-10-14 while its worker waited on the 361-test Playwright baseline its own plan requires,
+/// having ANSWERED every reminder in the terminal ("The main baseline is at 240 of 361. Still
+/// working, so no ready report."). Five reminders three minutes apart is fifteen minutes — shorter
+/// than the verification the plan asked for. The escalation is for SILENCE: a dead CLI, an
+/// unanswered modal.
+///
+/// Resetting the counter removes the only backstop against an agent that churns forever without
+/// finishing, so this deadline replaces it — a ceiling that does not care how busy the pane looks.
+const READY_ABSOLUTE_DEADLINE_MS: u64 = 6 * 60 * 60 * 1_000;
+
+/// What a ready-wait should do on this tick.
+///
+/// Pure, so the policy can be tested without an `AppState`, a plan row or a live tmux pane — the
+/// loop below only supplies the three numbers. `consecutive_unanswered` is reminders with NO pane
+/// movement between them; movement resets it at the call site.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyAction {
+    /// Still inside the idle window, or the agent is working — do nothing.
+    Wait,
+    /// Idle long enough: re-send the report command.
+    Nudge,
+    /// Reminders went unanswered. The agent is not there.
+    EscalateSilent,
+    /// Alive but never finishing. The ceiling.
+    EscalateDeadline,
+}
+
+fn ready_action(idle_ms: u64, total_ms: u64, consecutive_unanswered: u32) -> ReadyAction {
+    // The deadline outranks everything: a turn past the ceiling ends whether it looks busy or not.
+    if total_ms >= READY_ABSOLUTE_DEADLINE_MS {
+        return ReadyAction::EscalateDeadline;
+    }
+    if idle_ms < READY_NUDGE_IDLE_MS {
+        return ReadyAction::Wait;
+    }
+    if consecutive_unanswered >= MAX_READY_NUDGES {
+        return ReadyAction::EscalateSilent;
+    }
+    ReadyAction::Nudge
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4723,7 +4769,7 @@ async fn deliver_agent_prompt(
                      (session {session_id})"
                 ));
             }
-            if probe.is_empty() || snapshot.content.contains(&probe) {
+            if probe.is_empty() || pane_acknowledged(&snapshot.content, &probe) {
                 return Ok(());
             }
         }
@@ -4733,10 +4779,45 @@ async fn deliver_agent_prompt(
             "agent prompt not visible in pane after send; re-sending"
         );
     }
-    Err(format!(
-        "agent CLI never acknowledged its prompt after {PROMPT_DELIVERY_ATTEMPTS} attempts \
-         (session {session_id}); it may be showing a modal or failed to start"
-    ))
+    // NOT an error. A failed read-back means "we could not SEE it arrive", which is not the same
+    // as "it did not arrive" — and the caller of this function starts the coordinator loop, so
+    // returning `Err` here throws away the watcher for an agent that is, in every case observed so
+    // far, already working on the prompt. That is what happened to planning run `e9edf0e5` on
+    // 2026-10-14: the probe could not match (see `pane_acknowledged`), delivery "failed" three
+    // times, and the run sat in `planning_planner_running` for eight hours with a planner that had
+    // finished and a coordinator that had never started. It then happened a second time to that
+    // run's first review lens, whose verdict was already in the database when the coordinator died.
+    //
+    // A genuinely dead or modal-blocked CLI is caught downstream instead, by the idle nudges and
+    // the escalation in `wait_for_agent_ready_report` — a backstop that reports the run as needing
+    // attention WITHOUT discarding it. The folder-trust modal above still fails hard, because that
+    // one is a real, specific, human-answerable block.
+    tracing::warn!(
+        session_id,
+        attempts = PROMPT_DELIVERY_ATTEMPTS,
+        "agent prompt never read back in pane; proceeding anyway and leaving it to the idle nudges"
+    );
+    Ok(())
+}
+
+/// Did the pane show the prompt ARRIVE?
+///
+/// The probe text itself is the strongest signal, but a long prompt frequently never appears:
+/// Claude Code collapses pasted input into `[Pasted text #1]`, and a prompt that lands while the
+/// agent is still finishing its last turn is held as a queued message. In both cases the agent has
+/// the prompt and the first 33 characters of it are nowhere on screen. Treating a busy agent as a
+/// delivery failure also re-sends the prompt, which is how one review lens received the same task
+/// three times.
+fn pane_acknowledged(content: &str, probe: &str) -> bool {
+    if !probe.is_empty() && content.contains(probe) {
+        return true;
+    }
+    let lower = content.to_ascii_lowercase();
+    // Collapsed or queued input: the TUI is holding text it will not render in full.
+    lower.contains("[pasted text")
+        || lower.contains("edit queued messages")
+        // Working. Nothing but a submitted prompt puts an interrupt hint on the screen.
+        || lower.contains("esc to interrupt")
 }
 
 /// A distinctive, quote-free slice of the prompt to look for in the pane. Long prompts wrap and
@@ -5655,6 +5736,10 @@ async fn wait_for_lens_verdict(
         if key != last_key {
             last_key = key;
             last_changed_at = Instant::now();
+            // The agent is alive, so forget the reminders it has already had: this counter measures
+            // consecutive UNANSWERED reminders, not how long the turn has taken. See
+            // `READY_ABSOLUTE_DEADLINE_MS`, which is what bounds a turn that never ends.
+            nudges_sent = 0;
         }
         if last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
             if nudges_sent >= MAX_READY_NUDGES {
@@ -6084,6 +6169,10 @@ async fn wait_for_done_report(
         if key != last_key {
             last_key = key;
             last_changed_at = Instant::now();
+            // The agent is alive, so forget the reminders it has already had: this counter measures
+            // consecutive UNANSWERED reminders, not how long the turn has taken. See
+            // `READY_ABSOLUTE_DEADLINE_MS`, which is what bounds a turn that never ends.
+            nudges_sent = 0;
         }
         if last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
             if nudges_sent >= MAX_READY_NUDGES {
@@ -6345,6 +6434,7 @@ async fn wait_for_agent_ready_report(
     clear_agent_report(state, session_id).await;
     let mut last_key = String::new();
     let mut last_changed_at = Instant::now();
+    let started_at = Instant::now();
     let mut nudges_sent: u32 = 0;
     // When the agent reports it's blocked on a human, we stop nudging/escalating
     // and wait (indefinitely) for the human to reply — which resumes the agent and
@@ -6388,12 +6478,38 @@ async fn wait_for_agent_ready_report(
         if key != last_key {
             last_key = key;
             last_changed_at = Instant::now();
+            // The agent is alive, so forget the reminders it has already had: this counter measures
+            // consecutive UNANSWERED reminders, not how long the turn has taken. See
+            // `READY_ABSOLUTE_DEADLINE_MS`, which is what bounds a turn that never ends.
+            nudges_sent = 0;
         }
+
 
         // While blocked, never nudge/escalate — the agent is intentionally waiting
         // on the human, not stuck.
-        if !blocked && last_changed_at.elapsed() >= Duration::from_millis(READY_NUDGE_IDLE_MS) {
-            if nudges_sent >= MAX_READY_NUDGES {
+        let action = if blocked {
+            ReadyAction::Wait
+        } else {
+            ready_action(
+                last_changed_at.elapsed().as_millis() as u64,
+                started_at.elapsed().as_millis() as u64,
+                nudges_sent,
+            )
+        };
+        if action == ReadyAction::EscalateDeadline {
+            let (event_type, _) = ready_timeout_event(phase_id);
+            let hours = READY_ABSOLUTE_DEADLINE_MS / 3_600_000;
+            let _ = append_event(
+                state,
+                plan_id,
+                phase_id,
+                event_type,
+                json!({ "reason": "no_report_before_deadline", "hours": hours }),
+            );
+            return Err(format!("Agent has not reported completion after {hours} hours"));
+        }
+        if action != ReadyAction::Wait {
+            if action == ReadyAction::EscalateSilent {
                 // Record an explaining event before escalating, so the timeout shows
                 // up in the event log instead of a silent status flip (the generic
                 // coordinator catch sets `needs_attention` but writes no event).
@@ -6415,7 +6531,8 @@ async fn wait_for_agent_ready_report(
                     });
                 }
                 return Err(format!(
-                    "Agent went idle without reporting completion after {} reminders",
+                    "Agent went silent without reporting completion: {} reminders with no movement \
+                     in its terminal between them",
                     MAX_READY_NUDGES
                 ));
             }
@@ -17883,7 +18000,11 @@ mod replan_tests {
 
 #[cfg(test)]
 mod prompt_delivery_tests {
-    use super::{pane_awaiting_trust, prompt_probe, read_report_markdown_within, ReportMarkdown};
+    use super::{
+        pane_acknowledged, pane_awaiting_trust, prompt_probe, read_report_markdown_within,
+        ready_action, ReadyAction, ReportMarkdown, MAX_READY_NUDGES, READY_ABSOLUTE_DEADLINE_MS,
+        READY_NUDGE_IDLE_MS,
+    };
     use std::path::PathBuf;
 
     /// A fresh, real temp dir so `canonicalize` succeeds on the containment prefix. Mirrors
@@ -17909,6 +18030,84 @@ mod prompt_delivery_tests {
     /// Just the body, for the cases that only care whether anything was attached.
     fn body(roots: &[PathBuf], evidence: &str) -> Option<String> {
         read_report_markdown_within(roots, evidence).into_body()
+    }
+
+    #[test]
+    fn a_working_agent_is_never_escalated_for_taking_long() {
+        // THE FALSE ESCALATION. Dev run 51e640a8 phase 01 was dropped while its worker waited on the
+        // 361-test Playwright baseline its own plan requires, answering every reminder. Movement
+        // resets the counter at the call site, so the policy sees 0 and keeps waiting — for as long
+        // as the turn needs, right up to the deadline.
+        let one_hour = 60 * 60 * 1_000;
+        assert_eq!(ready_action(0, one_hour, 0), ReadyAction::Wait);
+        assert_eq!(ready_action(READY_NUDGE_IDLE_MS, one_hour, 0), ReadyAction::Nudge);
+        // Four reminders answered, a fifth idle spell: still a nudge, not an escalation.
+        assert_eq!(
+            ready_action(READY_NUDGE_IDLE_MS, 5 * one_hour, MAX_READY_NUDGES - 1),
+            ReadyAction::Nudge
+        );
+    }
+
+    #[test]
+    fn silence_still_escalates() {
+        // The control for the test above: the counter only reaches the cap when NOTHING answered.
+        assert_eq!(
+            ready_action(READY_NUDGE_IDLE_MS, READY_NUDGE_IDLE_MS * 6, MAX_READY_NUDGES),
+            ReadyAction::EscalateSilent
+        );
+        // ...and not while the agent is inside its idle window.
+        assert_eq!(
+            ready_action(READY_NUDGE_IDLE_MS - 1, READY_NUDGE_IDLE_MS * 6, MAX_READY_NUDGES),
+            ReadyAction::Wait
+        );
+    }
+
+    #[test]
+    fn the_deadline_outranks_a_busy_pane() {
+        // An agent that churns forever with a lively pane keeps resetting the counter, so without
+        // this ceiling nothing would ever stop it.
+        assert_eq!(
+            ready_action(0, READY_ABSOLUTE_DEADLINE_MS, 0),
+            ReadyAction::EscalateDeadline
+        );
+        assert_eq!(
+            ready_action(0, READY_ABSOLUTE_DEADLINE_MS - 1, 0),
+            ReadyAction::Wait
+        );
+    }
+
+    #[test]
+    fn pane_acknowledged_accepts_the_probe_itself() {
+        let probe = prompt_probe("You are the T1 developer for this phase.\nDo the work.");
+        assert!(pane_acknowledged(
+            "> You are the T1 developer for this phase.\n  working...",
+            &probe
+        ));
+    }
+
+    #[test]
+    fn pane_acknowledged_accepts_a_collapsed_paste() {
+        // THE EIGHT-HOUR STALL. Claude Code renders a long pasted prompt as `[Pasted text #1]`, so
+        // the probe is nowhere on screen even though the agent has the whole prompt.
+        let probe = prompt_probe("You are the Product review lens for this plan.\nRead it.");
+        assert!(!pane_acknowledged("❯ \n  ready", &probe), "control: an idle pane is NOT an ack");
+        assert!(pane_acknowledged("❯ [Pasted text #1]\n  paste again to expand", &probe));
+    }
+
+    #[test]
+    fn pane_acknowledged_accepts_a_queued_or_busy_agent() {
+        // A prompt delivered while the agent is mid-turn is held as a queued message, and a
+        // working agent shows an interrupt hint. Both mean it arrived; neither shows the text.
+        let probe = prompt_probe("Continue updating the plan at /tmp/plan.\nSay the marker.");
+        assert!(pane_acknowledged("❯ Press up to edit queued messages", &probe));
+        assert!(pane_acknowledged("· Considering… (3s)\n  esc to interrupt", &probe));
+    }
+
+    #[test]
+    fn pane_acknowledged_rejects_an_unrelated_pane() {
+        let probe = prompt_probe("You are the T1 developer for this phase.\nDo the work.");
+        assert!(!pane_acknowledged("$ ls\nREADME.md  src\n$ ", &probe));
+        assert!(!pane_acknowledged("", &probe));
     }
 
     #[test]

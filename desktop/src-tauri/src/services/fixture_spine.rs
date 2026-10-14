@@ -82,20 +82,40 @@ fn fixture_spine_verifies_are_narrow() {
     }
 }
 
-/// READING THIS CRATE'S TEST OUTPUT: this test shells out to the fixture workspace's own
-/// `cargo test`, whose stub crates are DELIBERATELY red — that is the whole assertion. So
-/// `cargo test -p johnnyone-desktop --lib` prints a pile of nested `FAILED` lines that mean the
-/// opposite of what they look like, and grepping `FAILED` here gives a wildly misleading answer.
+/// Run a fixture's verify command with its output CAPTURED, never inherited.
 ///
-/// Measured on this tree: 24 occurrences of `FAILED`, of which 22 are nested fixture noise —
-/// 11 `test <name>_works ... FAILED` plus 11 `test result: FAILED`. THE TELL: every nested result
-/// line ends `9 filtered out` (the fixture crate has 10 tests and is run one at a time), while
-/// this crate's own result line is the ONLY one saying `0 filtered out`. So:
+/// These fixtures exist to be RED: `fixture_every_verify_is_red_on_stubs` asserts that every one of
+/// them fails against the stubs. With `.status()` the child cargo inherited this process's stdout, so
+/// each of those expected failures printed its own `test add_works ... FAILED`, its own `failures:`
+/// block and its own `error: test failed, to rerun pass \`--lib\`` into the PARENT's test stream —
+/// roughly 1,700 lines of them. Reading that output, the parent's one real failure is invisible among
+/// a dozen deliberate ones that look identical, and on 2026-10-14 it cost a wrong diagnosis: the
+/// genuine failure (`kloo_needs_changes_parks_instead_of_alldone_loop`, environment-dependent) was
+/// reported as "just the fixture failing on purpose", because the `failures: add_works` block nearest
+/// the summary belonged to a child.
 ///
-///     cargo test -p johnnyone-desktop --lib 2>&1 | grep '0 filtered out'
-///
-/// is the real verdict; the final `test result` line is the same thing. Read one of those before
-/// concluding this crate's suite is red.
+/// Captured output is attached to the assertion message instead, so it is there when a failure is
+/// real and absent when it is not.
+fn run_verify(argv: &[String], dir: &std::path::Path) -> (bool, String) {
+    let out = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(dir)
+        .output()
+        .expect("spawn verify");
+    let detail = format!(
+        "exit {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    (out.status.success(), detail)
+}
+
+/// NOTE (integration, 2026-10-14): an earlier comment here measured the nested `FAILED` noise
+/// this test used to print into the parent stream and taught readers to grep `0 filtered out`
+/// for the real verdict. `run_verify` above now CAPTURES that output, so the noise is gone at
+/// the source and the counts in that comment no longer describe this tree. The final
+/// `test result` line is the verdict; it was removed rather than left asserting stale numbers.
 #[test]
 fn fixture_every_verify_is_red_on_stubs() {
     let tmp = std::env::temp_dir().join(format!(
@@ -109,17 +129,11 @@ fn fixture_every_verify_is_red_on_stubs() {
     copy_dir(&fixture_root().join("workspace"), &tmp);
     for s in load_all_specs() {
         let argv = check_verify(&s.verify).expect("fixture verify must be allowlisted");
-        let st = Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(&tmp)
-            .status()
-            .expect("spawn verify");
+        let (ok, detail) = run_verify(&argv, &tmp);
         assert!(
-            !st.success(),
-            "verify for {} must be red on stubs (exit {:?}): {}",
-            s.id,
-            st.code(),
-            s.verify
+            !ok,
+            "verify for {} must be red on stubs: {}\n{}",
+            s.id, s.verify, detail
         );
     }
     let _ = std::fs::remove_dir_all(&tmp);
@@ -144,20 +158,12 @@ fn fixture_one_verify_turns_green() {
     let specs = load_all_specs();
     let add = specs.iter().find(|s| s.id == "01-add").unwrap();
     let add_argv = check_verify(&add.verify).expect("add verify");
-    let ok = Command::new(&add_argv[0])
-        .args(&add_argv[1..])
-        .current_dir(&tmp)
-        .status()
-        .unwrap();
-    assert!(ok.success(), "add should be green after impl");
+    let (ok, detail) = run_verify(&add_argv, &tmp);
+    assert!(ok, "add should be green after impl\n{detail}");
     let sub = specs.iter().find(|s| s.id == "02-sub").unwrap();
     let sub_argv = check_verify(&sub.verify).expect("sub verify");
-    let bad = Command::new(&sub_argv[0])
-        .args(&sub_argv[1..])
-        .current_dir(&tmp)
-        .status()
-        .unwrap();
-    assert!(!bad.success(), "sub must stay red");
+    let (sub_ok, detail) = run_verify(&sub_argv, &tmp);
+    assert!(!sub_ok, "sub must stay red\n{detail}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
