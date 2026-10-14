@@ -11601,6 +11601,292 @@ diff --git a/two.md b/two.md
         assert_eq!(run.collected, Some(7));
     }
 
+    // ─────────── QA attack suite on the gate runner (added on top of 7d25023) ───────────
+
+    /// Non-UTF-8 output does not panic, but `String::from_utf8_lossy` expands every invalid byte
+    /// to a 3-byte U+FFFD, so the DELIVERED string is up to 3x the byte cap per stream. The cap is
+    /// a cap on bytes READ, not on bytes returned — `run_test_gate_caps_captured_output_without_hanging`
+    /// asserts `output.len() <= 2 * cap + 16` and that bound only holds for ASCII output.
+    #[tokio::test]
+    async fn qa_gate_non_utf8_output_expands_past_the_asserted_cap() {
+        let dir = tmp_dir("qa-gate-nonutf8");
+        let w = dir.to_string_lossy().to_string();
+        let bytes = TEST_GATE_STREAM_CAP_BYTES * 2;
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["head -c {bytes} /dev/zero | tr '\\0' '\\377' ; head -c {bytes} /dev/zero | tr '\\0' '\\377' 1>&2"]"#
+            )),
+        );
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("a flooding gate must not hang")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.truncated, "the cap must report it discarded output");
+        eprintln!(
+            "QA: non-UTF-8 output.len() = {} bytes (byte cap per stream = {})",
+            run.output.len(),
+            TEST_GATE_STREAM_CAP_BYTES
+        );
+        assert!(
+            run.output.len() > 2 * TEST_GATE_STREAM_CAP_BYTES + 16,
+            "expected lossy expansion past the byte cap, got {}",
+            run.output.len()
+        );
+    }
+
+    /// A command killed by a signal has no exit code. It must report -1, never 0.
+    #[tokio::test]
+    async fn qa_gate_signal_killed_command_is_not_a_pass() {
+        let dir = tmp_dir("qa-gate-signal");
+        let w = dir.to_string_lossy().to_string();
+        let marker = dir.join("second-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["kill -9 $$","touch {}"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, -1, "a signal kill must not read as a pass");
+        assert_eq!(run.commands_run, 1);
+        assert!(!marker.exists(), "a signal kill must stop the run");
+    }
+
+    /// There is NO timeout anywhere in the gate runner, at either call site. A gate command that
+    /// never exits blocks its caller forever — for `failing_test_command` that is the coordinator
+    /// loop, for `run_test_gate` it is the host RPC. Shown by not completing in 3s.
+    #[tokio::test]
+    async fn qa_gate_has_no_timeout_at_all() {
+        let dir = tmp_dir("qa-gate-hang");
+        let w = dir.to_string_lossy().to_string();
+        let plan = plan_with_test_commands(&w, Some(r#"["sleep 45"]"#));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_test_gate(&plan, None),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "run_test_gate grew a timeout — update this test and the docs"
+        );
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            failing_test_command(&plan, None),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "failing_test_command grew a timeout — update this test and the docs"
+        );
+    }
+
+    /// An unrunnable workspace is an Err from `run_test_gate` but a phase-FAILURE reason from
+    /// `failing_test_command`. Same condition, two different shapes — pinned so the divergence is
+    /// deliberate rather than discovered.
+    #[tokio::test]
+    async fn qa_gate_unrunnable_workspace_errors_while_the_coordinator_fails_the_phase() {
+        let dir = tmp_dir("qa-gate-ws");
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        for workspace in [
+            "/nonexistent-workspace-qa-xyz".to_string(),
+            file.to_string_lossy().to_string(),
+        ] {
+            let plan = plan_with_test_commands(&workspace, Some(r#"["true"]"#));
+            let err = run_test_gate(&plan, None)
+                .await
+                .expect_err("spawn must fail");
+            assert!(
+                err.contains("Could not run the test command"),
+                "{workspace}: {err}"
+            );
+            assert!(
+                failing_test_command(&plan, None).await.is_some(),
+                "{workspace}: the coordinator must still reject the phase"
+            );
+        }
+    }
+
+    /// A command that closes stdout and keeps writing stderr must not wedge the concurrent drain.
+    #[tokio::test]
+    async fn qa_gate_stdout_closed_early_still_captures_stderr() {
+        let dir = tmp_dir("qa-gate-closed");
+        let w = dir.to_string_lossy().to_string();
+        let plan = plan_with_test_commands(
+            &w,
+            Some(r#"["exec 1>&- ; echo LATE-STDERR 1>&2 ; echo '3 passed' 1>&2 ; exit 2"]"#),
+        );
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("must not hang")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 2);
+        assert!(
+            run.output.contains("LATE-STDERR"),
+            "stderr must survive a closed stdout: {}",
+            run.output
+        );
+        assert_eq!(run.collected, Some(3));
+    }
+
+    /// Blank/whitespace gates resolve to NO gate, and a command that does not exist is a FAILURE
+    /// (sh reports 127), not an Err.
+    #[tokio::test]
+    async fn qa_gate_blank_whitespace_and_missing_commands() {
+        let dir = tmp_dir("qa-gate-blank");
+        let w = dir.to_string_lossy().to_string();
+        for raw in [r#"[""]"#, r#"["   "]"#, r#"["\t\n"]"#] {
+            let plan = plan_with_test_commands(&w, Some(raw));
+            let run = run_test_gate(&plan, None).await.expect("gate must run");
+            assert_eq!(run.commands_run, 0, "{raw} must resolve to no gate");
+            assert_eq!(run.exit_code, 0);
+            assert_eq!(run.command, None);
+        }
+        let plan = plan_with_test_commands(&w, Some(r#"["definitely-not-a-real-command-qa"]"#));
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 127, "{}", run.output);
+    }
+
+    /// A gate command is one shell script: a newline inside it runs every line.
+    #[tokio::test]
+    async fn qa_gate_command_with_a_newline_runs_every_line() {
+        let dir = tmp_dir("qa-gate-meta");
+        let w = dir.to_string_lossy().to_string();
+        let marker = dir.join("both-lines-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["echo first\ntouch {}\nexit 6"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 6);
+        assert!(marker.exists(), "every line of a multi-line command runs");
+    }
+
+    /// A malformed gate at the PLAN level with no phase gate leaves the phase completely
+    /// UNGATED, silently — "gated" downgrades to "ungated" on a config typo. Documented as a
+    /// config error rather than a failure; pinned here because it is the worst outcome available.
+    #[tokio::test]
+    async fn qa_malformed_plan_gate_silently_leaves_the_phase_ungated() {
+        let dir = tmp_dir("qa-gate-malformed");
+        let w = dir.to_string_lossy().to_string();
+        for raw in [
+            "not json",
+            r#"{"commands":["exit 1"]}"#,
+            r#"["exit 1", null]"#,
+            r#"[1,2]"#,
+            r#"["exit 1""#,
+        ] {
+            let plan = plan_with_test_commands(&w, Some(raw));
+            assert!(
+                failing_test_command(&plan, Some(&phase_with_test_commands(None)))
+                    .await
+                    .is_none(),
+                "malformed plan gate {raw:?} must not fail the phase (it silently does not gate)"
+            );
+            let run = run_test_gate(&plan, None).await.expect("gate must run");
+            assert_eq!(run.commands_run, 0, "{raw:?} ran nothing");
+            assert_eq!(run.exit_code, 0, "{raw:?} reported a PASS with no gate run");
+        }
+    }
+
+    /// `parse_collected_count`'s "largest candidate wins" is documented as picking a runner's
+    /// grand total. For multi-binary cargo output there IS no grand total, so max != the number of
+    /// tests run, and any line shaped `<n> <keyword>` outranks a real count.
+    #[test]
+    fn qa_parse_collected_count_max_wins_is_not_a_grand_total() {
+        let cargo_workspace = "test result: ok. 500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+             test result: ok. 200 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        assert_eq!(
+            parse_collected_count(cargo_workspace),
+            Some(500),
+            "reports the biggest binary, not the 700 tests actually run"
+        );
+        assert_eq!(
+            parse_collected_count("5 passed\nwarning: 48129 skipped"),
+            Some(48129),
+            "any `<n> <keyword>` line outranks the real count"
+        );
+        assert_eq!(
+            parse_collected_count("Tests:       0 total"),
+            Some(0),
+            "a zero-collection suite parses as Some(0) — the one signal of that false green, \
+             which the design forbids acting on"
+        );
+    }
+
+    /// Seam (b): the GraphQL schema's field names for the gate types are checked against what the
+    /// host actually serializes, by reading the schema file. A renamed serde attribute or a
+    /// renamed GraphQL field breaks this instead of silently serving null.
+    #[test]
+    fn qa_graphql_schema_field_names_match_the_host_serialization() {
+        let schema = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../worker/schema/johnnyone-ai.graphql"
+        ))
+        .expect("read johnnyone-ai.graphql");
+
+        fn fields_of(schema: &str, type_name: &str) -> Vec<String> {
+            let header = format!("type {type_name} {{");
+            let start = schema
+                .find(&header)
+                .unwrap_or_else(|| panic!("no `{header}` in the schema"))
+                + header.len();
+            let body = &schema[start..];
+            let end = body.find("\n}").expect("unterminated type block");
+            body[..end]
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(|line| line.split(':').next())
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        }
+
+        let gate = TestGateRun {
+            exit_code: 1,
+            collected: Some(2),
+            command: Some("x".into()),
+            commands_run: 1,
+            output: "o".into(),
+            truncated: true,
+        };
+        let json = serde_json::to_value(&gate).expect("serialize TestGateRun");
+        for field in fields_of(&schema, "TestGateRun") {
+            assert!(
+                json.get(&field).is_some(),
+                "GraphQL TestGateRun.{field} has no key in the host's JSON: {json}"
+            );
+        }
+
+        let mut phase = phase_with_test_commands(Some(r#"["a"]"#));
+        phase.test_commands_list = vec!["a".into()];
+        phase.effective_test_commands = vec!["a".into()];
+        let json = serde_json::to_value(&phase).expect("serialize phase");
+        for field in ["testCommands", "effectiveTestCommands"] {
+            assert!(
+                json.get(field).is_some() && json[field].is_array(),
+                "AgentPlanPhase.{field} must serialize as a list: {json}"
+            );
+        }
+        let mut plan = plan_with_test_commands("/w", Some(r#"["a"]"#));
+        plan.test_commands_list = vec!["a".into()];
+        let json = serde_json::to_value(&plan).expect("serialize plan");
+        assert!(json["testCommands"].is_array());
+    }
+
     #[tokio::test]
     async fn failing_test_command_reports_an_unrunnable_command() {
         let plan = plan_with_test_commands("/nonexistent-workspace-xyz", Some(r#"["true"]"#));

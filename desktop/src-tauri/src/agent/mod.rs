@@ -2922,6 +2922,51 @@ mod files_rpc_tests {
         assert!(!bogus.success);
         assert!(bogus.error.unwrap_or_default().contains("Unknown RPC method"));
     }
+
+    /// Seam (a), QA-added: the two test-gate RPC methods are actually REGISTERED in `handle_rpc`'s
+    /// match arms and their param-pullers read the keys the worker resolvers send. Nothing else in
+    /// the tree drives a JSON-RPC request through them, so a renamed arm or a renamed param key
+    /// would compile, pass every other gate, and fail only in production.
+    ///
+    /// No plan is created: routing is proven by the error coming from the SERVICE
+    /// ("Agent plan not found") rather than the dispatch ("Unknown RPC method").
+    #[tokio::test]
+    async fn handle_rpc_routes_the_test_gate_methods() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        for method in ["update_agent_plan_test_commands", "run_agent_plan_test_gate"] {
+            // The param-puller rejects a missing `id` before it reaches the service.
+            let missing = AgentService::handle_rpc(&rpc(method, json!({})), &state).await;
+            assert!(!missing.success, "{method} with no id must fail");
+            let error = missing.error.unwrap_or_default();
+            assert!(
+                error.contains("Missing 'id' parameter"),
+                "{method}: expected the param-puller's error, got: {error}"
+            );
+
+            // With the exact payload the worker resolver sends, the arm must route into the
+            // service. `phaseId: null` is the plan level; `commands` is a list, not a JSON string.
+            let routed = AgentService::handle_rpc(
+                &rpc(
+                    method,
+                    json!({ "id": "no-such-plan", "phaseId": null, "commands": ["npm test"] }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(!routed.success, "{method} on a missing plan must fail");
+            let error = routed.error.unwrap_or_default();
+            assert!(
+                !error.contains("Unknown RPC method"),
+                "{method} is NOT registered in handle_rpc"
+            );
+            assert!(
+                error.contains("Agent plan not found"),
+                "{method}: expected the service's error, got: {error}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
