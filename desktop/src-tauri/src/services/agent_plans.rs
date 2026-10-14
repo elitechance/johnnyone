@@ -2950,7 +2950,11 @@ impl GateCapture {
     }
 }
 
-/// [`drain_capped_tail`]'s loop, publishing into `shared` after every read.
+/// `drain_capped_tail`'s loop, publishing into `shared` after every read.
+///
+/// Plain code span, not an intra-doc link: `drain_capped_tail` is `#[cfg(test)]`, so rustdoc
+/// cannot resolve it outside a test build and the link failed
+/// `-D rustdoc::broken_intra_doc_links`.
 async fn drain_capped_tail_into<R>(
     mut reader: R,
     cap: usize,
