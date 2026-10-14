@@ -5,6 +5,7 @@ use crate::db::models::{
 };
 use crate::providers::CliProvider;
 use crate::events::{AgentPlanRunEvent, StreamEvent};
+use crate::services::plan_artifacts;
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
@@ -2268,8 +2269,23 @@ fn is_worker_writable_store_file(path: &str) -> bool {
     // work IS producing evidence: 02-acceptance bounced three times on its own
     // `cargo-test-lib.txt` and `capture-library.mjs` and escalated to needs_attention, because a
     // fresh test run and an edited capture script both show as "removed lines" here.
-    if path.starts_with("artifacts/") || path.contains("/artifacts/") {
+    //
+    // Run-scoped artifact directories (`phases/<id>/artifacts/runs/<run_id>/…`) are the same
+    // thing one competing run at a time, so they classify identically — that is why `runs/` is
+    // nested UNDER `artifacts/` rather than beside it.
+    //
+    // The test is on path SEGMENTS, via `plan_artifacts::is_artifact_path`, not on substrings.
+    // `path.contains("/artifacts/")` was true for `phases/01-shell/artifacts/../../overview.md`,
+    // which names the spec while reading as an artifact — so `artifacts/` was a key that unlocked
+    // the rest of the store.
+    if crate::services::plan_artifacts::is_artifact_path(path) {
         return true;
+    }
+    // Same reason, for the named progress files below: a path with a `..`, an empty or a
+    // backslash-bearing segment is about a different file from the one it names, so it is not
+    // classified at all.
+    if !crate::services::plan_artifacts::is_safe_relative_path(path) {
+        return false;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
@@ -2300,6 +2316,22 @@ mod worker_writable_tests {
         assert!(!is_worker_writable_store_file("overview.md"));
         assert!(!is_worker_writable_store_file("phases/02-acceptance/tasks/02-02/prompt.md"));
         assert!(!is_worker_writable_store_file("phases/02-acceptance/overview.md"));
+    }
+
+    /// `artifacts/` must not be a key that unlocks the rest of the store.
+    ///
+    /// The classifier decides whether a diff touching a path counts as the worker doing its job
+    /// or as the worker weakening its own spec. A `..` segment anywhere makes that decision about
+    /// a DIFFERENT file than the one named, so the answer is meaningless: the path below names
+    /// `overview.md`, the spec, while reading as an artifact.
+    #[test]
+    fn a_traversing_path_is_never_worker_writable() {
+        assert!(!is_worker_writable_store_file("phases/01-shell/artifacts/../../overview.md"));
+        assert!(!is_worker_writable_store_file("artifacts/../overview.md"));
+        assert!(!is_worker_writable_store_file("phases/../decisions.md"));
+        // A backslash is a legal filename byte on the host, so a Windows-shaped path must not be
+        // read as separators either.
+        assert!(!is_worker_writable_store_file("phases/01-shell\\artifacts\\x.png"));
     }
 }
 
@@ -5554,7 +5586,7 @@ fn lens_reviewer_prompt(
     let brief_path = Path::new(&run.plan.plan_path).join("brief.md");
     format!(
         "You are the {name} reviewer for phase {phase_id} of a development run. Run ONLY the {name} lens — do not run the other lenses.\n\n\
-Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
+Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}; and the evidence this run delivered under {artifacts}, which is where T1 was told to write it. Then inspect the actual delivered work for this phase.\n\n\
 Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
         phase_id = phase.phase_id,
@@ -5564,6 +5596,11 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
         plan = get("plan_path"),
         phase_path = get("phase_path"),
         tasks = get("tasks_path"),
+        // The RUN-SCOPED artifacts directory, the same value the worker prompt names. The live
+        // development reviewer is this `format!`, not `DEFAULT_DEVELOPMENT_REVIEWER` (which is
+        // `#[allow(dead_code)]`, superseded by this fan-out) — so pointing the reviewer at the
+        // evidence has to happen here or it does not happen at all.
+        artifacts = get("artifacts_path"),
         extras = lens_prompt_extras(lens),
         report = lens_report_instruction(session_id, lens_name),
     )
@@ -8660,6 +8697,35 @@ fn phase_template_values(
                     .to_string_lossy()
                     .to_string()
             });
+    // The ONE place a phase's artifact directory is derived, run-scoped
+    // (`phases/<id>/artifacts/runs/<run_id>/`). `run_id` is the identity the run already has —
+    // `run.plan.id` today, `workflow_runs.id` once the arena exists — so no column is added for
+    // it. Created here, best-effort: the prompt should name a directory that exists, and a plan
+    // store that cannot be written to is already a failure the phase reports for its own reasons.
+    // Falls back to the champion's bare `artifacts/` only if the ids are not safe path segments,
+    // which host-generated slugs and uuids are.
+    let plan_root = Path::new(&run.plan.plan_path);
+    let artifacts_path = plan_artifacts::ensure_phase_run_artifacts_dir(
+        plan_root,
+        &phase.phase_id,
+        &run.plan.id,
+    )
+    .unwrap_or_else(|reason| {
+        tracing::warn!(
+            plan_id = %run.plan.id,
+            phase_id = %phase.phase_id,
+            %reason,
+            "falling back to the unscoped artifacts directory"
+        );
+        plan_artifacts::phase_artifacts_dir(plan_root, &phase.phase_id)
+            // Last resort: the PLAN-level `artifacts/` directory, not `phase_path.join(...)`.
+            // `phase_path` is computed by the caller from the raw phase id, so joining onto it
+            // carries any traversal the caller already introduced into a value handed to an
+            // agent. Reachable only with a phase id that is not a safe segment, which
+            // host-generated slugs are not; the plan-level directory is the nearest thing that
+            // is always inside the store.
+            .unwrap_or_else(|| plan_root.join(plan_artifacts::ARTIFACTS_DIR))
+    });
     vec![
         ("run_id", run.plan.id.clone()),
         ("phase_id", phase.phase_id.clone()),
@@ -8667,6 +8733,7 @@ fn phase_template_values(
         ("plan_path", run.plan.plan_path.clone()),
         ("phase_path", phase_path.to_string_lossy().to_string()),
         ("tasks_path", tasks_path.to_string_lossy().to_string()),
+        ("artifacts_path", artifacts_path.to_string_lossy().to_string()),
         ("methodology_path", methodology_path),
         ("conventions_path", conventions_path),
     ]
@@ -11130,21 +11197,11 @@ mod store_tests {
     use super::*;
     use crate::db::migrations::run_migrations;
     use crate::db::Database;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    /// Unique temp dir. `Date::now`/random are unavailable in this environment, so make the
-    /// suffix unique with the pid + a static counter.
+    /// Delegates to the ONE fixture factory, so these fixtures land in this process's single
+    /// fixture root and are reclaimed with it. This was a second private copy that built a
+    /// top-level `j1-p1-*` directory in the system temp dir and never removed it.
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "j1-p1-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::test_support::tmp_dir(&format!("p1-{tag}"))
     }
 
     /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the rest
@@ -11353,6 +11410,40 @@ mod store_tests {
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "--quiet", "-m", "mocks"]);
         assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
+    }
+
+    /// Run-scoped evidence is still this phase's evidence.
+    ///
+    /// The provenance walk selects by the `phases/<id>/` prefix, so it reaches
+    /// `artifacts/runs/<run_id>/` with no change — which is the reason `runs/` was nested under
+    /// `artifacts/` rather than placed beside it. Pinned here because it is the claim that makes
+    /// run-scoping safe for the review gate: if the walk missed these files, every competing run
+    /// would pass the evidence check by having no evidence it could see.
+    #[test]
+    fn run_scoped_evidence_is_still_judged() {
+        let dir = approved_store("ev-runscoped");
+        shot(
+            &dir,
+            "phases/01-shell/artifacts/runs/4f0821/mystery.png",
+            b"challenger pixels",
+        );
+        let reason = evidence_provenance_reason(&dir.to_string_lossy(), "01-shell")
+            .expect("a run-scoped image nobody describes must still be caught");
+        assert!(reason.contains("runs/4f0821/mystery.png"), "{reason}");
+
+        // And described run-scoped evidence passes, same as the flat layout.
+        let ok = approved_store("ev-runscoped-ok");
+        shot(
+            &ok,
+            "phases/01-shell/artifacts/runs/4f0821/aux-open.png",
+            b"open state pixels",
+        );
+        std::fs::write(
+            ok.join("phases/01-shell/tasks/t1/decisions.md"),
+            "aux-open.png — /patients/42 with the aux layer open.\n",
+        )
+        .unwrap();
+        assert_eq!(evidence_provenance_reason(&ok.to_string_lossy(), "01-shell"), None);
     }
 
     /// Another phase's screenshots must not decide this phase's readiness.
@@ -18018,5 +18109,777 @@ mod prompt_delivery_tests {
             "a fifo is in-root but is not a regular file, so it must be skipped unread"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// QA B — adversarial tests on the spec-weakening classifier's new segment rule.
+///
+/// `is_worker_writable_store_file` decides whether a diff that removed lines from a plan-store
+/// file counts as the worker doing its job (evidence being rewritten) or as the worker weakening
+/// its own spec. It is the one piece of this branch that is live on every run today, so it gets
+/// attacked on its own rather than only through `plan_artifacts`.
+#[cfg(test)]
+mod qa_b_worker_writable_tests {
+    use super::is_worker_writable_store_file;
+
+    /// Every shape QA could find that is NOT genuinely a file inside an `artifacts/` directory
+    /// and is not one of the named progress files. Any `true` here is `artifacts/` acting as a
+    /// key to the rest of the store.
+    #[test]
+    fn qa_only_a_real_artifact_or_a_named_progress_file_is_worker_writable() {
+        for refused in [
+            // Traversal, in every position.
+            "phases/01-shell/artifacts/../../overview.md",
+            "phases/01-shell/artifacts/runs/../../../overview.md",
+            "artifacts/../overview.md",
+            "artifacts/../../../../etc/passwd",
+            "phases/../decisions.md",
+            // A `..` hidden inside a longer segment.
+            "phases/01-shell/artifacts/v1..2/overview.md",
+            // Windows separators — `\` is a legal filename byte on this host, so a path shaped
+            // like a Windows one must not be read as having separators at all.
+            "phases/01-shell\\artifacts\\x.png",
+            "artifacts\\..\\overview.md",
+            "phases\\01-shell\\artifacts\\status.md",
+            // Absolute / UNC / empty and `.` segments.
+            "/artifacts/x.png",
+            "//host/artifacts/x.png",
+            "artifacts//x.png",
+            "artifacts/./x.png",
+            "./artifacts/x.png",
+            "",
+            // `artifacts` naming a FILE, not a directory above one.
+            "artifacts",
+            "phases/01-shell/artifacts",
+            // Substring, case and suffix near-misses.
+            "artifactsx/summary.md",
+            "my-artifacts/summary.md",
+            "artifacts.bak/summary.md",
+            "Artifacts/summary.md",
+            "phases/01-shell/notartifacts/x.png",
+            // The spec files themselves, which is the whole point of the classifier.
+            "phases/02-acceptance/overview.md",
+            "phases/02-acceptance/tasks/02-02/prompt.md",
+            "plan.md",
+            "brief.md",
+            // A named progress file reached through a traversal is still refused: the name is
+            // right but the path is about a different file.
+            "phases/01-shell/artifacts/../../tasks/t1/status.md",
+            "phases/../status.yml",
+        ] {
+            assert!(
+                !is_worker_writable_store_file(refused),
+                "{refused:?} must NOT be classified as worker-writable"
+            );
+        }
+    }
+
+    /// The other direction: the fix must not have stopped classifying real worker output, which
+    /// would make the coordinator bounce a phase for rewriting its own evidence. These are the
+    /// shapes the store actually contains.
+    #[test]
+    fn qa_real_worker_output_is_still_worker_writable() {
+        for allowed in [
+            "artifacts/summary.md",
+            "artifacts/mocks/seat-meter.html",
+            "artifacts/screens-to-verify/aux-open.png",
+            "phases/02-acceptance/artifacts/cargo-test-lib.txt",
+            "phases/02-acceptance/artifacts/capture-library.mjs",
+            "phases/01-shell/artifacts/screenshots/nested/deep.png",
+            // Run-scoped: the shape this branch adds.
+            "phases/04-leases/artifacts/runs/4f0821/seat-meter.html",
+            "phases/04-leases/artifacts/runs/4f0821/nested/shot.png",
+            // A file literally called `artifacts` INSIDE an artifacts dir is still output.
+            "phases/01-shell/artifacts/artifacts",
+            // Odd but legal names.
+            "phases/01-shell/artifacts/v1.2.png",
+            "phases/01-shell/artifacts/report.md ",
+        ] {
+            assert!(
+                is_worker_writable_store_file(allowed),
+                "{allowed:?} must still be classified as worker-writable"
+            );
+        }
+    }
+}
+
+/// QA B — what `{{artifacts_path}}` actually does on a live run.
+///
+/// The branch's biggest self-declared gap is that nothing writes to the run-scoped path yet. These
+/// tests measure the three halves of that claim separately, because they are not all true in the
+/// same way: the VALUE is plumbed, the DIRECTORY really is created on every live render (so the
+/// branch is NOT inert), and no shipped template consumes the value (so no worker is told about
+/// it).
+#[cfg(test)]
+mod qa_b_template_tests {
+    use super::*;
+
+    fn qa_run(plan_path: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "RUN-7fe2".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: plan_path.into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+                test_commands: None,
+                test_commands_list: Vec::new(),
+                executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn qa_phase() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "RUN-7fe2".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
+        }
+    }
+
+    fn value_of<'a>(values: &'a [(&'static str, String)], key: &str) -> &'a str {
+        values
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("no template value named {key:?}"))
+    }
+
+    /// The branch is NOT a no-op for live runs: rendering a phase's template values CREATES the
+    /// run-scoped directory on disk, as a side effect, using the plan id as the run id.
+    ///
+    /// Every prompt builder goes through `phase_template_values` — the worker prompt, the
+    /// single-reviewer prompt, the replan planner prompt and EACH lens reviewer prompt — so a
+    /// reviewed phase renders it several times per phase. Pinned so "nothing writes to the
+    /// run-scoped path yet" cannot be read as "nothing changes on disk yet".
+    #[test]
+    fn qa_rendering_a_phases_values_creates_the_run_scoped_directory_today() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-live");
+        let run = qa_run(plan.to_str().unwrap());
+        let phase = qa_phase();
+        let phase_path = plan.join("phases/01-thing");
+        let tasks_path = phase_path.join("tasks");
+
+        let expected = plan.join("phases/01-thing/artifacts/runs/RUN-7fe2");
+        assert!(!expected.exists(), "nothing exists before the render");
+
+        let values = phase_template_values(&state, &run, &phase, &phase_path, &tasks_path);
+
+        assert_eq!(
+            value_of(&values, "artifacts_path"),
+            expected.to_string_lossy(),
+            "the value must be the run-scoped directory, not the champion's"
+        );
+        assert!(
+            expected.is_dir(),
+            "rendering the values must have CREATED {}",
+            expected.display()
+        );
+        // The run id used is the plan id, exactly as the module doc says.
+        assert_eq!(value_of(&values, "run_id"), "RUN-7fe2");
+        // And the champion's bare directory is created as a by-product (it is the parent's
+        // parent), which is what a reader of the old layout will now always find present.
+        assert!(plan.join("phases/01-thing/artifacts").is_dir());
+    }
+
+    /// When the directory cannot be created the render must still produce a usable path rather
+    /// than failing the phase. Forced deterministically by putting a FILE where the artifacts
+    /// directory would go.
+    #[test]
+    fn qa_an_uncreatable_artifacts_dir_falls_back_instead_of_failing_the_phase() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-fallback");
+        std::fs::create_dir_all(plan.join("phases/01-thing")).unwrap();
+        // `artifacts` is a regular file, so `create_dir_all` under it cannot succeed.
+        std::fs::write(plan.join("phases/01-thing/artifacts"), b"not a directory").unwrap();
+
+        let run = qa_run(plan.to_str().unwrap());
+        let values = phase_template_values(
+            &state,
+            &run,
+            &qa_phase(),
+            &plan.join("phases/01-thing"),
+            &plan.join("phases/01-thing/tasks"),
+        );
+        assert_eq!(
+            value_of(&values, "artifacts_path"),
+            plan.join("phases/01-thing/artifacts").to_string_lossy(),
+            "the fallback is the champion's bare directory"
+        );
+    }
+
+    /// A hostile phase id cannot make the render escape the plan store, and still yields a value.
+    #[test]
+    fn qa_an_unsafe_phase_id_cannot_escape_the_plan_store_through_the_template() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-escape");
+        let run = qa_run(plan.to_str().unwrap());
+        let mut phase = qa_phase();
+        phase.phase_id = "../../..".into();
+        // `phase_path` is what the caller computed; the artifacts value must NOT be derived from
+        // it by string concatenation that keeps the traversal.
+        let phase_path = plan.join("phases").join(&phase.phase_id);
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let artifacts = value_of(&values, "artifacts_path");
+        // Today this falls back to `<phase_path>/artifacts`, which still contains the traversal
+        // the CALLER introduced — so the guard protects the segment this module adds, not a
+        // phase id the caller already joined. Nothing outside the store is CREATED, which is the
+        // property that matters.
+        assert!(artifacts.contains("artifacts"), "{artifacts}");
+        assert!(
+            !plan.parent().unwrap().join("artifacts").exists(),
+            "no artifacts directory may be created above the plan store"
+        );
+    }
+
+    /// THE revert-guard for turning the run-scoped path on: the prompt an agent actually
+    /// receives names the run's real directory.
+    ///
+    /// Renders the shipped worker template against real phase values, so it fails if ANY link in
+    /// the chain is removed — the template line, the `artifacts_path` value in
+    /// `phase_template_values`, or the placeholder's spelling drifting between the two. Checking
+    /// the template alone would miss the last two: an unrendered `{{artifacts_path}}` reaching an
+    /// agent is worse than no instruction, because the agent would create a directory with that
+    /// literal name.
+    #[test]
+    fn qa_the_rendered_worker_prompt_names_this_runs_artifact_directory() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-rendered");
+        let run = qa_run(plan.to_str().unwrap());
+        let phase = qa_phase();
+        let phase_path = plan.join("phases/01-thing");
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let rendered =
+            planner_prompts::render_template(planner_prompts::DEFAULT_DEVELOPMENT_WORKER, &values);
+
+        let expected = plan.join("phases/01-thing/artifacts/runs/RUN-7fe2");
+        assert!(
+            rendered.contains(&*expected.to_string_lossy()),
+            "the rendered worker prompt must name {}; got:\n{}",
+            expected.display(),
+            rendered
+        );
+        // The reason travels with the path.
+        assert!(rendered.contains("overwrite each other's evidence"), "{rendered}");
+        // No placeholder may survive rendering — an agent handed a literal `{{artifacts_path}}`
+        // would create a directory called that.
+        assert!(
+            !rendered.contains("{{"),
+            "an unrendered placeholder reached the prompt:\n{rendered}"
+        );
+        // And the directory the prompt names really exists by the time the agent reads it.
+        assert!(expected.is_dir(), "{} was named but not created", expected.display());
+    }
+
+    /// FIXED (was `qa_no_shipped_template_consumes_the_artifacts_path_value`, QA round 2). The
+    /// shipped development worker template now DOES consume `{{artifacts_path}}`, so the value
+    /// reaches a live agent.
+    ///
+    /// QA's test was the measured half of "the live worker prompts are fingerprint-pinned, so
+    /// nothing writes there yet", and it was true until the coordinator carried the
+    /// commercial-prompt decision on 2026-10-14. Same fixture — exhaustive over every default
+    /// prompt in `PlannerPromptSettings` via serde, so a template added later cannot be missed
+    /// by a hand-written list — with the assertion inverted.
+    ///
+    /// **QA's non-vacuity half is kept and is still load-bearing**, now in both directions: the
+    /// same search must find the placeholders that were already wired (otherwise a `contains`
+    /// over this JSON proves nothing), and it must NOT find a placeholder that exists nowhere
+    /// (otherwise the positive assertion above would pass against any string at all).
+    #[test]
+    fn qa_the_shipped_worker_template_consumes_the_artifacts_path_value() {
+        let defaults = planner_prompts::PlannerPromptSettings::default();
+        let as_json = serde_json::to_string(&defaults).expect("settings serialise");
+        assert!(
+            as_json.contains("artifacts_path"),
+            "the shipped worker template must reference {{{{artifacts_path}}}} — without it the \
+             run-scoped directory is created on every phase and written to by nobody"
+        );
+        // It is the WORKER template specifically, and it carries the reason, not just the path.
+        assert!(
+            planner_prompts::DEFAULT_DEVELOPMENT_WORKER.contains("{{artifacts_path}}"),
+            "the development worker template is the one that had to change"
+        );
+        assert!(
+            planner_prompts::DEFAULT_DEVELOPMENT_WORKER.contains("overwrite each other's evidence"),
+            "the instruction must say WHY, or the next editor will drop it as redundant"
+        );
+        // Not sprayed: the planning templates have no phase and no run-scoped directory.
+        assert!(!planner_prompts::DEFAULT_PLANNING_PLANNER.contains("artifacts_path"));
+        assert!(!planner_prompts::DEFAULT_PLANNING_REVIEWER.contains("artifacts_path"));
+
+        // Sanity, kept from QA: the same search DOES find the placeholders that are wired, so
+        // the assertion above is not vacuous...
+        for wired in ["tasks_path", "phase_path", "plan_path", "run_id", "conventions_path"] {
+            assert!(as_json.contains(wired), "{wired} should be in a shipped template");
+        }
+        // ...and does NOT find one that is wired nowhere, so `contains` is really discriminating.
+        assert!(
+            !as_json.contains("fleet_busy_path"),
+            "a placeholder no template defines must not be found, or the search means nothing"
+        );
+    }
+}
+
+/// QA B round 2 — the end-to-end claim: with the prompt wired, does a real phase render write
+/// its evidence where every reader looks for it?
+///
+/// Round 1 measured that the value was plumbed and the directory created; round 3 wired the
+/// shipped worker prompt. Nobody had joined the two ends. The chain has SIX links and they are
+/// written by four different modules, so agreement between them is a property to measure, not to
+/// assume:
+///
+/// 1. the worker prompt the agent is handed NAMES a directory,
+/// 2. that directory exists when the agent reads the prompt,
+/// 3. a file the worker writes there is found by `resolve_phase_artifacts_dir`,
+/// 4. the LENS REVIEWER prompt names the same directory (the live reviewer is the `format!` in
+///    `lens_reviewer_prompt`, not `DEFAULT_DEVELOPMENT_REVIEWER`),
+/// 5. `is_worker_writable_store_file` classifies it as worker output, so the coordinator does
+///    not bounce the phase for writing there,
+/// 6. the review gate's evidence walk reaches it.
+///
+/// The path is taken OUT OF THE RENDERED PROMPT TEXT rather than recomputed, because what the
+/// agent is told is the only thing that actually determines where the bytes land.
+#[cfg(test)]
+mod qa_b_r2_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git must be available")
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    /// A plan store that looks like a real one: a phase, a task with a spec, and a git commit, so
+    /// the evidence walk's "untracked files under this phase" question has a meaningful answer.
+    fn committed_plan_store(tag: &str) -> PathBuf {
+        let dir = crate::test_support::tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-thing/tasks/t1")).unwrap();
+        std::fs::write(
+            dir.join("phases/01-thing/tasks/t1/prompt.md"),
+            "# Task\n- The seat meter must render\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("phases/01-thing/tasks/t1/status.yml"), "status: todo\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "qa@example.com"]);
+        git(&dir, &["config", "user.name", "qa"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    fn run_for(plan_path: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "RUN-e2e".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: plan_path.into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+                test_commands: None,
+                test_commands_list: Vec::new(),
+                executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn phase_for() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "RUN-e2e".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
+        }
+    }
+
+    /// The path the WORKER is told to write to, read back out of the rendered prompt.
+    ///
+    /// Parsed from the text rather than recomputed: a test that recomputes the value is testing
+    /// the same expression twice, and would stay green if the template named a different one.
+    fn artifacts_dir_the_prompt_names(rendered: &str) -> PathBuf {
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("Artifacts path"))
+            .expect("the worker prompt must carry an `Artifacts path` line");
+        let (_, value) = line.split_once(':').expect("`<label>: <path>`");
+        PathBuf::from(value.trim())
+    }
+
+    /// THE end-to-end test. All six links, one directory.
+    #[test]
+    fn qa_the_worker_writes_where_every_reader_looks() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = committed_plan_store("qa-e2e-chain");
+        let run = run_for(plan.to_str().unwrap());
+        let phase = phase_for();
+        let phase_path = plan.join("phases/01-thing");
+
+        // ── 1. the prompt the agent is handed ─────────────────────────────────────────────────
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let rendered =
+            planner_prompts::render_template(planner_prompts::DEFAULT_DEVELOPMENT_WORKER, &values);
+        let told = artifacts_dir_the_prompt_names(&rendered);
+
+        // It is this RUN's directory, not the champion's shared one — the whole point.
+        assert!(
+            told.ends_with("phases/01-thing/artifacts/runs/RUN-e2e"),
+            "the worker was told to write to {}",
+            told.display()
+        );
+        assert!(told.starts_with(&plan), "{} escapes the plan store", told.display());
+
+        // ── 2. it exists before the agent reads the prompt ────────────────────────────────────
+        assert!(told.is_dir(), "{} was named but not created", told.display());
+
+        // ── 3. the worker writes there; the reader finds it ───────────────────────────────────
+        std::fs::write(told.join("seat-meter.html"), b"<html>delivered</html>").unwrap();
+        // Migrated to the TYPED reader (round 5 ruling): `resolve_phase_artifacts_dir`'s `None`
+        // now means any of five things, so a caller that wants "where is the evidence" must ask
+        // the reader that can answer.
+        let artifacts =
+            plan_artifacts::phase_artifacts_state(&plan, &phase.phase_id, Some(&run.plan.id));
+        assert!(!artifacts.is_fault(), "the store must be healthy here: {artifacts:?}");
+        let read_back = artifacts
+            .found()
+            .expect("the reader must resolve the directory the worker was told to use")
+            .to_path_buf();
+        assert_eq!(
+            read_back, told,
+            "the writer and the reader disagree about where this run's evidence lives"
+        );
+        assert_eq!(
+            std::fs::read(read_back.join("seat-meter.html")).unwrap(),
+            b"<html>delivered</html>"
+        );
+
+        // ── 4. the LIVE reviewer is pointed at the same directory ─────────────────────────────
+        let lens = ValidationLens {
+            name: "Product".into(),
+            provider: "claude_code".into(),
+            model: None,
+            prompt: None,
+            vision: false,
+            blocking: true,
+        };
+        let reviewer = lens_reviewer_prompt(&state, &run, &phase, &lens, "SESSION-1");
+        assert!(
+            reviewer.contains(&*told.to_string_lossy()),
+            "the {} lens reviewer was not told where the evidence is; prompt:\n{}",
+            lens.name,
+            reviewer
+        );
+
+        // ── 5. the coordinator treats it as worker output, not spec-weakening ─────────────────
+        let rel = told
+            .strip_prefix(&plan)
+            .unwrap()
+            .join("seat-meter.html")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(rel, "phases/01-thing/artifacts/runs/RUN-e2e/seat-meter.html");
+        assert!(
+            is_worker_writable_store_file(&rel),
+            "{rel} must classify as worker output, or rewriting its own evidence parks the phase"
+        );
+
+        // ── 6. the review gate's evidence walk reaches it ─────────────────────────────────────
+        // An image nobody describes must still be CAUGHT when it is run-scoped, or every
+        // competing run passes the evidence check by having no evidence the gate can see.
+        std::fs::write(told.join("mystery.png"), b"undescribed pixels").unwrap();
+        let reason = evidence_provenance_reason(&plan.to_string_lossy(), "01-thing")
+            .expect("a run-scoped image nobody describes must be caught by the gate");
+        assert!(
+            reason.contains("runs/RUN-e2e/mystery.png"),
+            "the gate named something else: {reason}"
+        );
+
+        // And once described, it passes — same as the flat layout.
+        std::fs::write(
+            plan.join("phases/01-thing/tasks/t1/decisions.md"),
+            "mystery.png — the seat meter at width 2.\nseat-meter.html — the delivered page.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_provenance_reason(&plan.to_string_lossy(), "01-thing"),
+            None,
+            "described run-scoped evidence must pass the gate"
+        );
+    }
+
+    /// The chain must not depend on the CHAMPION directory existing or being empty.
+    ///
+    /// A first-ever run of a phase has no champion artifacts at all; a later run has some. Both
+    /// must land in their own directory and be read back from it, because the emptiness rule
+    /// added in round 2 changes which directory the reader prefers.
+    #[test]
+    fn qa_the_chain_holds_whether_or_not_the_champion_has_artifacts() {
+        let (state, _root) = crate::test_support::test_state();
+
+        for champion_has_artifacts in [false, true] {
+            let plan = committed_plan_store("qa-e2e-champ");
+            if champion_has_artifacts {
+                std::fs::create_dir_all(plan.join("phases/01-thing/artifacts")).unwrap();
+                std::fs::write(
+                    plan.join("phases/01-thing/artifacts/old-champion.png"),
+                    b"previous winner",
+                )
+                .unwrap();
+            }
+            let run = run_for(plan.to_str().unwrap());
+            let phase = phase_for();
+            let phase_path = plan.join("phases/01-thing");
+            let values = phase_template_values(
+                &state,
+                &run,
+                &phase,
+                &phase_path,
+                &phase_path.join("tasks"),
+            );
+            let told = artifacts_dir_the_prompt_names(&planner_prompts::render_template(
+                planner_prompts::DEFAULT_DEVELOPMENT_WORKER,
+                &values,
+            ));
+            std::fs::write(told.join("mine.png"), b"this run").unwrap();
+
+            let artifacts =
+                plan_artifacts::phase_artifacts_state(&plan, &phase.phase_id, Some(&run.plan.id));
+            assert!(!artifacts.is_fault(), "{artifacts:?}");
+            let read_back = artifacts.found().expect("resolves").to_path_buf();
+            assert_eq!(
+                read_back, told,
+                "champion_has_artifacts={champion_has_artifacts}: writer and reader disagree"
+            );
+            assert!(read_back.join("mine.png").is_file());
+            // This run must NOT read the champion's file as its own.
+            assert!(
+                !read_back.join("old-champion.png").exists(),
+                "champion_has_artifacts={champion_has_artifacts}: this run read the champion's \
+                 evidence as its own"
+            );
+        }
+    }
+
+    /// Two runs of one phase, both wired end-to-end: the defect the branch exists to close,
+    /// measured through the real prompt rather than through the path builder.
+    #[test]
+    fn qa_two_runs_told_by_the_prompt_do_not_clobber_each_other() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = committed_plan_store("qa-e2e-two");
+        let phase = phase_for();
+        let phase_path = plan.join("phases/01-thing");
+
+        let mut told = Vec::new();
+        for run_id in ["RUN-a", "RUN-b"] {
+            let mut run = run_for(plan.to_str().unwrap());
+            run.plan.id = run_id.to_string();
+            let values = phase_template_values(
+                &state,
+                &run,
+                &phase,
+                &phase_path,
+                &phase_path.join("tasks"),
+            );
+            let dir = artifacts_dir_the_prompt_names(&planner_prompts::render_template(
+                planner_prompts::DEFAULT_DEVELOPMENT_WORKER,
+                &values,
+            ));
+            // Both runs deliver the SAME filename, which is the realistic arena case.
+            std::fs::write(dir.join("seat-meter.html"), run_id.as_bytes()).unwrap();
+            told.push(dir);
+        }
+
+        assert_ne!(told[0], told[1], "two runs were told to use one directory");
+        assert_eq!(std::fs::read(told[0].join("seat-meter.html")).unwrap(), b"RUN-a");
+        assert_eq!(std::fs::read(told[1].join("seat-meter.html")).unwrap(), b"RUN-b");
+        // And each run reads back its own.
+        for (i, run_id) in ["RUN-a", "RUN-b"].iter().enumerate() {
+            let artifacts = plan_artifacts::phase_artifacts_state(&plan, "01-thing", Some(run_id));
+            assert!(!artifacts.is_fault(), "{artifacts:?}");
+            let dir = artifacts.found().expect("resolves").to_path_buf();
+            assert_eq!(dir, told[i]);
+            assert_eq!(
+                std::fs::read(dir.join("seat-meter.html")).unwrap(),
+                run_id.as_bytes()
+            );
+        }
+    }
+}
+
+/// QA B round 4 — the review gate is a THIRD reader, and it does not go through the taxonomy.
+#[cfg(test)]
+mod qa_b_r4_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git must be available")
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    fn committed_store(tag: &str) -> PathBuf {
+        let dir = crate::test_support::tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-shell/tasks/t1")).unwrap();
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/prompt.md"), "# Task\n- x\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "qa@example.com"]);
+        git(&dir, &["config", "user.name", "qa"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    /// FINDING (scope, not a defect introduced by this branch). `is_fault()` cannot help the one
+    /// production reader of phase evidence that exists, because that reader does not use the
+    /// taxonomy at all.
+    ///
+    /// `evidence_provenance_reason` finds evidence by asking git for untracked files under
+    /// `phases/<id>/` — it never calls `phase_artifacts_state` or `resolve_phase_artifacts_dir`.
+    /// So when an artifacts directory cannot be read, the new `Unreadable` state is never
+    /// consulted and the gate simply sees no evidence: an undescribed screenshot that would have
+    /// been caught is silently not caught, and the phase passes the provenance check.
+    ///
+    /// What a reviewer should conclude: "one reader" is true of the two functions in
+    /// `plan_artifacts`, not of the host. The taxonomy is the right shape and the arena's reader
+    /// should use it — but the existing review gate still has the R2-3 failure mode, in the
+    /// opposite direction (a check that silently passes rather than a phase that looks empty),
+    /// and closing that means routing the gate through the taxonomy too. Out of scope for this
+    /// branch; in scope for whoever wires the arena's gate.
+    #[test]
+    fn qa_documents_the_review_gate_does_not_use_the_artifacts_taxonomy() {
+        let plan = committed_store("qa-r4-gate");
+        let art = plan.join("phases/01-shell/artifacts/runs/RUN-1");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("mystery.png"), b"undescribed pixels").unwrap();
+
+        // Readable: the gate catches the undescribed image.
+        let caught = evidence_provenance_reason(&plan.to_string_lossy(), "01-shell")
+            .expect("an undescribed image must be caught while the directory is readable");
+        assert!(caught.contains("mystery.png"), "{caught}");
+        // And the taxonomy agrees there is evidence there.
+        assert!(matches!(
+            plan_artifacts::phase_artifacts_state(&plan, "01-shell", Some("RUN-1")),
+            plan_artifacts::ArtifactsState::Found(_)
+        ));
+
+        // Now make that directory unlistable. The image is still on disk.
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&art).is_err() {
+            // The taxonomy says FAULT, loudly and actionably.
+            let state = plan_artifacts::phase_artifacts_state(&plan, "01-shell", Some("RUN-1"));
+            assert!(
+                state.is_fault(),
+                "the typed reader must call this a fault; got {state:?}"
+            );
+            // The GATE, which does not ask it, now reports no problem at all.
+            assert_eq!(
+                evidence_provenance_reason(&plan.to_string_lossy(), "01-shell"),
+                None,
+                "the gate passes the phase because it cannot see the evidence it would have \
+                 rejected — the fault the taxonomy identified never reaches it"
+            );
+        }
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Restored: the gate catches it again, so nothing about the store changed.
+        assert!(evidence_provenance_reason(&plan.to_string_lossy(), "01-shell").is_some());
     }
 }
