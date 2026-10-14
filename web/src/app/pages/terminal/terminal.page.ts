@@ -72,6 +72,7 @@ import {
   AgentPlanRun,
   AgentPlanEvent,
   FileContent,
+  FileEntry,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
@@ -154,10 +155,16 @@ import {
   phaseCards,
   planDocPath,
   taskStatusLabel,
+  artifactGroups,
+  artifactDirsFor,
+  artifactOpenMode,
   PlanCounts,
   DocNavEntry,
   PhaseCard,
   TaskStatusView,
+  ArtifactGroup,
+  ArtifactListings,
+  ArtifactNode,
 } from './plan-tab-logic';
 import {
   panelVisible,
@@ -410,6 +417,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   planDocMarkdown = signal<string>('');
   planLoading = signal<boolean>(false);
   planError = signal<string | null>(null);
+  /**
+   * Artifacts section (mass-artifacts): cached `filesListDir` results keyed by the dir's path
+   * RELATIVE to the plan dir (`artifacts`, `phases/<id>/artifacts`, and any expanded subdir).
+   * Relative keys, not host-absolute ones, so the cache survives a planPath that differs only in
+   * its prefix and so the keys are exactly what `planDocPath` validates.
+   */
+  planArtifactListings = signal<ArtifactListings>({});
+  /** Which artifact subdirectories the reader has opened (plan-relative keys). */
+  planArtifactExpanded = signal<Record<string, boolean>>({});
+  /**
+   * Why the artifacts of this plan cannot be listed at all, when that is a CONFIGURATION fact
+   * rather than "there are none". `files_root` and `initiatives_dir` are independent user settings,
+   * so an initiatives dir outside `files_root` is reachable config; the host then refuses the
+   * listing, and the honest thing is to say so rather than widen the guard or show nothing.
+   */
+  planArtifactsBlocked = signal<string | null>(null);
   /** Guard so the plan is fetched once per initiative (re-fetches only when the initiative changes). */
   private planLoadedForInitiative: string | null = null;
   /** Per-session working-tree diff (overhaul P7, D10), loaded lazily on Diff-tab activation. */
@@ -993,6 +1016,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** True once a run with at least one phase is loaded (else the Plan tab shows the empty state). */
   protected readonly planHasContent = computed<boolean>(
     () => (this.planRun()?.phases?.length ?? 0) > 0,
+  );
+  /** Artifacts navigator section — pure projection over the cached listings (mass-artifacts). */
+  protected readonly planArtifacts = computed<ArtifactGroup[]>(() =>
+    artifactGroups(this.planRun(), this.planArtifactListings(), this.planArtifactExpanded()),
   );
 
   // Run/Resume panel (console-features P01) — all decisions come from the pure `run-resume-logic`
@@ -2774,6 +2801,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.planSelectedDoc.set('plan.md');
     this.planDocMarkdown.set('');
     this.planError.set(null);
+    this.planArtifactListings.set({});
+    this.planArtifactExpanded.set({});
+    this.planArtifactsBlocked.set(null);
     if (!init.planPath?.trim()) return; // benign empty (no plan to read)
     this.planLoading.set(true);
     try {
@@ -2781,11 +2811,100 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.applyPlanRun(run ?? null);
       // Stage-aware default: overview.md when the plan has phases (development), else plan.md (planning).
       await this.loadPlanDoc(defaultPlanDoc(run));
+      // Artifacts are listed AFTER the doc is on screen and are not awaited: a plan with ten phases
+      // means ten `filesListDir` round-trips over the relay, and none of them should delay the text
+      // the reader came for. The section simply appears when the listings land.
+      void this.loadPlanArtifacts(run ?? null);
     } catch {
       this.applyPlanRun(null); // benign empty state, no crash
     } finally {
       this.planLoading.set(false);
     }
+  }
+
+  /**
+   * List every artifacts dir of the plan (its own + one per phase), in parallel, best-effort.
+   *
+   * Uses the EXISTING `filesListDir` host API, which is rooted at `files_root` and guards every
+   * path. A dir that does not exist simply fails and contributes nothing — that is the common case
+   * and is NOT an error worth showing. The one failure that IS worth showing is a confinement
+   * refusal (the initiatives dir configured outside `files_root`), surfaced via
+   * `planArtifactsBlocked` so the reader learns why instead of concluding there are no artifacts.
+   */
+  private async loadPlanArtifacts(run: AgentPlanRun | null): Promise<void> {
+    const planPath = this.selectedInitiative()?.planPath;
+    if (!planPath?.trim()) return;
+    const dirs = artifactDirsFor(run);
+    const results = await Promise.all(dirs.map((dir) => this.listArtifactDir(planPath, dir)));
+    const listings: ArtifactListings = {};
+    let blocked: string | null = null;
+    for (const r of results) {
+      if (r.entries) listings[r.dirRel] = r.entries;
+      if (r.blocked && !blocked) blocked = r.blocked;
+    }
+    this.planArtifactListings.set(listings);
+    // Only claim a configuration problem when NOTHING could be listed; a single phase dir refusing
+    // while others worked is not a config fact.
+    this.planArtifactsBlocked.set(Object.keys(listings).length ? null : blocked);
+  }
+
+  /** One guarded `filesListDir`, classified into entries / "absent" / "blocked by configuration". */
+  private async listArtifactDir(
+    planPath: string,
+    dirRel: string,
+  ): Promise<{ dirRel: string; entries?: FileEntry[]; blocked?: string }> {
+    const abs = planDocPath(planPath, dirRel);
+    if (!abs) return { dirRel };
+    try {
+      const listing = await firstValueFrom(this.api.listDir(abs));
+      return { dirRel, entries: listing?.entries ?? [] };
+    } catch (err) {
+      const msg = String((err as { message?: string })?.message ?? err ?? '');
+      // The host's own wording for a containment refusal (`resolve_within_root`).
+      if (/outside the configured files_root/i.test(msg)) {
+        return {
+          dirRel,
+          blocked:
+            'Artifacts cannot be listed: this plan store is outside the configured file-browsing root. ' +
+            'Point Settings → files root at a directory that contains the initiatives store.',
+        };
+      }
+      return { dirRel }; // absent / unreadable → no artifacts, no noise
+    }
+  }
+
+  /**
+   * Open an artifacts row.
+   *
+   * A directory toggles, listing its children lazily on first open. A file goes to whichever
+   * EXISTING renderer handles its type: markdown stays in the page through `johnny-markdown-view`
+   * (so mermaid and the zoom modal keep working), everything else goes to `openReportFile`, which
+   * already branches html → sandboxed iframe, image → data URI, else → text.
+   */
+  async openPlanArtifact(node: ArtifactNode): Promise<void> {
+    if (node.kind === 'dir') {
+      const willOpen = !this.planArtifactExpanded()[node.id];
+      this.planArtifactExpanded.update((m) => ({ ...m, [node.id]: willOpen }));
+      if (willOpen && !this.planArtifactListings()[node.id]) {
+        const planPath = this.selectedInitiative()?.planPath;
+        if (!planPath?.trim()) return;
+        const r = await this.listArtifactDir(planPath, node.id);
+        if (r.entries) {
+          this.planArtifactListings.update((m) => ({ ...m, [node.id]: r.entries }));
+        }
+      }
+      return;
+    }
+    if (artifactOpenMode(node.id) === 'markdown') {
+      await this.loadPlanDoc(node.id);
+      return;
+    }
+    const abs = planDocPath(this.selectedInitiative()?.planPath, node.id);
+    if (!abs) return;
+    // Deliberately NOT recorded as the selected doc: the file opens in the viewer modal, while the
+    // doc view behind it still shows the markdown it was showing. Marking the row selected would
+    // leave the eyebrow claiming to render a .png over somebody else's text.
+    await this.openReportFile(abs);
   }
 
   /** Load one navigator doc's markdown via the safe fixed-suffix path builder (T01). */
