@@ -30,3 +30,6 @@ mod workflows_qa_attacks_r2;
 /// QA A round 3: the executor, the identity key, the SQL guard, the cross-branch contract.
 #[cfg(test)]
 mod workflows_qa_attacks_r3;
+/// QA A round 4: the final verification pass.
+#[cfg(test)]
+mod workflows_qa_attacks_r4;
