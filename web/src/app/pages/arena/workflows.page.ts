@@ -1,5 +1,6 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
-import { RouterLink } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { arenaBackTarget, arenaReturnParams } from './arena-nav';
 import { firstValueFrom } from 'rxjs';
 import { ArenaApiService, type Workflow } from './arena-api.service';
 import { ARENA_CSS } from './arena-ui.css';
@@ -20,7 +21,7 @@ const FAMILIES = ['glm-5.3-flash', 'deepseek-v4.1-flash', 'qwen3.8-flash-next'];
   template: `
     <div class="aw">
       <div class="a-head">
-        <a class="a-back" [routerLink]="['/initiatives']">‹ console</a>
+        <a class="a-back" [routerLink]="back().link" [queryParams]="back().queryParams">{{ back().label }}</a>
         <span class="eyebrow">Workflows</span>
         <h1>Champions and challengers</h1>
       </div>
@@ -56,8 +57,8 @@ const FAMILIES = ['glm-5.3-flash', 'deepseek-v4.1-flash', 'qwen3.8-flash-next'];
                   <b>v{{ w.version }}</b>
                   @if (w.isChampion) { <span class="a-ok" data-test="champion-badge">champion</span> }
                   <span class="a-muted">width {{ w.fanOut }}</span>
-                  <a [attr.data-test]="'wf-link-' + w.id" [routerLink]="['/workflows', w.id]">the four parts</a>
-                  <a [attr.data-test]="'wf-arena-' + w.id" [routerLink]="['/workflows', w.id, 'arena']">arena</a>
+                  <a [attr.data-test]="'wf-link-' + w.id" [routerLink]="['/workflows', w.id]" [queryParams]="onward()">the four parts</a>
+                  <a [attr.data-test]="'wf-arena-' + w.id" [routerLink]="['/workflows', w.id, 'arena']" [queryParams]="onward()">arena</a>
                 </div>
                 <div class="a-muted wf-when">{{ w.createdAt }}</div>
               </li>
@@ -71,6 +72,25 @@ const FAMILIES = ['glm-5.3-flash', 'deepseek-v4.1-flash', 'qwen3.8-flash-next'];
 })
 export class WorkflowsPage implements OnInit {
   private readonly api = inject(ArenaApiService);
+  private readonly router = inject(Router);
+  private readonly activated = inject(ActivatedRoute);
+
+  /**
+   * Where "back" goes. `?from=` is the URL the person DEPARTED from — every arena-ward link carries
+   * it — and the static link below is only the fallback for a pasted URL or a bookmark, which has
+   * no history to honour. See `arena-nav.ts` for the four different hard-coded labels this replaces.
+   */
+  protected back() {
+    return arenaBackTarget(this.activated.snapshot.queryParamMap.get('from'), {
+      link: ['/initiatives'],
+      label: 'the console',
+    });
+  }
+
+  /** The `?from=` an onward arena link must carry, so the page it opens can come back here. */
+  protected onward(): Record<string, string> {
+    return arenaReturnParams(this.router.url);
+  }
   protected readonly families = FAMILIES;
   protected readonly all = signal<Workflow[]>([]);
   protected readonly loading = signal(true);

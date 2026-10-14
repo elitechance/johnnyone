@@ -37,10 +37,37 @@ export const ARENA_CSS = `
   padding-top: 12px;
   padding-left: max(16px, env(safe-area-inset-left, 0px));
   padding-right: max(16px, env(safe-area-inset-right, 0px));
-  padding-bottom: calc(48px + env(safe-area-inset-bottom, 0px));
-  scroll-padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px));
-  max-width: 1100px;
-  margin: 0 auto;
+  /* THE BOTTOM NAV IS FIXED AND SITS OVER THIS. Measured at 400x860 on
+     /initiatives/p1/arena?step=prompt, scrolled fully down: nav.botnav occupied y=806..860 (54px)
+     and the decisive start-search button ran to y=812 — 6px of it UNDER the bar, with
+     document.elementFromPoint at its bottom edge returning a.b, the nav link. Its centre still
+     hit, so it stayed tappable and the phone harness reported 0 unreachable pixels: that harness
+     compares scrollHeight to clientHeight and is blind to a fixed overlay. 48px did not clear a
+     54px bar; 72px clears it with room for the gesture inset underneath. */
+  padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+  scroll-padding-bottom: calc(120px + env(safe-area-inset-bottom, 0px));
+  /* DESKTOP GEOMETRY IS THE DEFAULT, and the phone overrides it below, because the repo has ONE
+     breakpoint value and it is spelled max-width: 900px (styles/_workspace-responsive.scss,
+     pinned by arena-phone.spec.ts). Writing this as min-width: 901px would have introduced a
+     second number for the same boundary.
+
+     Measured at 1440x900: the console is rail 64 + list 216 + centre pane 886 at x=286 +
+     validation 262, while every arena route was a single 1100px column at x=202. Crossing moved
+     the reading column 84px left and widened it by 214px, on top of losing the two side panes.
+     Matching the centre pane's width and offset removes that 298px of jump. 222px is 286 minus the
+     64px rail, which the arena content box already starts after. It does NOT bring the two panes
+     back — see the report; that means lifting initiative selection out of terminal.page.ts, which
+     is a different change from a navigation fix. */
+  max-width: 886px;
+  margin-left: 222px;
+  margin-right: auto;
+}
+@media (max-width: 900px) {
+  .aw {
+    max-width: 1100px;
+    margin-left: auto;
+    margin-right: auto;
+  }
 }
 .a-head {
   display: flex;

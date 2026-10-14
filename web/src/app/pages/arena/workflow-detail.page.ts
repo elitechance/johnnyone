@@ -1,5 +1,6 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
-import { ActivatedRoute, RouterLink } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { WORKFLOW_NOT_FOUND, arenaBackTarget, arenaReturnParams, isMissingWorkflow } from './arena-nav';
 import { firstValueFrom } from 'rxjs';
 import { ArenaApiService, type Workflow } from './arena-api.service';
 import { ARENA_CSS } from './arena-ui.css';
@@ -19,12 +20,21 @@ import { lineageOf } from './arena-logic';
   template: `
     <div class="aw">
       <div class="a-head">
-        <a class="a-back" [routerLink]="['/workflows']">‹ workflows</a>
+        <a class="a-back" [routerLink]="back().link" [queryParams]="back().queryParams">{{ back().label }}</a>
         <span class="eyebrow">{{ wf()?.repo }} · {{ wf()?.phaseType }} · {{ wf()?.family }}</span>
         <h1>v{{ wf()?.version }} @if (wf()?.isChampion) { <span class="a-ok">· champion</span> }</h1>
       </div>
 
       @if (loadError()) { <div class="a-block" data-test="load-error">{{ loadError() }}</div> }
+
+      @if (notFound()) {
+        <div class="a-card" data-test="not-found">
+          <p>{{ notFoundCopy }}</p>
+          <div class="a-row">
+            <a class="a-btn" data-test="not-found-out" [routerLink]="['/workflows']">All workflows</a>
+          </div>
+        </div>
+      } @else {
 
       @if (wf(); as w) {
         <div class="a-card">
@@ -54,14 +64,15 @@ import { lineageOf } from './arena-logic';
                 <b>v{{ l.version }}</b>
                 @if (l.isChampion) { <span class="a-ok">champion</span> }
                 @if (l.id === w.id) { <span class="a-muted">· this one</span> }
-                <a [routerLink]="['/workflows', l.id]">open</a>
+                <a [routerLink]="['/workflows', l.id]" [queryParams]="onward()">open</a>
               </li>
             } @empty {
               <li class="a-muted">No lineage recorded for this version.</li>
             }
           </ul>
-          <a class="a-btn" [routerLink]="['/workflows', w.id, 'arena']">Open the arena</a>
+          <a class="a-btn" [routerLink]="['/workflows', w.id, 'arena']" [queryParams]="onward()">Open the arena</a>
         </div>
+      }
       }
     </div>
   `,
@@ -70,9 +81,35 @@ import { lineageOf } from './arena-logic';
 export class WorkflowDetailPage implements OnInit {
   private readonly api = inject(ArenaApiService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
+
+  /**
+   * Where "back" goes. `?from=` is the URL the person DEPARTED from — every arena-ward link carries
+   * it — and the static link below is only the fallback for a pasted URL or a bookmark, which has
+   * no history to honour. See `arena-nav.ts` for the four different hard-coded labels this replaces.
+   */
+  protected back() {
+    return arenaBackTarget(this.route.snapshot.queryParamMap.get('from'), {
+      link: ['/workflows'],
+      label: 'workflows',
+    });
+  }
+
+  /** The `?from=` an onward arena link must carry, so the page it opens can come back here. */
+  protected onward(): Record<string, string> {
+    return arenaReturnParams(this.router.url);
+  }
   protected readonly wf = signal<Workflow | null>(null);
   protected readonly siblings = signal<Workflow[]>([]);
   protected readonly loadError = signal<string | null>(null);
+
+  /**
+   * The id in the URL is not a workflow. Separate from `loadError` on purpose: an absence has a
+   * way out (the list), a failure does not, and conflating them is what put a raw TypeError on the
+   * screen. `WORKFLOW_NOT_FOUND` carries the words.
+   */
+  protected readonly notFound = signal(false);
+  protected readonly notFoundCopy = WORKFLOW_NOT_FOUND;
 
   protected readonly lineage = computed(() => {
     const w = this.wf();
@@ -83,6 +120,14 @@ export class WorkflowDetailPage implements OnInit {
     const id = this.route.snapshot.paramMap.get('id') ?? '';
     try {
       const w = await firstValueFrom(this.api.workflow(id));
+      // AN ABSENCE IS NOT A FAILURE. The host answers `null` for an id that is not a workflow — a
+      // stale link, a bookmark, a removed challenger — and the old code let that `null` run on into
+      // `w.repo`, threw inside this try, and printed the TypeError as body copy (measured on
+      // /workflows/w9: "Could not read this workflow: TypeError: Cannot read properties of null").
+      if (isMissingWorkflow(w)) {
+        this.notFound.set(true);
+        return;
+      }
       this.wf.set(w);
       this.siblings.set(
         await firstValueFrom(this.api.workflows({ repo: w.repo, phaseType: w.phaseType, family: w.family })),

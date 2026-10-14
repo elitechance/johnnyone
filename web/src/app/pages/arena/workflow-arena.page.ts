@@ -1,5 +1,6 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
-import { ActivatedRoute, RouterLink } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { WORKFLOW_NOT_FOUND, arenaBackTarget, isMissingWorkflow } from './arena-nav';
 import { catchError, firstValueFrom, of } from 'rxjs';
 import {
   JohnnyApiService,
@@ -45,12 +46,21 @@ import {
   template: `
     <div class="aw">
       <div class="a-head">
-        <a class="a-back" [routerLink]="['/workflows', challenger()?.id]">‹ the four parts</a>
+        <a class="a-back" [routerLink]="back().link" [queryParams]="back().queryParams">{{ back().label }}</a>
         <span class="eyebrow">{{ challenger()?.repo }} · {{ challenger()?.phaseType }} · {{ challenger()?.family }}</span>
         <h1>champion vs challenger</h1>
       </div>
 
       @if (loadError()) { <div class="a-block" data-test="load-error">{{ loadError() }}</div> }
+
+      @if (notFound()) {
+        <div class="a-card" data-test="not-found">
+          <p>{{ notFoundCopy }}</p>
+          <div class="a-row">
+            <a class="a-btn" data-test="not-found-out" [routerLink]="['/workflows']">All workflows</a>
+          </div>
+        </div>
+      } @else {
 
       @if (haltBlock(); as block) {
         <div class="a-block" data-test="halt-block">
@@ -271,6 +281,7 @@ import {
           </div>
         }
       </div>
+      }
     </div>
   `,
   styles: [
@@ -287,6 +298,20 @@ export class WorkflowArenaPage implements OnInit {
    *  phase-then-plan, and a phase with no gate must not be offered a scoring control at all. */
   private readonly plans = inject(JohnnyApiService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
+
+  /**
+   * Where "back" goes. `?from=` is the URL the person DEPARTED from — every arena-ward link carries
+   * it — and the static link below is only the fallback for a pasted URL or a bookmark, which has
+   * no history to honour. See `arena-nav.ts` for the four different hard-coded labels this replaces.
+   */
+  protected back() {
+    return arenaBackTarget(this.route.snapshot.queryParamMap.get('from'), {
+      link: ['/workflows', this.challenger()?.id ?? ''],
+      label: 'the four parts',
+    });
+  }
+
 
   protected readonly challenger = signal<Workflow | null>(null);
   protected readonly champion = signal<Workflow | null>(null);
@@ -295,6 +320,15 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly searchState = signal<WorkflowSearchState | null>(null);
   protected readonly pref = signal<WorkflowPref | null>(null);
   protected readonly loadError = signal<string | null>(null);
+
+  /**
+   * The id in the URL is not a workflow — a stale link or a removed challenger. Kept apart from
+   * `loadError`: before this, the `null` answer ran on into `chal.repo`, threw inside the try, and
+   * `String(e)` printed "TypeError: Cannot read properties of null (reading 'repo')" as body copy,
+   * with the halt banner stacked underneath it saying the search state could not be read.
+   */
+  protected readonly notFound = signal(false);
+  protected readonly notFoundCopy = WORKFLOW_NOT_FOUND;
   protected readonly comparing = signal(false);
   protected readonly confirming = signal(false);
   protected readonly promoting = signal(false);
@@ -401,6 +435,10 @@ export class WorkflowArenaPage implements OnInit {
     const id = this.route.snapshot.paramMap.get('id') ?? '';
     try {
       const chal = await firstValueFrom(this.api.workflow(id));
+      if (isMissingWorkflow(chal)) {
+        this.notFound.set(true);
+        return;
+      }
       this.challenger.set(chal);
       const family = await firstValueFrom(
         this.api.workflows({ repo: chal.repo, phaseType: chal.phaseType, family: chal.family }),

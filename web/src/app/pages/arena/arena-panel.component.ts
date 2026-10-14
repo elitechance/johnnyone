@@ -1,5 +1,6 @@
-import { Component, Input } from '@angular/core';
-import { RouterLink } from '@angular/router';
+import { Component, Input, inject } from '@angular/core';
+import { Router, RouterLink } from '@angular/router';
+import { arenaReturnParams } from './arena-nav';
 import { ArenaRowComponent } from './arena-row.component';
 import { ARENA_CSS } from './arena-ui.css';
 
@@ -25,7 +26,7 @@ import { ARENA_CSS } from './arena-ui.css';
         already lives. This tab is the competition: setup, the run, and the one promotion decision.
       </p>
       <div class="a-row">
-        <a class="a-btn" data-test="all-workflows" [routerLink]="['/workflows']">All workflows</a>
+        <a class="a-btn" data-test="all-workflows" [routerLink]="['/workflows']" [queryParams]="onward()">All workflows</a>
       </div>
 
       @if (phases.length) {
@@ -69,6 +70,17 @@ import { ARENA_CSS } from './arena-ui.css';
   ],
 })
 export class ArenaPanelComponent {
+  private readonly router = inject(Router);
+
+  /**
+   * The departure URL for every arena-ward link out of this tab. Without it the arena's back link
+   * returned to a bare `/initiatives` — no initiative, no tab — which is not the place the person
+   * left (measured: departing from `?initiativeId=p1&tab=arena` landed on `/initiatives`).
+   */
+  protected onward(): Record<string, string> {
+    return arenaReturnParams(this.router.url);
+  }
+
   @Input() initiativeId = '';
   @Input() phases: {
     phaseId: string;

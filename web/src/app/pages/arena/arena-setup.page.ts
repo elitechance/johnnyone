@@ -1,5 +1,6 @@
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { arenaBackTarget, arenaReturnParams } from './arena-nav';
 import { firstValueFrom } from 'rxjs';
 import {
   JohnnyApiService,
@@ -44,7 +45,7 @@ const FAMILIES = [
   template: `
     <div class="aw">
       <div class="a-head">
-        <a class="a-back" [routerLink]="['/initiatives']" [queryParams]="{ initiativeId: initiativeId(), tab: 'arena' }">‹ back to the console</a>
+        <a class="a-back" [routerLink]="back().link" [queryParams]="back().queryParams">{{ back().label }}</a>
         <span class="eyebrow">Arena setup {{ stepNumber() }} of 3</span>
         <h1>{{ phase()?.phaseTitle || phaseId() || 'this phase' }}</h1>
       </div>
@@ -202,6 +203,20 @@ export class ArenaSetupPage implements OnInit {
   private readonly router = inject(Router);
 
   protected readonly families = FAMILIES;
+
+  /**
+   * Where "back" goes. `?from=` is the URL the person DEPARTED from — every arena-ward link carries
+   * it — and the static link below is only the fallback for a pasted URL or a bookmark, which has
+   * no history to honour. See `arena-nav.ts` for the four different hard-coded labels this replaces.
+   */
+  protected back() {
+    return arenaBackTarget(this.route.snapshot.queryParamMap.get('from'), {
+      link: ['/initiatives'],
+      queryParams: { initiativeId: this.initiativeId(), tab: 'arena' },
+      label: 'the console',
+    });
+  }
+
   protected readonly initiativeId = signal('');
   protected readonly phaseId = signal<string | null>(null);
   protected readonly step = signal<'gate' | 'seats' | 'prompt'>('gate');
@@ -386,7 +401,11 @@ export class ArenaSetupPage implements OnInit {
           seats: null,
         }),
       );
-      void this.router.navigate(['/workflows', wf.id, 'arena']).catch(() => undefined);
+      // Carry the departure URL so the arena's back link returns to this setup screen, which is
+      // where the person was, rather than to a list they never opened.
+      void this.router
+        .navigate(['/workflows', wf.id, 'arena'], { queryParams: arenaReturnParams(this.router.url) })
+        .catch(() => undefined);
     } catch (e) {
       this.startError.set(`The host refused to start this run: ${String(e)}`);
     } finally {

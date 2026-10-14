@@ -488,22 +488,10 @@
   color: #8fa0b3;
 }
 
-.workspace-statusbar {
+// The strip's own look lives in WorkspaceStatusbarComponent, which every workspace surface now
+// renders. What stays here is the one thing that is this layout's business: its grid track.
+johnny-workspace-statusbar {
   grid-row: 3; // pinned to the last (auto) track so the conditional topbar can't shift it
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 10px;
-  border-top: 1px solid #263241;
-  background: #0a0d12;
-  color: #8fa0b3;
-  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-
-  strong {
-    color: #dbe7f3;
-    font-weight: 500;
-  }
 }
 
 @media (max-width: workspace.$mobile-breakpoint) {
@@ -764,9 +752,8 @@
     padding: 24px;
   }
 
-  .workspace-statusbar {
-    display: none;
-  }
+  // The strip hides itself under 900px (WorkspaceStatusbarComponent's own media query), so there
+  // is nothing to hide from here any more.
 }
 
 
@@ -1659,7 +1646,6 @@ ion-modal.workspace-picker .picker-empty {
     flex: none;
   }
   .init-new {
-    margin-left: auto;
     width: 22px;
     height: 22px;
     display: inline-flex;

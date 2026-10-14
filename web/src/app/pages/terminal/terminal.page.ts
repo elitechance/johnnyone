@@ -22,6 +22,7 @@ import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { ArenaPanelComponent } from '../arena/arena-panel.component';
 import { ArenaRowComponent } from '../arena/arena-row.component';
 import { GateStripComponent } from '../arena/gate-strip.component';
+import { WorkspaceStatusbarComponent } from '../../components/workspace-statusbar/workspace-statusbar.component';
 import {
   IonModal,
   IonHeader,
@@ -270,6 +271,7 @@ addIcons({
     ArenaPanelComponent,
     ArenaRowComponent,
     GateStripComponent,
+    WorkspaceStatusbarComponent,
     IonModal,
     IonHeader,
     IonToolbar,
@@ -322,6 +324,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // — reuses the existing shared modal service (decision D4), no new zoom UI.
   readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
+
   private readonly alertCtrl = inject(AlertController);
   private readonly toastCtrl = inject(ToastController);
   private readonly minSidebarWidth = 260;

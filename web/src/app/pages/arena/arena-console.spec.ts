@@ -38,7 +38,10 @@ describe('ArenaRowComponent — step 1, on a phase that already exists', () => {
     const el = f.nativeElement as HTMLElement;
     const enter = el.querySelector('[data-test="enter-arena"]') as HTMLAnchorElement;
     expect(enter).toBeTruthy();
-    expect(enter.getAttribute('href')).toBe('/initiatives/init-1/arena?phaseId=04-leases');
+    // `from` is the departure URL the setup wizard's back link spends, so it returns to the console
+    // tab this row was clicked from instead of a bare /initiatives. Under TestBed the router URL is
+    // '/', so that is what it carries here; `arena-nav.spec.ts` pins the real values.
+    expect(enter.getAttribute('href')).toBe('/initiatives/init-1/arena?phaseId=04-leases&from=%2F');
     expect(el.textContent).toContain('cargo test --lib leases::');
   });
 
@@ -65,7 +68,7 @@ describe('ArenaRowComponent — step 1, on a phase that already exists', () => {
     f.detectChanges();
     expect(el.querySelector('[data-test="enter-arena"]')).toBeNull();
     const out = el.querySelector('[data-test="set-gate"]') as HTMLAnchorElement;
-    expect(out.getAttribute('href')).toBe('/initiatives/init-1/arena?phaseId=08-polish&step=gate');
+    expect(out.getAttribute('href')).toBe('/initiatives/init-1/arena?phaseId=08-polish&step=gate&from=%2F');
   });
 
   it('offers to SET a gate, so the dead end names its own way out', () => {
@@ -192,9 +195,12 @@ describe('ArenaPanelComponent — the Arena tab’s own body', () => {
     expect(el.querySelector('johnny-markdown-view')).toBeNull();
   });
 
-  it('links to the workflow list', () => {
+  it('links to the workflow list, carrying where to come back to', () => {
     const el = mount().nativeElement as HTMLElement;
-    expect((el.querySelector('[data-test="all-workflows"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows');
+    // The `from` is what makes the arena's back link return to this console tab rather than to a
+    // bare /initiatives — a different place from the one the person left. '/' is the TestBed router
+    // URL; the real values are pinned in `arena-nav.spec.ts` and measured in `arena-nav-harness`.
+    expect((el.querySelector('[data-test="all-workflows"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows?from=%2F');
   });
 
   it('says so plainly when the initiative has no phases yet', () => {

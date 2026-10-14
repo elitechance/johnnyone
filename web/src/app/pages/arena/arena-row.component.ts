@@ -1,5 +1,6 @@
-import { Component, Input } from '@angular/core';
-import { RouterLink } from '@angular/router';
+import { Component, Input, inject } from '@angular/core';
+import { Router, RouterLink } from '@angular/router';
+import { arenaReturnParams } from './arena-nav';
 import { arenaEntryRow } from './arena-logic';
 import { ARENA_CSS } from './arena-ui.css';
 
@@ -29,7 +30,7 @@ import { ARENA_CSS } from './arena-ui.css';
               class="a-btn"
               data-test="enter-arena"
               [routerLink]="['/initiatives', initiativeId, 'arena']"
-              [queryParams]="{ phaseId: phase.phaseId }"
+              [queryParams]="onward({ phaseId: phase.phaseId })"
             >Enter the arena</a>
             <span class="a-muted ar-sub">search for a better prompt for this phase</span>
           </div>
@@ -43,7 +44,7 @@ import { ARENA_CSS } from './arena-ui.css';
               class="ar-set"
               data-test="set-gate"
               [routerLink]="['/initiatives', initiativeId, 'arena']"
-              [queryParams]="{ phaseId: phase.phaseId, step: 'gate' }"
+              [queryParams]="onward({ phaseId: phase.phaseId, step: 'gate' })"
             >set one</a>
           </div>
           <p class="a-note" data-test="arena-row-reason">{{ entry().reason }}</p>
@@ -62,6 +63,17 @@ import { ARENA_CSS } from './arena-ui.css';
   ],
 })
 export class ArenaRowComponent {
+  private readonly router = inject(Router);
+
+  /**
+   * This row's own query params PLUS the departure URL, so the setup wizard's back link returns to
+   * the console tab the row was clicked from. Merged in one binding: two `[queryParams]` on one
+   * anchor is a silent template collision — the second wins and the first is simply dropped.
+   */
+  protected onward(params: Record<string, string>): Record<string, string> {
+    return { ...params, ...arenaReturnParams(this.router.url) };
+  }
+
   @Input() initiativeId = '';
   @Input() phase: {
     phaseId: string;

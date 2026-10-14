@@ -1,5 +1,6 @@
 import { Component } from '@angular/core';
 import { IonContent } from '@ionic/angular/standalone';
+import { WorkspaceStatusbarComponent } from '../../components/workspace-statusbar/workspace-statusbar.component';
 import { ArenaApiService } from './arena-api.service';
 import { WorkflowDetailPage } from './workflow-detail.page';
 
@@ -24,6 +25,13 @@ import { WorkflowDetailPage } from './workflow-detail.page';
  * `@ionic/core/components/p-DWoUQeZ3.js:244`). Keeping the import out of `workflow-detail.page.ts`
  * is what lets the body stay mounted and clicked in jsdom specs while the route still gets the
  * Ionic scroller it needs.
+ *
+ * It also renders the console's own status strip, OUTSIDE the `ion-content`. Ionic's `.ion-page` is
+ * a flex column and `ion-content` takes the free space, so a sibling after it is pinned to the
+ * bottom rather than scrolling away with the content. MEASURED at 1200x860: the strip painted on
+ * `/initiatives` and on no arena route, so the chrome disappeared as you crossed into the arena.
+ * At phone width it costs nothing — the component is `display: none` under 900px, exactly as the
+ * console's copy already was, so the 400x860 reachability numbers are unchanged.
  */
 @Component({
   selector: 'app-workflow-detail-shell',
@@ -32,8 +40,8 @@ import { WorkflowDetailPage } from './workflow-detail.page';
   // documents are constructed in — and bundled with — the arena chunk. On a route it would have to
   // be imported by the eagerly-loaded route table instead.
   providers: [ArenaApiService],
-  imports: [IonContent, WorkflowDetailPage],
-  template: `<ion-content class="arena-scroll"><app-workflow-detail /></ion-content>`,
+  imports: [IonContent, WorkflowDetailPage, WorkspaceStatusbarComponent],
+  template: `<ion-content class="arena-scroll"><app-workflow-detail /></ion-content><johnny-workspace-statusbar />`,
   styles: [
     `
       ion-content {

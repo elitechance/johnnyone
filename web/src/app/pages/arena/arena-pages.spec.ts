@@ -382,10 +382,13 @@ describe('WorkflowsPage — /workflows, the list and the fleet strip', () => {
     expect(q(f, '[data-test="wf-row-w2"] [data-test="champion-badge"]')).toBeNull();
   });
 
-  it('links each row to its four slots and to its arena', async () => {
+  it('links each row to its four slots and to its arena, carrying where to come back to', async () => {
     const f = await mount(WorkflowsPage, stubApi(), {});
-    expect((q(f, '[data-test="wf-link-w2"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows/w2');
-    expect((q(f, '[data-test="wf-arena-w2"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows/w2/arena');
+    // `?from=` is the departure URL the next page's back link spends, so the walk back retraces the
+    // way in instead of jumping to one hard-coded parent. '/' is the TestBed router URL; the real
+    // values are pinned in `arena-nav.spec.ts` and measured by `arena-nav-harness.mjs`.
+    expect((q(f, '[data-test="wf-link-w2"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows/w2?from=%2F');
+    expect((q(f, '[data-test="wf-arena-w2"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows/w2/arena?from=%2F');
   });
 
   it('the fleet strip reports what it actually knows — no invented seat meter', async () => {
@@ -852,5 +855,50 @@ describe('WorkflowArenaPage — scoring a recorded run', () => {
     const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
     expect(txt(f)).toContain('the fleet was busy when this run started');
     expect((q(f, '[data-test="score-run"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+/**
+ * A stale link is an ABSENCE, not a failure. MEASURED on the built bundle at both 400x860 and
+ * 1440x900 before this existed: `/workflows/w9` and `/workflows/w9/arena` rendered
+ *
+ *   Could not read this workflow: TypeError: Cannot read properties of null (reading 'repo')
+ *
+ * as body copy, with the arena page stacking the halt banner underneath it. The host answers
+ * `workflow: null` for an id it does not know — a bookmark, a shared link, a removed challenger —
+ * and the page let that null run on until a property read threw INSIDE the try, so `String(e)`
+ * went on the screen. That violates the project's own rule about never surfacing internal errors.
+ */
+describe('an id that is not a workflow', () => {
+  const missing = () => stubApi({ workflow: () => of(null) });
+
+  it('the detail page says what happened, in words, with a way out', async () => {
+    const f = await mount(WorkflowDetailPage, missing(), { id: 'w9' });
+    const text = txt(f);
+    expect(text).not.toMatch(/TypeError|Cannot read properties/);
+    expect(text).toMatch(/not here/i);
+    expect(q(f, '[data-test="not-found"]')).toBeTruthy();
+    expect((q(f, '[data-test="not-found-out"]') as HTMLAnchorElement).getAttribute('href')).toBe('/workflows');
+  });
+
+  it('the arena page says the same, and does not also claim the search is paused', async () => {
+    const f = await mount(WorkflowArenaPage, missing(), { id: 'w9' });
+    const text = txt(f);
+    expect(text).not.toMatch(/TypeError|Cannot read properties/);
+    expect(text).toMatch(/not here/i);
+    // The old page printed the TypeError AND the halt banner, because a null challenger also made
+    // the search state unreadable. One absence must not read as two separate problems.
+    expect(text).not.toMatch(/The search is paused/i);
+    expect(q(f, '[data-test="not-found-out"]')).toBeTruthy();
+  });
+
+  it('does not show the not-found panel for a workflow that IS there', async () => {
+    // An absence and a failure are different states with different copy, and conflating them is
+    // the defect. The failure half is `isMissingWorkflow` in `arena-nav.spec.ts`; a rejecting
+    // observable cannot be used here, because one thrown inside ngOnInit escapes the component's
+    // own catch as a zone-level uncaught exception and makes the whole file report an error.
+    const f = await mount(WorkflowDetailPage, stubApi(), { id: 'w2' });
+    expect(q(f, '[data-test="not-found"]')).toBeNull();
+    expect(txt(f)).not.toMatch(/not here/i);
   });
 });

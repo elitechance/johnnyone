@@ -59,7 +59,13 @@ describe('terminal.page.html — the arena is added, nothing is replaced', () =>
     // Measured: the compiled component style is 47.85 kB against a 48 kB error budget, so any new
     // rule here fails the build. Every arena style lives in the new components' own inline sheets.
     // The byte count is the SOURCE file; the budget applies to the compiled output.
-    expect(statSync(SCSS_PATH).size).toBe(74503);
+    //
+    // 74503 -> 74450 in the nav-seam round, and the direction is the point: the status bar's look
+    // LEFT this file for WorkspaceStatusbarComponent, which every workspace surface now renders so
+    // the chrome stops vanishing across the console/arena switch. Nothing was added, and the
+    // compiled sheet went from 47.85 kB to 47.52 kB. The pin is exact on purpose: this file cannot
+    // afford a rule.
+    expect(statSync(SCSS_PATH).size).toBe(74450);
     expect(readFileSync(SCSS_PATH, 'utf8')).not.toContain('arena');
   });
 });
