@@ -143,7 +143,7 @@ fn halt(state: &AppState, workflow_id: &str, repo: &str, phase: &str, family: &s
 /// transaction and already reads the workflow for the champion lock, so the fact is one query away
 /// from where the decision is made.
 #[tokio::test]
-async fn qa_a3_a_halt_arriving_during_the_gate_run_does_not_stop_the_score_landing() {
+async fn qa_a3_a_halt_arriving_during_the_gate_run_discards_the_score() {
     let (state, _root) = test_state();
     let workspace = tmp_dir("arena-r3-toctou");
     let w = workflow(&state, KEY.0, KEY.1, KEY.2);
@@ -179,22 +179,39 @@ async fn qa_a3_a_halt_arriving_during_the_gate_run_does_not_stop_the_score_landi
         state_after.halted,
         "the fixture must really halt the family while the gate runs"
     );
-    let scored = scored.expect(
-        "DEFECT PIN: the score lands on a family that halted while the gate was running. If this \
-         starts failing, execute_gate re-checks the halt inside set_gate_result's transaction and \
-         this test should be inverted.",
+    // FIXED. The halt is re-read INSIDE `set_gate_result`'s write transaction, so a halt that
+    // lands while the gate is running discards the result instead of letting it through. A check
+    // before a multi-minute await is not a check.
+    let error = scored.expect_err(
+        "a score gathered while the search gave up must not land",
+    );
+    assert!(error.contains("is halted"), "got: {error}");
+    assert!(
+        error.contains("its result is discarded"),
+        "the refusal must say what happened to the work: {error}"
     );
     assert_eq!(
-        scored.gate_exit,
-        Some(0),
-        "DEFECT PIN: and it is a GREEN score, so the halted family now holds fresh promotable \
-         evidence — exactly what the refusal's doc comment says it prevents"
+        get_workflow_run(&state, &run.id).unwrap().gate_exit,
+        None,
+        "and NOTHING was written: no partial score, no ended_at"
     );
-    // The leak is real, not cosmetic: the moment a human resumes, that evidence promotes with no
-    // new run.
+
+    // The consequence that made the leak matter is gone too: after a resume there is no stale
+    // evidence to promote on, so a new run has to be scored.
     resume_workflow_search(&state, KEY.0, KEY.1, KEY.2, "resuming", true).expect("resume");
-    promote_workflow(&state, &run.id, None, true)
-        .expect("DEFECT PIN: promoted on evidence gathered while the search had given up");
+    let still_unscored = promote_workflow(&state, &run.id, None, true)
+        .expect_err("there is no evidence to promote on");
+    assert!(still_unscored.contains("no gate result"), "got: {still_unscored}");
+
+    // And scoring AGAIN now that the halt is lifted works, which is what keeps this a discard
+    // rather than a dead end.
+    score_workflow_run(&state, &run.id, None)
+        .await
+        .expect("a resumed family can score the same run");
+    assert_eq!(
+        get_workflow_run(&state, &run.id).unwrap().gate_exit,
+        Some(0)
+    );
 }
 
 /// A fresh score is refused outright while the family is ALREADY halted, before anything runs —
@@ -438,25 +455,33 @@ async fn qa_a3_a_refused_rescore_runs_the_gate_but_keeps_the_old_score() {
 ///
 /// Measured at the recorder, since no real parser produces a count that large.
 #[test]
-fn qa_a3_the_collected_bound_contradicts_its_own_doc_comment() {
+fn qa_a3_the_collected_bound_keeps_the_score_and_drops_the_count() {
     let (state, _root) = test_state();
     let w = workflow(&state, KEY.0, KEY.1, KEY.2);
     let run = start_against(&state, &w.id, None);
 
-    let refused = record_workflow_run_gate(&state, &run.id, 0, Some(MAX_GATE_COLLECTED + 1));
-    assert!(
-        refused.is_err(),
-        "DEFECT PIN: a GREEN gate result is discarded over an advisory count. The bound is right; \
-         the doc comment above it still says the opposite."
-    );
-    assert!(refused.unwrap_err().contains("Number.MAX_SAFE_INTEGER"));
+    // FIXED, and the contradiction is resolved in the direction that keeps the score. An
+    // out-of-range advisory count is DROPPED to None with a warning, not refused: the exit code is
+    // the only score the arena has, and a gate that ran for minutes and passed must not lose it
+    // over a number nothing branches on.
+    //
+    // None rather than a clamp to MAX_GATE_COLLECTED, because None already means "no count the host
+    // could trust", whereas clamping would assert a precise number that was never measured — the
+    // quiet-wrong-value failure the bound exists to prevent, just relocated.
+    let kept = record_workflow_run_gate(&state, &run.id, 0, Some(MAX_GATE_COLLECTED + 1))
+        .expect("an advisory count must never cost the score");
+    assert_eq!(kept.gate_exit, Some(0), "the score is kept");
+    assert_eq!(kept.gate_collected, None, "and the untrustworthy count is dropped");
     assert_eq!(
         get_workflow_run(&state, &run.id).unwrap().gate_exit,
-        None,
-        "DEFECT PIN: and the exit code — the only score the arena has — is lost with it"
+        Some(0),
+        "persisted, not just returned"
     );
+    // A negative count goes the same way, for the same reason.
+    let negative = rescore_workflow_run_gate(&state, &run.id, 0, Some(-1)).expect("kept");
+    assert_eq!((negative.gate_exit, negative.gate_collected), (Some(0), None));
     // The boundary itself round-trips, so the bound is inclusive and exact.
-    let at_bound = record_workflow_run_gate(&state, &run.id, 0, Some(MAX_GATE_COLLECTED))
+    let at_bound = rescore_workflow_run_gate(&state, &run.id, 0, Some(MAX_GATE_COLLECTED))
         .expect("the boundary is allowed");
     assert_eq!(at_bound.gate_collected, Some(MAX_GATE_COLLECTED));
     assert_eq!(MAX_GATE_COLLECTED, 9_007_199_254_740_991);
@@ -635,17 +660,11 @@ fn qa_a3_the_reason_check_refuses_every_invisible_reason_i_could_build() {
     // Dev A's own doc comment anticipates this: *"If this list needs to grow, growing it is the
     // fix."* It needs to grow. The durable fix is `Default_Ignorable_Code_Point` plus the
     // Braille blank, which needs a Unicode table; the cheap fix is adding these ranges.
-    let expected_service_holes = [
-        "braille-blank",              // U+2800, renders as blank
-        "hangul-filler",              // U+3164
-        "halfwidth-hangul-filler",    // U+FFA0
-        "zwnbsp-variation",           // U+FE00
-        "variation-selector-16",      // U+FE0F
-        "hangul-choseong-filler",     // U+115F
-        "hangul-jungseong-filler",    // U+1160
-        "khmer-inherent-aq",          // U+17B4
-        "khmer-inherent-aa",          // U+17B5
-    ];
+    // FIXED: all nine were added to `has_visible_content`, so the expected-holes list is now
+    // EMPTY and the assertion below becomes "no input in this corpus passes the guard". The
+    // Default_Ignorable table was considered and deliberately not taken as a dependency — the
+    // reasoning is recorded on the function itself, including that a third batch would flip it.
+    let expected_service_holes: [&str; 0] = [];
     let mut unexpected: Vec<&str> = service_holes
         .iter()
         .copied()
@@ -664,8 +683,8 @@ fn qa_a3_the_reason_check_refuses_every_invisible_reason_i_could_build() {
     missing.sort_unstable();
     assert!(
         missing.is_empty(),
-        "DEFECT PIN: these were holes in has_visible_content and are no longer. The list has been \
-         grown — remove them from `expected_service_holes` and keep the assertion: {missing:?}"
+        "these were listed as known holes but the guard now refuses them; shrink \
+         `expected_service_holes` to match: {missing:?}"
     );
     // The guard still works for everything it DOES know about, which is most of the space.
     assert!(
@@ -860,18 +879,22 @@ fn qa_a3_remote_normalisation_folds_the_forms_that_are_one_repo() {
         normalise_remote_for_test("https://github.com/b/repo"),
     );
 
-    // **DEFECT PIN: a non-default SSH PORT becomes a path segment**, so one repo reachable on a
-    // custom port is a different identity from the same repo on 22. `replacen(':', "/", 1)` cannot
-    // tell a scp-form separator from a port.
-    assert_ne!(
+    // FIXED: a `:` followed by digits is a PORT, not the scp-form separator, and a port is not
+    // part of which repository this is — so it is dropped rather than folded into the path.
+    assert_eq!(
         normalise_remote_for_test("ssh://git@host.example/owner/repo.git"),
         normalise_remote_for_test("ssh://git@host.example:2222/owner/repo.git"),
+        "one repo on a custom port is ONE identity"
     );
     assert_eq!(
         normalise_remote_for_test("ssh://git@host.example:2222/owner/repo.git"),
-        "git:host.example/2222/owner/repo",
-        "DEFECT PIN: the port is folded into the path. Niche, and the direction is safe (two \
-         identities rather than a collision), but it is a second champion for one repo."
+        "git:host.example/owner/repo"
+    );
+    // And the scp form, where the `:` separates a PATH rather than a port, still folds correctly —
+    // the two cases are told apart by what follows the colon, not by guessing.
+    assert_eq!(
+        normalise_remote_for_test("git@host.example:owner/repo.git"),
+        "git:host.example/owner/repo"
     );
 }
 
@@ -921,25 +944,26 @@ fn qa_a3_two_worktrees_of_one_repo_are_one_identity() {
 /// Reading the first remote alphabetically, or `git remote get-url --all` with origin preferred,
 /// would close it.
 #[test]
-fn qa_a3_a_repo_whose_remote_is_not_named_origin_falls_back_to_the_path() {
+fn qa_a3_a_repo_whose_remote_is_not_named_origin_still_uses_the_remote() {
     let root = tmp_dir("arena-r3-upstream");
     let main = root.join("main");
     init_repo(&main);
     git(&main, &["remote", "add", "upstream", "git@github.com:owner/repo.git"]);
+    // FIXED: `git remote` is listed and `origin` merely PREFERRED, so a fork-style checkout with
+    // only an `upstream` remote uses that remote rather than falling through to the path.
     let identity = repo_identity(&main.to_string_lossy()).expect("identity");
-    assert!(
-        identity.starts_with("path:"),
-        "DEFECT PIN: a repo with a remote named `upstream` gets a path identity, not \
-         git:github.com/owner/repo. got: {identity}"
+    assert_eq!(
+        identity, "git:github.com/owner/repo",
+        "a repo with a remote named `upstream` has a remote, and the identity must use it"
     );
 
-    // And the consequence the design explicitly set out to avoid.
+    // And the consequence the design explicitly set out to avoid is gone with it.
     let linked = root.join("linked");
     git(&main, &["worktree", "add", "-q", linked.to_str().unwrap(), "-b", "side"]);
-    assert_ne!(
+    assert_eq!(
         repo_identity(&main.to_string_lossy()).expect("main"),
         repo_identity(&linked.to_string_lossy()).expect("worktree"),
-        "DEFECT PIN: two worktrees of ONE repo get two champions, because neither has an `origin`"
+        "two worktrees of ONE repo are ONE champion, whatever the remote is called"
     );
 
     // Renaming it to origin fixes it, which is what makes this a lookup gap rather than a design
@@ -949,9 +973,15 @@ fn qa_a3_a_repo_whose_remote_is_not_named_origin_falls_back_to_the_path() {
         repo_identity(&main.to_string_lossy()).expect("renamed"),
         "git:github.com/owner/repo"
     );
-    // …and the identity CHANGED when the remote was renamed, which orphans the old champion.
-    // Inherent to keying on the remote, worth knowing before the first rename in anger.
-    assert!(!identity.starts_with("git:"));
+    // …and the identity is UNCHANGED by the rename, which is now the better outcome: the remote
+    // URL is what the key is made of, so renaming `upstream` to `origin` moves no champion. The
+    // thing that WOULD orphan a champion is changing the remote's URL, which is a different and
+    // much rarer act than renaming it.
+    assert_eq!(
+        identity,
+        repo_identity(&main.to_string_lossy()).expect("after rename"),
+        "renaming a remote must not orphan the family's champion"
+    );
 }
 
 /// When origin exists alongside other remotes, origin wins — so multiple remotes are not ambiguous

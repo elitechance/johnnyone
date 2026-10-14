@@ -3729,6 +3729,108 @@ mod workflow_arena_rpc_tests {
             .contains("Unknown RPC method"));
     }
 
+    /// **Every required parameter of every arena method, omitted one at a time.**
+    ///
+    /// `handle_rpc_registers_every_arena_method` sends an EMPTY payload, so it only ever exercises
+    /// each method's FIRST missing-parameter message — the later pullers' strings are never run, and
+    /// a typo in one of them would compile, pass every gate, and fail in production against the one
+    /// client that omitted that argument. Same shape as the two unguarded rules an earlier revert
+    /// sweep turned up.
+    ///
+    /// Each row is a complete valid payload; the test removes one key at a time and asserts the
+    /// message names THAT key. Nothing here needs a workflow to exist: the pullers all run before
+    /// the service is reached.
+    #[tokio::test]
+    async fn handle_rpc_names_every_missing_parameter_not_just_the_first() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let complete: &[(&str, serde_json::Value, &[&str])] = &[
+            (
+                "create_workflow_version",
+                json!({
+                    "workspacePath": WORKSPACE,
+                    "phaseType": "dev-phase",
+                    "family": "glm",
+                    "role": "r",
+                    "instruction": "i",
+                    "contract": "c",
+                    "hop": "{}",
+                    "fanOut": 1
+                }),
+                &["workspacePath", "phaseType", "family", "role", "instruction", "contract", "hop", "fanOut"],
+            ),
+            (
+                "record_workflow_run_gate",
+                json!({ "runId": "r1", "gateExit": 0 }),
+                &["runId", "gateExit"],
+            ),
+            (
+                "record_workflow_run_rescore",
+                json!({ "runId": "r1", "gateExit": 0 }),
+                &["runId", "gateExit"],
+            ),
+            (
+                "record_workflow_pref",
+                json!({ "winnerRunId": "a", "loserRunId": "b" }),
+                &["winnerRunId", "loserRunId"],
+            ),
+            (
+                "record_workflow_rejection",
+                json!({ "runId": "r1", "reason": "no" }),
+                &["runId", "reason"],
+            ),
+            (
+                "update_workflow_search_resumed",
+                json!({
+                    "repo": "r",
+                    "phaseType": "dev-phase",
+                    "family": "glm",
+                    "reason": "go on"
+                }),
+                &["repo", "phaseType", "family", "reason"],
+            ),
+            (
+                "start_workflow_run",
+                json!({ "workflowId": "w1" }),
+                &["workflowId"],
+            ),
+            (
+                "get_workflow_search_state",
+                json!({ "repo": "r", "phaseType": "dev-phase", "family": "glm" }),
+                &["repo", "phaseType", "family"],
+            ),
+            ("get_repo_identity", json!({ "workspacePath": WORKSPACE }), &["workspacePath"]),
+            ("get_workflow", json!({ "id": "w1" }), &["id"]),
+            ("list_workflow_runs", json!({ "workflowId": "w1" }), &["workflowId"]),
+            ("list_workflow_prefs", json!({ "workflowId": "w1" }), &["workflowId"]),
+            ("run_workflow_run_gate", json!({ "runId": "r1" }), &["runId"]),
+            ("rescore_workflow_run_gate", json!({ "runId": "r1" }), &["runId"]),
+            ("update_workflow_champion", json!({ "runId": "r1", "confirmed": true }), &["runId"]),
+        ];
+
+        for (method, payload, required) in complete {
+            for omitted in *required {
+                let mut params = payload.clone();
+                params
+                    .as_object_mut()
+                    .expect("object payload")
+                    .remove(*omitted);
+                let response = AgentService::handle_rpc(&rpc(method, params), &state).await;
+                assert!(
+                    !response.success,
+                    "{method} without {omitted} must fail"
+                );
+                let error = response.error.unwrap_or_default();
+                assert_eq!(
+                    error,
+                    format!("Missing '{}' parameter", omitted),
+                    "{method}: omitting {omitted} must name {omitted}"
+                );
+            }
+        }
+    }
+
     /// The whole arena, end to end, through `handle_rpc` only — the surface a phone actually
     /// reaches. Also pins the camelCase JSON keys both ways: the params the resolvers send and the
     /// field names they read back.

@@ -279,8 +279,20 @@ pub const MAX_PROMPT_CHARS: usize = 100_000;
 /// `char::is_whitespace`, rather than a full Unicode `Default_Ignorable_Code_Point` table: that
 /// would mean a new dependency for one predicate. It is conservative in the safe direction — text
 /// made only of characters in this set is refused, and anything it fails to recognise can only
-/// cause a reason to be ACCEPTED, never a visible one to be rejected. If this list needs to grow,
-/// growing it is the fix.
+/// cause a reason to be ACCEPTED, never a visible one to be rejected.
+///
+/// **The list has already needed growing once, which is the honest argument for and against the
+/// table.** An audit of 48 inputs found nine code points passing the first version: the braille
+/// pattern BLANK, the hangul fillers (`U+3164`, `U+FFA0`, `U+115F`, `U+1160`), the khmer inherent
+/// vowels (`U+17B4`, `U+17B5`), and the variation selectors (`U+FE00`-`U+FE0F`). All are here now.
+///
+/// The durable answer is `Default_Ignorable_Code_Point` plus the braille blank, and that needs a
+/// Unicode property table. I have NOT taken a dependency for it, on the grounds that the
+/// consequence of a miss is bounded and unglamorous — one rejection whose reason renders blank, in
+/// a field nothing branches on — and that `unicode-properties`-class crates carry a table that is
+/// itself versioned against a Unicode release, so "correct" becomes a thing to keep up to date
+/// rather than a thing that is done. If a third audit finds a third batch, that calculus flips and
+/// the table is the right call; this comment is the record of why it was not yet.
 fn has_visible_content(text: &str) -> bool {
     text.chars().any(|c| {
         !c.is_whitespace()
@@ -288,12 +300,19 @@ fn has_visible_content(text: &str) -> bool {
             && !matches!(c,
                 '\u{00ad}'              // soft hyphen
                 | '\u{061c}'            // arabic letter mark
+                | '\u{115f}'..='\u{1160}' // hangul choseong / jungseong filler
+                | '\u{17b4}'..='\u{17b5}' // khmer inherent vowels AQ / AA
                 | '\u{180e}'            // mongolian vowel separator
                 | '\u{200b}'..='\u{200f}' // zero-width space .. RTL mark
                 | '\u{202a}'..='\u{202e}' // bidi embedding/override
                 | '\u{2060}'..='\u{2064}' // word joiner .. invisible plus
                 | '\u{2066}'..='\u{2069}' // bidi isolates
+                | '\u{2800}'             // braille pattern BLANK — not Default_Ignorable, but it
+                                          // renders as nothing, which is the property that matters
+                | '\u{3164}'            // hangul filler
+                | '\u{fe00}'..='\u{fe0f}' // variation selectors 1-16
                 | '\u{feff}'            // BOM / zero-width no-break space
+                | '\u{ffa0}'            // halfwidth hangul filler
                 | '\u{fff9}'..='\u{fffb}' // interlinear annotation
             )
     })
@@ -384,16 +403,52 @@ pub fn repo_identity(workspace_path: &str) -> Result<String, String> {
     Ok(format!("path:{}", absolute.to_string_lossy()))
 }
 
+/// The repository's remote URL: `origin` when it exists, otherwise the first remote by name.
+///
+/// It used to read `remote.origin.url` alone, and that was wrong for a whole normal shape of
+/// checkout: a fork with an `upstream` remote and no `origin` HAS a remote but fell through to the
+/// path fallback, so two worktrees of one such repository got two champions — precisely the
+/// collision the remote key exists to prevent.
+///
+/// `origin` is preferred rather than merely first because it is the conventional name for "where
+/// this checkout belongs", and alphabetical order among the rest is an arbitrary rule chosen only
+/// so that the answer is STABLE: an identity that depends on which remote was added first would
+/// make the champion key depend on local history.
+///
+/// NOTE this shells out with a blocking `std::process::Command`. Every current caller is
+/// synchronous, so that is fine today — but a future async caller (the coordinator reaching
+/// `create_workflow_version` from a task) would block a runtime thread, and the fix then is
+/// `spawn_blocking` at the call site, not here.
 fn git_remote_url(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
+        .args(["remote"])
         .current_dir(path)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut names: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_unstable();
+    let chosen = if names.iter().any(|name| *name == "origin") {
+        "origin"
+    } else {
+        names.first().copied()?
+    };
+    let url = std::process::Command::new("git")
+        .args(["remote", "get-url", chosen])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !url.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&url.stdout).trim().to_string();
     if url.is_empty() {
         None
     } else {
@@ -415,8 +470,24 @@ fn normalise_remote(url: &str) -> String {
     if let Some((_, after)) = rest.split_once('@') {
         rest = after;
     }
-    // `host:owner/repo` (scp form) becomes `host/owner/repo`.
-    let rest = rest.replacen(':', "/", 1);
+    // `host:owner/repo` (scp form) becomes `host/owner/repo` — but a `:` followed by digits is a
+    // PORT, not the scp separator, and blindly rewriting it made `ssh://git@host:2222/o/r` a second
+    // identity for the same repository. A port is not part of which repo this is, so it is dropped
+    // rather than folded into the path.
+    let rest = match rest.split_once(':') {
+        Some((host, after)) if after.chars().take_while(|c| *c != '/').all(|c| c.is_ascii_digit())
+            && after.starts_with(|c: char| c.is_ascii_digit()) =>
+        {
+            // `host:2222/owner/repo` -> `host/owner/repo`
+            match after.split_once('/') {
+                Some((_port, tail)) => format!("{}/{}", host, tail),
+                // `host:2222` with no path is not a repo URL; keep it whole rather than invent one.
+                None => rest.to_string(),
+            }
+        }
+        Some((host, after)) => format!("{}/{}", host, after),
+        None => rest.to_string(),
+    };
     let rest = rest.strip_suffix('/').unwrap_or(&rest);
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     format!("git:{}", rest.to_lowercase())
@@ -432,6 +503,16 @@ fn normalise_remote(url: &str) -> String {
 /// Entries whose count is zero are dropped, so `{"glm":3}` and `{"glm":3,"qwen":0}` are the same
 /// budget. Without that, "I held no Qwen seats" and "I did not mention Qwen" would compare
 /// unequal and every preference between them would be silently downgraded to non-comparable.
+///
+/// **This ERASES a distinction the lease pool deliberately preserves, and the erasure is the point.**
+/// `LeasePool` keeps idle families at `0` rather than omitting them, and documents that `"0 busy"`
+/// and `"not in the snapshot"` must stay distinguishable *for the comparability check*. On this
+/// side they must NOT: an all-zero snapshot is exactly what "the fleet was quiet" looks like coming
+/// out of a pool that enumerates every family, and if zero entries survived here, a quiet fleet
+/// would read as contention and nothing would ever be scoreable. So the guarantee the pool offers
+/// is one this consumer destroys on read, on purpose. Nothing is broken by that today; it is
+/// written down because the two comments otherwise contradict each other, and the next reader
+/// deserves to know which one the behaviour follows.
 ///
 /// A negative count, a non-integer count, a non-object payload and malformed JSON are all errors
 /// rather than empty maps: an unreadable budget must not look like "no seats", which would make
@@ -1181,9 +1262,21 @@ pub fn budget_was_honoured(
 /// **Host-internal, and deliberately NOT reachable over RPC or GraphQL.** The relay path goes
 /// through [`start_workflow_run`], which measures, so a browser can never declare its own
 /// contention — that is the whole point of the change. This exists for the host-side caller that
-/// already holds a measurement (the lease pool, once it is wired, will take a lease and then start
-/// the run with the snapshot it just took) and for tests that need to construct specific
-/// contention in order to exercise [`contention_is_comparable`] at all.
+/// already holds a measurement, and for tests that need to construct specific contention in order
+/// to exercise the scoreability rule at all.
+///
+/// **THE ORDER, and it is load-bearing: SNAPSHOT FIRST, ACQUIRE SECOND.**
+///
+/// An earlier version of this comment prescribed the opposite ("take a lease and then start the run
+/// with the snapshot it just took"), and that order is the losing one. `LeasePool::busy()` returns
+/// the TOTAL seats held per family, with no exclusion of the caller's own lease and no
+/// `busy_excluding` variant. Under the `fleet_busy` contract — foreign contention only, empty means
+/// quiet — a snapshot taken AFTER `acquire` reads the run's own seats as foreign load, so every run
+/// is unscoreable forever: the inert feature that looks finished and promotes nothing. Taken
+/// BEFORE, an idle fleet reads as quiet and the rule works.
+///
+/// It is also right on its own terms, independent of whose API bends: a concurrent run's seats
+/// belong in this run's snapshot, and its own do not. Snapshot, then acquire, then start.
 pub fn start_workflow_run_with_budget(
     state: &AppState,
     input: NewWorkflowRun,
@@ -1292,6 +1385,48 @@ pub fn rescore_workflow_run_gate(
     set_gate_result(state, run_id, gate_exit, gate_collected, true)
 }
 
+/// **The advisory-count rule.** An unusable `gate_collected` becomes `None`; it never costs the
+/// score.
+///
+/// Three positions have been taken on this field and the history matters. (1) Unbounded, because
+/// "refusing a real gate result because an advisory number is large is the wrong trade" — which
+/// made it the one field able to carry a value an IEEE-754 double cannot hold, silently ROUNDED by
+/// `JSON.parse` in the worker before GraphQL ever saw it. (2) Bounded with a refusal, which closed
+/// the rounding hole but contradicted (1)'s own reasoning: through the executor it meant a gate that
+/// ran for minutes and PASSED could have its real exit code discarded over the advisory count.
+/// (3) This: bound it, and on a violation drop the count rather than the result.
+///
+/// `None` is the right landing place and not merely a convenient one, because `None` already means
+/// exactly this — "no count the host could trust". Clamping to [`MAX_GATE_COLLECTED`] instead would
+/// assert a precise number that was never measured, which is the quiet-wrong-value failure the
+/// bound exists to prevent, just relocated. The `warn!` is what keeps it from being silent.
+///
+/// Negative counts go the same way for the same reason: a negative test count is not a number to
+/// correct, it is a number not to trust.
+fn sanitise_collected(run_id: &str, gate_collected: Option<i64>) -> Option<i64> {
+    match gate_collected {
+        Some(collected) if collected < 0 => {
+            tracing::warn!(
+                run_id,
+                collected,
+                "arena: discarding a negative collected-test count; the gate's exit code is kept"
+            );
+            None
+        }
+        Some(collected) if collected > MAX_GATE_COLLECTED => {
+            tracing::warn!(
+                run_id,
+                collected,
+                max = MAX_GATE_COLLECTED,
+                "arena: discarding a collected-test count above Number.MAX_SAFE_INTEGER, which \
+                 would be silently rounded on the wire; the gate's exit code is kept"
+            );
+            None
+        }
+        other => other,
+    }
+}
+
 fn set_gate_result(
     state: &AppState,
     run_id: &str,
@@ -1301,35 +1436,54 @@ fn set_gate_result(
 ) -> Result<WorkflowRun, String> {
     // A gate exit is a process exit code (plus the three reserved negatives the plan-level gate
     // defines). Anything outside 32 bits is not one, and it would be served on a wire field that
-    // cannot represent it. `gate_collected` is deliberately NOT bounded: it is advisory, and
-    // refusing a real score because an advisory count is large would be the wrong trade.
+    // cannot represent it. This one IS a refusal: the exit code is the score, and a score we cannot
+    // represent is not a score.
     if gate_exit < i32::MIN as i64 || gate_exit > i32::MAX as i64 {
         return Err(format!(
             "gateExit {} is outside the range of a process exit code",
             gate_exit
         ));
     }
-    // See [`MAX_GATE_COLLECTED`]. Left unbounded on purpose, which made it the only field that
-    // could carry a value a double silently ROUNDS — in `JSON.parse`, before GraphQL ever sees it.
-    if let Some(collected) = gate_collected {
-        if collected < 0 {
-            return Err(format!(
-                "gateCollected {} is negative: a test count cannot be",
-                collected
-            ));
-        }
-        if collected > MAX_GATE_COLLECTED {
-            return Err(format!(
-                "gateCollected {} is above {} (Number.MAX_SAFE_INTEGER) and would be silently ROUNDED on its way to any client, by JSON.parse before GraphQL sees it. A collected test count cannot legitimately be that large, and a refusal beats a wrong number that looks healthy",
-                collected, MAX_GATE_COLLECTED
-            ));
-        }
-    }
+    // **The advisory count never costs the score.** See [`sanitise_collected`] — out of range or
+    // negative becomes `None`, with a warning, rather than refusing the whole result.
+    let gate_collected = sanitise_collected(run_id, gate_collected);
     let ended_at = Utc::now().to_rfc3339();
     state.db.with_conn(|conn| {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         // Read first so a missing run is "not found" rather than a silent zero-row UPDATE.
         let existing = read_run(&tx, run_id)?;
+        let workflow = read_workflow(&tx, &existing.workflow_id)?;
+
+        // **THE ORDERING RULE: re-read the halt INSIDE the write, never before the await.**
+        //
+        // `execute_gate` checks the halt, then awaits the gate — a whole test suite, seconds to
+        // minutes, with the connection mutex released the entire time — and then writes the score
+        // in a different `with_conn`. Three rejections landing in that window halted the family
+        // and the score still landed: a green, promotable result on a search that had given up,
+        // which could then be resumed and promoted on. That is the same leak as the one closed in
+        // `promote_workflow`, one layer down and quieter, and a check before a long await is not a
+        // check at all.
+        //
+        // This is the one place both the executor and the recorder pass through, and it already
+        // holds a transaction and already reads the workflow for the champion lock — so the halt is
+        // one query away from the decision rather than a round trip before it. An automated caller
+        // will hit that window far more often than a human, which is why it is closed before one
+        // exists.
+        let search = search_state_on(&tx, &workflow.repo, &workflow.phase_type, &workflow.family)?;
+        if search.halted {
+            return Err(format!(
+                "the search for ({}, {}, {}) is halted after {} consecutive rejections (limit \
+                 {}): a halted search neither starts nor scores runs. If the gate was already \
+                 running when the halt landed, its result is discarded — lift the halt with an \
+                 explicit, human-confirmed resume and score again",
+                workflow.repo,
+                workflow.phase_type,
+                workflow.family,
+                search.consecutive_rejections,
+                search.strike_limit
+            ));
+        }
+
         if let Some(previous) = existing.gate_exit {
             if !rescore {
                 return Err(format!(
@@ -1339,7 +1493,6 @@ fn set_gate_result(
                     run_id, previous
                 ));
             }
-            let workflow = read_workflow(&tx, &existing.workflow_id)?;
             // Only the SITTING champion's evidence is locked. A promote row belonging to a
             // workflow that has since been displaced is history, not evidence in use.
             let sitting = champion_workflow_id(

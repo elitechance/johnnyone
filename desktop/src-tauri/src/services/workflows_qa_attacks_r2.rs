@@ -1170,7 +1170,7 @@ fn qa_a2_the_rescore_lock_holds_and_releases_correctly() {
 /// bounded by the host; `gate_collected` is deliberately NOT, which is the field that then has to
 /// survive the wire.
 #[test]
-fn qa_a2_the_host_bounds_every_numeric_including_gate_collected() {
+fn qa_a2_the_host_bounds_every_numeric_and_never_loses_a_score_to_the_count() {
     let (state, _root) = test_state();
 
     // fan_out
@@ -1257,12 +1257,15 @@ fn qa_a2_the_host_bounds_every_numeric_including_gate_collected() {
         .expect("the boundary is allowed");
     assert_eq!(scored.gate_exit, Some(i32::MAX as i64));
 
-    // **ROUND 4: gate_collected is bounded too, and this test is inverted from the pin that said
-    // it was not.** It was left unbounded on the grounds that refusing a real gate result over an
-    // advisory number is the wrong trade — which made it the ONE field able to carry a value an
-    // IEEE-754 double cannot hold. The corruption was silent and happened before GraphQL: the host
-    // stored and serialised an exact i64, and `JSON.parse` rounded it in the worker. No error, no
-    // null, no log. A refusal beats a wrong number that looks healthy.
+    // **ROUND 5: gate_collected is bounded, and an out-of-range count costs the COUNT, never the
+    // SCORE.** Three positions were taken here. Unbounded, which made it the one field able to
+    // carry a value an IEEE-754 double cannot hold — silently rounded by `JSON.parse` before
+    // GraphQL ever saw it. Then bounded with a refusal, which closed that hole but meant a gate
+    // that ran for minutes and PASSED could lose its exit code over an advisory number. Now:
+    // bounded, and a violation drops the count to None with a warning.
+    //
+    // None rather than a clamp, because None already means "no count the host could trust", while
+    // clamping would assert a precise number nobody measured.
     let run2 = measured_run(&state, &normal.id);
     for bad in [
         9_007_199_254_740_992_i64, // 2^53 — the first value whose +1 is unrepresentable
@@ -1270,16 +1273,18 @@ fn qa_a2_the_host_bounds_every_numeric_including_gate_collected() {
         i64::MAX,
         -1,
     ] {
-        let error = record_workflow_run_gate(&state, &run2.id, 0, Some(bad))
-            .expect_err("an unrepresentable or negative collected count must be refused");
-        assert!(
-            error.contains("gateCollected"),
-            "for {bad}: the refusal must name the field: {error}"
+        let kept = rescore_workflow_run_gate(&state, &run2.id, 0, Some(bad))
+            .unwrap_or_else(|e| panic!("for {bad}: the score must survive the count: {e}"));
+        assert_eq!(kept.gate_exit, Some(0), "for {bad}: the score is kept");
+        assert_eq!(
+            kept.gate_collected, None,
+            "for {bad}: and the untrustworthy count is dropped, not clamped to a number nobody \
+             measured"
         );
     }
     // MAX_SAFE_INTEGER itself is allowed and round-trips exactly — the bound is the last value a
     // double holds, not one short of it.
-    let scored2 = record_workflow_run_gate(&state, &run2.id, 0, Some(MAX_GATE_COLLECTED))
+    let scored2 = rescore_workflow_run_gate(&state, &run2.id, 0, Some(MAX_GATE_COLLECTED))
         .expect("the boundary is allowed");
     assert_eq!(scored2.gate_collected, Some(MAX_GATE_COLLECTED));
     let json = serde_json::to_value(&scored2).expect("serialise");
