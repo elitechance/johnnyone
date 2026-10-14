@@ -33,3 +33,6 @@ mod workflows_qa_attacks_r3;
 /// QA A round 4: the final verification pass.
 #[cfg(test)]
 mod workflows_qa_attacks_r4;
+/// QA A round 5: the fourth audit of the invisibility rule.
+#[cfg(test)]
+mod workflows_qa_attacks_r5;
