@@ -143,7 +143,7 @@ fn init_repo(dir: &Path) {
 /// unglamorous (one reason that renders blank in a field nothing branches on), so this is a
 /// direction call, not an emergency.
 #[test]
-fn qa_a4_a_third_batch_of_invisibles_still_passes_the_denylist() {
+fn qa_a4_the_unicode_property_refuses_the_third_batch_entirely() {
     let (state, _root) = test_state();
     let w = workflow(&state, KEY.0, KEY.1, KEY.2);
     let run = start_against(&state, &w.id, None);
@@ -184,12 +184,17 @@ fn qa_a4_a_third_batch_of_invisibles_still_passes_the_denylist() {
             holes.push(*label);
         }
     }
-    assert_eq!(
-        holes.len(),
-        third_batch.len(),
-        "DEFECT PIN: every one of these is still accepted as a rejection reason. If this count \
-         drops, the list was grown again (or the table landed) — shrink `third_batch` to whatever \
-         still gets through, and keep the assertion. got through: {holes:?}"
+    // FIXED, and by the table rather than by a fourth round of growing a list. The denylist is
+    // gone: the rule is `Default_Ignorable_Code_Point` (Unicode 16.0, encoded in-crate with the
+    // version named beside it) plus the three groups the property deliberately omits — the braille
+    // blank, the interlinear annotation controls, and the prepended concatenation marks. The last
+    // of those is this corpus's contribution: the two Kaithi number signs passed a table that
+    // implemented the property faithfully, because Unicode excludes them on the grounds that they
+    // affect the rendering of a FOLLOWING sequence — which a reason consisting only of them does
+    // not have.
+    assert!(
+        holes.is_empty(),
+        "every one of these renders as nothing and must be refused as a reason: {holes:?}"
     );
 
     // The same hole on a resume reason, which is the one a halted search shows a human.
@@ -206,14 +211,26 @@ fn qa_a4_a_third_batch_of_invisibles_still_passes_the_denylist() {
         &invisible_resume,
         true,
     );
+    // FIXED. This was the measured CONSEQUENCE rather than the defect — a halt lifted on a reason
+    // that renders as nothing — and it is the half that made the invisible-character work worth
+    // doing at all.
+    let error = resumed.expect_err("a halt must not be liftable on an invisible reason");
+    assert!(error.contains("must contain visible text"), "got: {error}");
     assert!(
-        resumed.is_ok(),
-        "DEFECT PIN: a halt can be lifted with a reason that renders as nothing"
+        search(&state, KEY.0, KEY.1, KEY.2).halted,
+        "and the halt stands"
     );
-    assert!(
-        !search(&state, KEY.0, KEY.1, KEY.2).halted,
-        "DEFECT PIN: and the halt really is lifted on it"
-    );
+    // A VISIBLE reason still lifts it, so the guard discriminates rather than refusing everything.
+    resume_workflow_search(
+        &state,
+        &repo_id(KEY.0),
+        KEY.1,
+        KEY.2,
+        "the gate was misconfigured for all three",
+        true,
+    )
+    .expect("a visible reason lifts the halt");
+    assert!(!search(&state, KEY.0, KEY.1, KEY.2).halted);
 
     // Non-vacuous twice over: the nine from round 3 are now CAUGHT, and visible text still passes.
     for fixed in [0x2800_u32, 0x3164, 0xFFA0, 0x115F, 0x1160, 0x17B4, 0x17B5, 0xFE00, 0xFE0F] {
@@ -631,7 +648,7 @@ fn run_with(seats_held: &str, fleet_busy: &str) -> WorkflowRun {
 /// what an inclusive-totals lease pool emits; see the fleet_busy contract" — is the difference
 /// between a five-minute diagnosis and an afternoon.
 #[test]
-fn qa_a4_a_convention_mismatch_reads_identically_to_real_contention() {
+fn qa_a4_a_convention_mismatch_reads_differently_from_real_contention() {
     let (state, _root) = test_state();
     let w = workflow(&state, KEY.0, KEY.1, KEY.2);
     let seats = r#"{"glm":3}"#;
@@ -654,32 +671,46 @@ fn qa_a4_a_convention_mismatch_reads_identically_to_real_contention() {
         run.not_scoreable_reason.expect("an unscoreable run says why")
     };
 
-    // The inclusive-totals signature: fleet_busy is EXACTLY this run's own seats.
+    // FIXED. The two columns are in the same ROW, so the host CAN tell the two causes apart, and
+    // the refusal now says which it is looking at.
+    //
+    // NOTE ON THIS TEST, from Dev A: as written, its two cases were the SAME INPUT. `mismatch` was
+    // `reason_for(seats)` and `real` was `reason_for(r#"{"glm":3}"#)` — and `seats` IS
+    // `{"glm":3}`, so the equality it asserted was trivially true and could not have failed for
+    // any implementation. The genuinely different case is a foreign load that is NOT the run's own
+    // budget, which the test already computed below as `other_family`; it is now the comparison.
+    //
+    // The two causes have completely different fixes — one is "swap two lines at integration", the
+    // other is "wait for a quiet fleet" — which is why one shared sentence was expensive.
     let mismatch = reason_for(seats);
-    // Genuine foreign load of the same magnitude on the same family — a second arena run.
-    let real = reason_for(r#"{"glm":3}"#);
-    assert_eq!(
-        mismatch, real,
-        "DEFECT PIN: byte-identical refusals for two causes with completely different fixes — one \
-         is 'swap two lines at integration', the other is 'wait for a quiet fleet'"
-    );
-
-    // Even across families the shape is the same sentence with different numbers, so there is no
-    // token a human or a log search can key on.
     let other_family = reason_for(r#"{"qwen":3}"#);
+
+    // Both still say the fleet was not quiet, with the magnitude: that part was never the problem.
     for reason in [&mismatch, &other_family] {
         assert!(reason.contains("the fleet was not quiet when it started"));
         assert!(reason.contains("3 foreign seats were held"));
     }
-    assert!(
-        !mismatch.contains("seatsHeld") && !mismatch.contains("seats_held"),
-        "DEFECT PIN: nothing in the refusal mentions the run's own budget, which is the one fact \
-         that separates the two causes and is sitting in the same row: {mismatch}"
+    // And they are no longer the same sentence.
+    assert_ne!(
+        mismatch, other_family,
+        "the inclusive-totals signature and real foreign load must not read identically"
     );
-    // The signal is cheaply available — this is the comparison the host does not make.
     assert!(
-        budgets_are_comparable(seats, seats),
-        "fleet_busy == seats_held is a one-line check away"
+        mismatch.contains("seatsHeld"),
+        "the refusal must name the run's own budget — the one fact that separates the two causes, \
+         sitting in the same row: {mismatch}"
+    );
+    assert!(
+        mismatch.contains("inclusive-totals"),
+        "and must name the convention it looks like: {mismatch}"
+    );
+    assert!(
+        mismatch.contains("not conclusive"),
+        "while saying it is not conclusive on one run: {mismatch}"
+    );
+    assert!(
+        !other_family.contains("inclusive-totals"),
+        "and real contention must NOT be reported as a convention mismatch: {other_family}"
     );
 }
 
@@ -775,16 +806,19 @@ fn qa_a4_no_doc_comment_cites_a_name_this_crate_does_not_define() {
         }
     }
 
-    assert_eq!(
-        dangling,
-        vec![
-            "services/workflows.rs:1193 cites [`contention_is_comparable`]".to_string(),
-        ],
-        "DEFECT PIN: a doc comment cites a name nothing defines. One is known and listed here — \
-         `measure_run_budget`'s link to `contention_is_comparable`, renamed when the exclude rule \
-         landed. When it is fixed, this list becomes empty and the assertion should say so. \
-         Anything NEW appearing here is the failure this round was about: a citation that reads as \
-         a guarantee with nothing behind it."
+    // FIXED: the list is EMPTY. The known one — `measure_run_budget`'s bracketed link to the
+    // renamed comparability helper — is gone, and so is a second, stale plain-prose copy of the
+    // same name that this sweep's `[`…`]`-only matching could not see.
+    //
+    // Two gates now cover this shape from different directions: this sweep, and
+    // `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc`, which catches the bracketed
+    // form for the whole crate including files no sweep reads. Running it for the first time found
+    // exactly one more, in `agent_plans.rs`, where the link target is `#[cfg(test)]` and therefore
+    // genuinely unresolvable from non-test docs.
+    assert!(
+        dangling.is_empty(),
+        "a doc comment cites a name nothing defines — a citation that reads as a guarantee with \
+         nothing behind it: {dangling:?}"
     );
 
     // Non-vacuous: the sweep really does resolve names that exist, and really would catch a fake.

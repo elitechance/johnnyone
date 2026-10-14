@@ -2918,7 +2918,12 @@ impl GateCapture {
     }
 }
 
-/// [`drain_capped_tail`]'s loop, publishing into `shared` after every read.
+/// `drain_capped_tail`'s loop, publishing into `shared` after every read.
+///
+/// Deliberately NOT an intra-doc link: `drain_capped_tail` is `#[cfg(test)]`, so it does not
+/// exist in a normal `cargo doc` build and a bracketed link to it is unresolvable. Found by
+/// `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc`, which nothing in the gate
+/// set ran until a dangling arena citation of exactly this shape got through every other gate.
 async fn drain_capped_tail_into<R>(
     mut reader: R,
     cap: usize,

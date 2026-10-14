@@ -268,6 +268,101 @@ pub const MAX_GATE_COLLECTED: i64 = 9_007_199_254_740_991;
 /// `workflows: [Workflow!]!`, so one pathological row slows every champion listing.
 pub const MAX_PROMPT_CHARS: usize = 100_000;
 
+/// **`Default_Ignorable_Code_Point`, encoded in-crate.** Unicode **16.0.0**, derived from
+/// `DerivedCoreProperties.txt`.
+///
+/// **Why a table and not a denylist, and why in-crate and not a dependency.** Three successive
+/// audits of the hand-written denylist this replaces each found a strictly LARGER batch than the
+/// last: 7 code points, then 9, then roughly 370 across nineteen ranges — the variation selectors
+/// supplement alone (`U+E0100..U+E01EF`, 240 of them) outnumbers every range the denylist named put
+/// together. A sequence that grows each time it is measured is not converging, and the measured
+/// consequence was concrete: a halt could be lifted with a reason that renders as nothing.
+///
+/// The original objection to a crate was that a Unicode property table is versioned against a
+/// Unicode release, so "correct" becomes something to keep up to date rather than something that is
+/// done. That objection stands — and encoding it HERE answers it rather than ignoring it: the
+/// version is named above, the ranges are visible in review, and moving to a new Unicode release is
+/// a deliberate edit to this file instead of a transitive bump nobody reads. What is not available
+/// is pretending the problem is small.
+///
+/// **Do not "simplify" this back to a list of the characters someone happened to hit.** That is
+/// what it already was, three times.
+///
+/// Ranges are inclusive and MUST stay sorted by start: [`is_default_ignorable`] binary-searches
+/// them, and `default_ignorable_table_is_sorted_and_disjoint` pins the invariant.
+const DEFAULT_IGNORABLE: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),   // SOFT HYPHEN
+    (0x034F, 0x034F),   // COMBINING GRAPHEME JOINER
+    (0x061C, 0x061C),   // ARABIC LETTER MARK
+    (0x115F, 0x1160),   // HANGUL CHOSEONG / JUNGSEONG FILLER
+    (0x17B4, 0x17B5),   // KHMER VOWEL INHERENT AQ / AA
+    (0x180B, 0x180F),   // MONGOLIAN FREE VARIATION SELECTOR 1-4 + VOWEL SEPARATOR
+    (0x200B, 0x200F),   // ZERO WIDTH SPACE .. RIGHT-TO-LEFT MARK
+    (0x202A, 0x202E),   // bidi embedding / override
+    (0x2060, 0x206F),   // WORD JOINER .. deprecated format controls (incl. unassigned 2065)
+    (0x3164, 0x3164),   // HANGUL FILLER
+    (0xFE00, 0xFE0F),   // VARIATION SELECTOR-1 .. 16
+    (0xFEFF, 0xFEFF),   // ZERO WIDTH NO-BREAK SPACE / BOM
+    (0xFFA0, 0xFFA0),   // HALFWIDTH HANGUL FILLER
+    (0xFFF0, 0xFFF8),   // unassigned, Other_Default_Ignorable_Code_Point
+    (0x13430, 0x1343F), // EGYPTIAN HIEROGLYPH FORMAT CONTROLS
+    (0x1BCA0, 0x1BCA3), // SHORTHAND FORMAT controls
+    (0x1D173, 0x1D17A), // MUSICAL SYMBOL BEGIN BEAM .. END PHRASE
+    (0xE0000, 0xE0FFF), // LANGUAGE TAG, TAG characters, VARIATION SELECTOR-17..256, unassigned
+];
+
+/// Invisible to a reader but NOT `Default_Ignorable_Code_Point`, so they need naming separately.
+/// Sorted by start, like [`DEFAULT_IGNORABLE`], and pinned by the same test.
+///
+/// `U+2800` BRAILLE PATTERN BLANK is a graphic character that renders as nothing — the property
+/// does not cover it and the rule has to.
+///
+/// `U+FFF9..U+FFFB` are the interlinear annotation controls. They are `Cf` but the Unicode
+/// derivation deliberately EXCLUDES them from `Default_Ignorable`, because an implementation that
+/// does not support them is supposed to show something. For a free-text reason the conservative
+/// direction is to refuse, so they stay listed: the cost of refusing is one re-typed sentence, and
+/// the cost of accepting is a halt whose stated reason is invisible.
+///
+/// The same argument covers the prepended concatenation marks below, which an audit measured
+/// getting through a table that implemented the property faithfully — the property is the right
+/// RULE and still not the whole of "renders as nothing".
+/// `Prepended_Concatenation_Mark=Yes` is the third group. These are `Cf` and Unicode EXCLUDES them
+/// from `Default_Ignorable_Code_Point` deliberately, on the grounds that they affect the rendering
+/// of the number or sequence that follows them. That reasoning is about text that HAS a following
+/// sequence; a reason consisting only of them has nothing to prepend to and no readable content, so
+/// the conservative direction is the same as for the interlinear controls: refuse.
+const ALSO_INVISIBLE: &[(u32, u32)] = &[
+    (0x0600, 0x0605),   // ARABIC NUMBER SIGN .. ARABIC NUMBER MARK ABOVE
+    (0x06DD, 0x06DD),   // ARABIC END OF AYAH
+    (0x070F, 0x070F),   // SYRIAC ABBREVIATION MARK
+    (0x0890, 0x0891),   // ARABIC POUND / PIASTRE MARK ABOVE
+    (0x08E2, 0x08E2),   // ARABIC DISPUTED END OF AYAH
+    (0x2800, 0x2800),   // BRAILLE PATTERN BLANK — a graphic character that renders as nothing
+    (0xFFF9, 0xFFFB),   // interlinear annotation controls
+    (0x110BD, 0x110BD), // KAITHI NUMBER SIGN
+    (0x110CD, 0x110CD), // KAITHI NUMBER SIGN ABOVE
+];
+
+/// Whether `c` has the `Default_Ignorable_Code_Point` property, or is one of the two invisible
+/// things that property omits. Binary search over [`DEFAULT_IGNORABLE`] and [`ALSO_INVISIBLE`].
+fn is_default_ignorable(c: char) -> bool {
+    let code = c as u32;
+    let in_table = |table: &[(u32, u32)]| {
+        table
+            .binary_search_by(|(start, end)| {
+                if code < *start {
+                    std::cmp::Ordering::Greater
+                } else if code > *end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    };
+    in_table(DEFAULT_IGNORABLE) || in_table(ALSO_INVISIBLE)
+}
+
 /// **Does this text contain anything a human can actually SEE?**
 ///
 /// `str::trim` is not enough, and that was a real hole: a reason of `"\u{200b}"` (zero-width
@@ -281,41 +376,17 @@ pub const MAX_PROMPT_CHARS: usize = 100_000;
 /// made only of characters in this set is refused, and anything it fails to recognise can only
 /// cause a reason to be ACCEPTED, never a visible one to be rejected.
 ///
-/// **The list has already needed growing once, which is the honest argument for and against the
-/// table.** An audit of 48 inputs found nine code points passing the first version: the braille
-/// pattern BLANK, the hangul fillers (`U+3164`, `U+FFA0`, `U+115F`, `U+1160`), the khmer inherent
-/// vowels (`U+17B4`, `U+17B5`), and the variation selectors (`U+FE00`-`U+FE0F`). All are here now.
+/// The rule is now the Unicode PROPERTY, not a list of characters someone hit:
+/// [`is_default_ignorable`] over a table encoded in this crate, plus `char::is_control` and
+/// `char::is_whitespace`. The table and the reasoning for carrying it here rather than as a
+/// dependency are on [`DEFAULT_IGNORABLE`]; the short version is that three audits of the previous
+/// hand-written denylist each found a strictly larger batch, so the denylist was not converging.
 ///
-/// The durable answer is `Default_Ignorable_Code_Point` plus the braille blank, and that needs a
-/// Unicode property table. I have NOT taken a dependency for it, on the grounds that the
-/// consequence of a miss is bounded and unglamorous — one rejection whose reason renders blank, in
-/// a field nothing branches on — and that `unicode-properties`-class crates carry a table that is
-/// itself versioned against a Unicode release, so "correct" becomes a thing to keep up to date
-/// rather than a thing that is done. If a third audit finds a third batch, that calculus flips and
-/// the table is the right call; this comment is the record of why it was not yet.
+/// Still conservative in the safe direction: text made only of these is refused, and anything the
+/// table misses can only cause a reason to be ACCEPTED, never a visible one to be rejected.
 fn has_visible_content(text: &str) -> bool {
-    text.chars().any(|c| {
-        !c.is_whitespace()
-            && !c.is_control()
-            && !matches!(c,
-                '\u{00ad}'              // soft hyphen
-                | '\u{061c}'            // arabic letter mark
-                | '\u{115f}'..='\u{1160}' // hangul choseong / jungseong filler
-                | '\u{17b4}'..='\u{17b5}' // khmer inherent vowels AQ / AA
-                | '\u{180e}'            // mongolian vowel separator
-                | '\u{200b}'..='\u{200f}' // zero-width space .. RTL mark
-                | '\u{202a}'..='\u{202e}' // bidi embedding/override
-                | '\u{2060}'..='\u{2064}' // word joiner .. invisible plus
-                | '\u{2066}'..='\u{2069}' // bidi isolates
-                | '\u{2800}'             // braille pattern BLANK — not Default_Ignorable, but it
-                                          // renders as nothing, which is the property that matters
-                | '\u{3164}'            // hangul filler
-                | '\u{fe00}'..='\u{fe0f}' // variation selectors 1-16
-                | '\u{feff}'            // BOM / zero-width no-break space
-                | '\u{ffa0}'            // halfwidth hangul filler
-                | '\u{fff9}'..='\u{fffb}' // interlinear annotation
-            )
-    })
+    text.chars()
+        .any(|c| !c.is_whitespace() && !c.is_control() && !is_default_ignorable(c))
 }
 
 /// **The human-text rule.** One reader for every field a person types: it must contain something
@@ -612,8 +683,43 @@ fn scoreability(fleet_busy: &str) -> Option<String> {
 
 /// [`scoreability`] for a whole run — the public form, and what `WorkflowRun.scoreable` reports so
 /// that a client can say WHY a run cannot compete instead of showing a mysteriously inert one.
+/// **The row-aware contention rule.** `None` means scoreable; `Some(reason)` names the contention,
+/// and names the inclusive-totals SIGNATURE when the snapshot is exactly the run's own budget.
+///
+/// Both callers go through here — [`run_is_scoreable`] and the row mapper's
+/// [`with_scoreability`] — because they did not, and that was a bug: the clause lived in
+/// `run_is_scoreable` while `WorkflowRun.not_scoreable_reason` was computed from `fleet_busy`
+/// alone, so the field a client actually reads never carried it. One rule with two
+/// implementations is the drift this module's whole structure exists to prevent, and it got in
+/// anyway.
+fn contention_block(fleet_busy: &str, seats_held: &str) -> Option<String> {
+    let reason = scoreability(fleet_busy)?;
+    // **A convention mismatch IS distinguishable from real contention.** An earlier comment
+    // claimed the host could not tell them apart; it can, because the two columns are in the same
+    // ROW. `fleet_busy` equal to this run's own `seats_held` is the exact signature an
+    // inclusive-totals lease pool emits on an IDLE fleet. Without this clause both cases produced
+    // byte-identical text that never mentioned the run's own budget — the difference between a
+    // five-minute diagnosis and an afternoon for whoever meets an arena that crowns nothing.
+    //
+    // It cannot be conclusive on ONE run, since a run really can contend with exactly its own
+    // width, so the wording says so and says what makes it conclusive: the same signature across
+    // the fleet is the convention, not the weather.
+    match (parse_seat_map(fleet_busy), parse_seat_map(seats_held)) {
+        (Ok(busy), Ok(seats)) if !busy.is_empty() && busy == seats => Some(format!(
+            "{}. NOTE this is exactly this run's own seatsHeld ({}), which is the signature an \
+             inclusive-totals lease pool emits on an IDLE fleet — `fleet_busy` must record FOREIGN \
+             contention only, excluding the run's own seats. On a single run this is not \
+             conclusive, since a run can genuinely contend with exactly its own width; if every \
+             run in the fleet shows it, it is the convention and not the weather",
+            reason, seats_held
+        )),
+        _ => Some(reason),
+    }
+}
+
+/// [`contention_block`] for a whole run — the public form.
 pub fn run_is_scoreable(run: &WorkflowRun) -> Option<String> {
-    scoreability(&run.fleet_busy)
+    contention_block(&run.fleet_busy, &run.seats_held)
 }
 
 /// Whether two runs saw the SAME foreign contention.
@@ -922,7 +1028,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRun> {
 /// Fill the two derived scoreability fields. Applied by [`map_run`] alone, so every read of a run —
 /// every one, including the ones inside transactions — carries the same answer.
 fn with_scoreability(mut run: WorkflowRun) -> WorkflowRun {
-    let reason = scoreability(&run.fleet_busy);
+    let reason = contention_block(&run.fleet_busy, &run.seats_held);
     run.scoreable = reason.is_none();
     run.not_scoreable_reason = reason;
     run
@@ -1190,7 +1296,7 @@ pub fn start_workflow_run(state: &AppState, input: NewWorkflowRun) -> Result<Wor
 ///
 /// **What it does until then, stated plainly rather than implied:** `seats_held` is the honest
 /// declared budget `{family: seats}`, and `fleet_busy` is `{}` for EVERY run. The consequence is
-/// that [`contention_is_comparable`] compares `{}` with `{}` and always answers true, so until the
+/// that [`run_is_scoreable`] sees an empty map on every run and always answers "quiet", so until the
 /// lease pool is wired, comparability is effectively seats-only again — the fix to
 /// `preference_comparability` is in place and its contention half has nothing real to read. That
 /// state is pinned by a test (`contention_is_unmeasured_until_the_lease_pool_lands`) which goes RED
@@ -1265,18 +1371,27 @@ pub fn budget_was_honoured(
 /// already holds a measurement, and for tests that need to construct specific contention in order
 /// to exercise the scoreability rule at all.
 ///
-/// **THE ORDER, and it is load-bearing: SNAPSHOT FIRST, ACQUIRE SECOND.**
+/// **THE ORDER, and it is load-bearing. The sequence is exactly three steps:**
 ///
-/// An earlier version of this comment prescribed the opposite ("take a lease and then start the run
-/// with the snapshot it just took"), and that order is the losing one. `LeasePool::busy()` returns
-/// the TOTAL seats held per family, with no exclusion of the caller's own lease and no
-/// `busy_excluding` variant. Under the `fleet_busy` contract — foreign contention only, empty means
-/// quiet — a snapshot taken AFTER `acquire` reads the run's own seats as foreign load, so every run
-/// is unscoreable forever: the inert feature that looks finished and promotes nothing. Taken
-/// BEFORE, an idle fleet reads as quiet and the rule works.
+/// 1. snapshot `fleet_busy` from `LeasePool::busy()` — BEFORE acquiring anything;
+/// 2. `acquire` the lease;
+/// 3. take `seats_held` from the RETURNED LEASE, not from the pool.
+///
+/// The two columns cannot be read at one moment, and that is why this is a sequence rather than a
+/// pair: `seats_held_json` is a method on the LEASE and does not exist until `acquire` has
+/// returned, while `fleet_busy` must be read before it. Any "take both together" simplification is
+/// unimplementable against that API, so it will quietly become acquire-then-snapshot — the losing
+/// order — if this comment does not spell the steps out.
+///
+/// An earlier version of this comment prescribed precisely that losing order ("take a lease and
+/// then start the run with the snapshot it just took"). `LeasePool::busy()` returns the TOTAL seats
+/// held per family, with no exclusion of the caller's own lease and no `busy_excluding` variant.
+/// Under the `fleet_busy` contract — foreign contention only, empty means quiet — a snapshot taken
+/// AFTER `acquire` reads the run's own seats as foreign load, so every run is unscoreable forever:
+/// the inert feature that looks finished and promotes nothing.
 ///
 /// It is also right on its own terms, independent of whose API bends: a concurrent run's seats
-/// belong in this run's snapshot, and its own do not. Snapshot, then acquire, then start.
+/// belong in this run's snapshot, and its own do not.
 pub fn start_workflow_run_with_budget(
     state: &AppState,
     input: NewWorkflowRun,
@@ -3797,6 +3912,63 @@ mod tests {
         }
     }
 
+    /// **The sortedness invariant [`is_default_ignorable`] depends on, pinned.**
+    ///
+    /// Both tables are binary-searched, so an out-of-order entry is not a style problem — it is
+    /// silently unreachable. I wrote this test's name into a doc comment before writing the test,
+    /// then immediately added the Kaithi marks and the braille blank in the wrong order and made
+    /// three code points unreachable. Two audit tests caught it; this one is what should have.
+    ///
+    /// Disjointness is checked too: overlapping ranges are not a correctness bug for a membership
+    /// query, but they mean one of the two is dead and a reader cannot tell which.
+    #[test]
+    fn default_ignorable_table_is_sorted_and_disjoint() {
+        for (label, table) in [
+            ("DEFAULT_IGNORABLE", DEFAULT_IGNORABLE),
+            ("ALSO_INVISIBLE", ALSO_INVISIBLE),
+        ] {
+            for (start, end) in table {
+                assert!(start <= end, "{label}: range {start:#x}..{end:#x} is inverted");
+            }
+            for pair in table.windows(2) {
+                let (_, previous_end) = pair[0];
+                let (next_start, _) = pair[1];
+                assert!(
+                    previous_end < next_start,
+                    "{label}: {previous_end:#x} then {next_start:#x} — the table must be sorted \
+                     by start and disjoint, or binary search silently misses entries"
+                );
+            }
+        }
+
+        // And the property the sortedness exists to serve, sampled at every table boundary: the
+        // first and last code point of every range must be found. A search that misses an entry
+        // fails here rather than in a distant reason-validation test.
+        for (label, table) in [
+            ("DEFAULT_IGNORABLE", DEFAULT_IGNORABLE),
+            ("ALSO_INVISIBLE", ALSO_INVISIBLE),
+        ] {
+            for (start, end) in table {
+                for code in [*start, *end] {
+                    let c = char::from_u32(code)
+                        .unwrap_or_else(|| panic!("{label}: {code:#x} is not a scalar value"));
+                    assert!(
+                        is_default_ignorable(c),
+                        "{label}: {code:#x} is in the table but not found by the search"
+                    );
+                }
+            }
+        }
+
+        // Non-vacuous: ordinary visible characters are NOT in the tables.
+        for c in ['a', 'Z', '0', '—', 'é', '漢', '🙂'] {
+            assert!(!is_default_ignorable(c), "{c:?} must not be ignorable");
+        }
+        // And the predicate the tables feed agrees, end to end.
+        assert!(has_visible_content("too slow"));
+        assert!(!has_visible_content("\u{2800}\u{110cd}\u{e0101}"));
+    }
+
     /// **THE `fleet_busy` CONTRACT, pinned.** The test the rule's own doc comment cites.
     ///
     /// `fleet_busy` records FOREIGN contention only — what everything *else* held when the run
@@ -3860,15 +4032,48 @@ mod tests {
         );
         assert!(
             reason.contains("glm=3"),
-            "and must name the load it saw, so a human can tell a convention mismatch from real \
-             contention: {reason}"
+            "and must name the load it saw: {reason}"
+        );
+        // **And it must name the SIGNATURE**, which is the whole diagnostic value. The two columns
+        // are in the same row, so `fleet_busy == seats_held` is distinguishable from real
+        // contention — an earlier version of this comment claimed the host could not tell them
+        // apart, and that premise was simply wrong. Without this clause both refusals were
+        // byte-identical and neither mentioned the run's own budget.
+        assert!(
+            reason.contains("inclusive-totals"),
+            "the refusal must name the convention it looks like: {reason}"
+        );
+        assert!(
+            reason.contains("seatsHeld"),
+            "and must point at the run's own budget as the thing it equals: {reason}"
+        );
+        assert!(
+            reason.contains("not conclusive"),
+            "and must say it is not conclusive on one run, since a run can genuinely contend with \
+             exactly its own width: {reason}"
         );
 
-        // 4. Real foreign load is unscoreable, which is the rule working as intended rather than a
-        //    convention problem — the two look the same here on purpose, because the host cannot
-        //    tell them apart and must refuse either way.
+        // 4. Real foreign load is unscoreable too — but the refusal is DIFFERENT, and that
+        //    difference is the fix. A load that is not the run's own width gets no convention
+        //    clause, so a reader can tell "the fleet was busy" from "the pool is reporting totals".
         let busy = start_with(&state, &workflow.id, seats, r#"{"qwen":4}"#);
         assert!(!busy.scoreable);
+        let busy_reason = busy
+            .not_scoreable_reason
+            .as_deref()
+            .expect("an unscoreable run must say why");
+        assert!(
+            busy_reason.contains("the fleet was not quiet"),
+            "got: {busy_reason}"
+        );
+        assert!(
+            !busy_reason.contains("inclusive-totals"),
+            "real contention must NOT be reported as a convention mismatch: {busy_reason}"
+        );
+        assert_ne!(
+            reason, busy_reason,
+            "the two refusals were byte-identical before this clause; they must differ now"
+        );
 
         // 5. And the consequence that makes the contract load-bearing: under the wrong convention
         //    NOTHING is comparable, so nothing is ever promotable. This is the "inert feature"
@@ -3889,7 +4094,7 @@ mod tests {
 
     /// **A DEFECT PIN of my own, in QA's style.** Until the lease pool is wired in,
     /// `measure_run_budget` reports `{}` for contention on EVERY run, so
-    /// `contention_is_comparable` compares `{}` with `{}` and always answers true — comparability
+    /// `run_is_scoreable` sees an empty map on every run and always answers "quiet" — comparability
     /// is effectively seats-only again, and the contention half of the rule has nothing real to
     /// read.
     ///
