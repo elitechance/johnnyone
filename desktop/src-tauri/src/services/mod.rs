@@ -21,3 +21,6 @@ pub mod workflows;
 pub mod workspace_git;
 #[cfg(test)]
 mod fixture_spine;
+/// QA A's adversarial tests against the workflow arena (migration 026).
+#[cfg(test)]
+mod workflows_qa_attacks;
