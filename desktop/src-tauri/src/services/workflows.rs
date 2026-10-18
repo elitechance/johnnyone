@@ -1176,6 +1176,85 @@ fn require_non_blank(label: &str, value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// The section header that opens one part of a composed prompt.
+///
+/// A section is `== <LABEL> ==` on its own line. The shape is pinned by
+/// [`prompt_section_marker_is_a_recognisable_header`] and read back by
+/// [`prompt_section_labels`], so "the four parts stay distinguishable" is a tested property of the
+/// format rather than a hope about whitespace.
+fn prompt_section_header(label: &str) -> String {
+    format!("== {} ==", label.to_lowercase())
+}
+
+/// The `LABEL`s of the section headers in `prompt`, in the order they appear.
+///
+/// The inverse of [`prompt_section_header`], and deliberately only recognises that exact shape: a
+/// part's own text mentioning `==` mid-line must not be mistaken for a boundary, or the
+/// distinguishability test would pass on a prompt whose parts had in fact run together.
+fn prompt_section_labels(prompt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in prompt.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("== ") {
+            if let Some(label) = rest.strip_suffix(" ==") {
+                if !label.is_empty() && !label.contains("== ") {
+                    out.push(label.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// **The composition step.** The prompt text an agent would be given for this workflow: role,
+/// instruction, contract and hop, in that order, each under its own section header.
+///
+/// This function exists because nothing else in the crate reads those three columns back. `role`,
+/// `instruction` and `contract` are written by [`create_workflow_version`], stored, and served to
+/// the UI — and then never turned into anything an agent sees, so a challenger and the champion
+/// execute the identical prompt and the arena's central claim ("the search searches prompts") is
+/// false where it matters. Composing is the missing step; *running* the result is not this
+/// function's business and is deliberately not done here.
+///
+/// Two refusals, both for the same reason — a prompt that is quietly missing a part is worse than
+/// no prompt, because it looks like the workflow ran:
+///
+/// * a blank role / instruction / contract, via [`require_non_blank`], naming which part was blank;
+/// * a `hop` that does not parse, via [`parse_hop`]. The hop is the steps; a prompt without them is
+///   not a degraded workflow, it is a different task, so it is an error and never a prompt.
+///
+/// The hop is re-serialised from the parsed value rather than pasted verbatim. Stored text is the
+/// caller's own bytes and may be minified onto one line; the prompt is read by a model and a human,
+/// and re-emitting canonically also guarantees the hop block contains no line that could be
+/// mistaken for a section header.
+///
+/// **Pure.** No connection, no state, no process, no gate.
+pub fn compose_workflow_prompt(w: &Workflow) -> Result<String, String> {
+    let role = require_non_blank("role", &w.role)?;
+    let instruction = require_non_blank("instruction", &w.instruction)?;
+    let contract = require_non_blank("contract", &w.contract)?;
+    let hop = parse_hop(&w.hop)?;
+    let hop = serde_json::to_string_pretty(&hop).map_err(|e| format!("hop cannot be rendered: {}", e))?;
+
+    let parts = [
+        ("role", role),
+        ("instruction", instruction),
+        ("contract", contract),
+        ("hop", hop),
+    ];
+    let mut out = String::new();
+    for (label, body) in parts {
+        out.push_str(&prompt_section_header(label));
+        out.push('\n');
+        out.push_str(&body);
+        out.push_str("\n\n");
+    }
+    while out.ends_with("\n\n") {
+        out.truncate(out.len() - 1);
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------------------------
@@ -4139,6 +4218,85 @@ mod tests {
         assert!(
             a.scoreable && b.scoreable,
             "DEFECT PIN: every run reads as scoreable while contention is unmeasured"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Composing the prompt
+    // -------------------------------------------------------------------------------------
+
+    /// A well-formed workflow composes, and every one of its four parts appears in the result.
+    #[test]
+    fn compose_workflow_prompt_contains_every_part() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+
+        let prompt = compose_workflow_prompt(&workflow).expect("compose");
+
+        assert!(
+            prompt.contains(&workflow.role),
+            "the role text must survive into the prompt"
+        );
+        assert!(
+            prompt.contains(&workflow.instruction),
+            "the instruction text must survive into the prompt"
+        );
+        assert!(
+            prompt.contains(&workflow.contract),
+            "the contract text must survive into the prompt"
+        );
+        assert!(
+            prompt.contains("verify"),
+            "a value from the hop must survive into the prompt"
+        );
+    }
+
+    /// A `hop` that is not valid JSON is refused rather than composed into a prompt.
+    #[test]
+    fn compose_workflow_prompt_rejects_a_malformed_hop() {
+        let (state, _root) = test_state();
+        let mut workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        workflow.hop = "steps: plan, edit, verify".to_string();
+
+        assert!(
+            compose_workflow_prompt(&workflow).is_err(),
+            "a hop that does not parse must never become a prompt"
+        );
+    }
+
+    /// A blank part is refused, and the message names WHICH part was blank.
+    #[test]
+    fn compose_workflow_prompt_names_the_blank_part() {
+        let (state, _root) = test_state();
+        let mut workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        workflow.instruction = "   ".to_string();
+
+        let err = compose_workflow_prompt(&workflow).expect_err("blank instruction must be refused");
+        assert!(
+            err.contains("instruction"),
+            "the error must name the blank part, got: {}",
+            err
+        );
+    }
+
+    /// The four parts stay distinguishable: reading the section headers back yields role,
+    /// instruction, contract and hop, in that order.
+    #[test]
+    fn compose_workflow_prompt_keeps_the_four_parts_distinguishable() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+
+        let prompt = compose_workflow_prompt(&workflow).expect("compose");
+
+        assert_eq!(
+            prompt_section_labels(&prompt),
+            vec![
+                "role".to_string(),
+                "instruction".to_string(),
+                "contract".to_string(),
+                "hop".to_string(),
+            ],
+            "the composed prompt must expose its four parts in order"
         );
     }
 }
