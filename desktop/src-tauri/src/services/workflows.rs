@@ -2210,6 +2210,53 @@ pub fn resume_workflow_search(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Execution seam
+// ---------------------------------------------------------------------------------------------
+
+/// **The seam between "we have a prompt" and "an agent ran it".**
+///
+/// One method, both arguments borrowed, and no return value beyond "did it run". Everything that
+/// actually drives a model — spawning a process, holding a seat, collecting a gate result — lives
+/// behind it, in the host, and is deliberately NOT this module's business. What this module owns is
+/// the decision about WHAT gets executed: which family, and which prompt.
+///
+/// `Ok(())` means an execution ran; `Err` means one did not. It says nothing about whether the run
+/// passed anything — an execution that ran and failed its gate is still `Ok(())`, and scoring is
+/// [`record_workflow_run_gate`]'s job, not this trait's.
+pub trait PhaseExecutor {
+    /// Run one phase's hop for `family` against `prompt`.
+    fn execute(&self, family: &str, prompt: &str) -> Result<(), String>;
+}
+
+/// **The seam's one caller-side rule: the family comes from the workflow row.**
+///
+/// Loads the run, loads its workflow, composes the prompt with [`compose_workflow_prompt`], and
+/// hands the executor `(&workflow.family, &prompt)`. There is no `family` parameter and there will
+/// not be one: a champion's family is part of its identity — it is a third of the champion key, and
+/// it is the context window the hop was tuned for — so a caller that could name a family different
+/// from the row's could attribute a run to a family whose model it never used. The row already
+/// holds the answer; nothing outside this function may supply it.
+///
+/// **It writes nothing.** No gate result, no score, no exit code, no `ended_at`. A failed execution
+/// returns the executor's error UNCHANGED and leaves the run's `gate_exit` NULL, which means the run
+/// is unscored and [`promotion_block`] refuses it. That is the whole point of the ordering: an
+/// execution that did not happen must not look like an execution that failed.
+///
+/// A workflow whose `hop` does not parse fails here, BEFORE the executor is called —
+/// [`compose_workflow_prompt`] refuses it — so a malformed candidate never reaches a model at all,
+/// and the run stays unscored for the same reason.
+pub fn execute_workflow_run<E: PhaseExecutor>(
+    state: &AppState,
+    run_id: &str,
+    exec: &E,
+) -> Result<(), String> {
+    let run = get_workflow_run(state, run_id)?;
+    let workflow = get_workflow(state, &run.workflow_id)?;
+    let prompt = compose_workflow_prompt(&workflow)?;
+    exec.execute(&workflow.family, &prompt)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------------------------
 
@@ -4297,6 +4344,161 @@ mod tests {
                 "hop".to_string(),
             ],
             "the composed prompt must expose its four parts in order"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // The execution seam
+    // -------------------------------------------------------------------------------------
+
+    /// A double that records what it was handed, and whether it was handed anything at all.
+    ///
+    /// `Cell`/`RefCell` rather than a mutex because a test double here is single-threaded and the
+    /// point is to READ BACK what the seam passed, not to share it.
+    #[derive(Debug, Clone)]
+    struct RecordingExecutor {
+        calls: std::cell::RefCell<Vec<(String, String)>>,
+        outcome: Result<(), String>,
+    }
+
+    impl RecordingExecutor {
+        fn ok() -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                outcome: Ok(()),
+            }
+        }
+
+        fn failing(reason: &str) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                outcome: Err(reason.to_string()),
+            }
+        }
+
+        fn invocations(&self) -> usize {
+            self.calls.borrow().len()
+        }
+
+        fn last(&self) -> (String, String) {
+            let calls = self.calls.borrow();
+            let last = calls
+                .last()
+                .expect("the executor must have been invoked exactly once");
+            last.clone()
+        }
+    }
+
+    impl PhaseExecutor for RecordingExecutor {
+        fn execute(&self, family: &str, prompt: &str) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push((family.to_string(), prompt.to_string()));
+            self.outcome.clone()
+        }
+    }
+
+    /// The double receives the workflow's OWN family and a prompt carrying its instruction text.
+    ///
+    /// The family assertion is the load-bearing one: it is compared against `workflow.family` read
+    /// back from the row, not against a literal, so the test says "the seam took it from the row"
+    /// rather than "the seam repeated what I typed".
+    #[test]
+    fn executor_seam_hands_the_double_the_workflows_own_family_and_prompt() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+
+        let exec = RecordingExecutor::ok();
+        execute_workflow_run(&state, &run.id, &exec).expect("the execution ran");
+
+        assert_eq!(exec.invocations(), 1, "one run, one execution");
+        let (family, prompt) = exec.last();
+        assert_eq!(
+            family, workflow.family,
+            "the family must come from the workflow row"
+        );
+        assert!(
+            prompt.contains(&workflow.instruction),
+            "the prompt must carry the workflow's instruction text"
+        );
+        assert!(
+            prompt.contains(&workflow.role) && prompt.contains(&workflow.contract),
+            "and the other composed parts, not just the instruction"
+        );
+    }
+
+    /// A failing execution surfaces the executor's error UNCHANGED, and leaves the run unscored.
+    ///
+    /// The `gate_exit` assertion is the reason this test exists: an execution that did not happen
+    /// must not be recorded as an execution that failed, or a run that never ran could be compared
+    /// against — and even promote over — one that did.
+    #[test]
+    fn executor_seam_failure_is_returned_unchanged_and_leaves_the_run_unscored() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+        assert_eq!(run.gate_exit, None, "nothing has run yet");
+
+        let exec = RecordingExecutor::failing("no seat could be held for glm");
+        let err = execute_workflow_run(&state, &run.id, &exec)
+            .expect_err("a failed execution must not report Ok");
+
+        assert_eq!(
+            err, "no seat could be held for glm",
+            "the executor's error must reach the caller verbatim"
+        );
+        assert_eq!(exec.invocations(), 1, "the failure came from the executor, not before it");
+        let after = get_workflow_run(&state, &run.id).expect("re-read the run");
+        assert_eq!(
+            after.gate_exit, None,
+            "a failed execution must leave gate_exit NULL — no score, no exit code, nothing"
+        );
+        assert_eq!(after.gate_collected, None, "and no advisory number either");
+        assert_eq!(after.ended_at, None, "and the run is not closed out");
+    }
+
+    /// A malformed hop fails BEFORE the executor is called.
+    ///
+    /// The double records that it was never invoked: a candidate whose steps do not parse must not
+    /// reach a model at all, and must not be scored. The row's `hop` is rewritten with raw SQL
+    /// because `create_workflow_version` validates it and would refuse to store it.
+    #[test]
+    fn executor_seam_refuses_a_malformed_hop_before_calling_the_executor() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE workflows SET hop = ?1 WHERE id = ?2",
+                    params!["steps: plan, edit, verify", workflow.id],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .expect("break the hop");
+
+        let exec = RecordingExecutor::ok();
+        let err = execute_workflow_run(&state, &run.id, &exec)
+            .expect_err("a hop that does not parse must not be executed");
+
+        assert_eq!(
+            exec.invocations(),
+            0,
+            "the double must record that it was never invoked"
+        );
+        assert!(
+            err.contains("hop"),
+            "the error must name the malformed part, got: {}",
+            err
+        );
+        assert_eq!(
+            get_workflow_run(&state, &run.id).unwrap().gate_exit,
+            None,
+            "and the run stays unscored"
         );
     }
 }
