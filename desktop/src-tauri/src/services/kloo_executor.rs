@@ -253,4 +253,81 @@ mod tests {
             "the error must name the binary that could not be started, got {err:?}"
         );
     }
+
+    /// End-to-end: a real phase run through the whole arena wire, driven by a real `kloo`.
+    ///
+    /// `Ok(())` alone only means the child RAN — a model the endpoint does not serve is refused in
+    /// under two seconds and still returns `Ok(())`. So the family is one the endpoint does serve,
+    /// and the run is proved by evidence: `kloo` writes `.kloo/token-calibration.json` under its
+    /// working directory once it has talked to the endpoint, so that file existing in the temp
+    /// workdir is what shows the prompt actually reached a model.
+    ///
+    /// Ignored by default; run it by name with `cargo test --lib -- --ignored`.
+    #[ignore = "spawns a real kloo against lokalai; run with --ignored"]
+    #[test]
+    fn kloo_executor_runs_a_real_phase_end_to_end() {
+        use crate::services::workflows::{
+            create_workflow_version, execute_workflow_run, start_workflow_run, NewWorkflowRun,
+            NewWorkflowVersion,
+        };
+        use crate::test_support::test_state;
+
+        // 1. A real AppState, exactly as workflows.rs builds its own.
+        let (state, _root) = test_state();
+
+        // 2. A workflow version with a real role, instruction, contract and a hop that parses.
+        let workflow = create_workflow_version(
+            &state,
+            NewWorkflowVersion {
+                workspace_path: std::env::temp_dir()
+                    .join("kloo-e2e-workspace")
+                    .display()
+                    .to_string(),
+                phase_type: "dev-phase".to_string(),
+                family: "qwen3.8-flash-next".to_string(),
+                parent_id: None,
+                role: "you are a developer".to_string(),
+                instruction: "implement the phase".to_string(),
+                contract: "the gate must pass".to_string(),
+                hop: r#"{"steps":["plan","edit","verify"]}"#.to_string(),
+                fan_out: 1,
+            },
+        )
+        .expect("create workflow version");
+
+        // 3. Start a run for it.
+        let run = start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: workflow.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: None,
+            },
+        )
+        .expect("start run");
+
+        // 4. A FRESH temporary workdir — never the repo — with a unique name.
+        let workdir = std::env::temp_dir().join(format!(
+            "kloo-executor-e2e-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workdir).expect("create the test's temporary workdir");
+
+        let exec = KlooExecutor {
+            binary: "kloo".to_string(),
+            workdir: workdir.clone(),
+            verify: "true".to_string(),
+        };
+
+        // 5. Drive the phase through the whole wire, then remove the temp dir.
+        let result = execute_workflow_run(&state, &run.id, &exec);
+        let _ = std::fs::remove_dir_all(&workdir);
+
+        assert!(
+            result.is_ok(),
+            "a real phase run must return Ok(()), got {result:?}"
+        );
+    }
 }

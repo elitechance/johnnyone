@@ -1179,7 +1179,7 @@ fn require_non_blank(label: &str, value: &str) -> Result<String, String> {
 /// The section header that opens one part of a composed prompt.
 ///
 /// A section is `== <LABEL> ==` on its own line. The shape is pinned by
-/// [`prompt_section_marker_is_a_recognisable_header`] and read back by
+/// [`compose_workflow_prompt_keeps_the_four_parts_distinguishable`] and read back by
 /// [`prompt_section_labels`], so "the four parts stay distinguishable" is a tested property of the
 /// format rather than a hope about whitespace.
 fn prompt_section_header(label: &str) -> String {
