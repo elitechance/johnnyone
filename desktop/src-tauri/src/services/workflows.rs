@@ -2773,6 +2773,83 @@ mod tests {
     // The schema's own guarantee
     // -------------------------------------------------------------------------------------
 
+    /// The host's `execute_workflow_run` RPC answers a serialized [`WorkflowRun`], and the worker
+    /// declares that same row as `type WorkflowRun` in `worker/schema/johnnyone-ai.graphql`. The web
+    /// client asks for fields BY NAME, so a rename on one side and not the other is a silent
+    /// production break that every desktop test sails past — it happened this session.
+    ///
+    /// This pins the two together. The field list is READ FROM THE SCHEMA FILE, never copied into
+    /// this test: a hard-coded list is a second place to forget, which is the very bug this exists to
+    /// prevent. A field the row carries and the schema does not declare is NOT a failure — the host
+    /// may publish more than it exposes. Only the other direction breaks a client.
+    #[test]
+    fn arena_contract_the_run_row_carries_every_field_the_graphql_schema_declares() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = scored_run(&state, &workflow.id, r#"{"glm-4":3}"#, 0);
+
+        let row = serde_json::to_value(&run).expect("serialize the run row");
+        let keys: Vec<String> = row
+            .as_object()
+            .expect("the run row serializes as a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        // Resolve the schema relative to the crate dir so this works from any cwd.
+        let schema_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../worker/schema/johnnyone-ai.graphql");
+        let schema = std::fs::read_to_string(&schema_path)
+            .unwrap_or_else(|e| panic!("read the worker schema at {:?}: {}", schema_path, e));
+
+        // Slice out the `type WorkflowRun { ... }` block, then take the field name from each line
+        // inside it: the first token of `name: Type`, skipping comments and blank lines.
+        let header = "type WorkflowRun {";
+        let start = schema
+            .find(header)
+            .unwrap_or_else(|| panic!("`{}` is declared in {:?}", header, schema_path));
+        let body = &schema[start + header.len()..];
+        let end = body.find('}').expect("the WorkflowRun block is closed");
+        let body = &body[..end];
+
+        let mut declared: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let name = line
+                .split(':')
+                .next()
+                .map(|n| n.trim().to_string())
+                .expect("a field line has a name");
+            assert!(
+                !name.is_empty() && !name.contains(char::is_whitespace),
+                "unexpected line in the WorkflowRun block: {:?}",
+                line
+            );
+            declared.push(name);
+        }
+
+        assert!(
+            !declared.is_empty(),
+            "parsed zero fields out of the WorkflowRun block — the parser is broken, not the row"
+        );
+
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|field| !keys.contains(field))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the worker schema declares {:?} on `type WorkflowRun`, but the host's serialized run \
+             row does not carry it. The web client asks for fields by name, so this is a silent \
+             production break. row keys: {:?}",
+            missing,
+            keys
+        );
+    }
+
     /// Two champions in one `(repo, phase_type, family)` must be IMPOSSIBLE, not merely avoided by
     /// the service. This goes straight at the table with raw SQL, bypassing `promote_workflow`
     /// entirely, because the partial index is the last line of defence against a future second
