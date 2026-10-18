@@ -293,6 +293,39 @@ export class ArenaApiService {
       .pipe(map((data) => data.runWorkflowRunGate));
   }
 
+  /**
+   * RUN one phase of an existing run on the desktop host — the arena's missing EXECUTE step, which
+   * is what makes a created run actually executable from the console.
+   *
+   * `verify` and `binary` are relayed ONLY when the caller supplied a non-empty string after
+   * trimming. They are deliberately NOT defaulted anywhere in the web code, and an omitted, empty
+   * or whitespace-only value is ABSENT from the variables rather than `null`: the host owns the
+   * resolution rule for which verify command and which binary a run executes with, and a null on
+   * the wire reads as an explicit override of that rule rather than as "use my default".
+   *
+   * The answer is the updated run row, whose `gateExit` is the score — and `null` there means the
+   * gate never ran, which is NOT a pass.
+   */
+  executeWorkflowRun(runId: string, verify?: string | null, binary?: string | null): Observable<WorkflowRun> {
+    const variables: { runId: string; verify?: string; binary?: string } = { runId };
+    if (typeof verify === 'string' && verify.trim() !== '') {
+      variables.verify = verify;
+    }
+    if (typeof binary === 'string' && binary.trim() !== '') {
+      variables.binary = binary;
+    }
+    return this.gql
+      .mutate<{ executeWorkflowRun: WorkflowRun }>(
+        `mutation ExecuteWorkflowRun($runId: ID!, $verify: String, $binary: String) {
+          executeWorkflowRun(runId: $runId, verify: $verify, binary: $binary) {
+            ${this.workflowRunFields}
+          }
+        }`,
+        variables
+      )
+      .pipe(map((data) => data.executeWorkflowRun));
+  }
+
   /** Execute the gate AGAIN for a run that already has a score, replacing it. Its own field, so
    *  there is no flag to forget and no default to get wrong. */
   runWorkflowRunRescore(runId: string, phaseId?: string | null): Observable<WorkflowRun> {
