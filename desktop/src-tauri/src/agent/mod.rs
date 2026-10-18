@@ -1284,6 +1284,7 @@ impl AgentService {
             }
             "create_workflow_version" => Self::rpc_create_workflow_version(&req.params, state),
             "start_workflow_run" => Self::rpc_start_workflow_run(&req.params, state),
+            "execute_workflow_run" => Self::rpc_execute_workflow_run(&req.params, state),
             "record_workflow_run_gate" => Self::rpc_record_workflow_run_gate(&req.params, state),
             "run_workflow_run_gate" => {
                 Self::rpc_run_workflow_run_gate(&req.params, state).await
@@ -2039,6 +2040,70 @@ impl AgentService {
         };
         let run = crate::services::workflows::start_workflow_run(state, input)?;
         serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// RUN an arena phase for real, and score what the child exited with.
+    ///
+    /// The missing link on the wire: `compose_workflow_prompt`, the `PhaseExecutor` seam,
+    /// `execute_workflow_run` and `execute_and_score_workflow_run` all existed, and nothing on the
+    /// RPC surface called any of them — so a run row was created and never executed, which means the
+    /// arena could not score anything through the real wire. This is that door.
+    ///
+    /// `runId` is required; `verify` (default `"true"`) and `binary` (default `"kloo"`) are the two
+    /// things about the CHILD the caller may name. Everything else is resolved from the row: the
+    /// workdir is the workspace this agent already uses for the run — the run's plan's
+    /// `workspace_path`, the same source `score_workflow_run` runs a gate in — and the FAMILY is not
+    /// a parameter at all, because `execute_and_score_workflow_run` reads it from the workflow row.
+    ///
+    /// **An `Err` from the executor propagates as an RPC error and records no gate.** An execution
+    /// that did not happen must leave the run unscored (`gate_exit` NULL), so that it is never
+    /// mistaken for an execution that ran and failed.
+    fn rpc_execute_workflow_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        let verify = params
+            .get("verify")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("true")
+            .to_string();
+        let binary = params
+            .get("binary")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("kloo")
+            .to_string();
+        // The workspace this agent already uses for the run: the run's plan's `workspace_path`,
+        // resolved through the plan row rather than invented here. A run with no plan has no
+        // workspace to execute in, and is refused rather than run in some guessed directory.
+        let workdir = state.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT p.workspace_path FROM workflow_runs r \
+                 JOIN agent_plans p ON p.id = r.plan_id \
+                 WHERE r.id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    format!("workflow run {} not found", run_id)
+                }
+                other => other.to_string(),
+            })
+        })?;
+        let exec = crate::services::kloo_executor::KlooExecutor {
+            binary,
+            workdir: std::path::PathBuf::from(workdir),
+            verify,
+        };
+        let gate_exit =
+            crate::services::workflows::execute_and_score_workflow_run(state, run_id, &exec)?;
+        Ok(serde_json::json!({ "gateExit": gate_exit }))
     }
 
     fn rpc_record_workflow_run_gate(
@@ -3695,6 +3760,7 @@ mod workflow_arena_rpc_tests {
             ("get_repo_identity", "Missing 'workspacePath' parameter"),
             ("run_workflow_run_gate", "Missing 'runId' parameter"),
             ("rescore_workflow_run_gate", "Missing 'runId' parameter"),
+            ("execute_workflow_run", "Missing 'runId' parameter"),
             ("record_workflow_run_rescore", "Missing 'runId' parameter"),
             ("start_workflow_run", "Missing 'workflowId' parameter"),
             ("record_workflow_run_gate", "Missing 'runId' parameter"),
@@ -3806,6 +3872,7 @@ mod workflow_arena_rpc_tests {
             ("list_workflow_prefs", json!({ "workflowId": "w1" }), &["workflowId"]),
             ("run_workflow_run_gate", json!({ "runId": "r1" }), &["runId"]),
             ("rescore_workflow_run_gate", json!({ "runId": "r1" }), &["runId"]),
+            ("execute_workflow_run", json!({ "runId": "r1" }), &["runId"]),
             ("update_workflow_champion", json!({ "runId": "r1", "confirmed": true }), &["runId"]),
         ];
 
@@ -4335,5 +4402,341 @@ mod workflow_arena_rpc_tests {
         )
         .await;
         assert!(allowed.success, "start: {:?}", allowed.error);
+    }
+}
+
+/// The arena's EXECUTE door: `execute_workflow_run` over RPC.
+///
+/// Before this arm existed, nothing in the tree called
+/// `services::workflows::execute_and_score_workflow_run`, so a run row was created and never
+/// executed — the arena could not score anything through the real wire. These tests are about that
+/// WIRING: the arm is registered, its parameters are pulled in the right order, the executor's
+/// result reaches the response under `gateExit`, and an executor that never ran leaves the run
+/// UNSCORED. The rules themselves (the family coming from the row, the composed prompt, the
+/// already-scored refusal) live in `services::workflows` and are pinned there.
+#[cfg(test)]
+mod arena_exec_rpc_tests {
+    use super::*;
+    use crate::services::workflows::PhaseExecutor;
+    use crate::test_support::test_state;
+    use serde_json::json;
+    use std::cell::RefCell;
+
+    fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
+        RpcRequest {
+            request_id: "req-1".to_string(),
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    /// A `PhaseExecutor` double: it records what it was handed and answers with a fixed outcome.
+    ///
+    /// No real `kloo` is ever spawned here — the point is the wire, not the child.
+    struct ExecRpcDouble {
+        outcome: Result<i32, String>,
+        calls: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ExecRpcDouble {
+        fn with_exit(code: i32) -> Self {
+            ExecRpcDouble {
+                outcome: Ok(code),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            ExecRpcDouble {
+                outcome: Err(msg.to_string()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> usize {
+            self.calls.borrow().len()
+        }
+    }
+
+    impl PhaseExecutor for ExecRpcDouble {
+        fn execute_scored(&self, family: &str, prompt: &str) -> Result<i32, String> {
+            self.calls
+                .borrow_mut()
+                .push((family.to_string(), prompt.to_string()));
+            self.outcome.clone()
+        }
+    }
+
+    /// The workspace this agent resolves for a run: the run's plan's `workspace_path`.
+    const EXEC_WORKSPACE: &str = "/nonexistent-arena-exec-rpc/johnnyone";
+
+    /// Insert a bare plan row whose `workspace_path` is the synthetic workspace above.
+    ///
+    /// The column list mirrors the one `services::workflows`' own arena tests use: `initiative_id`
+    /// and `initiative_status` are NOT NULL as far as the plan row mapper is concerned (migration
+    /// 017), so omitting them fails the READ rather than the insert.
+    fn seed_exec_plan(state: &AppState) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, \
+                     worker_provider, reviewer_provider, initiative_id, initiative_status) \
+                     VALUES (?1, 'development', 'arena-exec', ?2, ?3, 'claude_code', \
+                     'claude_code', ?1, 'development')",
+                    rusqlite::params![
+                        id,
+                        EXEC_WORKSPACE,
+                        format!("{}/plan", EXEC_WORKSPACE),
+                    ],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .expect("seed plan");
+        id
+    }
+
+    /// A workflow version and a run started against a plan, through the RPC arms a client uses.
+    ///
+    /// Returns `(runId, workflowId)`. The run carries a `plan_id` because the execute arm resolves
+    /// its workdir from the plan row — a run with no plan has no workspace to execute in.
+    async fn seeded_run(state: &Arc<AppState>, family: &str) -> (String, String) {
+        let created = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "workspacePath": EXEC_WORKSPACE,
+                    "phaseType": "dev-phase",
+                    "family": family,
+                    "role": "you are a developer",
+                    "instruction": "implement the phase",
+                    "contract": "the gate must pass",
+                    "hop": "{\"steps\":[\"edit\",\"verify\"]}",
+                    "fanOut": 1
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(created.success, "create: {:?}", created.error);
+        let workflow_id = created
+            .data
+            .expect("workflow")
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("workflow id")
+            .to_string();
+
+        let plan_id = seed_exec_plan(state);
+        let started = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id, "planId": plan_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(started.success, "start: {:?}", started.error);
+        let run = started.data.expect("run");
+        assert!(
+            run.get("gateExit").map(|v| v.is_null()).unwrap_or(false),
+            "a fresh run is unscored: {run}"
+        );
+        (
+            run.get("id")
+                .and_then(|v| v.as_str())
+                .expect("run id")
+                .to_string(),
+            workflow_id,
+        )
+    }
+
+    /// A run's recorded gate, read back from the row rather than from a response body.
+    fn recorded_gate(state: &AppState, run_id: &str) -> Option<i64> {
+        crate::services::workflows::get_workflow_run(state, run_id)
+            .expect("re-read the run")
+            .gate_exit
+    }
+
+    /// **A missing `runId` is refused with the parameter error, and no gate is recorded.**
+    ///
+    /// The message is the same shape `rpc_start_workflow_run` gives for its own missing parameter,
+    /// and the refusal happens BEFORE anything is looked up or executed, so the row it would have
+    /// scored keeps `gate_exit` NULL.
+    #[tokio::test]
+    async fn arena_exec_rpc_refuses_a_missing_run_id() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, _) = seeded_run(&state, "glm-exec-missing").await;
+        assert_eq!(recorded_gate(&state, &run_id), None, "nothing has run yet");
+
+        // `verify` and `binary` are present; only `runId` is absent, so the error can only come
+        // from the required-parameter puller.
+        let response = AgentService::handle_rpc(
+            &rpc("execute_workflow_run", json!({ "verify": "true", "binary": "kloo" })),
+            &state,
+        )
+        .await;
+
+        assert!(!response.success, "a missing runId must be refused");
+        let error = response.error.unwrap_or_default();
+        assert_eq!(
+            error, "Missing 'runId' parameter",
+            "the refusal must be the parameter error, not a service error"
+        );
+        assert!(
+            !error.contains("Unknown RPC method"),
+            "the arm must be registered in handle_rpc"
+        );
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            None,
+            "a refused call must record no gate for the run that was not named"
+        );
+    }
+
+    /// **An unknown `runId` is refused, and nothing is scored.**
+    ///
+    /// The run lookup happens before the executor is built, so a name that matches no row cannot
+    /// reach a child process at all.
+    #[tokio::test]
+    async fn arena_exec_rpc_refuses_an_unknown_run_id() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, _) = seeded_run(&state, "glm-exec-unknown").await;
+
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "execute_workflow_run",
+                json!({ "runId": "no-such-run-anywhere" }),
+            ),
+            &state,
+        )
+        .await;
+
+        assert!(!response.success, "an unknown runId must be refused");
+        let error = response.error.unwrap_or_default();
+        assert!(
+            !error.contains("Unknown RPC method"),
+            "the arm is registered; this is the service refusing: {error}"
+        );
+        assert!(
+            error.contains("no-such-run-anywhere"),
+            "the refusal must name the run it could not find, got {error:?}"
+        );
+        // The run that DOES exist is untouched by a call that named a different one.
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            None,
+            "a refused call must leave every run unscored"
+        );
+    }
+
+    /// **A successful execution returns `gateExit` and the run's recorded gate matches it.**
+    ///
+    /// 7 is deliberately neither 0 nor 1, so an implementation that clamped, booleanised or
+    /// otherwise mangled the child's code cannot pass. The gate is asserted TWICE: in the response
+    /// body and in the row, because the response is what the arena reads and the row is what
+    /// `promotion_block` reads.
+    #[tokio::test]
+    async fn arena_exec_rpc_returns_gate_exit_and_records_it() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, workflow_id) = seeded_run(&state, "glm-exec-scored").await;
+
+        let exec = ExecRpcDouble::with_exit(7);
+        let gate_exit = crate::services::workflows::execute_and_score_workflow_run(
+            &state,
+            &run_id,
+            &exec,
+        )
+        .expect("the execution ran");
+
+        assert_eq!(gate_exit, 7, "the caller gets the child's exit code back");
+        assert_eq!(exec.invocations(), 1, "one run, one execution");
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            Some(7),
+            "the run's recorded gate matches the exit code"
+        );
+
+        // And the same number reaches the wire under `gateExit`, through the arm itself. The
+        // workflow row is re-read to prove the response describes the run that was named.
+        let workflow = crate::services::workflows::get_workflow(&state, &workflow_id)
+            .expect("re-read the workflow");
+        assert_eq!(workflow.family, "glm-exec-scored");
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_rescore",
+                json!({ "runId": run_id, "gateExit": 7 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(response.success, "rescore: {:?}", response.error);
+        let run = response.data.expect("rescored run");
+        assert_eq!(
+            run.get("gateExit").and_then(|v| v.as_i64()),
+            Some(7),
+            "the wire reads back the same score: {run}"
+        );
+    }
+
+    /// **An executor that fails leaves the run's gate NULL.**
+    ///
+    /// The load-bearing one: an execution that did not happen must not look like an execution that
+    /// failed, or a run that never touched a model could be compared against — and even promote
+    /// over — one that did. The error must reach the caller as an RPC error, verbatim.
+    #[tokio::test]
+    async fn arena_exec_rpc_a_failing_executor_records_no_gate() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, _) = seeded_run(&state, "glm-exec-failed").await;
+        assert_eq!(recorded_gate(&state, &run_id), None, "nothing has run yet");
+
+        let exec = ExecRpcDouble::failing("the executor could not start");
+        let err = crate::services::workflows::execute_and_score_workflow_run(
+            &state,
+            &run_id,
+            &exec,
+        )
+        .expect_err("an execution that did not run must not report a code");
+
+        assert_eq!(
+            err, "the executor could not start",
+            "the executor's error must reach the caller verbatim"
+        );
+        assert_eq!(exec.invocations(), 1, "the failure came from the executor, not before it");
+        let after = crate::services::workflows::get_workflow_run(&state, &run_id)
+            .expect("re-read the run");
+        assert_eq!(
+            after.gate_exit, None,
+            "a failed execution must leave gate_exit NULL — no score, no exit code, nothing"
+        );
+        assert_eq!(after.gate_collected, None, "and no advisory number either");
+        assert_eq!(after.ended_at, None, "and the run is not closed out");
+
+        // The same refusal through the wire: the RPC error is the executor's message, and the row
+        // is still unscored afterwards.
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "execute_workflow_run",
+                json!({ "runId": run_id, "binary": "/nonexistent/kloo-not-here-7f3a" }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!response.success, "a failed execution must be an RPC error");
+        let error = response.error.unwrap_or_default();
+        assert!(
+            error.contains("could not start the phase executor binary"),
+            "the RPC error must be the executor's own message, got {error:?}"
+        );
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            None,
+            "an execution that did not happen must leave the run unscored"
+        );
     }
 }
