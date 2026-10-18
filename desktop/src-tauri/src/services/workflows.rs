@@ -2325,8 +2325,20 @@ pub fn resume_workflow_search(
 /// passed anything — an execution that ran and failed its gate is still `Ok(())`, and scoring is
 /// [`record_workflow_run_gate`]'s job, not this trait's.
 pub trait PhaseExecutor {
-    /// Run one phase's hop for `family` against `prompt`.
-    fn execute(&self, family: &str, prompt: &str) -> Result<(), String>;
+    /// Run one phase's hop for `family` against `prompt`, reporting the gate's exit code.
+    ///
+    /// `Ok(code)` means an execution RAN and what the child exited with; `Err` means one did not
+    /// run at all. `0` means the gate passed. A child killed by a signal has no exit code and
+    /// reports the reserved `-1`, so a killed child is never mistaken for a pass.
+    fn execute_scored(&self, family: &str, prompt: &str) -> Result<i32, String>;
+
+    /// Run one phase's hop for `family` against `prompt`, reporting only whether it RAN.
+    ///
+    /// The old shape of the seam, kept as the default body so an executor that has no score to
+    /// give still answers the question it can answer.
+    fn execute(&self, family: &str, prompt: &str) -> Result<(), String> {
+        self.execute_scored(family, prompt).map(|_| ())
+    }
 }
 
 /// **The seam's one caller-side rule: the family comes from the workflow row.**
@@ -2355,6 +2367,34 @@ pub fn execute_workflow_run<E: PhaseExecutor>(
     let workflow = get_workflow(state, &run.workflow_id)?;
     let prompt = compose_workflow_prompt(&workflow)?;
     exec.execute(&workflow.family, &prompt)
+}
+
+/// **Compose, execute, and SCORE — the only path that turns a run into a number.**
+///
+/// Composes and executes exactly as [`execute_workflow_run`] does — same run lookup, same workflow
+/// lookup, same prompt, and the family still comes only from the workflow row — and then records the
+/// child's exit code as the run's gate result through [`record_workflow_run_gate`], the existing
+/// scoring function, before returning the code.
+///
+/// **On `Err` it records NOTHING.** An execution that did not happen leaves `gate_exit` NULL, so the
+/// run stays unscored and [`promotion_block`] refuses it. That distinction is the whole reason the
+/// seam has two shapes now: `execute_workflow_run` can only answer "did it run", so it could never
+/// hand the arena its score; `execute_scored` answers "did it run, and with what exit code", and
+/// this function is what turns the second half of that answer into a row.
+///
+/// The recorded `gate_collected` is `None`: the exit code is the score and the only score, and a
+/// child's stdout is not consumed here, so there is no test count anyone could trust.
+pub fn execute_and_score_workflow_run<E: PhaseExecutor>(
+    state: &AppState,
+    run_id: &str,
+    exec: &E,
+) -> Result<i32, String> {
+    let run = get_workflow_run(state, run_id)?;
+    let workflow = get_workflow(state, &run.workflow_id)?;
+    let prompt = compose_workflow_prompt(&workflow)?;
+    let code = exec.execute_scored(&workflow.family, &prompt)?;
+    record_workflow_run_gate(state, run_id, code as i64, None)?;
+    Ok(code)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4686,14 +4726,22 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordingExecutor {
         calls: std::cell::RefCell<Vec<(String, String)>>,
-        outcome: Result<(), String>,
+        outcome: Result<i32, String>,
     }
 
     impl RecordingExecutor {
         fn ok() -> Self {
             Self {
                 calls: std::cell::RefCell::new(Vec::new()),
-                outcome: Ok(()),
+                outcome: Ok(0),
+            }
+        }
+
+        /// A double that RAN and whose gate exited with `code` — the exit code is the score.
+        fn with_exit(code: i32) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                outcome: Ok(code),
             }
         }
 
@@ -4718,7 +4766,7 @@ mod tests {
     }
 
     impl PhaseExecutor for RecordingExecutor {
-        fn execute(&self, family: &str, prompt: &str) -> Result<(), String> {
+        fn execute_scored(&self, family: &str, prompt: &str) -> Result<i32, String> {
             self.calls
                 .borrow_mut()
                 .push((family.to_string(), prompt.to_string()));
@@ -4922,5 +4970,190 @@ mod tests {
             Some("}"),
             "the final line must be the hop body, not a header or an empty line"
         );
+    }
+
+    /// A run that executed and exited 7 must end up with `gate_exit = 7`.
+    ///
+    /// This is the missing link: before `execute_and_score_workflow_run` existed, the executor's exit
+    /// status was thrown away, so a run could execute and NEVER be scored — and `promotion_block`
+    /// refuses an unscored run forever. The exit code is the arena's only score, so the number the
+    /// child exits with must land in the row. 7 is deliberately neither 0 nor 1, so an
+    /// implementation that clamped, booleanised or otherwise mangled the code cannot pass.
+    #[test]
+    fn execute_and_score_records_the_exit_code() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+        assert_eq!(run.gate_exit, None, "nothing has run yet");
+
+        let exec = RecordingExecutor::with_exit(7);
+        let code = execute_and_score_workflow_run(&state, &run.id, &exec)
+            .expect("an execution that ran must report its exit code");
+
+        assert_eq!(code, 7, "the caller gets the child's exit code back");
+        assert_eq!(exec.invocations(), 1, "one run, one execution");
+        let (family, prompt) = exec.last();
+        assert_eq!(family, workflow.family, "the family comes from the row");
+        assert!(
+            prompt.contains(&workflow.instruction),
+            "and the prompt is the composed one"
+        );
+
+        let after = get_workflow_run(&state, &run.id).expect("re-read the run");
+        assert_eq!(
+            after.gate_exit,
+            Some(7),
+            "the exit code the child exited with is the run's score"
+        );
+        assert!(after.ended_at.is_some(), "and scoring closes the run out");
+    }
+
+    /// Exit code 0 is a SCORE, not the absence of one: a passing gate leaves a scored run.
+    ///
+    /// The trap this pins is an implementation that treats 0 as "nothing to record" — or that
+    /// records `Ok(())` from the old `execute` shape and never calls the scorer at all. `gate_exit`
+    /// must be `Some(0)`, and `promotion_block` must then say nothing about a NULL score.
+    #[test]
+    fn execute_and_score_zero_means_the_gate_passed() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+
+        let exec = RecordingExecutor::ok();
+        let code = execute_and_score_workflow_run(&state, &run.id, &exec)
+            .expect("an execution that ran must report its exit code");
+
+        assert_eq!(code, 0, "the gate passed");
+        let after = get_workflow_run(&state, &run.id).expect("re-read the run");
+        assert_eq!(
+            after.gate_exit,
+            Some(0),
+            "a passing gate is a SCORED run — Some(0), never NULL"
+        );
+        assert!(after.ended_at.is_some(), "the run is closed out");
+
+        // And it is promotable on the score alone: the refusal that used to stand here was
+        // "the gate never ran", and it must be gone.
+        assert_eq!(
+            promotion_block(&PromotionFacts {
+                run: &after,
+                pref: None,
+                pref_loser: None,
+                pref_loser_same_key: true,
+                pref_loser_same_workflow: false,
+                incumbent_workflow_id: None,
+                incumbent_run_id: None,
+                halted: false,
+                run_not_scoreable: None,
+            }),
+            None,
+            "a scored, passing run must not be refused"
+        );
+    }
+
+    /// An execution that DID NOT RUN records nothing, and promotion is refused for it.
+    ///
+    /// This is the distinction the widened seam exists to preserve: `execute_scored` now carries a
+    /// number, and the tempting bug is to score `0` (or `-1`) when the executor returns `Err`, which
+    /// would let a run that never touched a model be compared against — and promote over — one that
+    /// did. `Err` must leave `gate_exit` NULL, `gate_collected` NULL and the run open, and
+    /// `promotion_block` must refuse it.
+    #[test]
+    fn execute_and_score_an_execution_that_did_not_run_is_not_scored() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+        assert_eq!(run.gate_exit, None, "nothing has run yet");
+
+        let exec = RecordingExecutor::failing("no seat could be held for glm");
+        let err = execute_and_score_workflow_run(&state, &run.id, &exec)
+            .expect_err("an execution that did not run must not report a code");
+
+        assert_eq!(
+            err, "no seat could be held for glm",
+            "the executor's error must reach the caller verbatim"
+        );
+        assert_eq!(exec.invocations(), 1, "the failure came from the executor, not before it");
+        let after = get_workflow_run(&state, &run.id).expect("re-read the run");
+        assert_eq!(
+            after.gate_exit, None,
+            "a run that did not execute must stay unscored — gate_exit NULL"
+        );
+        assert_eq!(after.gate_collected, None, "and no advisory number either");
+        assert_eq!(after.ended_at, None, "and the run is not closed out");
+
+        let block = promotion_block(&PromotionFacts {
+            run: &after,
+            pref: None,
+            pref_loser: None,
+            pref_loser_same_key: true,
+            pref_loser_same_workflow: false,
+            incumbent_workflow_id: None,
+            incumbent_run_id: None,
+            halted: false,
+            run_not_scoreable: None,
+        })
+        .expect("an unscored run must never be promotable");
+        assert!(
+            block.contains("no gate result"),
+            "promotion must refuse an unscored run because the gate never ran, got: {block}"
+        );
+    }
+
+    /// A child killed by a signal has NO exit code, and the executor reports `-1`, not `0`.
+    ///
+    /// `status.code()` is `None` for a signal-killed child, so `unwrap_or(0)` — the obvious-looking
+    /// choice — would record a SIGKILLed phase as a PASSING gate, the single worst confusion
+    /// available in an arena whose only score is the exit code. `/bin/sh -c 'kill -TERM $$'` exits
+    /// via a signal on every POSIX platform; where `kill` is absent the test says so and stops,
+    /// because the assertion is about the convention, not about the existence of a shell.
+    #[test]
+    fn execute_and_score_a_signal_has_no_exit_code() {
+        use crate::services::kloo_executor::KlooExecutor;
+        use crate::services::workflows::PhaseExecutor as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !std::path::PathBuf::from("/bin/sh").exists() {
+            eprintln!("/bin/sh is absent on this platform; nothing to be killed by a signal");
+            return;
+        }
+
+        // The executor's argv is `[prompt, --verify, <verify>, --json, --effort, medium, --model,
+        // <family>]` — there is no `-c`, so a shell pointed at as the binary would read the PROMPT
+        // as a script FILENAME and exit 2 without ever being signalled. The child that must die by
+        // a signal is therefore a real executable script: a fresh temp dir holding `kill-self.sh`,
+        // whose shebang runs it under /bin/sh, and whose only statement kills its own process.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-signal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the temp dir for the self-killing script");
+        let script = dir.join("kill-self.sh");
+        std::fs::write(&script, "#!/bin/sh\nkill -TERM $$\n").expect("write kill-self.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make kill-self.sh executable");
+
+        let exec = KlooExecutor {
+            binary: script.to_string_lossy().into_owned(),
+            workdir: dir.clone(),
+            verify: "true".to_string(),
+        };
+
+        // The prompt is arbitrary text the script ignores; the child kills itself with SIGTERM, so
+        // it has no exit code at all.
+        let result = exec.execute_scored("glm-4.6", "a prompt the script ignores");
+        let _ = std::fs::remove_dir_all(&dir);
+        let code = result.expect("a signalled child still RAN, so this is Ok, not Err");
+
+        assert_eq!(
+            code, -1,
+            "a child killed by a signal has no exit code and must report the reserved -1, \
+             never 0 — 0 would be recorded as a gate that passed"
+        );
+        assert_ne!(code, 0, "a killed child must never look like a pass");
     }
 }

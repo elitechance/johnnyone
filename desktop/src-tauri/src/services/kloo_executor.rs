@@ -73,11 +73,14 @@ impl KlooExecutor {
 }
 
 impl PhaseExecutor for KlooExecutor {
-    /// Spawn the binary, wait for it, and report only whether it RAN.
+    /// Spawn the binary, wait for it, and report the child's exit code as the gate's score.
     ///
-    /// `Ok(())` for any completed child, whatever its exit status. `Err` only when the process could
-    /// not be started or could not be waited on, naming the binary and the OS error.
-    fn execute(&self, family: &str, prompt: &str) -> Result<(), String> {
+    /// `Ok(code)` for any completed child, whatever its exit status: `0` means the gate passed, any
+    /// other code is a gate that ran and failed. A child killed by a signal has no exit code at all,
+    /// and reports the reserved `-1` rather than `0` — a killed child must never look like a pass.
+    /// `Err` only when the process could not be started or could not be waited on, naming the binary
+    /// and the OS error, because an execution that did not happen must not look like one that failed.
+    fn execute_scored(&self, family: &str, prompt: &str) -> Result<i32, String> {
         let mut cmd = self.command(family, prompt);
         let mut child = cmd.spawn().map_err(|e| {
             format!(
@@ -86,9 +89,11 @@ impl PhaseExecutor for KlooExecutor {
             )
         })?;
         match child.wait() {
-            // Ran to completion: exit 0, exit 1, signal — all of them are "it ran". The gate result
-            // is read from the run's own scoring path, not from here.
-            Ok(_status) => Ok(()),
+            // Ran to completion: exit 0, exit 1, signal — all of them are "it ran". The code is the
+            // arena's score; `record_workflow_run_gate` is what turns it into a run's `gate_exit`.
+            // A signal-killed child has `code() == None`, and `-1` is the convention the arena reads
+            // as "no code", never as a pass.
+            Ok(status) => Ok(status.code().unwrap_or(-1)),
             // The child started but could not be reaped. It still ran, so this is reported as an
             // error rather than silently as success: the caller must not record a hop whose end it
             // never learned.
