@@ -4476,6 +4476,15 @@ mod arena_exec_rpc_tests {
     /// and `initiative_status` are NOT NULL as far as the plan row mapper is concerned (migration
     /// 017), so omitting them fails the READ rather than the insert.
     fn seed_exec_plan(state: &AppState) -> String {
+        seed_exec_plan_at(state, EXEC_WORKSPACE)
+    }
+
+    /// The same row, but with the plan's `workspace_path` chosen by the caller.
+    ///
+    /// The execute arm builds its own `KlooExecutor` from this column, so a test that wants the arm
+    /// to run a REAL child — rather than a double it cannot inject — hands it a directory that
+    /// exists and holds that child.
+    fn seed_exec_plan_at(state: &AppState, workspace: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         state
             .db
@@ -4487,8 +4496,8 @@ mod arena_exec_rpc_tests {
                      'claude_code', ?1, 'development')",
                     rusqlite::params![
                         id,
-                        EXEC_WORKSPACE,
-                        format!("{}/plan", EXEC_WORKSPACE),
+                        workspace,
+                        format!("{}/plan", workspace),
                     ],
                 )
                 .map_err(|e| e.to_string())
@@ -4502,11 +4511,20 @@ mod arena_exec_rpc_tests {
     /// Returns `(runId, workflowId)`. The run carries a `plan_id` because the execute arm resolves
     /// its workdir from the plan row — a run with no plan has no workspace to execute in.
     async fn seeded_run(state: &Arc<AppState>, family: &str) -> (String, String) {
+        seeded_run_in(state, family, EXEC_WORKSPACE).await
+    }
+
+    /// The same pair, with the plan's workspace — and so the arm's workdir — chosen by the caller.
+    async fn seeded_run_in(
+        state: &Arc<AppState>,
+        family: &str,
+        workspace: &str,
+    ) -> (String, String) {
         let created = AgentService::handle_rpc(
             &rpc(
                 "create_workflow_version",
                 json!({
-                    "workspacePath": EXEC_WORKSPACE,
+                    "workspacePath": workspace,
                     "phaseType": "dev-phase",
                     "family": family,
                     "role": "you are a developer",
@@ -4528,7 +4546,7 @@ mod arena_exec_rpc_tests {
             .expect("workflow id")
             .to_string();
 
-        let plan_id = seed_exec_plan(state);
+        let plan_id = seed_exec_plan_at(state, workspace);
         let started = AgentService::handle_rpc(
             &rpc(
                 "start_workflow_run",
@@ -4737,6 +4755,75 @@ mod arena_exec_rpc_tests {
             recorded_gate(&state, &run_id),
             None,
             "an execution that did not happen must leave the run unscored"
+        );
+    }
+
+    /// **The `execute_workflow_run` ARM answers with the gate exit, under `gateExit`.**
+    ///
+    /// The other three success-shaped tests cannot see this: the one that asserts a response body
+    /// goes through `record_workflow_run_rescore`, and the two that call
+    /// `execute_and_score_workflow_run` never touch the wire at all. So the arm could answer under
+    /// any key it liked — `exitCode`, `code`, nothing — and the suite would stay green while the
+    /// web client read `gateExit` and got `undefined`. This drives the arm itself to a SUCCESS and
+    /// reads the key BY NAME.
+    ///
+    /// The arm builds its own `KlooExecutor` from the plan's `workspace_path`, so no double can be
+    /// injected — the child has to be real. Following `execute_and_score_a_signal_has_no_exit_code`
+    /// in `services::workflows`, the child is an executable script in a fresh temp dir: `#!/bin/sh`
+    /// then `exit 7`. It ignores every argument, so the executor's argv shape (`prompt --verify … 
+    /// --model <family>`) is irrelevant here; only its exit code is. 7 is neither 0 nor 1, so a
+    /// mangled code cannot pass either.
+    #[tokio::test]
+    async fn arena_exec_rpc_the_arm_answers_with_the_gate_exit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        // A real child: a uniquely-named temp dir holding `exit-seven.sh`, executable, whose only
+        // statement is `exit 7`. The dir doubles as the plan's workspace, which is what the arm
+        // resolves as the child's workdir.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-arm-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the temp dir for the exit-7 script");
+        let script = dir.join("exit-seven.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").expect("write exit-seven.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make exit-seven.sh executable");
+
+        let (run_id, _) =
+            seeded_run_in(&state, "glm-exec-arm-exit", &dir.to_string_lossy()).await;
+        assert_eq!(recorded_gate(&state, &run_id), None, "nothing has run yet");
+
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "execute_workflow_run",
+                json!({ "runId": run_id, "binary": script.to_string_lossy() }),
+            ),
+            &state,
+        )
+        .await;
+
+        // The temp dir goes BEFORE the asserts, so it is removed on the panic path too.
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(response.success, "the arm must succeed: {:?}", response.error);
+        let data = response.data.expect("the arm answers with data");
+        assert_eq!(
+            data.get("gateExit").and_then(|v| v.as_i64()),
+            Some(7),
+            "the arm must answer under the key `gateExit` with the child's code: {data}"
+        );
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            Some(7),
+            "and the arm must SCORE the run, not merely answer — the row carries the gate"
         );
     }
 }
