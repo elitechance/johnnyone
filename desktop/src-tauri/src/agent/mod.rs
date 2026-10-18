@@ -3914,10 +3914,18 @@ mod workflow_arena_rpc_tests {
                 Some(r#"{"glm-5.3-flash":3}"#),
                 "the HOST measured the budget from the workflow row, not from the caller: {run}"
             );
+            // The contention snapshot is the host's too — and it is no longer `{}`. An empty map
+            // used to mean "nothing measures contention" (the stand-in's value: the lease pool had
+            // not landed, so every run reported `{}` whether the fleet was busy or not). Now that
+            // `measure_run_budget` reads the real lease pool, a run on a quiet fleet reports every
+            // capped family AT ZERO — `{"glm-5.3-flash":0}` — which is the assertion's whole point:
+            // "measured, and the fleet was quiet" must not be confused with "never measured". A
+            // weakened `is_some()` here would let the stand-in's `{}` pass again and erase that
+            // distinction, so the exact snapshot is pinned.
             assert_eq!(
                 run.get("fleetBusy").and_then(|v| v.as_str()),
-                Some("{}"),
-                "and the contention snapshot is the host's too: {run}"
+                Some(r#"{"glm-5.3-flash":0}"#),
+                "and the contention snapshot is the host's too, measured and quiet: {run}"
             );
             run_ids.push(run.get("id").and_then(|v| v.as_str()).unwrap().to_string());
         }
