@@ -137,6 +137,7 @@ function stubApi(over: Record<string, unknown> = {}) {
     // Reading a preference back, rather than recording one to discover it (new in the API).
     workflowPrefs: rec('workflowPrefs', []),
     repoIdentity: rec('repoIdentity', 'github.com/lokalcamp/johnnyone'),
+    executeWorkflowRun: rec('executeWorkflowRun', { ...RUN_PASS, gateExit: 0, gateCollected: 23 }),
     runWorkflowRunGate: rec('runWorkflowRunGate', { ...RUN_PASS, gateExit: 0, gateCollected: 23 }),
     runWorkflowRunRescore: rec('runWorkflowRunRescore', { ...RUN_PASS, gateExit: 1, gateCollected: 23 }),
     recordWorkflowRunRescore: rec('recordWorkflowRunRescore', RUN_PASS),
@@ -855,6 +856,82 @@ describe('WorkflowArenaPage — scoring a recorded run', () => {
     const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
     expect(txt(f)).toContain('the fleet was busy when this run started');
     expect((q(f, '[data-test="score-run"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+// ── EXECUTE: running a phase of a run from the console ────────────────────────────────────────
+//
+// `executeWorkflowRun` runs one phase of an EXISTING run on the desktop host. Scoring a run only
+// measures work; this is the step that does the work. The page passes the run id and NOTHING else —
+// the host resolves which verify command and which binary the run executes with, and a second copy
+// of that default in the web bundle could only drift from it.
+describe('WorkflowArenaPage — executing a run', () => {
+  it('executes a run from the console', async () => {
+    const api = stubApi({
+      workflowRuns: () => of([RUN_UNSCORED]),
+      executeWorkflowRun: () => of({ ...RUN_UNSCORED, gateExit: 0, gateCollected: 23 }),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    const btn = q(f, '[data-test="execute-run"]') as HTMLButtonElement;
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBe(false);
+    expect(api.calls.some((c) => c.name === 'executeWorkflowRun')).toBe(false);
+    click(btn);
+    await flush(f);
+    const sent = api.calls.filter((c) => c.name === 'executeWorkflowRun');
+    expect(sent).toHaveLength(1);
+    // The run id ALONE. No verify, no binary, no third argument: the host owns that default.
+    expect(sent[0].args).toEqual(['r2']);
+    expect(sent[0].args).toHaveLength(1);
+    // The host's answer is the refreshed run row, and it is the only thing that changed the score.
+    expect((q(f, '[data-test="challenger-exit"]') as HTMLElement).textContent).toContain('exit 0');
+  });
+
+  it('a run already executing is not executed twice', async () => {
+    let settle: (v: unknown) => void = () => undefined;
+    const pending = new Promise((r) => (settle = r));
+    const api = stubApi({
+      workflowRuns: () => of([RUN_UNSCORED]),
+      executeWorkflowRun: () => from(pending) as never,
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="execute-run"]'));
+    await flush(f);
+    expect(api.calls.filter((c) => c.name === 'executeWorkflowRun')).toHaveLength(1);
+    // Still in flight: the control says so, and a second invocation sends nothing.
+    const btn = q(f, '[data-test="execute-run"]') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.textContent).toMatch(/executing|running/i);
+    click(btn);
+    await flush(f);
+    click(btn);
+    await flush(f);
+    expect(api.calls.filter((c) => c.name === 'executeWorkflowRun')).toHaveLength(1);
+    // Nothing on screen may claim a verdict that has not arrived.
+    expect((q(f, '[data-test="challenger-exit"]') as HTMLElement).textContent).toContain('never ran');
+    settle({ ...RUN_UNSCORED, gateExit: 0, gateCollected: 23 });
+    await flush(f);
+  });
+
+  it('an execute failure is shown and does not score the run', async () => {
+    const api = stubApi({
+      workflowRuns: () => of([RUN_UNSCORED]),
+      executeWorkflowRun: () => throwError(() => new Error('the host has no desktop node online')),
+    });
+    const f = await mount(WorkflowArenaPage, api, { id: 'w2' });
+    click(q(f, '[data-test="execute-run"]'));
+    await flush(f);
+    expect(api.calls.filter((c) => c.name === 'executeWorkflowRun')).toHaveLength(1);
+    // The message is on screen rather than swallowed beside a button just pressed…
+    expect(txt(f)).toContain('the host has no desktop node online');
+    // …and the page wrote no score: the run still reads "never ran", which is not a pass.
+    const cell = q(f, '[data-test="challenger-exit"]') as HTMLElement;
+    expect(cell.textContent).toContain('never ran');
+    expect(cell.textContent).not.toMatch(/\b0\b/);
+    expect((q(f, '[data-test="challenger-collected"]') as HTMLElement).textContent).toContain('not reported');
+    // A failed execute must not reach the score mutation either.
+    expect(api.calls.some((c) => c.name === 'runWorkflowRunGate')).toBe(false);
+    expect(api.calls.some((c) => c.name === 'recordWorkflowRunGate')).toBe(false);
   });
 });
 

@@ -158,6 +158,30 @@ import {
         @if (scoreError()) { <div class="a-block" data-test="score-error">{{ scoreError() }}</div> }
       </div>
 
+      <div class="a-card">
+        <h2>execute</h2>
+        <p class="a-note">
+          The step between a run that exists and a run that has done work: one phase of this run runs
+          on the desktop host. The host owns which verify command and which binary it executes with,
+          so this screen sends the run and <b>nothing else</b> — a second copy of that default here
+          could only drift. It <b>can take minutes</b>.
+        </p>
+        @if (execBlock(); as block) {
+          <div class="a-block" data-test="execute-block">{{ block }}</div>
+        }
+        <button
+          type="button"
+          class="a-btn primary"
+          data-test="execute-run"
+          [disabled]="executing() || execBlock() !== null"
+          (click)="executeRun()"
+        >{{ executing() ? 'Executing on the host…' : 'Execute this run' }}</button>
+        @if (executing()) {
+          <p class="a-note" data-test="execute-running">Still running. No result has arrived, and none is shown until it does.</p>
+        }
+        @if (executeError()) { <div class="a-block" data-test="execute-error">{{ executeError() }}</div> }
+      </div>
+
       <div class="a-cols">
         <div class="a-card">
           <h2>champion @if (champion()) { <span class="a-muted">v{{ champion()!.version }}</span> }</h2>
@@ -343,6 +367,8 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly scoring = signal(false);
   protected readonly scoreError = signal<string | null>(null);
   protected readonly rescoring = signal(false);
+  protected readonly executing = signal(false);
+  protected readonly executeError = signal<string | null>(null);
   protected readonly resuming = signal(false);
   protected readonly resumeSending = signal(false);
   protected readonly resumeReason = signal('');
@@ -409,6 +435,18 @@ export class WorkflowArenaPage implements OnInit {
   });
   /** True when there is a gate to run at all. No gate ⇒ no control, and a sentence saying why. */
   protected readonly hasGateToScore = computed(() => this.scoreCommands().length > 0);
+  /**
+   * Why EXECUTE cannot run right now, or null when it can. Both clauses read a HOST answer rather
+   * than re-deriving a rule here: the halt is the host's and is what `executeWorkflowRun` itself
+   * refuses on, and a run that does not exist has nothing for the host to execute. Deliberately NOT
+   * gated on `hasGateToScore()` — that is the SCORE control's rule (an ungated phase must never be
+   * scored, because exit 0 comes back from it as from a pass); executing a phase is a different
+   * question and the host is the one that answers it.
+   */
+  protected readonly execBlock = computed<string | null>(() => {
+    if (!this.challengerRun()) return 'There is no run to execute.';
+    return this.haltBlock();
+  });
   protected readonly confirmCopy = computed(() => {
     const w = this.challenger();
     return w
@@ -589,6 +627,35 @@ export class WorkflowArenaPage implements OnInit {
       this.rescoring.set(false);
     }
     this.scoring.set(false);
+  }
+
+  /**
+   * EXECUTE one phase of this run on the desktop host — the step that makes a run this console
+   * created actually executable from it. The run id is the ONLY argument: the host owns which verify
+   * command and which binary a run executes with, and passing either here would put a second copy of
+   * that default in the web bundle where it can only drift.
+   */
+  protected async executeRun(): Promise<void> {
+    const run = this.challengerRun();
+    if (!run || this.executing() || this.execBlock() !== null) return;
+    this.executing.set(true);
+    this.executeError.set(null);
+    // The refusal is handled IN THE STREAM rather than as a rejected promise: a promise rejection
+    // raised inside a DOM event task is reported by zone.js/testing as an uncaught error even when
+    // it is caught. Same shape as the two gate controls above, no phantom failure.
+    const executed = await firstValueFrom(
+      this.api.executeWorkflowRun(run.id).pipe(
+        catchError((e: unknown) => {
+          // The run keeps whatever score it had — for a fresh run that is none, "never ran". The
+          // page never writes a score itself; the host's row is the only source of one.
+          this.executeError.set(`The host refused to execute this run: ${String(e)}`);
+          return of(null);
+        }),
+      ),
+    );
+    // The host answers with the updated run row; adopting it IS the run-row refresh.
+    if (executed) this.challengerRun.set(executed);
+    this.executing.set(false);
   }
 
   /** Lift a halt — its own confirmed decision, carrying a reason, never a side effect of
