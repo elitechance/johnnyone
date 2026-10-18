@@ -15,7 +15,7 @@ interface WorkerEnv { CHAT_RELAY_DO: DurableObjectNamespace; [key: string]: unkn
 //
 // This EXECUTES work on the host, so it carries plans:write — the same authority as
 // `startWorkflowRun` and `runWorkflowRunGate`, and deliberately not a read scope.
-export default async function executeWorkflowRun(
+export default async function runWorkflowRunPhase(
   _parent: unknown,
   args: { runId: string; verify?: string | null; binary?: string | null },
   ctx: ResolverContext,

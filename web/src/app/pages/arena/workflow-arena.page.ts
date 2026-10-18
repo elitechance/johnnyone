@@ -437,7 +437,7 @@ export class WorkflowArenaPage implements OnInit {
   protected readonly hasGateToScore = computed(() => this.scoreCommands().length > 0);
   /**
    * Why EXECUTE cannot run right now, or null when it can. Both clauses read a HOST answer rather
-   * than re-deriving a rule here: the halt is the host's and is what `executeWorkflowRun` itself
+   * than re-deriving a rule here: the halt is the host's and is what `runWorkflowRunPhase` itself
    * refuses on, and a run that does not exist has nothing for the host to execute. Deliberately NOT
    * gated on `hasGateToScore()` — that is the SCORE control's rule (an ungated phase must never be
    * scored, because exit 0 comes back from it as from a pass); executing a phase is a different
@@ -644,7 +644,7 @@ export class WorkflowArenaPage implements OnInit {
     // raised inside a DOM event task is reported by zone.js/testing as an uncaught error even when
     // it is caught. Same shape as the two gate controls above, no phantom failure.
     const executed = await firstValueFrom(
-      this.api.executeWorkflowRun(run.id).pipe(
+      this.api.runWorkflowRunPhase(run.id).pipe(
         catchError((e: unknown) => {
           // The run keeps whatever score it had — for a fresh run that is none, "never ran". The
           // page never writes a score itself; the host's row is the only source of one.
