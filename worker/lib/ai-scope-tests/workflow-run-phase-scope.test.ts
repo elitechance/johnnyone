@@ -4,7 +4,7 @@ import * as apiKeyMod from '../../lib/auth/api-key';
 import { authedCtx } from '../auth/test-authed-ctx';
 
 /**
- * The `executeWorkflowRun` resolver seam — the worker's only route to the desktop's
+ * The `runWorkflowRunPhase` resolver seam — the worker's only route to the desktop's
  * `execute_workflow_run` RPC, which is what lets a browser run a phase at all.
  *
  * Mirrors workflow-arena-scope.test.ts / agent-plan-write-scope.test.ts. Four things are pinned
@@ -40,24 +40,24 @@ function fieldLine(name: string): string | undefined {
     .find((line) => line.startsWith(`${name}(`) || line.startsWith(`${name}:`));
 }
 
-describe('executeWorkflowRun resolver seam', () => {
+describe('runWorkflowRunPhase resolver seam', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
 
-  it('executeWorkflowRun relays the runId to the execute_workflow_run RPC', async () => {
+  it('runWorkflowRunPhase relays the runId to the execute_workflow_run RPC', async () => {
     const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({ gateExit: 0 } as any);
-    const { default: executeWorkflowRun } = await import('../../resolvers/ai/execute-workflow-run');
-    const res = await executeWorkflowRun(null, { runId: 'r1' }, mockCtx as any);
+    const { default: runWorkflowRunPhase } = await import('../../resolvers/ai/run-workflow-run-phase');
+    const res = await runWorkflowRunPhase(null, { runId: 'r1' }, mockCtx as any);
     // The caller's own ctx is relayed, so one tenant cannot run another tenant's phase.
     expect(spy).toHaveBeenCalledWith(mockCtx, 'execute_workflow_run', { runId: 'r1' });
     expect(res).toEqual({ gateExit: 0 });
   });
 
-  it('executeWorkflowRun relays a supplied non-empty verify and binary', async () => {
+  it('runWorkflowRunPhase relays a supplied non-empty verify and binary', async () => {
     const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({} as any);
-    const { default: executeWorkflowRun } = await import('../../resolvers/ai/execute-workflow-run');
-    await executeWorkflowRun(
+    const { default: runWorkflowRunPhase } = await import('../../resolvers/ai/run-workflow-run-phase');
+    await runWorkflowRunPhase(
       null,
       { runId: 'r1', verify: 'cargo test', binary: './target/debug/johnnyone' },
       mockCtx as any,
@@ -69,8 +69,8 @@ describe('executeWorkflowRun resolver seam', () => {
     });
   });
 
-  it('executeWorkflowRun does NOT relay an omitted, empty or whitespace-only verify/binary', async () => {
-    const { default: executeWorkflowRun } = await import('../../resolvers/ai/execute-workflow-run');
+  it('runWorkflowRunPhase does NOT relay an omitted, empty or whitespace-only verify/binary', async () => {
+    const { default: runWorkflowRunPhase } = await import('../../resolvers/ai/run-workflow-run-phase');
     const cases: Record<string, unknown>[] = [
       { runId: 'r1' },
       { runId: 'r1', verify: null, binary: null },
@@ -80,7 +80,7 @@ describe('executeWorkflowRun resolver seam', () => {
     ];
     for (const args of cases) {
       const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValueOnce({} as any);
-      await executeWorkflowRun(null, args as any, mockCtx as any);
+      await runWorkflowRunPhase(null, args as any, mockCtx as any);
       expect(spy).toHaveBeenCalledTimes(1);
       const params = spy.mock.calls[0][2] as Record<string, unknown>;
       expect(params.runId, `runId must still relay for ${JSON.stringify(args)}`).toBe('r1');
@@ -98,12 +98,12 @@ describe('executeWorkflowRun resolver seam', () => {
     }
   });
 
-  it('executeWorkflowRun authorizes with startWorkflowRun\'s plans:write scope', async () => {
+  it('runWorkflowRunPhase authorizes with startWorkflowRun\'s plans:write scope', async () => {
     const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValue({} as any);
     const auth = vi.spyOn(apiKeyMod, 'authorizeForAltToken').mockResolvedValue(undefined);
-    const { default: executeWorkflowRun } = await import('../../resolvers/ai/execute-workflow-run');
+    const { default: runWorkflowRunPhase } = await import('../../resolvers/ai/run-workflow-run-phase');
     const { default: startWorkflowRun } = await import('../../resolvers/ai/start-workflow-run');
-    await executeWorkflowRun(null, { runId: 'r1' }, mockCtx as any);
+    await runWorkflowRunPhase(null, { runId: 'r1' }, mockCtx as any);
     await startWorkflowRun(null, { workflowId: 'w1' }, mockCtx as any);
     const scopes = auth.mock.calls.map((c) => c[1]);
     expect(scopes).toEqual(['plans:write', 'plans:write']);
@@ -111,19 +111,19 @@ describe('executeWorkflowRun resolver seam', () => {
     expect(spy).toHaveBeenCalledTimes(2);
   });
 
-  it('executeWorkflowRun attempts no RPC when authorization fails', async () => {
+  it('runWorkflowRunPhase attempts no RPC when authorization fails', async () => {
     const spy = vi.spyOn(desktopRpcMod, 'desktopRpc').mockResolvedValue({} as any);
     vi.spyOn(apiKeyMod, 'authorizeForAltToken').mockRejectedValue(new Error('missing plans:write'));
-    const { default: executeWorkflowRun } = await import('../../resolvers/ai/execute-workflow-run');
-    await expect(executeWorkflowRun(null, { runId: 'r1' }, mockCtx as any)).rejects.toThrow(
+    const { default: runWorkflowRunPhase } = await import('../../resolvers/ai/run-workflow-run-phase');
+    await expect(runWorkflowRunPhase(null, { runId: 'r1' }, mockCtx as any)).rejects.toThrow(
       'missing plans:write',
     );
     expect(spy, 'a refused caller must not reach the host').not.toHaveBeenCalled();
   });
 
-  it('the schema declares executeWorkflowRun and exposes gateExit', () => {
-    const line = fieldLine('executeWorkflowRun');
-    expect(line, 'executeWorkflowRun must be declared in the schema').toBeTruthy();
+  it('the schema declares runWorkflowRunPhase and exposes gateExit', () => {
+    const line = fieldLine('runWorkflowRunPhase');
+    expect(line, 'runWorkflowRunPhase must be declared in the schema').toBeTruthy();
     expect(line).toContain('runId: ID!');
     expect(line, 'verify is optional: the host owns its default').toContain('verify: String');
     expect(line, 'binary is optional: the host owns its default').toContain('binary: String');

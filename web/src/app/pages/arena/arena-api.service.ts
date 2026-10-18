@@ -306,7 +306,7 @@ export class ArenaApiService {
    * The answer is the updated run row, whose `gateExit` is the score — and `null` there means the
    * gate never ran, which is NOT a pass.
    */
-  executeWorkflowRun(runId: string, verify?: string | null, binary?: string | null): Observable<WorkflowRun> {
+  runWorkflowRunPhase(runId: string, verify?: string | null, binary?: string | null): Observable<WorkflowRun> {
     const variables: { runId: string; verify?: string; binary?: string } = { runId };
     if (typeof verify === 'string' && verify.trim() !== '') {
       variables.verify = verify;
@@ -315,15 +315,15 @@ export class ArenaApiService {
       variables.binary = binary;
     }
     return this.gql
-      .mutate<{ executeWorkflowRun: WorkflowRun }>(
-        `mutation ExecuteWorkflowRun($runId: ID!, $verify: String, $binary: String) {
-          executeWorkflowRun(runId: $runId, verify: $verify, binary: $binary) {
+      .mutate<{ runWorkflowRunPhase: WorkflowRun }>(
+        `mutation RunWorkflowRunPhase($runId: ID!, $verify: String, $binary: String) {
+          runWorkflowRunPhase(runId: $runId, verify: $verify, binary: $binary) {
             ${this.workflowRunFields}
           }
         }`,
         variables
       )
-      .pipe(map((data) => data.executeWorkflowRun));
+      .pipe(map((data) => data.runWorkflowRunPhase));
   }
 
   /** Execute the gate AGAIN for a run that already has a score, replacing it. Its own field, so

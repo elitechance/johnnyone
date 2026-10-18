@@ -249,20 +249,20 @@ describe('ArenaApiService — the arena wire, lazy', () => {
   });
 
   // THE EXECUTE door. A run could be CREATED and then never RUN from the console, because nothing
-  // in the web app called `executeWorkflowRun`. Same run-row selection as the gate operations, and
+  // in the web app called `runWorkflowRunPhase`. Same run-row selection as the gate operations, and
   // the same rule the worker follows: `verify`/`binary` are relayed only when actually supplied.
   it('EXECUTES a phase: sends the runId and asks for the run back with its score', () => {
-    gql.payload = { executeWorkflowRun: {} };
-    api.executeWorkflowRun('r7').subscribe();
-    expect(last().op).toContain('executeWorkflowRun');
+    gql.payload = { runWorkflowRunPhase: {} };
+    api.runWorkflowRunPhase('r7').subscribe();
+    expect(last().op).toContain('runWorkflowRunPhase');
     expect(last().variables).toEqual({ runId: 'r7' });
     // gateExit is THE score, and null there means the gate never ran — not a pass.
     expect(last().op).toContain('gateExit');
   });
 
   it('EXECUTES with the same run selection the gate operations use, so no field is lost', () => {
-    gql.payload = { executeWorkflowRun: {} };
-    api.executeWorkflowRun('r7').subscribe();
+    gql.payload = { runWorkflowRunPhase: {} };
+    api.runWorkflowRunPhase('r7').subscribe();
     const execOp = last().op;
     for (const field of [
       'gateExit', 'gateCollected', 'seatsHeld', 'fleetBusy', 'startedAt', 'endedAt',
@@ -273,8 +273,8 @@ describe('ArenaApiService — the arena wire, lazy', () => {
   });
 
   it('EXECUTES a phase with a supplied non-empty verify and binary sent as variables', () => {
-    gql.payload = { executeWorkflowRun: {} };
-    api.executeWorkflowRun('r7', 'cargo test -p leases', 'kloo').subscribe();
+    gql.payload = { runWorkflowRunPhase: {} };
+    api.runWorkflowRunPhase('r7', 'cargo test -p leases', 'kloo').subscribe();
     expect(last().op).toContain('$verify: String');
     expect(last().op).toContain('$binary: String');
     expect(last().variables).toEqual({ runId: 'r7', verify: 'cargo test -p leases', binary: 'kloo' });
@@ -283,33 +283,33 @@ describe('ArenaApiService — the arena wire, lazy', () => {
   // Absent, NOT null. A null on the wire reads as "the caller explicitly wants no verify command",
   // which is an override of the host's rule; the host owns that rule and must apply its default.
   it('EXECUTES with an omitted verify/binary ABSENT from the variables — the host defaults them', () => {
-    gql.payload = { executeWorkflowRun: {} };
-    api.executeWorkflowRun('r7').subscribe();
+    gql.payload = { runWorkflowRunPhase: {} };
+    api.runWorkflowRunPhase('r7').subscribe();
     expect(last().variables).toEqual({ runId: 'r7' });
     expect(JSON.stringify(last().variables)).not.toContain('verify');
     expect(JSON.stringify(last().variables)).not.toContain('binary');
 
-    api.executeWorkflowRun('r7', null, null).subscribe();
+    api.runWorkflowRunPhase('r7', null, null).subscribe();
     expect(last().variables).toEqual({ runId: 'r7' });
 
-    api.executeWorkflowRun('r7', undefined, undefined).subscribe();
+    api.runWorkflowRunPhase('r7', undefined, undefined).subscribe();
     expect(last().variables).toEqual({ runId: 'r7' });
   });
 
   it('EXECUTES with a blank or whitespace-only verify/binary ABSENT, not relayed as a command', () => {
-    gql.payload = { executeWorkflowRun: {} };
-    api.executeWorkflowRun('r7', '', '   ').subscribe();
+    gql.payload = { runWorkflowRunPhase: {} };
+    api.runWorkflowRunPhase('r7', '', '   ').subscribe();
     expect(last().variables).toEqual({ runId: 'r7' });
-    api.executeWorkflowRun('r7', '  \t\n ', '').subscribe();
+    api.runWorkflowRunPhase('r7', '  \t\n ', '').subscribe();
     expect(last().variables).toEqual({ runId: 'r7' });
     // A supplied one still rides along even when the other is blank.
-    api.executeWorkflowRun('r7', '   ', 'npm run verify').subscribe();
+    api.runWorkflowRunPhase('r7', '   ', 'npm run verify').subscribe();
     expect(last().variables).toEqual({ runId: 'r7', binary: 'npm run verify' });
   });
 
   it('EXECUTES with NO default command or binary anywhere on the web wire', () => {
-    gql.payload = { executeWorkflowRun: {} };
-    api.executeWorkflowRun('r7').subscribe();
+    gql.payload = { runWorkflowRunPhase: {} };
+    api.runWorkflowRunPhase('r7').subscribe();
     const sent = last();
     expect(JSON.stringify(sent.variables)).not.toMatch(/cargo|npm|npx|vitest|kloo|make/);
     expect(sent.op).not.toMatch(/default/i);
@@ -321,13 +321,13 @@ describe('ArenaApiService — the arena wire, lazy', () => {
       seatsHeld: '{"kloo":2}', fleetBusy: '{"running":1}', startedAt: '2026-01-01T00:00:00Z',
       endedAt: null, scoreable: true, notScoreableReason: null,
     };
-    gql.payload = { executeWorkflowRun: row };
+    gql.payload = { runWorkflowRunPhase: row };
     let got: unknown;
-    api.executeWorkflowRun('r7', 'true').subscribe((r) => (got = r));
+    api.runWorkflowRunPhase('r7', 'true').subscribe((r) => (got = r));
     expect(got).toEqual(row);
     // A run whose gate never ran comes back with gateExit null — the caller must not read that 0.
-    gql.payload = { executeWorkflowRun: { ...row, gateExit: null } };
-    api.executeWorkflowRun('r7').subscribe((r) => (got = r));
+    gql.payload = { runWorkflowRunPhase: { ...row, gateExit: null } };
+    api.runWorkflowRunPhase('r7').subscribe((r) => (got = r));
     expect((got as WorkflowRun).gateExit).toBeNull();
   });
 

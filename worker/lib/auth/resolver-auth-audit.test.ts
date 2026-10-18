@@ -96,7 +96,7 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/ai/upsert-provider-config.ts',
   'resolvers/ai/validate-workspace-plan.ts',
   // --- the workflow arena (desktop migration 026) ---
-  'resolvers/ai/execute-workflow-run.ts',
+  'resolvers/ai/run-workflow-run-phase.ts',
   'resolvers/ai/create-workflow-version.ts',
   'resolvers/ai/record-workflow-pref.ts',
   'resolvers/ai/record-workflow-rejection.ts',

@@ -921,7 +921,7 @@ type Mutation {
   #
   # Executes work on the host, so it carries plans:write like startWorkflowRun and
   # runWorkflowRunGate. The result exposes `gateExit`, the run's score.
-  executeWorkflowRun(runId: ID!, verify: String, binary: String): WorkflowRun!
+  runWorkflowRunPhase(runId: ID!, verify: String, binary: String): WorkflowRun!
   # There is deliberately no `comparable` argument — see WorkflowPref.comparable.
   #
   # IDEMPOTENT per ordered pair: calling it again for the same (winner, loser) returns the EXISTING
