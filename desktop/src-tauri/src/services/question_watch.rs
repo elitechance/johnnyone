@@ -385,7 +385,11 @@ pub async fn sweep_and_report(
 /// Needs a live tmux server to do anything, so the loop itself is not
 /// unit-tested; [`QUESTION_POLL_INTERVAL`] and [`session_for_pane`] are.
 pub fn spawn_question_watch(state: AppState) {
-    tokio::spawn(async move {
+    // `tauri::async_runtime::spawn`, NOT `tokio::spawn`: this is called from Tauri's `setup`,
+    // which runs on the main thread with no tokio reactor entered, so a bare `tokio::spawn`
+    // panics there with "there is no reactor running" and takes the host down on boot. The two
+    // long-lived tasks beside it in `main.rs` are spawned the same way.
+    tauri::async_runtime::spawn(async move {
         let mut watch = QuestionWatch::new();
         // The first pass waits for the interval rather than firing at startup:
         // `main.rs` starts this alongside the terminal-status reconciliation and
