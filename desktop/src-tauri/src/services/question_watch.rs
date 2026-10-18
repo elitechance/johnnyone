@@ -41,6 +41,80 @@ pub fn capture_argv(pane_id: &str) -> Vec<String> {
     ]
 }
 
+/// The prefix every tmux session this host owns is named with.
+///
+/// Confirmed in [`crate::terminal`]: `tmux_session_name(session_id)` builds the
+/// owned session name as `format!("johnnyone_{}", safe)`, and
+/// `list_external_tmux_sessions` skips any name that
+/// `starts_with("johnnyone_")` so the user's own sessions are the ones left over
+/// for the user. The prefix is the rule here too — a session merely *containing*
+/// it later in the name belongs to the user and must never be swept.
+pub const AGENT_SESSION_PREFIX: &str = "johnnyone_";
+
+/// The tmux argv that lists EVERY pane on the server with the session it lives
+/// in, one pane per line as `<session>\t<pane_id>`.
+///
+/// `list-panes -a -F '#{session_name}\t#{pane_id}'` and nothing more:
+/// * **`-a`** — without it tmux lists only the panes of the *current* session,
+///   and a host poller has no current session; it has to see the whole server
+///   to find the agent panes it must sweep.
+/// * **`-F`** — a format string, so the output is machine-readable instead of
+///   the default table (which pads, aligns and can truncate a name).
+/// * **`#{session_name}` first** — [`agent_pane_ids`] needs the session to
+///   decide whether the pane is the host's, and the session name is the only
+///   field allowed to contain odd characters, so it goes first and the pane id
+///   is the last field.
+///
+/// Pure on purpose, exactly like [`capture_argv`]: the caller passes this to its
+/// tmux runner (see `run_tmux` in [`crate::terminal`]) and feeds the output to
+/// [`agent_pane_ids`], so tests can assert both halves without a tmux server.
+pub fn list_panes_argv() -> Vec<String> {
+    vec![
+        "list-panes".to_string(),
+        "-a".to_string(),
+        "-F".to_string(),
+        "#{session_name}\t#{pane_id}".to_string(),
+    ]
+}
+
+/// Pick the panes this host owns out of `list_panes_argv()`'s output.
+///
+/// Returns the pane ids whose SESSION NAME starts with
+/// [`AGENT_SESSION_PREFIX`], in the order the lines were given — the caller
+/// sweeps in tmux's own order rather than a reordered one.
+///
+/// The user's own sessions are never returned: the test is `starts_with`, so a
+/// session like `my_johnnyone_notes` that merely contains the prefix is the
+/// user's and is skipped.
+///
+/// Tolerant of what tmux and a pipe can hand back: blank lines and a trailing
+/// newline are skipped, a line with no tab is skipped (it carries no pane id to
+/// act on), and spaces around either field are trimmed — `#{session_name}` is
+/// whatever the user called the session and may well be padded. Nothing here
+/// panics on any input, since the poller runs this on a timer.
+pub fn agent_pane_ids(list_output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in list_output.lines() {
+        // A session name cannot contain a newline, so the first tab always
+        // ends it and the rest is the pane id.
+        let (session, pane_id) = match line.split_once('\t') {
+            Some(pair) => pair,
+            // No tab: not a listing line we can act on.
+            None => continue,
+        };
+        if !session.trim().starts_with(AGENT_SESSION_PREFIX) {
+            continue;
+        }
+        let pane_id = pane_id.trim();
+        // An owned session with no pane id on the line is not a pane.
+        if pane_id.is_empty() {
+            continue;
+        }
+        out.push(pane_id.to_string());
+    }
+    out
+}
+
 /// What the host has already reported, so one question is reported once.
 ///
 /// The memory is keyed by [`QuestionWatch::key`] — the pane id plus a digest
@@ -441,5 +515,206 @@ mod tests {
         // ...and did not poison the watcher: a real ask after it is reported.
         let asking = vec![("%2".to_string(), waiting_screen())];
         assert_eq!(watch.sweep(&asking).len(), 1);
+    }
+
+    // --- finding the panes to sweep --------------------------------------
+    //
+    // Which panes to capture is a decision, so it is expressed as data (the
+    // argv) and as a pure parse (the filter), both assertable without a tmux
+    // server. The poller's shape is: `list_panes_argv()` -> tmux ->
+    // `agent_pane_ids` -> `capture_argv` per pane -> `QuestionWatch::sweep`.
+
+    /// The listing argv asks for every pane on the server in a parseable form.
+    #[test]
+    fn question_host_list_panes_argv_lists_every_pane_with_session_and_id() {
+        let argv = list_panes_argv();
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("list-panes"),
+            "must be a list-panes invocation: {argv:?}"
+        );
+        // `-a` is what widens the listing from the current session to the
+        // whole server — without it the host cannot see its agent panes.
+        assert!(
+            argv.iter().any(|a| a == "-a"),
+            "must carry -a so every session's panes are listed: {argv:?}"
+        );
+        // `-F` is what makes the output parseable instead of a padded table.
+        assert!(
+            argv.iter().any(|a| a == "-F"),
+            "must carry -F so the output is one record per line: {argv:?}"
+        );
+        let format = argv
+            .iter()
+            .find(|a| a.contains("#{session_name}") && a.contains("#{pane_id}"))
+            .unwrap_or_else(|| {
+                panic!("the format must name both the session and the pane: {argv:?}")
+            });
+        // The session must be identifiable as the host's, and the pane must be
+        // capturable, so both fields are required and separated by a tab.
+        assert!(
+            format.contains('\t'),
+            "the two fields must be tab-separated: {format:?}"
+        );
+        assert!(
+            format.find("#{session_name}").unwrap() < format.find("#{pane_id}").unwrap(),
+            "the session name comes first so a name containing a tab cannot \
+             confuse the parse: {format:?}"
+        );
+        // Nothing else: no `-a`-competing target, no `-t`, no `-s`.
+        assert!(
+            !argv.iter().any(|a| a == "-t" || a == "-s" || a == "-e"),
+            "a whole-server listing names no target and wants no colour: {argv:?}"
+        );
+        // Stable across calls — the poller builds it every tick.
+        assert_eq!(argv, list_panes_argv());
+    }
+
+    /// A real-looking mixed listing: only the owned panes come back, in order.
+    #[test]
+    fn question_host_agent_pane_ids_returns_only_the_host_panes_in_order() {
+        // Modelled on the live host: the user's own sessions sit alongside the
+        // `johnnyone_<session id>` ones this host spawned.
+        let listing = concat!(
+            "kloo\t%1\n",
+            "johnnyone_768d2c33-d85a-4013-9cce-722948c87a69\t%2\n",
+            "kloo-cli\t%3\n",
+            "johnnyone_11111111-2222-3333-4444-555555555555\t%4\n",
+            "my work\t%5\n",
+            "johnnyone_dead-1\t%6\n",
+        );
+
+        let ids = agent_pane_ids(listing);
+        assert_eq!(
+            ids,
+            vec!["%2".to_string(), "%4".to_string(), "%6".to_string()],
+            "only the johnnyone_ panes, in the order tmux listed them"
+        );
+
+        // The user's panes are never in there, in any position.
+        assert!(
+            !ids.iter().any(|id| id == "%1" || id == "%3" || id == "%5"),
+            "the user's own sessions must never be swept: {ids:?}"
+        );
+
+        // A single owned pane is still found, and a listing of only the
+        // user's sessions yields nothing at all.
+        assert_eq!(
+            agent_pane_ids("johnnyone_abc\t%9\n"),
+            vec!["%9".to_string()]
+        );
+        assert!(
+            agent_pane_ids("kloo\t%1\nkloo-cli\t%3\n").is_empty(),
+            "nothing owned means nothing to sweep"
+        );
+    }
+
+    /// The prefix is the rule: `johnnyone_` anywhere else in the name is the
+    /// user's session and must not be touched.
+    #[test]
+    fn question_host_agent_pane_ids_requires_the_prefix_not_a_substring() {
+        let listing = concat!(
+            "my_johnnyone_notes\t%1\n",
+            "xjohnnyone_abc\t%2\n",
+            "work-johnnyone_test\t%3\n",
+            "JOHNNYONE_abc\t%4\n",
+            "johnnyone_\t%5\n",
+            "johnnyone_real\t%6\n",
+        );
+
+        let ids = agent_pane_ids(listing);
+        assert_eq!(
+            ids,
+            vec!["%5".to_string(), "%6".to_string()],
+            "only names STARTING with johnnyone_ are the host's: {ids:?}"
+        );
+        for not_ours in ["%1", "%2", "%3", "%4"] {
+            assert!(
+                !ids.iter().any(|id| id == not_ours),
+                "{not_ours} sits in a session that merely contains the \
+                 prefix (or differs in case) and must be left alone"
+            );
+        }
+        // `johnnyone_` with an empty id is still an owned session name.
+        assert!(ids.contains(&"%5".to_string()));
+    }
+
+    /// Ragged input is skipped, never a panic: blank lines, a trailing newline,
+    /// a line with no tab, and padded fields.
+    #[test]
+    fn question_host_agent_pane_ids_tolerates_blank_tabless_and_padded_lines() {
+        let listing = concat!(
+            "\n",
+            "   \n",
+            "johnnyone_a\t%1\n",
+            "no tab on this line at all\n",
+            "johnnyone_b\n",
+            "\t%2\n",
+            "  johnnyone_c  \t  %3  \n",
+            "kloo\t%4\n",
+            "johnnyone_d\t\n",
+            "johnnyone_e\t%5\n",
+            "\n",
+            "\n",
+        );
+
+        let ids = agent_pane_ids(listing);
+        assert_eq!(
+            ids,
+            vec!["%1".to_string(), "%3".to_string(), "%5".to_string()],
+            "blank, tabless, session-less and id-less lines are skipped; \
+             padded fields are trimmed"
+        );
+
+        // The shapes that must never panic, on their own.
+        assert!(agent_pane_ids("").is_empty(), "empty string");
+        assert!(agent_pane_ids("\n").is_empty(), "just a newline");
+        assert!(agent_pane_ids("\n\n\n").is_empty(), "just newlines");
+        assert!(agent_pane_ids("\t").is_empty(), "just a tab");
+        assert!(agent_pane_ids("no tab here").is_empty(), "no tab");
+        assert!(agent_pane_ids("\t\t\t").is_empty(), "tabs only");
+        // A pane id is the last field, so extra fields cannot panic; they are
+        // simply part of what tmux put after the first tab.
+        let extra = agent_pane_ids("johnnyone_x\t%1\textra\tfields");
+        assert_eq!(extra.len(), 1, "one line, one pane id: {extra:?}");
+        assert!(
+            extra[0].starts_with("%1"),
+            "the pane id still leads the remainder: {extra:?}"
+        );
+        // A trailing newline is not a phantom pane.
+        assert_eq!(
+            agent_pane_ids("johnnyone_x\t%1\n"),
+            agent_pane_ids("johnnyone_x\t%1").to_vec(),
+            "a trailing newline must not change the answer"
+        );
+    }
+
+    /// Nothing listed — no tmux server, or a server with no panes — means
+    /// nothing to sweep.
+    #[test]
+    fn question_host_agent_pane_ids_of_an_empty_listing_is_empty() {
+        let mut watch = QuestionWatch::new();
+
+        let ids = agent_pane_ids("");
+        assert!(ids.is_empty(), "an empty listing gives no pane ids: {ids:?}");
+        // And the whole poll collapses to a no-op rather than an error.
+        let screens: Vec<(String, String)> = ids
+            .into_iter()
+            .map(|id| (id, String::new()))
+            .collect();
+        assert!(
+            watch.sweep(&screens).is_empty(),
+            "no panes means no reports"
+        );
+        // Repeatedly, and still nothing.
+        for _ in 0..5 {
+            assert!(agent_pane_ids("").is_empty());
+        }
+        // An empty listing is not the same as a lost memory: once a pane does
+        // appear, its ask is reported.
+        let later = agent_pane_ids("johnnyone_new\t%7\n");
+        assert_eq!(later, vec!["%7".to_string()]);
+        let screens = vec![("%7".to_string(), waiting_screen())];
+        assert_eq!(watch.sweep(&screens).len(), 1);
     }
 }
