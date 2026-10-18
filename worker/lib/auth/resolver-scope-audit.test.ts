@@ -70,6 +70,8 @@ const SCOPE_GATED: Record<string, string> = {
   // only reads.
   'create-workflow-version.ts': 'plans:write',
   'start-workflow-run.ts': 'plans:write',
+  // Runs a phase on the host — execution, so the write scope, not a read.
+  'execute-workflow-run.ts': 'plans:write',
   'record-workflow-run-gate.ts': 'plans:write',
   'record-workflow-run-rescore.ts': 'plans:write',
   'run-workflow-run-rescore.ts': 'plans:write',

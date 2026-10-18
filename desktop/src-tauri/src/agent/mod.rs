@@ -2101,9 +2101,13 @@ impl AgentService {
             workdir: std::path::PathBuf::from(workdir),
             verify,
         };
-        let gate_exit =
-            crate::services::workflows::execute_and_score_workflow_run(state, run_id, &exec)?;
-        Ok(serde_json::json!({ "gateExit": gate_exit }))
+        crate::services::workflows::execute_and_score_workflow_run(state, run_id, &exec)?;
+        // Answer the RUN ROW, not a bare number: the worker's schema declares this mutation to
+        // return `WorkflowRun!`, like its neighbours `startWorkflowRun` and `runWorkflowRunGate`,
+        // whose arms end the same way. The serialised run already carries `gateExit`, so nothing
+        // is invented here and the score is not copied a second time into the payload.
+        let run = crate::services::workflows::get_workflow_run(state, run_id)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
     fn rpc_record_workflow_run_gate(
@@ -4819,6 +4823,15 @@ mod arena_exec_rpc_tests {
             data.get("gateExit").and_then(|v| v.as_i64()),
             Some(7),
             "the arm must answer under the key `gateExit` with the child's code: {data}"
+        );
+        // And it must answer with a WORKFLOW RUN, not a bare number: the worker's schema declares
+        // this mutation to return `WorkflowRun!` with a non-null `id`, so a client selecting `id`
+        // must find it. `gateExit` above is read BY NAME; `id` here pins that the payload is the
+        // run row itself, the same shape `startWorkflowRun` and `runWorkflowRunGate` answer with.
+        assert_eq!(
+            data.get("id").and_then(|v| v.as_str()),
+            Some(run_id.as_str()),
+            "the arm must answer with the run row, whose `id` is the run it executed: {data}"
         );
         assert_eq!(
             recorded_gate(&state, &run_id),

@@ -911,6 +911,17 @@ type Mutation {
   # type from the resolver filename's leading verb and `rescore-` is not a mutation prefix, so the
   # other spelling auto-wires as a Query.
   runWorkflowRunRescore(runId: ID!, phaseId: String): WorkflowRun!
+  # RUN one phase of an existing run on the host — the desktop's `execute_workflow_run` RPC.
+  #
+  # `verify` and `binary` are OPTIONAL and are NOT defaulted by the worker. The host owns the
+  # resolution rule for which verify command and which binary a run executes with; giving this
+  # field a worker-side default would put a second copy of that rule on the wire, where the stale
+  # one wins. Omitting one (or sending blank/whitespace) means "use the host's default", and the
+  # worker relays NOTHING for that key rather than a null that reads as an explicit override.
+  #
+  # Executes work on the host, so it carries plans:write like startWorkflowRun and
+  # runWorkflowRunGate. The result exposes `gateExit`, the run's score.
+  executeWorkflowRun(runId: ID!, verify: String, binary: String): WorkflowRun!
   # There is deliberately no `comparable` argument — see WorkflowPref.comparable.
   #
   # IDEMPOTENT per ordered pair: calling it again for the same (winner, loser) returns the EXISTING
