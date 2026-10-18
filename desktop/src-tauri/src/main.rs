@@ -119,8 +119,10 @@ fn main() {
 
             // Poll the host's own agent panes for a question the agent is stuck
             // at, and tell the console about it once per ask. Like the two above,
-            // this is a long-lived task on Tauri's tokio runtime, and it takes the
-            // same Arc<AppState> the relay and the plan loops use.
+            // this is a long-lived task on Tauri's tokio runtime, and it takes an
+            // `AppState` BY VALUE exactly as `relay::spawn_if_configured` does -
+            // the struct is internally `Arc`'d, so the clone is cheap and the task
+            // shares the one state.
             let question_state = app_state.clone();
             question_watch::spawn_question_watch(question_state);
 

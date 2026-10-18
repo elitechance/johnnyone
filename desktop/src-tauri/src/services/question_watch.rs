@@ -13,7 +13,6 @@
 //! and hands the text in.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::agent_plans::record_agent_report;
@@ -385,7 +384,7 @@ pub async fn sweep_and_report(
 ///
 /// Needs a live tmux server to do anything, so the loop itself is not
 /// unit-tested; [`QUESTION_POLL_INTERVAL`] and [`session_for_pane`] are.
-pub fn spawn_question_watch(state: Arc<AppState>) {
+pub fn spawn_question_watch(state: AppState) {
     tokio::spawn(async move {
         let mut watch = QuestionWatch::new();
         // The first pass waits for the interval rather than firing at startup:
