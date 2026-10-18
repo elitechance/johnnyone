@@ -13,11 +13,21 @@
 //! and hands the text in.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::services::agent_plans::record_agent_report;
 use crate::services::pane_question::{pane_is_asking, PaneQuestion};
 use crate::state::app_state::AppState;
 use crate::terminal::run_tmux;
+
+/// How long the host waits between two question polls.
+///
+/// Twenty seconds is slow enough that a poll is invisible next to the agent's
+/// own turn latency, and fast enough that a blocked agent is not left staring
+/// at its own prompt for minutes. It is a `pub const` so the loop, the tests and
+/// anyone tuning the cadence all read the same number.
+pub const QUESTION_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// The longest ask the console will be shown, in CHARACTERS (not bytes).
 ///
@@ -96,17 +106,85 @@ pub fn question_summary(pane_id: &str, ask: &str) -> String {
     format!("pane {pane_id} is waiting: {cleaned}")
 }
 
+/// The `(id, tmux_pane_id)` rows needed to attribute a question, read from
+/// `sessions`.
+///
+/// Only rows with a NON-NULL `tmux_pane_id` are read: a session with no pane is
+/// not running in a pane, so it can never be the asking one. `NULL` is filtered
+/// in SQL rather than in [`session_for_pane`] so the pure function never has to
+/// invent a stand-in for "no pane" — and a stored empty string is handled there
+/// anyway.
+///
+/// A failure is returned as an error string in the same shape the tmux helpers
+/// use, so one pass can log it and carry on.
+fn session_pane_rows(state: &AppState) -> Result<Vec<(String, String)>, String> {
+    state.db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT id, tmux_pane_id FROM sessions WHERE tmux_pane_id IS NOT NULL")
+            .map_err(|e| format!("read session pane ids: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let pane_id: String = row.get(1)?;
+                Ok((id, pane_id))
+            })
+            .map_err(|e| format!("read session pane ids: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let pair = row.map_err(|e| format!("read session pane ids: {e}"))?;
+            out.push(pair);
+        }
+        Ok(out)
+    })
+}
+
+/// The session running in a pane, out of the `(session_id, tmux_pane_id)` rows
+/// of `sessions`.
+///
+/// Returns the id of the FIRST row whose pane id equals `pane_id` EXACTLY once
+/// both sides are trimmed — a pane id is an opaque token (`%12`), so a prefix or
+/// a substring is not a match. `None` when nothing matches.
+///
+/// A row whose pane id is empty (or only whitespace) never matches ANYTHING,
+/// including an empty query: an empty pane id in the database means "no pane",
+/// and pairing it with a pane id that failed to parse would attribute a question
+/// to a session that has no pane at all.
+///
+/// Pure — no tmux, no database — because which session a question belongs to is
+/// a decision, and a decision is testable.
+pub fn session_for_pane(rows: &[(String, String)], pane_id: &str) -> Option<String> {
+    let query = pane_id.trim();
+    if query.is_empty() {
+        return None;
+    }
+    rows.iter()
+        .find(|(_session_id, row_pane_id)| {
+            let stored = row_pane_id.trim();
+            !stored.is_empty() && stored == query
+        })
+        // The row is `(session_id, tmux_pane_id)`; hand back the session id.
+        .map(|(session_id, _pane_id)| session_id.clone())
+}
+
 /// One polling pass: find the host's agent panes, capture each, and report every
 /// question that has not been reported yet.
 ///
 /// The shape is exactly the one the pure helpers were cut to allow:
 /// [`list_panes_argv`] through [`run_tmux`] -> [`agent_pane_ids`] ->
-/// [`capture_argv`] per pane -> [`QuestionWatch::sweep`] -> one
-/// [`record_agent_report`] per question, with kind `"update"` (narration — what
-/// the console's transcript renders) and the [`question_summary`] line as the
-/// summary. Every other optional field is `None`: this is a one-line narration,
-/// not a verdict, so there are no findings, severity, reason or evidence to
-/// carry.
+/// [`capture_argv`] per pane -> [`QuestionWatch::sweep`] -> [`session_for_pane`]
+/// per asking pane -> one [`record_agent_report`] per question, with kind
+/// `"update"` (narration — what the console's transcript renders) and the
+/// [`question_summary`] line as the summary. Every other optional field is
+/// `None`: this is a one-line narration, not a verdict, so there are no
+/// findings, severity, reason or evidence to carry.
+///
+/// The session a question is reported under is the ASKING PANE'S OWN, resolved
+/// from `sessions.tmux_pane_id` (added by
+/// `migrations/004_add_tmux_terminal.sql`) through [`session_for_pane`] — never
+/// a session id handed in by the caller, which would attribute an agent's ask to
+/// whichever agent happened to start the poll. A pane with no session row is
+/// SKIPPED: it is not ours to report, and guessing a session for it would be
+/// worse than staying silent about it.
 ///
 /// Returns how many questions were reported. A pane whose capture FAILS is
 /// skipped, not fatal — a pane can die between the listing and the capture, and
@@ -114,14 +192,78 @@ pub fn question_summary(pane_id: &str, ask: &str) -> String {
 /// LISTING itself is returned as an error: without it there is nothing to sweep
 /// and the caller has to know the poll did not run.
 ///
+/// Sweep ONLY the panes whose session is known, and return what to report.
+///
+/// The order matters and is the whole point of this function: the session is
+/// resolved BEFORE an ask is handed to [`QuestionWatch::sweep`], so a pane with
+/// no session row is never recorded as seen. Such a pane is an agent that just
+/// started — its `sessions.tmux_pane_id` has not been written yet — which is
+/// exactly when it is most likely to ask something; recording its ask as
+/// reported here would lose the question forever, because nothing is ever sent.
+/// Leaving it unreported means the pass on which the row finally appears tells
+/// the human about it.
+///
+/// A pane whose session IS known goes through `sweep`, so its ask is recorded
+/// as seen and stays reported across later passes: the de-duplication that
+/// stops a constantly-repainting pane from reporting the same ask every 20
+/// seconds is untouched. A pane that is reported and later has its row removed
+/// stays reported — it was already told.
+///
+/// Returns `(session_id, pane_id, question)` per asking pane with a known
+/// session, in the order the screens were given. Pure — no tmux, no database —
+/// so the ordering rule above is testable without a tmux server.
+pub fn sweep_known_panes(
+    rows: &[(String, String)],
+    screens: &[(String, String)],
+    watch: &mut QuestionWatch,
+) -> Vec<(String, String, PaneQuestion)> {
+    // 1. Resolve the session for every captured pane FIRST, and keep only the
+    //    panes we can attribute. An unattributable pane is dropped here, so it
+    //    never reaches `sweep` and never enters the watcher's memory.
+    let mut known: Vec<(String, String, String)> = Vec::new();
+    for (pane_id, screen) in screens {
+        match session_for_pane(rows, pane_id) {
+            Some(session_id) => known.push((session_id, pane_id.clone(), screen.clone())),
+            None => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    "leaving a question from a pane with no session row unreported"
+                );
+            }
+        }
+    }
+
+    // 2. Detect and de-duplicate over just those panes, then attribute each
+    //    question to the session resolved in step 1.
+    let pairs: Vec<(String, String)> = known
+        .iter()
+        .map(|(_session_id, pane_id, screen)| (pane_id.clone(), screen.clone()))
+        .collect();
+    let found = watch.sweep(&pairs);
+    found
+        .into_iter()
+        .filter_map(|(pane_id, question)| {
+            let session_id = known
+                .iter()
+                .find(|(_session_id, known_pane, _screen)| *known_pane == pane_id)
+                .map(|(session_id, _pane_id, _screen)| session_id.clone())?;
+            Some((session_id, pane_id, question))
+        })
+        .collect()
+}
+
 /// Needs a live tmux server, so it is deliberately not unit-tested; the argv
-/// builders, the pane filter, the sweep and [`question_summary`] above are the
-/// tested parts.
+/// builders, the pane filter, the sweep, [`session_for_pane`],
+/// [`sweep_known_panes`] and [`question_summary`] are the tested parts.
 pub async fn sweep_and_report(
     state: &AppState,
     watch: &mut QuestionWatch,
-    session_id: &str,
 ) -> Result<usize, String> {
+    // 0. Which session owns which pane. Without this a question would have to
+    //    be reported under a session id the caller guessed, which attributes
+    //    the ask to whichever agent happened to start the poll.
+    let rows = session_pane_rows(state)?;
+
     // 1. Which panes exist. A failure here is fatal to the pass.
     let listing = run_tmux(list_panes_argv()).await?;
 
@@ -141,15 +283,17 @@ pub async fn sweep_and_report(
         }
     }
 
-    // 4. Detect, de-duplicating against what this watcher already reported.
-    let found = watch.sweep(&screens);
+    // 4. Resolve each pane's session BEFORE the ask is recorded as seen, then
+    //    detect and de-duplicate over just the panes that can be attributed.
+    let found = sweep_known_panes(&rows, &screens, watch);
 
-    // 5. Report each new question to the console.
+    // 5. Report each new question to the console, under the session that is
+    //    actually running in the pane that asked.
     let mut reported = 0usize;
-    for (pane_id, question) in &found {
+    for (session_id, pane_id, question) in &found {
         record_agent_report(
             state,
-            session_id.to_string(),
+            session_id.clone(),
             "update".to_string(),
             None,
             None,
@@ -162,6 +306,46 @@ pub async fn sweep_and_report(
         reported += 1;
     }
     Ok(reported)
+}
+
+/// Start the host's own question poller.
+///
+/// The watcher is created ONCE, outside the loop, and lives for the whole task:
+/// its memory of what has been reported is what stops a waiting pane — which
+/// repaints many times a second — from reporting the same ask on every single
+/// pass. Rebuilding it per pass would report the question every 20 seconds.
+///
+/// An error from a pass is LOGGED and the loop continues. Every failure it can
+/// hit is transient by nature: no tmux server yet at startup, a pane that died
+/// mid-pass, a GraphQL mutation that timed out, a database row being written
+/// while we read it. A poller that exits on the first one of those would stop
+/// telling the human about blocked agents for the rest of the session, which is
+/// worse than any of the errors it would have died on.
+///
+/// Needs a live tmux server to do anything, so the loop itself is not
+/// unit-tested; [`QUESTION_POLL_INTERVAL`] and [`session_for_pane`] are.
+pub fn spawn_question_watch(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut watch = QuestionWatch::new();
+        // The first pass waits for the interval rather than firing at startup:
+        // `main.rs` starts this alongside the terminal-status reconciliation and
+        // the relay registration, and a `list-panes` competing with all of that
+        // buys nothing — no agent has had time to ask anything yet.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + QUESTION_POLL_INTERVAL,
+            QUESTION_POLL_INTERVAL,
+        );
+        loop {
+            ticker.tick().await;
+            match sweep_and_report(&state, &mut watch).await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "Reported waiting agent questions"),
+                Err(error) => {
+                    tracing::warn!(%error, "Question poll failed; trying again next tick")
+                }
+            }
+        }
+    });
 }
 
 /// The tmux argv that captures ONE visible screen for one pane.
@@ -344,6 +528,356 @@ impl QuestionWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- which session does a pane belong to? ----------------------------
+    //
+    // A question reported under the WRONG session id is attributed to the wrong
+    // agent, so the pane→session lookup is pure data and tested as such. The
+    // rows are `(session_id, tmux_pane_id)` — the two columns
+    // `sweep_and_report` reads out of `sessions`.
+
+    fn row(session_id: &str, pane_id: &str) -> (String, String) {
+        (session_id.to_string(), pane_id.to_string())
+    }
+
+    /// The lookup is by the pane's EXACT id, and it hands back the session id —
+    /// the first element of the row, not the pane id.
+    #[test]
+    fn question_session_exact_pane_id_match_returns_that_session_id() {
+        let rows = vec![
+            row("11111111-1111-1111-1111-111111111111", "%1"),
+            row("22222222-2222-2222-2222-222222222222", "%2"),
+            row("33333333-3333-3333-3333-333333333333", "%3"),
+        ];
+
+        assert_eq!(
+            session_for_pane(&rows, "%2"),
+            Some("22222222-2222-2222-2222-222222222222".to_string()),
+            "the middle pane must resolve to the session running in it"
+        );
+        // Every row is reachable, in any position.
+        assert_eq!(
+            session_for_pane(&rows, "%1"),
+            Some("11111111-1111-1111-1111-111111111111".to_string())
+        );
+        assert_eq!(
+            session_for_pane(&rows, "%3"),
+            Some("33333333-3333-3333-3333-333333333333".to_string())
+        );
+        // A single row is still resolved.
+        let one = vec![row("solo", "%42")];
+        assert_eq!(session_for_pane(&one, "%42"), Some("solo".to_string()));
+        // An exact match is not a prefix or substring match: a pane id is an
+        // opaque token, so `%1` must never resolve through `%12`.
+        let prefix = vec![row("wide", "%12")];
+        assert_eq!(session_for_pane(&prefix, "%1"), None, "%1 is not %12");
+        assert_eq!(session_for_pane(&prefix, "1"), None, "no bare-digit match");
+        assert_eq!(session_for_pane(&prefix, "%1x"), None, "no prefix match");
+        assert_eq!(session_for_pane(&prefix, "2"), None, "no substring match");
+        // And it is case-sensitive: tmux ids are not case-folded.
+        assert_eq!(session_for_pane(&prefix, "%X"), None);
+    }
+
+    /// A pane with no row is nobody's session — the caller must skip it rather
+    /// than report under a guessed id.
+    #[test]
+    fn question_session_pane_id_matching_no_row_returns_none() {
+        let rows = vec![
+            row("session-a", "%1"),
+            row("session-b", "%2"),
+            row("session-c", ""),
+        ];
+
+        assert_eq!(session_for_pane(&rows, "%3"), None, "unlisted pane");
+        assert_eq!(session_for_pane(&rows, "%99"), None, "farther along");
+        assert_eq!(session_for_pane(&rows, ""), None, "empty query");
+        assert_eq!(session_for_pane(&rows, "   "), None, "blank query");
+        assert_eq!(session_for_pane(&rows, "%"), None, "bare caret");
+        assert_eq!(session_for_pane(&rows, "session-a"), None, "not by session id");
+
+        // No rows at all — no session has a pane yet — resolves nothing, and
+        // does not panic.
+        let empty: Vec<(String, String)> = vec![];
+        assert_eq!(session_for_pane(&empty, "%1"), None);
+        assert_eq!(session_for_pane(&empty, ""), None);
+        for _ in 0..5 {
+            assert_eq!(session_for_pane(&empty, "%1"), None);
+        }
+    }
+
+    /// Both sides are trimmed: a stored pane id with padding and a padded query
+    /// still find the same session.
+    #[test]
+    fn question_session_padded_rows_and_padded_query_still_match() {
+        let rows = vec![
+            row("session-pad", "  %7  "),
+            row("session-tab", "\t%8\n"),
+            row("session-plain", "%9"),
+        ];
+
+        assert_eq!(
+            session_for_pane(&rows, "%7"),
+            Some("session-pad".to_string()),
+            "a padded stored pane id must still match a clean query"
+        );
+        assert_eq!(
+            session_for_pane(&rows, "  %7"),
+            Some("session-pad".to_string()),
+            "a padded query must still match"
+        );
+        assert_eq!(
+            session_for_pane(&rows, "\t %7 \n"),
+            Some("session-pad".to_string()),
+            "any surrounding whitespace is trimmed on both sides"
+        );
+        // Tabs and a trailing newline in the stored value too.
+        assert_eq!(session_for_pane(&rows, "%8"), Some("session-tab".to_string()));
+        assert_eq!(
+            session_for_pane(&rows, "%8 "),
+            Some("session-tab".to_string())
+        );
+        // A clean row is unaffected by the trimming rule.
+        assert_eq!(
+            session_for_pane(&rows, " %9 "),
+            Some("session-plain".to_string())
+        );
+        // Trimming must not turn one id into another.
+        assert_eq!(session_for_pane(&rows, "%77"), None);
+        assert_eq!(session_for_pane(&rows, "7"), None);
+    }
+
+    /// An empty pane id in a row means "this session has no pane", so it never
+    /// matches — not even an empty query.
+    #[test]
+    fn question_session_empty_pane_id_never_matches_even_an_empty_query() {
+        let rows = vec![
+            row("session-empty", ""),
+            row("session-blank", "   "),
+            row("session-nl", "\n"),
+            row("session-real", "%1"),
+        ];
+
+        assert_eq!(
+            session_for_pane(&rows, ""),
+            None,
+            "an empty query must not fall back onto a pane-less session"
+        );
+        assert_eq!(session_for_pane(&rows, "   "), None, "blank is empty");
+        assert_eq!(session_for_pane(&rows, "\n"), None, "a newline is empty");
+        // A row with an empty pane id matches nothing at all, empty or not.
+        for query in ["", " ", "%1", "%2", "session-empty"] {
+            let hit = session_for_pane(&rows, query);
+            if query.trim() == "%1" {
+                assert_eq!(hit, Some("session-real".to_string()), "{query:?}");
+            } else {
+                assert_eq!(hit, None, "{query:?} must not resolve: {hit:?}");
+            }
+        }
+        // A lone empty row resolves nothing, whatever is asked.
+        let only_empty = vec![row("orphan", "")];
+        assert_eq!(session_for_pane(&only_empty, ""), None);
+        assert_eq!(session_for_pane(&only_empty, "%1"), None);
+        // The real row is still found despite the empty ones sitting in front.
+        assert_eq!(
+            session_for_pane(&rows, " %1 "),
+            Some("session-real".to_string())
+        );
+    }
+
+    /// Two rows claiming one pane: the FIRST wins, deterministically, so the
+    /// same ask always lands on the same session.
+    #[test]
+    fn question_session_first_matching_row_wins_when_two_share_a_pane_id() {
+        let rows = vec![
+            row("session-first", "%5"),
+            row("session-second", "%5"),
+            row("session-third", "%5"),
+            row("session-other", "%6"),
+        ];
+
+        assert_eq!(
+            session_for_pane(&rows, "%5"),
+            Some("session-first".to_string()),
+            "the first row in table order claims the pane"
+        );
+        // Deterministic across repeated lookups and a padded query.
+        for _ in 0..10 {
+            assert_eq!(
+                session_for_pane(&rows, "%5"),
+                Some("session-first".to_string())
+            );
+        }
+        assert_eq!(
+            session_for_pane(&rows, " %5 "),
+            Some("session-first".to_string())
+        );
+        // The later duplicate is simply not reachable, and the other pane is
+        // untouched by the collision.
+        assert_eq!(session_for_pane(&rows, "%6"), Some("session-other".to_string()));
+        // An empty-pane-id duplicate cannot win either: the first USABLE row does.
+        let with_empty = vec![
+            row("orphan", ""),
+            row("session-first", "%5"),
+            row("session-second", "%5"),
+        ];
+        assert_eq!(
+            session_for_pane(&with_empty, "%5"),
+            Some("session-first".to_string()),
+            "an empty row is skipped, not chosen as the first match"
+        );
+    }
+
+    // --- which panes are swept, and when an ask is remembered ------------
+    //
+    // `sweep_and_report` resolves the pane's session BEFORE the ask is recorded
+    // as seen, so a pane with no session row stays unreported and is told when
+    // its row appears. That ordering is the whole decision, and
+    // `sweep_known_panes` is the pure shape that makes it testable without a
+    // tmux server.
+
+    /// The regression test: a pane with no session row must produce NOTHING,
+    /// and must not be remembered — the same watcher and the same screen must
+    /// report the question once the row appears. Recording the ask as seen
+    /// while skipping the report would lose it forever, and the pane in
+    /// question is an agent that just started, i.e. exactly the one most likely
+    /// to be asking.
+    #[test]
+    fn question_session_an_unknown_session_is_not_remembered() {
+        let mut watch = QuestionWatch::new();
+        let screens = vec![("%42".to_string(), waiting_screen())];
+
+        // No session row for %42 yet — the agent just started and its
+        // `tmux_pane_id` has not been written. Nothing is reported...
+        let rows: Vec<(String, String)> = vec![row("session-other", "%1")];
+        let first = sweep_known_panes(&rows, &screens, &mut watch);
+        assert!(
+            first.is_empty(),
+            "a pane with no session row must not be reported: {first:?}"
+        );
+
+        // ...and the ask was NOT remembered: many later passes with the SAME
+        // watcher and the SAME screen still produce nothing while the row is
+        // missing, but the moment the row appears the question is told.
+        for _ in 0..5 {
+            assert!(
+                sweep_known_panes(&rows, &screens, &mut watch).is_empty(),
+                "still no row, still nothing to report"
+            );
+        }
+
+        let rows_with_pane = vec![
+            row("session-other", "%1"),
+            row("session-new", " %42 "),
+        ];
+        let after = sweep_known_panes(&rows_with_pane, &screens, &mut watch);
+        assert_eq!(
+            after.len(),
+            1,
+            "the ask must survive until the session row appears: {after:?}"
+        );
+        assert_eq!(
+            after[0].0, "session-new",
+            "the question is attributed to the pane's own session"
+        );
+        assert_eq!(after[0].1, "%42", "the entry names the asking pane");
+        assert!(
+            after[0].2.ask.contains("please\nconfirm which one you want"),
+            "the report carries the agent's ask: {:?}",
+            after[0].2.ask
+        );
+
+        // Now that it HAS been told, it is remembered: the de-duplication is
+        // intact, so the repaints after the report stay silent.
+        for _ in 0..5 {
+            assert!(
+                sweep_known_panes(&rows_with_pane, &screens, &mut watch).is_empty(),
+                "a reported question must not be reported again"
+            );
+        }
+    }
+
+    /// A pane that DOES have a session row is reported once, and a later pass
+    /// with the same watcher and the same screen produces nothing — the
+    /// de-duplication must not be lost while fixing the unknown-pane case.
+    #[test]
+    fn question_session_a_known_session_is_remembered() {
+        let mut watch = QuestionWatch::new();
+        let rows = vec![row("session-a", "%1"), row("session-b", "%2")];
+        let screens = vec![("%2".to_string(), waiting_screen())];
+
+        let first = sweep_known_panes(&rows, &screens, &mut watch);
+        assert_eq!(
+            first.len(),
+            1,
+            "a pane with a session row must be reported: {first:?}"
+        );
+        assert_eq!(first[0].0, "session-b", "under its own session");
+        assert_eq!(first[0].1, "%2", "naming the asking pane");
+        assert!(
+            first[0].2.ask.contains("clamp before or after"),
+            "the report carries the ask: {:?}",
+            first[0].2.ask
+        );
+
+        // Later passes: same watcher, same rows, same screen — nothing.
+        for _ in 0..10 {
+            assert!(
+                sweep_known_panes(&rows, &screens, &mut watch).is_empty(),
+                "a waiting pane repaints constantly and must report once"
+            );
+        }
+        // A row that vanishes later does not un-report an already-told ask.
+        let rows_now_empty: Vec<(String, String)> = vec![];
+        assert!(
+            sweep_known_panes(&rows_now_empty, &screens, &mut watch).is_empty(),
+            "already reported stays reported"
+        );
+        // And a watcher built per pass would report every pass — which is why
+        // the loop keeps one watcher.
+        let mut fresh = QuestionWatch::new();
+        assert_eq!(sweep_known_panes(&rows, &screens, &mut fresh).len(), 1);
+    }
+
+    /// The poll cadence is the one the host and the console agree on: 20 seconds.
+    #[test]
+    fn question_session_poll_interval_is_twenty_seconds() {
+        assert_eq!(
+            QUESTION_POLL_INTERVAL,
+            Duration::from_secs(20),
+            "the host polls for agent questions every 20 seconds"
+        );
+        assert_eq!(QUESTION_POLL_INTERVAL.as_secs(), 20);
+        assert_eq!(QUESTION_POLL_INTERVAL.as_millis(), 20_000);
+        // Not a zero or sub-second tick, which would hammer tmux: the loop
+        // shells out to `list-panes` plus one capture per pane every pass.
+        assert!(
+            QUESTION_POLL_INTERVAL > Duration::from_secs(1),
+            "a poll must not spin: {QUESTION_POLL_INTERVAL:?}"
+        );
+    }
+
+    /// The loop keeps ONE watcher across passes, so the memory that makes a
+    /// question report-once lives outside the pass, not inside it.
+    #[test]
+    fn question_session_watch_is_reused_across_passes() {
+        let mut watch = QuestionWatch::new();
+        let screens = vec![("%1".to_string(), waiting_screen())];
+
+        // What the loop does every 20 seconds: same watcher, same screens.
+        assert_eq!(watch.sweep(&screens).len(), 1, "the first pass reports");
+        for _ in 0..5 {
+            assert_eq!(
+                watch.sweep(&screens).len(),
+                0,
+                "a later pass with the same watcher stays silent"
+            );
+        }
+        // A watcher built per pass would report every pass — the bug the
+        // single long-lived watcher in `spawn_question_watch` avoids.
+        let mut fresh = QuestionWatch::new();
+        assert_eq!(fresh.sweep(&screens).len(), 1);
+        assert_eq!(QuestionWatch::new().sweep(&screens).len(), 1);
+    }
 
     /// The waiting screen from `waiting_screen` in the pane_question tests:
     /// prose ask, `─` rule, status line, idle composer with a U+00A0 after the
