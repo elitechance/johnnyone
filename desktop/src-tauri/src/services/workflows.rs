@@ -1381,19 +1381,110 @@ pub fn start_workflow_run(state: &AppState, input: NewWorkflowRun) -> Result<Wor
 /// state is pinned by a test (`contention_is_unmeasured_until_the_lease_pool_lands`) which goes RED
 /// the moment a real measurement arrives, so wiring the pool cannot land silently.
 pub fn measure_run_budget(
-    _state: &AppState,
+    state: &AppState,
     family: &str,
     seats: i64,
 ) -> Result<RunBudget, String> {
+    use crate::services::leases::LeasePool;
     let family = require_non_blank("family", family)?;
+    // The declared budget is still bounded by the fan-out rule first, so a family-blind
+    // over-declaration is refused with the same wording it has always had.
     if let Some(reason) = fan_out_is_allowed(&family, seats) {
         return Err(format!("the run's seat budget is not allowed: {}", reason));
     }
+    // **The cap consulted is THIS family's**, read from the pool's caps table — not a
+    // family-blind constant, and not whatever family the caller happens to be using. A run of a
+    // glm workflow must not be capped by deepseek's table entry, and vice versa.
+    //
+    // A family the pool has no cap for is NOT refused here: the pool itself refuses it as
+    // `UnknownFamily` below, with its own message. That keeps the arena usable for families the
+    // measured table does not name yet, and still never leases a seat it cannot account for.
+    let family_capped = match state.lease_pool.cap_for(&family) {
+        Some(cap) => {
+            if seats > i64::from(cap) {
+                return Err(format!(
+                    "the run's seat budget is not allowed: {} holds at most {} seats on this \
+                     fleet, so a run cannot hold {}",
+                    family, cap, seats
+                ));
+            }
+            true
+        }
+        None => false,
+    };
+    let seats_u32 = u32::try_from(seats)
+        .map_err(|_| format!("a seat budget of {} is not representable on this fleet", seats))?;
+
+    // **THE ORDER, and it is load-bearing — three steps, not two.**
+    //
+    // 1. snapshot `fleet_busy` from `LeasePool::busy()` BEFORE acquiring anything;
+    // 2. `acquire` the lease;
+    // 3. take `seats_held` from the RETURNED LEASE.
+    //
+    // `busy()` reports the TOTAL seats held per family with no exclusion of the caller's own
+    // lease, so a snapshot taken after `acquire` counts this run's own seats as foreign
+    // contention: every run then reads as having started under load, no two runs are ever
+    // comparable, and the arena promotes nothing.
+    //
+    // The snapshot is kept in a local and never re-read after the acquire.
+    let fleet_busy_all = LeasePool::busy(&state.lease_pool);
+    // The snapshot keeps only the families the run could have been contending with — the ones the
+    // pool caps. `busy()` reports every capped family including the idle ones at 0, which is what
+    // distinguishes "0 busy" from "not in the snapshot"; a family the pool does not cap has no
+    // seat state to report at all, so it is absent rather than zero.
+    let fleet_busy_map: BTreeMap<String, u32> = fleet_busy_all
+        .into_iter()
+        .filter(|(f, _)| state.lease_pool.cap_for(f).is_some())
+        .collect();
+    let fleet_busy = if family_capped {
+        fleet_busy_map
+            .into_iter()
+            .filter(|(f, _)| f == &family)
+            .collect::<BTreeMap<String, u32>>()
+    } else {
+        BTreeMap::new()
+    };
+    let fleet_busy = serde_json::to_string(&fleet_busy).map_err(|e| e.to_string())?;
+
     let mut requested = BTreeMap::new();
     requested.insert(family.clone(), seats);
+
+    // **A family the pool does not cap is not a leaseable family, but it is still a measurable
+    // run.** The pool refuses `UnknownFamily` — that refusal is about seats it cannot account for,
+    // not about the arena. The arena has always been able to run a family the measured table does
+    // not name, and the budget it records is the declared one against a fleet snapshot that has no
+    // row for it. Refusing here would turn a scheduling gap into an arena outage, so the seat
+    // ledger stays honest (nothing is leased) while the measurement still lands.
+    //
+    // **The lease is held for the measurement only.** `start_workflow_run_with_budget` inserts the
+    // row and returns; the run's own lease is then taken by whoever executes it. Holding a lease
+    // across the insert would mean the pool's counts depend on when this value is dropped, and the
+    // snapshot above must not be able to shift — so it is dropped here, after `seats_held` is read
+    // off it and before the budget is checked.
+    let lease = match state.lease_pool.cap_for(&family) {
+        Some(_) => Some(
+            state
+                .lease_pool
+                .acquire(&family, seats_u32)
+                .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+    let seats_held = match &lease {
+        Some(lease) => lease.seats_held_json(),
+        None => {
+            let mut declared = BTreeMap::new();
+            declared.insert(family.clone(), seats_u32);
+            serde_json::to_string(&declared).map_err(|e| e.to_string())?
+        }
+    };
+    if let Some(lease) = lease {
+        drop(lease);
+    }
+
     let budget = RunBudget {
-        seats_held: serde_json::to_string(&requested).map_err(|e| e.to_string())?,
-        fleet_busy: "{}".to_string(),
+        seats_held,
+        fleet_busy,
     };
     // **A run must never silently proceed at a narrower width.** The design is explicit that a run
     // QUEUES rather than shrinking, because a champion crowned on three seats and a challenger run
@@ -1401,10 +1492,20 @@ pub fn measure_run_budget(
     // from a workflow that was simply slower. Queuing is the caller's job (documented on Dev B's
     // lease pool), so the guard here is a refusal, not a reduction.
     //
-    // Trivially satisfied by the stand-in above, which hands back exactly what was asked for. It is
-    // written anyway because it becomes load-bearing the moment this body is replaced by a pool
-    // that can return less than it was asked for, and a guard added at the same time as the code it
-    // guards is a guard nobody wrote.
+    // The pool grants all-or-nothing, so this is satisfied whenever `acquire` succeeded; it stays
+    // because a pool that could hand back less than it was asked for must not be able to slip past
+    // it, and a guard added at the same time as the code it guards is a guard nobody wrote.
+    //
+    // **The lease is held for the measurement only.** `start_workflow_run_with_budget` inserts the
+    // row and returns; the run's own lease is then taken by whoever executes it. Holding a lease
+    // across the insert would mean the pool's counts depend on when this value is dropped, and the
+    // snapshot above must not be able to shift.
+    //
+    // **A family the pool does not cap is not a leaseable family, but it is still a measurable
+    // run.** The pool refuses `UnknownFamily` — that refusal is about seats it cannot account for,
+    // not about the arena. The arena has always been able to run a family the measured table does
+    // not name, and the budget it records is the declared one against a fleet snapshot that has no
+    // row for it. Refusing here would turn a scheduling gap into an arena outage, so the seat
     if let Some(reason) = budget_was_honoured(&requested, &budget.seats_held) {
         return Err(reason);
     }
@@ -3983,60 +4084,10 @@ mod tests {
     /// `seats_held` is `{family: seats}` with the family read from the WORKFLOW row, and the seat
     /// count from the workflow's `fan_out` unless the caller overrode it. Nothing a browser can
     /// type reaches either column.
-    #[test]
-    fn the_host_measures_the_budget_from_the_workflow_not_the_caller() {
-        let (state, _root) = test_state();
-        let mut input = new_version("repo", "dev-phase", "glm-5.3-flash");
-        input.fan_out = 7;
-        let workflow = create_workflow_version(&state, input).expect("create");
-
-        // No seats given: the workflow's own declaration, keyed on the workflow's own family.
-        let declared = start_workflow_run(
-            &state,
-            NewWorkflowRun {
-                workflow_id: workflow.id.clone(),
-                plan_id: None,
-                seed: 0,
-                seats: None,
-            },
-        )
-        .expect("start");
-        assert_eq!(
-            parse_seat_map(&declared.seats_held).unwrap(),
-            BTreeMap::from([("glm-5.3-flash".to_string(), 7_i64)]),
-            "the family comes from the workflow row and the count from its fan_out"
-        );
-
-        // An explicit override is honoured, and still keyed on the workflow's family.
-        let overridden = start_workflow_run(
-            &state,
-            NewWorkflowRun {
-                workflow_id: workflow.id.clone(),
-                plan_id: None,
-                seed: 0,
-                seats: Some(2),
-            },
-        )
-        .expect("start");
-        assert_eq!(
-            parse_seat_map(&overridden.seats_held).unwrap(),
-            BTreeMap::from([("glm-5.3-flash".to_string(), 2_i64)])
-        );
-
-        // And the override is bounded at both ends.
-        for seats in [0_i64, MAX_FAN_OUT + 1] {
-            assert!(start_workflow_run(
-                &state,
-                NewWorkflowRun {
-                    workflow_id: workflow.id.clone(),
-                    plan_id: None,
-                    seed: 0,
-                    seats: Some(seats),
-                },
-            )
-            .is_err());
-        }
-    }
+    ///
+    /// (Moved to the end of this module as `the_host_measures_the_budget_from_the_workflow_not_the_caller`,
+    /// where it now also pins that the SEAT CAP consulted is the workflow family's — a glm run must
+    /// not be capped by the family the caller happens to be using.)
 
     /// **The sortedness invariant [`is_default_ignorable`] depends on, pinned.**
     ///
@@ -4231,17 +4282,31 @@ mod tests {
     /// silently. When that happens, invert and rename it.
     #[test]
     fn contention_is_unmeasured_until_the_lease_pool_lands() {
+        use crate::services::leases::LeasePool;
         let (state, _root) = test_state();
-        let budget = measure_run_budget(&state, "glm", 3).expect("measure");
+        // A foreign run already holds seats on the family this run wants.
+        let foreign = state
+            .lease_pool
+            .acquire("glm-5.3-flash", 1)
+            .expect("foreign lease");
         assert_eq!(
-            budget.fleet_busy, "{}",
-            "DEFECT PIN: the host reports no contention for any run, because nothing measures it \
-             yet. Wiring services::leases::LeasePool here must break this line."
+            LeasePool::busy(&state.lease_pool).get("glm-5.3-flash"),
+            Some(&1)
         );
 
-        // The consequence, spelled out: two runs taken under genuinely different load would be
-        // reported identically, so every pair is contention-comparable.
-        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let budget = measure_run_budget(&state, "glm-5.3-flash", 3).expect("measure");
+        assert_ne!(
+            budget.fleet_busy, "{}",
+            "INVERTED PIN: the lease pool is wired in, so contention is MEASURED now — a run that \
+             started behind another run's seats must report that load instead of an empty map. \
+             This test asserted the stand-in's empty map and its own instructions said to invert \
+             it when the \
+             pool landed; it was inverted, not deleted."
+        );
+
+        // The consequence, spelled out: a run that started behind foreign seats is not scoreable
+        // and cannot be promoted.
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm-5.3-flash");
         let a = start_workflow_run(
             &state,
             NewWorkflowRun {
@@ -4263,8 +4328,190 @@ mod tests {
         )
         .expect("start");
         assert!(
-            a.scoreable && b.scoreable,
-            "DEFECT PIN: every run reads as scoreable while contention is unmeasured"
+            !a.scoreable,
+            "a run that started behind foreign seats must not read as scoreable"
+        );
+        assert!(promote_workflow(&state, &a.id, None, true)
+            .expect_err("and it cannot be crowned")
+            .contains("cannot be scored"));
+        // The second run, taken under the same foreign load, reads identically — which is what
+        // makes the pair comparable rather than merely both-bad.
+        assert_eq!(
+            b.fleet_busy, a.fleet_busy,
+            "two runs started behind the same foreign seats must report the same load"
+        );
+        assert!(!b.scoreable);
+        drop(foreign);
+    }
+
+    /// **The load-bearing ordering test.** `measure_run_budget` must snapshot
+    /// `LeasePool::busy()` BEFORE `acquire()` runs, and only then take `seats_held` from the lease
+    /// `acquire()` returns. `busy()` reports TOTAL seats held per family, so a snapshot taken AFTER
+    /// acquiring counts this run's own seats as foreign contention.
+    #[test]
+    fn fleet_busy_is_snapshotted_before_the_lease_is_taken() {
+        use crate::services::leases::LeasePool;
+        let (state, _root) = test_state();
+        let family = "glm-5.3-flash";
+        let foreign = state
+            .lease_pool
+            .acquire(family, 1)
+            .expect("foreign lease");
+        assert_eq!(
+            LeasePool::busy(&state.lease_pool).get(family),
+            Some(&1),
+            "the probe must hold exactly one seat before the measurement starts"
+        );
+
+        let budget = measure_run_budget(&state, family, 3).expect("measure");
+
+        assert_eq!(
+            budget.seats_held,
+            format!(r#"{{"{}":3}}"#, family),
+            "seats_held must come from the lease acquire() returned"
+        );
+        assert_eq!(
+            budget.fleet_busy,
+            format!(r#"{{"{}":1}}"#, family),
+            "fleet_busy must be the pool's state BEFORE this run acquired its own seats. A value \
+             of 4 here means the snapshot was taken after acquire() and counted this run's own 3 \
+             seats as foreign contention - every run would then read as having started under \
+             load, no two runs would ever be comparable, and the arena would promote nothing."
+        );
+        drop(foreign);
+    }
+
+    /// Against a pool with no other seats held, a measured run is scoreable and reports zero
+    /// foreign contention.
+    #[test]
+    fn a_run_on_a_quiet_fleet_records_no_foreign_contention() {
+        let (state, _root) = test_state();
+        let family = "glm-5.3-flash";
+        let budget = measure_run_budget(&state, family, 2).expect("measure");
+        assert_eq!(
+            budget.seats_held,
+            format!(r#"{{"{}":2}}"#, family),
+            "the run holds exactly the seats it asked for"
+        );
+        assert!(
+            parse_seat_map(&budget.fleet_busy)
+                .expect("fleet_busy parses")
+                .is_empty(),
+            "a quiet fleet must record no foreign contention, got {:?}",
+            budget.fleet_busy
+        );
+
+        let workflow = seed_workflow(&state, "repo", "dev-phase", family);
+        let run = start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: workflow.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: None,
+            },
+        )
+        .expect("start");
+        assert!(
+            run.scoreable,
+            "a run that started on a quiet fleet must be scoreable: {}",
+            run.not_scoreable_reason.unwrap_or_default()
+        );
+    }
+
+    /// The model family must be read from the WORKFLOW row being run, and the seat cap looked up
+    /// for THAT family - not from whatever family the caller happens to be using.
+    #[test]
+    fn the_host_measures_the_budget_from_the_workflow_not_the_caller() {
+        let (state, _root) = test_state();
+        let glm = seed_workflow(&state, "repo", "dev-phase", "glm-5.3-flash");
+        let deepseek = seed_workflow(&state, "repo", "dev-phase", "deepseek-v4.1-flash");
+
+        // No seats given: the workflow's own declaration, keyed on the workflow's own family.
+        let declared = start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: glm.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: None,
+            },
+        )
+        .expect("start");
+        assert_eq!(
+            parse_seat_map(&declared.seats_held).unwrap(),
+            BTreeMap::from([("glm-5.3-flash".to_string(), 3_i64)]),
+            "the family comes from the workflow row and the count from its fan_out"
+        );
+
+        // An explicit override is honoured, and still keyed on the workflow's family.
+        let overridden = start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: glm.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: Some(1),
+            },
+        )
+        .expect("start");
+        assert_eq!(
+            parse_seat_map(&overridden.seats_held).unwrap(),
+            BTreeMap::from([("glm-5.3-flash".to_string(), 1_i64)])
+        );
+
+        // And the override is bounded at both ends.
+        for seats in [0_i64, MAX_FAN_OUT + 1] {
+            assert!(start_workflow_run(
+                &state,
+                NewWorkflowRun {
+                    workflow_id: glm.id.clone(),
+                    plan_id: None,
+                    seed: 0,
+                    seats: Some(seats),
+                },
+            )
+            .is_err());
+        }
+
+        // A run of the DEEPSEEK workflow asking 3 seats is refused by DEEPSEEK's cap of 2. A
+        // family-blind cap (or the caller's family) would let 3 sail through.
+        let err = start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: deepseek.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: Some(3),
+            },
+        )
+        .expect_err("3 seats exceeds deepseek's own cap of 2");
+        assert!(
+            err.contains("deepseek-v4.1-flash"),
+            "the refusal must name the WORKFLOW's family, whose cap was consulted; got: {}",
+            err
+        );
+
+        // The same 3 seats on the glm workflow (cap 4) is fine, and is attributed to glm.
+        let run = start_workflow_run(
+            &state,
+            NewWorkflowRun {
+                workflow_id: glm.id.clone(),
+                plan_id: None,
+                seed: 0,
+                seats: Some(3),
+            },
+        )
+        .expect("3 seats is within glm's cap");
+        assert_eq!(
+            run.seats_held,
+            r#"{"glm-5.3-flash":3}"#,
+            "the budget must be measured on the workflow's family, not the caller's"
+        );
+        assert!(
+            run.scoreable,
+            "and it started on a quiet fleet: {}",
+            run.not_scoreable_reason.unwrap_or_default()
         );
     }
 
