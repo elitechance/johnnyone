@@ -262,10 +262,21 @@ mod tests {
     /// working directory once it has talked to the endpoint, so that file existing in the temp
     /// workdir is what shows the prompt actually reached a model.
     ///
-    /// Ignored by default; run it by name with `cargo test --lib -- --ignored`.
-    #[ignore = "spawns a real kloo against lokalai; run with --ignored"]
-    #[test]
-    fn kloo_executor_runs_a_real_phase_end_to_end() {
+    /// Drive one real phase run through the whole arena wire and report the evidence.
+    ///
+    /// The family is the ONLY thing the two tests below differ on, so it is the only input here.
+    ///
+    /// Shared by the two `#[ignore]`d tests below, which differ ONLY in the family they ask for.
+    /// Everything here is the setup both of them need and nothing else: a real `AppState`, a
+    /// workflow version carrying a real role, instruction, contract and a hop that parses, a run
+    /// started for it, and a FRESH temporary workdir — never the repo — with a unique name.
+    ///
+    /// Returns the executor's result together with whether the evidence file
+    /// `.kloo/token-calibration.json` existed in the workdir. The existence check is taken BEFORE
+    /// the workdir is removed, because removing it first destroys the only evidence of what the
+    /// child actually did — a test that deleted the directory and then asserted nothing about its
+    /// contents would pass whether or not a model was ever reached.
+    fn run_real_phase(family: &str) -> (Result<(), String>, bool) {
         use crate::services::workflows::{
             create_workflow_version, execute_workflow_run, start_workflow_run, NewWorkflowRun,
             NewWorkflowVersion,
@@ -284,7 +295,7 @@ mod tests {
                     .display()
                     .to_string(),
                 phase_type: "dev-phase".to_string(),
-                family: "qwen3.8-flash-next".to_string(),
+                family: family.to_string(),
                 parent_id: None,
                 role: "you are a developer".to_string(),
                 instruction: "implement the phase".to_string(),
@@ -321,13 +332,57 @@ mod tests {
             verify: "true".to_string(),
         };
 
-        // 5. Drive the phase through the whole wire, then remove the temp dir.
+        // 5. Drive the phase through the whole wire...
         let result = execute_workflow_run(&state, &run.id, &exec);
+
+        // 6. ...and CAPTURE THE EVIDENCE before the workdir goes, then remove the temp dir.
+        let evidence_existed = workdir.join(".kloo/token-calibration.json").exists();
         let _ = std::fs::remove_dir_all(&workdir);
+
+        (result, evidence_existed)
+    }
+
+    /// Ignored by default; run it by name with `cargo test --lib -- --ignored`.
+    #[ignore = "spawns a real kloo against lokalai; run with --ignored"]
+    #[test]
+    fn kloo_executor_runs_a_real_phase_end_to_end() {
+        let (result, evidence_existed) = run_real_phase("qwen3.8-flash-next");
 
         assert!(
             result.is_ok(),
             "a real phase run must return Ok(()), got {result:?}"
+        );
+        assert!(
+            evidence_existed,
+            "the evidence file .kloo/token-calibration.json was never written in the run's \
+             workdir, so no model was reached: the prompt did not get an answer from the \
+             endpoint, whatever the child's exit status was"
+        );
+    }
+
+    /// The negative case: a family the endpoint does NOT serve still runs, but leaves no evidence.
+    ///
+    /// This is what makes the test above mean anything. `Ok(())` is returned for any completed
+    /// child, so a refused model is `Ok(())` too — the trait promises only that the execution RAN.
+    /// If this test ever reported the evidence file as PRESENT, the evidence file would be proving
+    /// nothing and the positive test's assertion would be vacuous.
+    ///
+    /// Ignored by default; run it by name with `cargo test --lib -- --ignored`.
+    #[ignore = "spawns a real kloo against lokalai; run with --ignored"]
+    #[test]
+    fn kloo_executor_e2e_catches_a_model_the_endpoint_does_not_serve() {
+        let (result, evidence_existed) = run_real_phase("glm-4.6");
+
+        assert!(
+            result.is_ok(),
+            "a child that ran against a model the endpoint does not serve is still Ok(()): the \
+             trait reports whether the execution ran, not whether it passed, got {result:?}"
+        );
+        assert!(
+            !evidence_existed,
+            "no evidence file may be written for a model the endpoint does not serve — if \
+             .kloo/token-calibration.json appeared anyway, its presence would no longer prove \
+             the prompt reached a model"
         );
     }
 }
