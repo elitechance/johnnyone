@@ -37,7 +37,19 @@ const INVALIDATED_READS: Record<string, string[]> = {
   update_session_title: ['list_sessions'],
   update_session_working_directory: ['list_sessions'],
   update_session_provider: ['list_sessions'],
+  // Plan writes stale the plan reads. `get_agent_plan` is cached for 3s, so without these a
+  // client that just set a gate reads back the PREVIOUS effectiveTestCommands — the field the
+  // design calls the one to render and the one to trust — for up to a full TTL. Same gap existed
+  // for validation_config, which is the same shape of write to the same rows.
+  update_agent_plan_test_commands: ['get_agent_plan', 'list_agent_plans'],
+  update_agent_plan_validation_config: ['get_agent_plan', 'list_agent_plans'],
 };
+
+// NOTE: the other plan writes (update_agent_plan_title, start_agent_plan, stop_agent_plan,
+// amend_agent_plan, manual_pass_agent_phase, …) have the same staleness gap and are deliberately
+// NOT added here — each needs its own think about which reads it invalidates, and widening the map
+// blind is how a cache starts lying in a new direction. The two above are the ones this change
+// touches.
 
 /** The cached read methods `method` invalidates — `[]` for a read or an unrelated write. */
 export function invalidatedReadsFor(method: string): string[] {

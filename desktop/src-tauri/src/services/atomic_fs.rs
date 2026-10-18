@@ -147,19 +147,11 @@ fn copy_dir_walk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
+    /// Delegates to the ONE fixture factory, so these fixtures land in this process's single
+    /// fixture root and are reclaimed with it. This was a third private copy that built a
+    /// top-level `j1-atomic-*` directory in the system temp dir and never removed it.
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "j1-atomic-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&d).unwrap();
-        d
+        crate::test_support::tmp_dir(&format!("atomic-{tag}"))
     }
 
     fn leftover_j1tmp(dir: &Path) -> Vec<String> {

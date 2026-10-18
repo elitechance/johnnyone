@@ -64,10 +64,41 @@ export function visibleConsoleTabs(
 }
 
 /**
+ * The strip the console actually renders: whatever `visibleConsoleTabs` already decided, with the
+ * arena APPENDED. A separate function on purpose — `visibleConsoleTabs` is what five shipped specs
+ * assert exact arrays against, and "Arena is an added tab, never a replacement" is better served by
+ * leaving that function's answer alone than by editing the tests that hold it. This is the ONE place
+ * the arena joins the strip, so `resolvedPaneTab` still sees it as visible and a persisted `arena`
+ * selection is not bounced back to Raw.
+ */
+export function consoleTabsWithArena(
+  init: AgentPlan | null | undefined,
+  hasTaskRun: boolean,
+  hasPlanCheck: boolean,
+  hasPreflight: boolean,
+): PaneTab[] {
+  return [...visibleConsoleTabs(init, hasTaskRun, hasPlanCheck, hasPreflight), 'arena'];
+}
+
+/**
  * Whether the Raw tab should render the inline attach affordance instead of a live terminal screen:
  * true when the initiative has no primary session yet, or it has one but no attached screen for it.
  * `hasScreen` = the page already has an attached `terminalScreens()[primarySessionId]`.
  */
 export function rawAttachNeeded(primarySessionId: string | null | undefined, hasScreen: boolean): boolean {
   return !primarySessionId || !hasScreen;
+}
+
+/**
+ * Which tabs need the initiative's `planRun` loaded.
+ *
+ * ONE home for a condition the console used to spell out inline. The Plan tab has always needed it;
+ * the ARENA tab needs the same rows (its entry points are per phase, and it is a tab a reader can
+ * open first) and did not get them — measured in Chrome: the tab said "This initiative has no
+ * phases yet" on an initiative with three, until the Plan tab had been opened once. A function
+ * rather than a condition in an effect, because that condition is otherwise untestable: the console
+ * page uses `templateUrl` and cannot be mounted under this project's vitest.
+ */
+export function tabNeedsPlanRun(tab: PaneTab): boolean {
+  return tab === 'plan' || tab === 'arena';
 }

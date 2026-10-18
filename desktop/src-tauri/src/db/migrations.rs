@@ -31,6 +31,8 @@ const MIGRATION_021: &str = include_str!("../../migrations/021_add_executor_conf
 const MIGRATION_022: &str = include_str!("../../migrations/022_add_dev_stage_providers.sql");
 const MIGRATION_023: &str = include_str!("../../migrations/023_add_test_commands.sql");
 const MIGRATION_024: &str = include_str!("../../migrations/024_add_session_reports.sql");
+const MIGRATION_025: &str = include_str!("../../migrations/025_add_phase_test_commands.sql");
+const MIGRATION_026: &str = include_str!("../../migrations/026_add_workflow_arena.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -95,6 +97,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (22, "022_add_dev_stage_providers", MIGRATION_022),
         (23, "023_add_test_commands", MIGRATION_023),
         (24, "024_add_session_reports", MIGRATION_024),
+        (25, "025_add_phase_test_commands", MIGRATION_025),
+        (26, "026_add_workflow_arena", MIGRATION_026),
     ];
 
     // Guard the shared version namespace. Versions are hand-assigned integers, and branches that
@@ -253,6 +257,29 @@ mod tests {
         assert!(
             cols.iter().any(|c| c == "validation_config"),
             "agent_plans missing column validation_config (have: {:?})",
+            cols
+        );
+    }
+
+    #[test]
+    fn migration_025_adds_phase_test_commands_column_idempotently() {
+        // The gate is per-PHASE as well as per-plan: a phase's own test_commands override the
+        // plan's. Same encoding as agent_plans.test_commands (JSON array of shell strings run
+        // from workspace_path); NULL or empty = no gate, so existing phases are unaffected.
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).expect("first run_migrations");
+        run_migrations(&conn).expect("second run_migrations (idempotent)");
+
+        let cols = column_names(&conn, "agent_plan_phases");
+        assert!(
+            cols.iter().any(|c| c == "test_commands"),
+            "agent_plan_phases missing column test_commands (have: {:?})",
+            cols
+        );
+        // The exit code is the only score, by design — no score column anywhere.
+        assert!(
+            !cols.iter().any(|c| c == "score"),
+            "agent_plan_phases must not grow a score column: {:?}",
             cols
         );
     }

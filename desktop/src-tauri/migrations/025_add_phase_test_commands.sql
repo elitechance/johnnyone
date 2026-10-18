@@ -1,0 +1,17 @@
+-- Make the coordinator's test gate per-PHASE as well as per-plan (migration 023 added the plan
+-- column).
+--
+-- One gate for a whole Initiative is the wrong grain: an early schema phase and a later UI phase
+-- do not share a suite, so a plan-wide command is either too broad to pass or too narrow to prove
+-- anything. A phase that declares its own commands gates on those.
+--
+-- Same encoding as `agent_plans.test_commands`: a nullable JSON array of shell strings, each run
+-- from the PLAN's `workspace_path` (phases have no workspace of their own). NULL or empty means
+-- "no phase-level gate", which falls back to the plan's commands — see
+-- `services::agent_plans::effective_test_commands`, the single place that rule lives.
+--
+-- Deliberately no `score` column. The gate's exit code IS the score: zero or non-zero. A numeric
+-- score would need a scale, a writer and an interpreter, and every one of those is a place for a
+-- false pass to hide. Collected test counts are parsed best-effort at run time and reported as
+-- advisory only; they are never persisted or compared.
+ALTER TABLE agent_plan_phases ADD COLUMN test_commands TEXT;

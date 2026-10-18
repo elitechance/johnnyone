@@ -180,8 +180,20 @@
       <tr><td>Stop</td><td><code>updateAgentPlanStopped(id: ID!): AgentPlanRun!</code></td></tr>
       <tr><td>App scope</td><td><code>updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!</code></td></tr>
       <tr><td>Block</td><td><code>updateAgentPlanBlocked(id: ID!, reason: String!): AgentPlanRun!</code></td></tr>
+      <tr><td>Test gate (set / clear)</td><td><code>updateAgentPlanTestCommands(id: ID!, phaseId: String, commands: [String!]!, clear: Boolean): AgentPlanRun!</code></td></tr>
+      <tr><td>Test gate (run once)</td><td><code>runAgentPlanTestGate(id: ID!, phaseId: String): TestGateRun!</code></td></tr>
       <tr><td>Delete</td><td><code>deleteAgentPlan(id: ID!): Boolean!</code></td></tr>
     </table>
+    <p>
+      <code>updateAgentPlanTestCommands</code>: <code>phaseId</code> null targets the plan's gate, a
+      phase id targets that phase's. Removing a gate needs <code>clear: true</code> — an empty
+      <code>commands</code> is rejected so an incomplete call cannot drop a gate.
+      <code>runAgentPlanTestGate</code> returns <code>TestGateRun</code>; read
+      <code>gateDeclared &amp;&amp; exitCode == 0</code> as "proven", since <code>exitCode: 0</code> alone is
+      also what a phase with no gate returns. <code>collected</code> is advisory and may be null.
+      Reserved negative <code>exitCode</code>s: -1 signal, -2 gate declared but unreadable,
+      -3 exceeded the host's per-command timeout.
+    </p>
     <p>
       <code>CreateAgentPlanInput</code>:
       <code>&#123; runType?, title?, workspacePath!, planPath!, workerProvider!, reviewerProvider!, brief?, appScope?, docsScope?, referencePaths? &#125;</code>.

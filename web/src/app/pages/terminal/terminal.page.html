@@ -485,6 +485,34 @@
                       </button>
                     }
                   }
+
+                  <!-- Artifacts (mass-artifacts): the plan's and each phase's `artifacts/` dir,
+                       listed via the existing `filesListDir`. Renders nothing when there are none. -->
+                  @if (planArtifacts().length || planArtifactsBlocked()) {
+                    <div class="dn dir art-head">documents</div>
+                  }
+                  @if (planArtifactsBlocked()) {
+                    <div class="dn art-note">{{ planArtifactsBlocked() }}</div>
+                  }
+                  @for (g of planArtifacts(); track g.dirRel) {
+                    <div class="dn dir indent-1" [title]="g.dirRel">
+                      <span class="lbl">{{ g.label }}</span>
+                    </div>
+                    @for (n of g.nodes; track n.id) {
+                      <button
+                        type="button"
+                        class="dn art"
+                        [ngClass]="'art-d' + (n.depth > 2 ? 2 : n.depth)"
+                        [class.on]="planSelectedDoc() === n.id"
+                        [attr.aria-expanded]="n.kind === 'dir' ? n.expanded : null"
+                        [title]="n.name"
+                        (click)="openPlanArtifact(n)"
+                      >
+                        <span class="ic">{{ n.kind === 'dir' ? (n.expanded ? '▾' : '▸') : '·' }}</span><span class="lbl">{{ n.name }}</span>
+                      </button>
+                    }
+                  }
+
                   <div class="docnav-foot">
                     <b>{{ selectedInitiative()?.planPath }}</b>
                     <span>global store · read-only render</span>
@@ -513,6 +541,15 @@
                           <span class="pt">{{ card.phaseTitle }}</span>
                           <span class="pc tnum">{{ card.done }} / {{ card.total }}</span>
                         </div>
+                        <!-- The arena's entry point (MASS step 1): ONE extra row on a phase that
+                             already exists. A standalone component with its own inline styles, so
+                             terminal.page.scss gains nothing and the Plan tab is unchanged
+                             otherwise. The phase it is given is the SAME `planRun` phase row the
+                             rest of this tab reads, so `effectiveTestCommands` is the host's. -->
+                        <johnny-arena-row
+                          [initiativeId]="sel.id"
+                          [phase]="arenaPhaseOf(card.phaseId)"
+                        />
                         <div class="tasklist">
                           @for (t of card.tasks; track t.id) {
                             @let sv = taskStatus(t.status);
@@ -539,6 +576,16 @@
           </section>
         } @else if (activeTab() === 'checks') {
           <section class="terminal-surface checks-surface">
+            <!-- MASS step 5: the gate's exit code and collected count, beside the lens/plan-check
+                 cards that already live here. The gate is a SECOND, parallel score used only to
+                 compare workflows — it does not decide whether a phase is done, and `gateVerdict`
+                 and the lens system are untouched. -->
+            <johnny-gate-strip
+              [gate]="phaseGate()"
+              [pending]="phaseGatePending()"
+              [commands]="phaseGateCommands()"
+              (run)="runPhaseGate()"
+            />
             @if (checks().state === 'empty') {
               <div class="pane-empty">{{ checks().card }}</div>
             } @else {
@@ -595,6 +642,10 @@
                 </div>
               }
             }
+          </section>
+        } @else if (activeTab() === 'arena') {
+          <section class="terminal-surface arena-surface">
+            <app-arena-panel [initiativeId]="sel.id" [phases]="arenaPhases()" />
           </section>
         } @else if (activeTab() === 'tasks') {
           <section class="terminal-surface tasks-surface">
@@ -773,10 +824,9 @@
     }
   </main>
 
-  <footer class="workspace-statusbar">
-    <span>relay <strong>connected</strong></span>
-    <span>raw input batched at <strong>200ms</strong></span>
-  </footer>
+  <!-- The same strip the arena shells render, so the chrome does not vanish as you cross into the
+       arena (measured: it painted on /initiatives and on no arena route at 1200x860). -->
+  <johnny-workspace-statusbar />
 </div>
   </section>
 

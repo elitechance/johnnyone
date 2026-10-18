@@ -46,10 +46,41 @@ const SCOPE_GATED: Record<string, string> = {
   // gated too rather than left on identity alone.
   'get-setting.ts': 'settings:read',
 
+  // ── The coordinator's test gate (migrations 023 / 025) ──
+  // Setting the gate decides what a phase is held to, and RUNNING it executes an arbitrary shell
+  // command on the host. Both are writes; the run is deliberately NOT a read scope.
+  'update-agent-plan-test-commands.ts': 'plans:write',
+  'run-agent-plan-test-gate.ts': 'plans:write',
+
   // ── Host plan-workspace file read ──
   // The host path-confines read_host_file to the plan's workspace_path, so the
   // residual exposure is purely "which identity may ask" — a file read.
   'read-host-file.ts': 'files:read',
+
+  // ── The workflow arena (desktop migration 026) ──
+  // The reads expose prompt bodies (role / instruction / contract / hop) — the searched artifact
+  // itself — so they are gated, not left on identity alone.
+  'workflows.ts': 'plans:read',
+  'workflow.ts': 'plans:read',
+  'workflow-runs.ts': 'plans:read',
+  'workflow-prefs.ts': 'plans:read',
+  'workflow-search-state.ts': 'plans:read',
+  // The writes decide what J1 executes. `update-workflow-champion.ts` is the one that CHANGES what
+  // every later run of a phase-type uses, so it must never be reachable by a key that was granted
+  // only reads.
+  'create-workflow-version.ts': 'plans:write',
+  'start-workflow-run.ts': 'plans:write',
+  'record-workflow-run-gate.ts': 'plans:write',
+  'record-workflow-run-rescore.ts': 'plans:write',
+  'run-workflow-run-rescore.ts': 'plans:write',
+  'repo-identity.ts': 'plans:read',
+  // Runs an arbitrary shell command on the host, like run-agent-plan-test-gate.
+  'run-workflow-run-gate.ts': 'plans:write',
+  'record-workflow-pref.ts': 'plans:write',
+  'update-workflow-champion.ts': 'plans:write',
+  // Lifting a halt overrules the search's own refusal, so it carries the write scope too.
+  'update-workflow-search-resumed.ts': 'plans:write',
+  'record-workflow-rejection.ts': 'plans:write',
 };
 
 /** Live, non-vacuous: tolerates the `<T>` type argument every real call uses. */

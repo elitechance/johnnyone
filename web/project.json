@@ -8,12 +8,16 @@
   "targets": {
     "build": {
       "executor": "@angular-devkit/build-angular:application",
-      "outputs": ["{options.outputPath}"],
+      "outputs": [
+        "{options.outputPath}"
+      ],
       "options": {
         "outputPath": "dist/web",
         "index": "web/src/index.html",
         "browser": "web/src/main.ts",
-        "polyfills": ["zone.js"],
+        "polyfills": [
+          "zone.js"
+        ],
         "tsConfig": "web/tsconfig.app.json",
         "inlineStyleLanguage": "scss",
         "assets": [
@@ -22,7 +26,9 @@
             "input": "web/public"
           }
         ],
-        "styles": ["web/src/styles.scss"],
+        "styles": [
+          "web/src/styles.scss"
+        ],
         "scripts": []
       },
       "configurations": {
@@ -77,6 +83,24 @@
     },
     "test": {
       "command": "npx vitest run --config web/vitest.config.ts"
+    },
+    "arena-phone": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node web/tools/arena-phone-harness.mjs"
+      },
+      "metadata": {
+        "description": "Arena phone harness. Drives the built app in real headless Chrome at 400x860 against canned GraphQL, and exits NON-ZERO naming the route and the reason when a page does not render, a scroller is degenerate or clips what it cannot scroll, content is unreachable, something overflows sideways, or a control is missing, unpainted, unhittable, clipped by an ancestor, or present-but-unchecked. NEEDS: a Chrome binary at /usr/bin/google-chrome, puppeteer from node_modules, and a current `nx build web` (it serves dist/web/browser). Screenshots go OUTSIDE the repo: ARENA_HARNESS_OUT, else a temp directory. CI, RECOMMENDED AND DELIBERATELY NOT WIRED (the user's call, not a developer's): make it BLOCKING for changes under web/src/app/pages/arena/, the four *.shell.ts and terminal.page.*, and ADVISORY elsewhere - a browser job that blocks everything gets disabled within a month, and then this evidence evaporates exactly the way it nearly did in a reports folder. STANDING RISK: this script is the only thing proving a human can reach the promote button on a phone, it has no tests of its own, and in the round that reviewed it two of three findings were defects in the harness rather than in the product. Check that the falsifications still FAIL before trusting a green run; they are listed at the top of the file."
+      }
+    },
+    "arena-nav": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node web/tools/arena-nav-harness.mjs"
+      },
+      "metadata": {
+        "description": "Arena NAV harness. Drives the built app in real headless Chrome AT BOTH 400x860 AND 1440x900, and proves the seven things a unit test cannot see: (1) the GLOBAL nav has an arena entry, one click from a cold start at /, on the painted surface at each width; (2) exactly one item is lit on every arena route and it names where you are (Arena on the /workflows tree, Work on the per-initiative setup wizard, which was never broken); (3) the status bar does not paint on one side of the console/arena switch and vanish on the other, asserted as PARITY per width because the seam is real only above 900px; (4) the PRIMARY defect: a back click returns to the console URL the person DEPARTED from, verified by RELOADING that URL on a 3-initiative fixture where the departure initiative is deliberately not the one the console auto-selects - in-session the component never unmounts, so the view looks right while the address bar has lost the initiative; (5) an unknown or removed workflow id reads as an absence with a way out, not as a raw TypeError; (6) nothing decisive sits under the FIXED bottom nav, hit-tested at the control bottom edge because scrollHeight/clientHeight arithmetic is blind to an overlay and reported 0 unreachable pixels with 6px of start-search under the bar; (7) the desktop reading column does not jump across the switch. It NEVER calls page.goto to reach the arena - that is the one thing it is not allowed to do. Its GraphQL stub answers per requested id, so an id-routing bug cannot hide behind one canned row. NEEDS a Chrome binary at /usr/bin/google-chrome, puppeteer, and a current nx build web (serves dist/web/browser). Every nav assertion FAILS if the surface it names is not painted at that width: both .botnav and .gnav keep their on class while hidden, and a previous measurement of this very feature quoted the hidden rail class list as the bottom bar. CI: blocking for nav-items.ts, app.component.*, pages/arena/** and terminal.page.*, advisory elsewhere; not wired, the user call."
+      }
     }
   }
 }

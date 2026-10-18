@@ -488,22 +488,10 @@
   color: #8fa0b3;
 }
 
-.workspace-statusbar {
+// The strip's own look lives in WorkspaceStatusbarComponent, which every workspace surface now
+// renders. What stays here is the one thing that is this layout's business: its grid track.
+johnny-workspace-statusbar {
   grid-row: 3; // pinned to the last (auto) track so the conditional topbar can't shift it
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 10px;
-  border-top: 1px solid #263241;
-  background: #0a0d12;
-  color: #8fa0b3;
-  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-
-  strong {
-    color: #dbe7f3;
-    font-weight: 500;
-  }
 }
 
 @media (max-width: workspace.$mobile-breakpoint) {
@@ -764,9 +752,8 @@
     padding: 24px;
   }
 
-  .workspace-statusbar {
-    display: none;
-  }
+  // The strip hides itself under 900px (WorkspaceStatusbarComponent's own media query), so there
+  // is nothing to hide from here any more.
 }
 
 
@@ -1659,7 +1646,6 @@ ion-modal.workspace-picker .picker-empty {
     flex: none;
   }
   .init-new {
-    margin-left: auto;
     width: 22px;
     height: 22px;
     display: inline-flex;
@@ -1897,9 +1883,6 @@ ion-modal.workspace-picker .picker-empty {
   .plandoc {
     grid-template-columns: 1fr;
   }
-  .plandoc .docnav {
-    display: none;
-  }
 }
 
 .plandoc .docnav {
@@ -1977,6 +1960,49 @@ ion-modal.workspace-picker .picker-empty {
     span {
       color: var(--jo-fg-faint, #6b7a8d);
       word-break: normal;
+    }
+  }
+}
+
+// Artifacts section of the docnav (mass-artifacts). Reuses the existing `.dn` / `.dn.dir` /
+// `.indent-1` row vocabulary for the headings, so only the deeper indent steps and the prose note
+// need rules of their own. NOTE: this file sits ~580 bytes under the 48 kB `anyComponentStyle`
+// error budget, so additions here have to be this frugal — see the report.
+.plandoc .docnav {
+  .dn.art-head {
+    margin-top: 10px;
+  }
+  // One step past the group label; capped at depth 2 so a deep tree never pushes the name out.
+  button.dn.art-d0 {
+    padding-left: 36px;
+  }
+  button.dn.art-d1 {
+    padding-left: 48px;
+  }
+  button.dn.art-d2 {
+    padding-left: 60px;
+  }
+  .dn.art-note {
+    white-space: normal;
+    font-size: 11px;
+  }
+}
+
+// PHONE (<=720px): the nav used to be `display: none`, which left a narrow screen with NO way to
+// reach any plan doc (the default one was all you got) and would have made artifacts unreachable
+// too. It now stacks above the doc as the same vertical list, height-capped and self-scrolling so
+// the doc stays close. Rows are full-width with an ellipsised label, so nothing scrolls sideways.
+@media (max-width: 720px) {
+  .plandoc .docnav {
+    border-right: none;
+    border-bottom: 1px solid var(--jo-border, #263241);
+    max-height: 38vh;
+    overflow-y: auto;
+
+    // The foot prints the full absolute planPath with `word-break: break-all`; inside a 38vh box
+    // that is several lines of the very space this cap exists to free. The path is desktop detail.
+    .docnav-foot {
+      display: none;
     }
   }
 }
