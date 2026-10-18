@@ -6,6 +6,7 @@ pub mod git_history;
 pub mod host_files;
 pub mod kloo_executor;
 pub mod leases;
+pub mod pane_question;
 pub mod plan_artifacts;
 pub mod plan_check;
 pub mod planner_prompts;
