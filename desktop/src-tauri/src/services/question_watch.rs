@@ -14,7 +14,155 @@
 
 use std::collections::HashSet;
 
+use crate::services::agent_plans::record_agent_report;
 use crate::services::pane_question::{pane_is_asking, PaneQuestion};
+use crate::state::app_state::AppState;
+use crate::terminal::run_tmux;
+
+/// The longest ask the console will be shown, in CHARACTERS (not bytes).
+///
+/// The summary line travels inside a GraphQL mutation that is itself embedded in
+/// a shell argument, so it has to stay short enough to survive being quoted,
+/// echoed and rendered on a phone screen. 160 characters is the agreed budget:
+/// long enough for a real question, short enough that the console shows the
+/// whole line without wrapping it into a second row.
+const SUMMARY_MAX_CHARS: usize = 160;
+
+/// The one line the console renders for a waiting agent.
+///
+/// `pane <pane_id> is waiting: <cleaned ask>`, where the cleaned ask is the
+/// agent's text squeezed into a single safe line:
+/// * every run of whitespace — newlines included, since the ask the detector
+///   returns spans the wrapped lines of the screen — collapses to one space,
+///   and the ends are trimmed;
+/// * `"` and `\` are removed ENTIRELY, not escaped: the mutation this line goes
+///   into is JSON inside a shell argument, and a single unescaped one of those
+///   would break the payload or let the ask inject text into the mutation;
+/// * the result is cut to [`SUMMARY_MAX_CHARS`] CHARACTERS on a character
+///   boundary — never mid-UTF-8, which would panic on a multi-byte ask — with a
+///   single `…` appended when (and only when) something was cut.
+///
+/// An ask that is empty, or only whitespace, yields `pane <pane_id> is waiting`
+/// with NO trailing colon: a dangling `: ` would render as a broken line.
+pub fn question_summary(pane_id: &str, ask: &str) -> String {
+    // Collapse whitespace first, then drop the two characters that would break
+    // the JSON-in-shell payload the line travels in. Order matters: stripping
+    // first cannot join two words, and collapsing first cannot resurrect a
+    // stripped character.
+    let mut cleaned = String::with_capacity(ask.len());
+    let mut prev_was_space = false;
+    for ch in ask.chars() {
+        if ch == '"' || ch == '\\' {
+            // Removed entirely — not replaced by a space, so `say\"hi\"` stays
+            // one word rather than becoming two.
+            continue;
+        }
+        if ch.is_whitespace() {
+            prev_was_space = true;
+            continue;
+        }
+        if prev_was_space && !cleaned.is_empty() {
+            cleaned.push(' ');
+        }
+        prev_was_space = false;
+        cleaned.push(ch);
+    }
+    // `is_whitespace` above already swallowed any trailing run, so nothing is
+    // left to trim at the end; `trim` is here for the leading run, which the
+    // `!cleaned.is_empty()` guard dropped.
+
+    if cleaned.is_empty() {
+        return format!("pane {pane_id} is waiting");
+    }
+
+    // Cut on a character boundary: `char_indices` gives the BYTE offset of each
+    // character's start, so truncating at one can never split a multi-byte
+    // character (`floor_char_boundary` is unstable). The budget counts
+    // CHARACTERS, not bytes, so the index to cut at is the byte offset of the
+    // character sitting at character position `SUMMARY_MAX_CHARS` — and
+    // reaching that position at all is what proves something was cut.
+    let mut cut = None;
+    for (count, (index, _ch)) in cleaned.char_indices().enumerate() {
+        if count == SUMMARY_MAX_CHARS {
+            cut = Some(index);
+            break;
+        }
+    }
+    if let Some(index) = cut {
+        cleaned.truncate(index);
+        cleaned.push('\u{2026}');
+    }
+
+    format!("pane {pane_id} is waiting: {cleaned}")
+}
+
+/// One polling pass: find the host's agent panes, capture each, and report every
+/// question that has not been reported yet.
+///
+/// The shape is exactly the one the pure helpers were cut to allow:
+/// [`list_panes_argv`] through [`run_tmux`] -> [`agent_pane_ids`] ->
+/// [`capture_argv`] per pane -> [`QuestionWatch::sweep`] -> one
+/// [`record_agent_report`] per question, with kind `"update"` (narration — what
+/// the console's transcript renders) and the [`question_summary`] line as the
+/// summary. Every other optional field is `None`: this is a one-line narration,
+/// not a verdict, so there are no findings, severity, reason or evidence to
+/// carry.
+///
+/// Returns how many questions were reported. A pane whose capture FAILS is
+/// skipped, not fatal — a pane can die between the listing and the capture, and
+/// one dead pane must not silence the other panes' asks. A failure of the
+/// LISTING itself is returned as an error: without it there is nothing to sweep
+/// and the caller has to know the poll did not run.
+///
+/// Needs a live tmux server, so it is deliberately not unit-tested; the argv
+/// builders, the pane filter, the sweep and [`question_summary`] above are the
+/// tested parts.
+pub async fn sweep_and_report(
+    state: &AppState,
+    watch: &mut QuestionWatch,
+    session_id: &str,
+) -> Result<usize, String> {
+    // 1. Which panes exist. A failure here is fatal to the pass.
+    let listing = run_tmux(list_panes_argv()).await?;
+
+    // 2. Which of them are the host's own agent panes.
+    let pane_ids = agent_pane_ids(&listing);
+
+    // 3. Capture each one. A pane can die in the gap between the listing and
+    //    its capture, so a failed capture drops just that pane from this pass;
+    //    the next pass re-lists and finds it gone.
+    let mut screens: Vec<(String, String)> = Vec::new();
+    for pane_id in pane_ids {
+        match run_tmux(capture_argv(&pane_id)).await {
+            Ok(screen) => screens.push((pane_id, screen)),
+            Err(err) => {
+                tracing::debug!(pane_id = %pane_id, error = %err, "skipping uncapturable pane");
+            }
+        }
+    }
+
+    // 4. Detect, de-duplicating against what this watcher already reported.
+    let found = watch.sweep(&screens);
+
+    // 5. Report each new question to the console.
+    let mut reported = 0usize;
+    for (pane_id, question) in &found {
+        record_agent_report(
+            state,
+            session_id.to_string(),
+            "update".to_string(),
+            None,
+            None,
+            Some(question_summary(pane_id, &question.ask)),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        reported += 1;
+    }
+    Ok(reported)
+}
 
 /// The tmux argv that captures ONE visible screen for one pane.
 ///
@@ -716,5 +864,267 @@ mod tests {
         assert_eq!(later, vec!["%7".to_string()]);
         let screens = vec![("%7".to_string(), waiting_screen())];
         assert_eq!(watch.sweep(&screens).len(), 1);
+    }
+
+    // --- the summary line the console renders ----------------------------
+    //
+    // `question_summary` is the only part of the report the phone console
+    // actually shows, and the line travels inside a GraphQL mutation that is
+    // itself JSON inside a shell argument. So it is tested as text: exact
+    // output, one line, no `"` or `\`, and a cut that never lands mid-UTF-8.
+    // `sweep_and_report` needs a live tmux server and is deliberately not
+    // tested here — these are the parts that decide what the user reads.
+
+    /// A plain one-line ask: the line is exactly the documented text, with the
+    /// pane id and the ask in it and nothing added.
+    #[test]
+    fn question_report_summary_is_the_exact_line_for_a_plain_ask() {
+        let line = question_summary("%3", "Should I use a map or a vec?");
+        assert_eq!(
+            line,
+            "pane %3 is waiting: Should I use a map or a vec?",
+            "the line is exactly `pane <pane_id> is waiting: <ask>`"
+        );
+        // Shape guards for the console's renderer: one line, and it names the
+        // pane that is blocked.
+        assert_eq!(line.lines().count(), 1, "the console renders one line");
+        assert!(line.starts_with("pane %3 is waiting: "), "{line}");
+        assert!(line.ends_with("vec?"), "the ask is not clipped: {line}");
+        assert!(!line.contains('\u{2026}'), "nothing was cut: {line}");
+        // A short ask keeps its own punctuation and case untouched.
+        assert!(line.contains('?'), "the ask mark survives: {line}");
+    }
+
+    /// The detector hands back the ask across the screen's wrapped lines, so a
+    /// multi-line ask must collapse to one line with SINGLE spaces — including
+    /// runs of tabs/spaces and a leading indent.
+    #[test]
+    fn question_report_summary_collapses_a_multi_line_ask_to_single_spaces() {
+        let ask = "Should I clamp before or after the multiply?\n  \t The brief says saturate,\n\n the task says wrap.\n";
+        let line = question_summary("%1", ask);
+        assert_eq!(
+            line,
+            "pane %1 is waiting: Should I clamp before or after the multiply? \
+             The brief says saturate, the task says wrap.",
+            "newlines, tabs and runs of spaces all become one space, and the \
+             ends are trimmed"
+        );
+        assert_eq!(line.lines().count(), 1, "no newline may survive");
+        assert!(!line.contains('\n'), "one line only: {line:?}");
+        assert!(!line.contains("  "), "no double space may survive: {line}");
+        assert!(!line.contains('\t'), "no tab may survive: {line}");
+        assert_eq!(
+            line.matches(": ").count(),
+            1,
+            "only the `: ` after `waiting` separates: {line}"
+        );
+        // A trailing run of whitespace must not leave a dangling space either.
+        let trailing = question_summary("%1", "wrap or saturate?   \n\n  ");
+        assert_eq!(trailing, "pane %1 is waiting: wrap or saturate?");
+        // And the real waiting screen's ask collapses the same way.
+        let ask = pane_is_asking(&waiting_screen()).unwrap().ask;
+        let real = question_summary("%2", &ask);
+        assert_eq!(real.lines().count(), 1, "the real ask is one line");
+        assert!(!real.contains("  "), "single spaces only: {real}");
+    }
+
+    /// `"` and `\` are removed ENTIRELY — not escaped — because one of them
+    /// left in would break the JSON-in-shell mutation the line rides in.
+    #[test]
+    fn question_report_summary_strips_quotes_and_backslashes() {
+        let line = question_summary(
+            "%9",
+            "The brief says \"saturate at u32\" while the task says \\wrap\\ — which?",
+        );
+        assert_eq!(
+            line,
+            "pane %9 is waiting: The brief says saturate at u32 while the task \
+             says wrap — which?",
+            "both quote styles are gone, and nothing replaces them"
+        );
+        assert!(!line.contains('"'), "no `\"` may reach the mutation: {line}");
+        assert!(!line.contains('\\'), "no `\\` may reach the mutation: {line}");
+        // Stripping must not invent a space: an escaped quote inside a word
+        // leaves the word intact.
+        let joined = question_summary("%1", "say \\\"hi\\\" now");
+        assert_eq!(joined, "pane %1 is waiting: say hi now", "{joined}");
+        assert!(!joined.contains("  "), "stripping cannot open a gap: {joined}");
+        // A quote-only ask is emptied by stripping and so takes the no-colon
+        // form rather than rendering `: ` out of nothing.
+        assert_eq!(
+            question_summary("%1", "\"\\\""),
+            "pane %1 is waiting",
+            "nothing left to show means no colon"
+        );
+        // An ask trying to close the mutation and inject its own field gets
+        // neutered: neither character is present to close anything with.
+        let hostile = question_summary("%1", "\" }, summary: \"pwned");
+        assert!(!hostile.contains('"'), "inert: {hostile}");
+    }
+
+    /// An ask longer than the 160-character budget is cut to exactly 160
+    /// characters plus ONE ellipsis — and a 160-character ask is not cut at all.
+    #[test]
+    fn question_report_summary_cuts_a_long_ask_to_160_plus_one_ellipsis() {
+        // 200 ASCII characters: `word` + space, repeated, so the cut lands on a
+        // word boundary and the count is easy to state exactly.
+        let ask = "word ".repeat(40);
+        assert_eq!(ask.chars().count(), 200);
+        let line = question_summary("%5", ask.trim_end());
+        let shown = line
+            .strip_prefix("pane %5 is waiting: ")
+            .expect("the line keeps its prefix");
+        assert_eq!(
+            shown.chars().count(),
+            161,
+            "160 kept characters plus a single ellipsis: {shown}"
+        );
+        assert!(
+            shown.ends_with('\u{2026}'),
+            "the cut is marked by one ellipsis: {shown}"
+        );
+        assert_eq!(
+            shown.matches('\u{2026}').count(),
+            1,
+            "exactly one ellipsis, appended: {shown}"
+        );
+        assert_eq!(
+            shown.trim_end_matches('\u{2026}'),
+            ask.trim_end().chars().take(160).collect::<String>(),
+            "the first 160 characters are kept verbatim"
+        );
+        assert!(!shown.ends_with(' '), "no dangling space before the …: {shown}");
+
+        // Exactly 160 characters: nothing was cut, so no ellipsis.
+        let exact = "a".repeat(160);
+        let kept = question_summary("%5", &exact);
+        assert_eq!(
+            kept,
+            format!("pane %5 is waiting: {exact}"),
+            "a 160-character ask fits and must not be marked as cut"
+        );
+        // 161 characters: one is cut, so exactly one ellipsis.
+        let over = question_summary("%5", &"a".repeat(161));
+        let shown = over.strip_prefix("pane %5 is waiting: ").unwrap();
+        assert_eq!(shown.chars().count(), 161, "160 + …: {shown}");
+        assert!(shown.ends_with('\u{2026}'));
+    }
+
+    /// A multi-byte ask must be cut on a CHARACTER boundary — slicing at byte
+    /// 160 would panic — and the budget counts characters, not bytes.
+    #[test]
+    fn question_report_summary_cuts_a_multibyte_ask_on_a_char_boundary() {
+        // 4-byte characters: byte 160 is also a character start, but byte 158
+        // and 159 are not, so a byte-based cut would panic.
+        let emoji = "\u{1F600}".repeat(200);
+        assert_eq!(emoji.len(), 800, "4 bytes each");
+        let line = question_summary("%6", &emoji);
+        let shown = line
+            .strip_prefix("pane %6 is waiting: ")
+            .expect("the line keeps its prefix");
+        assert_eq!(
+            shown.chars().count(),
+            161,
+            "160 characters plus the ellipsis: {}",
+            shown.chars().count()
+        );
+        assert!(shown.ends_with('\u{2026}'), "marked as cut: {shown}");
+        assert!(shown.is_ascii() == false, "the emoji survived: {shown}");
+        // The kept part is exactly the first 160 emoji, unsplit.
+        assert_eq!(
+            shown.trim_end_matches('\u{2026}'),
+            "\u{1F600}".repeat(160),
+            "the cut never splits a character"
+        );
+
+        // 2-byte characters (é, ü, ñ, å) and 3-byte (CJK) — the shapes that a
+        // byte-offset cut would land inside of.
+        let two_byte = "é".repeat(300);
+        assert_eq!(two_byte.len(), 600);
+        let line = question_summary("%6", &two_byte);
+        let shown = line.strip_prefix("pane %6 is waiting: ").unwrap();
+        assert_eq!(shown.chars().count(), 161);
+        assert_eq!(shown.trim_end_matches('\u{2026}'), "é".repeat(160));
+
+        let three_byte = "漢字テスト".repeat(60);
+        let line = question_summary("%6", &three_byte);
+        let shown = line.strip_prefix("pane %6 is waiting: ").unwrap();
+        assert_eq!(shown.chars().count(), 161);
+        assert!(shown.is_char_boundary(shown.len()), "valid UTF-8");
+
+        // Mixed multi-byte text with spaces, as a real wrapped ask looks: still
+        // one line, still valid UTF-8, still 160 + … .
+        let mixed = "Should I clamp before ".repeat(20) + "— 漢字 ünïcode \u{1F600} end";
+        let line = question_summary("%6", &mixed);
+        assert_eq!(line.lines().count(), 1, "one line: {line}");
+        let shown = line.strip_prefix("pane %6 is waiting: ").unwrap();
+        assert_eq!(shown.chars().count(), 161, "{}", shown.chars().count());
+        assert!(shown.ends_with('\u{2026}'));
+        // And a short multi-byte ask is untouched, no ellipsis.
+        let short = question_summary("%6", "möchtest du das?");
+        assert_eq!(short, "pane %6 is waiting: möchtest du das?");
+    }
+
+    /// An ask that is empty or only whitespace yields the no-colon form — a
+    /// dangling `: ` would render as a broken line on the console.
+    #[test]
+    fn question_report_summary_of_an_empty_ask_has_no_colon() {
+        for ask in ["", " ", "   ", "\n", "\n\n", "\t", " \t \n  ", "\u{a0}"] {
+            let line = question_summary("%4", ask);
+            assert_eq!(
+                line,
+                "pane %4 is waiting",
+                "an ask of {ask:?} must yield the no-colon form"
+            );
+            assert!(!line.ends_with(':'), "no dangling colon: {line}");
+            assert!(!line.ends_with(' '), "no trailing space: {line:?}");
+            assert!(!line.contains(':'), "no colon at all: {line}");
+            assert_eq!(line.lines().count(), 1);
+        }
+        // The pane id is still named, so the user knows which pane to look at.
+        assert!(question_summary("%42", "  \n ").starts_with("pane %42 "));
+        // An ask of only the characters that get stripped is empty too.
+        assert_eq!(question_summary("%4", "  \"\" \\"), "pane %4 is waiting");
+        // And the no-colon form is not applied to a real ask.
+        assert!(question_summary("%4", "which one?").contains(": which one?"));
+    }
+
+    /// The line is built from the pane id and the ask the sweep actually
+    /// returns, so the summary a report carries names the pane that asked.
+    #[test]
+    fn question_report_summary_names_the_pane_the_sweep_reported() {
+        let mut watch = QuestionWatch::new();
+        let screens = vec![
+            ("%1".to_string(), busy_screen()),
+            ("%2".to_string(), waiting_screen()),
+            ("%3".to_string(), other_ask_screen()),
+        ];
+        let found = watch.sweep(&screens);
+        assert_eq!(found.len(), 2, "both asking panes are reported");
+
+        let lines: Vec<String> = found
+            .iter()
+            .map(|(pane_id, q)| question_summary(pane_id, &q.ask))
+            .collect();
+        // Each line carries its OWN pane id — never the caller's, never the
+        // other pane's.
+        assert!(lines[0].starts_with("pane %2 is waiting: "), "{}", lines[0]);
+        assert!(lines[1].starts_with("pane %3 is waiting: "), "{}", lines[1]);
+        assert!(!lines[0].contains("%3"), "no cross-pane id: {}", lines[0]);
+        assert!(!lines[1].contains("%2"), "no cross-pane id: {}", lines[1]);
+        // Both are single safe lines, and each carries its own ask.
+        for line in &lines {
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+            assert!(!line.contains('"') && !line.contains('\\'), "{line:?}");
+            assert!(line.chars().count() <= 21 + 161, "bounded: {}", line);
+        }
+        assert!(lines[0].contains("clamp before or after"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("covering index or a partial one?"),
+            "{}",
+            lines[1]
+        );
+        // A busy pane contributes no line at all.
+        assert!(!lines.iter().any(|l| l.contains("%1")));
     }
 }
