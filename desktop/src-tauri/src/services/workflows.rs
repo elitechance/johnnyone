@@ -4380,4 +4380,98 @@ mod tests {
             "the composed prompt must expose its four parts in order"
         );
     }
+
+    /// The header TEXT itself, not just the sequence of labels.
+    ///
+    /// `compose_workflow_prompt_keeps_the_four_parts_distinguishable` only reads the labels back
+    /// through `prompt_section_labels`, so it stays green no matter how the header is rendered —
+    /// `== ROLE ==`, `[role]`, `role:` would all satisfy it. This pins the literal bytes
+    /// `prompt_section_header` emits today: `== <label> ==` with the label lowercased, single
+    /// spaces inside the delimiters, the header alone on its line, exactly one blank line between
+    /// sections, and a prompt that ends with the body and a SINGLE trailing newline (the doubled
+    /// newline each section is emitted with is trimmed back to one).
+    #[test]
+    fn compose_workflow_prompt_renders_the_literal_header_text() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+
+        // The header shape, exactly as prompt_section_header renders it: `== ` + lowercase label
+        // + ` ==`, nothing more.
+        assert_eq!(prompt_section_header("role"), "== role ==".to_string());
+        assert_eq!(
+            prompt_section_header("instruction"),
+            "== instruction ==".to_string()
+        );
+        assert_eq!(prompt_section_header("contract"), "== contract ==".to_string());
+        assert_eq!(prompt_section_header("hop"), "== hop ==".to_string());
+        // The label is lowercased by the header itself, whatever case it arrives in.
+        assert_eq!(prompt_section_header("INSTRUCTION"), "== instruction ==".to_string());
+        assert_eq!(prompt_section_header("Contract"), "== contract ==".to_string());
+
+        let prompt = compose_workflow_prompt(&workflow).expect("compose");
+
+        // The whole prompt, byte for byte: header line, body, blank line, next section, and the
+        // final body with a single trailing newline.
+        let expected = [
+            "== role ==",
+            "you are a developer",
+            "",
+            "== instruction ==",
+            "implement the phase",
+            "",
+            "== contract ==",
+            "the gate must pass",
+            "",
+            "== hop ==",
+            "{",
+            "  \"steps\": [",
+            "    \"plan\",",
+            "    \"edit\",",
+            "    \"verify\"",
+            "  ]",
+            "}",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(
+            prompt, expected,
+            "the header text, its casing, the section separator and the trailing newline are all pinned"
+        );
+
+        // Spelled out independently of the whole-prompt comparison:
+        // the separator between sections is a header alone on its line after ONE blank line.
+        for label in ["instruction", "contract", "hop"] {
+            let block = format!("\n\n== {} ==\n", label);
+            assert!(
+                prompt.contains(&block),
+                "each section must be preceded by exactly one blank line and the literal header {:?}, got: {}",
+                block,
+                prompt
+            );
+        }
+        assert!(
+            prompt.starts_with("== role ==\n"),
+            "the prompt must open with the literal first header and nothing before it, got: {:?}",
+            &prompt[..16.min(prompt.len())]
+        );
+        assert!(
+            !prompt.contains("\n\n\n"),
+            "sections are separated by a single blank line, never two"
+        );
+        // Trailing-newline contract: exactly one \n at the end, and the last line is the hop body.
+        assert!(
+            prompt.ends_with("}\n"),
+            "the prompt must end with the hop body and a single trailing newline, got: {:?}",
+            &prompt[prompt.len().saturating_sub(8)..]
+        );
+        assert!(
+            !prompt.ends_with("\n\n"),
+            "the prompt must not end with a blank line"
+        );
+        assert_eq!(
+            prompt.lines().last(),
+            Some("}"),
+            "the final line must be the hop body, not a header or an empty line"
+        );
+    }
 }
