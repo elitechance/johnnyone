@@ -209,9 +209,44 @@ pub fn session_for_pane(rows: &[(String, String)], pane_id: &str) -> Option<Stri
 /// seconds is untouched. A pane that is reported and later has its row removed
 /// stays reported — it was already told.
 ///
+/// Whether a pass that found asking panes attributed NONE of them.
+///
+/// This is the shape of the failure the console can otherwise never see: a
+/// fleet of agent panes whose tmux sessions still exist but whose rows were
+/// deleted from `sessions` (measured on one host: 101 `johnnyone_` panes, 100
+/// of them naming a session row that is gone). Every ask is dropped — correctly,
+/// since guessing a session would be worse — but a watch that finds questions
+/// and reports NONE of them then looks exactly like a quiet, healthy fleet.
+/// That is a dead feature wearing a healthy one, so the decision is made here,
+/// as data, and [`sweep_known_panes`] turns it into ONE warning per pass.
+///
+/// `asking_count` is how many captured panes were asking something;
+/// `attributed_count` is how many of those had a session row and were kept.
+///
+/// * `asking > 0 && attributed == 0` -> `true`: every ask this pass found was
+///   dropped because its session row is missing. Nothing was reported and
+///   nothing ever will be, and only a warning says so.
+/// * `attributed >= 1` -> `false`: the pass WORKED. Dropping some other pane is
+///   the normal, expected case — a just-started agent whose `tmux_pane_id` has
+///   not been written yet — and warning about it would cry wolf on every pass.
+/// * `asking == 0` -> `false`: a quiet fleet. No pane asked anything, so there
+///   is nothing this pass could have failed to attribute; the watcher is idle,
+///   not broken.
+///
+/// Pure, and total: no combination of counts panics, including the impossible
+/// `attributed > asking`, which is not an all-orphan pass either.
+pub fn pass_is_all_orphan(asking_count: usize, attributed_count: usize) -> bool {
+    asking_count > 0 && attributed_count == 0
+}
+
 /// Returns `(session_id, pane_id, question)` per asking pane with a known
 /// session, in the order the screens were given. Pure — no tmux, no database —
 /// so the ordering rule above is testable without a tmux server.
+///
+/// The return value is unchanged by the all-orphan warning below: an
+/// unattributable pane is still skipped, still never handed to
+/// [`QuestionWatch::sweep`], and still reported by nothing. Only the LOG of
+/// that skip changes, once per pass, when the pass attributed nothing at all.
 pub fn sweep_known_panes(
     rows: &[(String, String)],
     screens: &[(String, String)],
@@ -221,7 +256,14 @@ pub fn sweep_known_panes(
     //    panes we can attribute. An unattributable pane is dropped here, so it
     //    never reaches `sweep` and never enters the watcher's memory.
     let mut known: Vec<(String, String, String)> = Vec::new();
+    // How many of the captured panes were asking at all, whether or not we can
+    // attribute them. Counted here because the drop below loses the pane, and
+    // the all-orphan check further down needs to know the pass found asks.
+    let mut asking_count = 0usize;
     for (pane_id, screen) in screens {
+        if pane_is_asking(screen).is_some() {
+            asking_count += 1;
+        }
         match session_for_pane(rows, pane_id) {
             Some(session_id) => known.push((session_id, pane_id.clone(), screen.clone())),
             None => {
@@ -240,7 +282,7 @@ pub fn sweep_known_panes(
         .map(|(_session_id, pane_id, screen)| (pane_id.clone(), screen.clone()))
         .collect();
     let found = watch.sweep(&pairs);
-    found
+    let attributed: Vec<(String, String, PaneQuestion)> = found
         .into_iter()
         .filter_map(|(pane_id, question)| {
             let session_id = known
@@ -249,7 +291,26 @@ pub fn sweep_known_panes(
                 .map(|(session_id, _pane_id, _screen)| session_id.clone())?;
             Some((session_id, pane_id, question))
         })
-        .collect()
+        .collect();
+
+    // 3. Say so ONCE per pass when the pass found asks but attributed none of
+    //    them. The skip above is correct and unchanged — nothing is returned
+    //    for an orphan pane and nothing is reported to the console — but a
+    //    watch that finds questions and tells the operator NONE of them looks
+    //    exactly like a quiet fleet, so the drop has to be visible somewhere.
+    //    A pass that attributed at least one pane is a working pass and stays
+    //    silent; so does a pass with no asking panes at all.
+    if pass_is_all_orphan(asking_count, attributed.len()) {
+        tracing::warn!(
+            asking = asking_count,
+            attributed = attributed.len(),
+            "question watch found asking panes but could attribute none of them: \
+             {asking_count} ask(s) were dropped because their session rows are \
+             missing from `sessions`"
+        );
+    }
+
+    attributed
 }
 
 /// Needs a live tmux server, so it is deliberately not unit-tested; the argv
@@ -794,6 +855,143 @@ mod tests {
                 "a reported question must not be reported again"
             );
         }
+    }
+
+    // --- a pass that attributes NOTHING must be visible to the operator ----
+    //
+    // Measured on one host: `tmux list-panes` shows 101 sessions carrying the
+    // `johnnyone_` prefix, and for 100 of them the session row they name is gone
+    // from `sessions`. `sweep_known_panes` drops each such pane — correct, since
+    // guessing a session for it would be worse — but when EVERY ask of a pass is
+    // dropped that way the watch finds questions and reports none of them, which
+    // looks exactly like a quiet, healthy fleet. The decision to warn is made by
+    // the pure [`pass_is_all_orphan`] so it can be tested without a tmux server
+    // and without a tracing subscriber (tests cannot read log output).
+
+    /// The dead-feature shape, named: a pass with asking panes that attributed
+    /// NONE of them is an all-orphan pass and must be warned about.
+    #[test]
+    fn question_orphan_a_pass_that_attributes_nothing_is_reported_as_such() {
+        // The measured fleet: 100 asking panes, not one of them resolvable.
+        assert!(
+            pass_is_all_orphan(100, 0),
+            "every ask dropped because its session row is missing must be reported"
+        );
+        // The same shape at the smallest scale — one ask, no session row.
+        assert!(pass_is_all_orphan(1, 0), "one orphan ask is still an orphan pass");
+        assert!(pass_is_all_orphan(2, 0));
+        assert!(pass_is_all_orphan(usize::MAX, 0));
+
+        // A pass that attributed AT LEAST ONE pane is a working pass and must
+        // not warn: dropping a just-started agent whose `tmux_pane_id` has not
+        // been written yet is the normal case, not a broken watch.
+        assert!(
+            !pass_is_all_orphan(100, 1),
+            "one attributed pane means the watch works: 99 orphans are the \
+             normal just-started-agent case, not a dead feature"
+        );
+        assert!(!pass_is_all_orphan(2, 1));
+        assert!(!pass_is_all_orphan(100, 99));
+        assert!(!pass_is_all_orphan(1, 1));
+
+        // A pass with NO asking panes at all is simply a quiet fleet — the
+        // watcher is idle, not broken — and must not warn either.
+        assert!(
+            !pass_is_all_orphan(0, 0),
+            "no asking panes is a quiet fleet, not an orphan pass"
+        );
+        assert!(!pass_is_all_orphan(0, 1), "nothing asked, something attributed");
+        assert!(!pass_is_all_orphan(0, 50));
+
+        // Total over every count pair, and stable across repeated calls — the
+        // helper holds no state, so the same pass always decides the same way.
+        for asking in 0..6usize {
+            for attributed in 0..6usize {
+                let once = pass_is_all_orphan(asking, attributed);
+                assert_eq!(once, pass_is_all_orphan(asking, attributed));
+                assert_eq!(once, asking > 0 && attributed == 0, "({asking}, {attributed})");
+            }
+        }
+
+        // And the same decision the helper makes is the decision the pass makes:
+        // a watcher, a screen that IS asking, and no session row for that pane
+        // — the pass returns nothing (the skip is unchanged) while the counts it
+        // would report to the helper are exactly (1, 0), i.e. an orphan pass.
+        let mut watch = QuestionWatch::new();
+        let rows = vec![row("session-other", "%1")];
+        let screens = vec![("%42".to_string(), waiting_screen())];
+        let found = sweep_known_panes(&rows, &screens, &mut watch);
+        assert!(
+            found.is_empty(),
+            "an orphan pane must still not be reported: {found:?}"
+        );
+        assert!(
+            pass_is_all_orphan(screens.len(), found.len()),
+            "a pass that found an ask and attributed none is an orphan pass"
+        );
+        // The same screen with its row present is NOT an orphan pass.
+        let mut watch = QuestionWatch::new();
+        let rows_known = vec![row("session-new", "%42")];
+        let found = sweep_known_panes(&rows_known, &screens, &mut watch);
+        assert_eq!(found.len(), 1, "the known pane is reported");
+        assert!(
+            !pass_is_all_orphan(screens.len(), found.len()),
+            "a pass that attributed its ask must not be called an orphan pass"
+        );
+    }
+
+    /// The other side of the rule: a pass with one asking pane whose session IS
+    /// known attributed everything it found, so it is not an orphan pass — even
+    /// though the fleet around it may be full of orphans.
+    #[test]
+    fn question_orphan_a_pass_with_one_known_pane_is_not_an_orphan_pass() {
+        // The helper: one ask, one attribution.
+        assert!(
+            !pass_is_all_orphan(1, 1),
+            "a pass that attributed its one ask is a working pass"
+        );
+        // One known ask among many orphans is still a working pass.
+        assert!(
+            !pass_is_all_orphan(101, 1),
+            "the measured fleet minus one orphan: the watch is alive and must \
+             not warn"
+        );
+
+        // The same through the pass itself: two asking panes, only one of them
+        // has a session row. The orphan is dropped and NOT reported, but the
+        // pass attributed one pane, so it is not an all-orphan pass.
+        let mut watch = QuestionWatch::new();
+        let rows = vec![row("session-known", "%1")];
+        let screens = vec![
+            ("%1".to_string(), waiting_screen()),
+            ("%42".to_string(), other_ask_screen()),
+        ];
+        let found = sweep_known_panes(&rows, &screens, &mut watch);
+        assert_eq!(found.len(), 1, "only the pane with a row is reported");
+        assert_eq!(found[0].0, "session-known", "under its own session");
+        assert_eq!(found[0].1, "%1", "naming the asking pane");
+        assert!(
+            !pass_is_all_orphan(screens.len(), found.len()),
+            "attributing one of two asks is not an orphan pass"
+        );
+        // The orphan pane is still not remembered: its ask survives until its
+        // row appears, exactly as before this warning existed.
+        let mut fresh = QuestionWatch::new();
+        let orphan_only = vec![("%42".to_string(), other_ask_screen())];
+        assert_eq!(
+            sweep_known_panes(&rows, &orphan_only, &mut fresh).len(),
+            0,
+            "the orphan pane reports nothing"
+        );
+        let rows_with_orphan = vec![
+            row("session-known", "%1"),
+            row("session-orphan", "%42"),
+        ];
+        assert_eq!(
+            sweep_known_panes(&rows_with_orphan, &orphan_only, &mut fresh).len(),
+            1,
+            "and its ask is still there once the row appears"
+        );
     }
 
     /// A pane that DOES have a session row is reported once, and a later pass
