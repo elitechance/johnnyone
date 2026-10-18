@@ -5156,4 +5156,111 @@ mod tests {
         );
         assert_ne!(code, 0, "a killed child must never look like a pass");
     }
+
+    /// **The wire, end to end: a green execution produces a run the promotion rule accepts.**
+    ///
+    /// The two halves of the arena have so far only been pinned apart: the scoring tests assert what
+    /// lands in the row, the `promotion_block` tests assert what the rule does with a hand-built
+    /// [`PromotionFacts`]. Nothing drove one into the other, so an implementation that recorded a
+    /// green gate in a shape the rule does not read — `Some(0)` written as a string, `ended_at` left
+    /// open so the run reads as still in flight, `gate_exit` recorded but the run re-read from a
+    /// stale row — would keep both suites green while the arena promoted nothing. This drives
+    /// [`execute_and_score_workflow_run`] with an executor whose phase exits 0, RE-READS the run from
+    /// the database, and hands that freshly-read row to the rule.
+    ///
+    /// The shape is the first-champion seeding: no incumbent, no preference, no halt, nothing known
+    /// against the run's scoreability. Per the doc comment above [`promotion_block`], seeding a
+    /// family's first champion needs no head-to-head — "there is nothing to compare against; its
+    /// gate still has to be green" — so `pref`, `pref_loser`, `incumbent_workflow_id` and
+    /// `incumbent_run_id` are all `None`, `halted` and `run_not_scoreable` are off, and the only
+    /// fact carrying any weight is the `gate_exit` this test just caused to be written.
+    #[test]
+    fn arena_wire_an_executed_green_run_is_promotable() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+        assert_eq!(run.gate_exit, None, "nothing has run yet");
+
+        let exec = RecordingExecutor::ok();
+        let code = execute_and_score_workflow_run(&state, &run.id, &exec)
+            .expect("a phase that exits 0 must report its code, not an error");
+        assert_eq!(code, 0, "the gate passed");
+        assert_eq!(exec.invocations(), 1, "one run, one execution");
+
+        // Re-read from the database: the rule must be fed what the row says, not what the call
+        // returned.
+        let after = get_workflow_run(&state, &run.id).expect("re-read the run");
+        assert_eq!(
+            after.gate_exit,
+            Some(0),
+            "the green exit code must be the run's recorded score"
+        );
+
+        assert_eq!(
+            promotion_block(&PromotionFacts {
+                run: &after,
+                pref: None,
+                pref_loser: None,
+                pref_loser_same_key: true,
+                pref_loser_same_workflow: false,
+                incumbent_workflow_id: None,
+                incumbent_run_id: None,
+                halted: false,
+                run_not_scoreable: None,
+            }),
+            None,
+            "a green run seeding a family's first champion must be promotable"
+        );
+    }
+
+    /// **The wire, end to end: a failed execution leaves the run unpromotable.**
+    ///
+    /// The mirror image, and the half that actually breaks. If `execute_and_score_workflow_run`
+    /// ever scored an `Err` — `0` for "nothing happened", `-1` for "it went wrong", whatever looks
+    /// harmless — the run would carry a number, and the promotion rule would then be reasoning
+    /// about an execution that never touched a model. Driving the real executor failure through the
+    /// real row and into the real rule is what makes that unrepresentable: `gate_exit` must still be
+    /// `None` after the call, and the refusal must name the gate never having run.
+    #[test]
+    fn arena_wire_an_execution_that_failed_leaves_the_run_unpromotable() {
+        let (state, _root) = test_state();
+        let workflow = seed_workflow(&state, "repo", "dev-phase", "glm");
+        let run = start(&state, &workflow.id, r#"{"glm":3}"#);
+        assert_eq!(run.gate_exit, None, "nothing has run yet");
+
+        let exec = RecordingExecutor::failing("the phase could not be executed");
+        let err = execute_and_score_workflow_run(&state, &run.id, &exec)
+            .expect_err("an execution that failed must not report a code");
+        assert_eq!(
+            err, "the phase could not be executed",
+            "the executor's error reaches the caller verbatim"
+        );
+
+        let after = get_workflow_run(&state, &run.id).expect("re-read the run");
+        assert_eq!(
+            after.gate_exit, None,
+            "a failed execution records nothing — the run stays unscored"
+        );
+
+        let block = promotion_block(&PromotionFacts {
+            run: &after,
+            pref: None,
+            pref_loser: None,
+            pref_loser_same_key: true,
+            pref_loser_same_workflow: false,
+            incumbent_workflow_id: None,
+            incumbent_run_id: None,
+            halted: false,
+            run_not_scoreable: None,
+        })
+        .expect("a run whose gate never ran must never be promotable");
+        assert!(
+            block.contains("no gate result"),
+            "the refusal must name the gate never having run, got: {block}"
+        );
+        assert!(
+            block.contains("never ran"),
+            "and in words a human can act on, got: {block}"
+        );
+    }
 }
