@@ -9,7 +9,7 @@
 //! happened to be quiet. Counting seats here is the only place the count can exist.
 //!
 //! **Seats are per family, never pooled.** `family` is part of a workflow's identity, not its
-//! environment — a Hop tuned around one model's 262k context does not transfer to another's 131k.
+//! environment — a Hop tuned around one model's 262k context does not transfer to another's 132k.
 //! So a request for `glm-5.3-flash` is refused when `glm-5.3-flash` is full even if
 //! `deepseek-v4.1-flash` has seats free. Pooling would hand a run seats on a family its prompt
 //! was never searched on, which is how you promote a champion that is worse everywhere it is
@@ -96,12 +96,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// editing code. A family that is not in the table has no cap and cannot be leased at all —
 /// refusing an unknown family is the honest answer, because a cap guessed from nothing is worse
 /// than no pool.
+///
+/// The context lengths in the per-entry comments below were read from the provider's own
+/// `/v1/models` on 2026-10-19, and the figure these comments used to carry for
+/// `qwen3.8-flash-next` was never its context length — the provider reports 135168, which the
+/// comment below now records as 132K.
 pub const MEASURED_SEAT_CAPS: &[(&str, u32)] = &[
     // 262K · reasoning · executes the phase
     ("glm-5.3-flash", 4),
     // 262K · proposes the next prompt
     ("deepseek-v4.1-flash", 2),
-    // 131K · the busiest model — left alone by the arena, but counted
+    // 132K · the busiest model — left alone by the arena, but counted
     ("qwen3.8-flash-next", 4),
 ];
 
