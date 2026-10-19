@@ -61,6 +61,54 @@ pub fn provider_endpoint_from_profile(profile_json: &str, provider: &str) -> Opt
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Turn a stored `apiKey` value into the token to actually send.
+///
+/// On this machine the profile stores an **environment variable reference**, not a secret:
+/// `"apiKey":"${LOKALAI_API}"`. kloo expands that at launch; a caller that attaches the stored
+/// string verbatim sends the literal `${LOKALAI_API}` as the bearer token and is answered 401 —
+/// indistinguishable from sending no key at all, which is what left this check inert.
+///
+/// `raw` exactly of the form `${NAME}` (leading `${`, trailing `}`, non-empty `NAME` between) is
+/// resolved through `lookup`, trimmed, and is None when the variable is missing or blank — an unset
+/// variable means "send the request unauthenticated", and NEVER the literal `${NAME}`, because a
+/// placeholder sent as a bearer token is a guaranteed 401. Anything else is a literal key: returned
+/// trimmed, None when blank.
+///
+/// The lookup is a PARAMETER rather than a direct environment read so the tests can drive it with a
+/// closure — a test that mutated the process environment would race every other test in the same
+/// binary.
+pub fn expand_key_reference(
+    raw: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("${") {
+        // Anything with a leading `${` is trying to be a reference, so it is judged as one: an
+        // empty name or a missing closing brace is a broken reference and answers None, NOT the
+        // string itself — a half-written `${NAME` sent as a bearer token 401s exactly like the
+        // whole placeholder does.
+        let name = trimmed
+            .strip_prefix("${")
+            .and_then(|inner| inner.strip_suffix('}'))
+            .map(|inner| inner.trim());
+        let name = match name {
+            // `${}` names no variable, and `${NAME` has no closing brace: both are broken
+            // references and answer None rather than a string a caller could attach.
+            Some(name) if !name.is_empty() => name,
+            _ => return None,
+        };
+        return lookup(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+    // `$NAME` (no braces) is not the reference syntax either, and is still not a token worth
+    // sending — it names a variable rather than holding a key.
+    if trimmed.starts_with('$') {
+        return None;
+    }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// The `apiKey` of the SAME named provider block the endpoint came from, or None when that block
 /// carries no usable key. None means "send the request unauthenticated" — a public provider must
 /// keep working — and never `Some("")`, which would send an empty bearer token instead.
@@ -71,11 +119,13 @@ pub fn provider_endpoint_from_profile(profile_json: &str, provider: &str) -> Opt
 /// from the block named by `provider`, exactly like the endpoint, so a key is never sent to a
 /// provider it does not belong to. It is a secret: it is attached to the request and nothing else —
 /// never a tracing field, never part of a message.
+///
+/// The stored value is a `${VAR}` environment-variable reference on this machine, so it is expanded
+/// through [`expand_key_reference`] before it is attached.
 pub fn api_key_from_profile(profile_json: &str, provider: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(profile_json).ok()?;
     let key = value.get("providers")?.get(provider)?.get("apiKey")?.as_str()?;
-    let trimmed = key.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    expand_key_reference(key, |name| std::env::var(name).ok())
 }
 
 /// The provider the profile itself names as default. None when the profile does
@@ -317,6 +367,69 @@ mod tests {
         // A key belongs to a NAMED block and is never shared across providers: asking about a
         // provider the profile has no block for must not leak lokalai's key to its endpoint.
         assert_eq!(api_key_from_profile(PROFILE, "openrouter"), None);
+    }
+
+    #[test]
+    fn preflight_an_env_reference_key_is_expanded_from_the_environment() {
+        // The profile stores `"apiKey":"${LOKALAI_API}"` — an ENVIRONMENT VARIABLE REFERENCE, not a
+        // secret — and kloo expands it at launch. The preflight must expand it too: attaching the
+        // stored string verbatim sent the literal `${LOKALAI_API}` as the bearer token and the host
+        // logged the SAME 401 it logged with no key at all, so the check stayed inert.
+        assert_eq!(
+            expand_key_reference("${LOKALAI_API}", |name| {
+                (name == "LOKALAI_API").then(|| "sk-real".to_string())
+            })
+            .as_deref(),
+            Some("sk-real"),
+            "the reference resolves to the environment's value, never the literal that 401s"
+        );
+        assert_ne!(
+            expand_key_reference("${LOKALAI_API}", |_| Some("sk-real".to_string())).as_deref(),
+            Some("${LOKALAI_API}"),
+            "the placeholder itself is the bug and must never come back as a token"
+        );
+        // The lookup is asked for the name INSIDE the braces — `LOKALAI_API`, not the whole
+        // `${LOKALAI_API}` string, which no environment would ever answer.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolved = expand_key_reference("${LOKALAI_API}", |name| {
+            asked.borrow_mut().push(name.to_string());
+            Some("sk-real".to_string())
+        });
+        assert_eq!(resolved.as_deref(), Some("sk-real"));
+        assert_eq!(*asked.borrow(), vec!["LOKALAI_API".to_string()]);
+        // A key that is NOT a reference is a literal and comes back unchanged — the lookup is never
+        // consulted for it, so a closure that would panic on any call proves it is not called.
+        assert_eq!(
+            expand_key_reference("sk-literal", |name| panic!(
+                "a literal key must not be looked up in the environment (asked for {name:?})"
+            ))
+            .as_deref(),
+            Some("sk-literal")
+        );
+    }
+
+    #[test]
+    fn preflight_an_unset_env_reference_is_none_not_the_literal_placeholder() {
+        // None means "send the request UNAUTHENTICATED", never "send the placeholder": a `${…}`
+        // string attached as a bearer token is a guaranteed 401, which is exactly the bug this
+        // function exists to fix. An unset variable is therefore None…
+        assert_eq!(expand_key_reference("${LOKALAI_API}", |_| None), None);
+        // …and so is one whose value is blank or whitespace — a blank token is the same dead
+        // request wearing a different hat.
+        assert_eq!(
+            expand_key_reference("${LOKALAI_API}", |_| Some(String::new())),
+            None
+        );
+        assert_eq!(
+            expand_key_reference("${LOKALAI_API}", |_| Some("   ".to_string())),
+            None
+        );
+        // The malformed shapes are None too rather than a string a caller could send: `${}` names
+        // no variable, `${LOKALAI_API` has no closing brace, and `$LOKALAI_API` is not the
+        // reference syntax kloo expands — all three would be sent as nonsense tokens.
+        assert_eq!(expand_key_reference("${}", |_| Some("sk-real".to_string())), None);
+        assert_eq!(expand_key_reference("${LOKALAI_API", |_| Some("sk-real".to_string())), None);
+        assert_eq!(expand_key_reference("$LOKALAI_API", |_| Some("sk-real".to_string())), None);
     }
 
     #[test]
