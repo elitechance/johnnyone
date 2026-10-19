@@ -61,6 +61,23 @@ pub fn provider_endpoint_from_profile(profile_json: &str, provider: &str) -> Opt
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The `apiKey` of the SAME named provider block the endpoint came from, or None when that block
+/// carries no usable key. None means "send the request unauthenticated" — a public provider must
+/// keep working — and never `Some("")`, which would send an empty bearer token instead.
+///
+/// The model list is not public on the provider the profile names: an unauthenticated
+/// `GET /v1/models` is answered 401 every time, which left the whole check inert (and hid a
+/// wrong-provider bug, because the wrong provider served `/models` without a key). The key is read
+/// from the block named by `provider`, exactly like the endpoint, so a key is never sent to a
+/// provider it does not belong to. It is a secret: it is attached to the request and nothing else —
+/// never a tracing field, never part of a message.
+pub fn api_key_from_profile(profile_json: &str, provider: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(profile_json).ok()?;
+    let key = value.get("providers")?.get(provider)?.get("apiKey")?.as_str()?;
+    let trimmed = key.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// The provider the profile itself names as default. None when the profile does
 /// not name one — and None must mean "check nothing", not "guess a provider":
 /// checking the wrong provider produced a false "serves NONE of the capped
@@ -156,12 +173,18 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
     };
     let url = format!("{}/models", endpoint);
     let client = reqwest::Client::new();
-    let response = match client
+    // Authenticated with the key from THE SAME provider block the endpoint came from — the model
+    // list is not public on the provider the profile names, so an unauthenticated GET is answered
+    // 401 and the check never runs. A profile with no key still sends the request unauthenticated,
+    // so a public provider keeps working; a 401 is already handled as "skip" below, never as an
+    // empty fleet. The key itself is never logged and never part of a message.
+    let mut request = client
         .get(&url)
-        .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS))
-        .send()
-        .await
-    {
+        .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS));
+    if let Some(key) = api_key_from_profile(&profile_json, provider) {
+        request = request.bearer_auth(key);
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(e) => {
             tracing::debug!(%url, %e, "provider preflight skipped: model list unreachable");
@@ -275,6 +298,53 @@ mod tests {
             provider_endpoint_from_profile(PROFILE, "openrouter"),
             None
         );
+    }
+
+    #[test]
+    fn preflight_the_key_comes_from_the_same_provider_block_as_the_endpoint() {
+        // The request must authenticate with the key of the block whose endpoint it is calling —
+        // the model list is not public on the provider the profile names, so an unauthenticated
+        // GET is answered 401 and the check never runs.
+        assert_eq!(
+            api_key_from_profile(PROFILE, "lokalai").as_deref(),
+            Some("sk-…"),
+            "the key comes from the same block whose endpoint provider_endpoint_from_profile returns"
+        );
+        assert_eq!(
+            provider_endpoint_from_profile(PROFILE, "lokalai").as_deref(),
+            Some("https://lokalai.silverjrom.app/v1")
+        );
+        // A key belongs to a NAMED block and is never shared across providers: asking about a
+        // provider the profile has no block for must not leak lokalai's key to its endpoint.
+        assert_eq!(api_key_from_profile(PROFILE, "openrouter"), None);
+    }
+
+    #[test]
+    fn preflight_a_provider_block_with_no_key_is_none_not_an_empty_key() {
+        // None means "send it unauthenticated", which keeps a public provider working. Some("")
+        // would send an empty bearer token, which is a different and worse thing — so a block with
+        // an endpoint but no `apiKey`, a blank key, a non-string key, and an unparseable profile
+        // all answer None rather than a string a caller could attach to the request.
+        assert_eq!(
+            api_key_from_profile(
+                r#"{"providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1"}}}"#,
+                "lokalai"
+            ),
+            None
+        );
+        assert_eq!(
+            api_key_from_profile(r#"{"providers":{"lokalai":{"apiKey":""}}}"#, "lokalai"),
+            None
+        );
+        assert_eq!(
+            api_key_from_profile(r#"{"providers":{"lokalai":{"apiKey":"  "}}}"#, "lokalai"),
+            None
+        );
+        assert_eq!(
+            api_key_from_profile(r#"{"providers":{"lokalai":{"apiKey":42}}}"#, "lokalai"),
+            None
+        );
+        assert_eq!(api_key_from_profile("not json at all", "lokalai"), None);
     }
 
     #[test]
