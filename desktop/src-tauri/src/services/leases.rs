@@ -120,7 +120,7 @@ pub const DEFAULT_SEAT_CAPS: &[(&str, u32)] = &[
 ];
 
 /// The setting key a host may use to override [`DEFAULT_SEAT_CAPS`], as a JSON object
-/// (`{"glm-5.3-flash": 4, …}`). Absent or unparseable → the measured table, with a warning.
+/// (`{"glm-5.3-flash": 4, …}`). Absent or unparseable → [`DEFAULT_SEAT_CAPS`], with a warning.
 pub const SEAT_CAPS_SETTING_KEY: &str = "arena_seat_caps";
 
 /// How many seats each family has. Immutable once built, so a cap cannot drift mid-run.
@@ -130,8 +130,9 @@ pub struct SeatCaps {
 }
 
 impl SeatCaps {
-    /// The measured 2026-10-12 caps.
-    pub fn measured() -> Self {
+    /// The caps this build ships with — see [`DEFAULT_SEAT_CAPS`] for why they are not
+    /// called measured.
+    pub fn default_caps() -> Self {
         Self::from_pairs(DEFAULT_SEAT_CAPS.iter().map(|(f, n)| ((*f).to_string(), *n)))
     }
 
@@ -202,7 +203,7 @@ impl SeatCaps {
             .map_err(|e| format!("seat caps must be a JSON object of family -> seats: {}", e))
     }
 
-    /// Apply a host override ON TOP OF the measured table, and report everything questionable
+    /// Apply a host override ON TOP OF the default table, and report everything questionable
     /// about it.
     ///
     /// **A partial override MERGES; it does not replace.** It used to replace, and that was the
@@ -225,11 +226,11 @@ impl SeatCaps {
         let parsed = Self::parse_override_map(raw)?;
         // The all-zero / empty refusal still runs on the override AS WRITTEN, so its message
         // keeps naming what the operator typed. Merging would hide it: an all-zero override
-        // merges to exactly the measured table, so it would look like success.
+        // merges to exactly the default table, so it would look like success.
         let _ = Self::from_json(raw)?;
 
         let mut notes: Vec<CapNote> = Vec::new();
-        let mut merged = Self::measured().caps;
+        let mut merged = Self::default_caps().caps;
         for (family, seats) in &parsed {
             let measured = DEFAULT_SEAT_CAPS
                 .iter()
@@ -310,7 +311,7 @@ impl SeatCaps {
     /// `(family, configured, measured)`, **in [`DEFAULT_SEAT_CAPS`] order** — which is the
     /// fleet's own ordering (glm, deepseek, qwen), not alphabetical and not this table's
     /// `BTreeMap` order. The doc comment said "ascending", which was wrong and QA pinned it in
-    /// `qa_the_exceedance_order_is_the_measured_tables_not_alphabetical`; the order is stable,
+    /// `qa_the_exceedance_order_is_the_default_tables_not_alphabetical`; the order is stable,
     /// which is all a log line needs, so the comment is what was fixed.
     ///
     /// A different fleet legitimately needs a different number, so this is **not** a refusal and
@@ -620,9 +621,9 @@ fn counts(held: &Mutex<BTreeMap<String, u32>>) -> MutexGuard<'_, BTreeMap<String
 }
 
 impl LeasePool {
-    /// A pool over the measured 2026-10-12 caps.
+    /// A pool over the default 2026-10-12 caps.
     pub fn with_measured_caps() -> SharedLeasePool {
-        Arc::new(Self::new(SeatCaps::measured()))
+        Arc::new(Self::new(SeatCaps::default_caps()))
     }
 
     pub fn new(caps: SeatCaps) -> Self {
@@ -751,7 +752,7 @@ impl Drop for SeatLease {
 }
 
 /// The caps this host runs on: the [`SEAT_CAPS_SETTING_KEY`] override when it is set and parses,
-/// otherwise the measured table. The one impure entry point, kept thin so everything above it is
+/// otherwise the default table. The one impure entry point, kept thin so everything above it is
 /// testable without a database.
 ///
 /// Takes `&Database` rather than `&AppState` because `AppState::new` builds the pool, so this has
@@ -769,7 +770,7 @@ pub fn seat_caps_from_db(db: &crate::db::Database) -> SeatCaps {
         })
         .unwrap_or_default();
     if raw.trim().is_empty() {
-        return SeatCaps::measured();
+        return SeatCaps::default_caps();
     }
     match SeatCaps::from_override_json(&raw) {
         Ok((caps, notes)) => {
@@ -788,9 +789,9 @@ pub fn seat_caps_from_db(db: &crate::db::Database) -> SeatCaps {
             tracing::warn!(
                 key = SEAT_CAPS_SETTING_KEY,
                 %reason,
-                "ignoring the configured seat caps; falling back to the measured table"
+                "ignoring the configured seat caps; falling back to the default table"
             );
-            SeatCaps::measured()
+            SeatCaps::default_caps()
         }
     }
 }
@@ -845,7 +846,7 @@ mod tests {
     #[test]
     fn the_measured_caps_are_the_ones_recorded_in_the_mock() {
         // Measured 2026-10-12, mock.html step 3 ("Measured caps · 2026-10-12").
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         assert_eq!(caps.cap("glm-5.3-flash"), Some(4));
         assert_eq!(caps.cap("deepseek-v4.1-flash"), Some(2));
         assert_eq!(caps.cap("qwen3.8-flash-next"), Some(4));
@@ -1291,8 +1292,8 @@ mod tests {
                 ("qwen3.8-flash-next".to_string(), 0),
             ])
         );
-        // Unset setting → the measured table.
-        assert_eq!(load_seat_caps(&state), SeatCaps::measured());
+        // Unset setting → the default table.
+        assert_eq!(load_seat_caps(&state), SeatCaps::default_caps());
         crate::services::settings::set_setting(
             &state,
             SEAT_CAPS_SETTING_KEY.to_string(),
@@ -1307,7 +1308,7 @@ mod tests {
             "{oops".to_string(),
         )
         .unwrap();
-        assert_eq!(load_seat_caps(&state), SeatCaps::measured());
+        assert_eq!(load_seat_caps(&state), SeatCaps::default_caps());
     }
 
     /// A provider id list, spelled once so each test reads as its own claim.
@@ -1320,7 +1321,7 @@ mod tests {
         // The real case, read off the provider's /v1/models on 2026-10-12: it serves glm and
         // the qwen family (plus qwen variants) but NOT deepseek, so the table caps a pool that
         // can be leased and never used.
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         let provider = ids(&[
             "glm-5.3-flash",
             "qwen3.8-flash-next",
@@ -1335,7 +1336,7 @@ mod tests {
 
     #[test]
     fn seatcaps_a_family_the_provider_lists_is_not_reported() {
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         let provider = ids(&["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"]);
         assert_eq!(families_absent_from_provider(&caps, &provider), Vec::<String>::new());
 
@@ -1357,7 +1358,7 @@ mod tests {
     fn seatcaps_an_empty_provider_list_is_not_treated_as_every_family_missing() {
         // An empty list means "we could not read the provider", not "the provider serves
         // nothing" — one failed HTTP call must not become a fleet-wide alarm.
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         assert_eq!(families_absent_from_provider(&caps, &[]), Vec::<String>::new());
         assert!(!provider_serves_no_capped_family(&caps, &[]));
     }
@@ -1366,7 +1367,7 @@ mod tests {
     fn seatcaps_provider_serving_none_of_the_capped_families_is_its_own_condition() {
         // A non-empty list that shares nothing with the table: the arena cannot run at all,
         // which is a louder state than "one family is missing".
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         let none = ids(&["dgx3-qwen", "boxb-qwen"]);
         assert_eq!(
             families_absent_from_provider(&caps, &none),
@@ -1682,7 +1683,7 @@ mod qa_b_tests {
     /// QA round 2). Through the real setting: a zeroed override now falls back to the measured
     /// table, exactly as a malformed one does, instead of leaving the host with no caps at all.
     #[test]
-    fn qa_a_zeroed_setting_falls_back_to_the_measured_table() {
+    fn qa_a_zeroed_setting_falls_back_to_the_default_table() {
         let (state, _root) = crate::test_support::test_state();
         crate::services::settings::set_setting(
             &state,
@@ -1693,8 +1694,8 @@ mod qa_b_tests {
         let caps = load_seat_caps(&state);
         assert_eq!(
             caps,
-            SeatCaps::measured(),
-            "a zeroed override must fall back to the measured table, like a malformed one"
+            SeatCaps::default_caps(),
+            "a zeroed override must fall back to the default table, like a malformed one"
         );
         assert_eq!(caps.families().count(), 3);
         // And the host is usable rather than refusing everything as UnknownFamily.
@@ -1717,7 +1718,7 @@ mod qa_b_tests {
             Some(40),
             "ten times the measured 4, still accepted verbatim — this is a warning, not a clamp"
         );
-        assert_eq!(SeatCaps::measured().cap("glm-5.3-flash"), Some(4));
+        assert_eq!(SeatCaps::default_caps().cap("glm-5.3-flash"), Some(4));
 
         // The difference is now reported, with all three numbers.
         assert_eq!(
@@ -1734,7 +1735,7 @@ mod qa_b_tests {
         assert_eq!(pool.busy_for("glm-5.3-flash"), 40);
 
         // A cap at or BELOW the measured one is not reported — only an excess is news.
-        assert!(SeatCaps::measured().exceedances_vs_measured().is_empty());
+        assert!(SeatCaps::default_caps().exceedances_vs_measured().is_empty());
         assert!(SeatCaps::from_json(r#"{"glm-5.3-flash": 1}"#)
             .unwrap()
             .exceedances_vs_measured()
@@ -1832,10 +1833,10 @@ mod qa_b_tests {
         assert_eq!(half.seats_held_json(), r#"{"glm-5.3-flash":2}"#);
     }
 
-    /// The measured table is transcribed from the mock. Re-pinned here against the mock's own
+    /// The default table is transcribed from the mock. Re-pinned here against the mock's own
     /// wording so the two cannot drift silently in either direction.
     #[test]
-    fn qa_the_measured_table_matches_the_mocks_three_rows() {
+    fn qa_the_default_table_matches_the_mocks_three_rows() {
         assert_eq!(
             DEFAULT_SEAT_CAPS,
             &[
@@ -1893,7 +1894,7 @@ mod qa_b_r2_tests {
         );
         // Below measured → not news.
         assert!(caps(r#"{"glm-5.3-flash":1}"#).exceedances_vs_measured().is_empty());
-        // A family not in the measured table has nothing to exceed.
+        // A family not in the default table has nothing to exceed.
         assert!(caps(r#"{"local-7b":999}"#).exceedances_vs_measured().is_empty());
         // A mixed override reports only the family that exceeds.
         assert_eq!(
@@ -1901,18 +1902,18 @@ mod qa_b_r2_tests {
                 .exceedances_vs_measured(),
             vec![("deepseek-v4.1-flash".to_string(), 7, 2)]
         );
-        // And the measured table never reports against itself.
-        assert!(SeatCaps::measured().exceedances_vs_measured().is_empty());
+        // And the default table never reports against itself.
+        assert!(SeatCaps::default_caps().exceedances_vs_measured().is_empty());
     }
 
-    /// The report's ORDER is the measured table's order, not alphabetical.
+    /// The report's ORDER is the default table's order, not alphabetical.
     ///
     /// The doc comment says "ascending", which is what `families()` (a `BTreeMap`) gives and is
     /// NOT what this gives: it iterates `DEFAULT_SEAT_CAPS`, so the order is glm, deepseek,
     /// qwen. Deterministic either way, and the order is what Dev B's own assertion depends on —
     /// pinned here because the doc and the code disagree about which guarantee a caller has.
     #[test]
-    fn qa_the_exceedance_order_is_the_measured_tables_not_alphabetical() {
+    fn qa_the_exceedance_order_is_the_default_tables_not_alphabetical() {
         let all = SeatCaps::from_json(
             r#"{"deepseek-v4.1-flash":9,"glm-5.3-flash":9,"qwen3.8-flash-next":9}"#,
         )
@@ -1973,7 +1974,7 @@ mod qa_b_r2_tests {
     }
 
     /// FIXED (was `qa_documents_an_override_that_omits_a_measured_family_is_silent`, QA round 3).
-    /// A partial override now MERGES over the measured table, so an omitted family keeps its
+    /// A partial override now MERGES over the default table, so an omitted family keeps its
     /// measured cap instead of becoming unleasable.
     ///
     /// QA's finding, verbatim: omitting a key had the same effect as zeroing it, and the all-zero
@@ -2003,7 +2004,7 @@ mod qa_b_r2_tests {
         assert_eq!(lease.seats(), 2);
 
         // And the comparability snapshot keeps all three rows, so a run recorded under this
-        // override is comparable with one recorded under the measured table.
+        // override is comparable with one recorded under the default table.
         drop(lease);
         assert_eq!(
             pool.fleet_busy_json(),
@@ -2011,7 +2012,7 @@ mod qa_b_r2_tests {
         );
         assert_eq!(
             pool.fleet_busy_json(),
-            Arc::new(LeasePool::new(SeatCaps::measured())).fleet_busy_json(),
+            Arc::new(LeasePool::new(SeatCaps::default_caps())).fleet_busy_json(),
             "a partial override must not change the SHAPE of the snapshot"
         );
 
@@ -2181,7 +2182,7 @@ mod qa_b_r3_tests {
 
     // ── the merge, and the cost that was ruled acceptable ─────────────────────────────────────
 
-    /// A partial override MERGES over the measured table, and the stated cost is real: the two
+    /// A partial override MERGES over the default table, and the stated cost is real: the two
     /// families the operator did not mention keep their measured caps and stay leasable.
     ///
     /// This is the round-2 finding's agreed resolution, pinned so the cost is visible in the
@@ -2207,7 +2208,7 @@ mod qa_b_r3_tests {
     /// The all-zero refusal runs on the override AS WRITTEN, before the merge.
     ///
     /// This is the ordering that matters: under merge semantics an all-zero override would merge
-    /// to exactly the measured table and look like success, so the guard has to see the raw
+    /// to exactly the default table and look like success, so the guard has to see the raw
     /// object. Checked through `from_override_json`, not only through `from_json`.
     #[test]
     fn qa_the_all_zero_refusal_runs_before_the_merge() {
@@ -2224,7 +2225,7 @@ mod qa_b_r3_tests {
             );
         }
         // And it is not merely `from_json` being called first by accident: the merged result for
-        // an all-zero override WOULD have been the measured table, i.e. indistinguishable from
+        // an all-zero override WOULD have been the default table, i.e. indistinguishable from
         // success. This is what the ordering prevents.
         assert!(SeatCaps::from_override_json(
             r#"{"glm-5.3-flash":0,"deepseek-v4.1-flash":0,"qwen3.8-flash-next":0}"#
@@ -2237,7 +2238,7 @@ mod qa_b_r3_tests {
     /// behaviours stay different, and the reason is recorded in `from_json`.
     ///
     /// QA's analysis was right about the merge path: an all-zero override merges to exactly the
-    /// measured table, so on that path the refusal buys nothing. It is kept because `from_json`
+    /// default table, so on that path the refusal buys nothing. It is kept because `from_json`
     /// is a public constructor with its own contract — produce a usable caps table or fail — and
     /// has a caller shape that never merges, `LeasePool::new(SeatCaps::from_json(..)?)`. For that
     /// caller an all-zero table IS the empty-table state the guard exists to prevent: every

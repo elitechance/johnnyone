@@ -130,7 +130,7 @@ fn main() {
 
             // One read of the provider's model list, compared with the seat caps: a cap for a
             // family the provider will not serve is a pool that can be leased and never used.
-            provider_preflight::spawn_provider_preflight(leases::SeatCaps::measured());
+            provider_preflight::spawn_provider_preflight(leases::SeatCaps::default_caps());
 
             let bind_addr = std::env::var("JOHNNYONE_HOST_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:7788".to_string());
