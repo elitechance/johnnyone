@@ -47,9 +47,17 @@
         <span class="token-count">Out: {{ message.outputTokens }}</span>
       }
     }
-    @if (isAssistant && message.content) {
-      <button class="copy-btn" (click)="copyContent()" title="Copy">
-        <ion-icon name="copy-outline"></ion-icon>
+    @if (canCopy) {
+      <button
+        class="copy-btn"
+        data-testid="message-copy-btn"
+        [class.copied]="copyState === 'copied'"
+        [class.unavailable]="copyState === 'unavailable'"
+        [class.failed]="copyState === 'failed'"
+        (click)="copyContent()"
+        [title]="copyButtonTitle">
+        <ion-icon [name]="copyIcon"></ion-icon>
+        <span class="copy-state" role="status">{{ copyStateLabel }}</span>
       </button>
     }
   </div>
