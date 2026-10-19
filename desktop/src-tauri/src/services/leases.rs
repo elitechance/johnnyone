@@ -88,8 +88,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// The seat caps as MEASURED against the live fleet on 2026-10-12, recorded in
+/// The seat caps the arena ships with, recorded in
 /// `personal/plans/johnnyone/mass/mock.html` step 3.
+///
+/// They are SELF-IMPOSED, not measured. This comment claimed until 2026-10-19 that they
+/// were "measured against the live fleet on 2026-10-12", and that was wrong twice over:
+/// the provider's `/v1/models` carries no seat count in any field — it reports
+/// `status`, `admissible`, `resident`, `configured` and the context lengths, and nothing
+/// at all about concurrency — and `deepseek-v4.1-flash`, which this table gives 2 seats,
+/// answers HTTP 400 `model_not_found`, so there was never a fleet to measure that row
+/// against. A self-imposed ceiling is a perfectly good thing for this table to be; what
+/// it must not do is borrow authority from a measurement that never happened.
 ///
 /// Data, not logic: the numbers live in this one table, nothing branches on a family name, and
 /// a deployment with a different fleet overrides them via [`SeatCaps::from_json`] rather than by
@@ -101,7 +110,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// `/v1/models` on 2026-10-19, and the figure these comments used to carry for
 /// `qwen3.8-flash-next` was never its context length — the provider reports 135168, which the
 /// comment below now records as 132K.
-pub const MEASURED_SEAT_CAPS: &[(&str, u32)] = &[
+pub const DEFAULT_SEAT_CAPS: &[(&str, u32)] = &[
     // 262K · reasoning · executes the phase
     ("glm-5.3-flash", 4),
     // 262K · proposes the next prompt
@@ -110,7 +119,7 @@ pub const MEASURED_SEAT_CAPS: &[(&str, u32)] = &[
     ("qwen3.8-flash-next", 4),
 ];
 
-/// The setting key a host may use to override [`MEASURED_SEAT_CAPS`], as a JSON object
+/// The setting key a host may use to override [`DEFAULT_SEAT_CAPS`], as a JSON object
 /// (`{"glm-5.3-flash": 4, …}`). Absent or unparseable → the measured table, with a warning.
 pub const SEAT_CAPS_SETTING_KEY: &str = "arena_seat_caps";
 
@@ -123,7 +132,7 @@ pub struct SeatCaps {
 impl SeatCaps {
     /// The measured 2026-10-12 caps.
     pub fn measured() -> Self {
-        Self::from_pairs(MEASURED_SEAT_CAPS.iter().map(|(f, n)| ((*f).to_string(), *n)))
+        Self::from_pairs(DEFAULT_SEAT_CAPS.iter().map(|(f, n)| ((*f).to_string(), *n)))
     }
 
     /// Build from any `(family, seats)` source. A family with zero seats is dropped rather than
@@ -222,7 +231,7 @@ impl SeatCaps {
         let mut notes: Vec<CapNote> = Vec::new();
         let mut merged = Self::measured().caps;
         for (family, seats) in &parsed {
-            let measured = MEASURED_SEAT_CAPS
+            let measured = DEFAULT_SEAT_CAPS
                 .iter()
                 .find(|(m, _)| m == family)
                 .map(|(_, n)| *n);
@@ -298,7 +307,7 @@ impl SeatCaps {
     }
 
     /// Families whose cap here is HIGHER than the measured one, as
-    /// `(family, configured, measured)`, **in [`MEASURED_SEAT_CAPS`] order** — which is the
+    /// `(family, configured, measured)`, **in [`DEFAULT_SEAT_CAPS`] order** — which is the
     /// fleet's own ordering (glm, deepseek, qwen), not alphabetical and not this table's
     /// `BTreeMap` order. The doc comment said "ascending", which was wrong and QA pinned it in
     /// `qa_the_exceedance_order_is_the_measured_tables_not_alphabetical`; the order is stable,
@@ -311,7 +320,7 @@ impl SeatCaps {
     /// comment says it exists to prevent. Returned as DATA rather than logged in place so it can
     /// be asserted on; [`seat_caps_from_db`] is what turns each row into a warning.
     pub fn exceedances_vs_measured(&self) -> Vec<(String, u32, u32)> {
-        MEASURED_SEAT_CAPS
+        DEFAULT_SEAT_CAPS
             .iter()
             .filter_map(|(family, measured)| {
                 let configured = self.cap(family)?;
@@ -382,7 +391,7 @@ fn near_miss(key: &str) -> Option<NearMiss> {
         .filter(|c| !INVISIBLE_CHARS.iter().any(|(bad, _)| bad == c))
         .collect();
     let trimmed = stripped.trim();
-    let (measured, _) = MEASURED_SEAT_CAPS
+    let (measured, _) = DEFAULT_SEAT_CAPS
         .iter()
         .find(|(m, _)| m.eq_ignore_ascii_case(trimmed))?;
     let measured = (*measured).to_string();
@@ -1828,7 +1837,7 @@ mod qa_b_tests {
     #[test]
     fn qa_the_measured_table_matches_the_mocks_three_rows() {
         assert_eq!(
-            MEASURED_SEAT_CAPS,
+            DEFAULT_SEAT_CAPS,
             &[
                 ("glm-5.3-flash", 4u32),
                 ("deepseek-v4.1-flash", 2),
@@ -1839,7 +1848,7 @@ mod qa_b_tests {
         // Nothing branches on a family name: an unknown family is refused by the same code path
         // that would serve a known one, not by a special case.
         let pool = LeasePool::with_measured_caps();
-        for (family, cap) in MEASURED_SEAT_CAPS {
+        for (family, cap) in DEFAULT_SEAT_CAPS {
             assert_eq!(pool.cap_for(family), Some(*cap));
             let lease = pool.acquire(family, *cap).unwrap();
             assert_eq!(pool.free_for(family), Some(0));
@@ -1899,7 +1908,7 @@ mod qa_b_r2_tests {
     /// The report's ORDER is the measured table's order, not alphabetical.
     ///
     /// The doc comment says "ascending", which is what `families()` (a `BTreeMap`) gives and is
-    /// NOT what this gives: it iterates `MEASURED_SEAT_CAPS`, so the order is glm, deepseek,
+    /// NOT what this gives: it iterates `DEFAULT_SEAT_CAPS`, so the order is glm, deepseek,
     /// qwen. Deterministic either way, and the order is what Dev B's own assertion depends on —
     /// pinned here because the doc and the code disagree about which guarantee a caller has.
     #[test]
@@ -1912,7 +1921,7 @@ mod qa_b_r2_tests {
         assert_eq!(
             names,
             vec!["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"],
-            "the order follows MEASURED_SEAT_CAPS"
+            "the order follows DEFAULT_SEAT_CAPS"
         );
         // Alphabetical would be a different list, so the two really are distinguishable.
         let mut alphabetical = names.clone();

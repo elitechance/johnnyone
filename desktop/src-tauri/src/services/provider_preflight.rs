@@ -24,7 +24,7 @@
 //! {"object":"list","data":[{"id":"glm-5.3-flash",…},{"id":"qwen3.8-flash-next",…},…]}
 //! ```
 //!
-//! `deepseek-v4.1-flash` — which [`MEASURED_SEAT_CAPS`](leases::MEASURED_SEAT_CAPS) gives 2 seats
+//! `deepseek-v4.1-flash` — which [`DEFAULT_SEAT_CAPS`](leases::DEFAULT_SEAT_CAPS) gives 2 seats
 //! — is **not** among the ids. That is the mismatch this module reports, and it is the reason the
 //! check runs at all.
 //!
