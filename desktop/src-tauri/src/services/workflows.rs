@@ -1450,11 +1450,13 @@ pub fn measure_run_budget(
     requested.insert(family.clone(), seats);
 
     // **A family the pool does not cap is not a leaseable family, but it is still a measurable
-    // run.** The pool refuses `UnknownFamily` — that refusal is about seats it cannot account for,
-    // not about the arena. The arena has always been able to run a family the default table does
-    // not name, and the budget it records is the declared one against a fleet snapshot that has no
-    // row for it. Refusing here would turn a scheduling gap into an arena outage, so the seat
-    // ledger stays honest (nothing is leased) while the measurement still lands.
+    // run.** (A measurable run is one whose budget and score are recorded; nothing about that
+    // depends on the pool knowing the family.) The pool refuses `UnknownFamily` — that refusal is
+    // about seats it cannot account for, not about the arena. The arena has always been able to run
+    // a family the default table does not name, and the budget it records is the declared one
+    // against a fleet snapshot that has no row for it. Refusing here would turn a scheduling gap
+    // into an arena outage, so the seat ledger stays honest (nothing is leased) while the
+    // measurement still lands.
     //
     // **The lease is held for the measurement only.** `start_workflow_run_with_budget` inserts the
     // row and returns; the run's own lease is then taken by whoever executes it. Holding a lease
