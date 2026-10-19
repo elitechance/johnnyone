@@ -171,7 +171,7 @@ impl SeatCaps {
                 return Err("seat caps object is empty".to_string());
             }
             // Why an all-zero override is refused when a partial one is merely noted, since
-            // under merge semantics both end at the measured caps for every family:
+            // under merge semantics both end at the default caps for every family:
             //
             // This is an API-CONTRACT argument, not a live-caller one, and the distinction
             // matters because "there is a caller" is the kind of sentence that gets trusted
@@ -189,7 +189,7 @@ impl SeatCaps {
             // state the same rule in the same words, so an operator learns it either way.
             return Err(format!(
                 "every family in the seat caps object is set to zero ({}), so no family could be \
-                 leased at all; remove the key to use the measured caps instead. Zero does NOT \
+                 leased at all; remove the key to use the default caps instead. Zero does NOT \
                  disable a family — there is deliberately no disable switch",
                 zeroed_list(&zeroed)
             ));
@@ -207,14 +207,14 @@ impl SeatCaps {
     /// about it.
     ///
     /// **A partial override MERGES; it does not replace.** It used to replace, and that was the
-    /// bug: `{"glm-5.3-flash": 4}` left the other two measured families with no cap at all, so
+    /// bug: `{"glm-5.3-flash": 4}` left the other two default families with no cap at all, so
     /// they could not be leased — two thirds of the harm the all-zero guard was added to
     /// prevent, with no error and no warning. It also shrank `fleet_busy` to one row, which is
     /// precisely the "a quiet fleet versus a snapshot that never recorded that family"
     /// ambiguity [`LeasePool::busy`]'s own doc comment says it exists to avoid — and that column
     /// is what decides whether two arena runs are comparable at all.
     ///
-    /// So an omitted family keeps its measured cap, and that is now the documented default
+    /// So an omitted family keeps its default cap, and that is now the documented default
     /// rather than an implied disable. **There is deliberately no way to disable a family here.**
     /// A zero entry does not do it (it is reported and ignored, see [`CapNote::ZeroIgnored`]),
     /// because "disable" has to be explicit and warned rather than inferred from an absence, and
@@ -239,8 +239,8 @@ impl SeatCaps {
 
             // The key diagnostics run BEFORE the zero check, not after it. They used to be
             // after a `continue`, so `{"local-7b":0}` skipped them and the operator's ONLY note
-            // was `ZeroIgnored` claiming "the measured cap is kept" — for a family that has no
-            // measured cap to keep. The one note they got was the one that misinformed them.
+            // was `ZeroIgnored` claiming "the default cap is kept" — for a family that has no
+            // default cap to keep. The one note they got was the one that misinformed them.
             if measured.is_none() {
                 // A different fleet may legitimately have a family nobody here measured. But a
                 // typo of a measured name is the likelier cause and is otherwise invisible: the
@@ -275,7 +275,7 @@ impl SeatCaps {
                 });
             }
             if *seats == 0 {
-                // `measured` rides along so the message can only say "the measured cap is kept"
+                // `measured` rides along so the message can only say "the default cap is kept"
                 // when there is one.
                 notes.push(CapNote::ZeroIgnored {
                     family: family.clone(),
@@ -352,7 +352,7 @@ const INVISIBLE_CHARS: &[(char, &str)] = &[
     ('\u{feff}', "U+FEFF ZERO WIDTH NO-BREAK SPACE (BOM)"),
 ];
 
-/// How `key` nearly named a measured family.
+/// How `key` nearly named a default family.
 #[derive(Debug)]
 enum NearMiss {
     /// Differs only in case.
@@ -367,7 +367,7 @@ enum NearMiss {
     },
 }
 
-/// Did `key` nearly name a measured family?
+/// Did `key` nearly name a default family?
 ///
 /// Compares with surrounding whitespace removed, the zero-width format characters of
 /// [`INVISIBLE_CHARS`] removed, and case folded — because all three are what hand-edited JSON
@@ -379,7 +379,7 @@ enum NearMiss {
 /// key than was written. See the loop in `from_override_json`.
 ///
 /// Case folding is `eq_ignore_ascii_case`, so a NON-ASCII case variant would not match. Every
-/// measured family name is ASCII today; if one ever is not, this needs a Unicode case fold, and
+/// default family name is ASCII today; if one ever is not, this needs a Unicode case fold, and
 /// the symptom would be a near miss falling through to `UnmeasuredFamily`.
 fn near_miss(key: &str) -> Option<NearMiss> {
     let found: Vec<&str> = INVISIBLE_CHARS
@@ -418,15 +418,15 @@ fn near_miss(key: &str) -> Option<NearMiss> {
 /// is not a testable claim about a `tracing::warn!`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapNote {
-    /// The configured cap is above the measured capacity for that family.
+    /// The configured cap is above the default cap for that family.
     AboveMeasured {
         family: String,
         configured: u32,
         measured: u32,
     },
-    /// The key differs from a measured family only by case, so it did not apply to it.
+    /// The key differs from a default family only by case, so it did not apply to it.
     CaseMismatch { configured: String, measured: String },
-    /// The key differs from a measured family by surrounding whitespace (and possibly case too),
+    /// The key differs from a default family by surrounding whitespace (and possibly case too),
     /// so it did not apply to it. Its own variant rather than a `CaseMismatch`, because the
     /// operator has to be told WHICH invisible character to delete.
     WhitespaceMismatch {
@@ -434,7 +434,7 @@ pub enum CapNote {
         measured: String,
         case_too: bool,
     },
-    /// The key differs from a measured family by one or more ZERO-WIDTH format characters, which
+    /// The key differs from a default family by one or more ZERO-WIDTH format characters, which
     /// `str::trim` cannot see at all because they are not `char::is_whitespace`.
     ///
     /// Its own variant rather than a `WhitespaceMismatch` because the message has to name the
@@ -447,12 +447,12 @@ pub enum CapNote {
         characters: String,
         case_too: bool,
     },
-    /// The key matches no measured family at all, not even stripped, trimmed and case-folded.
+    /// The key matches no default family at all, not even stripped, trimmed and case-folded.
     UnmeasuredFamily { family: String },
     /// A zero entry. Zero is not a way to disable a family.
     ///
-    /// `measured` is the family's measured cap, if it has one. It is carried so the message
-    /// cannot claim "the measured cap is kept" about a family that has no measured cap — the
+    /// `measured` is the family's default cap, if it has one. It is carried so the message
+    /// cannot claim "the default cap is kept" about a family that has no default cap — the
     /// false note an unmeasured, zeroed key used to produce as the operator's ONLY diagnostic.
     ZeroIgnored {
         family: String,
@@ -469,7 +469,7 @@ impl fmt::Display for CapNote {
                 measured,
             } => write!(
                 f,
-                "configured seat cap for {:?} is {}, ABOVE the measured capacity of {}; the \
+                "configured seat cap for {:?} is {}, ABOVE the default cap of {}; the \
                  fleet reports no error when over-subscribed, so this will show up only as \
                  latency",
                 family, configured, measured
@@ -479,7 +479,7 @@ impl fmt::Display for CapNote {
                 measured,
             } => write!(
                 f,
-                "seat-cap key {:?} differs only in case from the measured family {:?}, so it did \
+                "seat-cap key {:?} differs only in case from the default family {:?}, so it did \
                  NOT change that family's cap — {:?} keeps its measured value and {:?} was added \
                  beside it. Family names are matched exactly; fix the case if this was a typo",
                 configured, measured, measured, configured
@@ -490,7 +490,7 @@ impl fmt::Display for CapNote {
                 case_too,
             } => write!(
                 f,
-                "seat-cap key {:?} differs from the measured family {:?} only by surrounding \
+                "seat-cap key {:?} differs from the default family {:?} only by surrounding \
                  whitespace{}, so it did NOT change that family's cap — {:?} keeps its measured \
                  value and {:?} was added beside it as a family of its own. Family names are \
                  matched exactly and the key is NOT trimmed; delete the whitespace if this was \
@@ -508,7 +508,7 @@ impl fmt::Display for CapNote {
                 case_too,
             } => write!(
                 f,
-                "seat-cap key {:?} contains {} and so does NOT name the measured family {:?}{} \
+                "seat-cap key {:?} contains {} and so does NOT name the default family {:?}{} \
                  — {:?} keeps its measured value and the key was added beside it as a family of \
                  its own. The character is invisible in an editor; delete it. Family names are \
                  matched exactly and the key is NOT trimmed or rewritten",
@@ -520,7 +520,7 @@ impl fmt::Display for CapNote {
             ),
             CapNote::UnmeasuredFamily { family } => write!(
                 f,
-                "seat-cap key {:?} matches no measured family; it is accepted as a new family, \
+                "seat-cap key {:?} matches no default family; it is accepted as a new family, \
                  but nothing here has measured its real capacity",
                 family
             ),
@@ -529,7 +529,7 @@ impl fmt::Display for CapNote {
                 measured: Some(measured),
             } => write!(
                 f,
-                "seat-cap entry {:?} is 0, which does NOT disable the family — its measured cap \
+                "seat-cap entry {:?} is 0, which does NOT disable the family — its default cap \
                  of {} is kept. Remove the key instead; there is deliberately no disable switch",
                 family, measured
             ),
@@ -538,7 +538,7 @@ impl fmt::Display for CapNote {
                 measured: None,
             } => write!(
                 f,
-                "seat-cap entry {:?} is 0 and that family has no measured cap either, so the \
+                "seat-cap entry {:?} is 0 and that family has no default cap either, so the \
                  entry does nothing at all — it neither grants seats nor disables anything. \
                  Remove it, or give it the number of seats the family really has",
                 family
@@ -1673,7 +1673,7 @@ mod qa_b_tests {
         assert!(err.contains("set to zero"), "{err}");
         assert!(err.contains("glm-5.3-flash"), "{err}");
         assert!(err.contains("deepseek-v4.1-flash"), "{err}");
-        assert!(err.contains("remove the key to use the measured caps"), "{err}");
+        assert!(err.contains("remove the key to use the default caps"), "{err}");
 
         // A partial zero is NOT refused: the surviving families are a usable table.
         let partial = SeatCaps::from_json(r#"{"glm-5.3-flash":4,"qwen3.8-flash-next":0}"#)
@@ -1706,20 +1706,20 @@ mod qa_b_tests {
         assert!(pool.acquire("glm-5.3-flash", 4).is_ok());
     }
 
-    /// FIXED (was `qa_an_override_above_the_measured_cap_is_accepted_with_no_warning`, QA round
-    /// 2). An override above the measured cap is still ACCEPTED — a different fleet legitimately
+    /// FIXED (was `qa_an_override_above_the_default_cap_is_accepted_with_no_warning`, QA round
+    /// 2). An override above the default cap is still ACCEPTED — a different fleet legitimately
     /// needs a different number — but it is no longer silent.
     ///
-    /// `exceedances_vs_measured` names the family, the configured value and the measured one, and
+    /// `exceedances_vs_default` names the family, the configured value and the default one, and
     /// `seat_caps_from_db` logs one warning per row. Returned as data precisely so this can be
     /// asserted: "it warns" is not a testable claim about a `tracing::warn!`.
     #[test]
-    fn qa_an_override_above_the_measured_cap_is_accepted_but_reported() {
+    fn qa_an_override_above_the_default_cap_is_accepted_but_reported() {
         let fat = SeatCaps::from_json(r#"{"glm-5.3-flash": 40}"#).unwrap();
         assert_eq!(
             fat.cap("glm-5.3-flash"),
             Some(40),
-            "ten times the measured 4, still accepted verbatim — this is a warning, not a clamp"
+            "ten times the default 4, still accepted verbatim — this is a warning, not a clamp"
         );
         assert_eq!(SeatCaps::default_caps().cap("glm-5.3-flash"), Some(4));
 
@@ -1737,7 +1737,7 @@ mod qa_b_tests {
         assert_eq!(lease.seats(), 40);
         assert_eq!(pool.busy_for("glm-5.3-flash"), 40);
 
-        // A cap at or BELOW the measured one is not reported — only an excess is news.
+        // A cap at or BELOW the default one is not reported — only an excess is news.
         assert!(SeatCaps::default_caps().exceedances_vs_measured().is_empty());
         assert!(SeatCaps::from_json(r#"{"glm-5.3-flash": 1}"#)
             .unwrap()
@@ -1755,7 +1755,7 @@ mod qa_b_tests {
             huge.exceedances_vs_measured(),
             vec![("glm-5.3-flash".to_string(), u32::MAX, 4)]
         );
-        // Every measured family is checked, not just the first.
+        // Every default family is checked, not just the first.
         let all = SeatCaps::from_json(
             r#"{"glm-5.3-flash":5,"deepseek-v4.1-flash":3,"qwen3.8-flash-next":5}"#,
         )
@@ -1976,27 +1976,27 @@ mod qa_b_r2_tests {
         );
     }
 
-    /// FIXED (was `qa_documents_an_override_that_omits_a_measured_family_is_silent`, QA round 3).
+    /// FIXED (was `qa_documents_an_override_that_omits_a_default_family_is_silent`, QA round 3).
     /// A partial override now MERGES over the default table, so an omitted family keeps its
-    /// measured cap instead of becoming unleasable.
+    /// default cap instead of becoming unleasable.
     ///
     /// QA's finding, verbatim: omitting a key had the same effect as zeroing it, and the all-zero
     /// refusal only fired when EVERY key was zero — so `{"glm-5.3-flash": 4}` silently took two
-    /// of the three measured families out of service, two thirds of the harm the all-zero guard
+    /// of the three default families out of service, two thirds of the harm the all-zero guard
     /// was added to prevent. It also shrank `fleet_busy` to one row, the exact ambiguity
     /// `busy()`'s doc comment says it exists to avoid, in the column that decides comparability.
     ///
-    /// Same fixture, inverted. The coordinator ruled merge-over-measured; I agree, and the
+    /// Same fixture, inverted. The coordinator ruled merge-over-default; I agree, and the
     /// alternative (omission disables) is argued against in `from_override_json`'s doc comment:
     /// a disable has to be its own explicit, warned key, not an absence.
     #[test]
-    fn qa_an_override_that_omits_a_measured_family_keeps_its_measured_cap() {
+    fn qa_an_override_that_omits_a_default_family_keeps_its_default_cap() {
         let (subset, notes) = SeatCaps::from_override_json(r#"{"glm-5.3-flash": 4}"#).unwrap();
-        // The omitted families are still leasable, at their measured caps.
+        // The omitted families are still leasable, at their default caps.
         assert_eq!(subset.cap("glm-5.3-flash"), Some(4));
         assert_eq!(subset.cap("deepseek-v4.1-flash"), Some(2));
         assert_eq!(subset.cap("qwen3.8-flash-next"), Some(4));
-        // 4 is exactly the measured cap, so there is nothing to report about this override.
+        // 4 is exactly the default cap, so there is nothing to report about this override.
         assert!(notes.is_empty(), "{notes:?}");
         assert!(subset.exceedances_vs_measured().is_empty());
 
@@ -2039,7 +2039,7 @@ mod qa_b_r2_tests {
     }
 
     /// FIXED (was `qa_documents_a_case_typo_in_a_family_name_is_not_reported`, QA round 3). A key
-    /// that differs from a measured family only in case is now reported.
+    /// that differs from a default family only in case is now reported.
     ///
     /// Matching stays exact and case-sensitive — lowering the key would be a guess about a name
     /// the fleet owns — so `{"GLM-5.3-Flash": 40}` still does not raise glm's cap. What changed
@@ -2067,7 +2067,7 @@ mod qa_b_r2_tests {
         let pool = Arc::new(LeasePool::new(typo));
         assert!(
             pool.acquire("glm-5.3-flash", 4).is_ok(),
-            "the real family must still be leasable at its measured cap"
+            "the real family must still be leasable at its default cap"
         );
 
         // A family that matches nothing even ignoring case is a different note: it may be a
@@ -2088,7 +2088,7 @@ mod qa_b_r2_tests {
                 .unwrap();
         assert!(notes.contains(&CapNote::ZeroIgnored {
             family: "glm-5.3-flash".to_string(),
-            // The measured cap rides along, so the message can only promise to keep one when
+            // The default cap rides along, so the message can only promise to keep one when
             // there IS one. QA found the unmeasured case claiming otherwise.
             measured: Some(4),
         }));
@@ -2186,7 +2186,7 @@ mod qa_b_r3_tests {
     // ── the merge, and the cost that was ruled acceptable ─────────────────────────────────────
 
     /// A partial override MERGES over the default table, and the stated cost is real: the two
-    /// families the operator did not mention keep their measured caps and stay leasable.
+    /// families the operator did not mention keep their default caps and stay leasable.
     ///
     /// This is the round-2 finding's agreed resolution, pinned so the cost is visible in the
     /// suite rather than only in a commit message: a fleet that genuinely lacks `deepseek` will
@@ -2257,7 +2257,7 @@ mod qa_b_r3_tests {
         let err = SeatCaps::from_override_json(r#"{"glm-5.3-flash":0}"#)
             .expect_err("an all-zero override is refused; see from_json's doc comment for why");
         assert!(err.contains("set to zero"), "{err}");
-        assert!(err.contains("remove the key to use the measured caps"), "{err}");
+        assert!(err.contains("remove the key to use the default caps"), "{err}");
         assert!(err.contains("does NOT disable a family"), "{err}");
         assert!(err.contains("no disable switch"), "{err}");
 
@@ -2281,17 +2281,17 @@ mod qa_b_r3_tests {
         }
     }
 
-    /// FIXED (was `qa_documents_zero_ignored_misinforms_for_an_unmeasured_family`, QA round 4).
+    /// FIXED (was `qa_documents_zero_ignored_misinforms_for_an_unnamed_family`, QA round 4).
     /// A zeroed key for a family nobody measured now gets a true note AND the note that was
     /// being suppressed.
     ///
     /// The zero branch used to `continue` before the unmeasured-family check, so such a key got
-    /// no `UnmeasuredFamily` note at all — and `ZeroIgnored` claimed "the measured cap is kept"
-    /// about a family with no measured cap. The single note the operator received was the one
+    /// no `UnmeasuredFamily` note at all — and `ZeroIgnored` claimed "the default cap is kept"
+    /// about a family with no default cap. The single note the operator received was the one
     /// that misinformed them. The key diagnostics now run first, and `ZeroIgnored` carries the
     /// measured value so its wording cannot promise something that does not exist.
     #[test]
-    fn qa_a_zeroed_unmeasured_family_gets_a_true_note_and_the_suppressed_one() {
+    fn qa_a_zeroed_unnamed_family_gets_a_true_note_and_the_suppressed_one() {
         let (caps, ns) = SeatCaps::from_override_json(r#"{"local-7b":0,"glm-5.3-flash":4}"#)
             .expect("accepted");
         // Nothing is "kept": the family simply is not there.
@@ -2316,10 +2316,10 @@ mod qa_b_r3_tests {
         );
         let shown = zero.to_string();
         assert!(
-            !shown.contains("measured cap of"),
+            !shown.contains("default cap of"),
             "it must not promise to keep a cap that does not exist: {shown}"
         );
-        assert!(shown.contains("no measured cap either"), "{shown}");
+        assert!(shown.contains("no default cap either"), "{shown}");
         assert!(shown.contains("does nothing at all"), "{shown}");
 
         // The MEASURED case still says the true thing for itself, naming the number.
@@ -2328,7 +2328,7 @@ mod qa_b_r3_tests {
             .iter()
             .find(|n| matches!(n, CapNote::ZeroIgnored { family, .. } if family == "glm-5.3-flash"))
             .unwrap();
-        assert!(zero.to_string().contains("measured cap of 4 is kept"), "{zero}");
+        assert!(zero.to_string().contains("default cap of 4 is kept"), "{zero}");
     }
 
     /// The note taxonomy, over every shape QA could construct.
@@ -2380,7 +2380,7 @@ mod qa_b_r3_tests {
     }
 
     /// FIXED (was `qa_documents_a_whitespace_typo_gets_only_the_generic_note`, QA round 4). A key
-    /// that differs from a measured family by surrounding whitespace now gets a note naming the
+    /// that differs from a default family by surrounding whitespace now gets a note naming the
     /// family it was meant to be, the same quality a case typo gets.
     ///
     /// A leading space in hand-edited JSON is at least as likely as a capital, and it used to
@@ -2706,7 +2706,7 @@ mod qa_b_r4_tests {
             CapNote::UnmeasuredFamily { .. }
         ));
 
-        // QA's second half, unchanged: the real family keeps its measured cap and the odd key is
+        // QA's second half, unchanged: the real family keeps its default cap and the odd key is
         // a family of its own — the note describes what happened, it does not change it.
         let mut map: BTreeMap<String, u32> = BTreeMap::new();
         map.insert("glm-5.3-flash\u{200b}".to_string(), 40);
@@ -2760,7 +2760,7 @@ mod qa_b_r4_tests {
         assert_ne!(refusal, note);
     }
 
-    /// `ZeroIgnored` can no longer claim a measured cap that does not exist — the round-3 finding.
+    /// `ZeroIgnored` can no longer claim a default cap that does not exist — the round-3 finding.
     #[test]
     fn qa_zero_ignored_tells_the_truth_for_both_measured_and_unmeasured() {
         let (_, ns) = SeatCaps::from_override_json(r#"{"local-7b":0,"glm-5.3-flash":0,"qwen3.8-flash-next":4}"#)
@@ -2775,16 +2775,16 @@ mod qa_b_r4_tests {
         // better than QA assumed, so the assertion pins the real wording.
         let measured = for_family("glm-5.3-flash");
         assert!(
-            measured.contains("its measured cap of 4 is kept"),
+            measured.contains("its default cap of 4 is kept"),
             "the measured case must name the cap it keeps: {measured}"
         );
         // Unmeasured: it must not claim any kept cap at all.
         let unmeasured = for_family("local-7b");
         assert!(
             !unmeasured.contains("is kept"),
-            "an unmeasured family has no measured cap to keep: {unmeasured}"
+            "a family the table does not name has no default cap to keep: {unmeasured}"
         );
-        assert!(!unmeasured.contains("measured cap of"), "{unmeasured}");
+        assert!(!unmeasured.contains("default cap of"), "{unmeasured}");
         // And the unmeasured, zeroed key now ALSO gets the note that is true about it, which the
         // round-3 version suppressed.
         assert!(
