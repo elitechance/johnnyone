@@ -1091,31 +1091,28 @@ ion-modal.workspace-picker .picker-empty {
   .st-who { color: var(--jo-fg-muted); text-transform: uppercase; font-weight: 600; }
   .st-when { color: var(--jo-fg-faint); font-variant-numeric: tabular-nums; }
   .st-row.you .st-who { color: var(--jo-accent); }
-  /* The copy control: an icon, not a word. Quiet until touched, and big enough to hit
-     with a thumb on the phone console this transcript is mostly read on. */
+  // The copy control: an icon, not a word. This stylesheet sits ON its 48 kB
+  // per-component budget, so the rule carries only what the control cannot be read
+  // without: padding rather than a min-size box for the thumb target, and no colour of
+  // its own for the failure state - its icon and its sentence already say it.
   .st-copy-btn {
     display: inline-flex;
     align-items: center;
     gap: 4px;
     margin-left: auto;
-    padding: 2px 4px;
+    padding: 3px 6px;
     border: 0;
-    border-radius: 5px;
-    background: transparent;
+    background: none;
     color: var(--jo-fg-faint);
     font: inherit;
     cursor: pointer;
-    min-width: 24px;
-    min-height: 24px;
-    justify-content: center;
 
     ion-icon { font-size: 14px; }
-    &:hover, &:focus-visible { color: var(--jo-fg-strong); background: rgba(139, 151, 165, 0.15); }
+    &:hover, &:focus-visible { color: var(--jo-fg-strong); }
     &.copied { color: var(--jo-accent); }
-    &.warn { color: #f0a372; }
   }
-  /* Only the failure states show words, and they wrap rather than stretch the row. */
-  .st-copy-why { font-size: 9.5px; letter-spacing: 0; overflow-wrap: anywhere; }
+  // Only the failure states show words.
+  .st-copy-why { font-size: 9.5px; }
   .st-hd {
     font-family: var(--jo-font-mono, ui-monospace, monospace);
     font-size: 11px;

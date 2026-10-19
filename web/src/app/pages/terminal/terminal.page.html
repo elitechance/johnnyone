@@ -158,7 +158,6 @@
                     @if (canCopyRow(row)) {
                       <button type="button" class="st-copy-btn" data-testid="st-copy-btn"
                               [class.copied]="copyRowState($index) === 'copied'"
-                              [class.warn]="copyRowShowsWhy($index)"
                               [attr.aria-label]="copyRowLabel($index) || 'Copy this message'"
                               [title]="copyRowLabel($index) || 'Copy this message'"
                               (click)="copyRow($index, row)">
