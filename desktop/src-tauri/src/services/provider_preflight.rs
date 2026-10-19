@@ -265,6 +265,68 @@ pub fn mismatch_report(caps: &SeatCaps, provider_ids: &[String]) -> Option<Strin
     }
 }
 
+/// What the preflight is about to ask, decided before any IO happens.
+///
+/// The url and the token are decided TOGETHER, out of the SAME provider block of the same profile,
+/// so neither can drift from the other: the endpoint that gets `/models` appended and the key that
+/// authenticates it are read from one block named by one `provider` argument, and a caller cannot
+/// hold one without the other. That coupling is the entire point of this function.
+///
+/// This is the one question the three shipped-and-green versions of this check each answered
+/// wrongly — and every one of them was wrong HERE, with everything around it passing:
+///   1. it asked openrouter, a compiled-in constant, while the profile names lokalai;
+///   2. then the right provider, but with no Authorization header — 401 every time;
+///   3. then a header carrying the literal string `${LOKALAI_API}`, because the profile stores an
+///      env reference and not a secret — the same 401.
+/// Each was found only by running the binary, because no test ever asked "what request is this
+/// about to send?". Making that question a pure, testable decision is what this struct is for: the
+/// answer is now inspectable without a network, a profile on disk, or a process environment.
+///
+/// No endpoint means None — there is nothing to ask, and guessing a URL would turn a misconfigured
+/// profile into a confident claim about a fleet nobody configured. A missing or unusable key is
+/// `token: None`, which means "send it unauthenticated" and NEVER a placeholder: a `${VAR}` string
+/// attached as a bearer token is a guaranteed 401 (failure 3 above). The token is a secret — it is
+/// attached to the request and nothing else, never a tracing field, never part of a message.
+///
+/// `lookup` resolves a `${NAME}` reference and is a PARAMETER rather than a direct environment read
+/// so a test can drive it; a test that mutated the process environment would race every other test
+/// in the same binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightRequest {
+    pub url: String,
+    pub token: Option<String>,
+}
+
+/// Decide [`PreflightRequest`] — the url and the token the preflight is about to send — from the
+/// profile JSON alone, before any IO happens. See [`PreflightRequest`] for why the two are decided
+/// in one place.
+pub fn preflight_request_plan(
+    profile_json: &str,
+    provider: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<PreflightRequest> {
+    let endpoint = provider_endpoint_from_profile(profile_json, provider)?;
+    // The raw stored value, read from the SAME block the endpoint came from. A block with no
+    // `apiKey` at all — or a non-string one — is not a reason to skip: it is a request with no
+    // token, so the key is defaulted to "" (which expands to None) rather than short-circuiting
+    // the whole plan.
+    let raw = serde_json::from_str::<serde_json::Value>(profile_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("providers")?
+                .get(provider)?
+                .get("apiKey")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    Some(PreflightRequest {
+        url: format!("{}/models", endpoint),
+        token: expand_key_reference(&raw, lookup),
+    })
+}
+
 /// Read the profile, fetch the provider's model list once, and log the report.
 ///
 /// Every failure is silent-but-logged at debug: a preflight that cannot reach the provider must not
@@ -283,8 +345,13 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
             return;
         }
     };
-    let endpoint = match provider_endpoint_from_profile(&profile_json, provider) {
-        Some(endpoint) => endpoint,
+    // The whole request — which url, with which token — is decided by [`preflight_request_plan`]
+    // before any IO happens, so the composition itself is testable rather than only observable in
+    // the running binary. Nothing below rebuilds the url or re-reads the key: the plan is the only
+    // source of both.
+    let plan = match preflight_request_plan(&profile_json, provider, |name| std::env::var(name).ok())
+    {
+        Some(plan) => plan,
         None => {
             tracing::debug!(
                 path = %profile_path,
@@ -294,18 +361,18 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
             return;
         }
     };
-    let url = format!("{}/models", endpoint);
+    let url = plan.url;
     let client = reqwest::Client::new();
-    // Authenticated with the key from THE SAME provider block the endpoint came from — the model
-    // list is not public on the provider the profile names, so an unauthenticated GET is answered
-    // 401 and the check never runs. A profile with no key still sends the request unauthenticated,
-    // so a public provider keeps working; a 401 is already handled as "skip" below, never as an
-    // empty fleet. The key itself is never logged and never part of a message.
+    // Authenticated with the token from THE SAME provider block the url came from — the model list
+    // is not public on the provider the profile names, so an unauthenticated GET is answered 401 and
+    // the check never runs. A profile with no usable key still sends the request unauthenticated, so
+    // a public provider keeps working; a 401 is already handled as "skip" below, never as an empty
+    // fleet. The token itself is never logged and never part of a message.
     let mut request = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS));
-    if let Some(key) = api_key_from_profile(&profile_json, provider) {
-        request = request.bearer_auth(key);
+    if let Some(token) = plan.token {
+        request = request.bearer_auth(token);
     }
     let response = match request.send().await {
         Ok(response) => response,
@@ -749,5 +816,98 @@ mod tests {
         ];
         let report = mismatch_report(&caps, &variants_only).expect("a variant is not the family");
         assert!(report.contains("cannot run at all"), "{report}");
+    }
+
+    #[test]
+    fn preflight_the_request_plan_for_the_real_profile_targets_lokalai_with_a_token() {
+        // A profile of the REAL shape: the key is stored as an environment-variable REFERENCE, which
+        // is what this machine actually holds (PROFILE's own key is a literal, so it cannot show the
+        // expansion happening). The plan IS the whole request — which url, with which token — and it
+        // is decided out of ONE provider block, so the two cannot drift apart.
+        let profile = r#"{"defaultProvider":"lokalai","providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1","apiKey":"${LOKALAI_API}","defaultModel":"next","models":{"next":{"contextLength":262144}}}}}"#;
+        let plan = preflight_request_plan(profile, "lokalai", |name| {
+            (name == "LOKALAI_API").then(|| "sk-real".to_string())
+        })
+        .expect("the profile has an endpoint for the provider it names, so there is something to ask");
+        assert_eq!(plan.url, "https://lokalai.silverjrom.app/v1/models");
+        assert_eq!(
+            plan.token.as_deref(),
+            Some("sk-real"),
+            "the stored reference is expanded, not sent as-is"
+        );
+
+        // Each of today's three failures, asserted explicitly, so this one test would have caught
+        // all three of them:
+        //   1. the wrong provider — openrouter was a compiled-in constant while the profile names
+        //      lokalai, so the check asked a fleet the arena never uses.
+        assert!(
+            !plan.url.contains("openrouter"),
+            "the url must be the profile's own provider's, not a compiled-in constant: {}",
+            plan.url
+        );
+        //   2. no Authorization header at all — the model list is not public on lokalai, so an
+        //      unauthenticated GET is answered 401 and the check never ran.
+        assert!(
+            plan.token.is_some(),
+            "a plan with no token sends the request unauthenticated and is answered 401 every time"
+        );
+        //   3. the literal placeholder as the bearer token — the same 401, indistinguishable from
+        //      failure 2 in the log.
+        assert_ne!(
+            plan.token.as_deref(),
+            Some("${LOKALAI_API}"),
+            "the stored reference string is not a token; sending it is a guaranteed 401"
+        );
+
+        // Planning the same profile for a provider it has NO block for is None — nothing to ask. Not
+        // lokalai's endpoint, and definitely not lokalai's key: a key is never sent to a provider it
+        // does not belong to.
+        assert_eq!(preflight_request_plan(profile, "openrouter", |_| None), None);
+        assert_eq!(preflight_request_plan(PROFILE, "openrouter", |_| None), None);
+    }
+
+    #[test]
+    fn preflight_a_plan_is_none_when_there_is_nothing_to_ask() {
+        // No endpoint means there is nothing to ask, EVEN when the block carries a usable key — the
+        // key has nowhere to be sent, and guessing a url would turn a misconfigured profile into a
+        // confident claim about a fleet nobody configured.
+        assert_eq!(
+            preflight_request_plan(
+                r#"{"providers":{"lokalai":{"apiKey":"sk-…"}}}"#,
+                "lokalai",
+                |_| None
+            ),
+            None
+        );
+        // An unparseable profile is the same answer: no invented url, no invented token.
+        assert_eq!(preflight_request_plan("not json at all", "lokalai", |_| None), None);
+        assert_eq!(preflight_request_plan("", "lokalai", |_| None), None);
+
+        // An endpoint but no key plans SOME with token None — a public provider must keep working
+        // unauthenticated, so "no key" is a request, not a skip.
+        let public = preflight_request_plan(
+            r#"{"providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1"}}}"#,
+            "lokalai",
+            |_| None,
+        )
+        .expect("there is an endpoint, so there is something to ask");
+        assert_eq!(public.url, "https://lokalai.silverjrom.app/v1/models");
+        assert_eq!(public.token, None, "no key means unauthenticated, never Some(\"\")");
+
+        // An unresolvable reference is likewise token None and SPECIFICALLY NOT the placeholder: a
+        // `${MISSING}` sent as a bearer token is a guaranteed 401, which was failure 3 above.
+        let unset = preflight_request_plan(
+            r#"{"providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1","apiKey":"${MISSING}"}}}"#,
+            "lokalai",
+            |_| None,
+        )
+        .expect("the endpoint is there even though the key is not");
+        assert_eq!(unset.url, "https://lokalai.silverjrom.app/v1/models");
+        assert_eq!(unset.token, None, "an unset variable means unauthenticated");
+        assert_ne!(
+            unset.token.as_deref(),
+            Some("${MISSING}"),
+            "a placeholder sent as a bearer token is a guaranteed 401"
+        );
     }
 }
