@@ -786,6 +786,42 @@ pub fn load_seat_caps(state: &crate::state::app_state::AppState) -> SeatCaps {
     seat_caps_from_db(&state.db)
 }
 
+/// The capped families the provider does not list. The seat table is the operator's
+/// intent; the provider's /v1/models is what will actually answer. A family in the
+/// table and absent from the provider is a pool that can be leased and never used.
+///
+/// Returned in the caps table's own (sorted) order. Pure: the caller fetches the
+/// provider list, this decides, so the claim is testable without a network.
+///
+/// An EMPTY provider list means "we could not read the provider", NOT "the provider
+/// serves nothing": returning every family there would turn one failed HTTP call into
+/// a fleet-wide alarm. So an empty list reports nothing.
+///
+/// Matching is EXACT string equality on the family id — no prefix or substring
+/// matching, because `qwen3.8-flash-next` and `qwen3.8-flash-next-132k-fast` are
+/// different models and a prefix match would silently call the second one a match for
+/// the first.
+pub fn families_absent_from_provider(caps: &SeatCaps, provider_ids: &[String]) -> Vec<String> {
+    if provider_ids.is_empty() {
+        return Vec::new();
+    }
+    caps.families()
+        .filter(|family| !provider_ids.iter().any(|id| id == family))
+        .map(String::from)
+        .collect()
+}
+
+/// Whether the provider serves NONE of the capped families — a different condition
+/// from "one is missing", because the arena then cannot run at all rather than
+/// running narrower. False for an empty provider list, for the same reason as above.
+pub fn provider_serves_no_capped_family(caps: &SeatCaps, provider_ids: &[String]) -> bool {
+    if provider_ids.is_empty() {
+        return false;
+    }
+    caps.families()
+        .all(|family| !provider_ids.iter().any(|id| id == family))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1294,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_seat_caps(&state), SeatCaps::measured());
+    }
+
+    /// A provider id list, spelled once so each test reads as its own claim.
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn seatcaps_a_capped_family_the_provider_does_not_list_is_reported() {
+        // The real case, read off the provider's /v1/models on 2026-10-12: it serves glm and
+        // the qwen family (plus qwen variants) but NOT deepseek, so the table caps a pool that
+        // can be leased and never used.
+        let caps = SeatCaps::measured();
+        let provider = ids(&[
+            "glm-5.3-flash",
+            "qwen3.8-flash-next",
+            "qwen3.8-flash-next-132k-fast",
+            "qwen3.8-flash-next-160k-validator",
+        ]);
+        assert_eq!(
+            families_absent_from_provider(&caps, &provider),
+            vec!["deepseek-v4.1-flash".to_string()]
+        );
+    }
+
+    #[test]
+    fn seatcaps_a_family_the_provider_lists_is_not_reported() {
+        let caps = SeatCaps::measured();
+        let provider = ids(&["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"]);
+        assert_eq!(families_absent_from_provider(&caps, &provider), Vec::<String>::new());
+
+        // The prefix-match trap: `qwen3.8-flash-next-132k-fast` is a DIFFERENT model, so it
+        // does not satisfy `qwen3.8-flash-next`. A startswith/contains comparison would call
+        // this a match and the gap would go unreported.
+        let variants_only = ids(&["qwen3.8-flash-next-132k-fast"]);
+        assert_eq!(
+            families_absent_from_provider(&caps, &variants_only),
+            vec![
+                "deepseek-v4.1-flash".to_string(),
+                "glm-5.3-flash".to_string(),
+                "qwen3.8-flash-next".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn seatcaps_an_empty_provider_list_is_not_treated_as_every_family_missing() {
+        // An empty list means "we could not read the provider", not "the provider serves
+        // nothing" — one failed HTTP call must not become a fleet-wide alarm.
+        let caps = SeatCaps::measured();
+        assert_eq!(families_absent_from_provider(&caps, &[]), Vec::<String>::new());
+        assert!(!provider_serves_no_capped_family(&caps, &[]));
+    }
+
+    #[test]
+    fn seatcaps_provider_serving_none_of_the_capped_families_is_its_own_condition() {
+        // A non-empty list that shares nothing with the table: the arena cannot run at all,
+        // which is a louder state than "one family is missing".
+        let caps = SeatCaps::measured();
+        let none = ids(&["dgx3-qwen", "boxb-qwen"]);
+        assert_eq!(
+            families_absent_from_provider(&caps, &none),
+            vec![
+                "deepseek-v4.1-flash".to_string(),
+                "glm-5.3-flash".to_string(),
+                "qwen3.8-flash-next".to_string(),
+            ]
+        );
+        assert!(provider_serves_no_capped_family(&caps, &none));
+
+        // One family present and the arena can run, narrowly — so this condition is false even
+        // though two of the three are still absent.
+        let one = ids(&["glm-5.3-flash"]);
+        assert!(!provider_serves_no_capped_family(&caps, &one));
+        assert_eq!(
+            families_absent_from_provider(&caps, &one),
+            vec![
+                "deepseek-v4.1-flash".to_string(),
+                "qwen3.8-flash-next".to_string(),
+            ]
+        );
     }
 }
 
