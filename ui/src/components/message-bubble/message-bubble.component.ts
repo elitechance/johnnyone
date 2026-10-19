@@ -29,6 +29,7 @@ import {
   clearCopyResetTimer,
   copyTextFor,
   copyStateLabelFor,
+  copyIconFor,
   performCopy,
   type CopyOutcome,
 } from '../../lib/copy-message';
@@ -81,17 +82,9 @@ export class MessageBubbleComponent implements AfterViewChecked, OnDestroy {
     return canCopyMessage(this.message);
   }
 
+  /** The icon decision lives in the shared seam, so the transcript row shows the same one. */
   get copyIcon(): string {
-    switch (this.copyState) {
-      case 'copied':
-        return 'checkmark-outline';
-      case 'unavailable':
-        return 'alert-circle-outline';
-      case 'failed':
-        return 'close-outline';
-      default:
-        return 'copy-outline';
-    }
+    return copyIconFor(this.copyState);
   }
 
   /**
