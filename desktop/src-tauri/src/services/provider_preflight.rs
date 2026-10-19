@@ -151,7 +151,53 @@ pub fn default_provider_from_profile(profile_json: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// The model ids in a `/v1/models` body, read from `data[].id`.
+/// Whether an entry in the provider's `data[]` is a model the provider will actually SERVE.
+///
+/// **"Listed" is not "available."** `provider_ids_from_models_json` used to answer the first claim
+/// and the callers read it as the second, which is the same mistake that reported the payload
+/// carrying "no concurrency/slot/queue keys" because those three words were absent rather than
+/// because nothing about readiness was in it. Re-measured 2026-10-19, every entry of the real
+/// `/v1/models` payload carries readiness fields, under these field names:
+///
+/// ```text
+/// glm-5.3-flash       status="servable"  resident=true  admissible=true  configured=true
+/// qwen3.8-flash-next  status="servable"  resident=true  admissible=true  configured=true
+/// ```
+///
+/// (all nine entries read the same that day) — so this excludes nothing today and changes no
+/// current behaviour. What it closes is the state where a model is LISTED but refusing work, which
+/// is precisely the state the arena would otherwise lease seats into: a cap for a model that is
+/// present-but-refusing is a seat that can be leased and never served, and the mismatch check would
+/// call it served because the id was in the list.
+///
+/// The rules, and why each is shaped the way it is:
+///   * `status`, when present and a string, must equal `"servable"` — exact and case-sensitive,
+///     because a status we do not recognise is not a promise. `"SERVABLE"` is not a claim we can
+///     honour; `"loading"`, `"draining"`, `"queued"` and anything else are refusals.
+///   * `admissible` and `resident`, when present and booleans, must each be `true`.
+///   * a field that is ABSENT, `null`, or of an unexpected type is NOT a claim, and so is not a
+///     reason to exclude the model. An unknown or missing field is read as **silence**, never as a
+///     refusal — excluding a model on a field we do not understand would invent an outage. In
+///     particular an OLDER provider that reports none of these fields keeps working exactly as it
+///     does today: an entry making no readiness claim at all is servable.
+pub fn model_is_servable(entry: &serde_json::Value) -> bool {
+    if let Some(status) = entry.get("status").and_then(|value| value.as_str()) {
+        if status != "servable" {
+            return false;
+        }
+    }
+    for flag in ["admissible", "resident"] {
+        if let Some(claim) = entry.get(flag).and_then(|value| value.as_bool()) {
+            if !claim {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The model ids in a `/v1/models` body, read from `data[].id`, of the models the provider says it
+/// will serve.
 ///
 /// Returns None when the body cannot be parsed or has no `data` array — an unreadable answer is NOT
 /// an empty fleet, and the difference decides whether the mismatch check runs at all. Collapsing
@@ -161,11 +207,16 @@ pub fn default_provider_from_profile(profile_json: &str) -> Option<String> {
 ///
 /// Ids that are not strings are skipped rather than fatal, since a provider adding a field shape
 /// is not a reason to stop checking the ids it did send.
+///
+/// An entry is dropped when [`model_is_servable`] says it is not servable: being listed while
+/// refusing work is not being available, and a model in that state must be REPORTED as absent by
+/// [`mismatch_report`] rather than counted as a family the arena can lease seats on.
 pub fn provider_ids_from_models_json(body: &str) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let data = value.get("data")?.as_array()?;
     Some(
         data.iter()
+            .filter(|entry| model_is_servable(entry))
             .filter_map(|entry| entry.get("id")?.as_str())
             .map(String::from)
             .collect(),
@@ -816,6 +867,119 @@ mod tests {
         ];
         let report = mismatch_report(&caps, &variants_only).expect("a variant is not the family");
         assert!(report.contains("cannot run at all"), "{report}");
+    }
+
+    #[test]
+    fn preflight_a_listed_but_unservable_model_does_not_count_as_served() {
+        // "The id appears in `data`" and "the provider will serve it" are DIFFERENT claims. Every
+        // entry of the real payload carries readiness fields (measured 2026-10-19:
+        // `status="servable"`, `resident=true`, `admissible=true`), so a model can be listed while
+        // refusing work — and that is the state the arena would otherwise lease seats into.
+        let body = r#"{"object":"list","data":[
+            {"id":"glm-5.3-flash","status":"servable"},
+            {"id":"deepseek-v4.1-flash","status":"loading"}
+        ]}"#;
+        let served = ids(body);
+        assert!(
+            served.iter().any(|id| id == "glm-5.3-flash"),
+            "an entry whose status is servable is served: {served:?}"
+        );
+        assert!(
+            !served.iter().any(|id| id == "deepseek-v4.1-flash"),
+            "a model that is listed but not servable is NOT served: {served:?}"
+        );
+
+        // The same exclusion for each boolean claim, on its own.
+        let inadmissible = r#"{"data":[
+            {"id":"glm-5.3-flash","status":"servable"},
+            {"id":"deepseek-v4.1-flash","status":"servable","admissible":false}
+        ]}"#;
+        let served = ids(inadmissible);
+        assert!(served.iter().any(|id| id == "glm-5.3-flash"));
+        assert!(
+            !served.iter().any(|id| id == "deepseek-v4.1-flash"),
+            "admissible:false is a refusal: {served:?}"
+        );
+        let unresident = r#"{"data":[
+            {"id":"glm-5.3-flash","status":"servable"},
+            {"id":"deepseek-v4.1-flash","status":"servable","resident":false}
+        ]}"#;
+        let served = ids(unresident);
+        assert!(served.iter().any(|id| id == "glm-5.3-flash"));
+        assert!(
+            !served.iter().any(|id| id == "deepseek-v4.1-flash"),
+            "resident:false is a refusal: {served:?}"
+        );
+        // Positive claims are honoured too — all three true is today's real payload.
+        assert!(model_is_servable(&serde_json::json!({
+            "id": "glm-5.3-flash",
+            "status": "servable",
+            "resident": true,
+            "admissible": true,
+            "configured": true
+        })));
+
+        // Being listed did not save it: the excluded model is REPORTED as absent by the mismatch
+        // check, which is the whole point — a seat leased on a refusing model is never served.
+        let caps = SeatCaps::measured();
+        let served = ids(body);
+        let report = mismatch_report(&caps, &served).expect("the excluded family is now absent");
+        assert!(
+            report.contains("deepseek-v4.1-flash"),
+            "the report has to name the family the provider refused to serve: {report}"
+        );
+    }
+
+    #[test]
+    fn preflight_a_model_that_claims_nothing_about_readiness_is_taken_as_servable() {
+        // An OLDER provider that reports no readiness fields at all must keep working exactly as it
+        // does today: no claim is not a refusal.
+        let body = r#"{"object":"list","data":[
+            {"id":"glm-5.3-flash","object":"model","owned_by":"lokalai"},
+            {"id":"qwen3.8-flash-next","object":"model","owned_by":"lokalai"},
+            {"id":"next","object":"model","owned_by":"lokalai"}
+        ]}"#;
+        assert_eq!(
+            ids(body),
+            vec![
+                "glm-5.3-flash".to_string(),
+                "qwen3.8-flash-next".to_string(),
+                "next".to_string()
+            ]
+        );
+        // …which includes the real MODELS body this module was written against.
+        assert_eq!(ids(MODELS).len(), 3);
+
+        // Silence in each of its shapes — absent, null, wrong type — is NOT a refusal.
+        assert_eq!(
+            ids(r#"{"data":[{"id":"glm-5.3-flash","status":null,"admissible":null},
+                            {"id":"qwen3.8-flash-next","resident":null,"status":42}]}"#),
+            vec![
+                "glm-5.3-flash".to_string(),
+                "qwen3.8-flash-next".to_string()
+            ],
+            "a null or wrongly-typed field made no claim, so it cannot exclude a model"
+        );
+        assert!(model_is_servable(&serde_json::json!({"id": "x", "status": 42})));
+        assert!(model_is_servable(&serde_json::json!({"id": "x", "admissible": "no"})));
+        assert!(model_is_servable(&serde_json::json!({"id": "x"})));
+
+        // An UNRECOGNISED status is not a promise, including the right word in the wrong case —
+        // exact, case-sensitive match, because guessing at a status would promise a model the
+        // provider never offered.
+        assert!(!model_is_servable(&serde_json::json!({"id": "x", "status": "SERVABLE"})));
+        assert!(!model_is_servable(&serde_json::json!({"id": "x", "status": "Servable"})));
+        assert!(!model_is_servable(&serde_json::json!({"id": "x", "status": "ready"})));
+        assert_eq!(
+            ids(r#"{"data":[{"id":"glm-5.3-flash","status":"SERVABLE"}]}"#),
+            Vec::<String>::new(),
+            "a status we do not recognise is not a promise"
+        );
+
+        // And the unreadable-answer rule is untouched by all of this: None, never Some(vec![]).
+        assert_eq!(provider_ids_from_models_json("<html>502 Bad Gateway</html>"), None);
+        assert_eq!(provider_ids_from_models_json(""), None);
+        assert_eq!(provider_ids_from_models_json(r#"{"object":"list"}"#), None);
     }
 
     #[test]
