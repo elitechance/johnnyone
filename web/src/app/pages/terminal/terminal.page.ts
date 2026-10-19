@@ -59,6 +59,9 @@ import {
   expandOutline,
   folderOutline,
   documentOutline,
+  copyOutline,
+  checkmarkOutline,
+  alertCircleOutline,
 } from 'ionicons/icons';
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
@@ -92,6 +95,7 @@ import {
   copyTextFor,
   performCopy,
   copyStateLabelFor,
+  copyIconFor,
   clearCopyResetTimer,
   type TestGateRun,
   type CopyOutcome,
@@ -259,6 +263,10 @@ addIcons({
   'expand-outline': expandOutline,
   'folder-outline': folderOutline,
   'document-outline': documentOutline,
+  // The transcript row's copy control - unregistered names make ionicons throw on render.
+  'copy-outline': copyOutline,
+  'checkmark-outline': checkmarkOutline,
+  'alert-circle-outline': alertCircleOutline,
 });
 
 @Component({
@@ -769,6 +777,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** The words under the button — 'Copied' / a failure reason / '' for the default. */
   protected copyRowLabel(i: number): string {
     return copyStateLabelFor(this.copyRowState(i));
+  }
+
+  /** The ion-icon name for this row's state — the same seam the message bubble uses. */
+  protected copyRowIcon(i: number): string {
+    return copyIconFor(this.copyRowState(i));
+  }
+
+  /**
+   * Only the two FAILURE states put words on screen. 'Copied' is the checkmark alone
+   * (the icon says it), but "no clipboard API on a plain-http page" is a sentence the
+   * user cannot guess from a glyph, so it stays visible beside the icon.
+   */
+  protected copyRowShowsWhy(i: number): boolean {
+    const state = this.copyRowState(i);
+    return state === 'unavailable' || state === 'failed';
   }
 
   /**

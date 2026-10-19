@@ -50,6 +50,27 @@ export function copyStateLabelFor(state: CopyStateOrNull): string {
 }
 
 /**
+ * Which ion-icon the copy control shows for each state. The names are registered with
+ * `addIcons` by every component that renders them (ionicons standalone otherwise tries
+ * to fetch the SVG by URL and throws "Failed to construct 'URL': Invalid base URL").
+ * Kept here, beside the wording, so the transcript row and the message bubble cannot
+ * drift apart: a checkmark means the text is on the clipboard, a warning triangle means
+ * this page has no clipboard API at all, and a cross means a clipboard refused the write.
+ */
+export function copyIconFor(state: CopyStateOrNull): string {
+  switch (state) {
+    case 'copied':
+      return 'checkmark-outline';
+    case 'unavailable':
+      return 'alert-circle-outline';
+    case 'failed':
+      return 'close-outline';
+    default:
+      return 'copy-outline';
+  }
+}
+
+/**
  * The pure decision behind "clear the pending copy feedback". A bubble scrolled out
  * of a long transcript is destroyed with its reset timer still pending, so the
  * teardown must cancel it; this helper makes that decision testable without Angular.

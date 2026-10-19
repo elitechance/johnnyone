@@ -157,7 +157,16 @@
                     <!-- Same rule as the message bubble: nothing to copy, no button. -->
                     @if (canCopyRow(row)) {
                       <button type="button" class="st-copy-btn" data-testid="st-copy-btn"
-                              (click)="copyRow($index, row)">{{ copyRowLabel($index) || 'Copy' }}</button>
+                              [class.copied]="copyRowState($index) === 'copied'"
+                              [class.warn]="copyRowShowsWhy($index)"
+                              [attr.aria-label]="copyRowLabel($index) || 'Copy this message'"
+                              [title]="copyRowLabel($index) || 'Copy this message'"
+                              (click)="copyRow($index, row)">
+                        <ion-icon [name]="copyRowIcon($index)" aria-hidden="true"></ion-icon>
+                        @if (copyRowShowsWhy($index)) {
+                          <span class="st-copy-why" role="status">{{ copyRowLabel($index) }}</span>
+                        }
+                      </button>
                     }
                   </div>
                   @if (row.tool) { <div class="st-hd">{{ row.tool }}</div> }

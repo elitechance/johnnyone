@@ -133,6 +133,7 @@ export {
   copyTextFor,
   performCopy,
   copyStateLabelFor,
+  copyIconFor,
   clearCopyResetTimer,
 } from './lib/copy-message';
 export type {

@@ -13,6 +13,8 @@ import { describe, expect, it } from 'vitest';
 import {
   canCopyMessage,
   copyTextFor,
+  copyStateLabelFor,
+  copyIconFor,
 } from '../../../../../ui/src/lib/copy-message';
 
 /** The row shape the transcript loop hands the seam. */
@@ -57,5 +59,31 @@ describe('transcript row copy decisions', () => {
     expect(copiedText(row)).toBe('## Report\n\n```mermaid\ngraph TD; A-->B;\n```');
     expect(copiedText({ type: 'you', text: '  do it  ' })).toBe('do it');
     expect(copiedText({ type: 'agent', text: '   \n ' })).toBe('');
+  });
+});
+
+describe('transcript row copy icon', () => {
+  it('copy_icon_the_resting_state_is_a_copy_glyph_not_the_word_copy', () => {
+    // The shipped bug: the row's button body was `copyRowLabel($index) || 'Copy'`, and
+    // copyStateLabelFor(null) is '' - so every untouched row read as the literal word.
+    expect(copyStateLabelFor(null)).toBe('');
+    expect(copyIconFor(null)).toBe('copy-outline');
+  });
+
+  it('copy_icon_each_outcome_has_its_own_glyph', () => {
+    // Four distinct glyphs: a success must not look like a refusal, and 'no clipboard
+    // API here' must not look like 'this write was refused'.
+    const icons = (['copied', 'unavailable', 'failed'] as const).map(copyIconFor);
+    expect(icons).toEqual(['checkmark-outline', 'alert-circle-outline', 'close-outline']);
+    expect(new Set([...icons, copyIconFor(null)]).size).toBe(4);
+  });
+
+  it('copy_icon_only_the_failure_states_need_words_beside_the_glyph', () => {
+    // 'Copied' is the checkmark alone; the two failure sentences cannot be guessed
+    // from a glyph, so the row keeps showing them.
+    expect(copyStateLabelFor('copied')).toBe('Copied');
+    expect(copyStateLabelFor('unavailable')).toContain('secure');
+    // The real wording in ui/src/lib/copy-message.ts is 'Copy refused — try again'.
+    expect(copyStateLabelFor('failed')).toContain('try again');
   });
 });
