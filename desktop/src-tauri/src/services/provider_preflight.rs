@@ -61,6 +61,17 @@ pub fn provider_endpoint_from_profile(profile_json: &str, provider: &str) -> Opt
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The provider the profile itself names as default. None when the profile does
+/// not name one — and None must mean "check nothing", not "guess a provider":
+/// checking the wrong provider produced a false "serves NONE of the capped
+/// families" alarm, which is worse than no check at all.
+pub fn default_provider_from_profile(profile_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(profile_json).ok()?;
+    let name = value.get("defaultProvider")?.as_str()?;
+    let trimmed = name.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// The model ids in a `/v1/models` body, read from `data[].id`.
 ///
 /// Returns None when the body cannot be parsed or has no `data` array — an unreadable answer is NOT
@@ -195,17 +206,46 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
     }
 }
 
-/// Spawn [`run_once`] on Tauri's runtime.
+/// Spawn [`run_once`] on Tauri's runtime, for the provider the profile names as its own default.
 ///
 /// MUST be `tauri::async_runtime::spawn` and NEVER the bare per-crate spawn: Tauri's `setup`
 /// closure runs with no tokio reactor of its own, and spawning directly onto that runtime there
 /// panics `there is no reactor running` — which killed this host on boot earlier today. The caps
 /// are taken BY VALUE because the spawned task outlives `setup` and cannot borrow the caller's
 /// table.
+///
+/// The provider is read from the profile's own `defaultProvider`, NOT from any compiled-in
+/// constant: the arena runs against whatever the profile names (`lokalai` on this machine), and
+/// asking a provider the arena never uses raised a fleet-wide "serves NONE of the capped families"
+/// alarm about a fleet that is not the arena's. The profile is read once here so the name and the
+/// endpoint come from the same file. When the profile names no default provider there is nothing
+/// to check, and this returns WITHOUT spawning — checking a guessed provider is worse than
+/// checking nothing.
 pub fn spawn_provider_preflight(caps: SeatCaps) {
     let profile_path = crate::providers::kloo_cli::default_profile_path();
+    let profile_json = match std::fs::read_to_string(&profile_path) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::debug!(
+                path = %profile_path,
+                %e,
+                "provider preflight skipped: could not read the kloo profile"
+            );
+            return;
+        }
+    };
+    let provider = match default_provider_from_profile(&profile_json) {
+        Some(provider) => provider,
+        None => {
+            tracing::debug!(
+                path = %profile_path,
+                "provider preflight skipped: profile names no default provider, nothing to check"
+            );
+            return;
+        }
+    };
     tauri::async_runtime::spawn(async move {
-        run_once(&profile_path, crate::providers::kloo_cli::DEFAULT_PROVIDER, &caps).await;
+        run_once(&profile_path, &provider, &caps).await;
     });
 }
 
@@ -260,6 +300,49 @@ mod tests {
             .as_deref(),
             Some("https://lokalai.silverjrom.app/v1")
         );
+    }
+
+    #[test]
+    fn preflight_the_provider_checked_is_the_profiles_own_default() {
+        // The arena runs against whatever the profile NAMES, not against a compiled-in constant.
+        assert_eq!(
+            default_provider_from_profile(PROFILE).as_deref(),
+            Some("lokalai"),
+            "the profile's own defaultProvider is the provider to check"
+        );
+        // …and specifically NOT the other provider the profile also carries a block for: the
+        // presence of an `openrouter` block does not make it the default, and checking it raised a
+        // fleet-wide alarm about a fleet the arena never uses.
+        assert_ne!(
+            default_provider_from_profile(PROFILE).as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            default_provider_from_profile(
+                r#"{"defaultProvider":"openrouter","providers":{"openrouter":{},"lokalai":{}}}"#
+            )
+            .as_deref(),
+            Some("openrouter")
+        );
+    }
+
+    #[test]
+    fn preflight_a_profile_with_no_default_provider_checks_nothing() {
+        // None means "check nothing", never "guess". A profile with providers but no
+        // `defaultProvider`, an unparseable profile, and a profile naming nothing usable all answer
+        // None, and the spawner returns without spawning for each of them.
+        assert_eq!(
+            default_provider_from_profile(
+                r#"{"providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1"},"openrouter":{}}}"#
+            ),
+            None
+        );
+        assert_eq!(default_provider_from_profile("not json at all"), None);
+        assert_eq!(default_provider_from_profile(""), None);
+        assert_eq!(default_provider_from_profile("{}"), None);
+        // A non-string or blank name is not a provider either.
+        assert_eq!(default_provider_from_profile(r#"{"defaultProvider":42}"#), None);
+        assert_eq!(default_provider_from_profile(r#"{"defaultProvider":"  "}"#), None);
     }
 
     #[test]
