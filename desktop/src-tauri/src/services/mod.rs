@@ -12,6 +12,7 @@ pub mod plan_check;
 pub mod planner_prompts;
 pub mod prompt_library;
 pub mod providers;
+pub mod provider_preflight;
 pub mod question_watch;
 pub mod relay;
 pub mod sessions;

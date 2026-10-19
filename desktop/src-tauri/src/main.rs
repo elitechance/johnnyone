@@ -6,6 +6,8 @@ use johnnyone_desktop_lib::db::Database;
 use johnnyone_desktop_lib::host;
 use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
+use johnnyone_desktop_lib::services::leases;
+use johnnyone_desktop_lib::services::provider_preflight;
 use johnnyone_desktop_lib::services::question_watch;
 use johnnyone_desktop_lib::services::relay;
 use johnnyone_desktop_lib::state::app_state::AppState;
@@ -125,6 +127,10 @@ fn main() {
             // shares the one state.
             let question_state = app_state.clone();
             question_watch::spawn_question_watch(question_state);
+
+            // One read of the provider's model list, compared with the seat caps: a cap for a
+            // family the provider will not serve is a pool that can be leased and never used.
+            provider_preflight::spawn_provider_preflight(leases::SeatCaps::measured());
 
             let bind_addr = std::env::var("JOHNNYONE_HOST_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:7788".to_string());
