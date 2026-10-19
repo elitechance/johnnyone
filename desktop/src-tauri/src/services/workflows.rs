@@ -1398,7 +1398,7 @@ pub fn measure_run_budget(
     //
     // A family the pool has no cap for is NOT refused here: the pool itself refuses it as
     // `UnknownFamily` below, with its own message. That keeps the arena usable for families the
-    // measured table does not name yet, and still never leases a seat it cannot account for.
+    // default table does not name yet, and still never leases a seat it cannot account for.
     let family_capped = match state.lease_pool.cap_for(&family) {
         Some(cap) => {
             if seats > i64::from(cap) {
@@ -1451,7 +1451,7 @@ pub fn measure_run_budget(
 
     // **A family the pool does not cap is not a leaseable family, but it is still a measurable
     // run.** The pool refuses `UnknownFamily` — that refusal is about seats it cannot account for,
-    // not about the arena. The arena has always been able to run a family the measured table does
+    // not about the arena. The arena has always been able to run a family the default table does
     // not name, and the budget it records is the declared one against a fleet snapshot that has no
     // row for it. Refusing here would turn a scheduling gap into an arena outage, so the seat
     // ledger stays honest (nothing is leased) while the measurement still lands.
@@ -1503,7 +1503,7 @@ pub fn measure_run_budget(
     //
     // **A family the pool does not cap is not a leaseable family, but it is still a measurable
     // run.** The pool refuses `UnknownFamily` — that refusal is about seats it cannot account for,
-    // not about the arena. The arena has always been able to run a family the measured table does
+    // not about the arena. The arena has always been able to run a family the default table does
     // not name, and the budget it records is the declared one against a fleet snapshot that has no
     // row for it. Refusing here would turn a scheduling gap into an arena outage, so the seat
     if let Some(reason) = budget_was_honoured(&requested, &budget.seats_held) {

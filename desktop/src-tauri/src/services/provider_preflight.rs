@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn preflight_a_missing_family_is_named_in_the_report() {
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         let provider = vec!["glm-5.3-flash".to_string(), "qwen3.8-flash-next".to_string()];
         let report = mismatch_report(&caps, &provider).expect("a mismatch is reported");
         assert!(
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn preflight_nothing_missing_produces_no_report() {
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         let served: Vec<String> = caps
             .families()
             .map(|family| format!("{}-extra", family))
@@ -921,7 +921,7 @@ mod tests {
 
         // Being listed did not save it: the excluded model is REPORTED as absent by the mismatch
         // check, which is the whole point — a seat leased on a refusing model is never served.
-        let caps = SeatCaps::measured();
+        let caps = SeatCaps::default_caps();
         let served = ids(body);
         let report = mismatch_report(&caps, &served).expect("the excluded family is now absent");
         assert!(
