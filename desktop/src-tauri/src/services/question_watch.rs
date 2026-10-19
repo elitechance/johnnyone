@@ -238,6 +238,21 @@ pub fn pass_is_all_orphan(asking_count: usize, attributed_count: usize) -> bool 
     asking_count > 0 && attributed_count == 0
 }
 
+/// The captured panes that are ASKING something and whose session row is
+/// missing from `sessions` - the asks this pass is dropping. Pure: no tmux,
+/// no database, so the log's claim is testable.
+pub fn unattributed_asking_panes(
+    rows: &[(String, String)],
+    screens: &[(String, String)],
+) -> Vec<String> {
+    screens
+        .iter()
+        .filter(|(_pane_id, screen)| pane_is_asking(screen).is_some())
+        .filter(|(pane_id, _screen)| session_for_pane(rows, pane_id).is_none())
+        .map(|(pane_id, _screen)| pane_id.clone())
+        .collect()
+}
+
 /// Returns `(session_id, pane_id, question)` per asking pane with a known
 /// session, in the order the screens were given. Pure — no tmux, no database —
 /// so the ordering rule above is testable without a tmux server.
@@ -265,12 +280,7 @@ pub fn sweep_known_panes(
         }
         match session_for_pane(rows, pane_id) {
             Some(session_id) => known.push((session_id, pane_id.clone(), screen.clone())),
-            None => {
-                tracing::debug!(
-                    pane_id = %pane_id,
-                    "leaving a question from a pane with no session row unreported"
-                );
-            }
+            None => {}
         }
     }
 
@@ -292,7 +302,22 @@ pub fn sweep_known_panes(
         })
         .collect();
 
-    // 3. Say so ONCE per pass when the pass found asks but attributed none of
+    // 3. Name the panes whose ASK this pass dropped. Only panes that are
+    //    actually asking are named — a silent pane with no row is the normal,
+    //    expected shape of a quiet fleet and saying so about every one of them
+    //    every 20 seconds is noise that drowns the signal — and only ONCE per
+    //    pane, because a pane with no row now will have no row on the next pass
+    //    either, so repeating the name carries no new information.
+    for pane_id in unattributed_asking_panes(rows, screens) {
+        if watch.orphans_logged.insert(pane_id.clone()) {
+            tracing::debug!(
+                pane_id = %pane_id,
+                "leaving a question from a pane with no session row unreported"
+            );
+        }
+    }
+
+    // 4. Say so ONCE per pass when the pass found asks but attributed none of
     //    them. The skip above is correct and unchanged — nothing is returned
     //    for an orphan pane and nothing is reported to the console — but a
     //    watch that finds questions and tells the operator NONE of them looks
@@ -520,6 +545,10 @@ pub fn agent_pane_ids(list_output: &str) -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct QuestionWatch {
     seen: HashSet<String>,
+    /// Pane ids already named in the orphan log. A pane with no row now will have
+    /// no row on the next pass either, so naming it again every 20 seconds carries
+    /// no new information.
+    orphans_logged: HashSet<String>,
 }
 
 impl QuestionWatch {
@@ -995,6 +1024,155 @@ mod tests {
             1,
             "and its ask is still there once the row appears"
         );
+    }
+
+    /// The orphan log may only name a pane that is ACTUALLY asking. The old log
+    /// fired for every captured pane with no session row, so on a host with 108
+    /// silent panes it wrote 108 lines per pass claiming each had a question —
+    /// 128,950 lines of it, ~90% of a 39.6 MB log. The claim is only true of the
+    /// panes `pane_is_asking` matches, so the seam that makes it is tested here:
+    /// one pane asking with no row, one silent pane with no row, one pane asking
+    /// WITH a row — and only the first may be named.
+    #[test]
+    fn question_orphan_log_names_only_panes_that_are_actually_asking() {
+        // Only %1 has a session row; %2 and %3 have none.
+        let rows = vec![row("session-known", "%1")];
+        let screens = vec![
+            // %1: asking, and attributable — dropped by nothing, so never named.
+            ("%1".to_string(), waiting_screen()),
+            // %2: no row AND not asking (mid-answer, idle composer) — the shape
+            // that used to be logged as having an unreported question.
+            ("%2".to_string(), busy_screen()),
+            // %3: no row and genuinely asking — the one true orphan ask.
+            ("%3".to_string(), other_ask_screen()),
+        ];
+
+        // The seam itself: exactly the asking pane with no row, in screen order.
+        assert_eq!(
+            unattributed_asking_panes(&rows, &screens),
+            vec!["%3".to_string()],
+            "only a pane that IS asking and has NO row is an orphan ask"
+        );
+
+        // A silent pane is never named whatever its row situation: no row here,
+        // and still nothing comes back.
+        let silent_no_row = vec![("%2".to_string(), busy_screen())];
+        assert!(
+            unattributed_asking_panes(&rows, &silent_no_row).is_empty(),
+            "a silent pane with no row is not an orphan ask"
+        );
+        // ...and the same silent pane whose row is MISSING entirely from the
+        // listing is still not named.
+        let no_rows_at_all: Vec<(String, String)> = vec![];
+        assert!(
+            unattributed_asking_panes(&no_rows_at_all, &silent_no_row).is_empty(),
+            "no rows at all still must not name a silent pane"
+        );
+        // An asking pane WITH a row is attributed, so it is not dropped and not
+        // named either.
+        let asking_known = vec![("%1".to_string(), waiting_screen())];
+        assert!(
+            unattributed_asking_panes(&rows, &asking_known).is_empty(),
+            "an attributed ask is not an orphan"
+        );
+        // Every pane orphaned: all of them named, in the order given.
+        assert_eq!(
+            unattributed_asking_panes(&no_rows_at_all, &screens),
+            vec!["%1".to_string(), "%3".to_string()],
+            "with no rows, every ASKING pane is named, in screen order, and \
+             the silent one still is not"
+        );
+        // Nothing captured names nothing, and does not panic.
+        let empty: Vec<(String, String)> = vec![];
+        assert!(unattributed_asking_panes(&rows, &empty).is_empty());
+        assert!(unattributed_asking_panes(&empty, &empty).is_empty());
+
+        // And the pass still behaves exactly as before: the asking pane with a
+        // row is reported, the orphan ask is not, the silent pane contributes
+        // nothing.
+        let mut watch = QuestionWatch::new();
+        let found = sweep_known_panes(&rows, &screens, &mut watch);
+        assert_eq!(found.len(), 1, "only the attributable ask is reported");
+        assert_eq!(found[0].0, "session-known");
+        assert_eq!(found[0].1, "%1");
+    }
+
+    /// A pane with no row now will have no row on the next pass either, so
+    /// naming it again every 20 seconds carries no new information. One watcher
+    /// over many passes names the same orphan ONCE — which is what turns 108
+    /// lines per pass into one line per pane for the life of the poller.
+    #[test]
+    fn question_orphan_log_names_a_pane_once_not_on_every_pass() {
+        let mut watch = QuestionWatch::new();
+        let rows: Vec<(String, String)> = vec![row("session-other", "%1")];
+        let screens = vec![("%42".to_string(), waiting_screen())];
+
+        assert_eq!(
+            unattributed_asking_panes(&rows, &screens),
+            vec!["%42".to_string()],
+            "the first pass finds the orphan ask"
+        );
+
+        // Pass one: the pane is named, i.e. recorded in the watcher's memory.
+        assert!(
+            sweep_known_panes(&rows, &screens, &mut watch).is_empty(),
+            "an orphan pane is still never reported"
+        );
+        assert_eq!(
+            watch.orphans_logged.len(),
+            1,
+            "the first pass names the orphan pane once"
+        );
+        assert!(watch.orphans_logged.contains("%42"));
+
+        // Every later pass with the same watcher and the same orphan: the seam
+        // still reports the drop (the ask is still unattributed), but the log
+        // memory does not grow, so `HashSet::insert` returns false and nothing
+        // is logged again.
+        for pass in 2..=10 {
+            assert_eq!(
+                unattributed_asking_panes(&rows, &screens),
+                vec!["%42".to_string()],
+                "pass {pass}: the ask is still dropped"
+            );
+            assert!(sweep_known_panes(&rows, &screens, &mut watch).is_empty());
+            assert_eq!(
+                watch.orphans_logged.len(),
+                1,
+                "pass {pass}: the same orphan pane must not be named again"
+            );
+        }
+
+        // A DIFFERENT orphan pane is new information and is added beside it.
+        let two_orphans = vec![
+            ("%42".to_string(), waiting_screen()),
+            ("%43".to_string(), other_ask_screen()),
+        ];
+        sweep_known_panes(&rows, &two_orphans, &mut watch);
+        assert_eq!(
+            watch.orphans_logged.len(),
+            2,
+            "a second orphan pane is named once too"
+        );
+        assert!(watch.orphans_logged.contains("%43"));
+
+        // And the ask itself is untouched by the log memory: when the row
+        // finally appears, the question is still told.
+        let rows_with_orphan = vec![
+            row("session-other", "%1"),
+            row("session-orphan", "%42"),
+        ];
+        let after = sweep_known_panes(
+            &rows_with_orphan,
+            &[("%42".to_string(), waiting_screen())],
+            &mut watch,
+        );
+        assert_eq!(
+            after.len(),
+            1,
+            "naming an orphan must not swallow its ask: {after:?}"
+        );
+        assert_eq!(after[0].0, "session-orphan");
     }
 
     /// A pane that DOES have a session row is reported once, and a later pass
