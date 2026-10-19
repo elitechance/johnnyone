@@ -621,8 +621,9 @@ fn counts(held: &Mutex<BTreeMap<String, u32>>) -> MutexGuard<'_, BTreeMap<String
 }
 
 impl LeasePool {
-    /// A pool over the default 2026-10-12 caps.
-    pub fn with_measured_caps() -> SharedLeasePool {
+    /// A pool over the caps this build ships with — see [`DEFAULT_SEAT_CAPS`] for why they
+    /// are not called measured.
+    pub fn with_default_caps() -> SharedLeasePool {
         Arc::new(Self::new(SeatCaps::default_caps()))
     }
 
@@ -844,8 +845,10 @@ mod tests {
     use std::sync::Barrier;
 
     #[test]
-    fn the_measured_caps_are_the_ones_recorded_in_the_mock() {
-        // Measured 2026-10-12, mock.html step 3 ("Measured caps · 2026-10-12").
+    fn the_default_caps_are_the_ones_recorded_in_the_mock() {
+        // Transcribed from mock.html step 3, whose table is titled
+        // "Measured caps · 2026-10-12" — a title this build no longer endorses; see
+        // [`DEFAULT_SEAT_CAPS`] for why the rows are self-imposed, not measured.
         let caps = SeatCaps::default_caps();
         assert_eq!(caps.cap("glm-5.3-flash"), Some(4));
         assert_eq!(caps.cap("deepseek-v4.1-flash"), Some(2));
@@ -885,7 +888,7 @@ mod tests {
 
     #[test]
     fn acquire_then_release_restores_the_previous_count() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         assert_eq!(pool.busy_for("glm-5.3-flash"), 0);
 
         let first = pool.acquire("glm-5.3-flash", 1).unwrap();
@@ -909,7 +912,7 @@ mod tests {
 
     #[test]
     fn over_acquire_is_refused_whole_and_takes_nothing() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let _held = pool.acquire("glm-5.3-flash", 3).unwrap();
 
         let err = pool.acquire("glm-5.3-flash", 2).expect_err("2 must not fit in 1 free seat");
@@ -936,7 +939,7 @@ mod tests {
         assert_eq!(pool.busy_for("glm-5.3-flash"), 4);
 
         // A request bigger than the whole cap is the same refusal, not a special case.
-        let whole = LeasePool::with_measured_caps();
+        let whole = LeasePool::with_default_caps();
         assert!(matches!(
             whole.acquire("deepseek-v4.1-flash", 3),
             Err(SeatError::OverCap { free: 2, cap: 2, .. })
@@ -946,7 +949,7 @@ mod tests {
 
     #[test]
     fn a_full_family_blocks_even_with_other_families_idle() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let _full = pool.acquire("deepseek-v4.1-flash", 2).unwrap();
 
         // 8 seats are free across glm + qwen, and none of them may satisfy this.
@@ -972,7 +975,7 @@ mod tests {
 
     #[test]
     fn an_uncapped_family_cannot_be_leased() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let err = pool.acquire("some-model-nobody-measured", 1).unwrap_err();
         assert_eq!(
             err,
@@ -995,7 +998,7 @@ mod tests {
     /// is permanent: nothing can reconcile against a fleet that cannot be asked how busy it is.
     #[test]
     fn seats_come_back_when_the_holder_panics() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let inner = Arc::clone(&pool);
         let joined = std::thread::spawn(move || {
             let _lease = inner.acquire("glm-5.3-flash", 3).unwrap();
@@ -1030,7 +1033,7 @@ mod tests {
         const THREADS: usize = 32;
         const ROUNDS: usize = 50;
         const CAP: u32 = 4;
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let start = Arc::new(Barrier::new(THREADS));
         let mid = Arc::new(Barrier::new(THREADS));
         let won = Arc::new(AtomicU32::new(0));
@@ -1126,7 +1129,7 @@ mod tests {
     fn concurrent_families_do_not_bleed_into_each_other() {
         const FAMILIES: [&str; 3] = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
         const THREADS: usize = 30;
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let start = Arc::new(Barrier::new(THREADS));
         let gate = Arc::new(Barrier::new(THREADS));
         // Per-family, by the same index as FAMILIES: peak seats observed in use, and how many
@@ -1202,7 +1205,7 @@ mod tests {
     /// a paragraph. It is the only guard the doc has until Dev A writes those three lines.
     #[test]
     fn the_snapshot_order_decides_whether_two_runs_are_ever_comparable() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         // A rival run already holds 1 glm seat: that is the contention this run starts against,
         // and it is what `fleet_busy` is for.
         let _rival = pool.acquire("glm-5.3-flash", 1).unwrap();
@@ -1242,7 +1245,7 @@ mod tests {
         // own `fan_out`, so a budget comparison between two runs of different widths is wrong by
         // the difference of their widths, which is exactly the quantity it is trying to control
         // for.)
-        let quiet = LeasePool::with_measured_caps();
+        let quiet = LeasePool::with_default_caps();
         let quiet_lease = quiet.acquire("glm-5.3-flash", 2).unwrap();
         let quiet_wrong = quiet.fleet_busy_json();
         assert!(
@@ -1252,7 +1255,7 @@ mod tests {
         );
         drop(quiet_lease);
         // Under the RIGHT order the same run would have recorded an idle fleet.
-        let quiet = LeasePool::with_measured_caps();
+        let quiet = LeasePool::with_default_caps();
         let quiet_right = quiet.fleet_busy_json();
         let _quiet_lease = quiet.acquire("glm-5.3-flash", 2).unwrap();
         assert!(
@@ -1265,7 +1268,7 @@ mod tests {
     /// The two JSON columns a run snapshots at start.
     #[test]
     fn the_snapshot_columns_are_json_a_run_can_store() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         assert_eq!(
             pool.fleet_busy_json(),
             r#"{"deepseek-v4.1-flash":0,"glm-5.3-flash":0,"qwen3.8-flash-next":0}"#
@@ -1433,7 +1436,7 @@ mod qa_b_tests {
     /// while suspended inside the `await`, not allowed to run to completion.
     #[tokio::test]
     async fn qa_a_future_cancelled_mid_await_returns_its_seats() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let inner = Arc::clone(&pool);
         let mut held = Box::pin(async move {
             let lease = inner.acquire("glm-5.3-flash", 3).unwrap();
@@ -1467,7 +1470,7 @@ mod qa_b_tests {
     /// The same thing through `JoinHandle::abort`, which is how a real task is cancelled.
     #[tokio::test]
     async fn qa_an_aborted_task_returns_its_seats() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let inner = Arc::clone(&pool);
         let task = tokio::spawn(async move {
             let _lease = inner.acquire("deepseek-v4.1-flash", 2).unwrap();
@@ -1500,7 +1503,7 @@ mod qa_b_tests {
     #[test]
     fn qa_racing_refusals_take_nothing_and_report_a_free_count_that_is_real() {
         const N: usize = 24;
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let _held = pool.acquire("glm-5.3-flash", 3).unwrap(); // exactly 1 seat free
 
         let start = Arc::new(Barrier::new(N));
@@ -1551,7 +1554,7 @@ mod qa_b_tests {
     fn qa_over_cap_free_is_exact_for_every_reachable_state() {
         for in_use in 0..=4u32 {
             for requested in (5 - in_use)..=12u32 {
-                let pool = LeasePool::with_measured_caps();
+                let pool = LeasePool::with_default_caps();
                 let _pre = (in_use > 0).then(|| pool.acquire("glm-5.3-flash", in_use).unwrap());
                 let free = 4 - in_use;
                 assert_eq!(
@@ -1588,7 +1591,7 @@ mod qa_b_tests {
         const THREADS: usize = 24;
         const ROUNDS: usize = 400;
         const CAP: u32 = 4;
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let start = Arc::new(Barrier::new(THREADS));
         let peak = Arc::new(AtomicU32::new(0));
         let grants = Arc::new(AtomicU32::new(0));
@@ -1771,7 +1774,7 @@ mod qa_b_tests {
     /// interleaving the concurrency test could not cover is also the one that cannot happen.
     #[test]
     fn qa_a_family_cannot_be_added_or_resized_after_the_pool_is_built() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         assert_eq!(pool.cap_for("late-arrival"), None);
         // There is no `&mut self` on LeasePool and no setter on SeatCaps; the only way to a
         // different cap is a different pool, which a running arena run cannot be moved onto.
@@ -1798,7 +1801,7 @@ mod qa_b_tests {
     /// is done" is not read as "the mock's seat behaviour is implemented".
     #[test]
     fn qa_documents_there_is_no_queue_only_an_immediate_refusal() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let _full = pool.acquire("glm-5.3-flash", 4).unwrap();
         let before = Instant::now();
         assert!(pool.acquire("glm-5.3-flash", 1).is_err());
@@ -1816,7 +1819,7 @@ mod qa_b_tests {
     /// module's atomicity guarantee is per lease, not per run.
     #[test]
     fn qa_documents_a_two_family_request_is_not_atomic_across_families() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let _rival = pool.acquire("deepseek-v4.1-flash", 2).unwrap();
 
         let half = pool
@@ -1848,7 +1851,7 @@ mod qa_b_tests {
         );
         // Nothing branches on a family name: an unknown family is refused by the same code path
         // that would serve a known one, not by a special case.
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         for (family, cap) in DEFAULT_SEAT_CAPS {
             assert_eq!(pool.cap_for(family), Some(*cap));
             let lease = pool.acquire(family, *cap).unwrap();
@@ -2116,7 +2119,7 @@ mod qa_b_r2_tests {
     fn qa_the_cross_family_race_really_grants_every_seat() {
         const FAMILIES: [&str; 3] = ["glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next"];
         const THREADS: usize = 30;
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let start = Arc::new(Barrier::new(THREADS));
         let gate = Arc::new(Barrier::new(THREADS));
         let peaks: Arc<[AtomicU32; 3]> =
@@ -2516,7 +2519,7 @@ mod qa_b_r3_tests {
     /// `won == cap` is not read as covering fairness.
     #[test]
     fn qa_documents_the_cap_tests_cannot_see_starvation() {
-        let pool = LeasePool::with_measured_caps();
+        let pool = LeasePool::with_default_caps();
         let _narrow: Vec<_> = (0..4).map(|_| pool.acquire("glm-5.3-flash", 1).unwrap()).collect();
         // A 4-seat request can never be satisfied while four 1-seat holders cycle, and nothing
         // in the pool records that it was asked, let alone orders it first.
