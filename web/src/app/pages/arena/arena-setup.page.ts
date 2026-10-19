@@ -23,11 +23,17 @@ import {
 } from './arena-logic';
 
 /** The three families, with the seat caps MEASURED on 2026-10-12 and recorded in the mock. They are
- *  a recorded measurement, not a live reading: J1 has no lease pool, so nothing here is live. */
+ *  a recorded measurement, not a live reading: J1 has no lease pool, so nothing here is live.
+ *
+ *  The context figures in the notes were read from the provider's own /v1/models on 2026-10-19:
+ *  qwen3.8-flash-next reports context_length 135168 tokens, i.e. 132K. The figure this table carried
+ *  before was never anybody's context length — a round power of two that merely looks close enough.
+ *  The other two notes are untouched: glm's matches the provider, and deepseek-v4.1-flash is not
+ *  served by the provider at all, so there is nothing to compare its figure against. */
 const FAMILIES = [
   { family: 'glm-5.3-flash', note: '262K · reasoning · executes', cap: 4 },
   { family: 'deepseek-v4.1-flash', note: '262K · proposes the next prompt', cap: 2 },
-  { family: 'qwen3.8-flash-next', note: '131K · busiest model', cap: 4 },
+  { family: 'qwen3.8-flash-next', note: '132K · busiest model', cap: 4 },
 ];
 
 /**
