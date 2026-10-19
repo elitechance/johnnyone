@@ -89,7 +89,14 @@ import {
   HostFileEntry,
   TmuxSession,
   phaseNnOf,
+  canCopyMessage,
+  copyTextFor,
+  performCopy,
+  copyStateLabelFor,
+  clearCopyResetTimer,
   type TestGateRun,
+  type CopyOutcome,
+  type ClipboardLike,
 } from '@johnnyone/ui';
 import {
   PaneTab,
@@ -740,6 +747,54 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** Ticks so the liveness line re-renders while nothing else changes. */
   private readonly shellClock = signal(0);
   private shellClockInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Per-row copy feedback, keyed by the row's index in `shellRows()`. */
+  private readonly copyRowStates = new Map<number, CopyOutcome>();
+  /** Pending "back to 'Copy'" resets, keyed by the same row index. */
+  private readonly copyRowResetTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** How long the button reads 'Copied' before returning to 'Copy'. */
+  private static readonly COPY_RESET_MS = 2000;
+
+  /**
+   * Is this row worth a copy button? Delegates to the shared seam so the rule is the
+   * same one the message bubble uses: any role qualifies, an empty body does not.
+   */
+  protected canCopyRow(row: { text: string }): boolean {
+    return canCopyMessage({ content: row.text });
+  }
+
+  /** The row's last copy outcome, or null before its first click. */
+  protected copyRowState(i: number): CopyOutcome | null {
+    return this.copyRowStates.get(i) ?? null;
+  }
+
+  /** The words under the button — 'Copied' / a failure reason / '' for the default. */
+  protected copyRowLabel(i: number): string {
+    return copyStateLabelFor(this.copyRowState(i));
+  }
+
+  /**
+   * Copy a transcript row. The text is the row's RAW text (never the rendered markdown),
+   * and the outcome is always surfaced — a silent no-op is the bug this seam exists for.
+   */
+  protected async copyRow(i: number, row: { text: string }): Promise<void> {
+    const text = copyTextFor({ content: row.text });
+    // ONE clipboard surface for the whole page — see `clipboardSurface()` below.
+    const clipboard = this.clipboardSurface();
+    const outcome = await performCopy(text, clipboard);
+    this.copyRowStates.set(i, outcome);
+    clearCopyResetTimer(this.copyRowResetTimers.get(i));
+    this.copyRowResetTimers.delete(i);
+    if (outcome === 'copied') {
+      this.copyRowResetTimers.set(
+        i,
+        setTimeout(() => {
+          this.copyRowResetTimers.delete(i);
+          this.copyRowStates.delete(i);
+        }, TerminalPage.COPY_RESET_MS),
+      );
+    }
+  }
 
   /** Merged display rows: local echoes interleaved with reports, in send order. */
   protected shellRows(): Array<{
@@ -1757,6 +1812,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   ngOnDestroy(): void {
     for (const timer of this.pendingVisualUnsubscribes.values()) clearTimeout(timer);
     this.pendingVisualUnsubscribes.clear();
+    for (const h of this.copyRowResetTimers.values()) clearCopyResetTimer(h);
+    this.copyRowResetTimers.clear();
     this.clearShellPendingTimer();
     if (this.shellClockInterval) {
       clearInterval(this.shellClockInterval);
@@ -4609,10 +4666,23 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return `~/${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
   }
 
+  /**
+   * The page's ONE clipboard surface. The clipboard API is UNDEFINED in a non-secure
+   * context (plain http on a phone), so every copy path — the transcript rows and the
+   * session-id chip — reads it through here rather than each holding its own reference
+   * to it. One mention of the global, one path.
+   */
+  private clipboardSurface(): ClipboardLike | null {
+    if (typeof navigator === 'undefined') return null;
+    const nav = navigator as Navigator & { clipboard?: ClipboardLike };
+    return nav.clipboard ?? null;
+  }
+
   private async copyTextToClipboard(value: string): Promise<boolean> {
     try {
-      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value);
+      const clip = this.clipboardSurface();
+      if (clip?.writeText) {
+        await clip.writeText(value);
         return true;
       }
     } catch {
