@@ -126,3 +126,17 @@ export {
   escapeHtml,
   highlightCode,
 } from './lib/markdown-render';
+
+// ── Copy core ────────────────────────────────────────────────────────────────
+export {
+  canCopyMessage,
+  copyTextFor,
+  performCopy,
+  copyStateLabelFor,
+  clearCopyResetTimer,
+} from './lib/copy-message';
+export type {
+  CopyOutcome,
+  CopyableMessage,
+  ClipboardLike,
+} from './lib/copy-message';

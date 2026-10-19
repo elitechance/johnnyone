@@ -154,6 +154,11 @@
                   <div class="st-meta">
                     <span class="st-who">{{ row.type === 'you' ? 'You' : 'Agent' }}</span>
                     @if (row.at) { <span class="st-when">{{ row.at }}</span> }
+                    <!-- Same rule as the message bubble: nothing to copy, no button. -->
+                    @if (canCopyRow(row)) {
+                      <button type="button" class="st-copy-btn" data-testid="st-copy-btn"
+                              (click)="copyRow($index, row)">{{ copyRowLabel($index) || 'Copy' }}</button>
+                    }
                   </div>
                   @if (row.tool) { <div class="st-hd">{{ row.tool }}</div> }
                   @if (row.type === 'markdown') {
