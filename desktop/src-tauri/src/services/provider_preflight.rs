@@ -61,6 +61,18 @@ pub fn provider_endpoint_from_profile(profile_json: &str, provider: &str) -> Opt
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The context lengths the arena's own assumptions are built on, as `(model, tokens)`.
+///
+/// These are the figures read from the provider's own `/v1/models` on 2026-10-19. The check exists
+/// so that a provider-side change to a model's context is REPORTED rather than silently breaking a
+/// context budget that was sized against the old number. `135168` is the number the provider gives
+/// for `qwen3.8-flash-next` — not the round power-of-two figure the code assumed before it was
+/// measured, which was never that model's context length at all.
+pub const ASSUMED_CONTEXT_LENGTHS: &[(&str, u32)] = &[
+    ("glm-5.3-flash", 262144),
+    ("qwen3.8-flash-next", 135168),
+];
+
 /// Turn a stored `apiKey` value into the token to actually send.
 ///
 /// On this machine the profile stores an **environment variable reference**, not a secret:
@@ -158,6 +170,67 @@ pub fn provider_ids_from_models_json(body: &str) -> Option<Vec<String>> {
             .map(String::from)
             .collect(),
     )
+}
+
+/// The `(id, context_length)` pairs in a `/v1/models` body, read from `data[]`.
+///
+/// Same shape and the same rule as [`provider_ids_from_models_json`]: None only when the body cannot
+/// be parsed or has no `data` array, because an unreadable answer is not an empty fleet — the
+/// difference is between "we do not know" and "the provider says every model is tiny", and only the
+/// first one is true of a body we could not read.
+///
+/// An entry is paired only when BOTH an `id` and a usable `context_length` are present, so a model
+/// that reports no context length is SKIPPED rather than reported as zero: "the provider did not
+/// say" and "the provider says 0 tokens" are different facts, and reading the first as the second
+/// would produce a mismatch line about a model the provider never made a claim about. A
+/// `context_length` that is not a non-negative integer fitting a `u32` is likewise not a claim.
+pub fn provider_context_lengths_from_models_json(body: &str) -> Option<Vec<(String, u32)>> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = value.get("data")?.as_array()?;
+    Some(
+        data.iter()
+            .filter_map(|entry| {
+                let id = entry.get("id")?.as_str()?;
+                let length = entry.get("context_length")?.as_u64()?;
+                let length = u32::try_from(length).ok()?;
+                Some((id.to_string(), length))
+            })
+            .collect(),
+    )
+}
+
+/// One line per model whose context length the provider reports as DIFFERENT from what the code
+/// assumes, in `assumed`'s own order.
+///
+/// A context length is not a cosmetic number: a Hop's budget, and the point at which a run starts
+/// compacting, are sized against it. If the provider shrinks a model — 262144 down to something
+/// much smaller — nothing else in the host notices: the run just starts losing its head, so this is
+/// the only place that condition can be reported at all.
+///
+/// A model the provider does not report is NOT a mismatch and is skipped: an absence is already
+/// named by the family check in [`mismatch_report`], and naming the same model twice in two
+/// different voices is how an operator learns to skip the log. An empty `provider` slice therefore
+/// yields no lines at all, for the same reason the family check treats an empty list as "unknown"
+/// rather than as "everything is wrong" — a provider we could not read has not contradicted anybody.
+pub fn context_length_mismatches(
+    assumed: &[(&str, u32)],
+    provider: &[(String, u32)],
+) -> Vec<String> {
+    assumed
+        .iter()
+        .filter_map(|(model, assumed_ctx)| {
+            let reported = provider
+                .iter()
+                .find(|(id, _)| id == model)?
+                .1;
+            (reported != *assumed_ctx).then(|| {
+                format!(
+                    "{model}: the arena assumes {assumed_ctx} tokens, the provider reports \
+                     {reported}"
+                )
+            })
+        })
+        .collect()
 }
 
 /// The one-line operator warning, or None when there is nothing to say.
@@ -276,6 +349,16 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
             ids = provider_ids.len(),
             "provider preflight: every capped family is served"
         ),
+    }
+    // The SAME body already in hand — a second HTTP request for a field that is already sitting in
+    // this response would be a second chance to fail, and a second thing to time out at boot.
+    // A distinct message from the seat-cap one, so "the provider does not serve this family" and
+    // "the provider resized a family it does serve" are separable in the log: they are different
+    // failures with different fixes. No lines means no warning at all — a provider that agrees with
+    // the table has earned silence, not a debug line per model on every boot.
+    let lengths = provider_context_lengths_from_models_json(&body).unwrap_or_default();
+    for report in context_length_mismatches(ASSUMED_CONTEXT_LENGTHS, &lengths) {
+        tracing::warn!(%url, %report, "provider/context-length mismatch");
     }
 }
 
@@ -541,6 +624,67 @@ mod tests {
         // `deepseek-v4.1-flash` is genuinely absent from the real fleet's ids — the fact that
         // makes the mismatch check worth running.
         assert!(!ids(MODELS).iter().any(|id| id == "deepseek-v4.1-flash"));
+    }
+
+    #[test]
+    fn preflight_a_context_length_the_provider_reports_differently_is_named() {
+        // A context length is not cosmetic: a Hop's budget and the point a run starts compacting
+        // are sized against it, so a provider-side change has to be reported rather than silently
+        // shrinking the window a run was planned for.
+        let lines = context_length_mismatches(
+            &[("qwen3.8-flash-next", 131072)],
+            &[("qwen3.8-flash-next".to_string(), 135168)],
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("qwen3.8-flash-next"));
+        assert!(lines[0].contains("131072"));
+        assert!(lines[0].contains("135168"));
+        // A length the provider reports as the code assumes is not a mismatch.
+        assert!(context_length_mismatches(
+            &[("qwen3.8-flash-next", 131072)],
+            &[("qwen3.8-flash-next".to_string(), 131072)],
+        )
+        .is_empty());
+        // …and the table this module actually ships is TRUE as of 2026-10-19, read from the
+        // provider's own /v1/models. If this assert ever fails the provider moved, which is
+        // precisely the condition the check exists to surface.
+        let reported = provider_context_lengths_from_models_json(
+            r#"{"data":[{"id":"glm-5.3-flash","context_length":262144},{"id":"qwen3.8-flash-next","context_length":135168}]}"#,
+        )
+        .expect("a parseable body with a data array");
+        assert_eq!(
+            reported,
+            vec![
+                ("glm-5.3-flash".to_string(), 262144),
+                ("qwen3.8-flash-next".to_string(), 135168)
+            ]
+        );
+        assert!(context_length_mismatches(ASSUMED_CONTEXT_LENGTHS, &reported).is_empty());
+    }
+
+    #[test]
+    fn preflight_a_model_the_provider_does_not_report_a_context_for_is_not_a_mismatch() {
+        // An entry with no `context_length` made no claim, so it is SKIPPED - never read as 0,
+        // which would manufacture a mismatch about a model the provider said nothing about.
+        let reported = provider_context_lengths_from_models_json(
+            r#"{"data":[{"id":"no-context-reported"},{"id":"glm-5.3-flash","context_length":262144}]}"#,
+        )
+        .expect("a parseable body with a data array");
+        assert_eq!(reported, vec![("glm-5.3-flash".to_string(), 262144)]);
+        // A provider we could not read has not contradicted anybody.
+        assert!(context_length_mismatches(ASSUMED_CONTEXT_LENGTHS, &[]).is_empty());
+        // An assumed model absent from the provider's list is already named by the family check
+        // in `mismatch_report`; saying it twice in two different voices is how an operator learns
+        // to skip the log.
+        assert!(context_length_mismatches(
+            &[("deepseek-v4.1-flash", 262144)],
+            &[("glm-5.3-flash".to_string(), 262144)],
+        )
+        .is_empty());
+        // None is "unreadable", which is NOT Some(vec![]): an empty list would read as a provider
+        // that reports no contexts at all.
+        assert_eq!(provider_context_lengths_from_models_json("not json"), None);
+        assert_eq!(provider_context_lengths_from_models_json(r#"{"models":[]}"#), None);
     }
 
     #[test]
