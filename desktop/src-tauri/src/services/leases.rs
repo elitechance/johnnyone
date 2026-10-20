@@ -679,6 +679,17 @@ impl LeasePool {
         unserved_set(&self.unserved).clone()
     }
 
+    /// The caps this pool is actually enforcing.
+    ///
+    /// The preflight compares the provider's model list against THIS table rather than against a
+    /// freshly-built [`SeatCaps::default_caps()`]: a host whose pool was built from
+    /// `seat_caps_from_db` may be enforcing caps the default table does not describe, and checking
+    /// a table the pool is not using would refuse (or clear) families on the strength of caps that
+    /// decide nothing.
+    pub fn caps(&self) -> &SeatCaps {
+        &self.caps
+    }
+
     /// Take `seats` on `family`, all or nothing.
     ///
     /// The check and the take happen under ONE lock acquisition, so two threads cannot both
