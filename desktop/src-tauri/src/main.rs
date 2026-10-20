@@ -6,7 +6,6 @@ use johnnyone_desktop_lib::db::Database;
 use johnnyone_desktop_lib::host;
 use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
-use johnnyone_desktop_lib::services::leases;
 use johnnyone_desktop_lib::services::provider_preflight;
 use johnnyone_desktop_lib::services::question_watch;
 use johnnyone_desktop_lib::services::relay;
@@ -130,7 +129,11 @@ fn main() {
 
             // One read of the provider's model list, compared with the seat caps: a cap for a
             // family the provider will not serve is a pool that can be leased and never used.
-            provider_preflight::spawn_provider_preflight(leases::SeatCaps::default_caps());
+            // It now gets the LIVE pool rather than a default caps table, so the comparison is
+            // made against the caps this host actually enforces (`seat_caps_from_db`) and the
+            // answer is told to the pool, not just to the log — `acquire` then refuses a family
+            // the provider will not serve. A hiccup at boot leaves the pool untouched.
+            provider_preflight::spawn_provider_preflight(app_state.lease_pool.clone());
 
             let bind_addr = std::env::var("JOHNNYONE_HOST_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:7788".to_string());

@@ -40,7 +40,7 @@
 //! warnings. An unreadable answer means *unknown*, and unknown reports nothing.
 
 use crate::services::leases::{
-    families_absent_from_provider, provider_serves_no_capped_family, SeatCaps,
+    families_absent_from_provider, provider_serves_no_capped_family, SeatCaps, SharedLeasePool,
 };
 
 /// How long to wait for the model list. Short on purpose: this runs at boot and the answer is a
@@ -316,6 +316,28 @@ pub fn mismatch_report(caps: &SeatCaps, provider_ids: &[String]) -> Option<Strin
     }
 }
 
+/// The families to refuse, decided from one model-list body. `None` means
+/// INCONCLUSIVE (unparseable body, or a parseable body that named no ids) and
+/// the caller must leave the pool untouched. `Some(list)` is conclusive, and an
+/// empty list is a real answer: every capped family is served, so nothing is refused.
+///
+/// The distinction is the whole content of this function. `None` and `Some(vec![])` look alike to
+/// a caller that only checks `is_empty()`, but they mean opposite things to the pool: `None` is
+/// "we could not ask the provider", and marking on it would refuse the entire fleet because one
+/// HTTP response failed or a laptop booted offline; `Some(vec![])` is "the provider answered and
+/// serves everything", which must CLEAR a refusal left by the last outage. The two inconclusive
+/// shapes are therefore both `None` here — an unparseable body (`provider_ids_from_models_json`
+/// answers None) and a parseable body that named no ids at all (an empty vec) — and the conclusive
+/// list is the leases module's own [`families_absent_from_provider`], not a second copy of the
+/// comparison, so exact-not-prefix matching stays defined in exactly one place.
+pub fn unserved_from_models_body(caps: &SeatCaps, body: &str) -> Option<Vec<String>> {
+    let ids = provider_ids_from_models_json(body)?;
+    if ids.is_empty() {
+        return None;
+    }
+    Some(families_absent_from_provider(caps, &ids))
+}
+
 /// What the preflight is about to ask, decided before any IO happens.
 ///
 /// The url and the token are decided TOGETHER, out of the SAME provider block of the same profile,
@@ -378,13 +400,22 @@ pub fn preflight_request_plan(
     })
 }
 
-/// Read the profile, fetch the provider's model list once, and log the report.
+/// Read the profile, fetch the provider's model list once, log the report, and TELL THE POOL.
 ///
 /// Every failure is silent-but-logged at debug: a preflight that cannot reach the provider must not
 /// block or alarm the host, and an empty/unreadable answer means "unknown", which reports nothing.
 /// Nothing here returns a `Result` and nothing is `warn!` except the report itself — the host's
 /// boot path must not be able to fail because of this.
-pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
+///
+/// The pool is passed instead of a caps table so the caps the report is judged against are the caps
+/// the pool is actually enforcing (`pool.caps()`, built from `seat_caps_from_db` on this host)
+/// rather than a freshly-built default table that may describe a different fleet — and so the one
+/// conclusive answer can be acted on: [`LeasePool::mark_unserved`] refuses those families at
+/// `acquire`. EVERY early return below leaves the pool untouched; a provider hiccup at boot must
+/// not refuse the whole fleet.
+///
+/// [`LeasePool::mark_unserved`]: leases::LeasePool::mark_unserved
+pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool) {
     let profile_json = match std::fs::read_to_string(profile_path) {
         Ok(text) => text,
         Err(e) => {
@@ -460,13 +491,23 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
         tracing::debug!(%url, "provider preflight skipped: model list named no ids");
         return;
     }
-    match mismatch_report(caps, &provider_ids) {
+    match mismatch_report(pool.caps(), &provider_ids) {
         Some(report) => tracing::warn!(%url, %report, "provider/seat-cap mismatch"),
         None => tracing::debug!(
             %url,
             ids = provider_ids.len(),
             "provider preflight: every capped family is served"
         ),
+    }
+    // The one conclusive answer this function can get — a 2xx body that parsed and named at least
+    // one id — is now ACTED on rather than only logged: the pool is told which capped families the
+    // provider will not serve, so `acquire` refuses them instead of leasing seats that can never
+    // run work. Every early return above leaves the pool untouched, which is the whole safety
+    // property here: a provider hiccup at boot must not refuse the whole fleet. `mark_unserved`
+    // REPLACES the set, so a body naming every family clears a previous refusal — a provider that
+    // came back is not still being refused for the last one's outage.
+    if let Some(families) = unserved_from_models_body(pool.caps(), &body) {
+        pool.mark_unserved(families);
     }
     // The SAME body already in hand — a second HTTP request for a field that is already sitting in
     // this response would be a second chance to fail, and a second thing to time out at boot.
@@ -495,7 +536,12 @@ pub async fn run_once(profile_path: &str, provider: &str, caps: &SeatCaps) {
 /// endpoint come from the same file. When the profile names no default provider there is nothing
 /// to check, and this returns WITHOUT spawning — checking a guessed provider is worse than
 /// checking nothing.
-pub fn spawn_provider_preflight(caps: SeatCaps) {
+///
+/// Takes the [`SharedLeasePool`] itself rather than a caps table: the spawned task outlives `setup`
+/// and cannot borrow a caller's table, and the pool is what has to be told — the caps come off it
+/// (`pool.caps()`), so the comparison and the refusal are made against the same table the arena
+/// leases against.
+pub fn spawn_provider_preflight(pool: SharedLeasePool) {
     let profile_path = crate::providers::kloo_cli::default_profile_path();
     let profile_json = match std::fs::read_to_string(&profile_path) {
         Ok(text) => text,
@@ -519,13 +565,14 @@ pub fn spawn_provider_preflight(caps: SeatCaps) {
         }
     };
     tauri::async_runtime::spawn(async move {
-        run_once(&profile_path, &provider, &caps).await;
+        run_once(&profile_path, &provider, &pool).await;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::leases::{LeasePool, SeatError};
 
     /// The real profile shape at `~/etc/kloo.json`.
     const PROFILE: &str = r#"{"defaultProvider":"lokalai","providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1","apiKey":"sk-…","defaultModel":"next","models":{"next":{"contextLength":262144}}}}}"#;
@@ -980,6 +1027,141 @@ mod tests {
         assert_eq!(provider_ids_from_models_json("<html>502 Bad Gateway</html>"), None);
         assert_eq!(provider_ids_from_models_json(""), None);
         assert_eq!(provider_ids_from_models_json(r#"{"object":"list"}"#), None);
+    }
+
+    #[test]
+    fn wire_an_unparseable_body_is_inconclusive() {
+        // A body we could not read is INCONCLUSIVE, and the caller must leave the pool untouched.
+        // Marking on this would refuse the whole fleet because one HTTP response came back as HTML,
+        // a truncated stream, or a 2xx gateway page — a provider hiccup at boot must not do that.
+        let caps = SeatCaps::default_caps();
+        assert_eq!(unserved_from_models_body(&caps, "{"), None);
+        // The other inconclusive shapes answer the same way, for the same reason.
+        assert_eq!(unserved_from_models_body(&caps, ""), None);
+        assert_eq!(unserved_from_models_body(&caps, "<html>502 Bad Gateway</html>"), None);
+        assert_eq!(unserved_from_models_body(&caps, r#"{"object":"list"}"#), None);
+    }
+
+    #[test]
+    fn wire_an_empty_model_list_is_inconclusive() {
+        // A parseable `{"data":[]}` named NO ids, so the provider made no claim about the fleet at
+        // all — which is "we do not know", NOT "it serves nothing". Marking every capped family
+        // from an empty list is the exact fleet-wide refusal this distinction exists to prevent, so
+        // this is None and the pool keeps leasing exactly as it did before the call.
+        let caps = SeatCaps::default_caps();
+        assert_eq!(
+            unserved_from_models_body(&caps, r#"{"object":"list","data":[]}"#),
+            None
+        );
+        // A `data` array whose entries all name nothing usable is the same silence.
+        assert_eq!(unserved_from_models_body(&caps, r#"{"data":[{},{}]}"#), None);
+    }
+
+    #[test]
+    fn wire_a_missing_family_is_named() {
+        // A body that parsed and named at least one id IS conclusive, and the family it does not
+        // name is refused: `deepseek-v4.1-flash` is genuinely absent from this fleet, so leasing
+        // its 2 seats would hold seats that can never run work.
+        let caps = SeatCaps::default_caps();
+        let body = r#"{"object":"list","data":[
+            {"id":"glm-5.3-flash","status":"servable"},
+            {"id":"qwen3.8-flash-next","status":"servable"}
+        ]}"#;
+        let refused = unserved_from_models_body(&caps, body).expect("a conclusive answer");
+        assert_eq!(
+            refused,
+            vec!["deepseek-v4.1-flash".to_string()],
+            "the absent family is named so the pool can refuse it"
+        );
+        // The two served families are NOT in the list — refusing them would narrow the arena for
+        // no reason the provider gave.
+        assert!(!refused.iter().any(|family| family == "glm-5.3-flash"));
+        assert!(!refused.iter().any(|family| family == "qwen3.8-flash-next"));
+    }
+
+    #[test]
+    fn wire_a_fully_served_fleet_refuses_nothing() {
+        // Some(vec![]) is a REAL answer, not "unknown": the provider answered and serves every
+        // capped family, so nothing is refused AND a previous refusal must be cleared. None here
+        // would strand a fleet that came back, refusing families on the strength of an outage that
+        // has ended — which is why this is deliberately Some(empty) and not None.
+        let caps = SeatCaps::default_caps();
+        let body = format!(
+            r#"{{"object":"list","data":[{}]}}"#,
+            caps
+                .families()
+                .map(|family| format!(r#"{{"id":"{family}","status":"servable"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(unserved_from_models_body(&caps, &body), Some(Vec::new()));
+    }
+
+    #[test]
+    fn wire_marking_from_a_body_makes_the_pool_refuse() {
+        // The end-to-end claim: the preflight's conclusive answer reaches the pool, and `acquire`
+        // refuses the family on provider grounds rather than leasing seats that can never run.
+        let pool = LeasePool::with_default_caps();
+        let body = r#"{"object":"list","data":[
+            {"id":"glm-5.3-flash","status":"servable"},
+            {"id":"qwen3.8-flash-next","status":"servable"}
+        ]}"#;
+        let refused = unserved_from_models_body(pool.caps(), body).expect("a conclusive answer");
+        pool.mark_unserved(refused);
+        assert_eq!(
+            pool.unserved(),
+            ["deepseek-v4.1-flash".to_string()].into_iter().collect(),
+            "the pool was told exactly the family the provider does not serve"
+        );
+        assert!(
+            matches!(
+                pool.acquire("deepseek-v4.1-flash", 1),
+                Err(SeatError::ProviderWillNotServe { .. })
+            ),
+            "the absent family is refused on provider grounds"
+        );
+        // A served family still leases — the refusal is per family, not a fleet-wide shutdown.
+        let lease = pool
+            .acquire("glm-5.3-flash", 1)
+            .expect("a served family still leases");
+        assert_eq!(lease.family(), "glm-5.3-flash");
+    }
+
+    #[test]
+    fn wire_a_served_fleet_clears_a_previous_refusal() {
+        // `mark_unserved` REPLACES the set, and that is what makes a recovery possible: the family
+        // the last outage refused is leasable again once a body names every capped family. Adding
+        // instead of replacing would make the first bad boot permanent.
+        let pool = LeasePool::with_default_caps();
+        let missing = r#"{"object":"list","data":[
+            {"id":"glm-5.3-flash","status":"servable"},
+            {"id":"qwen3.8-flash-next","status":"servable"}
+        ]}"#;
+        pool.mark_unserved(
+            unserved_from_models_body(pool.caps(), missing).expect("a conclusive answer"),
+        );
+        assert!(matches!(
+            pool.acquire("deepseek-v4.1-flash", 1),
+            Err(SeatError::ProviderWillNotServe { .. })
+        ));
+        // The provider came back and now names everything.
+        let served = format!(
+            r#"{{"object":"list","data":[{}]}}"#,
+            pool.caps()
+                .families()
+                .map(|family| format!(r#"{{"id":"{family}","status":"servable"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        pool.mark_unserved(
+            unserved_from_models_body(pool.caps(), &served)
+                .expect("a fully-served body is conclusive"),
+        );
+        assert!(pool.unserved().is_empty(), "the refusal was cleared");
+        let lease = pool
+            .acquire("deepseek-v4.1-flash", 1)
+            .expect("the family leases again once the provider serves it");
+        assert_eq!(lease.family(), "deepseek-v4.1-flash");
     }
 
     #[test]
