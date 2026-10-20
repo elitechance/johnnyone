@@ -370,6 +370,20 @@ pub struct PreflightRequest {
     pub token: Option<String>,
 }
 
+/// What one model-list read came back as. The preflight's safety property is
+/// entirely about which of these leave the pool untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelListFetch {
+    /// The request never got an answer (DNS, refused, timeout).
+    Unreachable,
+    /// An answer that was not 2xx; the status is kept for the log line.
+    NotSuccess(u16),
+    /// A 2xx whose body could not be read.
+    Unreadable,
+    /// A 2xx body, parseable or not — `unserved_from_models_body` decides.
+    Body(String),
+}
+
 /// Decide [`PreflightRequest`] — the url and the token the preflight is about to send — from the
 /// profile JSON alone, before any IO happens. See [`PreflightRequest`] for why the two are decided
 /// in one place.
@@ -415,7 +429,15 @@ pub fn preflight_request_plan(
 /// not refuse the whole fleet.
 ///
 /// [`LeasePool::mark_unserved`]: leases::LeasePool::mark_unserved
-pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool) {
+pub async fn run_once_with<F, Fut>(
+    profile_path: &str,
+    provider: &str,
+    pool: &SharedLeasePool,
+    fetch: F,
+) where
+    F: FnOnce(&PreflightRequest) -> Fut,
+    Fut: std::future::Future<Output = ModelListFetch>,
+{
     let profile_json = match std::fs::read_to_string(profile_path) {
         Ok(text) => text,
         Err(e) => {
@@ -443,40 +465,30 @@ pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool
             return;
         }
     };
-    let url = plan.url;
-    let client = reqwest::Client::new();
-    // Authenticated with the token from THE SAME provider block the url came from — the model list
-    // is not public on the provider the profile names, so an unauthenticated GET is answered 401 and
-    // the check never runs. A profile with no usable key still sends the request unauthenticated, so
-    // a public provider keeps working; a 401 is already handled as "skip" below, never as an empty
-    // fleet. The token itself is never logged and never part of a message.
-    let mut request = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS));
-    if let Some(token) = plan.token {
-        request = request.bearer_auth(token);
-    }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(e) => {
-            tracing::debug!(%url, %e, "provider preflight skipped: model list unreachable");
+    // The answer comes ONLY from `fetch` — this function never builds a request itself, which is
+    // what makes the safety property below testable without a network. The plan is BORROWED into
+    // the closure so a caller that never reaches `fetch` (no profile, no endpoint) can still be
+    // proven not to have made a request, and `url` below is the same url that was handed over.
+    let outcome = fetch(&plan).await;
+    let url = &plan.url;
+    let body = match outcome {
+        ModelListFetch::Unreachable => {
+            tracing::debug!(%url, "provider preflight skipped: model list unreachable");
             return;
         }
-    };
-    if !response.status().is_success() {
-        tracing::debug!(
-            %url,
-            status = %response.status(),
-            "provider preflight skipped: model list request was not 2xx"
-        );
-        return;
-    }
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::debug!(%url, %e, "provider preflight skipped: model list body unreadable");
+        ModelListFetch::NotSuccess(status) => {
+            tracing::debug!(
+                %url,
+                %status,
+                "provider preflight skipped: model list request was not 2xx"
+            );
             return;
         }
+        ModelListFetch::Unreadable => {
+            tracing::debug!(%url, "provider preflight skipped: model list body unreadable");
+            return;
+        }
+        ModelListFetch::Body(body) => body,
     };
     let provider_ids = match provider_ids_from_models_json(&body) {
         Some(ids) => ids,
@@ -519,6 +531,59 @@ pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool
     for report in context_length_mismatches(ASSUMED_CONTEXT_LENGTHS, &lengths) {
         tracing::warn!(%url, %report, "provider/context-length mismatch");
     }
+}
+
+/// Read the profile, fetch the provider's model list once, log the report, and TELL THE POOL.
+///
+/// Every failure is silent-but-logged at debug: a preflight that cannot reach the provider must not
+/// block or alarm the host, and an empty/unreadable answer means "unknown", which reports nothing.
+/// Nothing here returns a `Result` and nothing is `warn!` except the report itself — the host's
+/// boot path must not be able to fail because of this.
+///
+/// The pool is passed instead of a caps table so the caps the report is judged against are the caps
+/// the pool is actually enforcing (`pool.caps()`, built from `seat_caps_from_db` on this host)
+/// rather than a freshly-built default table that may describe a different fleet — and so the one
+/// conclusive answer can be acted on: [`LeasePool::mark_unserved`] refuses those families at
+/// `acquire`. EVERY early return in [`run_once_with`] leaves the pool untouched; a provider hiccup
+/// at boot must not refuse the whole fleet.
+///
+/// This is the real-IO wrapper: it exists ONLY to turn a [`PreflightRequest`] into a
+/// [`ModelListFetch`] over reqwest. It decides nothing — every decision, including which outcomes
+/// may touch the pool, lives in [`run_once_with`], which the tests drive with a closure.
+///
+/// [`LeasePool::mark_unserved`]: leases::LeasePool::mark_unserved
+pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool) {
+    run_once_with(profile_path, provider, pool, |plan| {
+        let url = plan.url.clone();
+        let token = plan.token.clone();
+        async move {
+            let client = reqwest::Client::new();
+        // Authenticated with the token from THE SAME provider block the url came from — the model
+        // list is not public on the provider the profile names, so an unauthenticated GET is
+        // answered 401 and the check never runs. A profile with no usable key still sends the
+        // request unauthenticated, so a public provider keeps working; a 401 is already handled as
+        // "skip" by the caller, never as an empty fleet. The token itself is never logged and never
+        // part of a message.
+            let mut request = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(_) => return ModelListFetch::Unreachable,
+            };
+            if !response.status().is_success() {
+                return ModelListFetch::NotSuccess(response.status().as_u16());
+            }
+            match response.text().await {
+                Ok(body) => ModelListFetch::Body(body),
+                Err(_) => ModelListFetch::Unreadable,
+            }
+        }
+    })
+    .await;
 }
 
 /// Spawn [`run_once`] on Tauri's runtime, for the provider the profile names as its own default.
@@ -582,6 +647,234 @@ mod tests {
 
     fn ids(body: &str) -> Vec<String> {
         provider_ids_from_models_json(body).expect("parseable")
+    }
+
+    /// A profile naming the endpoint the preflight will be pointed at, written to a file of THIS
+    /// test's own so concurrent tests in the same binary cannot read each other's profile.
+    fn profile_named_after_the_test(test_name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("provider_preflight_{test_name}.json"));
+        std::fs::write(
+            &path,
+            r#"{"defaultProvider":"lokalai","providers":{"lokalai":{"endpoint":"https://example.invalid/v1","apiKey":"sk-test"}}}"#,
+        )
+        .expect("the temp dir is writable");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Drive [`run_once_with`] with a canned answer.
+    ///
+    /// Driven with `tokio::runtime::Builder::new_current_thread` rather than
+    /// `tauri::async_runtime::block_on`: `block_on` panics when called from a thread that is
+    /// ALREADY inside a runtime, and these are plain `#[test]`s — a fresh single-threaded runtime
+    /// per drive is the one executor that cannot be re-entrant. It is the same reactor
+    /// `#[tokio::test]` gives the rest of this crate's async tests.
+    fn drive(profile_path: &str, pool: &SharedLeasePool, outcome: ModelListFetch) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to drive the preflight on");
+        let profile = profile_path.to_string();
+        runtime.block_on(run_once_with(
+            &profile,
+            "lokalai",
+            pool,
+            move |_plan| async move { outcome },
+        ));
+    }
+
+    /// Drive [`run_once_with`] with a caller-supplied closure, for the test that has to observe
+    /// whether the closure was reached at all. Same runtime as [`drive`], for the same reason.
+    fn drive_with<F, Fut>(profile_path: &str, pool: &SharedLeasePool, fetch: F)
+    where
+        F: FnOnce(&PreflightRequest) -> Fut,
+        Fut: std::future::Future<Output = ModelListFetch>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to drive the preflight on");
+        runtime.block_on(run_once_with(profile_path, "lokalai", pool, fetch));
+    }
+
+    /// The (a) half of the safety property: a fresh pool is still refusing nothing.
+    fn assert_fresh_pool_untouched(profile_path: &str, outcome: ModelListFetch) {
+        let pool = LeasePool::with_default_caps();
+        assert!(pool.unserved().is_empty(), "a fresh pool refuses nothing");
+        drive(profile_path, &pool, outcome);
+        assert!(
+            pool.unserved().is_empty(),
+            "an inconclusive read must not refuse any family, let alone the whole fleet"
+        );
+    }
+
+    /// The (b) half: a refusal made before the read is STILL there after it. A hiccup must not
+    /// clear a refusal any more than it may create one — `mark_unserved` REPLACES the set, so a
+    /// path that reached it with an empty list would silently un-refuse a family the provider is
+    /// still known not to serve.
+    fn assert_previous_refusal_survives(profile_path: &str, outcome: ModelListFetch) {
+        let pool = LeasePool::with_default_caps();
+        pool.mark_unserved(["deepseek-v4.1-flash".to_string()]);
+        drive(profile_path, &pool, outcome);
+        assert!(
+            pool.unserved()
+                .contains("deepseek-v4.1-flash"),
+            "an inconclusive read must leave an existing refusal in place"
+        );
+    }
+
+    /// Both halves at once, which is the point of every `paths_*` test here.
+    fn assert_pool_untouched_both_ways(profile_path: &str, outcome: ModelListFetch) {
+        assert_fresh_pool_untouched(profile_path, outcome.clone());
+        assert_previous_refusal_survives(profile_path, outcome);
+    }
+
+    #[test]
+    fn paths_an_unreachable_provider_leaves_the_pool_untouched() {
+        // DNS failed, the connection was refused, the 5s timeout expired — the provider never
+        // answered, so nothing about the fleet is known and the pool keeps leasing exactly as it
+        // did. Marking here would refuse the whole arena because a laptop booted offline.
+        let profile = profile_named_after_the_test(
+            "an_unreachable_provider_leaves_the_pool_untouched",
+        );
+        assert_pool_untouched_both_ways(&profile, ModelListFetch::Unreachable);
+    }
+
+    #[test]
+    fn paths_a_non_2xx_leaves_the_pool_untouched() {
+        // A 401 (the failure this module has already shipped three times over) or a 502 gateway
+        // page is an ANSWER ABOUT THE TRANSPORT, not about which models exist. The status is kept
+        // for the log line and decides nothing else.
+        let profile = profile_named_after_the_test("a_non_2xx_leaves_the_pool_untouched");
+        assert_pool_untouched_both_ways(&profile, ModelListFetch::NotSuccess(401));
+        assert_pool_untouched_both_ways(&profile, ModelListFetch::NotSuccess(502));
+    }
+
+    #[test]
+    fn paths_an_unreadable_body_leaves_the_pool_untouched() {
+        // 2xx all the way, then the stream dies before the body arrives. "We could not read it" is
+        // not "it serves nothing", and an empty list handed to `mark_unserved` here would clear a
+        // refusal the last conclusive read earned.
+        let profile = profile_named_after_the_test("an_unreadable_body_leaves_the_pool_untouched");
+        assert_pool_untouched_both_ways(&profile, ModelListFetch::Unreadable);
+    }
+
+    #[test]
+    fn paths_an_unparseable_body_leaves_the_pool_untouched() {
+        // A 2xx whose body is HTML or truncated JSON. `unserved_from_models_body` answers None for
+        // this, and the caller must honour that rather than defaulting to an empty list — which is
+        // exactly the mutation this test exists to catch, since an `unwrap_or_default()` here would
+        // refuse the whole fleet and every other test in the crate would stay green.
+        let profile = profile_named_after_the_test("an_unparseable_body_leaves_the_pool_untouched");
+        assert_pool_untouched_both_ways(&profile, ModelListFetch::Body("{".to_string()));
+        assert_pool_untouched_both_ways(
+            &profile,
+            ModelListFetch::Body("<html>502 Bad Gateway</html>".to_string()),
+        );
+    }
+
+    #[test]
+    fn paths_an_empty_model_list_leaves_the_pool_untouched() {
+        // A parseable `{"data":[]}` named NO ids, so the provider made no claim about the fleet at
+        // all. This is the shape most likely to be mistaken for conclusive, because the body parsed
+        // fine — but "said nothing" is not "serves nothing", and marking from it would refuse every
+        // capped family on the strength of one empty response.
+        let profile = profile_named_after_the_test("an_empty_model_list_leaves_the_pool_untouched");
+        assert_pool_untouched_both_ways(
+            &profile,
+            ModelListFetch::Body(r#"{"object":"list","data":[]}"#.to_string()),
+        );
+    }
+
+    #[test]
+    fn paths_a_conclusive_body_marks_the_pool() {
+        // The ONE path allowed to touch the pool: a 2xx body that parsed and named at least one id.
+        // `glm-5.3-flash` and `qwen3.8-flash-next` are served, `deepseek-v4.1-flash` is not, so the
+        // pool ends up refusing exactly that one family — no more (that would narrow the arena for
+        // no reason the provider gave) and no less (that would lease seats that can never run).
+        let profile = profile_named_after_the_test("a_conclusive_body_marks_the_pool");
+        let pool = LeasePool::with_default_caps();
+        drive(
+            &profile,
+            &pool,
+            ModelListFetch::Body(
+                r#"{"object":"list","data":[
+                    {"id":"glm-5.3-flash","status":"servable"},
+                    {"id":"qwen3.8-flash-next","status":"servable"}
+                ]}"#
+                .to_string(),
+            ),
+        );
+        assert_eq!(
+            pool.unserved(),
+            ["deepseek-v4.1-flash".to_string()].into_iter().collect(),
+            "exactly the family the provider does not serve is refused"
+        );
+        // And the refusal is real at the point of use, not just a set nobody consults.
+        assert!(
+            matches!(
+                pool.acquire("deepseek-v4.1-flash", 1),
+                Err(SeatError::ProviderWillNotServe { .. })
+            ),
+            "the refused family is refused on provider grounds"
+        );
+    }
+
+    #[test]
+    fn paths_a_fully_served_body_clears_a_previous_refusal() {
+        // The other half of acting on a conclusive answer: `mark_unserved` REPLACES, so a body
+        // naming every capped family clears the refusal the last outage left. Refusing to clear
+        // would make one bad boot permanent — a provider that came back must not still be refused.
+        let profile = profile_named_after_the_test("a_fully_served_body_clears_a_previous_refusal");
+        let pool = LeasePool::with_default_caps();
+        pool.mark_unserved(["deepseek-v4.1-flash".to_string()]);
+        let served = format!(
+            r#"{{"object":"list","data":[{}]}}"#,
+            pool.caps()
+                .families()
+                .map(|family| format!(r#"{{"id":"{family}","status":"servable"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        drive(&profile, &pool, ModelListFetch::Body(served));
+        assert!(pool.unserved().is_empty(), "the refusal was cleared");
+        let lease = pool
+            .acquire("deepseek-v4.1-flash", 1)
+            .expect("the family leases again once the provider serves it");
+        assert_eq!(lease.family(), "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn paths_a_missing_profile_never_calls_fetch() {
+        // No profile means nothing to ask: no endpoint, no provider block, no url. The closure is
+        // never invoked — a fetch here would be a request to a guessed endpoint, which is the very
+        // first failure this module shipped with — and the pool is untouched in both directions.
+        let profile = std::env::temp_dir().join(
+            "provider_preflight_a_missing_profile_never_calls_fetch-does-not-exist.json",
+        );
+        assert!(
+            !profile.exists(),
+            "the test's own path must not exist: {profile:?}"
+        );
+        let pool = LeasePool::with_default_caps();
+        pool.mark_unserved(["deepseek-v4.1-flash".to_string()]);
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        drive_with(
+            profile.to_string_lossy().as_ref(),
+            &pool,
+            |_plan| {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { ModelListFetch::Unreachable }
+            },
+        );
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "with no profile to read there is no request to make"
+        );
+        assert!(
+            pool.unserved()
+                .contains("deepseek-v4.1-flash"),
+            "a missing profile leaves the pool exactly as it was"
+        );
     }
 
     #[test]
