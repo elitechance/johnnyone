@@ -338,6 +338,30 @@ pub fn unserved_from_models_body(caps: &SeatCaps, body: &str) -> Option<Vec<Stri
     Some(families_absent_from_provider(caps, &ids))
 }
 
+/// Why this read is being skipped, as the operator will read it: the fixed sentence plus the cause
+/// the transport gave, for the three outcomes that are a skip. `None` for `Body`, which is not a
+/// skip at all.
+///
+/// The cause is the entire content of the skip line — DNS, a refused connection and a timeout are
+/// three different failures with three different fixes, and collapsing them into one sentence is
+/// what made the line useless. This is the ONE place those sentences are assembled: the skip arms of
+/// [`run_once_with`] log this value rather than building their own text, so the words a test reads
+/// are the words the operator reads.
+pub fn skip_reason(outcome: &ModelListFetch) -> Option<String> {
+    match outcome {
+        ModelListFetch::Unreachable(cause) => {
+            Some(format!("model list unreachable: {cause}"))
+        }
+        ModelListFetch::Unreadable(cause) => {
+            Some(format!("model list body unreadable: {cause}"))
+        }
+        ModelListFetch::NotSuccess(status) => {
+            Some(format!("model list request was not 2xx: {status}"))
+        }
+        ModelListFetch::Body(_) => None,
+    }
+}
+
 /// What the preflight is about to ask, decided before any IO happens.
 ///
 /// The url and the token are decided TOGETHER, out of the SAME provider block of the same profile,
@@ -472,24 +496,16 @@ pub async fn run_once_with<F, Fut>(
     // proven not to have made a request, and `url` below is the same url that was handed over.
     let outcome = fetch(&plan).await;
     let url = &plan.url;
-    let body = match outcome {
-        ModelListFetch::Unreachable(cause) => {
-            tracing::debug!(%url, %cause, "provider preflight skipped: model list unreachable");
+    // A skip logs [`skip_reason`]'s value — the fixed sentence AND the cause — rather than
+    // assembling its own text here, so the words a test reads are the words the operator reads and
+    // an arm cannot silently drop its cause.
+    let body = match &outcome {
+        ModelListFetch::Body(body) => body.clone(),
+        other => {
+            let reason = skip_reason(other).unwrap_or_default();
+            tracing::debug!(%url, %reason, "provider preflight skipped");
             return;
         }
-        ModelListFetch::NotSuccess(status) => {
-            tracing::debug!(
-                %url,
-                %status,
-                "provider preflight skipped: model list request was not 2xx"
-            );
-            return;
-        }
-        ModelListFetch::Unreadable(cause) => {
-            tracing::debug!(%url, %cause, "provider preflight skipped: model list body unreadable");
-            return;
-        }
-        ModelListFetch::Body(body) => body,
     };
     let provider_ids = match provider_ids_from_models_json(&body) {
         Some(ids) => ids,
@@ -885,19 +901,96 @@ mod tests {
     }
 
     #[test]
-    fn cause_a_failed_read_names_its_reason() {
+    fn reason_an_unreachable_read_names_the_transport_error() {
         // The line's whole purpose is naming WHY the read failed — DNS, a refused connection and a
-        // timeout must not collapse into one indistinguishable line. So the variant carries the
-        // transport error's own words, and the closure maps `Err(e)` into exactly this shape.
-        let outcome = ModelListFetch::Unreachable("dns error".to_string());
+        // timeout are three different failures with three different fixes — so the reason the
+        // operator reads carries the transport error's own words, not just a fixed sentence.
+        let reason = skip_reason(&ModelListFetch::Unreachable(
+            "dns error: no record".to_string(),
+        ))
+        .expect("an unreachable read is a skip and has a reason");
         assert!(
-            matches!(&outcome, ModelListFetch::Unreachable(cause) if cause == "dns error"),
-            "the variant holds the cause rather than throwing it away"
+            reason.contains("model list unreachable"),
+            "the reason names the outcome the operator sees: {reason}"
         );
         assert!(
-            format!("{outcome:?}").contains("dns error"),
-            "the debug form of the outcome names the reason: {outcome:?}"
+            reason.contains("dns error: no record"),
+            "the reason carries the cause the transport gave: {reason}"
         );
+    }
+
+    #[test]
+    fn reason_an_unreadable_body_names_its_error() {
+        // Same shape for a 2xx whose body could not be read: the read error's own words belong in
+        // the line, and the sentence is the unreadable one, not the unreachable one.
+        let reason = skip_reason(&ModelListFetch::Unreadable(
+            "body read failed: connection reset".to_string(),
+        ))
+        .expect("an unreadable body is a skip and has a reason");
+        assert!(
+            reason.contains("model list body unreadable"),
+            "the reason names the outcome the operator sees: {reason}"
+        );
+        assert!(
+            reason.contains("body read failed: connection reset"),
+            "the reason carries the cause the read gave: {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_a_non_2xx_names_the_status() {
+        // A server that ANSWERED is not a server that could not be reached: the status is the whole
+        // claim here, and the sentence must not borrow the unreachable one.
+        let reason = skip_reason(&ModelListFetch::NotSuccess(503))
+            .expect("a non-2xx answer is a skip and has a reason");
+        assert!(
+            reason.contains("503"),
+            "the reason names the status the provider gave: {reason}"
+        );
+        assert!(
+            !reason.contains("unreachable"),
+            "a server that answered is not a server that could not be reached: {reason}"
+        );
+    }
+
+    #[test]
+    fn reason_a_body_is_not_a_skip() {
+        // A body — parseable or not — is not a skip: `unserved_from_models_body` decides what it
+        // means, and a function that invented a reason here would be claiming a failure that did
+        // not happen.
+        assert_eq!(
+            skip_reason(&ModelListFetch::Body("{\"object\":\"list\",\"data\":[]}".to_string())),
+            None,
+            "a body is not a skip and so has no skip reason"
+        );
+    }
+
+    #[test]
+    fn reason_every_skip_names_a_cause() {
+        // The one that fails if any arm drops its cause again: each skip outcome is built with a
+        // distinctive string, and that exact string must survive into the reason the arm logs.
+        for (outcome, cause) in [
+            (
+                ModelListFetch::Unreachable("transport said: no route to host".to_string()),
+                "transport said: no route to host",
+            ),
+            (
+                ModelListFetch::Unreadable("read said: unexpected eof".to_string()),
+                "read said: unexpected eof",
+            ),
+            (
+                ModelListFetch::NotSuccess(429),
+                // The status IS the cause for this outcome, so it is the string that must appear.
+                "429",
+            ),
+        ] {
+            let reason = skip_reason(&outcome)
+                .unwrap_or_else(|| panic!("every skip outcome has a reason: {outcome:?}"));
+            assert!(
+                reason.contains(cause),
+                "the reason for {outcome:?} must contain its cause {cause:?}: {reason}"
+            );
+        }
     }
 
     #[test]
