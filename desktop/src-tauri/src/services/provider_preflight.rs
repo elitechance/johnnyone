@@ -374,12 +374,13 @@ pub struct PreflightRequest {
 /// entirely about which of these leave the pool untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelListFetch {
-    /// The request never got an answer (DNS, refused, timeout).
-    Unreachable,
+    /// The request never got an answer (DNS, refused, timeout) — with the transport error's own
+    /// words, because which of those three it was IS the thing this log line exists to say.
+    Unreachable(String),
     /// An answer that was not 2xx; the status is kept for the log line.
     NotSuccess(u16),
-    /// A 2xx whose body could not be read.
-    Unreadable,
+    /// A 2xx whose body could not be read — with the read error's own words, for the same reason.
+    Unreadable(String),
     /// A 2xx body, parseable or not — `unserved_from_models_body` decides.
     Body(String),
 }
@@ -472,8 +473,8 @@ pub async fn run_once_with<F, Fut>(
     let outcome = fetch(&plan).await;
     let url = &plan.url;
     let body = match outcome {
-        ModelListFetch::Unreachable => {
-            tracing::debug!(%url, "provider preflight skipped: model list unreachable");
+        ModelListFetch::Unreachable(cause) => {
+            tracing::debug!(%url, %cause, "provider preflight skipped: model list unreachable");
             return;
         }
         ModelListFetch::NotSuccess(status) => {
@@ -484,8 +485,8 @@ pub async fn run_once_with<F, Fut>(
             );
             return;
         }
-        ModelListFetch::Unreadable => {
-            tracing::debug!(%url, "provider preflight skipped: model list body unreadable");
+        ModelListFetch::Unreadable(cause) => {
+            tracing::debug!(%url, %cause, "provider preflight skipped: model list body unreadable");
             return;
         }
         ModelListFetch::Body(body) => body,
@@ -558,12 +559,12 @@ pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool
         let token = plan.token.clone();
         async move {
             let client = reqwest::Client::new();
-        // Authenticated with the token from THE SAME provider block the url came from — the model
-        // list is not public on the provider the profile names, so an unauthenticated GET is
-        // answered 401 and the check never runs. A profile with no usable key still sends the
-        // request unauthenticated, so a public provider keeps working; a 401 is already handled as
-        // "skip" by the caller, never as an empty fleet. The token itself is never logged and never
-        // part of a message.
+            // Authenticated with the token from THE SAME provider block the url came from — the model
+            // list is not public on the provider the profile names, so an unauthenticated GET is
+            // answered 401 and the check never runs. A profile with no usable key still sends the
+            // request unauthenticated, so a public provider keeps working; a 401 is already handled as
+            // "skip" by the caller, never as an empty fleet. The token itself is never logged and never
+            // part of a message.
             let mut request = client
                 .get(&url)
                 .timeout(std::time::Duration::from_secs(PREFLIGHT_TIMEOUT_SECS));
@@ -572,14 +573,14 @@ pub async fn run_once(profile_path: &str, provider: &str, pool: &SharedLeasePool
             }
             let response = match request.send().await {
                 Ok(response) => response,
-                Err(_) => return ModelListFetch::Unreachable,
+                Err(e) => return ModelListFetch::Unreachable(e.to_string()),
             };
             if !response.status().is_success() {
                 return ModelListFetch::NotSuccess(response.status().as_u16());
             }
             match response.text().await {
                 Ok(body) => ModelListFetch::Body(body),
-                Err(_) => ModelListFetch::Unreadable,
+                Err(e) => return ModelListFetch::Unreadable(e.to_string()),
             }
         }
     })
@@ -736,7 +737,10 @@ mod tests {
         let profile = profile_named_after_the_test(
             "an_unreachable_provider_leaves_the_pool_untouched",
         );
-        assert_pool_untouched_both_ways(&profile, ModelListFetch::Unreachable);
+        assert_pool_untouched_both_ways(
+            &profile,
+            ModelListFetch::Unreachable("dns error".to_string()),
+        );
     }
 
     #[test]
@@ -755,7 +759,10 @@ mod tests {
         // not "it serves nothing", and an empty list handed to `mark_unserved` here would clear a
         // refusal the last conclusive read earned.
         let profile = profile_named_after_the_test("an_unreadable_body_leaves_the_pool_untouched");
-        assert_pool_untouched_both_ways(&profile, ModelListFetch::Unreadable);
+        assert_pool_untouched_both_ways(
+            &profile,
+            ModelListFetch::Unreadable("body stream terminated".to_string()),
+        );
     }
 
     #[test]
@@ -863,7 +870,7 @@ mod tests {
             &pool,
             |_plan| {
                 asked.store(true, std::sync::atomic::Ordering::SeqCst);
-                async move { ModelListFetch::Unreachable }
+                async move { ModelListFetch::Unreachable("dns error".to_string()) }
             },
         );
         assert!(
@@ -874,6 +881,22 @@ mod tests {
             pool.unserved()
                 .contains("deepseek-v4.1-flash"),
             "a missing profile leaves the pool exactly as it was"
+        );
+    }
+
+    #[test]
+    fn cause_a_failed_read_names_its_reason() {
+        // The line's whole purpose is naming WHY the read failed — DNS, a refused connection and a
+        // timeout must not collapse into one indistinguishable line. So the variant carries the
+        // transport error's own words, and the closure maps `Err(e)` into exactly this shape.
+        let outcome = ModelListFetch::Unreachable("dns error".to_string());
+        assert!(
+            matches!(&outcome, ModelListFetch::Unreachable(cause) if cause == "dns error"),
+            "the variant holds the cause rather than throwing it away"
+        );
+        assert!(
+            format!("{outcome:?}").contains("dns error"),
+            "the debug form of the outcome names the reason: {outcome:?}"
         );
     }
 
