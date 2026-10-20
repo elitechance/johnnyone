@@ -84,7 +84,7 @@
 //!    This is not an oversight to fix here: a cross-family primitive needs a wait policy, which
 //!    is item 1, which belongs to the caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -562,6 +562,11 @@ pub enum SeatError {
         free: u32,
         cap: u32,
     },
+    /// The provider that would run this family does not serve it, so its seats could be
+    /// leased and never used. Set by the provider preflight, which only ever reports this
+    /// after a SUCCESSFUL model-list read — never on a network error, a non-2xx or an
+    /// unparseable body, each of which leaves the pool exactly as it was.
+    ProviderWillNotServe { family: String },
 }
 
 impl fmt::Display for SeatError {
@@ -569,7 +574,7 @@ impl fmt::Display for SeatError {
         match self {
             SeatError::UnknownFamily { family } => write!(
                 f,
-                "no measured seat cap for model family {:?}; add it to the seat-cap table before \
+                "no seat cap recorded for model family {:?}; add it to the seat-cap table before \
                  leasing seats on it",
                 family
             ),
@@ -590,6 +595,14 @@ impl fmt::Display for SeatError {
                  partially granted",
                 requested, family, free, cap
             ),
+            SeatError::ProviderWillNotServe { family } => write!(
+                f,
+                "the provider does not serve model family {:?}, so leasing seats on it would \
+                 hold seats that can never run work; either move this family's cap into the \
+                 host seat-cap override so it names a model the provider really has, or the \
+                 provider needs the model before the arena can run on it",
+                family
+            ),
         }
     }
 }
@@ -607,6 +620,10 @@ pub struct LeasePool {
     /// across an `await`, and `Drop` can take it (a `tokio::sync::Mutex` cannot be locked from
     /// `Drop`, which is what makes release-on-panic possible here).
     held: Mutex<BTreeMap<String, u32>>,
+    /// Families the provider will not serve, as last reported by the preflight. A
+    /// `std::sync::Mutex` for the same reason `held` uses one: never held across an
+    /// `await`, and the lock is taken on the acquire path.
+    unserved: Mutex<BTreeSet<String>>,
 }
 
 /// Lock the counts, recovering a poisoned lock rather than panicking — the same choice
@@ -615,6 +632,18 @@ pub struct LeasePool {
 /// of them.
 fn counts(held: &Mutex<BTreeMap<String, u32>>) -> MutexGuard<'_, BTreeMap<String, u32>> {
     match held.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Lock the unserved-family set, recovering a poisoned lock for the same reason [`counts`] does:
+/// a poisoned lock here means some OTHER thread panicked, and the set it leaves behind is still a
+/// set of family names. Panicking on read would turn that one panic into every lease request in
+/// the process — and refusing to lease is the harmlessness that makes it tempting, but it is also
+/// an arena that silently stops running anything on a provider that serves everything.
+fn unserved_set(unserved: &Mutex<BTreeSet<String>>) -> MutexGuard<'_, BTreeSet<String>> {
+    match unserved.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
@@ -631,7 +660,23 @@ impl LeasePool {
         Self {
             caps,
             held: Mutex::new(BTreeMap::new()),
+            // Empty: a pool nobody has told anything about the provider behaves exactly as it
+            // did before this field existed — every family is leasable on provider grounds.
+            unserved: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Record the families the provider will not serve. REPLACES the previous set rather
+    /// than adding to it: the preflight reads the whole model list every time, so a family
+    /// that is served again must stop being refused. An empty list therefore clears it.
+    pub fn mark_unserved<I: IntoIterator<Item = String>>(&self, families: I) {
+        let mut unserved = unserved_set(&self.unserved);
+        *unserved = families.into_iter().collect();
+    }
+
+    /// The families currently refused on provider grounds.
+    pub fn unserved(&self) -> BTreeSet<String> {
+        unserved_set(&self.unserved).clone()
     }
 
     /// Take `seats` on `family`, all or nothing.
@@ -640,7 +685,17 @@ impl LeasePool {
     /// observe the same free seats and both take them. On refusal the counts are not touched:
     /// there is no partial acquire, because a run at a reduced width is not running the same
     /// experiment and its result is not comparable to the other side's.
+    /// The provider check runs FIRST, before the cap lookup: a family the provider will not
+    /// serve is refused whether or not it has a cap, and "the provider refuses this model" is
+    /// the more useful of the two messages — `UnknownFamily` would send the operator to the
+    /// seat-cap table for a family that no amount of capping can make runnable. The two locks
+    /// are taken in sequence, never nested, so the lock discipline is unchanged.
     pub fn acquire(self: &Arc<Self>, family: &str, seats: u32) -> Result<SeatLease, SeatError> {
+        if unserved_set(&self.unserved).contains(family) {
+            return Err(SeatError::ProviderWillNotServe {
+                family: family.to_string(),
+            });
+        }
         let cap = self.caps.cap(family).ok_or_else(|| SeatError::UnknownFamily {
             family: family.to_string(),
         })?;
@@ -983,7 +1038,7 @@ mod tests {
                 family: "some-model-nobody-measured".to_string()
             }
         );
-        assert!(err.to_string().contains("no measured seat cap"), "{err}");
+        assert!(err.to_string().contains("no seat cap recorded"), "{err}");
         assert_eq!(pool.cap_for("some-model-nobody-measured"), None);
         assert_eq!(pool.free_for("some-model-nobody-measured"), None);
         // Zero seats is a caller bug, and is refused before anything is counted.
@@ -992,6 +1047,111 @@ mod tests {
             Err(SeatError::ZeroSeats { .. })
         ));
         assert_eq!(pool.busy_for("glm-5.3-flash"), 0);
+    }
+
+    /// The refusal this field exists to make: a cap for a family the provider will not serve is
+    /// a pool whose seats can be leased and never used — `deepseek-v4.1-flash` has a cap of 2
+    /// today and the provider answers HTTP 400 `model_not_found` for it.
+    #[test]
+    fn unserved_a_marked_family_is_refused_with_the_provider_reason() {
+        let pool = LeasePool::with_default_caps();
+        pool.mark_unserved(["deepseek-v4.1-flash".to_string()]);
+        assert_eq!(
+            pool.unserved(),
+            BTreeSet::from(["deepseek-v4.1-flash".to_string()])
+        );
+
+        let err = pool
+            .acquire("deepseek-v4.1-flash", 1)
+            .expect_err("an unserved family must not lease");
+        assert_eq!(
+            err,
+            SeatError::ProviderWillNotServe {
+                family: "deepseek-v4.1-flash".to_string()
+            }
+        );
+        // The message reaches the console, so it names the family and says what to do.
+        let shown = err.to_string();
+        assert!(shown.contains("deepseek-v4.1-flash"), "{shown}");
+        assert!(shown.contains("does not serve"), "{shown}");
+        // Refused before anything was counted.
+        assert_eq!(pool.busy_for("deepseek-v4.1-flash"), 0);
+    }
+
+    /// The non-regression case, and the one that matters most: a pool nobody has told anything
+    /// about the provider leases exactly as it did before this field existed.
+    #[test]
+    fn unserved_an_unmarked_pool_leases_exactly_as_before() {
+        let pool = LeasePool::with_default_caps();
+        assert!(pool.unserved().is_empty());
+        let lease = pool.acquire("glm-5.3-flash", 2).expect("an unmarked pool grants");
+        assert_eq!(lease.seats_held_json(), r#"{"glm-5.3-flash":2}"#);
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 2);
+        assert_eq!(pool.free_for("glm-5.3-flash"), Some(2));
+        drop(lease);
+        assert_eq!(pool.busy_for("glm-5.3-flash"), 0);
+        // An uncapped family still fails for the cap reason, not the provider one.
+        assert!(matches!(
+            pool.acquire("some-model-nobody-measured", 1),
+            Err(SeatError::UnknownFamily { .. })
+        ));
+    }
+
+    /// The preflight re-reads the WHOLE model list every time, so marking replaces: a family
+    /// that is served again must stop being refused, and accumulating would refuse it forever.
+    #[test]
+    fn unserved_marking_replaces_rather_than_accumulates() {
+        let pool = LeasePool::with_default_caps();
+        pool.mark_unserved(["glm-5.3-flash".to_string()]);
+        assert!(matches!(
+            pool.acquire("glm-5.3-flash", 1),
+            Err(SeatError::ProviderWillNotServe { .. })
+        ));
+
+        pool.mark_unserved(["deepseek-v4.1-flash".to_string()]);
+        assert_eq!(
+            pool.unserved(),
+            BTreeSet::from(["deepseek-v4.1-flash".to_string()])
+        );
+        // The previously-marked family leases again...
+        let _back = pool
+            .acquire("glm-5.3-flash", 1)
+            .expect("a family served again must stop being refused");
+        // ...and the newly-marked one is refused.
+        assert!(matches!(
+            pool.acquire("deepseek-v4.1-flash", 1),
+            Err(SeatError::ProviderWillNotServe { .. })
+        ));
+    }
+
+    /// A marked family with NO cap gets the provider reason, not `UnknownFamily`: the provider
+    /// check runs before the cap lookup, and "add it to the cap table" would send the operator
+    /// to fix a family that no cap can make runnable.
+    #[test]
+    fn unserved_the_provider_reason_beats_the_cap_reason() {
+        let pool = LeasePool::with_default_caps();
+        assert!(pool.cap_for("some-model-nobody-measured").is_none());
+        pool.mark_unserved(["some-model-nobody-measured".to_string()]);
+        assert_eq!(
+            pool.acquire("some-model-nobody-measured", 1).unwrap_err(),
+            SeatError::ProviderWillNotServe {
+                family: "some-model-nobody-measured".to_string()
+            }
+        );
+    }
+
+    /// An empty list clears the set — the preflight reading a model list that serves everything
+    /// must un-refuse every family it previously refused.
+    #[test]
+    fn unserved_marking_an_empty_list_clears_the_set() {
+        let pool = LeasePool::with_default_caps();
+        pool.mark_unserved(["glm-5.3-flash".to_string(), "qwen3.8-flash-next".to_string()]);
+        assert_eq!(pool.unserved().len(), 2);
+        pool.mark_unserved(std::iter::empty());
+        assert!(pool.unserved().is_empty());
+        let _lease = pool
+            .acquire("qwen3.8-flash-next", 1)
+            .expect("clearing the set un-refuses the family");
     }
 
     /// A lease released only on the happy path is a leaked seat on every panic, and a leaked seat
