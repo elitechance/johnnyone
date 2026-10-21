@@ -375,7 +375,8 @@ pub fn alias_targets_from_profile(profile_json: &str, provider: &str) -> Vec<(St
         .collect::<Vec<_>>();
     // Sorted by ALIAS — the operator's own name — so the report is the same line every boot rather
     // than whatever order the map's keys happened to come out in (serde_json without
-    // `preserve_order` builds that map on a `HashMap`, so an unsorted walk gives a different warning
+    // `preserve_order` builds that map on a `BTreeMap`, which is already ordered — by the keys'
+    // bytes, not by anything the operator chose — so an unsorted walk gives a different warning
     // line on each boot for the same profile). BYTE ORDER BY ALIAS is the only stable order
     // available once the map is parsed: the order the operator typed the keys in is not recoverable
     // from a parsed `Map` at all, so no ordering could claim to reproduce it. That is exactly why

@@ -8124,7 +8124,7 @@ pub(crate) async fn handle_reviewer_output(
             // Both modes route through send_reviewer_feedback_to_worker: for a claude
             // worker it injects the feedback into the live session; for kloo/local-small
             // it bridges the reviewer's insights into a guided replan (I19) so the amend
-            // planner turns them into corrective glimmer tasks. (kloo mode used to park
+            // planner turns them into corrective qwen3.8-flash-next tasks. (kloo mode used to park
             // here, before the bridge existed.)
             send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
@@ -8220,12 +8220,12 @@ pub(crate) async fn send_reviewer_feedback_to_worker(
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
-    // KLOO / local-small (glimmer): there is no persistent worker session to inject
-    // reviewer feedback into (glimmer runs as per-task kloo subprocesses with fixed,
+    // KLOO / local-small (qwen3.8-flash-next): there is no persistent worker session to inject
+    // reviewer feedback into (qwen3.8-flash-next runs as per-task kloo subprocesses with fixed,
     // self-contained task.yml prompts). BRIDGE the reviewer's insights into a REPLAN:
     // write them as the queued guidance the amend planner (claude_code) consumes, then
     // start the replan. The amend planner rewrites the affected task prompts to address
-    // the reviewer's findings, and glimmer re-runs the updated tasks. Everything stays on
+    // the reviewer's findings, and qwen3.8-flash-next re-runs the updated tasks. Everything stays on
     // the CLI (claude_code), the full API verdict is preserved, and OpenRouter is never used.
     if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
         let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
