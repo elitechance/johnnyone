@@ -96,9 +96,33 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// the provider's `/v1/models` carries no seat count in any field — it reports
 /// `status`, `admissible`, `resident`, `configured` and the context lengths, and nothing
 /// at all about concurrency — and `deepseek-v4.1-flash`, which this table gives 2 seats,
-/// answers HTTP 400 `model_not_found`, so there was never a fleet to measure that row
-/// against. A self-imposed ceiling is a perfectly good thing for this table to be; what
-/// it must not do is borrow authority from a measurement that never happened.
+/// answered HTTP 400 `model_not_found` when measured 2026-10-19, so there was never a fleet to
+/// measure that row against. A self-imposed ceiling is a perfectly good thing for this table to
+/// be; what it must not do is borrow authority from a measurement that never happened.
+///
+/// **Re-measured 2026-10-21, and the fact is stronger than the 400.** `GET /v1/models` on the same
+/// provider now lists exactly FOUR ids — `boxb-qwen`, `glm-5.3-flash`, `qwen3.8-flash-next`,
+/// `qwen3.8-flash-next-132k-fast` — and `deepseek-v4.1-flash` is not among them. It listed nine ids
+/// a week ago. So that family is not merely unanswerable when called: it is ABSENT FROM THE FLEET
+/// LISTING, which is the very listing the provider preflight reads at startup
+/// ([`families_absent_from_provider`], via the preflight module). Absence from the listing is the
+/// load-bearing fact; the 400 was only its symptom.
+///
+/// **Two consequences of that listing, both deliberate.**
+///
+/// (a) **The `("deepseek-v4.1-flash", 2)` row STAYS.** The preflight marks the family unserved at
+///     boot, so [`LeasePool::acquire`] refuses those seats without this table changing; and if the
+///     provider ever serves it again, there is no code change to make — the row is already correct.
+///     A family absent from this table cannot be leased AT ALL, which is a different and worse
+///     answer than a family the preflight refuses today: the first is a permanent hole that needs an
+///     edit to close, the second is a refusal that closes itself the moment the fleet returns.
+///
+/// (b) **Two of the four served ids have no row here** — `boxb-qwen` and `qwen3.8-flash-next-132k-fast`
+///     are served but UNCAPPED, and an uncapped family is refused rather than guessed at. That is the
+///     designed answer, and it means those two are invisible to anything that leases seats until
+///     somebody decides their numbers. This is a decision on record, not an omission: adding a row
+///     requires picking a cap, and a cap picked from nothing is the thing this comment exists to
+///     forbid.
 ///
 /// Data, not logic: the numbers live in this one table, nothing branches on a family name, and
 /// a deployment with a different fleet overrides them via [`SeatCaps::from_json`] rather than by
