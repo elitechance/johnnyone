@@ -378,7 +378,11 @@ pub fn alias_targets_from_profile(profile_json: &str, provider: &str) -> Vec<(St
     // WITHOUT `preserve_order` it is a `BTreeMap`, whose walk is already in alias byte order, so today
     // this sort is a no-op; WITH `preserve_order` it becomes an insertion-ordered `IndexMap`, and an
     // unsorted walk would then return the aliases in whatever order the profile file happens to spell
-    // them, changing the shape of the warning line with no code change. A Cargo feature can be switched
+    // them — which changes the shape of the warning line with no code change only WHEN that spelling
+    // order is not already byte order. A profile whose operator happened to type the aliases in byte
+    // order would emit a byte-identical line either way, so the exposure is a property of the profile
+    // file, not of every profile file; it is exactly the profiles that spell their aliases any other
+    // way that would start warning in a different order the moment the feature is unified on. A Cargo feature can be switched
     // on by ANY crate in the dependency tree through feature unification without touching this crate's
     // own Cargo.toml, so the explicit sort is what makes the order a property of THIS function rather
     // than a property of a dependency's feature flags. BYTE ORDER BY ALIAS is the only stable order
