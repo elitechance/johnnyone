@@ -374,10 +374,14 @@ pub fn alias_targets_from_profile(profile_json: &str, provider: &str) -> Vec<(St
         })
         .collect::<Vec<_>>();
     // Sorted by ALIAS — the operator's own name — so the report is the same line every boot rather
-    // than whatever order the map's keys happened to come out in (serde_json without
-    // `preserve_order` builds that map on a `BTreeMap`, which is already ordered — by the keys'
-    // bytes, not by anything the operator chose — so an unsorted walk gives a different warning
-    // line on each boot for the same profile). BYTE ORDER BY ALIAS is the only stable order
+    // than whatever order the map's keys happened to come out in. serde_json's `Map` is feature-gated:
+    // WITHOUT `preserve_order` it is a `BTreeMap`, whose walk is already in alias byte order, so today
+    // this sort is a no-op; WITH `preserve_order` it becomes an insertion-ordered `IndexMap`, and an
+    // unsorted walk would then return the aliases in whatever order the profile file happens to spell
+    // them, changing the shape of the warning line with no code change. A Cargo feature can be switched
+    // on by ANY crate in the dependency tree through feature unification without touching this crate's
+    // own Cargo.toml, so the explicit sort is what makes the order a property of THIS function rather
+    // than a property of a dependency's feature flags. BYTE ORDER BY ALIAS is the only stable order
     // available once the map is parsed: the order the operator typed the keys in is not recoverable
     // from a parsed `Map` at all, so no ordering could claim to reproduce it. That is exactly why
     // `glimmer` precedes `glm` here — "i" < "m" — and not because the profile lists glimmer first.
@@ -1820,13 +1824,16 @@ mod tests {
             "the report says what is wrong: {report}"
         );
         // The two aliases that DO resolve to served models are not mentioned — naming them would
-        // send the operator hunting for a problem that is not there.
+        // send the operator hunting for a problem that is not there. Assert the absence of the ALIAS
+        // in the phrase the report formats it in (`alias "X" points at "Y"`), NOT of the bare word
+        // `next`: the report's wording may legitimately contain "next" one day ("next boot", "the
+        // next alias") and a substring match on the word would fail on correct code.
         assert!(
-            !report.contains("next"),
+            !report.contains(&format!("alias \"{}\" points at", "next")),
             "a served alias must not appear in the line: {report}"
         );
         assert!(
-            !report.contains("glm-5.3-flash"),
+            !report.contains(&format!("alias \"{}\" points at", "glm")),
             "a served alias must not appear in the line: {report}"
         );
         // Exact matching, never prefix, exactly like the family check: `muse-glimmer-30b-fast` is
