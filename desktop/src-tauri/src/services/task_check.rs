@@ -372,7 +372,7 @@ impl Ladder {
         let mut ladder = Ladder::default();
         if let Some(m) = base_model.map(str::trim).filter(|s| !s.is_empty()) {
             let label = m.rsplit('/').next().unwrap_or(m).to_string();
-            // Local-small runs are GLIMMER-ONLY: no commercial escalation tiers.
+            // A local-small ladder is SINGLE-TIER: no commercial escalation tiers.
             // The default ladder's escalation models (anthropic/claude-*) resolve
             // through OpenRouter (kloo_cli DEFAULT_PROVIDER), which this deployment
             // does not use. Replace the whole ladder with the single base tier and
@@ -447,28 +447,37 @@ mod tests {
     use crate::providers::kloo_cli::{FilesChanged, HookResult, VerifyResult};
 
     #[test]
-    fn for_executor_is_glimmer_only_no_openrouter_escalation() {
+    fn for_executor_local_small_ladder_is_single_tier() {
         // base tier = configured model, label derived from the id after the last '/'
-        let l = Ladder::for_executor(Some("muse-glimmer-30b"));
+        let l = Ladder::for_executor(Some("qwen3.8-flash-next"));
         match l.next_attempt(&[], None) {
             Step::Run { model, label, .. } => {
-                assert_eq!(model, "muse-glimmer-30b");
-                assert_eq!(label, "muse-glimmer-30b");
+                assert_eq!(model, "qwen3.8-flash-next");
+                assert_eq!(label, "qwen3.8-flash-next");
             }
             s => panic!("{s:?}"),
         }
-        let g = || Attempt { label: "muse-glimmer-30b".into(), model: "muse-glimmer-30b".into(), class: Some(FailureClass::Model), infra_retry: false };
-        // after 2 MODEL failures there is still a 3rd glimmer attempt (max_model_attempts=3)
+        let g = || Attempt {
+            label: "qwen3.8-flash-next".into(),
+            model: "qwen3.8-flash-next".into(),
+            class: Some(FailureClass::Model),
+            infra_retry: false,
+        };
+        // after 2 MODEL failures there is still a 3rd attempt on the same local model (max_model_attempts=3)
         match l.next_attempt(&[g(), g()], Some(FailureClass::Model)) {
-            Step::Run { model, .. } => assert_eq!(model, "muse-glimmer-30b"),
+            Step::Run { model, .. } => assert_eq!(model, "qwen3.8-flash-next"),
             s => panic!("{s:?}"),
         }
         // after 3 MODEL failures the ladder is EXHAUSTED — NO commercial/OpenRouter tier;
         // the coordinator's route:planner path hands off to the replan planner instead.
         match l.next_attempt(&[g(), g(), g()], Some(FailureClass::Model)) {
             Step::Exhausted => {}
-            s => panic!("expected Exhausted (glimmer-only), got {s:?}"),
+            s => panic!("expected Exhausted (single-tier qwen3.8-flash-next), got {s:?}"),
         }
+        // the single tier really is the ONLY slot: no second label to escalate to.
+        assert_eq!(l.slots.len(), 1);
+        assert_eq!(l.slots[0].model, "qwen3.8-flash-next");
+        assert_eq!(l.slots[0].label, "qwen3.8-flash-next");
         // None base ⇒ default ladder (unchanged commercial behaviour)
         match Ladder::for_executor(None).next_attempt(&[], None) {
             Step::Run { model, .. } => assert_eq!(model, "qwen/qwen3-coder"),
