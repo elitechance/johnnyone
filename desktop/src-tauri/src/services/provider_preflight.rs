@@ -316,6 +316,122 @@ pub fn mismatch_report(caps: &SeatCaps, provider_ids: &[String]) -> Option<Strin
     }
 }
 
+/// Each alias in the profile's `models` block paired with the model id it
+/// resolves to. A STRING value is the target (`"next": "qwen3.8-flash-next"`);
+/// an OBJECT value is per-model config, not a redirect, so the alias key is
+/// itself the model id (`"next": {"contextLength": 262144}`). Any other value
+/// type is skipped rather than guessed at.
+///
+/// Read from the SAME named provider block the endpoint and the key come from, so an alias is
+/// judged against the fleet it will actually be sent to. Sorted by BYTE ORDER OF THE ALIAS.
+///
+/// Byte order by alias is the ONLY stable order available once the profile is parsed: `serde_json`'s
+/// default `Map` is a `BTreeMap`, so the order the operator typed the keys in is not recoverable
+/// from the parsed map at all, and no ordering could claim to reproduce it. That is exactly why
+/// `glimmer` precedes `glm` here — "i" (0x69) < "m" (0x6d).
+///
+/// Comparing the ALIAS ALONE rather than the whole pair still matters for that reason: the pair's
+/// second element is a MODEL ID the operator never typed, so letting it participate in the order
+/// would sort the operator's own names by a string of theirs that does not exist — repointing one
+/// alias's target would move that alias relative to the others, changing the order of the operator's
+/// names with no edit to any name of theirs. An alias is a JSON object key and therefore UNIQUE, so
+/// the alias-only comparison is a total order on everything this reader can produce.
+///
+/// An empty vec for an unparseable profile, a provider the profile has no block for, or a block
+/// with no `models` — never a panic, and never a guess. Those three are "the profile made no alias
+/// claim", which is the same silence as a provider that reports no readiness fields: absence is not
+/// a claim about a model, so it must not become a warning about one.
+pub fn alias_targets_from_profile(profile_json: &str, provider: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(profile_json) else {
+        return Vec::new();
+    };
+    let Some(models) = value
+        .get("providers")
+        .and_then(|providers| providers.get(provider))
+        .and_then(|block| block.get("models"))
+        .and_then(|models| models.as_object())
+    else {
+        return Vec::new();
+    };
+    let mut pairs = models
+        .iter()
+        .filter_map(|(alias, target)| {
+            let target = match target {
+                // A string value IS the redirect: the alias names the model the provider is asked
+                // for, and that id is what has to exist in the fleet.
+                serde_json::Value::String(target) => target.as_str(),
+                // An object value is per-model CONFIG (`{"contextLength": 262144}`), not a
+                // redirect — kloo resolves such an alias to a model of the same name, so the KEY
+                // is the model id. Reading the object as "no target" would leave the most common
+                // profile shape unchecked, which is the hole this function exists to close.
+                serde_json::Value::Object(_) => alias.as_str(),
+                // A number, array, bool or null is not a shape this module claims to understand,
+                // so it is skipped rather than guessed at.
+                _ => return None,
+            };
+            let target = target.trim();
+            (!target.is_empty()).then(|| (alias.clone(), target.to_string()))
+        })
+        .collect::<Vec<_>>();
+    // Sorted by ALIAS — the operator's own name — so the report is the same line every boot rather
+    // than whatever order the map's keys happened to come out in (serde_json without
+    // `preserve_order` builds that map on a `HashMap`, so an unsorted walk gives a different warning
+    // line on each boot for the same profile). BYTE ORDER BY ALIAS is the only stable order
+    // available once the map is parsed: the order the operator typed the keys in is not recoverable
+    // from a parsed `Map` at all, so no ordering could claim to reproduce it. That is exactly why
+    // `glimmer` precedes `glm` here — "i" < "m" — and not because the profile lists glimmer first.
+    // `sort_by` on the alias ALONE, NOT a plain `sort` on the pair, still matters for that reason:
+    // the pair's second element is a MODEL ID the operator never typed, so letting it participate in
+    // the order would sort the operator's own names by a string of theirs that does not exist —
+    // repointing the target under one alias would move that alias relative to the others, changing
+    // the order of the operator's names with no edit to any name of theirs. An alias is a JSON object
+    // key and therefore UNIQUE, so the alias-only comparison is a total order on everything this
+    // reader can produce, and `sort_by` (stable) still gives byte-identical output across boots.
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    pairs
+}
+
+/// The aliases whose target the provider does not serve, as ONE line for the log, or `None` when
+/// every alias resolves to something served. `None` also for an empty provider list, exactly as
+/// [`families_absent_from_provider`] does: an unreadable fleet is unknown, not empty.
+///
+/// The line names BOTH the alias and its target, because the fix differs depending on which of the
+/// two is wrong: the alias is the user's own name for a model, while the target is what the
+/// provider was actually asked for. `"glimmer"` alone would send the operator to the provider's
+/// console; `"muse-glimmer-30b"` alone would send them to their own profile. Several mismatches are
+/// joined with `; ` into one line, so one boot produces one warning to read rather than one per
+/// alias.
+///
+/// **This must NOT be wired to the lease pool.** An alias is not a capped family: there is no seat
+/// count to refuse, and `acquire` is never asked for an alias — it is called with a family from the
+/// caps table. So unlike [`mismatch_report`], whose conclusive answer feeds
+/// [`LeasePool::mark_unserved`], this comparison is LOG-ONLY and there is nothing for
+/// `mark_unserved` to do with its result. Do not add it to `unserved_from_models_body`, and do not
+/// feed it to `mark_unserved`: refusing an alias would be refusing a name the pool has never heard,
+/// which either no-ops or — worse, if a family ever shares a spelling with an alias — narrows the
+/// arena on the strength of a profile typo.
+///
+/// [`LeasePool::mark_unserved`]: leases::LeasePool::mark_unserved
+pub fn alias_mismatch_report(
+    aliases: &[(String, String)],
+    provider_ids: &[String],
+) -> Option<String> {
+    // An empty fleet is "we could not read the provider", not "the provider serves nothing" — the
+    // leases module's rule, inherited rather than restated. Reporting here would turn one bad HTTP
+    // response into an alarm about every alias in the profile.
+    if provider_ids.is_empty() {
+        return None;
+    }
+    let problems = aliases
+        .iter()
+        .filter(|(_, target)| !provider_ids.iter().any(|id| id == target))
+        .map(|(alias, target)| {
+            format!("alias \"{alias}\" points at \"{target}\", which this provider does not serve")
+        })
+        .collect::<Vec<_>>();
+    (!problems.is_empty()).then(|| problems.join("; "))
+}
+
 /// The families to refuse, decided from one model-list body. `None` means
 /// INCONCLUSIVE (unparseable body, or a parseable body that named no ids) and
 /// the caller must leave the pool untouched. `Some(list)` is conclusive, and an
@@ -535,6 +651,17 @@ pub async fn run_once_with<F, Fut>(
     // property here: a provider hiccup at boot must not refuse the whole fleet. `mark_unserved`
     // REPLACES the set, so a body naming every family clears a previous refusal — a provider that
     // came back is not still being refused for the last one's outage.
+    // The aliases are checked against the SAME `provider_ids` already in hand — no second request,
+    // and no second parse of a body that has already given up its ids. Deliberately placed BEFORE
+    // the `mark_unserved` call and never feeding it: an alias is not a capped family, so there is
+    // no seat count to refuse and `acquire` is never asked for an alias. This comparison ends at
+    // the log.
+    if let Some(report) = alias_mismatch_report(
+        &alias_targets_from_profile(&profile_json, provider),
+        &provider_ids,
+    ) {
+        tracing::warn!(%url, %report, "provider/alias mismatch");
+    }
     if let Some(families) = unserved_from_models_body(pool.caps(), &body) {
         pool.mark_unserved(families);
     }
@@ -1571,6 +1698,208 @@ mod tests {
             .acquire("deepseek-v4.1-flash", 1)
             .expect("the family leases again once the provider serves it");
         assert_eq!(lease.family(), "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn alias_a_string_value_is_the_target() {
+        // The redirect shape: `"next": "qwen3.8-flash-next"` says WHICH model the provider is
+        // asked for, so the string is the target that has to exist in the fleet.
+        assert_eq!(
+            alias_targets_from_profile(
+                r#"{"providers":{"lokalai":{"models":{"next":"qwen3.8-flash-next"}}}}"#,
+                "lokalai"
+            ),
+            vec![("next".to_string(), "qwen3.8-flash-next".to_string())]
+        );
+    }
+
+    #[test]
+    fn alias_an_object_value_means_the_key_is_the_model() {
+        // The per-model-config shape: `"next": {"contextLength": 262144}` makes no redirect, so
+        // the alias KEY is itself the model id. Reading an object as "no target here" would leave
+        // the shape this repo's own PROFILE constant uses — and the shape most profiles use —
+        // completely unchecked.
+        assert_eq!(
+            alias_targets_from_profile(
+                r#"{"providers":{"lokalai":{"models":{"next":{"contextLength":262144}}}}}"#,
+                "lokalai"
+            ),
+            vec![("next".to_string(), "next".to_string())]
+        );
+        // …and the same for the real PROFILE constant in this module.
+        assert_eq!(
+            alias_targets_from_profile(PROFILE, "lokalai"),
+            vec![("next".to_string(), "next".to_string())]
+        );
+    }
+
+    #[test]
+    fn alias_a_broken_profile_yields_nothing() {
+        // All three silences answer with an empty vec rather than panicking or guessing: an
+        // unparseable profile, a provider the profile has no block for (lokalai's aliases must not
+        // be judged against openrouter's fleet, nor leak into a claim about it), and a block with
+        // no `models` at all.
+        assert_eq!(alias_targets_from_profile("not json at all", "lokalai"), Vec::new());
+        assert_eq!(alias_targets_from_profile("", "lokalai"), Vec::new());
+        assert_eq!(alias_targets_from_profile("{}", "lokalai"), Vec::new());
+        assert_eq!(alias_targets_from_profile(PROFILE, "openrouter"), Vec::new());
+        assert_eq!(
+            alias_targets_from_profile(
+                r#"{"providers":{"lokalai":{"endpoint":"https://lokalai.silverjrom.app/v1"}}}"#,
+                "lokalai"
+            ),
+            Vec::new()
+        );
+        // A `models` block that is not an object is the same silence, and a value type this module
+        // does not understand is skipped rather than guessed at — the alias key is NOT silently
+        // treated as a model id for a number/array/bool/null, because those are not the two shapes
+        // kloo defines.
+        assert_eq!(
+            alias_targets_from_profile(r#"{"providers":{"lokalai":{"models":[1,2]}}}"#, "lokalai"),
+            Vec::new()
+        );
+        assert_eq!(
+            alias_targets_from_profile(
+                r#"{"providers":{"lokalai":{"models":{"next":42,"glimmer":["a"],"glm":null,"k":true}}}}"#,
+                "lokalai"
+            ),
+            Vec::new()
+        );
+        // Sorted by BYTE ORDER OF THE ALIAS — the only stable order available once the profile has
+        // been parsed. The profile spells its keys next, glimmer, glm, but that order is gone the
+        // moment the JSON becomes a `Map` (serde_json's default `Map` is a `BTreeMap`), so no
+        // ordering at any cost could claim to reproduce the order the operator typed the keys in.
+        // Hence `glimmer` BEFORE `glm` — "i" (0x69) < "m" (0x6d) — regardless of how the profile
+        // spells its aliases, and the pair's model-id half never participates in that decision
+        // because it is an id the operator never typed.
+        assert_eq!(
+            alias_targets_from_profile(
+                r#"{"providers":{"lokalai":{"models":{
+                    "next":"qwen3.8-flash-next",
+                    "glimmer":"muse-glimmer-30b",
+                    "glm":"glm-5.3-flash"
+                }}}}"#,
+                "lokalai"
+            ),
+            vec![
+                ("glimmer".to_string(), "muse-glimmer-30b".to_string()),
+                ("glm".to_string(), "glm-5.3-flash".to_string()),
+                ("next".to_string(), "qwen3.8-flash-next".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn alias_an_unserved_target_is_named_with_its_alias() {
+        // The real profile at `~/etc/kloo.json` against the real fleet measured today:
+        // `muse-glimmer-30b` is NOT among the servable ids, and NOTHING noticed, because the
+        // seat-cap check has no cap for `glimmer` to compare. The line has to name both the alias
+        // (the user's own name, fixed in the profile) and the target (what the provider was asked
+        // for, fixed at the provider), because the fix differs per side.
+        let aliases = alias_targets_from_profile(
+            r#"{"providers":{"lokalai":{"models":{
+                "next":"qwen3.8-flash-next",
+                "glimmer":"muse-glimmer-30b",
+                "glm":"glm-5.3-flash"
+            }}}}"#,
+            "lokalai",
+        );
+        let provider = vec!["glm-5.3-flash".to_string(), "qwen3.8-flash-next".to_string()];
+        let report = alias_mismatch_report(&aliases, &provider).expect("glimmer is not served");
+        assert!(
+            report.contains("glimmer"),
+            "the report names the alias the run would ask for: {report}"
+        );
+        assert!(
+            report.contains("muse-glimmer-30b"),
+            "the report names the target the provider was asked for: {report}"
+        );
+        assert!(
+            report.contains("does not serve"),
+            "the report says what is wrong: {report}"
+        );
+        // The two aliases that DO resolve to served models are not mentioned — naming them would
+        // send the operator hunting for a problem that is not there.
+        assert!(
+            !report.contains("next"),
+            "a served alias must not appear in the line: {report}"
+        );
+        assert!(
+            !report.contains("glm-5.3-flash"),
+            "a served alias must not appear in the line: {report}"
+        );
+        // Exact matching, never prefix, exactly like the family check: `muse-glimmer-30b-fast` is
+        // not `muse-glimmer-30b`.
+        let near_miss = vec![
+            "glm-5.3-flash".to_string(),
+            "qwen3.8-flash-next".to_string(),
+            "muse-glimmer-30b-fast".to_string(),
+        ];
+        let report = alias_mismatch_report(&aliases, &near_miss).expect("a variant is not the model");
+        assert!(report.contains("glimmer"), "{report}");
+        // The mirror-image fleet: `muse-glimmer-30b` is back and `qwen3.8-flash-next` is the id that
+        // vanished instead. To report `next` the served list must OMIT `qwen3.8-flash-next` while
+        // INCLUDING `muse-glimmer-30b` — with all three ids served every alias resolves, the answer
+        // is correctly `None`, and a list naming all three could never produce this line.
+        let glimmer_back = vec![
+            "glm-5.3-flash".to_string(),
+            "muse-glimmer-30b".to_string(),
+        ];
+        let report = alias_mismatch_report(&aliases, &glimmer_back)
+            .expect("qwen3.8-flash-next is the id that vanished this time");
+        assert!(
+            report.contains("next"),
+            "the line names the alias the run would ask for: {report}"
+        );
+        assert!(
+            report.contains("qwen3.8-flash-next"),
+            "and the target the provider was asked for: {report}"
+        );
+        assert!(
+            !report.contains("glimmer"),
+            "the alias now served is not mentioned: {report}"
+        );
+        let two_problems = alias_mismatch_report(
+            &aliases,
+            &["glm-5.3-flash".to_string()],
+        )
+        .expect("two aliases are unserved");
+        assert!(
+            two_problems.contains("; "),
+            "several mismatches are one line joined with `; `: {two_problems}"
+        );
+        assert!(two_problems.contains("glimmer"), "{two_problems}");
+        assert!(two_problems.contains("next"), "{two_problems}");
+    }
+
+    #[test]
+    fn alias_every_alias_served_reports_nothing() {
+        // Every alias resolves to an id the provider serves — including the object-value shape,
+        // where the alias key names the model. Silence here is the point: a profile that agrees
+        // with the fleet must not produce a warning on every boot.
+        let aliases = vec![
+            ("glm".to_string(), "glm-5.3-flash".to_string()),
+            ("glimmer".to_string(), "muse-glimmer-30b".to_string()),
+            ("next".to_string(), "qwen3.8-flash-next".to_string()),
+        ];
+        let provider = vec![
+            "glm-5.3-flash".to_string(),
+            "muse-glimmer-30b".to_string(),
+            "qwen3.8-flash-next".to_string(),
+        ];
+        assert_eq!(alias_mismatch_report(&aliases, &provider), None);
+        // An empty alias list is the same silence: no claim, nothing to say.
+        assert_eq!(alias_mismatch_report(&[], &provider), None);
+    }
+
+    #[test]
+    fn alias_an_empty_provider_list_reports_nothing() {
+        // An EMPTY provider list means "we could not read the fleet", not "the fleet is empty" —
+        // unknown is not empty. Reporting against it would turn one bad HTTP response, or one
+        // laptop that booted offline, into an alarm about every alias in the profile. This is the
+        // leases module's rule for the seat-cap comparison, inherited here rather than restated.
+        let aliases = vec![("glimmer".to_string(), "muse-glimmer-30b".to_string())];
+        assert_eq!(alias_mismatch_report(&aliases, &[]), None);
     }
 
     #[test]
