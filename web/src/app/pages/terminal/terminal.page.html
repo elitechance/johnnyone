@@ -34,7 +34,24 @@
           </div>
         </div>
       } @empty {
-        <div class="pane-empty">No initiatives yet.</div>
+        <!-- The list's own empty block used to be the ONLY thing this could say, so it said it while
+             the list was still loading and again when `listAgentPlans` failed. Branch on the pure
+             `consolePaneState` projection (`consoleState()`) instead — 'loading' / 'failed' / 'empty'
+             are three different screens, and only 'empty' may invite a new initiative here. -->
+        @switch (consoleState()) {
+          @case ('loading') {
+            <div class="pane-empty">Loading initiatives…</div>
+          }
+          @case ('failed') {
+            <div class="pane-empty">Could not load the initiatives list.</div>
+            <div class="pane-empty">
+              <button type="button" class="ia" (click)="retryInitiatives()">Retry</button>
+            </div>
+          }
+          @default {
+            <div class="pane-empty">No initiatives yet.</div>
+          }
+        }
       }
     </div>
   </aside>
@@ -154,6 +171,19 @@
                   <div class="st-meta">
                     <span class="st-who">{{ row.type === 'you' ? 'You' : 'Agent' }}</span>
                     @if (row.at) { <span class="st-when">{{ row.at }}</span> }
+                    <!-- Same rule as the message bubble: nothing to copy, no button. -->
+                    @if (canCopyRow(row)) {
+                      <button type="button" class="st-copy-btn" data-testid="st-copy-btn"
+                              [class.copied]="copyRowState($index) === 'copied'"
+                              [attr.aria-label]="copyRowLabel($index) || 'Copy this message'"
+                              [title]="copyRowLabel($index) || 'Copy this message'"
+                              (click)="copyRow($index, row)">
+                        <ion-icon [name]="copyRowIcon($index)" aria-hidden="true"></ion-icon>
+                        @if (copyRowShowsWhy($index)) {
+                          <span class="st-copy-why" role="status">{{ copyRowLabel($index) }}</span>
+                        }
+                      </button>
+                    }
                   </div>
                   @if (row.tool) { <div class="st-hd">{{ row.tool }}</div> }
                   @if (row.type === 'markdown') {
@@ -485,6 +515,34 @@
                       </button>
                     }
                   }
+
+                  <!-- Artifacts (mass-artifacts): the plan's and each phase's `artifacts/` dir,
+                       listed via the existing `filesListDir`. Renders nothing when there are none. -->
+                  @if (planArtifacts().length || planArtifactsBlocked()) {
+                    <div class="dn dir art-head">documents</div>
+                  }
+                  @if (planArtifactsBlocked()) {
+                    <div class="dn art-note">{{ planArtifactsBlocked() }}</div>
+                  }
+                  @for (g of planArtifacts(); track g.dirRel) {
+                    <div class="dn dir indent-1" [title]="g.dirRel">
+                      <span class="lbl">{{ g.label }}</span>
+                    </div>
+                    @for (n of g.nodes; track n.id) {
+                      <button
+                        type="button"
+                        class="dn art"
+                        [ngClass]="'art-d' + (n.depth > 2 ? 2 : n.depth)"
+                        [class.on]="planSelectedDoc() === n.id"
+                        [attr.aria-expanded]="n.kind === 'dir' ? n.expanded : null"
+                        [title]="n.name"
+                        (click)="openPlanArtifact(n)"
+                      >
+                        <span class="ic">{{ n.kind === 'dir' ? (n.expanded ? '▾' : '▸') : '·' }}</span><span class="lbl">{{ n.name }}</span>
+                      </button>
+                    }
+                  }
+
                   <div class="docnav-foot">
                     <b>{{ selectedInitiative()?.planPath }}</b>
                     <span>global store · read-only render</span>
@@ -513,6 +571,15 @@
                           <span class="pt">{{ card.phaseTitle }}</span>
                           <span class="pc tnum">{{ card.done }} / {{ card.total }}</span>
                         </div>
+                        <!-- The arena's entry point (MASS step 1): ONE extra row on a phase that
+                             already exists. A standalone component with its own inline styles, so
+                             terminal.page.scss gains nothing and the Plan tab is unchanged
+                             otherwise. The phase it is given is the SAME `planRun` phase row the
+                             rest of this tab reads, so `effectiveTestCommands` is the host's. -->
+                        <johnny-arena-row
+                          [initiativeId]="sel.id"
+                          [phase]="arenaPhaseOf(card.phaseId)"
+                        />
                         <div class="tasklist">
                           @for (t of card.tasks; track t.id) {
                             @let sv = taskStatus(t.status);
@@ -539,6 +606,16 @@
           </section>
         } @else if (activeTab() === 'checks') {
           <section class="terminal-surface checks-surface">
+            <!-- MASS step 5: the gate's exit code and collected count, beside the lens/plan-check
+                 cards that already live here. The gate is a SECOND, parallel score used only to
+                 compare workflows — it does not decide whether a phase is done, and `gateVerdict`
+                 and the lens system are untouched. -->
+            <johnny-gate-strip
+              [gate]="phaseGate()"
+              [pending]="phaseGatePending()"
+              [commands]="phaseGateCommands()"
+              (run)="runPhaseGate()"
+            />
             @if (checks().state === 'empty') {
               <div class="pane-empty">{{ checks().card }}</div>
             } @else {
@@ -595,6 +672,10 @@
                 </div>
               }
             }
+          </section>
+        } @else if (activeTab() === 'arena') {
+          <section class="terminal-surface arena-surface">
+            <app-arena-panel [initiativeId]="sel.id" [phases]="arenaPhases()" />
           </section>
         } @else if (activeTab() === 'tasks') {
           <section class="terminal-surface tasks-surface">
@@ -759,24 +840,41 @@
       <!-- No initiative selected. Standalone terminals/shells live on /shells now, so the console
            does NOT surface floating session panes here — an active shell must not make an empty
            initiative list render a terminal. Show an initiative-oriented empty state instead. -->
+      <!-- One screen used to stand for three situations: `loadInitiatives()` started empty and its
+           `catch` set empty too, so this rendered "No initiatives yet" + New initiative for the ~2 s
+           the list was in flight AND when the call failed. It now renders the four non-console states
+           of the pure `consolePaneState` (`consoleState()`), each telling the truth, and offers
+           "New initiative" only where creating one is actually the right move. -->
       <section class="workspace-empty">
-        @if (consoleRows().length === 0) {
-          <div class="empty-title">No initiatives yet</div>
-          <div class="empty-copy">Create an initiative to start briefing, planning, and development.</div>
-        } @else {
-          <div class="empty-title">No initiative selected</div>
-          <div class="empty-copy">Pick an initiative from the list, or create a new one.</div>
+        @switch (consoleState()) {
+          @case ('loading') {
+            <div class="empty-title">Loading initiatives…</div>
+            <div class="empty-copy">Fetching your initiatives from the engine.</div>
+          }
+          @case ('failed') {
+            <div class="empty-title">Could not load the initiatives list</div>
+            <div class="empty-copy">The initiatives surface could not reach the engine. Try again.</div>
+            <button class="primary-action" (click)="retryInitiatives()">Retry</button>
+          }
+          @case ('empty') {
+            <div class="empty-title">No initiatives yet</div>
+            <div class="empty-copy">Create an initiative to start briefing, planning, and development.</div>
+            <button class="primary-action" (click)="newInitiative()">New initiative</button>
+          }
+          @default {
+            <div class="empty-title">No initiative selected</div>
+            <div class="empty-copy">Pick an initiative from the list, or create a new one.</div>
+            <button class="primary-action" (click)="newInitiative()">New initiative</button>
+          }
         }
-        <button class="primary-action" (click)="newInitiative()">New initiative</button>
       </section>
     }
     }
   </main>
 
-  <footer class="workspace-statusbar">
-    <span>relay <strong>connected</strong></span>
-    <span>raw input batched at <strong>200ms</strong></span>
-  </footer>
+  <!-- The same strip the arena shells render, so the chrome does not vanish as you cross into the
+       arena (measured: it painted on /initiatives and on no arena route at 1200x860). -->
+  <johnny-workspace-statusbar />
 </div>
   </section>
 

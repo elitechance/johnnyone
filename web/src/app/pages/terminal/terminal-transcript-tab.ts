@@ -9,11 +9,13 @@ import type { StreamEvent } from '@johnnyone/ui';
 
 /** Per-session terminal pane tab. The Transcript surface was removed (the rendered-stream lane only
  *  covered structured chat-API sessions, not J1's tmux-driven agents); Raw terminal is the default. */
-export type PaneTab = 'raw' | 'plan' | 'diff' | 'checks' | 'tasks';
+export type PaneTab = 'raw' | 'plan' | 'diff' | 'checks' | 'tasks' | 'arena';
 
 export const DEFAULT_PANE_TAB: PaneTab = 'raw';
 
-const KNOWN_TABS = new Set<PaneTab>(['raw', 'plan', 'diff', 'checks', 'tasks']);
+// `arena` is ADDED, never a replacement: every tab that exists today keeps working exactly as it
+// does (mock step 1, "Arena is an added tab").
+const KNOWN_TABS = new Set<PaneTab>(['raw', 'plan', 'diff', 'checks', 'tasks', 'arena']);
 
 /** Cap per-session transcript growth in long sessions. */
 export const MAX_TRANSCRIPT_EVENTS = 2000;

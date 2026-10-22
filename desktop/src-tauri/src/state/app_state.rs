@@ -135,6 +135,11 @@ pub struct AppState {
     /// OS pids of in-flight kloo `--benchmark` children, keyed by plan id.
     /// `stop_plan` kills these (kloo has no tmux pane).
     pub kloo_pids: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// Model-fleet seat accounting. The fleet reports no provider count, no queue depth and no
+    /// 429, so this is the only place seats in use are counted; its caller-to-be is the arena's
+    /// run starter, which snapshots `fleet_busy` / `seats_held` from it. Per family, never
+    /// pooled across families.
+    pub lease_pool: crate::services::leases::SharedLeasePool,
 }
 
 impl AppState {
@@ -150,6 +155,9 @@ impl AppState {
         let (terminal_screen_tx, _) = broadcast::channel(256);
         let (stream_event_tx, _) = broadcast::channel(256);
         let (agent_plan_run_tx, _) = broadcast::channel(256);
+        let lease_pool = Arc::new(crate::services::leases::LeasePool::new(
+            crate::services::leases::seat_caps_from_db(&db),
+        ));
 
         tracing::info!(
             node_id = %node_id,
@@ -185,6 +193,7 @@ impl AppState {
             relay_task: Arc::new(Mutex::new(None)),
             coordinator_loops: Arc::new(std::sync::Mutex::new(HashSet::new())),
             kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            lease_pool,
         }
     }
 
@@ -198,6 +207,9 @@ impl AppState {
         let (terminal_screen_tx, _) = broadcast::channel(256);
         let (stream_event_tx, _) = broadcast::channel(256);
         let (agent_plan_run_tx, _) = broadcast::channel(256);
+        let lease_pool = Arc::new(crate::services::leases::LeasePool::new(
+            crate::services::leases::seat_caps_from_db(&db),
+        ));
 
         Self {
             db,
@@ -227,6 +239,7 @@ impl AppState {
             relay_task: Arc::new(Mutex::new(None)),
             coordinator_loops: Arc::new(std::sync::Mutex::new(HashSet::new())),
             kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            lease_pool,
         }
     }
 

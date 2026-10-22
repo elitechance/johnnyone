@@ -63,6 +63,9 @@ export type {
   GitDiffView,
   WorkspaceFileDiff,
   WorkspaceValidation,
+  // The test gate (migrations 023/025). The ARENA's own types are not here: they belong to
+  // `web/src/app/pages/arena/arena-api.service.ts`, which only the lazy arena chunk injects.
+  TestGateRun,
 } from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
 export type {
@@ -123,3 +126,18 @@ export {
   escapeHtml,
   highlightCode,
 } from './lib/markdown-render';
+
+// ── Copy core ────────────────────────────────────────────────────────────────
+export {
+  canCopyMessage,
+  copyTextFor,
+  performCopy,
+  copyStateLabelFor,
+  copyIconFor,
+  clearCopyResetTimer,
+} from './lib/copy-message';
+export type {
+  CopyOutcome,
+  CopyableMessage,
+  ClipboardLike,
+} from './lib/copy-message';

@@ -17,6 +17,12 @@ import { FormsModule } from '@angular/forms';
 import { DomSanitizer, SafeHtml, Title } from '@angular/platform-browser';
 import { FileViewerService } from '../../services/file-viewer.service';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+// The arena (MASS). All three are standalone components with INLINE templates and styles, which is
+// why they can be mounted in jsdom specs — and why none of them adds a byte to terminal.page.scss.
+import { ArenaPanelComponent } from '../arena/arena-panel.component';
+import { ArenaRowComponent } from '../arena/arena-row.component';
+import { GateStripComponent } from '../arena/gate-strip.component';
+import { WorkspaceStatusbarComponent } from '../../components/workspace-statusbar/workspace-statusbar.component';
 import {
   IonModal,
   IonHeader,
@@ -53,6 +59,9 @@ import {
   expandOutline,
   folderOutline,
   documentOutline,
+  copyOutline,
+  checkmarkOutline,
+  alertCircleOutline,
 } from 'ionicons/icons';
 import { AuthService } from '../../services/auth.service';
 import { RelayTerminalService } from '../../services/relay-terminal.service';
@@ -62,7 +71,6 @@ import {
   JohnnyApiService,
   ChatAttachment,
   TerminalScreenComponent,
-  TranscriptViewComponent,
   DiffViewComponent,
   MarkdownViewComponent,
   LifecycleBarComponent,
@@ -72,6 +80,7 @@ import {
   AgentPlanRun,
   AgentPlanEvent,
   FileContent,
+  FileEntry,
   AiSession as SharedAiSession,
   AiMessage as SharedAiMessage,
   AiMessageDelta,
@@ -82,6 +91,15 @@ import {
   HostFileEntry,
   TmuxSession,
   phaseNnOf,
+  canCopyMessage,
+  copyTextFor,
+  performCopy,
+  copyStateLabelFor,
+  copyIconFor,
+  clearCopyResetTimer,
+  type TestGateRun,
+  type CopyOutcome,
+  type ClipboardLike,
 } from '@johnnyone/ui';
 import {
   PaneTab,
@@ -111,6 +129,7 @@ import {
   lensSummary,
   lensSource,
   consolePaneFor,
+  consolePaneState,
   CONSOLE_SEGMENTS,
   InitiativeRow,
   LensChip,
@@ -118,12 +137,14 @@ import {
   LensSource,
   modeChip,
 } from './console-logic';
+import type { ConsolePaneState } from './console-logic';
 import { initiativeTimeline, windowTimeline, TimelineEvent } from './initiative-events-logic';
 import {
   resolvePrimarySessionId,
   initiativeTabOf,
   rawAttachNeeded,
-  visibleConsoleTabs,
+  consoleTabsWithArena,
+  tabNeedsPlanRun,
   isLocalSmall,
   resolvedPaneTab,
 } from './console-tabs-logic';
@@ -154,10 +175,21 @@ import {
   phaseCards,
   planDocPath,
   taskStatusLabel,
+  artifactGroups,
+  artifactOpenMode,
+  artifactListError,
+  isDocDir,
+  phaseDir,
+  planListPath,
+  emptyArtifactCache,
+  mergeArtifactListings,
   PlanCounts,
   DocNavEntry,
   PhaseCard,
   TaskStatusView,
+  ArtifactGroup,
+  ArtifactCache,
+  ArtifactNode,
 } from './plan-tab-logic';
 import {
   panelVisible,
@@ -233,6 +265,10 @@ addIcons({
   'expand-outline': expandOutline,
   'folder-outline': folderOutline,
   'document-outline': documentOutline,
+  // The transcript row's copy control - unregistered names make ionicons throw on render.
+  'copy-outline': copyOutline,
+  'checkmark-outline': checkmarkOutline,
+  'alert-circle-outline': alertCircleOutline,
 });
 
 @Component({
@@ -243,11 +279,14 @@ addIcons({
     FormsModule,
     RouterLink,
     TerminalScreenComponent,
-    TranscriptViewComponent,
     DiffViewComponent,
     MarkdownViewComponent,
     LifecycleBarComponent,
     StatusPillComponent,
+    ArenaPanelComponent,
+    ArenaRowComponent,
+    GateStripComponent,
+    WorkspaceStatusbarComponent,
     IonModal,
     IonHeader,
     IonToolbar,
@@ -300,6 +339,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // — reuses the existing shared modal service (decision D4), no new zoom UI.
   readonly mermaidZoom = inject(MermaidZoomService);
   private readonly router = inject(Router);
+
   private readonly alertCtrl = inject(AlertController);
   private readonly toastCtrl = inject(ToastController);
   private readonly minSidebarWidth = 260;
@@ -410,6 +450,28 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   planDocMarkdown = signal<string>('');
   planLoading = signal<boolean>(false);
   planError = signal<string | null>(null);
+  /**
+   * Artifacts section (mass-artifacts): cached `filesListDir` results keyed by the dir's path
+   * RELATIVE to the plan dir (`artifacts`, `mocks`, `phases/<id>/artifacts`, any expanded subdir).
+   * Relative keys, not host-absolute ones, so the keys are exactly what `planDocPath` validates —
+   * which is also why the cache is TAGGED with the initiative it belongs to (D3): the same relative
+   * key means a stale fan-out would otherwise show one initiative's filenames under another's.
+   */
+  planArtifactCache = signal<ArtifactCache>(emptyArtifactCache(''));
+  /** Which artifact subdirectories the reader has opened (plan-relative keys). */
+  planArtifactExpanded = signal<Record<string, boolean>>({});
+  /**
+   * `<initiativeId>|<phase dir>` claims for phases whose document dirs have been ANSWERED, so each
+   * phase is probed at most once per selection while a failed probe stays retryable.
+   */
+  private readonly phasesArtifactsLoaded = new Set<string>();
+  /**
+   * Why the artifacts of this plan cannot be listed at all, when that is a CONFIGURATION fact
+   * rather than "there are none". `files_root` and `initiatives_dir` are independent user settings,
+   * so an initiatives dir outside `files_root` is reachable config; the host then refuses the
+   * listing, and the honest thing is to say so rather than widen the guard or show nothing.
+   */
+  planArtifactsBlocked = signal<string | null>(null);
   /** Guard so the plan is fetched once per initiative (re-fetches only when the initiative changes). */
   private planLoadedForInitiative: string | null = null;
   /** Per-session working-tree diff (overhaul P7, D10), loaded lazily on Diff-tab activation. */
@@ -430,8 +492,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // The Work console wraps this page's existing pane shell in a master-detail grid. All row/summary/
   // file/segment decisions delegate to the pure `console-logic.ts` (D3/D6/D7/D8); the primitives are the
   // P2 `johnny-status-pill`/`johnny-lifecycle-bar`. No transcript/diff/pane-shell code is forked.
-  /** Initiatives from `listAgentPlans` (best-effort; empty when none/unauthorized). */
+  /** Initiatives from `listAgentPlans` (best-effort; the last good rows survive a failed reload). */
   protected readonly agentPlans = signal<AgentPlan[]>([]);
+  /**
+   * The load's own status — ONE signal, not a `loading`/`failed` boolean pair that could be both at
+   * once. `'loading'` before the request, `'ready'` on success, `'failed'` in the `catch`, and
+   * `initiativeListError` keeps whatever the failure was so the view can say something true.
+   */
+  protected readonly initiativeListStatus = signal<'loading' | 'ready' | 'failed'>('loading');
+  /** The surface that failed (`listAgentPlans`), NOT the exception text — see `retryInitiatives()`. */
+  protected readonly initiativeListError = signal<string | null>(null);
   /** The selected initiative id (drives the center lifecycle bar + right validation column). */
   protected readonly selectedInitiativeId = signal<string | null>(null);
   /** The `surface` query param (P4): `'shell'` opens the plain terminal surface (no initiative chrome).
@@ -447,6 +517,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly consoleRows = computed<InitiativeRow[]>(() =>
     initiativeRows(this.agentPlans(), this.selectedInitiativeId(), this.consoleNow()),
   );
+  /**
+   * Which of the five console states the surface is in (pure `consolePaneState` — the ordering that
+   * keeps a load in flight, or a failed one, from claiming "No initiatives yet").
+   */
+  protected readonly consoleState = computed<ConsolePaneState>(() =>
+    consolePaneState({
+      loading: this.initiativeListStatus() === 'loading',
+      failed: this.initiativeListStatus() === 'failed',
+      rowCount: this.consoleRows().length,
+      hasSelection: !!this.selectedInitiative(),
+    }),
+  );
+  /** Retry affordance for the `failed` state: re-runs the loader (which flips back to `loading`). */
+  protected retryInitiatives(): void {
+    void this.loadInitiatives();
+  }
   /** The selected initiative record (for the lifecycle bar + validation config). */
   // C1: resolve the selection by plan-run `id` OR group `initiativeId` so a `?initiativeId=<id>`
   // deep-link renders the terminal instead of stranding on the empty state (console-selection-logic).
@@ -693,6 +779,69 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** Ticks so the liveness line re-renders while nothing else changes. */
   private readonly shellClock = signal(0);
   private shellClockInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Per-row copy feedback, keyed by the row's index in `shellRows()`. */
+  private readonly copyRowStates = new Map<number, CopyOutcome>();
+  /** Pending "back to 'Copy'" resets, keyed by the same row index. */
+  private readonly copyRowResetTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** How long the button reads 'Copied' before returning to 'Copy'. */
+  private static readonly COPY_RESET_MS = 2000;
+
+  /**
+   * Is this row worth a copy button? Delegates to the shared seam so the rule is the
+   * same one the message bubble uses: any role qualifies, an empty body does not.
+   */
+  protected canCopyRow(row: { text: string }): boolean {
+    return canCopyMessage({ content: row.text });
+  }
+
+  /** The row's last copy outcome, or null before its first click. */
+  protected copyRowState(i: number): CopyOutcome | null {
+    return this.copyRowStates.get(i) ?? null;
+  }
+
+  /** The words under the button — 'Copied' / a failure reason / '' for the default. */
+  protected copyRowLabel(i: number): string {
+    return copyStateLabelFor(this.copyRowState(i));
+  }
+
+  /** The ion-icon name for this row's state — the same seam the message bubble uses. */
+  protected copyRowIcon(i: number): string {
+    return copyIconFor(this.copyRowState(i));
+  }
+
+  /**
+   * Only the two FAILURE states put words on screen. 'Copied' is the checkmark alone
+   * (the icon says it), but "no clipboard API on a plain-http page" is a sentence the
+   * user cannot guess from a glyph, so it stays visible beside the icon.
+   */
+  protected copyRowShowsWhy(i: number): boolean {
+    const state = this.copyRowState(i);
+    return state === 'unavailable' || state === 'failed';
+  }
+
+  /**
+   * Copy a transcript row. The text is the row's RAW text (never the rendered markdown),
+   * and the outcome is always surfaced — a silent no-op is the bug this seam exists for.
+   */
+  protected async copyRow(i: number, row: { text: string }): Promise<void> {
+    const text = copyTextFor({ content: row.text });
+    // ONE clipboard surface for the whole page — see `clipboardSurface()` below.
+    const clipboard = this.clipboardSurface();
+    const outcome = await performCopy(text, clipboard);
+    this.copyRowStates.set(i, outcome);
+    clearCopyResetTimer(this.copyRowResetTimers.get(i));
+    this.copyRowResetTimers.delete(i);
+    if (outcome === 'copied') {
+      this.copyRowResetTimers.set(
+        i,
+        setTimeout(() => {
+          this.copyRowResetTimers.delete(i);
+          this.copyRowStates.delete(i);
+        }, TerminalPage.COPY_RESET_MS),
+      );
+    }
+  }
 
   /** Merged display rows: local echoes interleaved with reports, in send order. */
   protected shellRows(): Array<{
@@ -994,6 +1143,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly planHasContent = computed<boolean>(
     () => (this.planRun()?.phases?.length ?? 0) > 0,
   );
+  /** Artifacts navigator section — pure projection over the cached listings (mass-artifacts). */
+  protected readonly planArtifacts = computed<ArtifactGroup[]>(() =>
+    artifactGroups(this.planRun(), this.planArtifactCache().listings, this.planArtifactExpanded()),
+  );
 
   // Run/Resume panel (console-features P01) — all decisions come from the pure `run-resume-logic`
   // seam; these signals hold only the form state the user edits. Pre-seeded from the run when the
@@ -1007,6 +1160,48 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** True while a run/resume submit is in flight (disables the button). */
   protected readonly runSubmitting = signal<boolean>(false);
   /** Whole-panel visibility — dev run with ≥1 phase, else hidden. */
+  // ── The arena (MASS) ───────────────────────────────────────────────────────────────────────
+  // The phases the Arena tab and the plan tab's arena rows are built from. Same `planRun` the rest
+  // of the Plan tab reads; no second fetch.
+  protected readonly arenaPhases = computed(() => this.planRun()?.phases ?? []);
+
+  /** The phase row behind a Plan-tab phase card, so the arena row reads the host's
+   *  `effectiveTestCommands` instead of the card projection re-deriving a gate. */
+  protected arenaPhaseOf(phaseId: string) {
+    return this.arenaPhases().find((p) => p.phaseId === phaseId) ?? null;
+  }
+  /** One run of the CURRENT phase's effective gate, for the Checks tab (mock step 5). */
+  protected readonly phaseGate = signal<TestGateRun | null>(null);
+  protected readonly phaseGatePending = signal(false);
+  /** The gate that actually applies to the current phase — the host's `effectiveTestCommands`,
+   *  never a client-side fallback between the phase's and the plan's. */
+  protected readonly phaseGateCommands = computed<string[]>(() => {
+    const run = this.planRun();
+    const phaseId = run?.plan?.currentPhaseId;
+    const phase = (run?.phases ?? []).find((p) => p.phaseId === phaseId) ?? (run?.phases ?? [])[0];
+    return phase?.effectiveTestCommands ?? [];
+  });
+
+  /** Run the current phase's gate once and show the exit code + collected count on the Checks tab.
+   *  Same resolution and same shell as the coordinator's own ready-check, so what this reports is
+   *  what the coordinator would see. */
+  protected async runPhaseGate(): Promise<void> {
+    const run = this.planRun();
+    const planId = run?.plan?.id;
+    if (!planId || this.phaseGatePending()) return;
+    this.phaseGatePending.set(true);
+    try {
+      this.phaseGate.set(
+        await firstValueFrom(this.api.runAgentPlanTestGate(planId, run?.plan?.currentPhaseId ?? null)),
+      );
+    } catch {
+      // Leave the previous result on screen rather than replacing it with a fabricated one.
+      this.phaseGate.set(null);
+    } finally {
+      this.phaseGatePending.set(false);
+    }
+  }
+
   protected readonly runResumeVisible = computed<boolean>(() => panelVisible(this.planRun()));
   /** Error banner model (shown above the panel when the run is paused). */
   protected readonly runBanner = computed(() => bannerModel(this.planRun()));
@@ -1065,8 +1260,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   });
   protected readonly replanFlags = computed(() => replanFlagsOf(this.parsedPreflight()));
+  // The tab strip is `visibleConsoleTabs` — unchanged, and still the one place that decides which
+  // of Raw/Plan/Checks/Tasks/Diff are shown — with the arena APPENDED by `consoleTabsWithArena`,
+  // which delegates to it. `console-tabs-logic.spec.ts` now asserts that delegation over its whole
+  // fixture matrix AND that this line calls the delegating function, so a hand-rolled array here
+  // fails (proved by mutating it).
   protected readonly visibleTabs = computed(() =>
-    visibleConsoleTabs(
+    consoleTabsWithArena(
       this.selectedInitiative(),
       !!this.taskRunJson(),
       !!this.planCheckJson(),
@@ -1372,9 +1572,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // plan signals synchronously before its first await.
     effect(
       () => {
-        const isPlan = this.activeTab() === 'plan';
+        // The ARENA tab needs the same `planRun`: its rows are per phase, and it is a tab a reader
+        // can open first. MEASURED in Chrome before this line existed — the Arena tab said "This
+        // initiative has no phases yet" on an initiative with three phases, until the Plan tab was
+        // opened once (see `.johnnyone/reports/arena-screens/before2-console-arena-tab-no-phases.png`).
+        // `ensurePlanLoaded` is once-per-initiative and benign, so sharing the trigger costs nothing.
+        const wantsPlan = tabNeedsPlanRun(this.activeTab());
         const init = this.selectedInitiative();
-        if (isPlan && init) {
+        if (wantsPlan && init) {
           void this.ensurePlanLoaded();
         }
       },
@@ -1654,6 +1859,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   ngOnDestroy(): void {
     for (const timer of this.pendingVisualUnsubscribes.values()) clearTimeout(timer);
     this.pendingVisualUnsubscribes.clear();
+    for (const h of this.copyRowResetTimers.values()) clearCopyResetTimer(h);
+    this.copyRowResetTimers.clear();
     this.clearShellPendingTimer();
     if (this.shellClockInterval) {
       clearInterval(this.shellClockInterval);
@@ -2626,7 +2833,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       value === 'plan' ||
       value === 'diff' ||
       value === 'checks' ||
-      value === 'tasks'
+      value === 'tasks' ||
+      value === 'arena'
     );
   }
 
@@ -2695,6 +2903,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         return 'Checks';
       case 'tasks':
         return 'Tasks';
+      case 'arena':
+        // No glyph. The mock draws "⚔ Arena", but in the console's monospace stack the crossed
+        // swords fall back to a mark that reads as ✕ — a tab labelled "✕ Arena" looks like a close
+        // button (measured: `.johnnyone/reports/arena-screens/before-console-arena-tab.png`).
+        return 'Arena';
     }
   }
 
@@ -2774,6 +2987,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.planSelectedDoc.set('plan.md');
     this.planDocMarkdown.set('');
     this.planError.set(null);
+    this.planArtifactCache.set(emptyArtifactCache(init.id));
+    this.planArtifactExpanded.set({});
+    this.planArtifactsBlocked.set(null);
+    this.phasesArtifactsLoaded.clear();
     if (!init.planPath?.trim()) return; // benign empty (no plan to read)
     this.planLoading.set(true);
     try {
@@ -2781,11 +2998,156 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.applyPlanRun(run ?? null);
       // Stage-aware default: overview.md when the plan has phases (development), else plan.md (planning).
       await this.loadPlanDoc(defaultPlanDoc(run));
+      // Artifacts are listed AFTER the doc is on screen and are NOT awaited: nothing about the
+      // artifacts should delay the text the reader opened the tab for.
+      void this.loadPlanArtifacts(init.id, init.planPath);
     } catch {
       this.applyPlanRun(null); // benign empty state, no crash
     } finally {
       this.planLoading.set(false);
     }
+  }
+
+  /**
+   * Is `initiativeId` still the one whose plan we are loading?
+   *
+   * Every artifact listing is an await, and the reader can switch initiative mid-flight. Without
+   * this check a slow fan-out for initiative A lands AFTER `ensurePlanLoaded` has reset the signals
+   * for initiative B, and because `'artifacts'` is the same literal cache key for every plan, B's
+   * navigator renders A's filenames — and clicking one joins B's `planPath` to A's filename.
+   * `planLoadedForInitiative` already encodes exactly this ownership, so it is the authority.
+   */
+  private stillLoadingPlanFor(initiativeId: string): boolean {
+    return this.planLoadedForInitiative === initiativeId;
+  }
+
+  /**
+   * Discover and list the plan's document directories (`artifacts/`, `mocks/`,
+   * `screens-to-verify/`, …), best-effort, through the EXISTING `filesListDir` host API.
+   *
+   * ONE call lists the plan dir itself; whichever of the allowlisted names it reports back are then
+   * listed for their contents. That replaces probing all seven names blind, and it is why phases
+   * are not touched here at all: the previous version listed the plan dir plus EVERY phase dir on
+   * every Plan-tab open, measured at 243 `filesListDir` calls over the real store with 146 of them
+   * (60%) for directories that do not exist, worst case 15 parallel relay RPCs for one initiative.
+   * This repo throttles terminal screen-publishes specifically to limit Durable Object traffic, so
+   * a 15-way burst that is 60% waste cuts against an existing constraint. Re-measured after this
+   * change: 113 calls total, worst case 3 for one initiative, nothing wasted. A phase's documents
+   * are listed when that phase is opened (`loadPhaseArtifacts`).
+   */
+  private async loadPlanArtifacts(initiativeId: string, planPath: string): Promise<void> {
+    if (!planPath.trim()) return;
+    const probe = await this.listArtifactDir(planPath, '');
+    if (!this.stillLoadingPlanFor(initiativeId)) return;
+    if (probe.blocked) {
+      this.planArtifactsBlocked.set(probe.blocked);
+      return;
+    }
+    // (`planArtifactsBlocked` is reset per initiative and only written behind the same ownership
+    // check, so a stale refusal cannot be shown against another initiative's plan.)
+    const present = (probe.entries ?? [])
+      .filter((e) => e.kind === 'dir' && isDocDir(e.name))
+      .map((e) => e.name);
+    if (!present.length) return;
+    const results = await Promise.all(
+      present.map((dir) => this.listArtifactDir(planPath, dir)),
+    );
+    this.planArtifactCache.update((c) => mergeArtifactListings(c, initiativeId, results));
+  }
+
+  /**
+   * The same one-call discovery for a single phase, run when that phase row is opened.
+   *
+   * At most once per phase per initiative selection — the claim is taken BEFORE the await, so a
+   * fast double tap cannot start two probes. A probe that FAILS releases the claim, so a second tap
+   * retries: the claim marks "answered", not "attempted", because a dropped relay would otherwise
+   * leave that phase's documents permanently invisible with no recovery but switching initiative
+   * and coming back. A probe that succeeds keeps the claim even when the phase turns out to have no
+   * document dirs — that is an answer, not a failure, and re-asking costs a call per tap.
+   *
+   * The claim key is scoped to the initiative so that a stale release can only ever remove the
+   * entry it added, never a claim the newly-selected initiative has just taken for a phase that
+   * happens to share an id.
+   */
+  private async loadPhaseArtifacts(initiativeId: string, phaseId: string): Promise<void> {
+    const planPath = this.selectedInitiative()?.planPath;
+    if (!planPath?.trim()) return;
+    const dir = phaseDir(phaseId);
+    if (!dir) return;
+    const claim = `${initiativeId}|${dir}`;
+    if (this.phasesArtifactsLoaded.has(claim)) return;
+    this.phasesArtifactsLoaded.add(claim);
+    const probe = await this.listArtifactDir(planPath, dir);
+    if (!probe.entries) {
+      // The listing did not answer (dir absent, host down, relay drop). Release so a tap retries.
+      this.phasesArtifactsLoaded.delete(claim);
+      return;
+    }
+    if (!this.stillLoadingPlanFor(initiativeId)) return;
+    const present = (probe.entries ?? [])
+      .filter((e) => e.kind === 'dir' && isDocDir(e.name))
+      .map((e) => `${dir}/${e.name}`);
+    if (!present.length) return;
+    const results = await Promise.all(present.map((d) => this.listArtifactDir(planPath, d)));
+    this.planArtifactCache.update((c) => mergeArtifactListings(c, initiativeId, results));
+  }
+
+  /**
+   * One guarded `filesListDir`, classified into entries / absent / refused-by-configuration.
+   *
+   * `dirRel` is resolved through `planListPath` — which is `planDocPath`, the single allowlist, or
+   * `planBasePath` for the one listing whose target IS the plan dir. So EVERY listing in this
+   * feature passes a validator from `plan-tab-logic`, with no exceptions and no raw paths.
+   */
+  private async listArtifactDir(
+    planPath: string,
+    dirRel: string,
+  ): Promise<{ dirRel: string; entries?: FileEntry[]; blocked?: string }> {
+    const abs = planListPath(planPath, dirRel);
+    if (!abs) return { dirRel };
+    try {
+      const listing = await firstValueFrom(this.api.listDir(abs));
+      return { dirRel, entries: listing?.entries ?? [] };
+    } catch (err) {
+      // Absent/unreadable → no artifacts and no noise; a confinement refusal → an explanation.
+      // Classification lives in the pure `artifactListError`, over the shared `normalizeFileError`.
+      const blocked = artifactListError(err);
+      return blocked ? { dirRel, blocked } : { dirRel };
+    }
+  }
+
+  /**
+   * Open an artifacts row.
+   *
+   * A directory toggles, listing its children lazily on first open. A file goes to whichever
+   * EXISTING renderer handles its type: markdown stays in the page through `johnny-markdown-view`
+   * (so mermaid and the zoom modal keep working), everything else goes to `openReportFile`, which
+   * already branches html → sandboxed iframe, image → data URI, else → text.
+   */
+  async openPlanArtifact(node: ArtifactNode): Promise<void> {
+    if (node.kind === 'dir') {
+      const willOpen = !this.planArtifactExpanded()[node.id];
+      this.planArtifactExpanded.update((m) => ({ ...m, [node.id]: willOpen }));
+      if (willOpen && !this.planArtifactCache().listings[node.id]) {
+        const init = this.selectedInitiative();
+        if (!init?.planPath?.trim()) return;
+        const r = await this.listArtifactDir(init.planPath, node.id);
+        // Same ownership check as the fan-out: the reader may have switched initiative while this
+        // listing was in flight, and this cache is keyed by a plan-RELATIVE path.
+        this.planArtifactCache.update((c) => mergeArtifactListings(c, init.id, [r]));
+      }
+      return;
+    }
+    if (artifactOpenMode(node.id) === 'markdown') {
+      await this.loadPlanDoc(node.id);
+      return;
+    }
+    const abs = planDocPath(this.selectedInitiative()?.planPath, node.id);
+    if (!abs) return;
+    // Deliberately NOT recorded as the selected doc: the file opens in the viewer modal, while the
+    // doc view behind it still shows the markdown it was showing. Marking the row selected would
+    // leave the eyebrow claiming to render a .png over somebody else's text.
+    await this.openReportFile(abs);
   }
 
   /** Load one navigator doc's markdown via the safe fixed-suffix path builder (T01). */
@@ -2806,9 +3168,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  /** Doc-navigator click: switch the rendered doc (overview.md / status.md / a phase's overview). */
+  /**
+   * Doc-navigator click: switch the rendered doc (overview.md / status.md / a phase's overview).
+   *
+   * Opening a PHASE also discovers that phase's document dirs (R3). Listing them here rather than
+   * up-front is what keeps a Plan-tab open at ~2 host calls instead of one per phase: you pay for
+   * a phase's artifacts when you ask for that phase.
+   */
   openPlanDoc(sel: string): void {
     void this.loadPlanDoc(sel);
+    const init = this.selectedInitiative();
+    const isPhase = (this.planRun()?.phases ?? []).some((ph) => ph.phaseId === sel);
+    if (init && isPhase) void this.loadPhaseArtifacts(init.id, sel);
   }
 
   /**
@@ -2817,16 +3188,25 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    * the plain pane shell. `consoleNow` is stamped once here so `formatRelTime` stays deterministic.
    */
   private async loadInitiatives(): Promise<void> {
+    // Announce the load BEFORE the request: `consolePaneState` gives `loading` precedence over both
+    // `failed` (a retry in flight is not a failure) and `empty`, so the console says "Loading" from
+    // the first paint instead of the empty copy for the ~2 s the call takes.
+    this.initiativeListStatus.set('loading');
+    this.initiativeListError.set(null);
     try {
       const plans = await firstValueFrom(this.api.listAgentPlans());
       this.consoleNow.set(new Date().toISOString());
       this.agentPlans.set(plans ?? []);
+      this.initiativeListStatus.set('ready');
       // Default the selection to the first initiative so the header/right column have context.
       if (!this.selectedInitiativeId() && plans && plans.length > 0) {
         this.selectedInitiativeId.set(plans[0].id);
       }
     } catch {
-      this.agentPlans.set([]);
+      // A failure is NOT "no initiatives": keep whatever the last good list was and record that the
+      // load failed, so the view can offer Retry instead of inviting a duplicate initiative.
+      this.initiativeListError.set('listAgentPlans');
+      this.initiativeListStatus.set('failed');
     }
   }
 
@@ -4342,10 +4722,23 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return `~/${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
   }
 
+  /**
+   * The page's ONE clipboard surface. The clipboard API is UNDEFINED in a non-secure
+   * context (plain http on a phone), so every copy path — the transcript rows and the
+   * session-id chip — reads it through here rather than each holding its own reference
+   * to it. One mention of the global, one path.
+   */
+  private clipboardSurface(): ClipboardLike | null {
+    if (typeof navigator === 'undefined') return null;
+    const nav = navigator as Navigator & { clipboard?: ClipboardLike };
+    return nav.clipboard ?? null;
+  }
+
   private async copyTextToClipboard(value: string): Promise<boolean> {
     try {
-      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value);
+      const clip = this.clipboardSurface();
+      if (clip?.writeText) {
+        await clip.writeText(value);
         return true;
       }
     } catch {

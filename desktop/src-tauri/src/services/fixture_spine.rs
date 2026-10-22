@@ -111,6 +111,11 @@ fn run_verify(argv: &[String], dir: &std::path::Path) -> (bool, String) {
     (out.status.success(), detail)
 }
 
+/// NOTE (integration, 2026-10-14): an earlier comment here measured the nested `FAILED` noise
+/// this test used to print into the parent stream and taught readers to grep `0 filtered out`
+/// for the real verdict. `run_verify` above now CAPTURES that output, so the noise is gone at
+/// the source and the counts in that comment no longer describe this tree. The final
+/// `test result` line is the verdict; it was removed rather than left asserting stale numbers.
 #[test]
 fn fixture_every_verify_is_red_on_stubs() {
     let tmp = std::env::temp_dir().join(format!(

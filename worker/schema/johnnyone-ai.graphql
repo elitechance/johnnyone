@@ -40,6 +40,10 @@ type AiSession {
   updatedAt: String!
   # True when this session attaches to an external tmux session (UI shows Detach).
   attachedTmux: Boolean!
+  # The LIVE terminal state reported by the host: 'none' | 'attached' | 'detached' | 'ended'.
+  # Unlike `attachedTmux` (an INTENT flag — "this session is the kind that attaches to a tmux"),
+  # this says whether the terminal actually exists right now; 'ended' means the pane is gone.
+  terminalStatus: String
 }
 
 type AiMessage {
@@ -158,6 +162,13 @@ type AgentPlan {
   executorConfig: String
   # Host consecutive_non_pass_planning_rounds for the initiative. Nullable for deploy-skew.
   consecutiveNonPassPlanningRounds: Int
+  # The coordinator's own test gate (migration 023): shell commands it runs itself, from
+  # workspacePath, when a phase reports ready. The host parses the stored JSON array and serves
+  # this list, so no client ever handles the encoding. NULLABLE for the same deploy-skew reason as
+  # validationConfig: a worker deploy against a pre-migration-023 desktop returns JSON without the
+  # key, and nullable degrades to null instead of failing non-null coercion on every
+  # AgentPlan-returning operation. Null or empty = no plan-level gate (opt-in).
+  testCommands: [String!]
   createdAt: String!
   updatedAt: String!
 }
@@ -179,6 +190,59 @@ type AgentPlanPhase {
   findingsJson: String!
   createdAt: String!
   updatedAt: String!
+  # This phase's OWN gate (migration 025). Nullable for deploy-skew, like the plan's above.
+  # Null or empty means this phase declares no gate and inherits the plan's — see
+  # effectiveTestCommands, which is the field to render and the field to trust.
+  testCommands: [String!]
+  # The gate that ACTUALLY applies to this phase: its own commands when it declares any, else the
+  # plan's. Resolved on the host by `services::agent_plans::effective_test_commands`, the single
+  # place that precedence lives, so no UI re-implements the fallback and no two clients can
+  # disagree about what a phase is held to. Non-null: an empty list is the honest answer when
+  # there is no gate at either level.
+  #
+  # Note the deploy-skew asymmetry with the nullable fields above is deliberate — a pre-025
+  # desktop omits the key and a non-null list coerces to [] via the default, which is exactly the
+  # correct "no gate" reading.
+  effectiveTestCommands: [String!]!
+}
+
+# One run of a phase's (or a plan's) effective test gate — see the runAgentPlanTestGate mutation.
+type TestGateRun {
+  # Whether a gate was DECLARED at all, at either level.
+  #
+  # This is what separates "passed" from "there was nothing to pass". An exitCode of 0 is returned
+  # both by a gate that ran every command successfully and by a phase that declares no gate, so a
+  # client asking "is this phase proven?" must check `gateDeclared && exitCode == 0`. exitCode == 0
+  # alone only means "nothing failed".
+  #
+  # true with commandsRun == 0 and a non-zero exitCode is the malformed case: a gate is configured
+  # but its stored value could not be read, so nothing ran. That used to report exitCode 0 and was
+  # indistinguishable from a pass.
+  gateDeclared: Boolean!
+  # The score. Zero means the gate passed; anything else is the exit code of the FIRST command
+  # that failed (-1 when a signal killed it and no code was reported). This is the ONLY score the
+  # gate has, by design: a numeric quality score would need a scale, a writer and an interpreter,
+  # and each is a place for a false pass to hide.
+  # Three reserved NEGATIVE values cover outcomes with no real exit code, so that a client
+  # treating non-zero as failure refuses them without needing to know which: -1 killed by a
+  # signal, -2 gate declared but unreadable, -3 exceeded the host's per-command timeout.
+  exitCode: Int!
+  # How many tests the run reported, parsed best-effort from its output.
+  #
+  # NULLABLE BY DESIGN, and null is NOT an error. A gate that prints nothing a parser recognises —
+  # a lint, a build, a bespoke script, a runner whose summary format the host has never seen — is a
+  # perfectly legitimate gate with a perfectly well-known exit code. Treat this as a display hint
+  # only: never gate on it, never compare it across runs, never store it.
+  collected: Int
+  # The command whose exitCode is reported: the first failure, or the last command on success.
+  # Null when the phase has no gate at either level.
+  command: String
+  # Commands actually executed — fewer than the gate declares when one failed and stopped the run.
+  commandsRun: Int!
+  # Captured stdout+stderr of the reported command, size-capped on the host (128 KiB per stream).
+  output: String!
+  # True when the cap discarded earlier output, so this is a tail window rather than the whole run.
+  truncated: Boolean!
 }
 
 type AgentPlanTask {
@@ -533,6 +597,133 @@ input PlannerPlanningPromptsInput {
 
 # --- Queries ---
 
+# --- The workflow arena (desktop migration 026) ---
+#
+# A Workflow is the SEARCHED ARTIFACT: the four prompt parts a phase-type is executed with, with
+# `parentId` lineage. A champion is the one Workflow per (repo, phaseType, family) that J1 actually
+# uses, and it materialises as an ordinary plan file, so the execution path is untouched.
+#
+# Every rule behind these fields lives on the host, in `services::workflows`, behind one named
+# function each — `budgets_are_comparable`, `promotion_block`, `workflow_search_state`. No client
+# re-derives any of them, for the same reason `AgentPlanPhase.effectiveTestCommands` exists.
+
+type Workflow {
+  id: ID!
+  repo: String!
+  # 'dev-phase', 'ui-phase', … The phase-type this workflow is a candidate for.
+  phaseType: String!
+  # The model family, e.g. 'glm-5.3-flash'. Part of a champion's IDENTITY, not its environment: a
+  # hop tuned around one context window does not transfer to another, and treating the model as
+  # environment is how a champion gets promoted that is worse everywhere it is actually used.
+  family: String!
+  # NOTE on Float. Every numeric field in this feature is `Float`, not `Int`, and that is
+  # deliberate: GraphQL `Int` is 32-bit, and an `Int!` that cannot serialise does not degrade to a
+  # bad value — the null propagates up every non-null link to the RESPONSE ROOT, so the client gets
+  # `data: null` and loses every other field in the same document too. This project has already
+  # shipped that outage: one AI session's token count passed 2^31-1 and `listAiSessions` returned
+  # null, which emptied the terminal tab bar on every device with nothing saying why. The fix there
+  # was Int! -> Float!, and this follows it. The host additionally BOUNDS what is genuinely bounded
+  # (fanOut, seed, gateExit); gateCollected is advisory and deliberately unbounded, which is exactly
+  # why it must not sit on a 32-bit field.
+  # Monotonic WITHIN (repo, phaseType, family), starting at 1. Independent across families.
+  version: Float!
+  # Lineage. Always within the same (repo, phaseType, family) — the host refuses a cross-family
+  # parent.
+  parentId: String
+  role: String!
+  instruction: String!
+  contract: String!
+  # JSON: steps, parallel groups, returns. Served as the stored string; the host validates that it
+  # IS JSON on write but deliberately does not model its shape.
+  hop: String!
+  # Seat cost, bounded by the fleet: at least 1 and at most the host's MAX_FAN_OUT.
+  fanOut: Float!
+  # Exactly one workflow per (repo, phaseType, family) can be true, enforced by a PARTIAL unique
+  # index in the database, not only by the service.
+  isChampion: Boolean!
+  createdAt: String!
+}
+
+# One execution of one workflow.
+type WorkflowRun {
+  id: ID!
+  workflowId: String!
+  # The Initiative this run executed as, if any. Set to null if that plan is later deleted.
+  planId: String
+  # Replay index. Bounded by the host's MAX_SEED.
+  seed: Float!
+  # THE SCORE, and the only one. Zero means the gate passed. NULL means the gate never ran, which
+  # is NOT a pass — `updateWorkflowChampion` refuses it. There is deliberately no numeric quality
+  # score anywhere in this feature: a score needs a scale, a writer and an interpreter, and each is
+  # a place for a false pass to hide.
+  gateExit: Float
+  # How many tests the gate reported. ADVISORY AND NULLABLE, and null is NOT an error: a gate that
+  # prints nothing a parser recognises (a lint, a build, a bespoke script) is a perfectly
+  # legitimate gate with a perfectly well-known exit code. Never gate on it, never rank on it. Its
+  # one job is to let a human notice a suite that collects NOTHING — such a suite exits 0 and
+  # scores every workflow identically, so the search would follow pure noise unreported.
+  # `Float`, and BOUNDED on the host at Number.MAX_SAFE_INTEGER. It was left unbounded on the
+  # grounds that refusing a real gate result over an advisory number is the wrong trade — which made
+  # it the one field able to carry a value an IEEE-754 double cannot hold. The corruption was silent
+  # and happened BEFORE GraphQL: the host serialised an exact i64 and JSON.parse rounded it in the
+  # worker. No error, no null, no log. A refusal beats a wrong number that looks healthy.
+  gateCollected: Float
+  # JSON object, model → seats. The seat budget this run held; the comparability rule reads this.
+  seatsHeld: String!
+  # JSON object: fleet contention when the run started. Two concurrent runs contend, there is no
+  # 429 to notice, and the slower one simply looks like the worse workflow — this is how a human
+  # sees that instead of promoting a champion because the other box was quiet.
+  fleetBusy: String!
+  startedAt: String!
+  endedAt: String
+  # DERIVED on the host from fleetBusy, not stored: whether this run started on a quiet fleet and
+  # can therefore be scored at all. The arena scores on a quiet fleet; a run taken under load
+  # measured the fleet rather than the workflow.
+  #
+  # This replaced an earlier rule that two runs are comparable iff their fleetBusy maps are EQUAL.
+  # Equality was right in principle and wrong in practice: contention is a live measurement, two
+  # runs minutes apart are never byte-identical, and the feature would have looked finished while
+  # promoting nothing. Excluding rather than comparing keeps the design's point — a champion must
+  # never be crowned because the other box happened to be idle — without collapsing to never.
+  scoreable: Boolean!
+  # Why not, when scoreable is false. This is the field that turns "these two runs are mysteriously
+  # never comparable" into something a human can read.
+  notScoreableReason: String
+}
+
+# One outcome: this run beat that run. Also the project-level measurement.
+type WorkflowPref {
+  id: ID!
+  winnerRunId: String!
+  loserRunId: String!
+  # False when the two runs held DIFFERENT seat budgets. Computed by the host from the runs
+  # themselves — it is not an argument, so a client cannot assert a comparability it does not have.
+  # A non-comparable preference is still recorded (it happened) but CANNOT promote.
+  comparable: Boolean!
+  reason: String
+  createdAt: String!
+}
+
+# The search's state for one (repo, phaseType, family) — the halt as DATA rather than a log line.
+type WorkflowSearchState {
+  repo: String!
+  phaseType: String!
+  family: String!
+  # DISTINCT runs refused since the last `resume` in this family, counted from the end of the
+  # decision log. Distinct RUNS, not rejection rows: a retried call or a double-submitting button
+  # used to halt a search on one human verdict.
+  consecutiveRejections: Float!
+  # consecutiveRejections >= strikeLimit. While true the host REFUSES to start another run in this
+  # family AND refuses to promote one. The only way out is `updateWorkflowSearchResumed`: an
+  # explicit, human-confirmed decision carrying a reason. A promotion used to clear a halt, which
+  # made the halt escapable with no new evidence at all.
+  halted: Boolean!
+  strikeLimit: Float!
+  # The trailing rejections' reasons, newest first — the one thing a halted search owes a human.
+  recentRejections: [String!]!
+  championWorkflowId: String
+}
+
 type Query {
   listDesktopNodes: [DesktopNode!]!
   listAiSessions(status: String): [AiSession!]!
@@ -580,6 +771,31 @@ type Query {
   initiativeUploadChunk(initiativeId: ID!, path: String!, chunkIndex: Int!, totalChunks: Int!, dataBase64: String!, done: Boolean!): UploadChunkResult!
   # Whole-tree working-tree diff (overhaul P7, D7/D10) — path-keyed, scope-gated like the file ops.
   gitDiff(path: String!): GitDiffView!
+  # --- The workflow arena (desktop migration 026) ---
+  # All three filters are optional and independent; absent means "any".
+  workflows(repo: String, phaseType: String, family: String): [Workflow!]!
+  workflow(id: ID!): Workflow!
+  # A missing workflow is an ERROR here, not an empty list: "no runs yet" and "no such workflow"
+  # are different answers and an empty arena cannot tell them apart.
+  workflowRuns(workflowId: ID!): [WorkflowRun!]!
+  # Every preference involving this workflow's runs, as winner or loser, newest first.
+  #
+  # There was no way to read a preference back at all, so a client that recorded one and reloaded
+  # could not recover the `prefId` that updateWorkflowChampion requires — the only route forward was
+  # to record it again, which duplicated rows in the table the design calls the project-level
+  # measurement. recordWorkflowPref is idempotent per ordered pair now, and this is the other half:
+  # discovering an existing preference no longer requires issuing a write.
+  workflowPrefs(workflowId: ID!): [WorkflowPref!]!
+  # The repo identity the host derives for a workspace path — the ONE way a client learns the value
+  # to key its reads on, without re-implementing the derivation.
+  #
+  # `workflows.repo` used to be sent by the client as the basename of the workspace path, so two
+  # unrelated checkouts called johnnyone shared one champion. The host derives it now: the git
+  # remote, normalised, else the absolute path. The remote is the right identity and the path only a
+  # fallback, because this project works out of git worktrees constantly and keying on the path
+  # alone would give a worktree a different champion from its own main checkout.
+  repoIdentity(workspacePath: String!): String!
+  workflowSearchState(repo: String!, phaseType: String!, family: String!): WorkflowSearchState!
 }
 
 # --- Mutations ---
@@ -610,6 +826,21 @@ type Mutation {
   # Overhaul phase 7 (D1). Persist the Initiative's ordered validation-lens array as a JSON string;
   # a null/empty config clears it (→ desktop resolves the default product/qa/lead template).
   updateAgentPlanValidationConfig(id: ID!, config: String): AgentPlanRun!
+  # Set — or explicitly clear — the coordinator's test gate (migrations 023 / 025). `phaseId`
+  # picks the level: null writes the PLAN's gate, a phase id writes that phase's.
+  #
+  # `commands` is NON-NULL and clearing needs `clear: true`. Both are deliberate: with `commands`
+  # optional and an empty list meaning "remove", `updateAgentPlanTestCommands(id: "x")` silently
+  # wiped the Initiative-wide gate, which is the wrong thing for an incomplete call to do to a
+  # mutation that sounds additive. Clearing is still how a level opts out — a cleared phase falls
+  # back to the plan, a cleared plan means no gate at all — it just has to be asked for. Passing
+  # both a non-empty `commands` and `clear: true` is rejected.
+  updateAgentPlanTestCommands(id: ID!, phaseId: String, commands: [String!]!, clear: Boolean): AgentPlanRun!
+  # Run a phase's (or the plan's) effective gate ONCE and report the outcome, without bouncing the
+  # worker. Same resolution rule and same shell as the coordinator's automatic ready-check, so
+  # what this reports is what the coordinator would see. Commands run sequentially from the plan's
+  # workspacePath and stop at the first non-zero exit.
+  runAgentPlanTestGate(id: ID!, phaseId: String): TestGateRun!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
@@ -626,6 +857,109 @@ type Mutation {
   createBriefingInitiative(input: CreateBriefingInput!): AgentPlanRun!
   acceptInitiativeBrief(input: AcceptBriefInput!): AgentPlanRun!
   addInitiativeReferencePath(initiativeId: ID!, path: String!): AgentPlanRun!
+  # --- The workflow arena (desktop migration 026) ---
+  # A new version is never born champion; becoming one is updateWorkflowChampion's job.
+  # `repo` is NOT an argument — see repoIdentity. The host derives it from `workspacePath`, because
+  # a client-supplied identity is a client-supplied champion key.
+  #
+  # `phaseType` is validated against a closed set on the host: a champion is keyed on
+  # (repo, phaseType, family), so free text there starts a second search that looks like the real
+  # one.
+  createWorkflowVersion(workspacePath: String!, phaseType: String!, family: String!, parentId: String, role: String!, instruction: String!, contract: String!, hop: String!, fanOut: Float!): Workflow!
+  # REFUSED while the family's search is halted — that is what "three consecutive rejections halt
+  # the search" means operationally.
+  #
+  # `seatsHeld` and `fleetBusy` are NOT arguments, and used to be. The caller is a browser, which
+  # can measure neither: the UI was sending the declared budget and an EMPTY contention map, which
+  # reduced `comparable` to "did two clients type the same numbers" — the exact failure those two
+  # columns exist to prevent. The HOST takes both snapshots now
+  # (`services::workflows::measure_run_budget`, whose intended source is the lease pool).
+  #
+  # `seats` optionally overrides the workflow's own `fanOut`. The model family is never an argument:
+  # it is the workflow's, read from the workflow row.
+  startWorkflowRun(workflowId: ID!, planId: String, seed: Float, seats: Float): WorkflowRun!
+  # `gateExit` is NON-NULL: it is the score, and a missing score must be an error rather than a 0
+  # that reads as a pass. `gateCollected` is advisory and omitting it is a NORMAL result.
+  #
+  # `rescore` defaults to FALSE and a second result for a run is REFUSED without it. This was an
+  # unconditional overwrite: a second call silently replaced a green score with a red one and erased
+  # the advisory count, leaving only `endedAt` to say it had happened twice, so a promoted
+  # champion's own run could be re-scored red after the fact. The run a SITTING CHAMPION was
+  # promoted on is refused even with `rescore: true` — editing the evidence under a promotion that
+  # already happened is falsification, not correction.
+  recordWorkflowRunGate(runId: ID!, gateExit: Float!, gateCollected: Float): WorkflowRun!
+  # Replace a run's gate result with one measured elsewhere, DELIBERATELY.
+  #
+  # Its own field rather than a `rescore: Boolean` on the one above. The host's rationale for two
+  # entry points was "the separate name IS the guard: there is no flag to forget and no default to
+  # get wrong" — and the wire API still took a boolean, so on the only surface a client can reach,
+  # the guard WAS the flag that rationale rejected. The sitting champion's promoting run is refused
+  # through either field.
+  recordWorkflowRunRescore(runId: ID!, gateExit: Float!, gateCollected: Float): WorkflowRun!
+  # EXECUTE an arena run's gate and record the result — the step that closes the arena's loop.
+  #
+  # recordWorkflowRunGate takes a score someone else measured; this one MEASURES it, by running the
+  # plan's effective gate in the plan's workspace. Without it a workflow_runs row keeps a null
+  # gateExit forever, so promotion is refused for having no score and comparison is impossible,
+  # which makes the one human decision the arena exists for unreachable.
+  #
+  # Refused when the run has no plan, when the family's search is halted, and when the plan
+  # declares NO gate at either level — that last one matters most: an exit code of 0 is returned
+  # both by a gate that passed and by a phase with no gate, so recording it would make an ungated
+  # run look promotable. A phase with no gate cannot compete.
+  runWorkflowRunGate(runId: ID!, phaseId: String): WorkflowRun!
+  # Execute the gate AGAIN for a run that already has a score, and replace it. Its own field, for
+  # the same reason as recordWorkflowRunRescore.
+  #
+  # Named runWorkflowRunRescore rather than rescoreWorkflowRunGate because lokal infers the field
+  # type from the resolver filename's leading verb and `rescore-` is not a mutation prefix, so the
+  # other spelling auto-wires as a Query.
+  runWorkflowRunRescore(runId: ID!, phaseId: String): WorkflowRun!
+  # RUN one phase of an existing run on the host — the desktop's `execute_workflow_run` RPC.
+  #
+  # `verify` and `binary` are OPTIONAL and are NOT defaulted by the worker. The host owns the
+  # resolution rule for which verify command and which binary a run executes with; giving this
+  # field a worker-side default would put a second copy of that rule on the wire, where the stale
+  # one wins. Omitting one (or sending blank/whitespace) means "use the host's default", and the
+  # worker relays NOTHING for that key rather than a null that reads as an explicit override.
+  #
+  # Executes work on the host, so it carries plans:write like startWorkflowRun and
+  # runWorkflowRunGate. The result exposes `gateExit`, the run's score.
+  runWorkflowRunPhase(runId: ID!, verify: String, binary: String): WorkflowRun!
+  # There is deliberately no `comparable` argument — see WorkflowPref.comparable.
+  #
+  # IDEMPOTENT per ordered pair: calling it again for the same (winner, loser) returns the EXISTING
+  # preference instead of inserting a second one. If the second call carries a different `reason`,
+  # the first reason wins and the stored row comes back unchanged — a recorded outcome is not
+  # editable, and erroring would turn a page reload into a failure.
+  recordWorkflowPref(winnerRunId: ID!, loserRunId: ID!, reason: String): WorkflowPref!
+  # PROMOTE: make this run's workflow the one champion of its (repo, phaseType, family), demoting
+  # the incumbent in the SAME host transaction.
+  #
+  # `confirmed` is NON-NULL for the same reason `updateAgentPlanTestCommands.commands` is: this is
+  # the arena's one irreversible step, and a call that forgot its arguments must be a validation
+  # error rather than a promotion. The host defaults a missing value to false as well.
+  #
+  # Refused when the run's gateExit is NULL or non-zero, when the named preference is not
+  # comparable or names a different winner, or when an incumbent champion exists and no comparable
+  # preference was given. `prefId` may be omitted ONLY to seed a family's FIRST champion, where
+  # there is nothing to compare against; its gate must still be green.
+  updateWorkflowChampion(runId: ID!, prefId: String, confirmed: Boolean!): Workflow!
+  # REJECT: saying no, with a reason. `reason` is non-null and the host also refuses a blank one —
+  # three consecutive rejections halt the search and the reasons are all a halted search has to
+  # show. Returns the resulting search state so the halt is data the caller already holds.
+  recordWorkflowRejection(runId: ID!, reason: String!): WorkflowSearchState!
+  # RESUME: lift a halt. The ONLY thing that resets the rejection streak.
+  #
+  # It exists because a PROMOTION used to be what cleared a halt, and that made the halt escapable
+  # with no new evidence: re-promoting the sitting champion was a row-level no-op that still
+  # appended a decision and reset the count, and promoting the very run a human had rejected three
+  # times overturned the search's own refusal using the operation it was refusing.
+  #
+  # `reason` and `confirmed` are both non-null: continuing past a halt is the decision a reader will
+  # most want explained, and it must not be something a client reaches by forgetting an argument.
+  # Refused when the family is NOT halted — a resume with nothing to resume is a free streak reset.
+  updateWorkflowSearchResumed(repo: String!, phaseType: String!, family: String!, reason: String!, confirmed: Boolean!): WorkflowSearchState!
 }
 
 # --- Subscriptions ---

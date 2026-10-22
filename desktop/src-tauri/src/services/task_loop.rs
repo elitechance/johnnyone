@@ -1958,7 +1958,7 @@ mod tests {
         // I6: the executor_config's provider/model/ctx must reach the kloo request.
         let root = tmp("exec-cfg");
         let (mut ctx, _) = ctx_for(&root, "00-x");
-        ctx.exec_model = Some("muse-glimmer-30b".into());
+        ctx.exec_model = Some("qwen3.8-flash-next".into());
         ctx.exec_provider = Some("lokalai".into());
         ctx.exec_ctx = Some(65536);
         write_task(
@@ -1972,10 +1972,10 @@ mod tests {
         let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
         assert_eq!(out, PhaseLoopOutcome::AllDone);
         // base tier ran the CONFIGURED model via the CONFIGURED provider (not qwen3-coder / default)
-        assert_eq!(host.spawned_models[0], "muse-glimmer-30b");
+        assert_eq!(host.spawned_models[0], "qwen3.8-flash-next");
         assert_eq!(host.spawned_providers[0].as_deref(), Some("lokalai"));
         let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
-        assert_eq!(file.tasks[0].succeeded_tier.as_deref(), Some("muse-glimmer-30b"));
+        assert_eq!(file.tasks[0].succeeded_tier.as_deref(), Some("qwen3.8-flash-next"));
     }
 
     #[tokio::test]

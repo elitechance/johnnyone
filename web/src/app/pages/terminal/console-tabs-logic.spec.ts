@@ -10,6 +10,7 @@ import {
   rawAttachNeeded,
   resolvedPaneTab,
   visibleConsoleTabs,
+  consoleTabsWithArena,
 } from './console-tabs-logic';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -126,10 +127,45 @@ describe('visibleConsoleTabs', () => {
   });
 });
 
-describe('wiring — visibleConsoleTabs', () => {
-  it('terminal page mentions visibleConsoleTabs', () => {
-    const html = readFileSync(resolve(here, 'terminal.page.html'), 'utf8');
+// REPLACED (with the coordinator's authorisation, round 3). This was named a wiring test and
+// asserted that `terminal.page.{html,ts}` CONTAINED the string "visibleConsoleTabs" — which a
+// comment satisfies, and which would stay green if someone replaced the delegation with a
+// hand-rolled array that quietly dropped a tab. That is the exact drift the two-function design
+// exists to prevent, so the wiring test now asserts the DELEGATION over the same fixtures the file
+// already uses, plus the one thing a pure test cannot see: which function the page calls.
+describe('wiring — the strip the console renders is the strip this file decides, plus arena', () => {
+  const FIXTURES: { name: string; init: AgentPlan; taskRun: boolean; planCheck: boolean; preflight: boolean }[] = [
+    { name: 'commercial planning', init: plan({ initiativeStatus: 'planning' }), taskRun: false, planCheck: false, preflight: false },
+    { name: 'commercial development', init: plan({ initiativeStatus: 'development' }), taskRun: true, planCheck: true, preflight: true },
+    { name: 'local-small planning', init: plan({ initiativeStatus: 'planning', executorConfig: '{"mode":"local-small"}' }), taskRun: false, planCheck: false, preflight: false },
+    { name: 'local-small development + preflight', init: plan({ initiativeStatus: 'development', executorConfig: '{"mode":"local-small"}' }), taskRun: false, planCheck: false, preflight: true },
+    { name: 'local-small development + task-run', init: plan({ initiativeStatus: 'development', executorConfig: '{"mode":"local-small"}' }), taskRun: true, planCheck: false, preflight: true },
+  ];
+
+  for (const f of FIXTURES) {
+    it(`${f.name}: the rendered strip is exactly visibleConsoleTabs + arena`, () => {
+      const base = visibleConsoleTabs(f.init, f.taskRun, f.planCheck, f.preflight);
+      expect(consoleTabsWithArena(f.init, f.taskRun, f.planCheck, f.preflight)).toEqual([
+        ...base,
+        'arena',
+      ]);
+    });
+  }
+
+  it('appends arena exactly once, and never drops or reorders what was already there', () => {
+    for (const f of FIXTURES) {
+      const withArena = consoleTabsWithArena(f.init, f.taskRun, f.planCheck, f.preflight);
+      expect(withArena.filter((t) => t === 'arena')).toHaveLength(1);
+      expect(withArena[withArena.length - 1]).toBe('arena');
+      expect(new Set(withArena).size).toBe(withArena.length);
+    }
+  });
+
+  it('the console calls the delegating function, not a hand-rolled list', () => {
     const ts = readFileSync(resolve(here, 'terminal.page.ts'), 'utf8');
-    expect(html + ts).toMatch(/visibleConsoleTabs/);
+    expect(ts).toMatch(/visibleTabs\s*=\s*computed\([^;]*consoleTabsWithArena\(/);
+    // A second, literal tab array in the page would be the drift this guards against — in either
+    // quote style, because `["raw", "plan", …]` evaded the single-quote-only version.
+    expect(ts).not.toMatch(/\[\s*(['"`])raw\1\s*,\s*(['"`])plan\2/);
   });
 });

@@ -1569,7 +1569,7 @@ fn send_keys_named_args(pane_id: &str, keys: &[String]) -> Vec<String> {
     args
 }
 
-async fn run_tmux(args: Vec<String>) -> Result<String, String> {
+pub(crate) async fn run_tmux(args: Vec<String>) -> Result<String, String> {
     let output = Command::new("tmux")
         .args(&args)
         .output()

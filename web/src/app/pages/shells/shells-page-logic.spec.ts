@@ -10,6 +10,7 @@ import {
   attachableTmux,
   shellSessionLabel,
   formatRelTime,
+  shellRowState,
   openIntent,
 } from './shells-page-logic';
 import { plainTerminalRoute, attachTmuxInput } from '../../components/launcher-menu/launcher-logic';
@@ -108,6 +109,62 @@ describe('shells page — pure logic', () => {
 
     it('treats a whitespace-only title as empty', () => {
       expect(shellSessionLabel({ title: '   ', attachedTmux: false })).toEqual({ title: 'Shell', tag: 'shell' });
+    });
+  });
+
+  // The badge must follow the terminal's REAL state. `attachedTmux` is only the INTENT, so a row whose
+  // tmux has died kept reading "attached tmux" while three keystrokes typed into it vanished (measured:
+  // `kloo-cli` listed as attached; tmux reported only `j1`, `kloo`, `kord`). The host now sends the LIVE
+  // `terminalStatus` ('none' | 'attached' | 'detached' | 'ended'); this is where intent and truth meet.
+  describe('shellRowState', () => {
+    it('reads "shell" for a plain shell — it has no external pane that could die', () => {
+      expect(shellRowState({ attachedTmux: false, terminalStatus: 'attached' })).toBe('shell');
+      expect(shellRowState({ attachedTmux: false, terminalStatus: 'ended' })).toBe('shell');
+      expect(shellRowState({ attachedTmux: false, terminalStatus: undefined })).toBe('shell');
+    });
+
+    it('reads "ended" for an attached row whose terminal is gone (the measured kloo-cli case)', () => {
+      expect(shellRowState({ attachedTmux: true, terminalStatus: 'ended' })).toBe('ended');
+    });
+
+    it('reads "detached" for an attached row whose pane exists but is not being viewed', () => {
+      expect(shellRowState({ attachedTmux: true, terminalStatus: 'detached' })).toBe('detached');
+    });
+
+    it('reads "attached" when the host reports the terminal attached', () => {
+      expect(shellRowState({ attachedTmux: true, terminalStatus: 'attached' })).toBe('attached');
+    });
+
+    // An OLDER host that does not send the field must keep behaving exactly as today. Absence is not
+    // evidence of death — only an explicit 'ended' is.
+    it('reads "attached" when terminalStatus is MISSING (older host — no invented death)', () => {
+      expect(shellRowState({ attachedTmux: true, terminalStatus: undefined })).toBe('attached');
+      expect(shellRowState({ attachedTmux: true } as any)).toBe('attached');
+    });
+
+    it('reads "attached" for an unrecognised status rather than guessing a death', () => {
+      expect(shellRowState({ attachedTmux: true, terminalStatus: 'none' })).toBe('attached');
+      expect(shellRowState({ attachedTmux: true, terminalStatus: 'what-is-this' })).toBe('attached');
+      expect(shellRowState({ attachedTmux: true, terminalStatus: '' })).toBe('attached');
+    });
+
+    // 'ended' and 'detached' are different promises: one pane can be re-opened, the other cannot, so
+    // collapsing them (or reading either as 'attached') would put `Open ▸` back on a dead row.
+    it('keeps "ended" distinct from "detached" and from "attached"', () => {
+      const ended = shellRowState({ attachedTmux: true, terminalStatus: 'ended' });
+      const detached = shellRowState({ attachedTmux: true, terminalStatus: 'detached' });
+      const attached = shellRowState({ attachedTmux: true, terminalStatus: 'attached' });
+      expect(ended).not.toBe(detached);
+      expect(ended).not.toBe(attached);
+      expect(detached).not.toBe(attached);
+      expect(new Set([ended, detached, attached]).size).toBe(3);
+    });
+
+    it('answers differently for every state the host can report', () => {
+      const answers = (['ended', 'detached', 'attached', 'none', undefined] as const).map((t) =>
+        shellRowState({ attachedTmux: true, terminalStatus: t }),
+      );
+      expect(answers).toEqual(['ended', 'detached', 'attached', 'attached', 'attached']);
     });
   });
 

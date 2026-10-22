@@ -1,9 +1,93 @@
-use crate::db::models::{CreateSessionInput, Message, Session};
+use crate::db::models::{CreateSessionInput, Message};
 use crate::events::SessionUpdatedEvent;
 use crate::providers::CliProvider;
 use crate::state::app_state::AppState;
 use rusqlite::params;
+use std::collections::HashSet;
 use uuid::Uuid;
+
+/// Decide what the host tells the client a session's terminal REALLY is.
+///
+/// - not an attached-tmux session → `"none"`;
+/// - `tmux_alive == Some(false)` → `"ended"` — the tmux is gone, and that beats whatever
+///   the row stored, because the row is a memory and the tmux is the fact;
+/// - `tmux_alive == Some(true)` or `None` (we could not check) → `"attached"` when `stored`
+///   is `"attached"`, otherwise `"detached"`.
+///
+/// `None` means "unknown", and unknown must NEVER be reported as `"ended"` — a failed check
+/// is not evidence that a terminal died.
+pub fn reported_terminal_status(
+    attached_tmux: bool,
+    stored: Option<&str>,
+    tmux_alive: Option<bool>,
+) -> &'static str {
+    if !attached_tmux {
+        return "none";
+    }
+    if tmux_alive == Some(false) {
+        return "ended";
+    }
+    if stored == Some("attached") {
+        "attached"
+    } else {
+        "detached"
+    }
+}
+
+/// The struct that goes to the client IS `db::models::Session` — this module owns the
+/// `terminal_status` decision (see [`reported_terminal_status`]) and re-exports the type
+/// so every caller (`commands::sessions`, the host GraphQL, the relay RPC) reads the real
+/// terminal state off one struct instead of guessing from the `attached_tmux` INTENT flag.
+pub use crate::db::models::Session;
+
+/// Ask tmux ONCE which sessions exist, for a whole listing.
+///
+/// `Some(names)` = the exact names tmux reported, so a row can pass
+/// `Some(names.contains(name))`. `None` = tmux could not be asked at all (no binary, no
+/// server) — every row then gets `tmux_alive == None`, which [`reported_terminal_status`]
+/// refuses to call `"ended"`.
+fn live_tmux_session_names() -> Option<HashSet<String>> {
+    let out = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim_end_matches(['\r', '\n']))
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+/// The external tmux session name a row expects, if it recorded one.
+fn stored_tmux_name(conn: &rusqlite::Connection, id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT tmux_session_name FROM sessions WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .map(|name| name.trim().to_string())
+    .filter(|name| !name.is_empty())
+}
+
+/// Is this row's tmux alive, given the one live-name set for the whole listing?
+/// `None` (unknown) when tmux could not be asked.
+fn tmux_alive_for(
+    conn: &rusqlite::Connection,
+    id: &str,
+    live: Option<&HashSet<String>>,
+) -> Option<bool> {
+    let names = live?;
+    match stored_tmux_name(conn, id) {
+        Some(name) => Some(names.contains(&name)),
+        None => Some(false),
+    }
+}
 
 pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Session, String> {
     let id = Uuid::new_v4().to_string();
@@ -81,6 +165,10 @@ pub fn list_sessions_filtered(
     status: Option<String>,
     kind: Option<String>,
 ) -> Result<Vec<Session>, String> {
+    // ONE tmux question for the whole listing, never one per row. `None` means tmux
+    // could not be asked, and then no row may be called "ended".
+    let live = live_tmux_session_names();
+
     state.db.with_conn(|conn| {
         let mut clauses: Vec<String> = Vec::new();
         let mut bound: Vec<String> = Vec::new();
@@ -98,7 +186,7 @@ pub fn list_sessions_filtered(
             format!(" WHERE {}", clauses.join(" AND "))
         };
         let sql = format!(
-            "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux FROM sessions{} ORDER BY updated_at DESC",
+            "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status FROM sessions{} ORDER BY updated_at DESC",
             where_sql
         );
 
@@ -108,8 +196,12 @@ pub fn list_sessions_filtered(
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let sessions = stmt
             .query_map(params_dyn.as_slice(), |row| {
+                let id: String = row.get(0)?;
+                let attached_tmux: bool = row.get::<_, i64>(13)? != 0;
+                let stored: Option<String> = row.get(14)?;
+                let tmux_alive = tmux_alive_for(conn, &id, live.as_ref());
                 Ok(Session {
-                    id: row.get(0)?,
+                    id,
                     title: row.get(1)?,
                     provider: row.get(2)?,
                     model: row.get(3)?,
@@ -122,7 +214,13 @@ pub fn list_sessions_filtered(
                     kind: row.get(10)?,
                     created_at: row.get(11)?,
                     updated_at: row.get(12)?,
-                    attached_tmux: row.get::<_, i64>(13)? != 0,
+                    attached_tmux,
+                    terminal_status: reported_terminal_status(
+                        attached_tmux,
+                        stored.as_deref(),
+                        tmux_alive,
+                    )
+                    .to_string(),
                 })
             })
             .map_err(|e| e.to_string())?
@@ -316,11 +414,16 @@ pub fn list_messages(
     })
 }
 
+/// The single-session read. Carries `terminal_status` too, checked against tmux the same way
+/// a listing is — ONE `tmux list-sessions` for this one row.
 fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, String> {
+    let live = live_tmux_session_names();
     conn.query_row(
-        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux FROM sessions WHERE id = ?1",
+        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status FROM sessions WHERE id = ?1",
         params![id],
         |row| {
+            let attached_tmux: bool = row.get::<_, i64>(13)? != 0;
+            let stored: Option<String> = row.get(14)?;
             Ok(Session {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -335,7 +438,13 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                 kind: row.get(10)?,
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
-                attached_tmux: row.get::<_, i64>(13)? != 0,
+                attached_tmux,
+                terminal_status: reported_terminal_status(
+                    attached_tmux,
+                    stored.as_deref(),
+                    tmux_alive_for(conn, id, live.as_ref()),
+                )
+                .to_string(),
             })
         },
     )
@@ -350,4 +459,162 @@ fn publish_session_update(state: &AppState, session: &Session) {
         session_id: session.id.clone(),
         session: value,
     });
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::reported_terminal_status;
+
+    // ── branch: not an attached-tmux session → "none" ─────────────────────────
+    // Whatever else is known about such a row, it has no external terminal to report.
+
+    #[test]
+    fn reported_terminal_status_not_attached_tmux_is_none_regardless_of_stored() {
+        assert_eq!(reported_terminal_status(false, None, None), "none");
+        assert_eq!(reported_terminal_status(false, None, Some(true)), "none");
+        assert_eq!(reported_terminal_status(false, None, Some(false)), "none");
+        assert_eq!(
+            reported_terminal_status(false, Some("attached"), Some(true)),
+            "none"
+        );
+        assert_eq!(
+            reported_terminal_status(false, Some("attached"), Some(false)),
+            "none"
+        );
+        assert_eq!(
+            reported_terminal_status(false, Some("detached"), None),
+            "none"
+        );
+    }
+
+    // ── branch: tmux_alive == Some(false) → "ended" ───────────────────────────
+    // The tmux is gone, and that beats whatever the row stored: the row is a
+    // memory, the tmux is the fact.
+
+    #[test]
+    fn reported_terminal_status_stored_attached_whose_tmux_is_gone_reports_ended() {
+        // The measured defect: 00d2bdc0 / "kloo-cli" — stored "attached" (or
+        // anything else), no such tmux on the machine. Must NOT read as attached.
+        assert_eq!(
+            reported_terminal_status(true, Some("attached"), Some(false)),
+            "ended"
+        );
+        assert_eq!(
+            reported_terminal_status(true, Some("detached"), Some(false)),
+            "ended"
+        );
+        assert_eq!(reported_terminal_status(true, None, Some(false)), "ended");
+        assert_eq!(
+            reported_terminal_status(true, Some("none"), Some(false)),
+            "ended"
+        );
+        assert_eq!(
+            reported_terminal_status(true, Some("garbage"), Some(false)),
+            "ended"
+        );
+    }
+
+    // ── branch: tmux alive (or unchecked) + stored "attached" → "attached" ────
+
+    #[test]
+    fn reported_terminal_status_tmux_alive_and_stored_attached_reports_attached() {
+        assert_eq!(
+            reported_terminal_status(true, Some("attached"), Some(true)),
+            "attached"
+        );
+    }
+
+    #[test]
+    fn reported_terminal_status_unknown_check_and_stored_attached_reports_attached() {
+        // Could not ask tmux — the stored memory is all we have, and it says attached.
+        assert_eq!(
+            reported_terminal_status(true, Some("attached"), None),
+            "attached"
+        );
+    }
+
+    // ── branch: tmux alive (or unchecked) + stored NOT "attached" → "detached" ─
+
+    #[test]
+    fn reported_terminal_status_tmux_alive_and_stored_detached_reports_detached() {
+        assert_eq!(
+            reported_terminal_status(true, Some("detached"), Some(true)),
+            "detached"
+        );
+    }
+
+    #[test]
+    fn reported_terminal_status_tmux_alive_and_stored_missing_or_other_reports_detached() {
+        assert_eq!(reported_terminal_status(true, None, Some(true)), "detached");
+        assert_eq!(
+            reported_terminal_status(true, Some(""), Some(true)),
+            "detached"
+        );
+        assert_eq!(
+            reported_terminal_status(true, Some("none"), Some(true)),
+            "detached"
+        );
+        assert_eq!(
+            reported_terminal_status(true, Some("ended"), Some(true)),
+            "detached"
+        );
+    }
+
+    #[test]
+    fn reported_terminal_status_unknown_check_and_stored_detached_reports_detached() {
+        assert_eq!(reported_terminal_status(true, None, None), "detached");
+        assert_eq!(
+            reported_terminal_status(true, Some("detached"), None),
+            "detached"
+        );
+        assert_eq!(
+            reported_terminal_status(true, Some("none"), None),
+            "detached"
+        );
+    }
+
+    // ── the hard rule: an unknown check NEVER reports "ended" ─────────────────
+    // A failed `tmux list-sessions` (no binary, no server) is not evidence that a
+    // terminal died. `None` must never produce "ended" for any input.
+
+    #[test]
+    fn reported_terminal_status_unknown_check_never_reports_ended() {
+        for attached in [true, false] {
+            for stored in [
+                None,
+                Some(""),
+                Some("attached"),
+                Some("detached"),
+                Some("ended"),
+                Some("none"),
+                Some("Attached"),
+                Some("garbage"),
+            ] {
+                let answer = reported_terminal_status(attached, stored, None);
+                assert_ne!(
+                    answer, "ended",
+                    "unknown tmux check reported \"ended\" for attached={attached}, stored={stored:?}"
+                );
+                assert!(
+                    matches!(answer, "none" | "attached" | "detached"),
+                    "unexpected status {answer:?} for attached={attached}, stored={stored:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reported_terminal_status_only_answers_the_four_known_states() {
+        for attached in [true, false] {
+            for stored in [None, Some("attached"), Some("detached"), Some("junk")] {
+                for alive in [None, Some(true), Some(false)] {
+                    let answer = reported_terminal_status(attached, stored, alive);
+                    assert!(
+                        matches!(answer, "none" | "attached" | "detached" | "ended"),
+                        "invented status {answer:?} for attached={attached}, stored={stored:?}, alive={alive:?}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -4,6 +4,7 @@ import {
   writeCachedRpc,
   invalidateCachedRpc,
   invalidatedReadsFor,
+  isReadRpcCacheable,
 } from './desktop-rpc-cache';
 
 const auth = { tenantId: 't1', userId: 'u1' } as any;
@@ -72,6 +73,39 @@ describe('desktop RPC cache — write invalidation (F2)', () => {
       expect(invalidatedReadsFor(method), method).toContain('list_sessions');
     }
     expect(invalidatedReadsFor('list_sessions')).toEqual([]);
+  });
+
+  it('a plan-gate WRITE invalidates the cached plan reads it stales', () => {
+    // get_agent_plan is cached for 3s. Without invalidation, a client that just set a gate reads
+    // back the PREVIOUS effectiveTestCommands for up to a full TTL — the field the design calls
+    // the one to render and the one to trust, serving a stale answer right after the write that
+    // changed it.
+    for (const method of [
+      'update_agent_plan_test_commands',
+      'update_agent_plan_validation_config',
+    ]) {
+      expect(invalidatedReadsFor(method), method).toContain('get_agent_plan');
+      expect(invalidatedReadsFor(method), method).toContain('list_agent_plans');
+    }
+  });
+
+  it('a gate RUN is never served from cache', () => {
+    // run_agent_plan_test_gate EXECUTES commands. A cached second call would report the first
+    // call's exit code, which is the one thing a gate must never do. It must stay out of
+    // CACHE_TTL_MS entirely rather than rely on an invalidation entry.
+    expect(isReadRpcCacheable('run_agent_plan_test_gate')).toBe(false);
+    // And the reads it must not displace are cacheable, so this is a real distinction.
+    expect(isReadRpcCacheable('get_agent_plan')).toBe(true);
+  });
+
+  it('a plan-gate write actually drops the cached plan read', () => {
+    // End to end through the cache, not just the map: write a plan read, invalidate via the gate
+    // write method, and the entry must be gone.
+    const gateAuth = { tenantId: 't-gate', userId: 'u-gate' } as any;
+    writeCachedRpc(gateAuth, 'get_agent_plan', { id: 'p1' }, { plan: { id: 'p1' } });
+    expect(readCachedRpc(gateAuth, 'get_agent_plan', { id: 'p1' })).not.toBeNull();
+    invalidateCachedRpc(gateAuth, 'update_agent_plan_test_commands');
+    expect(readCachedRpc(gateAuth, 'get_agent_plan', { id: 'p1' })).toBeNull();
   });
 });
 

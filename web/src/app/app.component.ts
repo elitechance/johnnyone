@@ -1,5 +1,5 @@
-import { Component, HostListener, inject } from '@angular/core';
-import { RouterLink, RouterLinkActive } from '@angular/router';
+import { Component, HostListener, computed, inject, signal } from '@angular/core';
+import { NavigationEnd, Router, RouterLink } from '@angular/router';
 import {
   IonApp,
   IonIcon,
@@ -21,18 +21,18 @@ import {
   logOutOutline,
   settingsOutline,
   terminalOutline,
+  trophyOutline,
 } from 'ionicons/icons';
 import { AuthService } from './services/auth.service';
 import { MermaidZoomService } from './services/mermaid-zoom.service';
 import { MermaidZoomModalComponent } from './components/mermaid-zoom-modal/mermaid-zoom-modal.component';
 import { FileViewerModalComponent } from './components/file-viewer-modal/file-viewer-modal.component';
 import { LauncherMenuComponent } from './components/launcher-menu/launcher-menu.component';
-import { NAV_ITEMS } from './nav-items';
+import { NAV_ITEMS, navItemIsActive, navLinkQueryParams } from './nav-items';
 
 @Component({
   imports: [
     RouterLink,
-    RouterLinkActive,
     IonApp,
     IonIcon,
     IonRouterOutlet,
@@ -46,13 +46,44 @@ import { NAV_ITEMS } from './nav-items';
 })
 export class AppComponent {
   protected readonly auth = inject(AuthService);
+  private readonly router = inject(Router);
   private readonly mermaidZoom = inject(MermaidZoomService);
   private readonly popoverCtrl = inject(PopoverController);
 
-  /** The four global destinations shared by the rail + bottom nav (single source). */
+  /** The global destinations shared by the rail + bottom nav (single source). */
   protected readonly navItems = NAV_ITEMS;
 
+  /**
+   * The URL the nav lights from. `routerLinkActive` is NOT used for this any more, and that is the
+   * whole fix: it lights an item only when the URL starts with that item's own `routerLink`, so the
+   * arena's `/workflows` tree lit nothing — measured in Chrome at 400x860, `nav.botnav a.b.on` was
+   * the empty set on `/workflows`, `/workflows/:id` and `/workflows/:id/arena`. Each item now
+   * declares the area it OWNS (`NavItem.owns`) and the lit state is a prefix test against that
+   * (`navItemIsActive`, pinned by `nav-active.spec.ts`).
+   *
+   * Seeded from `router.url` rather than only from the event stream: the first paint happens before
+   * any `NavigationEnd` on a cold load, and an unlit bar on first paint is the same defect.
+   */
+  private readonly currentUrl = signal(this.router.url);
+  protected readonly navActive = computed(() => {
+    const url = this.currentUrl();
+    return Object.fromEntries(NAV_ITEMS.map((item) => [item.id, navItemIsActive(item, url)]));
+  });
+
+  /**
+   * Per-item link query. Only the arena entry gets one, and only from the console — see
+   * `navLinkQueryParams`. It is what stops the global way in from being a way to LOSE the
+   * initiative you were on.
+   */
+  protected readonly navQuery = computed(() => {
+    const url = this.currentUrl();
+    return Object.fromEntries(NAV_ITEMS.map((item) => [item.id, navLinkQueryParams(item, url)]));
+  });
+
   constructor() {
+    this.router.events.subscribe((event) => {
+      if (event instanceof NavigationEnd) this.currentUrl.set(event.urlAfterRedirects);
+    });
     // The rail uses add/apps/folder/code-working/settings; the remaining glyphs
     // stay registered so other pages that reference them by name keep resolving.
     addIcons({
@@ -67,6 +98,7 @@ export class AppComponent {
       'code-slash-outline': codeSlashOutline,
       'code-working-outline': codeWorkingOutline,
       'settings-outline': settingsOutline,
+      'trophy-outline': trophyOutline,
       'log-out-outline': logOutOutline,
     });
   }

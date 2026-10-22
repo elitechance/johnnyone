@@ -1,3 +1,9 @@
+// Dead-CSS purge: 34 top-level classes referenced by no template or TS under web/src or
+// ui/src were deleted from this file. They were leftovers from pages that now live in
+// attic/ (the legacy workspace topbar, draggable terminal panes, and the file-browser /
+// planner modals mirrored from planner.page.scss). The file was 75,234 bytes and compiled
+// to ~48 kB — at the 48 kB error budget ceiling (double its 24 kB warning threshold).
+// Rules reaching into child components, :host, and element/attribute selectors were untouched.
 @use '../../styles/workspace-responsive' as workspace;
 
 :host {
@@ -37,144 +43,6 @@
   color: #dbe7f3;
 }
 
-.workspace-topbar {
-  display: grid;
-  grid-template-columns: auto auto 1fr auto;
-  align-items: center;
-  gap: 12px;
-  padding: 0 14px;
-  border-bottom: 1px solid #263241;
-  background: #0a0d12;
-}
-
-.brand-lockup,
-.workspace-actions,
-.mode-switch,
-.pane-title,
-.pane-meta {
-  display: flex;
-  align-items: center;
-}
-
-.brand-lockup {
-  gap: 10px;
-  font-weight: 650;
-}
-
-.brand-name {
-  font-size: 20px;
-  line-height: 1;
-}
-
-.brand-mark {
-  width: 20px;
-  height: 20px;
-  border: 1px solid #3a4a5f;
-  background:
-    linear-gradient(90deg, transparent 47%, rgba(100, 181, 255, 0.75) 48%, rgba(100, 181, 255, 0.75) 52%, transparent 53%),
-    linear-gradient(0deg, transparent 47%, rgba(87, 214, 141, 0.75) 48%, rgba(87, 214, 141, 0.75) 52%, transparent 53%),
-    #101722;
-}
-
-.workspace-topbar-brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.workspace-tabs {
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 6px;
-  min-width: 0;
-  overflow: auto hidden;
-  overscroll-behavior-inline: contain;
-  scrollbar-width: none;
-  -webkit-overflow-scrolling: touch;
-  touch-action: pan-x;
-}
-
-.workspace-tab {
-  flex: 0 0 auto;
-  height: 30px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 10px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: #8fa0b3;
-  cursor: grab;
-  white-space: nowrap;
-
-  &.dragging {
-    opacity: 0.45;
-    cursor: grabbing;
-  }
-
-  &.active {
-    color: #dbe7f3;
-    border-color: #263241;
-    background: #121821;
-  }
-}
-
-.tab-status {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #57d68d;
-}
-
-.tab-number {
-  color: #8fa0b3;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
-}
-
-.workspace-actions {
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.mode-switch {
-  border: 1px solid #263241;
-}
-
-.mode-switch button {
-  @include workspace.control-height;
-  min-width: 96px;
-  border: 0;
-  background: transparent;
-  color: #8fa0b3;
-  padding: 0 10px;
-  cursor: pointer;
-  font: 14px/1.2 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-
-.mode-switch button.active {
-  color: #dbe7f3;
-  background: #10243a;
-  box-shadow: inset 0 -2px 0 #64b5ff;
-}
-
-.provider-dropdown,
-.primary-action,
-.icon-action,
-.pane-tool,
-.pane-icon {
-  @include workspace.control-height;
-  border: 1px solid #263241;
-  background: #121821;
-  color: #dbe7f3;
-}
-
-.provider-dropdown {
-  min-width: 150px;
-  padding: 0 9px;
-}
-
 .primary-action {
   min-width: 150px;
   padding: 0 12px;
@@ -188,11 +56,21 @@
   }
 }
 
-.icon-action {
-  width: 32px;
-  display: inline-grid;
-  place-items: center;
-  cursor: pointer;
+.secondary-action {
+  background: #122033;
+  border-color: #2e4763;
+}
+
+.pane-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 10px;
+  border-bottom: 1px solid #263241;
+  background: #101722;
+  cursor: move;
 }
 
 .terminal-workspace {
@@ -209,157 +87,6 @@
 
   &.has-fullscreen-pane {
     background: #07090d;
-  }
-}
-
-.terminal-pane {
-  position: absolute;
-  min-width: 420px;
-  min-height: 260px;
-  border: 1px solid #3a4a5f;
-  background: #0d1117;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
-  display: grid;
-  grid-template-rows: 36px 1fr;
-  overflow: hidden;
-  z-index: 1;
-
-  &.active {
-    border-color: #64b5ff;
-    box-shadow: 0 22px 58px rgba(0, 0, 0, 0.55);
-    z-index: 3;
-  }
-
-  &.dragging,
-  &.resizing {
-    border-color: #64b5ff;
-    user-select: none;
-  }
-
-  &.fullscreen {
-    min-width: 0;
-    min-height: 0;
-    z-index: 8;
-    border-color: #64b5ff;
-    box-shadow: inset 0 0 0 1px rgba(100, 181, 255, 0.18);
-
-    .pane-header {
-      cursor: default;
-    }
-  }
-}
-
-.pane-header {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  padding: 0 10px;
-  border-bottom: 1px solid #263241;
-  background: #101722;
-  cursor: move;
-}
-
-.pane-title {
-  gap: 8px;
-  min-width: 0;
-  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-}
-
-.provider-badge {
-  flex: 0 0 auto;
-  padding: 3px 6px;
-  border: 1px solid #263241;
-  color: #64b5ff;
-  background: rgba(100, 181, 255, 0.08);
-  font-size: 11px;
-}
-
-.pane-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pane-id {
-  color: #8fa0b3;
-}
-
-.pane-meta {
-  gap: 8px;
-  min-width: 0;
-}
-
-.pane-tool {
-  max-width: 220px;
-  padding: 0 8px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  color: #8fa0b3;
-  cursor: pointer;
-
-  &.danger {
-    color: #fca5a5;
-  }
-}
-
-.pane-fullscreen-btn {
-  min-width: 44px;
-  max-width: none;
-  padding: 0 8px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: #bfdbfe;
-  flex: 0 0 auto;
-
-  ion-icon {
-    font-size: 15px;
-    flex: 0 0 auto;
-  }
-}
-
-.pane-fullscreen-label {
-  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  text-transform: lowercase;
-}
-
-.pane-icon {
-  width: 28px;
-  display: inline-grid;
-  place-items: center;
-  color: #8fa0b3;
-  cursor: pointer;
-  font: 16px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-
-  &:hover {
-    color: #fca5a5;
-  }
-}
-
-.pane-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: #57d68d;
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-
-  &::before {
-    content: '';
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-
-  &.offline {
-    color: #f87171;
   }
 }
 
@@ -423,12 +150,6 @@
   }
 }
 
-// The transcript surface scrolls its reflowing content (the terminal surface manages
-// its own scroll internally, so this only applies to the Transcript tab).
-.transcript-surface {
-  overflow: auto;
-}
-
 ::ng-deep .terminal-pane johnny-terminal-screen {
   display: flex;
   flex-direction: column;
@@ -442,30 +163,6 @@
   min-height: 0;
   overflow: hidden;
   border: 0;
-}
-
-.pane-resize-handle {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  width: 18px;
-  height: 18px;
-  cursor: nwse-resize;
-  background:
-    linear-gradient(135deg, transparent 52%, rgba(143, 160, 179, 0.85) 53%, rgba(143, 160, 179, 0.85) 58%, transparent 59%),
-    linear-gradient(135deg, transparent 68%, rgba(143, 160, 179, 0.7) 69%, rgba(143, 160, 179, 0.7) 74%, transparent 75%);
-}
-
-.terminal-error {
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: 12px;
-  padding: 10px 12px;
-  border: 1px solid rgba(248, 113, 113, 0.45);
-  background: rgba(69, 10, 10, 0.92);
-  color: #fecaca;
-  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .workspace-empty {
@@ -488,22 +185,10 @@
   color: #8fa0b3;
 }
 
-.workspace-statusbar {
+// The strip's own look lives in WorkspaceStatusbarComponent, which every workspace surface now
+// renders. What stays here is the one thing that is this layout's business: its grid track.
+johnny-workspace-statusbar {
   grid-row: 3; // pinned to the last (auto) track so the conditional topbar can't shift it
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 10px;
-  border-top: 1px solid #263241;
-  background: #0a0d12;
-  color: #8fa0b3;
-  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-
-  strong {
-    color: #dbe7f3;
-    font-weight: 500;
-  }
 }
 
 @media (max-width: workspace.$mobile-breakpoint) {
@@ -570,96 +255,6 @@
     grid-template-rows: auto minmax(0, 1fr) auto;
   }
 
-  .workspace-topbar {
-    grid-template-columns: 1fr;
-    @include workspace.mobile-topbar;
-    gap: 6px;
-    padding-block: 6px;
-    max-height: none;
-    overflow: visible;
-  }
-
-  .workspace-topbar-brand {
-    width: 100%;
-  }
-
-  .page-title-chip {
-    margin-inline: 0 auto 0;
-  }
-
-  .workspace-session-segment {
-    width: 100%;
-    min-width: 0;
-    --background: transparent;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    touch-action: pan-x;
-
-    ion-segment-button {
-      --padding-start: 10px;
-      --padding-end: 10px;
-      min-width: 0;
-    }
-
-    ion-label {
-      font-size: 12px;
-      letter-spacing: 0.01em;
-    }
-  }
-
-  .workspace-tabs {
-    @include workspace.mobile-tab-strip;
-    flex: none;
-    touch-action: pan-x;
-  }
-
-  .workspace-tab {
-    flex: 0 0 auto;
-    max-width: min(72vw, 300px);
-  }
-
-  .brand-lockup {
-    min-width: 0;
-  }
-
-  .brand-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .mode-switch {
-    @include workspace.mobile-mode-switch;
-  }
-
-  .workspace-actions {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    gap: 6px;
-    width: 100%;
-    padding-bottom: 0;
-  }
-
-  .workspace-actions .provider-dropdown {
-    grid-column: 1;
-    min-width: 0;
-    width: 100%;
-  }
-
-  .workspace-actions .primary-action {
-    grid-column: 2;
-    min-width: 0;
-    width: auto;
-    padding: 0 10px;
-    white-space: nowrap;
-  }
-
-  .workspace-actions .icon-action {
-    grid-column: 3;
-    width: 32px;
-    min-width: 32px;
-  }
-
   .terminal-workspace {
     @include workspace.mobile-panel-shell;
     display: flex;
@@ -667,75 +262,6 @@
     min-height: 0;
     padding: 6px;
     overflow: hidden;
-  }
-
-  .terminal-pane {
-    position: relative;
-    left: auto !important;
-    top: auto !important;
-    width: 100% !important;
-    height: 100% !important;
-    flex: 1 1 auto;
-    grid-template-rows: auto minmax(0, 1fr);
-    min-width: 0;
-    min-height: 0;
-    max-width: 100%;
-    max-height: none;
-    overflow: hidden;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
-  }
-
-  .pane-header {
-    grid-row: 1;
-    grid-template-columns: minmax(0, 1fr) auto;
-    position: sticky;
-    top: 0;
-    z-index: 4;
-    min-height: 36px;
-    padding-block: 4px;
-    align-items: center;
-    gap: 6px;
-    cursor: default;
-    touch-action: auto;
-    overflow: hidden;
-    background: #101722;
-    isolation: isolate;
-  }
-
-  .pane-title {
-    display: none;
-  }
-
-  .pane-meta {
-    display: flex;
-    width: 100%;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-  }
-
-  .pane-tool:not(.danger):not(.pane-cwd):not(.pane-fullscreen-btn) {
-    display: none;
-  }
-
-  .pane-tool {
-    max-width: none;
-    flex: 1 1 auto;
-    min-width: 0;
-    text-align: left;
-  }
-
-  .pane-tool.pane-cwd {
-    flex: 1 1 auto;
-    max-width: calc(100% - 116px);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .pane-tool.danger {
-    flex: 0 0 auto;
-    min-width: 52px;
   }
 
   .terminal-surface {
@@ -747,14 +273,6 @@
     overflow: hidden;
   }
 
-  .pane-status {
-    display: none;
-  }
-
-  .pane-resize-handle {
-    display: none;
-  }
-
   .workspace-empty {
     position: static;
     transform: none;
@@ -764,68 +282,8 @@
     padding: 24px;
   }
 
-  .workspace-statusbar {
-    display: none;
-  }
-}
-
-
-/* === Reusable modal styles (mirrored from planner.page.scss) === */
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: rgba(0, 0, 0, 0.62);
-}
-
-.browser-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 0 12px;
-  background: #101722;
-}
-
-.browser-list,
-.phase-task-list {
-  overflow: auto;
-  padding: 10px;
-}
-
-.browser-row {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.file-empty {
-  border: 1px solid rgba(38, 50, 65, 0.7);
-  background: #0d1117;
-  color: #8fa0b3;
-  padding: 10px;
-}
-
-.icon-action {
-  width: 32px;
-  display: inline-grid;
-  place-items: center;
-}
-
-.primary-action {
-  min-width: 150px;
-  background: #19314a;
-  border-color: #315b82;
-}
-
-.secondary-action {
-  background: #122033;
-  border-color: #2e4763;
+  // The strip hides itself under 900px (WorkspaceStatusbarComponent's own media query), so there
+  // is nothing to hide from here any more.
 }
 
 
@@ -884,22 +342,6 @@ ion-modal.workspace-picker .picker-empty {
   ion-modal.workspace-picker ion-footer {
     @include workspace.safe-bottom-padding(0px);
   }
-}
-
-/* === Page title chip (Terminal) === */
-.page-title-chip {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  margin: 0 8px;
-  border-radius: 999px;
-  background: var(--ion-color-primary, #5096ff);
-  color: var(--jo-bg-base, #0d0f12);
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
 }
 
 /* ===========================================================================
@@ -1104,6 +546,28 @@ ion-modal.workspace-picker .picker-empty {
   .st-who { color: var(--jo-fg-muted); text-transform: uppercase; font-weight: 600; }
   .st-when { color: var(--jo-fg-faint); font-variant-numeric: tabular-nums; }
   .st-row.you .st-who { color: var(--jo-accent); }
+  // The copy control: an icon, not a word. This stylesheet sits ON its 48 kB
+  // per-component budget, so the rule carries only what the control cannot be read
+  // without: padding rather than a min-size box for the thumb target, and no colour of
+  // its own for the failure state - its icon and its sentence already say it.
+  .st-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding: 3px 6px;
+    border: 0;
+    background: none;
+    color: var(--jo-fg-faint);
+    font: inherit;
+    cursor: pointer;
+
+    ion-icon { font-size: 14px; }
+    &:hover, &:focus-visible { color: var(--jo-fg-strong); }
+    &.copied { color: var(--jo-accent); }
+  }
+  // Only the failure states show words.
+  .st-copy-why { font-size: 9.5px; }
   .st-hd {
     font-family: var(--jo-font-mono, ui-monospace, monospace);
     font-size: 11px;
@@ -1659,7 +1123,6 @@ ion-modal.workspace-picker .picker-empty {
     flex: none;
   }
   .init-new {
-    margin-left: auto;
     width: 22px;
     height: 22px;
     display: inline-flex;
@@ -1897,9 +1360,6 @@ ion-modal.workspace-picker .picker-empty {
   .plandoc {
     grid-template-columns: 1fr;
   }
-  .plandoc .docnav {
-    display: none;
-  }
 }
 
 .plandoc .docnav {
@@ -1977,6 +1437,49 @@ ion-modal.workspace-picker .picker-empty {
     span {
       color: var(--jo-fg-faint, #6b7a8d);
       word-break: normal;
+    }
+  }
+}
+
+// Artifacts section of the docnav (mass-artifacts). Reuses the existing `.dn` / `.dn.dir` /
+// `.indent-1` row vocabulary for the headings, so only the deeper indent steps and the prose note
+// need rules of their own. NOTE: this file sits ~580 bytes under the 48 kB `anyComponentStyle`
+// error budget, so additions here have to be this frugal — see the report.
+.plandoc .docnav {
+  .dn.art-head {
+    margin-top: 10px;
+  }
+  // One step past the group label; capped at depth 2 so a deep tree never pushes the name out.
+  button.dn.art-d0 {
+    padding-left: 36px;
+  }
+  button.dn.art-d1 {
+    padding-left: 48px;
+  }
+  button.dn.art-d2 {
+    padding-left: 60px;
+  }
+  .dn.art-note {
+    white-space: normal;
+    font-size: 11px;
+  }
+}
+
+// PHONE (<=720px): the nav used to be `display: none`, which left a narrow screen with NO way to
+// reach any plan doc (the default one was all you got) and would have made artifacts unreachable
+// too. It now stacks above the doc as the same vertical list, height-capped and self-scrolling so
+// the doc stays close. Rows are full-width with an ellipsised label, so nothing scrolls sideways.
+@media (max-width: 720px) {
+  .plandoc .docnav {
+    border-right: none;
+    border-bottom: 1px solid var(--jo-border, #263241);
+    max-height: 38vh;
+    overflow-y: auto;
+
+    // The foot prints the full absolute planPath with `word-break: break-all`; inside a 38vh box
+    // that is several lines of the very space this cap exists to free. The path is desktop detail.
+    .docnav-foot {
+      display: none;
     }
   }
 }

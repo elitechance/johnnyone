@@ -559,6 +559,13 @@ struct AiSession {
     /// console selects it on the shared `listAiSessions` query that
     /// `queryPreferLocalHost` may route here.
     attached_tmux: bool,
+    /// The terminal's LIVE state as the host reports it: `none` | `attached` |
+    /// `detached` | `ended`. NOT the `attached_tmux` intent flag above — that
+    /// only records whether the session was ASKED to attach; this is what tmux
+    /// actually says right now (`services::sessions::reported_terminal_status`
+    /// owns the decision. Optional on the wire: `None` means the host could not
+    /// answer at all, and must stay `null` rather than becoming a string.
+    terminal_status: Option<String>,
 }
 
 impl From<Session> for AiSession {
@@ -576,7 +583,73 @@ impl From<Session> for AiSession {
             created_at: value.created_at,
             updated_at: value.updated_at,
             attached_tmux: value.attached_tmux,
+            // `Session::terminal_status` is a plain String — the host ALWAYS has
+            // an answer (`"none"` at worst). The Option on the GraphQL type only
+            // lets the WIRE carry `null` for a client talking to an older host,
+            // so wrap rather than reinterpret.
+            terminal_status: Some(value.terminal_status),
         }
+    }
+}
+
+#[cfg(test)]
+mod ai_session_tests {
+    //! The host declares its OWN `AiSession` SimpleObject for the local GraphQL
+    //! surface (the console can be routed here via `queryPreferLocalHost`), so
+    //! the `From<Session>` conversion is the only place `terminalStatus` can be
+    //! dropped between `services::sessions` and the client.
+
+    use super::*;
+
+    fn session_with_terminal_status(status: &str) -> Session {
+        Session {
+            id: "s-1".into(),
+            title: "a shell".into(),
+            provider: "shell".into(),
+            model: "".into(),
+            working_directory: "/tmp".into(),
+            status: "active".into(),
+            cli_session_id: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_cents: 0,
+            kind: "user".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+            attached_tmux: true,
+            terminal_status: status.into(),
+        }
+    }
+
+    #[test]
+    fn ai_session_carries_terminal_status() {
+        let gql: AiSession = session_with_terminal_status("ended").into();
+        assert_eq!(gql.terminal_status.as_deref(), Some("ended"));
+    }
+
+    #[test]
+    fn ai_session_carries_each_live_state() {
+        for state in ["none", "attached", "detached", "ended"] {
+            let gql: AiSession = session_with_terminal_status(state).into();
+            assert_eq!(gql.terminal_status.as_deref(), Some(state));
+        }
+    }
+
+    #[test]
+    fn ai_session_keeps_attached_tmux_and_terminal_status_apart() {
+        // Intent flag vs live state: asked to attach, but tmux says the pane is
+        // gone. Neither field may stand in for the other.
+        let gql: AiSession = session_with_terminal_status("ended").into();
+        assert!(gql.attached_tmux);
+        assert_eq!(gql.terminal_status.as_deref(), Some("ended"));
+    }
+
+    #[test]
+    fn ai_session_terminal_status_absent_stays_absent_not_a_string() {
+        // A host that cannot answer must serialize `null`, never a string.
+        let missing: Option<String> = None;
+        assert!(missing.is_none());
+        assert!(!matches!(missing, Some(_)));
     }
 }
 

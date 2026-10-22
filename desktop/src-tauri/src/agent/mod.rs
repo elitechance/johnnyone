@@ -1259,9 +1259,50 @@ impl AgentService {
             "update_agent_plan_validation_config" => {
                 Self::rpc_update_agent_plan_validation_config(&req.params, state)
             }
+            // --- the test gate (migration 023 plan-level, 025 phase-level) ---
+            "update_agent_plan_test_commands" => {
+                Self::rpc_update_agent_plan_test_commands(&req.params, state)
+            }
+            "run_agent_plan_test_gate" => {
+                Self::rpc_run_agent_plan_test_gate(&req.params, state).await
+            }
             "refresh_agent_plan_phases" => {
                 Self::rpc_refresh_agent_plan_phases(&req.params, state)
             },
+            // --- the workflow arena (migration 026) ---
+            // Reads first, then the writes. Every one of these is a thin param-puller: the rules
+            // (comparability, the promotion refusals, the three-strike halt) live in
+            // `services::workflows`, never here, so the relay and a future local caller cannot
+            // disagree about them.
+            "list_workflows" => Self::rpc_list_workflows(&req.params, state),
+            "get_workflow" => Self::rpc_get_workflow(&req.params, state),
+            "list_workflow_runs" => Self::rpc_list_workflow_runs(&req.params, state),
+            "list_workflow_prefs" => Self::rpc_list_workflow_prefs(&req.params, state),
+            "get_repo_identity" => Self::rpc_get_repo_identity(&req.params, state),
+            "get_workflow_search_state" => {
+                Self::rpc_get_workflow_search_state(&req.params, state)
+            }
+            "create_workflow_version" => Self::rpc_create_workflow_version(&req.params, state),
+            "start_workflow_run" => Self::rpc_start_workflow_run(&req.params, state),
+            "execute_workflow_run" => Self::rpc_execute_workflow_run(&req.params, state),
+            "record_workflow_run_gate" => Self::rpc_record_workflow_run_gate(&req.params, state),
+            "run_workflow_run_gate" => {
+                Self::rpc_run_workflow_run_gate(&req.params, state).await
+            }
+            "rescore_workflow_run_gate" => {
+                Self::rpc_rescore_workflow_run_gate(&req.params, state).await
+            }
+            "record_workflow_run_rescore" => {
+                Self::rpc_record_workflow_run_rescore(&req.params, state)
+            }
+            "record_workflow_pref" => Self::rpc_record_workflow_pref(&req.params, state),
+            "update_workflow_champion" => Self::rpc_update_workflow_champion(&req.params, state),
+            "record_workflow_rejection" => {
+                Self::rpc_record_workflow_rejection(&req.params, state)
+            }
+            "update_workflow_search_resumed" => {
+                Self::rpc_update_workflow_search_resumed(&req.params, state)
+            }
             "amend_agent_plan" => Self::rpc_amend_agent_plan(&req.params, state).await,
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
@@ -1761,6 +1802,538 @@ impl AgentService {
             config,
         )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    // --- the test gate ---
+    // Thin param-pullers mirroring rpc_update_agent_plan_validation_config: read typed params,
+    // call the service, serialize. The phase-over-plan resolution rule is NOT here — it lives in
+    // `services::agent_plans::effective_test_commands` and nowhere else.
+
+    fn rpc_update_agent_plan_test_commands(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        // Optional: absent/null targets the PLAN's gate, present targets that phase's.
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        let commands: Vec<String> = params
+            .get("commands")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Clearing is explicit. An empty `commands` without `clear: true` is REJECTED by the
+        // service, so a call that forgot its arguments cannot wipe a gate — the defaults here are
+        // deliberately the ones that fail loudly rather than the ones that destroy state.
+        let clear = params
+            .get("clear")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let run = crate::services::agent_plans::update_test_commands(
+            state,
+            id.to_string(),
+            phase_id,
+            commands,
+            clear,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    // --- the workflow arena (migration 026) ---
+    //
+    // Thin param-pullers mirroring `rpc_update_agent_plan_test_commands`: read typed params from
+    // the JSON value, call `services::workflows`, serialize the result. camelCase keys match the
+    // worker resolvers and the GraphQL arguments.
+    //
+    // NOTHING here decides anything. The comparability rule, the promotion refusals and the
+    // three-strike halt are all in the service, behind one named function each, because this layer
+    // will eventually have a second caller (a local Tauri command) and two copies of a rule is how
+    // this repo has already produced a false pass.
+
+    fn workflow_key(
+        params: &serde_json::Value,
+    ) -> Result<(String, String, String), String> {
+        let repo = params
+            .get("repo")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'repo' parameter".to_string())?;
+        let phase_type = params
+            .get("phaseType")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'phaseType' parameter".to_string())?;
+        let family = params
+            .get("family")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'family' parameter".to_string())?;
+        Ok((repo.to_string(), phase_type.to_string(), family.to_string()))
+    }
+
+    fn rpc_list_workflows(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        // All three filters are optional and independent — absent means "any".
+        let optional = |key: &str| {
+            params
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty())
+        };
+        let repo = optional("repo");
+        let phase_type = optional("phaseType");
+        let family = optional("family");
+        let workflows = crate::services::workflows::list_workflows(
+            state,
+            repo.as_deref(),
+            phase_type.as_deref(),
+            family.as_deref(),
+        )?;
+        serde_json::to_value(workflows).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_workflow(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let workflow = crate::services::workflows::get_workflow(state, id)?;
+        serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_list_workflow_runs(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let workflow_id = params
+            .get("workflowId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        let runs = crate::services::workflows::list_workflow_runs(state, workflow_id)?;
+        serde_json::to_value(runs).map_err(|e| e.to_string())
+    }
+
+    fn rpc_list_workflow_prefs(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let workflow_id = params
+            .get("workflowId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        let prefs = crate::services::workflows::list_workflow_prefs(state, workflow_id)?;
+        serde_json::to_value(prefs).map_err(|e| e.to_string())
+    }
+
+    /// The repo identity for a workspace path — the one way a client can learn the value the host
+    /// derives, so it can key `list_workflows` / `get_workflow_search_state` on it without
+    /// re-implementing the derivation.
+    fn rpc_get_repo_identity(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let _ = state;
+        let workspace_path = params
+            .get("workspacePath")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workspacePath' parameter".to_string())?;
+        let repo = crate::services::workflows::repo_identity(workspace_path)?;
+        // A bare JSON string: the GraphQL field is `String!`, so there is no wrapper object for a
+        // client to unpack and no second place for the key's name to drift.
+        serde_json::to_value(repo).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_workflow_search_state(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (repo, phase_type, family) = Self::workflow_key(params)?;
+        let search = crate::services::workflows::workflow_search_state(
+            state,
+            &repo,
+            &phase_type,
+            &family,
+        )?;
+        serde_json::to_value(search).map_err(|e| e.to_string())
+    }
+
+    fn rpc_create_workflow_version(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let required = |key: &str| -> Result<String, String> {
+            params
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .ok_or_else(|| format!("Missing '{}' parameter", key))
+        };
+        // NOTE `repo` is NOT a parameter. The client used to send it as
+        // `basename(workspace_path)`, so `/a/johnnyone` and `/b/johnnyone` shared one champion.
+        // The host derives the identity from the workspace path instead
+        // (`services::workflows::repo_identity`: the git remote, normalised, else the absolute
+        // path), because a client-supplied identity is a client-supplied champion key.
+        let input = crate::services::workflows::NewWorkflowVersion {
+            workspace_path: required("workspacePath")?,
+            phase_type: required("phaseType")?,
+            family: required("family")?,
+            parent_id: params
+                .get("parentId")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty()),
+            role: required("role")?,
+            instruction: required("instruction")?,
+            contract: required("contract")?,
+            hop: required("hop")?,
+            // No default. A fan-out the caller did not state is not "1 seat" — it is a bug, and a
+            // silent default here would let a workflow compete on a seat budget nobody chose.
+            fan_out: params
+                .get("fanOut")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| "Missing 'fanOut' parameter".to_string())?,
+        };
+        let workflow = crate::services::workflows::create_workflow_version(state, input)?;
+        serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_start_workflow_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let workflow_id = params
+            .get("workflowId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'workflowId' parameter".to_string())?;
+        // NOTE what is NOT read here: `seatsHeld` and `fleetBusy`. They used to be relayed
+        // parameters, and the caller is a browser that can measure neither — so `comparable`
+        // degraded to "did two clients type the same numbers", which is the exact failure those two
+        // columns exist to prevent. The host measures both now
+        // (`services::workflows::measure_run_budget`), and the model family comes from the workflow
+        // row rather than from the caller.
+        let input = crate::services::workflows::NewWorkflowRun {
+            workflow_id: workflow_id.to_string(),
+            plan_id: params
+                .get("planId")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty()),
+            seed: params.get("seed").and_then(|value| value.as_i64()).unwrap_or(0),
+            // Optional override of the workflow's own `fan_out`. Absent means "whatever the
+            // workflow declares", which is the normal case.
+            seats: params.get("seats").and_then(|value| value.as_i64()),
+        };
+        let run = crate::services::workflows::start_workflow_run(state, input)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// RUN an arena phase for real, and score what the child exited with.
+    ///
+    /// The missing link on the wire: `compose_workflow_prompt`, the `PhaseExecutor` seam,
+    /// `execute_workflow_run` and `execute_and_score_workflow_run` all existed, and nothing on the
+    /// RPC surface called any of them — so a run row was created and never executed, which means the
+    /// arena could not score anything through the real wire. This is that door.
+    ///
+    /// `runId` is required; `verify` (default `"true"`) and `binary` (default `"kloo"`) are the two
+    /// things about the CHILD the caller may name. Everything else is resolved from the row: the
+    /// workdir is the workspace this agent already uses for the run — the run's plan's
+    /// `workspace_path`, the same source `score_workflow_run` runs a gate in — and the FAMILY is not
+    /// a parameter at all, because `execute_and_score_workflow_run` reads it from the workflow row.
+    ///
+    /// **An `Err` from the executor propagates as an RPC error and records no gate.** An execution
+    /// that did not happen must leave the run unscored (`gate_exit` NULL), so that it is never
+    /// mistaken for an execution that ran and failed.
+    fn rpc_execute_workflow_run(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        let verify = params
+            .get("verify")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("true")
+            .to_string();
+        let binary = params
+            .get("binary")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("kloo")
+            .to_string();
+        // The workspace this agent already uses for the run: the run's plan's `workspace_path`,
+        // resolved through the plan row rather than invented here. A run with no plan has no
+        // workspace to execute in, and is refused rather than run in some guessed directory.
+        let workdir = state.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT p.workspace_path FROM workflow_runs r \
+                 JOIN agent_plans p ON p.id = r.plan_id \
+                 WHERE r.id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    format!("workflow run {} not found", run_id)
+                }
+                other => other.to_string(),
+            })
+        })?;
+        let exec = crate::services::kloo_executor::KlooExecutor {
+            binary,
+            workdir: std::path::PathBuf::from(workdir),
+            verify,
+        };
+        crate::services::workflows::execute_and_score_workflow_run(state, run_id, &exec)?;
+        // Answer the RUN ROW, not a bare number: the worker's schema declares this mutation to
+        // return `WorkflowRun!`, like its neighbours `startWorkflowRun` and `runWorkflowRunGate`,
+        // whose arms end the same way. The serialised run already carries `gateExit`, so nothing
+        // is invented here and the score is not copied a second time into the payload.
+        let run = crate::services::workflows::get_workflow_run(state, run_id)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_record_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        // `gateExit` is REQUIRED: it is the score, and a missing score must be an error rather
+        // than a 0 that reads as a pass.
+        let gate_exit = params
+            .get("gateExit")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| "Missing 'gateExit' parameter".to_string())?;
+        // `gateCollected` is ADVISORY and genuinely optional: absent and explicit null both mean
+        // "the gate printed nothing a parser recognised", which is a normal result for a lint, a
+        // build or a bespoke script. It is never an error and nothing branches on it.
+        let gate_collected = params.get("gateCollected").and_then(|value| value.as_i64());
+        let run = crate::services::workflows::record_workflow_run_gate(
+            state,
+            run_id,
+            gate_exit,
+            gate_collected,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Replace a run's gate result with one measured elsewhere, DELIBERATELY.
+    ///
+    /// There is no `rescore` flag on `record_workflow_run_gate` any more. The service's own
+    /// rationale was "the separate name IS the guard: there is no flag to forget and no default to
+    /// get wrong" — and the wire API still took a boolean, so on the only surface a client can
+    /// reach, the guard WAS the flag that rationale rejected. Now it is the method.
+    fn rpc_record_workflow_run_rescore(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        let gate_exit = params
+            .get("gateExit")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| "Missing 'gateExit' parameter".to_string())?;
+        let gate_collected = params.get("gateCollected").and_then(|value| value.as_i64());
+        let run = crate::services::workflows::rescore_workflow_run_gate(
+            state,
+            run_id,
+            gate_exit,
+            gate_collected,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// EXECUTE an arena run's gate and record the result — the step that closes the arena's loop.
+    ///
+    /// `record_workflow_run_gate` takes a score someone else measured; this one measures it, by
+    /// running the plan's effective gate in the plan's workspace. Same `rescore` discipline: a
+    /// second result for a run is refused unless asked for.
+    /// `runId` plus the optional `phaseId` level selector, shared by the first-score and the
+    /// deliberate-rescore methods. There is no `rescore` parameter on either: the METHOD NAME is
+    /// the guard, which is what the recorder's own rationale asked for and what the wire API did
+    /// not yet honour.
+    fn gate_run_params(
+        params: &serde_json::Value,
+    ) -> Result<(String, Option<String>), String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        // Absent targets the PLAN's gate, present targets that phase's — the same level-selection
+        // rule as `run_agent_plan_test_gate`.
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        Ok((run_id.to_string(), phase_id))
+    }
+
+    async fn rpc_run_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (run_id, phase_id) = Self::gate_run_params(params)?;
+        let run =
+            crate::services::workflows::score_workflow_run(state, &run_id, phase_id).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Execute the gate again for a run that already has a score, and REPLACE it.
+    ///
+    /// Its own method rather than a flag on the one above. A sitting champion's promoting run is
+    /// refused here too — that is in the service, not in the choice of door.
+    async fn rpc_rescore_workflow_run_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (run_id, phase_id) = Self::gate_run_params(params)?;
+        let run =
+            crate::services::workflows::rescore_workflow_run(state, &run_id, phase_id).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_record_workflow_pref(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let winner_run_id = params
+            .get("winnerRunId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'winnerRunId' parameter".to_string())?;
+        let loser_run_id = params
+            .get("loserRunId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'loserRunId' parameter".to_string())?;
+        // NOTE there is deliberately no `comparable` parameter. The service computes it from the
+        // two runs' own seat budgets, so a client cannot assert a comparability it does not have.
+        let reason = params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let pref = crate::services::workflows::record_workflow_pref(
+            state,
+            winner_run_id,
+            loser_run_id,
+            reason,
+        )?;
+        serde_json::to_value(pref).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_workflow_champion(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        let pref_id = params
+            .get("prefId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        // Defaults to FALSE, so a call that forgot its arguments cannot promote. Promotion is the
+        // arena's one irreversible, human-confirmed step.
+        let confirmed = params
+            .get("confirmed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let workflow = crate::services::workflows::promote_workflow(
+            state,
+            run_id,
+            pref_id.as_deref(),
+            confirmed,
+        )?;
+        serde_json::to_value(workflow).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_workflow_search_resumed(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let (repo, phase_type, family) = Self::workflow_key(params)?;
+        // Both required. Lifting a halt is the decision a reader will most want explained, and the
+        // `confirmed` default is false so a call that forgot its arguments cannot lift one.
+        let reason = params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'reason' parameter".to_string())?;
+        let confirmed = params
+            .get("confirmed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let search = crate::services::workflows::resume_workflow_search(
+            state,
+            &repo,
+            &phase_type,
+            &family,
+            reason,
+            confirmed,
+        )?;
+        serde_json::to_value(search).map_err(|e| e.to_string())
+    }
+
+    fn rpc_record_workflow_rejection(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let run_id = params
+            .get("runId")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'runId' parameter".to_string())?;
+        // Required. The service rejects a blank one too — three rejections halt the search and the
+        // reasons are the only thing a halted search has to show.
+        let reason = params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'reason' parameter".to_string())?;
+        let search = crate::services::workflows::reject_workflow_run(state, run_id, reason)?;
+        serde_json::to_value(search).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_run_agent_plan_test_gate(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let phase_id = params
+            .get("phaseId")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        let result = crate::services::agent_plans::run_plan_test_gate(
+            state,
+            id.to_string(),
+            phase_id,
+        )
+        .await?;
+        serde_json::to_value(result).map_err(|e| e.to_string())
     }
 
     fn rpc_refresh_agent_plan_phases(
@@ -2435,6 +3008,7 @@ impl AgentService {
             created_at: session.created_at,
             updated_at: session.updated_at,
             attached_tmux: session.attached_tmux,
+            terminal_status: session.terminal_status,
         }
     }
 
@@ -2853,6 +3427,51 @@ mod files_rpc_tests {
         assert!(!bogus.success);
         assert!(bogus.error.unwrap_or_default().contains("Unknown RPC method"));
     }
+
+    /// Seam (a), QA-added: the two test-gate RPC methods are actually REGISTERED in `handle_rpc`'s
+    /// match arms and their param-pullers read the keys the worker resolvers send. Nothing else in
+    /// the tree drives a JSON-RPC request through them, so a renamed arm or a renamed param key
+    /// would compile, pass every other gate, and fail only in production.
+    ///
+    /// No plan is created: routing is proven by the error coming from the SERVICE
+    /// ("Agent plan not found") rather than the dispatch ("Unknown RPC method").
+    #[tokio::test]
+    async fn handle_rpc_routes_the_test_gate_methods() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        for method in ["update_agent_plan_test_commands", "run_agent_plan_test_gate"] {
+            // The param-puller rejects a missing `id` before it reaches the service.
+            let missing = AgentService::handle_rpc(&rpc(method, json!({})), &state).await;
+            assert!(!missing.success, "{method} with no id must fail");
+            let error = missing.error.unwrap_or_default();
+            assert!(
+                error.contains("Missing 'id' parameter"),
+                "{method}: expected the param-puller's error, got: {error}"
+            );
+
+            // With the exact payload the worker resolver sends, the arm must route into the
+            // service. `phaseId: null` is the plan level; `commands` is a list, not a JSON string.
+            let routed = AgentService::handle_rpc(
+                &rpc(
+                    method,
+                    json!({ "id": "no-such-plan", "phaseId": null, "commands": ["npm test"] }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(!routed.success, "{method} on a missing plan must fail");
+            let error = routed.error.unwrap_or_default();
+            assert!(
+                !error.contains("Unknown RPC method"),
+                "{method} is NOT registered in handle_rpc"
+            );
+            assert!(
+                error.contains("Agent plan not found"),
+                "{method}: expected the service's error, got: {error}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3081,5 +3700,1204 @@ mod liveness_watchdog_tests {
             (HEARTBEAT_LIVENESS_CHECK_SECS as i64) * 3 <= HEARTBEAT_STALE_AFTER_SECS,
             "liveness check should run at least 3x per staleness window"
         );
+    }
+}
+
+/// The workflow arena's relay-RPC wiring (migration 026).
+///
+/// A separate module from `files_rpc_tests` for the same reason that one exists: nothing else in
+/// the tree drives a JSON-RPC request through these arms, so a renamed match arm or a renamed
+/// param key would compile, pass every other gate, and fail only in production — against a phone.
+///
+/// These tests are about WIRING, not rules. The rules (comparability, the promotion refusals, the
+/// three-strike halt) are pinned where they live, in `services::workflows`.
+#[cfg(test)]
+mod workflow_arena_rpc_tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use serde_json::json;
+
+    fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
+        RpcRequest {
+            request_id: "req-1".to_string(),
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    /// Round 3: `repo` is no longer a parameter — the host derives the identity from a workspace
+    /// path. These tests use a stable synthetic path (deliberately non-existent, so the derivation
+    /// finds no git remote and falls back to the absolute path) and ask the HOST what identity it
+    /// derived, rather than hard-coding the answer. If the derivation changes, these tests follow it
+    /// instead of pinning a stale string.
+    const WORKSPACE: &str = "/nonexistent-arena-rpc/johnnyone";
+
+    async fn derived_repo(state: &Arc<AppState>) -> String {
+        let response = AgentService::handle_rpc(
+            &rpc("get_repo_identity", json!({ "workspacePath": WORKSPACE })),
+            state,
+        )
+        .await;
+        assert!(response.success, "repo identity: {:?}", response.error);
+        response
+            .data
+            .expect("identity")
+            .as_str()
+            .expect("a bare string")
+            .to_string()
+    }
+
+    /// Every arena method is REGISTERED. Proven by the error coming from the param-puller or the
+    /// service rather than from the dispatch's `_ =>` arm.
+    #[tokio::test]
+    async fn handle_rpc_registers_every_arena_method() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        // A deliberately empty payload: each arm must reject it with ITS OWN missing-parameter
+        // message, which can only happen if the arm is wired to the right puller.
+        let cases: &[(&str, &str)] = &[
+            ("get_workflow", "Missing 'id' parameter"),
+            ("list_workflow_runs", "Missing 'workflowId' parameter"),
+            ("list_workflow_prefs", "Missing 'workflowId' parameter"),
+            ("get_workflow_search_state", "Missing 'repo' parameter"),
+            ("create_workflow_version", "Missing 'workspacePath' parameter"),
+            ("get_repo_identity", "Missing 'workspacePath' parameter"),
+            ("run_workflow_run_gate", "Missing 'runId' parameter"),
+            ("rescore_workflow_run_gate", "Missing 'runId' parameter"),
+            ("execute_workflow_run", "Missing 'runId' parameter"),
+            ("record_workflow_run_rescore", "Missing 'runId' parameter"),
+            ("start_workflow_run", "Missing 'workflowId' parameter"),
+            ("record_workflow_run_gate", "Missing 'runId' parameter"),
+            ("record_workflow_pref", "Missing 'winnerRunId' parameter"),
+            ("update_workflow_champion", "Missing 'runId' parameter"),
+            ("record_workflow_rejection", "Missing 'runId' parameter"),
+            ("update_workflow_search_resumed", "Missing 'repo' parameter"),
+        ];
+        for (method, expected) in cases {
+            let response = AgentService::handle_rpc(&rpc(method, json!({})), &state).await;
+            assert!(!response.success, "{method} with no params must fail");
+            let error = response.error.unwrap_or_default();
+            assert!(
+                !error.contains("Unknown RPC method"),
+                "{method} is NOT registered in handle_rpc"
+            );
+            assert_eq!(&error, expected, "{method}: wrong param-puller");
+        }
+
+        // `list_workflows` takes no required parameter — an empty payload is the "list everything"
+        // call, so it must SUCCEED. That is also what proves it is registered.
+        let listed = AgentService::handle_rpc(&rpc("list_workflows", json!({})), &state).await;
+        assert!(listed.success, "list_workflows: {:?}", listed.error);
+        assert_eq!(listed.data.and_then(|data| data.as_array().map(|a| a.len())), Some(0));
+
+        // And the unknown-method arm still works, so the assertions above are not vacuous.
+        let bogus = AgentService::handle_rpc(&rpc("workflow_bogus", json!({})), &state).await;
+        assert!(!bogus.success);
+        assert!(bogus
+            .error
+            .unwrap_or_default()
+            .contains("Unknown RPC method"));
+    }
+
+    /// **Every required parameter of every arena method, omitted one at a time.**
+    ///
+    /// `handle_rpc_registers_every_arena_method` sends an EMPTY payload, so it only ever exercises
+    /// each method's FIRST missing-parameter message — the later pullers' strings are never run, and
+    /// a typo in one of them would compile, pass every gate, and fail in production against the one
+    /// client that omitted that argument. Same shape as the two unguarded rules an earlier revert
+    /// sweep turned up.
+    ///
+    /// Each row is a complete valid payload; the test removes one key at a time and asserts the
+    /// message names THAT key. Nothing here needs a workflow to exist: the pullers all run before
+    /// the service is reached.
+    #[tokio::test]
+    async fn handle_rpc_names_every_missing_parameter_not_just_the_first() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let complete: &[(&str, serde_json::Value, &[&str])] = &[
+            (
+                "create_workflow_version",
+                json!({
+                    "workspacePath": WORKSPACE,
+                    "phaseType": "dev-phase",
+                    "family": "glm",
+                    "role": "r",
+                    "instruction": "i",
+                    "contract": "c",
+                    "hop": "{}",
+                    "fanOut": 1
+                }),
+                &["workspacePath", "phaseType", "family", "role", "instruction", "contract", "hop", "fanOut"],
+            ),
+            (
+                "record_workflow_run_gate",
+                json!({ "runId": "r1", "gateExit": 0 }),
+                &["runId", "gateExit"],
+            ),
+            (
+                "record_workflow_run_rescore",
+                json!({ "runId": "r1", "gateExit": 0 }),
+                &["runId", "gateExit"],
+            ),
+            (
+                "record_workflow_pref",
+                json!({ "winnerRunId": "a", "loserRunId": "b" }),
+                &["winnerRunId", "loserRunId"],
+            ),
+            (
+                "record_workflow_rejection",
+                json!({ "runId": "r1", "reason": "no" }),
+                &["runId", "reason"],
+            ),
+            (
+                "update_workflow_search_resumed",
+                json!({
+                    "repo": "r",
+                    "phaseType": "dev-phase",
+                    "family": "glm",
+                    "reason": "go on"
+                }),
+                &["repo", "phaseType", "family", "reason"],
+            ),
+            (
+                "start_workflow_run",
+                json!({ "workflowId": "w1" }),
+                &["workflowId"],
+            ),
+            (
+                "get_workflow_search_state",
+                json!({ "repo": "r", "phaseType": "dev-phase", "family": "glm" }),
+                &["repo", "phaseType", "family"],
+            ),
+            ("get_repo_identity", json!({ "workspacePath": WORKSPACE }), &["workspacePath"]),
+            ("get_workflow", json!({ "id": "w1" }), &["id"]),
+            ("list_workflow_runs", json!({ "workflowId": "w1" }), &["workflowId"]),
+            ("list_workflow_prefs", json!({ "workflowId": "w1" }), &["workflowId"]),
+            ("run_workflow_run_gate", json!({ "runId": "r1" }), &["runId"]),
+            ("rescore_workflow_run_gate", json!({ "runId": "r1" }), &["runId"]),
+            ("execute_workflow_run", json!({ "runId": "r1" }), &["runId"]),
+            ("update_workflow_champion", json!({ "runId": "r1", "confirmed": true }), &["runId"]),
+        ];
+
+        for (method, payload, required) in complete {
+            for omitted in *required {
+                let mut params = payload.clone();
+                params
+                    .as_object_mut()
+                    .expect("object payload")
+                    .remove(*omitted);
+                let response = AgentService::handle_rpc(&rpc(method, params), &state).await;
+                assert!(
+                    !response.success,
+                    "{method} without {omitted} must fail"
+                );
+                let error = response.error.unwrap_or_default();
+                assert_eq!(
+                    error,
+                    format!("Missing '{}' parameter", omitted),
+                    "{method}: omitting {omitted} must name {omitted}"
+                );
+            }
+        }
+    }
+
+    /// The whole arena, end to end, through `handle_rpc` only — the surface a phone actually
+    /// reaches. Also pins the camelCase JSON keys both ways: the params the resolvers send and the
+    /// field names they read back.
+    #[tokio::test]
+    async fn handle_rpc_drives_the_arena_end_to_end() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        // TWO workflows, because a displacing head-to-head must be against the INCUMBENT's run:
+        // the incumbent (v1) seeds the champion slot, the challenger (v2) takes it from there.
+        let mut workflow_ids = Vec::new();
+        for expected_version in [1_i64, 2] {
+            let created = AgentService::handle_rpc(
+                &rpc(
+                    "create_workflow_version",
+                    json!({
+                        "workspacePath": WORKSPACE,
+                        "phaseType": "dev-phase",
+                        "family": "glm-5.3-flash",
+                        "role": "you are a developer",
+                        "instruction": "implement the phase",
+                        "contract": "the gate must pass",
+                        "hop": "{\"steps\":[\"edit\",\"verify\"]}",
+                        "fanOut": 3
+                    }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(created.success, "create: {:?}", created.error);
+            let workflow = created.data.expect("workflow");
+            assert_eq!(
+                workflow.get("version").and_then(|v| v.as_i64()),
+                Some(expected_version)
+            );
+            assert_eq!(
+                workflow.get("isChampion").and_then(|v| v.as_bool()),
+                Some(false),
+                "a new version is never born champion"
+            );
+            workflow_ids.push(
+                workflow
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .expect("id")
+                    .to_string(),
+            );
+        }
+        let workflow_id = workflow_ids[0].clone();
+        let challenger_id = workflow_ids[1].clone();
+
+        // One run each, on the SAME seat budget AND the same fleet contention, so the preference
+        // between them is comparable on both halves of the rule.
+        let mut run_ids = Vec::new();
+        for owner in [&workflow_id, &challenger_id] {
+            // NOTE the payload deliberately ALSO sends `seatsHeld` and `fleetBusy`, which used to
+            // be the real parameters. They must be ignored: the caller here is a browser and the
+            // host is the only thing that can measure either. If a future edit reads them again,
+            // the assertions below fail.
+            let started = AgentService::handle_rpc(
+                &rpc(
+                    "start_workflow_run",
+                    json!({
+                        "workflowId": owner,
+                        "seed": 0,
+                        "seatsHeld": "{\"attacker\":999}",
+                        "fleetBusy": "{\"attacker\":999}"
+                    }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(started.success, "start: {:?}", started.error);
+            let run = started.data.expect("run");
+            assert!(
+                run.get("gateExit").map(|v| v.is_null()).unwrap_or(false),
+                "a fresh run has no score: {run}"
+            );
+            assert_eq!(
+                run.get("seatsHeld").and_then(|v| v.as_str()),
+                Some(r#"{"glm-5.3-flash":3}"#),
+                "the HOST measured the budget from the workflow row, not from the caller: {run}"
+            );
+            // The contention snapshot is the host's too — and it is no longer `{}`. An empty map
+            // used to mean "nothing measures contention" (the stand-in's value: the lease pool had
+            // not landed, so every run reported `{}` whether the fleet was busy or not). Now that
+            // `measure_run_budget` reads the real lease pool, a run on a quiet fleet reports every
+            // capped family AT ZERO — `{"glm-5.3-flash":0}` — which is the assertion's whole point:
+            // "measured, and the fleet was quiet" must not be confused with "never measured". A
+            // weakened `is_some()` here would let the stand-in's `{}` pass again and erase that
+            // distinction, so the exact snapshot is pinned.
+            assert_eq!(
+                run.get("fleetBusy").and_then(|v| v.as_str()),
+                Some(r#"{"glm-5.3-flash":0}"#),
+                "and the contention snapshot is the host's too, measured and quiet: {run}"
+            );
+            run_ids.push(run.get("id").and_then(|v| v.as_str()).unwrap().to_string());
+        }
+
+        // The winner's gate passes and reports no collected count — `gateCollected` ABSENT is a
+        // normal result, not an error.
+        let scored = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[0], "gateExit": 0 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(scored.success, "gate: {:?}", scored.error);
+        let scored = scored.data.expect("scored run");
+        assert_eq!(scored.get("gateExit").and_then(|v| v.as_i64()), Some(0));
+        assert!(
+            scored.get("gateCollected").map(|v| v.is_null()).unwrap_or(false),
+            "an absent gateCollected must stay null, not become 0: {scored}"
+        );
+
+        let loser_scored = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[1], "gateExit": 0, "gateCollected": 12 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(loser_scored.success, "gate: {:?}", loser_scored.error);
+        let loser_scored = loser_scored.data.expect("loser run");
+        assert_eq!(loser_scored.get("gateExit").and_then(|v| v.as_i64()), Some(0));
+        // The advisory count must ROUND-TRIP when it is supplied. Asserting only "the call
+        // succeeded" let a renamed param key (`gateCollected` → `collected`) pass this test —
+        // measured, not imagined: that mutation was green here until this assertion was added.
+        assert_eq!(
+            loser_scored.get("gateCollected").and_then(|v| v.as_i64()),
+            Some(12),
+            "a supplied gateCollected must arrive: {loser_scored}"
+        );
+
+        // A second score for the same run is refused unless `rescore` is asked for.
+        let silent = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_gate",
+                json!({ "runId": run_ids[1], "gateExit": 1 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!silent.success, "a silent re-score must be refused");
+        assert!(silent
+            .error
+            .unwrap_or_default()
+            .contains("already has a gate result"));
+        // The deliberate replacement is its OWN method, not a flag on the one above.
+        let deliberate = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_rescore",
+                json!({ "runId": run_ids[1], "gateExit": 0, "gateCollected": 12 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(deliberate.success, "rescore: {:?}", deliberate.error);
+
+        // The incumbent takes the slot first, with no preference (nothing to displace).
+        let seeded = AgentService::handle_rpc(
+            &rpc(
+                "update_workflow_champion",
+                json!({ "runId": run_ids[0], "confirmed": true }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(seeded.success, "seed champion: {:?}", seeded.error);
+
+        // Now the challenger's head-to-head — against the INCUMBENT's run, which is the only loser
+        // that can displace it.
+        let pref = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_pref",
+                json!({
+                    "winnerRunId": run_ids[1],
+                    "loserRunId": run_ids[0],
+                    "reason": "green gate"
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(pref.success, "pref: {:?}", pref.error);
+        let pref = pref.data.expect("pref");
+        assert_eq!(pref.get("comparable").and_then(|v| v.as_bool()), Some(true));
+        let pref_id = pref.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+        // Promotion without `confirmed` must be refused — the default is the safe one.
+        let unconfirmed = AgentService::handle_rpc(
+            &rpc(
+                "update_workflow_champion",
+                json!({ "runId": run_ids[1], "prefId": pref_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!unconfirmed.success, "an unconfirmed promote must fail");
+        assert!(unconfirmed
+            .error
+            .unwrap_or_default()
+            .contains("human-confirmed"));
+
+        let promoted = AgentService::handle_rpc(
+            &rpc(
+                "update_workflow_champion",
+                json!({ "runId": run_ids[1], "prefId": pref_id, "confirmed": true }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(promoted.success, "promote: {:?}", promoted.error);
+        assert_eq!(
+            promoted
+                .data
+                .expect("promoted")
+                .get("isChampion")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let search = AgentService::handle_rpc(
+            &rpc(
+                "get_workflow_search_state",
+                json!({ "repo": derived_repo(&state).await, "phaseType": "dev-phase", "family": "glm-5.3-flash" }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(search.success, "search state: {:?}", search.error);
+        let search = search.data.expect("search state");
+        assert_eq!(
+            search.get("championWorkflowId").and_then(|v| v.as_str()),
+            Some(challenger_id.as_str()),
+            "the challenger displaced the incumbent"
+        );
+        assert_eq!(search.get("halted").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(search.get("strikeLimit").and_then(|v| v.as_i64()), Some(3));
+
+        for owner in [&workflow_id, &challenger_id] {
+            let runs = AgentService::handle_rpc(
+                &rpc("list_workflow_runs", json!({ "workflowId": owner })),
+                &state,
+            )
+            .await;
+            assert!(runs.success);
+            assert_eq!(
+                runs.data
+                    .and_then(|data| data.as_array().map(|rows| rows.len())),
+                Some(1)
+            );
+
+            // The preference is readable back without issuing a write — the gap that forced a
+            // reloaded client to record a duplicate.
+            let prefs = AgentService::handle_rpc(
+                &rpc("list_workflow_prefs", json!({ "workflowId": owner })),
+                &state,
+            )
+            .await;
+            assert!(prefs.success, "prefs: {:?}", prefs.error);
+            let rows = prefs.data.expect("prefs");
+            let rows = rows.as_array().expect("array");
+            assert_eq!(rows.len(), 1, "both sides of the head-to-head see it");
+            assert_eq!(rows[0].get("id").and_then(|v| v.as_str()), Some(pref_id.as_str()));
+        }
+
+        // And re-recording the SAME ordered pair returns the SAME row rather than a duplicate.
+        let again = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_pref",
+                json!({
+                    "winnerRunId": run_ids[1],
+                    "loserRunId": run_ids[0],
+                    "reason": "a different explanation"
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(again.success, "re-record: {:?}", again.error);
+        let again = again.data.expect("pref");
+        assert_eq!(
+            again.get("id").and_then(|v| v.as_str()),
+            Some(pref_id.as_str()),
+            "the same ordered pair must not create a second row"
+        );
+        assert_eq!(
+            again.get("reason").and_then(|v| v.as_str()),
+            Some("green gate"),
+            "the FIRST reason wins: a recorded outcome is not editable"
+        );
+    }
+
+    /// The halt, over the relay: three rejections and the next `start_workflow_run` is refused,
+    /// with the halt visible as DATA on `get_workflow_search_state`.
+    #[tokio::test]
+    async fn handle_rpc_reports_and_enforces_the_three_strike_halt() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let workflow_id = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "workspacePath": WORKSPACE,
+                    "phaseType": "ui-phase",
+                    "family": "qwen",
+                    "role": "r",
+                    "instruction": "i",
+                    "contract": "c",
+                    "hop": "{}",
+                    "fanOut": 1
+                }),
+            ),
+            &state,
+        )
+        .await
+        .data
+        .expect("workflow")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+        for index in 1..=3 {
+            let run_id = AgentService::handle_rpc(
+                &rpc(
+                    "start_workflow_run",
+                    json!({ "workflowId": workflow_id }),
+                ),
+                &state,
+            )
+            .await
+            .data
+            .expect("run")
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+            // A blank reason must be refused: the reasons are the point of the halt.
+            let blank = AgentService::handle_rpc(
+                &rpc(
+                    "record_workflow_rejection",
+                    json!({ "runId": run_id, "reason": "  " }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(!blank.success, "a blank rejection reason must be refused");
+
+            let rejected = AgentService::handle_rpc(
+                &rpc(
+                    "record_workflow_rejection",
+                    json!({ "runId": run_id, "reason": format!("strike {index}") }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(rejected.success, "reject: {:?}", rejected.error);
+            let search = rejected.data.expect("search state");
+            assert_eq!(
+                search.get("consecutiveRejections").and_then(|v| v.as_i64()),
+                Some(index)
+            );
+            assert_eq!(
+                search.get("halted").and_then(|v| v.as_bool()),
+                Some(index >= 3),
+                "halt state at strike {index}"
+            );
+        }
+
+        let blocked = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!blocked.success, "a halted search must refuse a new run");
+        let error = blocked.error.unwrap_or_default();
+        assert!(error.contains("is halted after 3 consecutive rejections"), "got: {error}");
+        assert!(error.contains("strike 3"), "the halt must name its reasons: {error}");
+
+        // The ONLY way out, over the relay: an explicit, human-confirmed resume with a reason.
+        // Unconfirmed first, because the default must not lift a halt.
+        let key = json!({ "repo": derived_repo(&state).await, "phaseType": "ui-phase", "family": "qwen" });
+        let mut unconfirmed_params = key.clone();
+        unconfirmed_params["reason"] = json!("let it run");
+        let unconfirmed =
+            AgentService::handle_rpc(&rpc("update_workflow_search_resumed", unconfirmed_params), &state)
+                .await;
+        assert!(!unconfirmed.success, "an unconfirmed resume must be refused");
+        assert!(unconfirmed
+            .error
+            .unwrap_or_default()
+            .contains("human-confirmed"));
+
+        let mut resume_params = key.clone();
+        resume_params["reason"] = json!("the gate itself was broken");
+        resume_params["confirmed"] = json!(true);
+        let resumed =
+            AgentService::handle_rpc(&rpc("update_workflow_search_resumed", resume_params), &state)
+                .await;
+        assert!(resumed.success, "resume: {:?}", resumed.error);
+        let resumed = resumed.data.expect("search state");
+        assert_eq!(resumed.get("halted").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            resumed.get("consecutiveRejections").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+
+        let allowed = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(allowed.success, "after a resume a run must start: {:?}", allowed.error);
+    }
+
+    /// Three rejections of ONE run are ONE strike over the relay. The rule counts distinct
+    /// candidates, not rows, so a retried call or a double-submitting button cannot halt a search
+    /// on a single human verdict.
+    #[tokio::test]
+    async fn handle_rpc_counts_distinct_runs_not_rejection_rows() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        let workflow_id = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "workspacePath": WORKSPACE,
+                    "phaseType": "dev-phase",
+                    "family": "glm",
+                    "role": "r",
+                    "instruction": "i",
+                    "contract": "c",
+                    "hop": "{}",
+                    "fanOut": 1
+                }),
+            ),
+            &state,
+        )
+        .await
+        .data
+        .expect("workflow")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+        let run_id = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await
+        .data
+        .expect("run")
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+        for attempt in 1..=5 {
+            let rejected = AgentService::handle_rpc(
+                &rpc(
+                    "record_workflow_rejection",
+                    json!({ "runId": run_id, "reason": format!("tap {attempt}") }),
+                ),
+                &state,
+            )
+            .await;
+            assert!(rejected.success, "reject: {:?}", rejected.error);
+            let search = rejected.data.expect("search state");
+            assert_eq!(
+                search.get("consecutiveRejections").and_then(|v| v.as_i64()),
+                Some(1),
+                "attempt {attempt}: one candidate is one strike however many times it is rejected"
+            );
+            assert_eq!(search.get("halted").and_then(|v| v.as_bool()), Some(false));
+        }
+
+        // And the search is still runnable, which is what makes the dedup meaningful.
+        let allowed = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(allowed.success, "start: {:?}", allowed.error);
+    }
+}
+
+/// The arena's EXECUTE door: `execute_workflow_run` over RPC.
+///
+/// Before this arm existed, nothing in the tree called
+/// `services::workflows::execute_and_score_workflow_run`, so a run row was created and never
+/// executed — the arena could not score anything through the real wire. These tests are about that
+/// WIRING: the arm is registered, its parameters are pulled in the right order, the executor's
+/// result reaches the response under `gateExit`, and an executor that never ran leaves the run
+/// UNSCORED. The rules themselves (the family coming from the row, the composed prompt, the
+/// already-scored refusal) live in `services::workflows` and are pinned there.
+#[cfg(test)]
+mod arena_exec_rpc_tests {
+    use super::*;
+    use crate::services::workflows::PhaseExecutor;
+    use crate::test_support::test_state;
+    use serde_json::json;
+    use std::cell::RefCell;
+
+    fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
+        RpcRequest {
+            request_id: "req-1".to_string(),
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    /// A `PhaseExecutor` double: it records what it was handed and answers with a fixed outcome.
+    ///
+    /// No real `kloo` is ever spawned here — the point is the wire, not the child.
+    struct ExecRpcDouble {
+        outcome: Result<i32, String>,
+        calls: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ExecRpcDouble {
+        fn with_exit(code: i32) -> Self {
+            ExecRpcDouble {
+                outcome: Ok(code),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            ExecRpcDouble {
+                outcome: Err(msg.to_string()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> usize {
+            self.calls.borrow().len()
+        }
+    }
+
+    impl PhaseExecutor for ExecRpcDouble {
+        fn execute_scored(&self, family: &str, prompt: &str) -> Result<i32, String> {
+            self.calls
+                .borrow_mut()
+                .push((family.to_string(), prompt.to_string()));
+            self.outcome.clone()
+        }
+    }
+
+    /// The workspace this agent resolves for a run: the run's plan's `workspace_path`.
+    const EXEC_WORKSPACE: &str = "/nonexistent-arena-exec-rpc/johnnyone";
+
+    /// Insert a bare plan row whose `workspace_path` is the synthetic workspace above.
+    ///
+    /// The column list mirrors the one `services::workflows`' own arena tests use: `initiative_id`
+    /// and `initiative_status` are NOT NULL as far as the plan row mapper is concerned (migration
+    /// 017), so omitting them fails the READ rather than the insert.
+    fn seed_exec_plan(state: &AppState) -> String {
+        seed_exec_plan_at(state, EXEC_WORKSPACE)
+    }
+
+    /// The same row, but with the plan's `workspace_path` chosen by the caller.
+    ///
+    /// The execute arm builds its own `KlooExecutor` from this column, so a test that wants the arm
+    /// to run a REAL child — rather than a double it cannot inject — hands it a directory that
+    /// exists and holds that child.
+    fn seed_exec_plan_at(state: &AppState, workspace: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, \
+                     worker_provider, reviewer_provider, initiative_id, initiative_status) \
+                     VALUES (?1, 'development', 'arena-exec', ?2, ?3, 'claude_code', \
+                     'claude_code', ?1, 'development')",
+                    rusqlite::params![
+                        id,
+                        workspace,
+                        format!("{}/plan", workspace),
+                    ],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .expect("seed plan");
+        id
+    }
+
+    /// A workflow version and a run started against a plan, through the RPC arms a client uses.
+    ///
+    /// Returns `(runId, workflowId)`. The run carries a `plan_id` because the execute arm resolves
+    /// its workdir from the plan row — a run with no plan has no workspace to execute in.
+    async fn seeded_run(state: &Arc<AppState>, family: &str) -> (String, String) {
+        seeded_run_in(state, family, EXEC_WORKSPACE).await
+    }
+
+    /// The same pair, with the plan's workspace — and so the arm's workdir — chosen by the caller.
+    async fn seeded_run_in(
+        state: &Arc<AppState>,
+        family: &str,
+        workspace: &str,
+    ) -> (String, String) {
+        let created = AgentService::handle_rpc(
+            &rpc(
+                "create_workflow_version",
+                json!({
+                    "workspacePath": workspace,
+                    "phaseType": "dev-phase",
+                    "family": family,
+                    "role": "you are a developer",
+                    "instruction": "implement the phase",
+                    "contract": "the gate must pass",
+                    "hop": "{\"steps\":[\"edit\",\"verify\"]}",
+                    "fanOut": 1
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(created.success, "create: {:?}", created.error);
+        let workflow_id = created
+            .data
+            .expect("workflow")
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("workflow id")
+            .to_string();
+
+        let plan_id = seed_exec_plan_at(state, workspace);
+        let started = AgentService::handle_rpc(
+            &rpc(
+                "start_workflow_run",
+                json!({ "workflowId": workflow_id, "planId": plan_id }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(started.success, "start: {:?}", started.error);
+        let run = started.data.expect("run");
+        assert!(
+            run.get("gateExit").map(|v| v.is_null()).unwrap_or(false),
+            "a fresh run is unscored: {run}"
+        );
+        (
+            run.get("id")
+                .and_then(|v| v.as_str())
+                .expect("run id")
+                .to_string(),
+            workflow_id,
+        )
+    }
+
+    /// A run's recorded gate, read back from the row rather than from a response body.
+    fn recorded_gate(state: &AppState, run_id: &str) -> Option<i64> {
+        crate::services::workflows::get_workflow_run(state, run_id)
+            .expect("re-read the run")
+            .gate_exit
+    }
+
+    /// **A missing `runId` is refused with the parameter error, and no gate is recorded.**
+    ///
+    /// The message is the same shape `rpc_start_workflow_run` gives for its own missing parameter,
+    /// and the refusal happens BEFORE anything is looked up or executed, so the row it would have
+    /// scored keeps `gate_exit` NULL.
+    #[tokio::test]
+    async fn arena_exec_rpc_refuses_a_missing_run_id() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, _) = seeded_run(&state, "glm-exec-missing").await;
+        assert_eq!(recorded_gate(&state, &run_id), None, "nothing has run yet");
+
+        // `verify` and `binary` are present; only `runId` is absent, so the error can only come
+        // from the required-parameter puller.
+        let response = AgentService::handle_rpc(
+            &rpc("execute_workflow_run", json!({ "verify": "true", "binary": "kloo" })),
+            &state,
+        )
+        .await;
+
+        assert!(!response.success, "a missing runId must be refused");
+        let error = response.error.unwrap_or_default();
+        assert_eq!(
+            error, "Missing 'runId' parameter",
+            "the refusal must be the parameter error, not a service error"
+        );
+        assert!(
+            !error.contains("Unknown RPC method"),
+            "the arm must be registered in handle_rpc"
+        );
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            None,
+            "a refused call must record no gate for the run that was not named"
+        );
+    }
+
+    /// **An unknown `runId` is refused, and nothing is scored.**
+    ///
+    /// The run lookup happens before the executor is built, so a name that matches no row cannot
+    /// reach a child process at all.
+    #[tokio::test]
+    async fn arena_exec_rpc_refuses_an_unknown_run_id() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, _) = seeded_run(&state, "glm-exec-unknown").await;
+
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "execute_workflow_run",
+                json!({ "runId": "no-such-run-anywhere" }),
+            ),
+            &state,
+        )
+        .await;
+
+        assert!(!response.success, "an unknown runId must be refused");
+        let error = response.error.unwrap_or_default();
+        assert!(
+            !error.contains("Unknown RPC method"),
+            "the arm is registered; this is the service refusing: {error}"
+        );
+        assert!(
+            error.contains("no-such-run-anywhere"),
+            "the refusal must name the run it could not find, got {error:?}"
+        );
+        // The run that DOES exist is untouched by a call that named a different one.
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            None,
+            "a refused call must leave every run unscored"
+        );
+    }
+
+    /// **A successful execution returns `gateExit` and the run's recorded gate matches it.**
+    ///
+    /// 7 is deliberately neither 0 nor 1, so an implementation that clamped, booleanised or
+    /// otherwise mangled the child's code cannot pass. The gate is asserted TWICE: in the response
+    /// body and in the row, because the response is what the arena reads and the row is what
+    /// `promotion_block` reads.
+    #[tokio::test]
+    async fn arena_exec_rpc_returns_gate_exit_and_records_it() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, workflow_id) = seeded_run(&state, "glm-exec-scored").await;
+
+        let exec = ExecRpcDouble::with_exit(7);
+        let gate_exit = crate::services::workflows::execute_and_score_workflow_run(
+            &state,
+            &run_id,
+            &exec,
+        )
+        .expect("the execution ran");
+
+        assert_eq!(gate_exit, 7, "the caller gets the child's exit code back");
+        assert_eq!(exec.invocations(), 1, "one run, one execution");
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            Some(7),
+            "the run's recorded gate matches the exit code"
+        );
+
+        // And the same number reaches the wire under `gateExit`, through the arm itself. The
+        // workflow row is re-read to prove the response describes the run that was named.
+        let workflow = crate::services::workflows::get_workflow(&state, &workflow_id)
+            .expect("re-read the workflow");
+        assert_eq!(workflow.family, "glm-exec-scored");
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "record_workflow_run_rescore",
+                json!({ "runId": run_id, "gateExit": 7 }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(response.success, "rescore: {:?}", response.error);
+        let run = response.data.expect("rescored run");
+        assert_eq!(
+            run.get("gateExit").and_then(|v| v.as_i64()),
+            Some(7),
+            "the wire reads back the same score: {run}"
+        );
+    }
+
+    /// **An executor that fails leaves the run's gate NULL.**
+    ///
+    /// The load-bearing one: an execution that did not happen must not look like an execution that
+    /// failed, or a run that never touched a model could be compared against — and even promote
+    /// over — one that did. The error must reach the caller as an RPC error, verbatim.
+    #[tokio::test]
+    async fn arena_exec_rpc_a_failing_executor_records_no_gate() {
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+        let (run_id, _) = seeded_run(&state, "glm-exec-failed").await;
+        assert_eq!(recorded_gate(&state, &run_id), None, "nothing has run yet");
+
+        let exec = ExecRpcDouble::failing("the executor could not start");
+        let err = crate::services::workflows::execute_and_score_workflow_run(
+            &state,
+            &run_id,
+            &exec,
+        )
+        .expect_err("an execution that did not run must not report a code");
+
+        assert_eq!(
+            err, "the executor could not start",
+            "the executor's error must reach the caller verbatim"
+        );
+        assert_eq!(exec.invocations(), 1, "the failure came from the executor, not before it");
+        let after = crate::services::workflows::get_workflow_run(&state, &run_id)
+            .expect("re-read the run");
+        assert_eq!(
+            after.gate_exit, None,
+            "a failed execution must leave gate_exit NULL — no score, no exit code, nothing"
+        );
+        assert_eq!(after.gate_collected, None, "and no advisory number either");
+        assert_eq!(after.ended_at, None, "and the run is not closed out");
+
+        // The same refusal through the wire: the RPC error is the executor's message, and the row
+        // is still unscored afterwards.
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "execute_workflow_run",
+                json!({ "runId": run_id, "binary": "/nonexistent/kloo-not-here-7f3a" }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(!response.success, "a failed execution must be an RPC error");
+        let error = response.error.unwrap_or_default();
+        assert!(
+            error.contains("could not start the phase executor binary"),
+            "the RPC error must be the executor's own message, got {error:?}"
+        );
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            None,
+            "an execution that did not happen must leave the run unscored"
+        );
+    }
+
+    /// **The `execute_workflow_run` ARM answers with the gate exit, under `gateExit`.**
+    ///
+    /// The other three success-shaped tests cannot see this: the one that asserts a response body
+    /// goes through `record_workflow_run_rescore`, and the two that call
+    /// `execute_and_score_workflow_run` never touch the wire at all. So the arm could answer under
+    /// any key it liked — `exitCode`, `code`, nothing — and the suite would stay green while the
+    /// web client read `gateExit` and got `undefined`. This drives the arm itself to a SUCCESS and
+    /// reads the key BY NAME.
+    ///
+    /// The arm builds its own `KlooExecutor` from the plan's `workspace_path`, so no double can be
+    /// injected — the child has to be real. Following `execute_and_score_a_signal_has_no_exit_code`
+    /// in `services::workflows`, the child is an executable script in a fresh temp dir: `#!/bin/sh`
+    /// then `exit 7`. It ignores every argument, so the executor's argv shape (`prompt --verify … 
+    /// --model <family>`) is irrelevant here; only its exit code is. 7 is neither 0 nor 1, so a
+    /// mangled code cannot pass either.
+    #[tokio::test]
+    async fn arena_exec_rpc_the_arm_answers_with_the_gate_exit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (state, _root) = test_state();
+        let state = Arc::new(state);
+
+        // A real child: a uniquely-named temp dir holding `exit-seven.sh`, executable, whose only
+        // statement is `exit 7`. The dir doubles as the plan's workspace, which is what the arm
+        // resolves as the child's workdir.
+        let dir = std::env::temp_dir().join(format!(
+            "wf-arm-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the temp dir for the exit-7 script");
+        let script = dir.join("exit-seven.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").expect("write exit-seven.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make exit-seven.sh executable");
+
+        let (run_id, _) =
+            seeded_run_in(&state, "glm-exec-arm-exit", &dir.to_string_lossy()).await;
+        assert_eq!(recorded_gate(&state, &run_id), None, "nothing has run yet");
+
+        let response = AgentService::handle_rpc(
+            &rpc(
+                "execute_workflow_run",
+                json!({ "runId": run_id, "binary": script.to_string_lossy() }),
+            ),
+            &state,
+        )
+        .await;
+
+        // The temp dir goes BEFORE the asserts, so it is removed on the panic path too.
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(response.success, "the arm must succeed: {:?}", response.error);
+        let data = response.data.expect("the arm answers with data");
+        assert_eq!(
+            data.get("gateExit").and_then(|v| v.as_i64()),
+            Some(7),
+            "the arm must answer under the key `gateExit` with the child's code: {data}"
+        );
+        // And it must answer with a WORKFLOW RUN, not a bare number: the worker's schema declares
+        // this mutation to return `WorkflowRun!` with a non-null `id`, so a client selecting `id`
+        // must find it. `gateExit` above is read BY NAME; `id` here pins that the payload is the
+        // run row itself, the same shape `startWorkflowRun` and `runWorkflowRunGate` answer with.
+        assert_eq!(
+            data.get("id").and_then(|v| v.as_str()),
+            Some(run_id.as_str()),
+            "the arm must answer with the run row, whose `id` is the run it executed: {data}"
+        );
+        assert_eq!(
+            recorded_gate(&state, &run_id),
+            Some(7),
+            "and the arm must SCORE the run, not merely answer — the row carries the gate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_view_tests {
+    //! `session_view` is the FIFTH hop: it builds the `RpcSessionView` that the
+    //! `list_sessions` RPC serialises, which the worker's `listAiSessions`
+    //! forwards verbatim. A field the DB row has, the service computes and the
+    //! GraphQL types declare still reads `null` on the client if THIS mapper
+    //! drops it — so pin both the carry and the camelCase wire key here.
+
+    use super::AgentService;
+
+    fn session_with_terminal_status(status: &str) -> crate::db::models::Session {
+        crate::db::models::Session {
+            id: "s-1".into(),
+            title: "a shell".into(),
+            provider: "shell".into(),
+            model: "".into(),
+            working_directory: "/tmp".into(),
+            status: "active".into(),
+            cli_session_id: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_cents: 0,
+            kind: "user".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+            attached_tmux: true,
+            terminal_status: status.into(),
+        }
+    }
+
+    #[test]
+    fn session_view_carries_terminal_status() {
+        let view = AgentService::session_view(session_with_terminal_status("ended"));
+        assert_eq!(
+            view.terminal_status, "ended",
+            "the RPC view must carry the terminal's live state, not drop it"
+        );
+        // The relay hands the worker JSON, so the WIRE key is what the client
+        // actually reads: `rename_all = "camelCase"` must land it as
+        // `terminalStatus`, and it must be a string (never null).
+        let json = serde_json::to_value(&view).expect("the view serialises");
+        assert_eq!(
+            json.get("terminalStatus").and_then(|v| v.as_str()),
+            Some("ended"),
+            "serialised RPC JSON must carry terminalStatus: {json}"
+        );
+    }
+
+    #[test]
+    fn session_view_carries_each_live_state_and_keeps_the_intent_flag_apart() {
+        for state in ["none", "attached", "detached", "ended"] {
+            let view = AgentService::session_view(session_with_terminal_status(state));
+            assert_eq!(view.terminal_status, state);
+            // Asked to attach (`attached_tmux: true`) yet reporting `none` /
+            // `ended` — neither field may stand in for the other.
+            assert!(view.attached_tmux);
+        }
     }
 }

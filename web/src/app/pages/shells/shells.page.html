@@ -40,22 +40,45 @@
       @if (shells().length > 0) {
         <div class="grouphdr">Active shells</div>
         @for (s of shells(); track s.id) {
-          <div class="row" (click)="open(s)">
-            <div class="ic" [class.tmux]="shellSessionLabel(s).tag === 'tmux'">
-              <ion-icon [name]="shellSessionLabel(s).tag === 'tmux' ? 'git-network-outline' : 'terminal-outline'"></ion-icon>
-            </div>
-            <div class="meta">
-              <div class="nm">
-                {{ shellSessionLabel(s).title }}
-                <span class="tag" [class.shell]="shellSessionLabel(s).tag === 'shell'" [class.tmux]="shellSessionLabel(s).tag === 'tmux'">
-                  {{ shellSessionLabel(s).tag === 'tmux' ? 'attached tmux' : 'shell' }}
-                </span>
+          <!-- `shellRowState` is the row's REAL state, not the `attachedTmux` INTENT: an attached row
+               whose tmux has since died reads 'ended' here instead of "attached tmux". -->
+          @switch (shellRowState(s)) {
+            @case ('ended') {
+              <!-- An ended row does not invite you in: no `Open ▸`, and the sub says plainly that the
+                   terminal is gone. The ✕ stays — clearing the list is how you get rid of it. -->
+              <div class="row ended">
+                <div class="ic dead">
+                  <ion-icon name="help-circle-outline"></ion-icon>
+                </div>
+                <div class="meta">
+                  <div class="nm">
+                    {{ shellSessionLabel(s).title }}
+                    <span class="tag ended">ended</span>
+                  </div>
+                  <div class="sub">Terminal ended — its tmux session is gone, so there is nothing to open. The transcript is still kept.</div>
+                </div>
+                <button type="button" class="ia danger" title="Clear this shell" aria-label="Clear this shell" [disabled]="busy()" (click)="clearOne(s); $event.stopPropagation()">✕</button>
               </div>
-              <div class="sub">{{ formatRelTime((s.updatedAt || s.createdAt), nowIso()) }}</div>
-            </div>
-            <div class="act">Open ▸</div>
-            <button type="button" class="ia danger" title="Clear this shell" aria-label="Clear this shell" [disabled]="busy()" (click)="clearOne(s); $event.stopPropagation()">✕</button>
-          </div>
+            }
+            @default {
+              <div class="row" (click)="open(s)">
+                <div class="ic" [class.tmux]="shellSessionLabel(s).tag === 'tmux'">
+                  <ion-icon [name]="shellSessionLabel(s).tag === 'tmux' ? 'git-network-outline' : 'terminal-outline'"></ion-icon>
+                </div>
+                <div class="meta">
+                  <div class="nm">
+                    {{ shellSessionLabel(s).title }}
+                    <span class="tag" [class.shell]="shellRowState(s) === 'shell'" [class.tmux]="shellRowState(s) !== 'shell'" [class.detached]="shellRowState(s) === 'detached'">
+                      {{ shellRowState(s) === 'shell' ? 'shell' : shellRowState(s) === 'detached' ? 'detached' : 'attached tmux' }}
+                    </span>
+                  </div>
+                  <div class="sub">{{ formatRelTime((s.updatedAt || s.createdAt), nowIso()) }}</div>
+                </div>
+                <div class="act">Open ▸</div>
+                <button type="button" class="ia danger" title="Clear this shell" aria-label="Clear this shell" [disabled]="busy()" (click)="clearOne(s); $event.stopPropagation()">✕</button>
+              </div>
+            }
+          }
         }
       }
 

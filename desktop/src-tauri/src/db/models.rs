@@ -26,6 +26,17 @@ pub struct Session {
     /// offers "Detach" instead of "Close", and archive won't kill the tmux).
     #[serde(default)]
     pub attached_tmux: bool,
+    /// The terminal's REAL state as the host reports it: `none` | `attached` |
+    /// `detached` | `ended`. NOT the `attached_tmux` intent flag above — see
+    /// `services::sessions::reported_terminal_status`, which owns the decision.
+    /// Defaults to `"none"` so a raw row that never consulted tmux cannot claim
+    /// a terminal exists.
+    #[serde(default = "default_terminal_status")]
+    pub terminal_status: String,
+}
+
+fn default_terminal_status() -> String {
+    "none".to_string()
 }
 
 fn default_session_kind() -> String {
@@ -178,7 +189,15 @@ pub struct AgentPlan {
     pub dev_reviewer_provider: Option<String>,
     /// Nullable JSON array of shell commands the coordinator runs itself when a phase reports ready
     /// (J1-16). NULL/empty preserves the previous behaviour of trusting the agent's report.
+    ///
+    /// Serialized as `testCommandsRaw`, NOT `testCommands`: the API surface is the parsed
+    /// [`Self::test_commands_list`] below, so nothing above the host ever has to know the encoding.
+    #[serde(rename = "testCommandsRaw")]
     pub test_commands: Option<String>,
+    /// [`Self::test_commands`] parsed once, at the SQL boundary (`agent_plan_from_row`). This is
+    /// GraphQL's `AgentPlan.testCommands`. Not a DB column — derived, never written.
+    #[serde(rename = "testCommands", default)]
+    pub test_commands_list: Vec<String>,
     /// Nullable JSON `{mode, profile?, provider?, model?, ctx?}`. NULL/empty = commercial.
     /// Same deploy-skew pattern as `validation_config` (migration 021).
     pub executor_config: Option<String>,
@@ -207,6 +226,23 @@ pub struct AgentPlanPhase {
     pub findings_json: String,
     pub created_at: String,
     pub updated_at: String,
+    /// This phase's OWN declared test gate (migration 025). Same encoding as
+    /// [`AgentPlan::test_commands`]: a nullable JSON array of shell strings run from the PLAN's
+    /// `workspace_path`. NULL/empty means "no phase-level gate" and falls back to the plan's — the
+    /// fallback lives in exactly one place, `services::agent_plans::effective_test_commands`.
+    ///
+    /// Serialized as `testCommandsRaw` for the same reason as the plan's.
+    #[serde(rename = "testCommandsRaw", default)]
+    pub test_commands: Option<String>,
+    /// [`Self::test_commands`] parsed at the SQL boundary. GraphQL's `AgentPlanPhase.testCommands`.
+    #[serde(rename = "testCommands", default)]
+    pub test_commands_list: Vec<String>,
+    /// The gate that would ACTUALLY run for this phase: this phase's commands when it declares
+    /// any, else the plan's. Resolved by `services::agent_plans::effective_test_commands` and
+    /// filled when a run is assembled (`get_plan`), so no UI re-implements the fallback. Empty
+    /// means there is no gate at either level. Not a DB column.
+    #[serde(rename = "effectiveTestCommands", default)]
+    pub effective_test_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,6 +393,7 @@ mod tests {
             dev_worker_provider: None,
             dev_reviewer_provider: None,
             test_commands: None,
+            test_commands_list: Vec::new(),
             executor_config: None,
             consecutive_non_pass_planning_rounds: None,
         }

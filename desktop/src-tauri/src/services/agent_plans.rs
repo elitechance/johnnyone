@@ -5,6 +5,7 @@ use crate::db::models::{
 };
 use crate::providers::CliProvider;
 use crate::events::{AgentPlanRunEvent, StreamEvent};
+use crate::services::plan_artifacts;
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
@@ -877,6 +878,12 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
         tasks,
         events,
     };
+    // The single place a phase's effective gate is materialised for the API. One emitter, one
+    // rule: `effective_test_commands`. No consumer re-implements the phase-over-plan fallback.
+    for index in 0..run.phases.len() {
+        let resolved = effective_test_commands(&run.plan, Some(&run.phases[index]));
+        run.phases[index].effective_test_commands = resolved;
+    }
     run.plan.consecutive_non_pass_planning_rounds = Some(
         consecutive_non_pass_planning_rounds_for_initiative(state, &run.plan.initiative_id)?,
     );
@@ -1258,6 +1265,113 @@ pub fn update_plan_app_scope(
 /// (a malformed string is rejected, not silently written) and each lens's `provider` must be a
 /// real `CliProvider` (D13 — a typo/hostile config can't smuggle an unrunnable provider into the
 /// review fan-out). An empty array is allowed and stored as-is (→ resolve falls back to default).
+/// Set — or explicitly clear — the test gate on a plan, or on ONE of its phases.
+///
+/// `phase_id` picks the level: `None` writes the plan's gate, `Some(phase_id)` writes that phase's.
+///
+/// **Clearing must be asked for.** An empty `commands` is REJECTED unless `clear` is true. The
+/// first shape of this function treated "no commands" as "remove the gate", which made
+/// `updateAgentPlanTestCommands(id: "x")` — a call that forgot both optional arguments — silently
+/// wipe the Initiative-wide gate. For a mutation whose name sounds additive, losing a gate must not
+/// be the default outcome of an incomplete call. `clear: true` with a non-empty `commands` is also
+/// rejected, because the caller plainly means two different things at once.
+///
+/// Clearing is still the way to make a level opt out: a cleared phase falls back to the plan, and a
+/// cleared plan means no gate at all. It writes NULL, the shape migrations 023/025 default to.
+///
+/// The list is serialized to the storage encoding here and parsed back by the row mappers, so the
+/// JSON-array shape stays an implementation detail of this file.
+pub fn update_test_commands(
+    state: &AppState,
+    id: String,
+    phase_id: Option<String>,
+    commands: Vec<String>,
+    clear: bool,
+) -> Result<AgentPlanRun, String> {
+    // Judge the CONTRADICTION on what the caller actually sent, before blanks are filtered.
+    //
+    // Filtering first made the rule inconsistent: `clear: true` with `["npm test"]` was rejected,
+    // but `clear: true` with `["   "]` was accepted and silently cleared, because the blank was
+    // removed before the check ran. Same contradictory intent, two different outcomes, decided by
+    // whitespace. A caller who passed any command alongside `clear` has said two things at once and
+    // should hear about it either way.
+    let sent_any_command = !commands.is_empty();
+    let commands: Vec<String> = commands
+        .into_iter()
+        .filter(|command| !command.trim().is_empty())
+        .collect();
+    if clear && sent_any_command {
+        return Err(
+            "Pass either `commands` to set the test gate or `clear: true` to remove it, not both. \
+             (A blank or whitespace-only command still counts as passing one.)"
+                .to_string(),
+        );
+    }
+    if !clear && commands.is_empty() {
+        return Err(
+            "No test commands given. To REMOVE a test gate, pass `clear: true` — an empty command \
+             list is rejected so that an incomplete call cannot silently drop a gate."
+                .to_string(),
+        );
+    }
+    let stored: Option<String> = if clear {
+        None
+    } else {
+        Some(serde_json::to_string(&commands).map_err(|e| e.to_string())?)
+    };
+    // Ensure the plan exists (clear error if not) before writing.
+    get_plan(state, &id)?;
+    match phase_id.as_deref() {
+        Some(phase_id) => {
+            let changed = state.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plan_phases SET test_commands = ?1, updated_at = datetime('now') WHERE plan_id = ?2 AND phase_id = ?3",
+                    params![stored, id, phase_id],
+                )
+                .map_err(|e| e.to_string())
+            })?;
+            if changed == 0 {
+                return Err(format!("Phase not found: {}", phase_id));
+            }
+        }
+        None => {
+            state.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET test_commands = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    params![stored, id],
+                )
+                .map_err(|e| e.to_string())
+            })?;
+        }
+    }
+    append_event(
+        state,
+        &id,
+        phase_id.as_deref(),
+        "agent_plan_test_commands_updated",
+        json!({ "phaseId": phase_id, "commands": commands.len() }),
+    )?;
+    get_plan(state, &id)
+}
+
+/// Run a plan's or phase's effective test gate ONCE, on request, and report the outcome.
+///
+/// Resolves the gate with [`effective_test_commands`] — the same rule the coordinator's automatic
+/// ready-check uses — so what this reports is what the coordinator would see. `phase_id` is
+/// optional: `None` runs the plan-level gate.
+pub async fn run_plan_test_gate(
+    state: &AppState,
+    id: String,
+    phase_id: Option<String>,
+) -> Result<TestGateRun, String> {
+    let run = get_plan(state, &id)?;
+    let phase = match phase_id.as_deref() {
+        Some(phase_id) => Some(find_phase(&run, phase_id)?),
+        None => None,
+    };
+    run_test_gate(&run.plan, phase.as_ref()).await
+}
+
 pub fn update_plan_validation_config(
     state: &AppState,
     id: String,
@@ -2201,8 +2315,23 @@ fn is_worker_writable_store_file(path: &str) -> bool {
     // work IS producing evidence: 02-acceptance bounced three times on its own
     // `cargo-test-lib.txt` and `capture-library.mjs` and escalated to needs_attention, because a
     // fresh test run and an edited capture script both show as "removed lines" here.
-    if path.starts_with("artifacts/") || path.contains("/artifacts/") {
+    //
+    // Run-scoped artifact directories (`phases/<id>/artifacts/runs/<run_id>/…`) are the same
+    // thing one competing run at a time, so they classify identically — that is why `runs/` is
+    // nested UNDER `artifacts/` rather than beside it.
+    //
+    // The test is on path SEGMENTS, via `plan_artifacts::is_artifact_path`, not on substrings.
+    // `path.contains("/artifacts/")` was true for `phases/01-shell/artifacts/../../overview.md`,
+    // which names the spec while reading as an artifact — so `artifacts/` was a key that unlocked
+    // the rest of the store.
+    if crate::services::plan_artifacts::is_artifact_path(path) {
         return true;
+    }
+    // Same reason, for the named progress files below: a path with a `..`, an empty or a
+    // backslash-bearing segment is about a different file from the one it names, so it is not
+    // classified at all.
+    if !crate::services::plan_artifacts::is_safe_relative_path(path) {
+        return false;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
@@ -2233,6 +2362,22 @@ mod worker_writable_tests {
         assert!(!is_worker_writable_store_file("overview.md"));
         assert!(!is_worker_writable_store_file("phases/02-acceptance/tasks/02-02/prompt.md"));
         assert!(!is_worker_writable_store_file("phases/02-acceptance/overview.md"));
+    }
+
+    /// `artifacts/` must not be a key that unlocks the rest of the store.
+    ///
+    /// The classifier decides whether a diff touching a path counts as the worker doing its job
+    /// or as the worker weakening its own spec. A `..` segment anywhere makes that decision about
+    /// a DIFFERENT file than the one named, so the answer is meaningless: the path below names
+    /// `overview.md`, the spec, while reading as an artifact.
+    #[test]
+    fn a_traversing_path_is_never_worker_writable() {
+        assert!(!is_worker_writable_store_file("phases/01-shell/artifacts/../../overview.md"));
+        assert!(!is_worker_writable_store_file("artifacts/../overview.md"));
+        assert!(!is_worker_writable_store_file("phases/../decisions.md"));
+        // A backslash is a legal filename byte on the host, so a Windows-shaped path must not be
+        // read as separators either.
+        assert!(!is_worker_writable_store_file("phases/01-shell\\artifacts\\x.png"));
     }
 }
 
@@ -2722,7 +2867,720 @@ fn collect_prose(dir: &Path, out: &mut String) {
     }
 }
 
-/// Run the plan's declared test commands and return the first failure, if any.
+/// Hard ceiling on the output BYTES a single gate command may buffer, per stream (stdout, stderr).
+///
+/// A gate is an arbitrary shell command; a chatty or looping suite can emit gigabytes. This repo
+/// has already been OOM-killed once by an unbounded read of workspace bytes, so the capture is a
+/// bounded TAIL window: bytes past the cap push the oldest bytes out instead of growing the
+/// buffer, and the kept window is the END of the output — where every test runner puts its summary.
+///
+/// **What this bounds, precisely.** It caps bytes READ per stream, not the size of the `String`
+/// delivered. `String::from_utf8_lossy` replaces each invalid byte with U+FFFD, which is 3 bytes,
+/// so a stream of non-UTF-8 bytes expands up to 3x on conversion, and `TestGateRun::output`
+/// concatenates two such streams. The real worst case for a delivered `output` is therefore about
+/// `6 * TEST_GATE_STREAM_CAP_BYTES` (~768 KiB at the current value), not `2 * cap`. Memory stays
+/// bounded by a constant either way, which is the property that matters, but a caller sizing a
+/// buffer or a response budget must use the 6x figure. (The feature commit's own assertion said
+/// `2 * cap + 16`; that holds only for ASCII output, and QA caught it.)
+pub const TEST_GATE_STREAM_CAP_BYTES: usize = 128 * 1024;
+
+/// Wall-clock deadline for ONE gate command.
+///
+/// Without this a gate that never exits hangs its caller forever: the coordinator loop for
+/// `failing_test_command`, or a host RPC for `run_test_gate`. That was survivable while the gate
+/// was only reachable from inside the host, but the gate is now reachable over GraphQL by anything
+/// holding `plans:write`, which turns a hang into a remote denial of service. Every gate run is
+/// bounded, at both call sites, because they share one runner.
+///
+/// 20 minutes is chosen to sit above a real full-suite run (this repo's own desktop suite is ~7s,
+/// its worker suite ~20s, and a browser e2e pass is minutes) and well below the 25-minute budget
+/// the project uses for a whole agent task. A gate slower than this is a misconfiguration, and
+/// saying so beats hanging.
+pub const TEST_GATE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// How long the gate waits for output to arrive AFTER the command itself has exited.
+///
+/// The capture stops at the command's exit, not at pipe EOF, because a background job the gate
+/// started inherits the pipes and holds them open (see `run_one_gate_command_with_timeout`). This
+/// short window is the flush allowance: whatever the gate itself wrote is already in the pipe, and
+/// a reader that stops instantly can still race the final write. It is deliberately far shorter
+/// than any plausible test-runner runtime, because it is not waiting for work — only for bytes
+/// already in flight.
+pub const TEST_GATE_PIPE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Reserved `TestGateRun::exit_code` values for outcomes where the command produced no code.
+///
+/// All are NON-ZERO, so any caller correctly treating "zero passed, non-zero failed" refuses them
+/// without knowing what they mean; the specific value says which. They are negative because a
+/// POSIX process cannot exit with a negative status, so they can never collide with a real code.
+pub const TEST_GATE_EXIT_SIGNAL: i32 = -1;
+/// The gate is DECLARED but its stored payload could not be read — a configuration error.
+pub const TEST_GATE_EXIT_MALFORMED: i32 = -2;
+/// The command exceeded [`TEST_GATE_COMMAND_TIMEOUT`] and was killed.
+pub const TEST_GATE_EXIT_TIMEOUT: i32 = -3;
+
+/// Read `reader` to EOF but keep only the last `cap` bytes.
+///
+/// Draining to EOF (rather than stopping at the cap) is deliberate: a reader that stops reading
+/// fills the pipe buffer and the child blocks on write forever, which would turn an over-chatty
+/// gate into a hung coordinator instead of a reported exit code.
+///
+/// The window is a `Vec` with `drain(..overflow)` once past the cap. That shape memmoves `cap`
+/// bytes per read, which sounds quadratic and is not: it is O(output) with a constant factor of
+/// `cap / read_size` = 16, done by a vectorised `memmove` over a cache-resident 128 KiB buffer.
+///
+/// An earlier revision replaced this with a `VecDeque` ring on the theory that the `Vec` form was
+/// O(output x cap). **That theory was wrong**, and the ring measured far SLOWER: `extend(iter()
+/// .copied())` plus per-byte `pop_front()` is ~2 operations per byte of the whole stream, where
+/// this form is two memcpy intrinsics. Best of 3, 128 KiB cap, same harness, DEBUG profile (the
+/// profile the test suite runs):
+///
+/// | output | `VecDeque` ring | this `Vec` form |
+/// |--------|-----------------|-----------------|
+/// |  6 MiB |   75.8 ms       |   1.10 ms       |
+/// | 24 MiB |  305.6 ms       |   5.04 ms       |
+/// | 96 MiB | 1227.0 ms       |  19.78 ms       |
+///
+/// Both are linear — ratios 4.03/4.02 for the ring, 4.58/3.92 for this — the ring simply has a
+/// ~60x worse constant. In release the gap narrows to ~2.5x as the per-byte loop vectorises, so
+/// the ring loses in both profiles.
+///
+/// A fixed-size ring with bulk `copy_from_slice` does beat this (0.22 / 1.68 / 7.16 ms) and was
+/// deliberately NOT taken: it needs modular arithmetic and a split copy, and reassembling the
+/// window in the wrong order would silently corrupt the tail — the one thing this function exists
+/// to deliver correctly. 19.78 ms to absorb 96 MiB does not buy that risk.
+///
+/// Returns the kept text, whether the cap discarded anything, and the read error if one ended the
+/// drain. A read error is NOT the same as EOF: it also yields a short capture, and reporting it
+/// separately stops a truncated-by-failure window from reading as a complete one.
+/// Test-only convenience over [`drain_capped_tail_into`]: run a drain to completion and return the
+/// capture as a tuple. The runner does not use it — it needs the capture to be readable WHILE the
+/// drain is still running — so it is `#[cfg(test)]` rather than dead code in the shipped binary.
+#[cfg(test)]
+async fn drain_capped_tail<R>(reader: R, cap: usize) -> (String, bool, Option<String>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
+    drain_capped_tail_into(reader, cap, shared.clone()).await;
+    GateCapture::take(&shared)
+}
+
+/// A gate stream's capture, published after every read.
+///
+/// The runner may stop waiting on a drain before it reaches EOF (a background job holding the pipe
+/// open — see `run_one_gate_command_with_timeout`), and when it does, whatever was read so far must
+/// survive. Publishing incrementally is what makes that possible: an earlier version awaited the
+/// drain task with a timeout and discarded the task's value on expiry, which threw away the gate's
+/// own output. Measured: a gate whose only output was `echo started` reported an EMPTY capture
+/// because a background writer kept the pipe open past the grace window.
+#[derive(Default)]
+struct GateCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    error: Option<String>,
+}
+
+impl GateCapture {
+    /// Snapshot as `(text, truncated, read_error)`. A poisoned lock yields an empty capture rather
+    /// than panicking: losing output is bad, failing the whole gate run over it is worse.
+    fn take(shared: &std::sync::Mutex<Self>) -> (String, bool, Option<String>) {
+        match shared.lock() {
+            Ok(capture) => (
+                String::from_utf8_lossy(&capture.bytes).into_owned(),
+                capture.truncated,
+                capture.error.clone(),
+            ),
+            Err(_) => (String::new(), false, Some("capture lock poisoned".to_string())),
+        }
+    }
+}
+
+/// `drain_capped_tail`'s loop, publishing into `shared` after every read.
+///
+/// Deliberately NOT an intra-doc link: `drain_capped_tail` is `#[cfg(test)]`, so it does not
+/// exist in a normal `cargo doc` build and a bracketed link to it is unresolvable. Found by
+/// `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc`, which nothing in the gate
+/// set ran until a dangling arena citation of exactly this shape got through every other gate.
+async fn drain_capped_tail_into<R>(
+    mut reader: R,
+    cap: usize,
+    shared: std::sync::Arc<std::sync::Mutex<GateCapture>>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let Ok(mut capture) = shared.lock() else { break };
+                capture.bytes.extend_from_slice(&buf[..n]);
+                if capture.bytes.len() > cap {
+                    let overflow = capture.bytes.len() - cap;
+                    capture.bytes.drain(..overflow);
+                    capture.truncated = true;
+                }
+            }
+            Err(err) => {
+                if let Ok(mut capture) = shared.lock() {
+                    capture.error = Some(err.to_string());
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// The shell a gate command is run with. One place, so the gate runner and the coordinator's
+/// ready-check can never disagree about how a command is interpreted.
+///
+/// **POSIX only, deliberately.** This used to return `("cmd", "/C")` under
+/// `cfg!(target_os = "windows")`, which was worse than having no Windows path at all: the process
+/// group and the group kill are `#[cfg(unix)]`, so a Windows gate had no containment, and — the
+/// part that actually misreports — Windows exit codes are a full `u32` surfaced through `i32`, so a
+/// command exiting `-3` would have been reported as a TIMEOUT and `-2` as a malformed gate. The
+/// three reserved codes are only unreachable because `ExitStatus::code()` is 0..=255 on unix. A
+/// half-implemented platform that silently lies about why a gate failed is worse than an absent
+/// one, so the branch is gone. Nothing in this project runs on Windows; if that changes, the
+/// outcome needs its own field rather than an overloaded exit code.
+fn gate_shell() -> (&'static str, &'static str) {
+    ("sh", "-c")
+}
+
+/// What one stored `test_commands` payload declares.
+///
+/// The three cases are deliberately distinct because conflating two of them is the one failure an
+/// exit-code-only design cannot notice. "Nothing declared" is the opt-in default and means the
+/// phase is trusted; "declared but unreadable" is a typo that must NOT quietly downgrade a gated
+/// phase to an ungated one. Before this existed, `not json`, `{"commands":[...]}`, `["exit 1", null]`,
+/// `[1,2]` and a truncated `["exit 1"` all resolved to "no gate" and reported `exitCode: 0` —
+/// indistinguishable, over the API, from a gate that ran and passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredGate {
+    /// NULL, empty, `[]`, or entries that are all blank. No gate at this level.
+    Absent,
+    /// Present but not a JSON array of shell strings.
+    Malformed { error: String },
+    /// Commands to run, in order, with blank entries dropped.
+    Commands(Vec<String>),
+}
+
+/// Parse one `test_commands` payload: a JSON array of shell strings.
+///
+/// The single reader of the storage encoding. Both levels, every caller, and the row mappers go
+/// through here, so there is one definition of what a stored gate means.
+fn parse_test_commands(raw: Option<&str>) -> DeclaredGate {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return DeclaredGate::Absent;
+    };
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(parsed) => {
+            let commands: Vec<String> = parsed
+                .into_iter()
+                .filter(|command| !command.trim().is_empty())
+                .collect();
+            // `[]` and `["  "]` declare nothing to run, which is the same as declaring no gate.
+            if commands.is_empty() {
+                DeclaredGate::Absent
+            } else {
+                DeclaredGate::Commands(commands)
+            }
+        }
+        Err(error) => DeclaredGate::Malformed {
+            error: error.to_string(),
+        },
+    }
+}
+
+impl DeclaredGate {
+    /// The commands this level declares, for the `testCommands` display fields.
+    ///
+    /// `Malformed` yields an empty list: a field whose job is to say what commands would run must
+    /// not invent any. Callers that must ACT on the gate match on the enum instead, so "broken"
+    /// can never be read as "none" where it matters.
+    fn into_commands(self) -> Vec<String> {
+        match self {
+            DeclaredGate::Commands(commands) => commands,
+            DeclaredGate::Absent | DeclaredGate::Malformed { .. } => Vec::new(),
+        }
+    }
+}
+
+/// Which level a gate came from, for messages that have to name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateLevel {
+    Phase,
+    Plan,
+}
+
+impl GateLevel {
+    fn label(self) -> &'static str {
+        match self {
+            GateLevel::Phase => "phase",
+            GateLevel::Plan => "plan",
+        }
+    }
+}
+
+/// **The resolution rule.** The test gate that actually applies to a phase: the phase's own
+/// `test_commands` when it declares any, otherwise the plan's.
+///
+/// Migration 023 put the gate on the plan, 025 put it on the phase. Both levels exist because one
+/// command for a whole Initiative is the wrong grain — an early schema phase and a late UI phase
+/// do not share a suite. The precedence between them is one line of logic and therefore exactly
+/// one function: this repo has already been bitten by three independent writers of one SQL clause
+/// drifting apart (see `DETACH_TERMINAL_SET` in `terminal.rs`, hoisted for that reason), and a
+/// gate that resolves differently in the coordinator than in the UI is a false pass waiting to
+/// happen. Every caller — the coordinator's ready-check, the run-once host command, and the
+/// `effectiveTestCommands` the API exposes — goes through here. Do not inline the fallback.
+///
+/// A MALFORMED level does not fall through. Falling through would mask the typo behind whatever the
+/// other level happens to say, which is the silent downgrade this type exists to prevent: a broken
+/// gate is reported, never resolved past. `Absent` does fall through — that is the opt-in default.
+pub fn effective_gate(plan: &AgentPlan, phase: Option<&AgentPlanPhase>) -> (DeclaredGate, GateLevel) {
+    match parse_test_commands(phase.and_then(|phase| phase.test_commands.as_deref())) {
+        DeclaredGate::Absent => (parse_test_commands(plan.test_commands.as_deref()), GateLevel::Plan),
+        declared => (declared, GateLevel::Phase),
+    }
+}
+
+/// The effective gate as a plain command list, for callers that only need "what would run".
+///
+/// This is what `AgentPlanPhase.effectiveTestCommands` serves. A malformed level reports an empty
+/// list here — the list cannot express "broken", and a field whose job is to say what commands
+/// would run must not invent any. Callers that must ACT on the gate use [`effective_gate`] and
+/// handle [`DeclaredGate::Malformed`]; this one is for display.
+pub fn effective_test_commands(plan: &AgentPlan, phase: Option<&AgentPlanPhase>) -> Vec<String> {
+    effective_gate(plan, phase).0.into_commands()
+}
+
+/// Outcome of running a phase's effective gate once.
+///
+/// `exit_code` is authoritative and is the ONLY score this feature has: zero means the gate
+/// passed, anything else means it failed. `collected` is advisory — see its doc comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestGateRun {
+    /// Whether a gate was DECLARED at all, at either level.
+    ///
+    /// This is the field that separates "passed" from "there was nothing to pass". Without it an
+    /// `exit_code: 0` is ambiguous: it is returned both by a gate that ran every command
+    /// successfully and by a phase that declares no gate — and, before this field existed, also by
+    /// a gate whose stored payload was a typo. A caller that wants "this phase is proven" must
+    /// check `gate_declared && exit_code == 0`; `exit_code == 0` alone only means "nothing failed".
+    ///
+    /// `true` with `commands_run == 0` and a non-zero `exit_code` is the malformed case: something
+    /// was declared, nothing could be run.
+    pub gate_declared: bool,
+    /// Exit code of the run: `0` when every command succeeded, otherwise the code of the FIRST
+    /// command that failed. Three reserved negative values cover the cases where no code exists:
+    /// [`TEST_GATE_EXIT_SIGNAL`], [`TEST_GATE_EXIT_MALFORMED`], [`TEST_GATE_EXIT_TIMEOUT`].
+    pub exit_code: i32,
+    /// How many tests the run reported, parsed best-effort from its output — see
+    /// [`parse_collected_count`].
+    ///
+    /// **Nullable by design, and `None` is not an error.** A gate that prints nothing a parser
+    /// recognises (a lint, a build, a bespoke script, a runner whose summary format we have never
+    /// seen) is a perfectly legitimate gate with a perfectly well-known exit code. Callers MUST
+    /// treat this as a display hint only and MUST NOT gate on it, compare it, or persist it.
+    pub collected: Option<i64>,
+    /// The command whose exit code is reported: the first failure, or the last command on success.
+    /// `None` when the phase has no gate at all, or when the gate was declared but unreadable.
+    pub command: Option<String>,
+    /// Commands actually executed. Fewer than the gate declares when one failed and stopped the run.
+    pub commands_run: i64,
+    /// Captured stdout+stderr tail of the reported command. Bounded by
+    /// [`TEST_GATE_STREAM_CAP_BYTES`] bytes READ per stream; see that constant for why the
+    /// delivered string can still be ~6x that.
+    pub output: String,
+    /// True when the cap discarded earlier output, so a reader knows the window is a tail.
+    pub truncated: bool,
+}
+
+impl TestGateRun {
+    /// The no-gate-declared outcome: nothing to run, nothing failed, nothing proven.
+    fn undeclared() -> Self {
+        Self {
+            gate_declared: false,
+            exit_code: 0,
+            collected: None,
+            command: None,
+            commands_run: 0,
+            output: String::new(),
+            truncated: false,
+        }
+    }
+}
+
+/// Best-effort count of the tests a gate run reported.
+///
+/// There is no portable way to ask an arbitrary shell command how many tests it ran, so this reads
+/// the output. It scans every line for `<number> <keyword>` pairs (`passed`, `passing`, `failed`,
+/// `failing`, `skipped`, `ignored`, `pending`, `todo`) and sums them, and understands two common
+/// summary idioms specially: an explicit `N total` (jest) wins over the sum on its line, and
+/// `Executed N of M` (karma) reports `M`. The LARGEST per-line candidate wins.
+///
+/// **What "largest wins" is and is not.** It is a heuristic for picking a runner's own summary line
+/// out of surrounding chatter — it is NOT a grand total, and this function does not compute one.
+/// Known and accepted wrong answers:
+/// - multi-binary `cargo test` prints one `test result:` line per binary and NO overall total, so
+///   two binaries at 500 and 200 report 500, not the 700 actually run;
+/// - any line shaped `<n> <keyword>` outranks a real count, so
+///   `"5 passed\nwarning: 48129 skipped"` reports 48129;
+/// - mocha splits `12 passing` / `1 failing` across lines and reports 12;
+/// - `"Tests: 0 total"` reports `Some(0)`.
+///
+/// That last one is the only case that could mislead rather than merely miscount: a suite that
+/// collected ZERO tests is a classic false green ("a suite that collects 0 tests passes
+/// everything"), and `Some(0)` is the one signal of it available here. It is still NOT safe to act
+/// on, because `None` is equally common and means nothing of the sort. Detecting an empty
+/// collection properly belongs in the gate command itself (`--passWithNoTests=false` and friends).
+/// Returns `None` whenever nothing matched. The exit code is the score; never decide on this number.
+pub fn parse_collected_count(output: &str) -> Option<i64> {
+    const COUNTED: [&str; 8] = [
+        "passed", "passing", "failed", "failing", "skipped", "ignored", "pending", "todo",
+    ];
+    let mut best: Option<i64> = None;
+    for line in output.lines() {
+        let tokens: Vec<String> = line
+            .split_whitespace()
+            .map(|token| {
+                token
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let mut sum: Option<i64> = None;
+        let mut total: Option<i64> = None;
+        let mut executed_of: Option<i64> = None;
+        for (index, token) in tokens.iter().enumerate() {
+            let Ok(number) = token.parse::<i64>() else {
+                continue;
+            };
+            // `Executed 288 of 293` — the denominator is what was collected.
+            if index >= 1
+                && tokens[index - 1] == "executed"
+                && tokens.get(index + 1).map(String::as_str) == Some("of")
+            {
+                executed_of = tokens.get(index + 2).and_then(|t| t.parse::<i64>().ok());
+            }
+            match tokens.get(index + 1).map(String::as_str) {
+                Some("total") => total = Some(number),
+                Some(next) if COUNTED.contains(&next) => {
+                    sum = Some(sum.unwrap_or(0) + number);
+                }
+                _ => {}
+            }
+        }
+        if let Some(found) = executed_of.or(total).or(sum) {
+            best = Some(best.map_or(found, |previous: i64| previous.max(found)));
+        }
+    }
+    best
+}
+
+/// Run ONE gate command under a deadline, capturing a bounded tail of both streams.
+///
+/// The single place a gate command is ever executed. Both the on-demand runner and the
+/// coordinator's ready-check go through here, so the timeout, the output cap, the shell, and
+/// `kill_on_drop` cannot be present in one path and missing in the other — which is exactly how
+/// the unbounded, un-timed `failing_test_command` loop came to exist alongside the capped one.
+///
+/// `Err` is reserved for "could not start the command at all" (a missing or non-directory
+/// `workspace_path`). A command that starts and then fails, is killed, or times out is an `Ok`
+/// outcome with a non-zero code — those are gate results, not runner errors.
+async fn run_one_gate_command(
+    command: &str,
+    workspace_path: &str,
+) -> Result<(i32, String, bool), String> {
+    run_one_gate_command_with_timeout(command, workspace_path, TEST_GATE_COMMAND_TIMEOUT).await
+}
+
+/// [`run_one_gate_command`] with the deadline injected.
+///
+/// Production always uses [`TEST_GATE_COMMAND_TIMEOUT`]; the parameter exists so the timeout and
+/// `kill_on_drop` paths can be proven in milliseconds instead of waiting out the real 20 minutes.
+/// An untested timeout is a timeout nobody has seen fire.
+async fn run_one_gate_command_with_timeout(
+    command: &str,
+    workspace_path: &str,
+    deadline: std::time::Duration,
+) -> Result<(i32, String, bool), String> {
+    let (shell, flag) = gate_shell();
+    let mut builder = tokio::process::Command::new(shell);
+    builder
+        .arg(flag)
+        .arg(command)
+        .current_dir(workspace_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Without this, dropping the future (a cancelled RPC, a timed-out coordinator tick) leaves
+        // the shell running: QA observed orphaned `sh -c sleep 45` processes outliving the test
+        // that spawned them. Necessary but NOT sufficient on its own — see the process group below.
+        .kill_on_drop(true);
+    // Put the gate command in its OWN process group, so the whole tree can be signalled.
+    //
+    // `kill_on_drop` and `Child::kill` only reach the DIRECT child, the shell. A gate command is a
+    // shell script, and a shell that does not `exec` its last command forks it as a grandchild:
+    // killing the shell then orphans the grandchild, which is reparented and keeps running. The
+    // group leader is the shell, so the TIMEOUT path can signal the whole tree.
+    //
+    // Scope of the guarantee, precisely: a gate that EXCEEDS ITS DEADLINE does not leave work
+    // running. A gate that SUCCEEDS is never signalled, so a background job it started survives it
+    // — deliberately, because killing a passing gate's children would break setups that start a
+    // service on purpose. `qa_gate_background_job_outlives_a_successful_gate` pins that. The
+    // earlier wording here claimed the host was protected from leftover work in general; it is only
+    // protected on the deadline path.
+    #[cfg(unix)]
+    builder.process_group(0);
+    let mut child = builder.spawn().map_err(|error| {
+        format!(
+            "Could not run the test command `{}` in {}: {}",
+            command, workspace_path, error
+        )
+    })?;
+    let child_pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let cap = TEST_GATE_STREAM_CAP_BYTES;
+
+    // BOTH pipes must be drained concurrently, and concurrently with waiting on the child.
+    //
+    // Draining stdout to EOF first deadlocks as soon as the child fills the stderr pipe buffer: it
+    // blocks on write, stdout never reaches EOF, and the gate hangs forever instead of reporting an
+    // exit code. (QA reproduced this by replacing the join! with sequential drains: both flood
+    // tests then time out at 60s.) They run as spawned tasks rather than a `join!` so that the
+    // child's exit can be observed WITHOUT waiting for the pipes to close — see the grace period
+    // below for why that distinction matters.
+    // The captures are shared, not returned: a drain the runner stops waiting on must still hand
+    // over what it read. See `GateCapture`.
+    let out_capture = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
+    let err_capture = std::sync::Arc::new(std::sync::Mutex::new(GateCapture::default()));
+    let mut drain_stdout = tokio::spawn({
+        let shared = out_capture.clone();
+        async move {
+            if let Some(pipe) = stdout {
+                drain_capped_tail_into(pipe, cap, shared).await;
+            }
+        }
+    });
+    let mut drain_stderr = tokio::spawn({
+        let shared = err_capture.clone();
+        async move {
+            if let Some(pipe) = stderr {
+                drain_capped_tail_into(pipe, cap, shared).await;
+            }
+        }
+    });
+
+    // THE DEADLINE BOUNDS THE COMMAND, AND ONLY THE COMMAND.
+    //
+    // Wait for the COMMAND to exit, not for its pipes to close. A gate's own exit tells us the
+    // result; pipe EOF does not, because a background job the gate started INHERITS the pipes and
+    // holds them open after the gate exits — so EOF waits on the background job, not on the gate.
+    // Measured: a shell that exited 0 in milliseconds took 3.157s to return because it left a
+    // `sleep 3` running. In production a gate like `npm test` that leaves a watcher or a dev server
+    // behind would have waited the FULL deadline and then been reported as a timeout: the right
+    // answer (it passed) replaced by a wrong diagnosis blaming the command for being slow.
+    //
+    // The flush grace below is deliberately OUTSIDE this timeout. When the deadline covered
+    // `wait()` plus the grace, a command that exited 0 within one grace-width of the deadline was
+    // reported `-3`, and — the worse half — the group-kill block's safety argument became false in
+    // that window, because it assumes the shell has NOT been reaped while the negative-pid kill
+    // runs. Keeping the grace outside means the deadline measures exactly what it claims to, and
+    // the timeout branch is reached only with the child un-waited.
+    let wait_result = tokio::time::timeout(deadline, child.wait()).await;
+
+    match wait_result {
+        Ok(status) => {
+            // The command is gone; now give its output a brief, bounded moment to arrive. This is
+            // a flush window, not a wait on the background job: whatever the gate itself wrote is
+            // already in the pipe, and a reader that stops instantly can still race the last write.
+            // Both graces run CONCURRENTLY — awaited one after the other, a background job holding
+            // both pipes would cost two full grace windows instead of one.
+            let _ = tokio::join!(
+                tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, &mut drain_stdout),
+                tokio::time::timeout(TEST_GATE_PIPE_FLUSH_GRACE, &mut drain_stderr),
+            );
+            // ABORT rather than detach. Dropping a `JoinHandle` detaches the task, so a gate that
+            // leaves a daemon holding its pipes would leave two drains alive until that daemon
+            // exits, each pinning up to `cap` bytes — bounded per gate, unbounded across a long
+            // coordinator session. The capture is already shared, so nothing is lost by stopping
+            // them: everything read so far is in `out_capture`/`err_capture` below.
+            drain_stdout.abort();
+            drain_stderr.abort();
+            // Read the SHARED captures, not the tasks' return values. Whether a drain finished at
+            // EOF or was cut short by the grace window, what it read is here.
+            let (out, out_truncated, out_err) = GateCapture::take(&out_capture);
+            let (err, err_truncated, err_err) = GateCapture::take(&err_capture);
+            let truncated = out_truncated || err_truncated;
+            let read_error = out_err.or(err_err);
+            let mut combined = format!("{}\n{}", out, err);
+            // A read error also produces a short capture. Saying so stops a window truncated by
+            // failure from reading as a complete one.
+            if let Some(read_error) = read_error {
+                combined.push_str(&format!(
+                    "\n[gate] reading the command's output failed: {}. The capture above is \
+                     incomplete for that reason, not because the command printed nothing more.",
+                    read_error
+                ));
+            }
+            let status = status.map_err(|error| {
+                format!("Could not wait on the test command `{}`: {}", command, error)
+            })?;
+            Ok((
+                status.code().unwrap_or(TEST_GATE_EXIT_SIGNAL),
+                combined,
+                truncated,
+            ))
+        }
+        Err(_) => {
+            // Kill the whole GROUP, not just the shell, then reap. Dropping `child` alone would
+            // SIGKILL the shell and orphan whatever it forked.
+            //
+            // ORDER IS LOAD-BEARING: the group kill MUST come before `child.kill()`.
+            //
+            // The negative-pid form signals "the process group whose id is this pid", and the pgid
+            // equals the shell's pid only while the kernel still owns that pid — which it does
+            // while the shell is alive or an unreaped zombie. `child.kill()` reaps it and releases
+            // the pid for reuse, after which `kill -KILL -<pid>` could signal a RECYCLED group, i.e.
+            // kill processes belonging to someone else. Reordering these two statements is a
+            // kill-the-wrong-thing bug, not a tidiness question, and
+            // `the_group_kill_runs_before_the_child_is_reaped` pins the order.
+            //
+            // THE PRECONDITION IS STRUCTURAL, and it has been false once. This branch is reached
+            // only from `timeout(deadline, child.wait())` expiring, so the child is un-waited here
+            // by construction. When the deadline also covered the flush grace, a command could
+            // exit and be reaped INSIDE the bounded region and still land in this branch — the pid
+            // was then already released and the argument above did not hold. That is why the grace
+            // now sits outside the timeout: it keeps this precondition true, not merely likely.
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // This crate has neither `libc` nor `nix`, so the group is signalled via kill(1).
+                // The status is CHECKED: discarding it meant that on a box without that binary the
+                // group kill no-opped silently and a timed-out gate orphaned its grandchildren
+                // exactly as it did before the group was introduced — the defect, invisibly back.
+                match tokio::process::Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{}", pid))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => {}
+                    // `kill` ran and refused: almost always ESRCH because the whole group already
+                    // exited between the deadline and here, which is the common, harmless case.
+                    Ok(status) => tracing::debug!(
+                        pgid = pid,
+                        ?status,
+                        "gate group kill reported no such process group (it had already exited)"
+                    ),
+                    // `kill` could not be EXECUTED. This is the silent-no-op case: containment is
+                    // gone and the gate's descendants are still running. Loud, because the only
+                    // other symptom is work quietly outliving its deadline on the user's host.
+                    Err(error) => tracing::error!(
+                        pgid = pid,
+                        %error,
+                        "gate group kill could not run `kill`; the timed-out gate's process group \
+                         was NOT signalled and its descendants may still be running"
+                    ),
+                }
+            }
+            // Reap the shell itself so it does not linger as a zombie. AFTER the group kill above.
+            let _ = child.kill().await;
+            Ok((
+                TEST_GATE_EXIT_TIMEOUT,
+                format!(
+                    "[gate] the command `{}` did not finish within {} seconds and was killed, \
+                     along with every process it started. No output was collected because it never \
+                     completed. Two things cause this: a gate that genuinely takes longer than the \
+                     deadline, or a gate that finished but left a background process (a watcher, a \
+                     dev server) running — the second is a misconfigured gate, not a slow one.",
+                    command,
+                    deadline.as_secs()
+                ),
+                false,
+            ))
+        }
+    }
+}
+
+/// Run a phase's effective gate ONCE and report its exit code (plus an advisory collected count).
+///
+/// This is the on-demand counterpart to the coordinator's automatic ready-check: same resolution
+/// rule ([`effective_gate`]), same runner, same sequential stop-at-first-failure semantics, but it
+/// reports instead of bouncing the worker. Commands run from the plan's `workspace_path` — phases
+/// have no workspace of their own.
+///
+/// A phase with no gate at either level is not an error: it reports `gate_declared: false` with
+/// `exit_code: 0` and `commands_run: 0`, which says truthfully "nothing to run, nothing failed,
+/// nothing proven". A DECLARED but unreadable gate is a non-zero
+/// [`TEST_GATE_EXIT_MALFORMED`] with `gate_declared: true`, so it can never be mistaken for a pass.
+pub async fn run_test_gate(
+    plan: &AgentPlan,
+    phase: Option<&AgentPlanPhase>,
+) -> Result<TestGateRun, String> {
+    let (declared, level) = effective_gate(plan, phase);
+    let commands = match declared {
+        DeclaredGate::Absent => return Ok(TestGateRun::undeclared()),
+        DeclaredGate::Malformed { error } => {
+            return Ok(TestGateRun {
+                gate_declared: true,
+                exit_code: TEST_GATE_EXIT_MALFORMED,
+                collected: None,
+                command: None,
+                commands_run: 0,
+                output: malformed_gate_message(level, &error),
+                truncated: false,
+            })
+        }
+        DeclaredGate::Commands(commands) => commands,
+    };
+    let mut last = TestGateRun {
+        gate_declared: true,
+        ..TestGateRun::undeclared()
+    };
+    for command in commands {
+        tracing::info!(plan_id = %plan.id, %command, "running declared test command on request");
+        let (exit_code, output, truncated) =
+            run_one_gate_command(&command, &plan.workspace_path).await?;
+        last = TestGateRun {
+            gate_declared: true,
+            exit_code,
+            collected: parse_collected_count(&output),
+            command: Some(command.clone()),
+            commands_run: last.commands_run + 1,
+            output,
+            truncated,
+        };
+        // Sequential, stop at the first non-zero: a later command cannot un-fail an earlier one.
+        if last.exit_code != 0 {
+            break;
+        }
+    }
+    Ok(last)
+}
+
+/// The one wording for "a gate is declared here but cannot be read".
+///
+/// Shared by the on-demand runner and the coordinator's ready-check so a person who sees it in a
+/// phase bounce and in an API response reads the same sentence.
+fn malformed_gate_message(level: GateLevel, error: &str) -> String {
+    format!(
+        "The {} declares a test gate, but its stored `test_commands` could not be read: {}. \
+         Expected a JSON array of shell command strings, for example [\"npm test\"]. \
+         This is NOT a passing gate and NOT an absent one — it is a configuration error, and it is \
+         reported rather than ignored because silently treating it as \"no gate\" would downgrade a \
+         gated phase to an ungated one on a typo.",
+        level.label(),
+        error
+    )
+}
+
+/// Run the phase's effective test gate and return a bounce reason if it does not pass.
 ///
 /// "All three test layers green" is the project's phase rule, but the coordinator only ever learned
 /// the outcome from the agent's own report — and that report has been wrong. A phase was reported
@@ -2730,56 +3588,85 @@ fn collect_prose(dir: &Path, out: &mut String) {
 /// an earlier phase recorded "Karma 288" where an independent run produced 293. Every place the
 /// coordinator trusts an agent's self-report about its own work has produced a false pass.
 ///
-/// Opt-in: `test_commands` is a JSON array of shell strings run from `workspace_path`. NULL or empty
-/// keeps the previous behaviour exactly, so existing plans are unaffected.
+/// Opt-in: a gate declared at neither level returns `None` and the phase is trusted exactly as it
+/// was before migration 023. A gate that is DECLARED but unreadable returns `Some` — see
+/// [`DeclaredGate`] for why that is not the same thing.
+///
+/// Which commands run is NOT decided here — it is [`effective_gate`], the one place the
+/// phase-over-plan fallback lives. Pass the phase that reported ready so a phase declaring its own
+/// gate is held to its own gate; `run_development_worker_phase` does, and
+/// `coordinator_ready_check_uses_the_phase_gate` pins that it keeps doing so.
+///
+/// Execution is delegated to [`run_one_gate_command`], the same runner the on-demand
+/// `run_test_gate` uses. It was previously a second, independent loop here — unbounded output, no
+/// timeout, no `kill_on_drop` — which is precisely the drift that having two emitters invites.
 async fn failing_test_command(
     plan: &AgentPlan,
+    phase: Option<&AgentPlanPhase>,
 ) -> Option<String> {
-    let raw = plan.test_commands.as_deref()?.trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    let commands: Vec<String> = serde_json::from_str(&raw).ok()?;
-    let shell = if cfg!(target_os = "windows") { "cmd" } else { "sh" };
-    let flag = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+    let (declared, level) = effective_gate(plan, phase);
+    let commands = match declared {
+        DeclaredGate::Absent => return None,
+        DeclaredGate::Malformed { error } => {
+            // A typo must not downgrade a gated phase to an ungated one. Bounce it as a config
+            // error with the fix spelled out, rather than passing the phase on no evidence.
+            return Some(format!(
+                "{}\n\nThe phase cannot be accepted on an unreadable gate. Fix the stored \
+                 `test_commands` (or clear it deliberately if this phase is meant to be ungated), \
+                 then report ready again.",
+                malformed_gate_message(level, &error)
+            ));
+        }
+        DeclaredGate::Commands(commands) => commands,
+    };
 
-    for command in commands.iter().filter(|c| !c.trim().is_empty()) {
+    for command in commands.iter() {
         tracing::info!(plan_id = %plan.id, %command, "coordinator running declared test command");
-        let output = tokio::process::Command::new(shell)
-            .arg(flag)
-            .arg(command)
-            .current_dir(&plan.workspace_path)
-            .output()
-            .await;
-        match output {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                // Tail, not head: test runners put the summary at the end.
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail = |text: &str| -> String {
-                    text.lines()
-                        .rev()
-                        .take(20)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("\n")
+        match run_one_gate_command(command, &plan.workspace_path).await {
+            Ok((0, _, _)) => {}
+            Ok((exit_code, output, truncated)) => {
+                // Tail, not head: test runners put the summary at the end. The capture is already
+                // a bounded tail in bytes; this trims it to something readable in a bounce message.
+                let tail: String = {
+                    let lines: Vec<&str> = output.lines().collect();
+                    let start = lines.len().saturating_sub(40);
+                    lines[start..].join("\n")
+                };
+                let note = if truncated {
+                    "\n(earlier output was discarded by the capture cap — this is the tail.)"
+                } else {
+                    ""
+                };
+                let timed_out = if exit_code == TEST_GATE_EXIT_TIMEOUT {
+                    format!(
+                        "\n\nThe command did not finish within {} seconds and was killed. That is \
+                         a misconfigured gate, not a test failure — make it terminate.",
+                        TEST_GATE_COMMAND_TIMEOUT.as_secs()
+                    )
+                } else {
+                    String::new()
                 };
                 return Some(format!(
                     "The phase was reported ready, but the coordinator ran `{}` in {} and it FAILED \
                      (exit {}). A phase is not done until its declared tests pass — fix the failures \
-                     and report ready again. Do not edit the tests to make them pass.\n\n\
-                     --- stdout (tail) ---\n{}\n--- stderr (tail) ---\n{}",
+                     and report ready again. Do not edit the tests to make them pass.{}\n\n\
+                     --- output (tail) ---\n{}{}",
                     command,
                     plan.workspace_path,
-                    out.status.code().unwrap_or(-1),
-                    tail(&stdout),
-                    tail(&stderr),
+                    exit_code,
+                    timed_out,
+                    tail,
+                    note,
                 ));
             }
             Err(error) => {
+                // R4, deliberate and pinned by
+                // `qa_gate_unrunnable_workspace_errors_while_the_coordinator_fails_the_phase`:
+                // a workspace that cannot be entered is an `Err` from `run_test_gate` (the caller
+                // asked to run a gate and nothing ran — that is a request-level failure) but a
+                // phase-REJECTION here (the coordinator cannot verify the phase, so it must not
+                // accept it). Same condition, two shapes, because the two callers owe their callers
+                // different things. Not restructured on purpose.
                 return Some(format!(
                     "The coordinator could not run the declared test command `{}` in {}: {}. \
                      Check the command and the workspace, then report ready again.",
@@ -2789,6 +3676,24 @@ async fn failing_test_command(
         }
     }
     None
+}
+
+/// The ready-check as the COORDINATOR must call it: a phase is required, not optional.
+///
+/// This wrapper exists for one reason. QA mutated the coordinator's call site from
+/// `failing_test_command(&run.plan, Some(&phase))` to `(&run.plan, None)` — a plausible-looking
+/// refactor — and the whole per-phase gate silently reverted to plan-only gating with every phase
+/// gate passing, while the suite stayed green. An `Option` parameter made the wrong call
+/// expressible; this signature does not. Passing `None` here is a compile error, which is a
+/// stronger guarantee than any test, and
+/// `the_coordinator_ready_check_requires_a_phase` pins that the coordinator keeps using it.
+///
+/// The `Option` form stays for the on-demand API path, which legitimately runs a plan-level gate.
+async fn failing_phase_test_command(
+    plan: &AgentPlan,
+    phase: &AgentPlanPhase,
+) -> Option<String> {
+    failing_test_command(plan, Some(phase)).await
 }
 
 /// Tasks the agent has not marked finished, when it says the phase is done.
@@ -2859,7 +3764,7 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
     wait_for_worker_ready(state, &session_id, &run.plan.id, Some(&phase.phase_id)).await?;
     // Phase-ready gates (main's SDLC false-pass defenses): verify the phase's own claims before
     // spending a three-lens review round. Each bounces the worker and re-polls on the next tick.
-    if let Some(reason) = failing_test_command(&run.plan).await {
+    if let Some(reason) = failing_phase_test_command(&run.plan, &phase).await {
         tracing::warn!(plan_id = %run.plan.id, phase = %phase.phase_id, "declared tests failed on a ready report");
         bounce_ready_or_escalate(state, run, &session_id, Some(&phase.phase_id), "phase_ready_rejected_tests_failed", &reason).await?;
         return Ok(());
@@ -4762,7 +5667,7 @@ fn lens_reviewer_prompt(
     let brief_path = Path::new(&run.plan.plan_path).join("brief.md");
     format!(
         "You are the {name} reviewer for phase {phase_id} of a development run. Run ONLY the {name} lens — do not run the other lenses.\n\n\
-Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}. Then inspect the actual delivered work for this phase.\n\n\
+Read first: the ACCEPTED BRIEF (the user's finalized intent) at {brief} — validate the delivered work against it; methodology at {methodology}; all conventions under {conventions} (especially review-lenses.md — the development-review {name} checklist); the plan overview at {plan}; this phase's overview/status at {phase_path}; the task files under {tasks}; and the evidence this run delivered under {artifacts}, which is where T1 was told to write it. Then inspect the actual delivered work for this phase.\n\n\
 Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{extras}{report}",
         name = lens_name,
         phase_id = phase.phase_id,
@@ -4772,6 +5677,11 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
         plan = get("plan_path"),
         phase_path = get("phase_path"),
         tasks = get("tasks_path"),
+        // The RUN-SCOPED artifacts directory, the same value the worker prompt names. The live
+        // development reviewer is this `format!`, not `DEFAULT_DEVELOPMENT_REVIEWER` (which is
+        // `#[allow(dead_code)]`, superseded by this fan-out) — so pointing the reviewer at the
+        // evidence has to happen here or it does not happen at all.
+        artifacts = get("artifacts_path"),
         extras = lens_prompt_extras(lens),
         report = lens_report_instruction(session_id, lens_name),
     )
@@ -7214,7 +8124,7 @@ pub(crate) async fn handle_reviewer_output(
             // Both modes route through send_reviewer_feedback_to_worker: for a claude
             // worker it injects the feedback into the live session; for kloo/local-small
             // it bridges the reviewer's insights into a guided replan (I19) so the amend
-            // planner turns them into corrective glimmer tasks. (kloo mode used to park
+            // planner turns them into corrective qwen3.8-flash-next tasks. (kloo mode used to park
             // here, before the bridge existed.)
             send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
         }
@@ -7310,12 +8220,12 @@ pub(crate) async fn send_reviewer_feedback_to_worker(
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
-    // KLOO / local-small (glimmer): there is no persistent worker session to inject
-    // reviewer feedback into (glimmer runs as per-task kloo subprocesses with fixed,
+    // KLOO / local-small (qwen3.8-flash-next): there is no persistent worker session to inject
+    // reviewer feedback into (qwen3.8-flash-next runs as per-task kloo subprocesses with fixed,
     // self-contained task.yml prompts). BRIDGE the reviewer's insights into a REPLAN:
     // write them as the queued guidance the amend planner (claude_code) consumes, then
     // start the replan. The amend planner rewrites the affected task prompts to address
-    // the reviewer's findings, and glimmer re-runs the updated tasks. Everything stays on
+    // the reviewer's findings, and qwen3.8-flash-next re-runs the updated tasks. Everything stays on
     // the CLI (claude_code), the full API verdict is preserved, and OpenRouter is never used.
     if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
         let runs_dir = replan_runs_dir(state, run, &phase.phase_id);
@@ -7904,6 +8814,35 @@ fn phase_template_values(
                     .to_string_lossy()
                     .to_string()
             });
+    // The ONE place a phase's artifact directory is derived, run-scoped
+    // (`phases/<id>/artifacts/runs/<run_id>/`). `run_id` is the identity the run already has —
+    // `run.plan.id` today, `workflow_runs.id` once the arena exists — so no column is added for
+    // it. Created here, best-effort: the prompt should name a directory that exists, and a plan
+    // store that cannot be written to is already a failure the phase reports for its own reasons.
+    // Falls back to the champion's bare `artifacts/` only if the ids are not safe path segments,
+    // which host-generated slugs and uuids are.
+    let plan_root = Path::new(&run.plan.plan_path);
+    let artifacts_path = plan_artifacts::ensure_phase_run_artifacts_dir(
+        plan_root,
+        &phase.phase_id,
+        &run.plan.id,
+    )
+    .unwrap_or_else(|reason| {
+        tracing::warn!(
+            plan_id = %run.plan.id,
+            phase_id = %phase.phase_id,
+            %reason,
+            "falling back to the unscoped artifacts directory"
+        );
+        plan_artifacts::phase_artifacts_dir(plan_root, &phase.phase_id)
+            // Last resort: the PLAN-level `artifacts/` directory, not `phase_path.join(...)`.
+            // `phase_path` is computed by the caller from the raw phase id, so joining onto it
+            // carries any traversal the caller already introduced into a value handed to an
+            // agent. Reachable only with a phase id that is not a safe segment, which
+            // host-generated slugs are not; the plan-level directory is the nearest thing that
+            // is always inside the store.
+            .unwrap_or_else(|| plan_root.join(plan_artifacts::ARTIFACTS_DIR))
+    });
     vec![
         ("run_id", run.plan.id.clone()),
         ("phase_id", phase.phase_id.clone()),
@@ -7911,6 +8850,7 @@ fn phase_template_values(
         ("plan_path", run.plan.plan_path.clone()),
         ("phase_path", phase_path.to_string_lossy().to_string()),
         ("tasks_path", tasks_path.to_string_lossy().to_string()),
+        ("artifacts_path", artifacts_path.to_string_lossy().to_string()),
         ("methodology_path", methodology_path),
         ("conventions_path", conventions_path),
     ]
@@ -8457,7 +9397,7 @@ fn find_phase(run: &AgentPlanRun, phase_id: &str) -> Result<AgentPlanPhase, Stri
 fn list_phases(state: &AppState, plan_id: &str) -> Result<Vec<AgentPlanPhase>, String> {
     state.db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, plan_id, phase_id, phase_title, phase_index, status, worker_started_at, worker_idle_at, reviewer_started_at, reviewer_idle_at, gate_verdict, clarification_attempts, summary, findings_json, created_at, updated_at FROM agent_plan_phases WHERE plan_id = ?1 ORDER BY phase_index",
+            "SELECT id, plan_id, phase_id, phase_title, phase_index, status, worker_started_at, worker_idle_at, reviewer_started_at, reviewer_idle_at, gate_verdict, clarification_attempts, summary, findings_json, created_at, updated_at, test_commands FROM agent_plan_phases WHERE plan_id = ?1 ORDER BY phase_index",
         ).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![plan_id], agent_plan_phase_from_row)
@@ -9168,6 +10108,10 @@ pub(crate) fn is_text_content_type(content_type: &str) -> bool {
 }
 
 fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
+    // Parse the gate encoding once, at the SQL boundary. Every consumer above the host reads the
+    // parsed list, never the JSON string.
+    let test_commands: Option<String> = row.get(29)?;
+    let test_commands_list = parse_test_commands(test_commands.as_deref()).into_commands();
     Ok(AgentPlan {
         id: row.get(0)?,
         run_type: row.get(1)?,
@@ -9201,12 +10145,16 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         executor_config: row.get(26)?,
         dev_worker_provider: row.get(27)?,
         dev_reviewer_provider: row.get(28)?,
-        test_commands: row.get(29)?,
+        test_commands,
+        test_commands_list,
         consecutive_non_pass_planning_rounds: None,
     })
 }
 
 fn agent_plan_phase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlanPhase> {
+    // Migration 025, appended last — SELECT order is load-bearing and must match this index.
+    let test_commands: Option<String> = row.get(16)?;
+    let test_commands_list = parse_test_commands(test_commands.as_deref()).into_commands();
     Ok(AgentPlanPhase {
         id: row.get(0)?,
         plan_id: row.get(1)?,
@@ -9224,6 +10172,11 @@ fn agent_plan_phase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentP
         findings_json: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+        test_commands,
+        test_commands_list,
+        // Resolved against the plan when the run is assembled (`get_plan`) — a phase row alone
+        // cannot know the plan's fallback. Empty here, never a second copy of the rule.
+        effective_test_commands: Vec::new(),
     })
 }
 
@@ -9306,7 +10259,12 @@ fn event_actor(event_type: &str) -> &'static str {
         | "agent_plan_blocked"
         | "planning_started"
         | "planning_amend_requested"
-        | "agent_plan_phases_refreshed" => "user",
+        | "agent_plan_phases_refreshed"
+        // Config edits are human actions. `agent_plan_validation_config_updated` was never listed
+        // and so fell through to "coordinator", which misattributes a person's edit to the engine;
+        // both belong here.
+        | "agent_plan_validation_config_updated"
+        | "agent_plan_test_commands_updated" => "user",
         _ => "coordinator",
     }
 }
@@ -9576,6 +10534,21 @@ fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value) -> String 
             }
         }
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
+        "agent_plan_test_commands_updated" => {
+            let count = payload
+                .get("commands")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let scope = match payload_str(payload, "phaseId") {
+                Some(phase_id) if !phase_id.is_empty() => format!("phase {phase_id}"),
+                _ => "the plan".to_string(),
+            };
+            if count == 0 {
+                format!("Cleared the test gate on {scope}")
+            } else {
+                format!("Set {count} test command(s) on {scope}")
+            }
+        }
         _ => humanize_event_type(&event.event_type),
     }
 }
@@ -10341,21 +11314,11 @@ mod store_tests {
     use super::*;
     use crate::db::migrations::run_migrations;
     use crate::db::Database;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    /// Unique temp dir. `Date::now`/random are unavailable in this environment, so make the
-    /// suffix unique with the pid + a static counter.
+    /// Delegates to the ONE fixture factory, so these fixtures land in this process's single
+    /// fixture root and are reclaimed with it. This was a second private copy that built a
+    /// top-level `j1-p1-*` directory in the system temp dir and never removed it.
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "j1-p1-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::test_support::tmp_dir(&format!("p1-{tag}"))
     }
 
     /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the rest
@@ -10419,6 +11382,7 @@ mod store_tests {
             validation_config: None,
             dev_worker_provider: dev_worker.map(str::to_string),
             test_commands: None,
+            test_commands_list: Vec::new(),
             dev_reviewer_provider: dev_reviewer.map(str::to_string),
             executor_config: None,
             consecutive_non_pass_planning_rounds: None,
@@ -10563,6 +11527,40 @@ mod store_tests {
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "--quiet", "-m", "mocks"]);
         assert_eq!(evidence_provenance_reason(&dir.to_string_lossy(), "01-shell"), None);
+    }
+
+    /// Run-scoped evidence is still this phase's evidence.
+    ///
+    /// The provenance walk selects by the `phases/<id>/` prefix, so it reaches
+    /// `artifacts/runs/<run_id>/` with no change — which is the reason `runs/` was nested under
+    /// `artifacts/` rather than placed beside it. Pinned here because it is the claim that makes
+    /// run-scoping safe for the review gate: if the walk missed these files, every competing run
+    /// would pass the evidence check by having no evidence it could see.
+    #[test]
+    fn run_scoped_evidence_is_still_judged() {
+        let dir = approved_store("ev-runscoped");
+        shot(
+            &dir,
+            "phases/01-shell/artifacts/runs/4f0821/mystery.png",
+            b"challenger pixels",
+        );
+        let reason = evidence_provenance_reason(&dir.to_string_lossy(), "01-shell")
+            .expect("a run-scoped image nobody describes must still be caught");
+        assert!(reason.contains("runs/4f0821/mystery.png"), "{reason}");
+
+        // And described run-scoped evidence passes, same as the flat layout.
+        let ok = approved_store("ev-runscoped-ok");
+        shot(
+            &ok,
+            "phases/01-shell/artifacts/runs/4f0821/aux-open.png",
+            b"open state pixels",
+        );
+        std::fs::write(
+            ok.join("phases/01-shell/tasks/t1/decisions.md"),
+            "aux-open.png — /patients/42 with the aux layer open.\n",
+        )
+        .unwrap();
+        assert_eq!(evidence_provenance_reason(&ok.to_string_lossy(), "01-shell"), None);
     }
 
     /// Another phase's screenshots must not decide this phase's readiness.
@@ -10999,11 +11997,18 @@ diff --git a/two.md b/two.md
         let dir = tmp_dir("tests-optin");
         let w = dir.to_string_lossy().to_string();
         // Unset and empty both preserve the previous behaviour: no gate, no failure.
-        assert!(failing_test_command(&plan_with_test_commands(&w, None)).await.is_none());
-        assert!(failing_test_command(&plan_with_test_commands(&w, Some(""))).await.is_none());
-        assert!(failing_test_command(&plan_with_test_commands(&w, Some("[]"))).await.is_none());
-        // Malformed JSON must not fail a phase — it is a config error, not a test failure.
-        assert!(failing_test_command(&plan_with_test_commands(&w, Some("not json"))).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, None), None).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("")), None).await.is_none());
+        assert!(failing_test_command(&plan_with_test_commands(&w, Some("[]")), None).await.is_none());
+        // Malformed JSON is NOT in this list any more. It used to return None here — a config
+        // error silently downgrading a gated phase to an ungated one — and that is now reported
+        // instead; see `qa_malformed_gate_is_reported_not_treated_as_ungated`.
+        assert!(
+            failing_test_command(&plan_with_test_commands(&w, Some("not json")), None)
+                .await
+                .is_some(),
+            "a declared-but-unreadable gate must be reported, not treated as absent"
+        );
     }
 
     #[tokio::test]
@@ -11011,7 +12016,7 @@ diff --git a/two.md b/two.md
         let dir = tmp_dir("tests-pass");
         let w = dir.to_string_lossy().to_string();
         let plan = plan_with_test_commands(&w, Some(r#"["true","exit 0"]"#));
-        assert!(failing_test_command(&plan).await.is_none());
+        assert!(failing_test_command(&plan, None).await.is_none());
     }
 
     #[tokio::test]
@@ -11027,7 +12032,7 @@ diff --git a/two.md b/two.md
                 marker.to_string_lossy()
             )),
         );
-        let reason = failing_test_command(&plan).await.expect("must fail");
+        let reason = failing_test_command(&plan, None).await.expect("must fail");
         assert!(reason.contains("exit 3"), "{reason}");
         assert!(reason.contains("boom-on-stdout"), "output tail must be included: {reason}");
         assert!(
@@ -11037,10 +12042,1808 @@ diff --git a/two.md b/two.md
         assert!(!marker.exists(), "commands after the first failure must not run");
     }
 
+    /// End-to-end through the REAL database: migration 025's column, the `list_phases` SELECT, the
+    /// row mapper's parse, and `get_plan`'s single resolution pass. The pure-function test above
+    /// proves the rule; this proves the rule is actually WIRED — a correct helper nothing calls is
+    /// the failure mode this feature started from (`test_commands` existed in SQLite and Rust and
+    /// was invisible to everything above the host).
+    #[tokio::test]
+    async fn get_plan_serves_the_stored_and_effective_test_commands() {
+        let (state, root) = test_state();
+        let plan_path = root.join("plan");
+        scaffold_plan(&plan_path, "test gate wiring");
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .expect("create plan");
+        let plan_id = run.plan.id.clone();
+
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status)
+                     VALUES ('phA', ?1, '01-own', 'Declares its own gate', 0, 'locked')",
+                    params![plan_id],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status)
+                     VALUES ('phB', ?1, '02-inherits', 'Inherits the plan gate', 1, 'locked')",
+                    params![plan_id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+
+        // Set the gate through the public setter at both levels — the same path the API uses.
+        update_test_commands(&state, plan_id.clone(), None, vec!["npm run plan-gate".into()], false)
+            .expect("set the plan gate");
+        let run = update_test_commands(
+            &state,
+            plan_id.clone(),
+            Some("01-own".into()),
+            vec!["npm run phase-gate".into(), "  ".into()],
+            false,
+        )
+        .expect("set the phase gate");
+
+        assert_eq!(run.plan.test_commands_list, vec!["npm run plan-gate".to_string()]);
+        let own = run.phases.iter().find(|p| p.phase_id == "01-own").unwrap();
+        let inherits = run.phases.iter().find(|p| p.phase_id == "02-inherits").unwrap();
+        // Blank entries are dropped on write, so the stored list is exactly the real commands.
+        assert_eq!(own.test_commands_list, vec!["npm run phase-gate".to_string()]);
+        assert_eq!(own.effective_test_commands, vec!["npm run phase-gate".to_string()]);
+        // A phase that declares nothing reports nothing of its own but still shows the gate it is
+        // actually held to. This is the field a UI renders; it never re-derives the fallback.
+        assert!(inherits.test_commands_list.is_empty());
+        assert_eq!(inherits.effective_test_commands, vec!["npm run plan-gate".to_string()]);
+
+        // Clearing the phase gate returns it to inheriting — the column goes back to NULL.
+        let run = update_test_commands(&state, plan_id.clone(), Some("01-own".into()), vec![], true)
+            .expect("clear the phase gate");
+        let own = run.phases.iter().find(|p| p.phase_id == "01-own").unwrap();
+        assert_eq!(own.test_commands, None, "clearing must write NULL, not \"[]\"");
+        assert_eq!(own.effective_test_commands, vec!["npm run plan-gate".to_string()]);
+
+        // Clearing the plan gate leaves no gate anywhere — the opt-in default.
+        let run = update_test_commands(&state, plan_id.clone(), None, vec![], true)
+            .expect("clear the plan gate");
+        assert!(run.plan.test_commands_list.is_empty());
+        assert!(run
+            .phases
+            .iter()
+            .all(|phase| phase.effective_test_commands.is_empty()));
+
+        // Writing to a phase that does not exist is an error, not a silent no-op.
+        let err = update_test_commands(
+            &state,
+            plan_id,
+            Some("99-nope".into()),
+            vec!["x".into()],
+            false,
+        )
+        .expect_err("unknown phase must be rejected");
+        assert!(err.contains("Phase not found"), "{err}");
+    }
+
+    /// The host→worker→ui camelCase contract for the gate fields. GraphQL declares
+    /// `testCommands: [String!]` and `effectiveTestCommands: [String!]!`, so the host MUST emit
+    /// those exact keys as LISTS. A silent rename or a raw JSON string here is the deploy-skew
+    /// null the plan's own naming test was written to catch.
+    #[test]
+    fn the_gate_fields_serialize_under_the_names_graphql_declares() {
+        let mut phase = phase_with_test_commands(Some(r#"["a","b"]"#));
+        phase.test_commands_list = vec!["a".into(), "b".into()];
+        phase.effective_test_commands = vec!["a".into(), "b".into()];
+        let json = serde_json::to_value(&phase).expect("serialize phase");
+        assert_eq!(json["testCommands"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["effectiveTestCommands"], serde_json::json!(["a", "b"]));
+        // The storage encoding is served under its own key, never as `testCommands`.
+        assert_eq!(json["testCommandsRaw"], serde_json::json!(r#"["a","b"]"#));
+
+        let mut plan = plan_with_test_commands("/w", Some(r#"["c"]"#));
+        plan.test_commands_list = vec!["c".into()];
+        let json = serde_json::to_value(&plan).expect("serialize plan");
+        assert_eq!(json["testCommands"], serde_json::json!(["c"]));
+        assert_eq!(json["testCommandsRaw"], serde_json::json!(r#"["c"]"#));
+    }
+
+    fn phase_with_test_commands(commands: Option<&str>) -> crate::db::models::AgentPlanPhase {
+        let mut phase = sample_phase_for_prompt();
+        phase.test_commands = commands.map(str::to_string);
+        phase
+    }
+
+    #[test]
+    fn effective_test_commands_prefers_the_phase_then_falls_back_to_the_plan() {
+        // THE resolution rule, in one place. Every caller goes through this function.
+        let plan = plan_with_test_commands("/w", Some(r#"["plan-gate"]"#));
+
+        // A phase that declares its own gate is held to its own gate.
+        assert_eq!(
+            effective_test_commands(&plan, Some(&phase_with_test_commands(Some(r#"["phase-gate"]"#)))),
+            vec!["phase-gate".to_string()],
+        );
+        // NULL, empty-string and empty-array on the phase all fall back to the plan.
+        for empty in [None, Some(""), Some("[]"), Some(r#"["  "]"#)] {
+            assert_eq!(
+                effective_test_commands(&plan, Some(&phase_with_test_commands(empty))),
+                vec!["plan-gate".to_string()],
+                "phase test_commands {:?} must fall back to the plan",
+                empty
+            );
+        }
+        // No phase at all (plan-level callers) still resolves the plan's gate.
+        assert_eq!(
+            effective_test_commands(&plan, None),
+            vec!["plan-gate".to_string()]
+        );
+        // Neither level set = no gate. This is the opt-in default.
+        let bare = plan_with_test_commands("/w", None);
+        assert!(effective_test_commands(&bare, Some(&phase_with_test_commands(None))).is_empty());
+        // A malformed phase gate does NOT fall through to the plan's. Falling through would hide
+        // the typo behind whatever the other level happens to say, which is the silent downgrade
+        // the DeclaredGate enum exists to prevent. The display list is empty (it cannot express
+        // "broken") and `effective_gate` reports Malformed at the PHASE level.
+        let broken = phase_with_test_commands(Some("not json"));
+        assert!(effective_test_commands(&plan, Some(&broken)).is_empty());
+        let (declared, level) = effective_gate(&plan, Some(&broken));
+        assert!(matches!(declared, DeclaredGate::Malformed { .. }), "{declared:?}");
+        assert_eq!(level, GateLevel::Phase);
+        // Absent still falls through, and reports the PLAN as the level it came from.
+        let (declared, level) = effective_gate(&plan, Some(&phase_with_test_commands(None)));
+        assert_eq!(declared, DeclaredGate::Commands(vec!["plan-gate".to_string()]));
+        assert_eq!(level, GateLevel::Plan);
+    }
+
+    #[tokio::test]
+    async fn failing_test_command_gates_on_the_phase_commands_when_the_phase_declares_them() {
+        // The coordinator's ready-check must use the SAME resolution rule as everything else.
+        // Before migration 025 it only ever saw the plan's commands, so a phase declaring a
+        // stricter gate was silently ignored — the exact false pass this feature exists to stop.
+        let dir = tmp_dir("tests-phase-override");
+        let w = dir.to_string_lossy().to_string();
+        // The plan's gate PASSES; the phase's gate FAILS. A phase-aware check must fail.
+        let plan = plan_with_test_commands(&w, Some(r#"["true"]"#));
+        let phase = phase_with_test_commands(Some(r#"["echo phase-gate-ran && exit 7"]"#));
+        let reason = failing_test_command(&plan, Some(&phase))
+            .await
+            .expect("the phase's own gate must be the one that runs");
+        assert!(reason.contains("exit 7"), "{reason}");
+        assert!(reason.contains("phase-gate-ran"), "{reason}");
+
+        // And the converse: a phase with no gate of its own is still held to the plan's.
+        let plan = plan_with_test_commands(&w, Some(r#"["exit 9"]"#));
+        let reason = failing_test_command(&plan, Some(&phase_with_test_commands(None)))
+            .await
+            .expect("plan gate must still apply to a phase that declares none");
+        assert!(reason.contains("exit 9"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_reports_the_exit_code_and_stops_at_the_first_failure() {
+        let dir = tmp_dir("gate-run-exit");
+        let w = dir.to_string_lossy().to_string();
+        let marker = dir.join("third-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["true","echo boom && exit 5","touch {}"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        // Exit code is authoritative, and it is the FIRST failure's code.
+        assert_eq!(run.exit_code, 5);
+        assert_eq!(run.commands_run, 2, "must stop at the first non-zero");
+        assert!(!marker.exists(), "commands after the first failure must not run");
+        assert!(run.output.contains("boom"), "output must be captured: {}", run.output);
+        assert_eq!(run.command.as_deref(), Some("echo boom && exit 5"));
+
+        // All green: exit 0, every command run.
+        let plan = plan_with_test_commands(&w, Some(r#"["true","exit 0"]"#));
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.commands_run, 2);
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_uses_the_phase_gate_and_is_a_no_op_without_one() {
+        let dir = tmp_dir("gate-run-phase");
+        let w = dir.to_string_lossy().to_string();
+        // Same resolution rule as the coordinator: the phase wins.
+        let plan = plan_with_test_commands(&w, Some(r#"["true"]"#));
+        let phase = phase_with_test_commands(Some(r#"["exit 4"]"#));
+        let run = run_test_gate(&plan, Some(&phase)).await.expect("gate must run");
+        assert_eq!(run.exit_code, 4);
+
+        // No gate at either level is not an error — it is "nothing to run, nothing failed".
+        let bare = plan_with_test_commands(&w, None);
+        let run = run_test_gate(&bare, None).await.expect("no gate is not an error");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.commands_run, 0);
+        assert_eq!(run.command, None);
+        assert_eq!(run.collected, None);
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_collected_count_is_advisory_and_nullable() {
+        let dir = tmp_dir("gate-run-collected");
+        let w = dir.to_string_lossy().to_string();
+        // A cargo-shaped summary parses.
+        let plan = plan_with_test_commands(
+            &w,
+            Some(r#"["echo 'test result: ok. 642 passed; 1 failed; 0 ignored; 0 measured'"]"#),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.collected, Some(643));
+
+        // A gate that prints nothing parseable is a LEGITIMATE gate with a known exit code, not an
+        // error: exit code present, collected None.
+        let plan = plan_with_test_commands(&w, Some(r#"["echo tsc --noEmit clean"]"#));
+        let run = run_test_gate(&plan, None).await.expect("unparseable output is not an error");
+        assert_eq!(run.exit_code, 0);
+        assert_eq!(run.collected, None);
+
+        // Unparseable AND failing: the exit code still comes through.
+        let plan = plan_with_test_commands(&w, Some(r#"["echo 'segmentation fault' && exit 139"]"#));
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 139);
+        assert_eq!(run.collected, None);
+    }
+
+    #[test]
+    fn parse_collected_count_reads_the_common_runner_summaries() {
+        // Each case is a real summary line from a runner this repo actually uses or has used.
+        let cases: Vec<(&str, Option<i64>)> = vec![
+            ("test result: ok. 642 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out", Some(643)),
+            ("      Tests  178 passed (178)", Some(178)),
+            ("Tests:       5 passed, 5 total", Some(5)),
+            // mocha splits its summary over two lines; max-wins reports the passing count
+            // only. Documented imprecision — this number is advisory, never a gate.
+            ("  12 passing (2s)\n  1 failing", Some(12)),
+            ("===== 5 passed, 1 failed in 0.12s =====", Some(6)),
+            ("Executed 288 of 293 SUCCESS", Some(293)),
+            ("tsc --noEmit", None),
+            ("", None),
+            // The LARGEST candidate wins — a runner's grand total is bigger than its per-file
+            // lines. (Real vitest output: Test Files before Tests.)
+            (" Test Files  30 passed (30)\n      Tests  178 passed (178)", Some(178)),
+            // ...and the order of those two lines must not change the answer.
+            ("      Tests  178 passed (178)\n Test Files  30 passed (30)", Some(178)),
+        ];
+        for (output, expected) in cases {
+            assert_eq!(
+                parse_collected_count(output),
+                expected,
+                "parse_collected_count({:?})",
+                output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_test_gate_caps_captured_output_without_hanging() {
+        // A chatty gate must not be able to grow the buffer: this repo has already been OOM-killed
+        // by an unbounded read. The capture is a bounded TAIL, and draining both pipes concurrently
+        // is what keeps a command that floods stderr from blocking forever on a full pipe.
+        let dir = tmp_dir("gate-run-cap");
+        let w = dir.to_string_lossy().to_string();
+        let bytes = TEST_GATE_STREAM_CAP_BYTES * 3;
+        let plan = plan_with_test_commands(
+            &w,
+            // Flood BOTH streams, well past the cap, then end with a recognisable marker.
+            Some(&format!(
+                r#"["head -c {bytes} /dev/zero | tr '\\0' 'x' ; head -c {bytes} /dev/zero | tr '\\0' 'y' 1>&2 ; echo TAIL-MARKER ; echo 7 passed"]"#
+            )),
+        );
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("a flooding gate must not hang the runner")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.truncated, "the cap must report that it discarded output");
+        // The REAL bound. The cap is on bytes READ per stream, not on the delivered String:
+        // `from_utf8_lossy` expands each invalid byte to a 3-byte U+FFFD and two streams are
+        // concatenated, so the worst case is ~6x the cap. The feature commit asserted
+        // `2 * cap + 16` here, which only holds for ASCII output — QA caught it with a 0xFF flood
+        // that produced 786,433 bytes against a 131,072-byte cap. This output IS ASCII ('x'/'y'),
+        // so it lands near 2x; the assertion is written against the bound that is true for ANY
+        // output, which is the one a caller sizing a budget has to rely on.
+        assert!(
+            run.output.len() <= 6 * TEST_GATE_STREAM_CAP_BYTES + 64,
+            "captured {} bytes, byte cap is {} per stream (worst case ~6x)",
+            run.output.len(),
+            TEST_GATE_STREAM_CAP_BYTES
+        );
+        // It is a TAIL: the end of the output survives, which is where summaries live.
+        assert!(run.output.contains("TAIL-MARKER"), "the kept window must be the tail");
+        assert_eq!(run.collected, Some(7));
+    }
+
+    // ─────────── QA attack suite on the gate runner (added on top of 7d25023) ───────────
+
+    /// Non-UTF-8 output does not panic, but `String::from_utf8_lossy` expands every invalid byte
+    /// to a 3-byte U+FFFD, so the DELIVERED string is up to 3x the byte cap per stream. The cap is
+    /// a cap on bytes READ, not on bytes returned — `run_test_gate_caps_captured_output_without_hanging`
+    /// asserts `output.len() <= 2 * cap + 16` and that bound only holds for ASCII output.
+    #[tokio::test]
+    async fn qa_gate_non_utf8_output_expands_past_the_asserted_cap() {
+        let dir = tmp_dir("qa-gate-nonutf8");
+        let w = dir.to_string_lossy().to_string();
+        let bytes = TEST_GATE_STREAM_CAP_BYTES * 2;
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["head -c {bytes} /dev/zero | tr '\\0' '\\377' ; head -c {bytes} /dev/zero | tr '\\0' '\\377' 1>&2"]"#
+            )),
+        );
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("a flooding gate must not hang")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.truncated, "the cap must report it discarded output");
+        eprintln!(
+            "QA: non-UTF-8 output.len() = {} bytes (byte cap per stream = {})",
+            run.output.len(),
+            TEST_GATE_STREAM_CAP_BYTES
+        );
+        assert!(
+            run.output.len() > 2 * TEST_GATE_STREAM_CAP_BYTES + 16,
+            "expected lossy expansion past the byte cap, got {}",
+            run.output.len()
+        );
+    }
+
+    /// A command killed by a signal has no exit code. It must report -1, never 0.
+    #[tokio::test]
+    async fn qa_gate_signal_killed_command_is_not_a_pass() {
+        let dir = tmp_dir("qa-gate-signal");
+        let w = dir.to_string_lossy().to_string();
+        let marker = dir.join("second-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["kill -9 $$","touch {}"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, -1, "a signal kill must not read as a pass");
+        assert_eq!(run.commands_run, 1);
+        assert!(!marker.exists(), "a signal kill must stop the run");
+    }
+
+    /// Every gate run is BOUNDED, at both call sites. Was QA's `qa_gate_has_no_timeout_at_all`,
+    /// which pinned the defect: `["sleep 45"]` returned from neither entry point, so a gate command
+    /// that never exits hung the coordinator loop (via `failing_phase_test_command`) or a host RPC
+    /// (via `run_test_gate`) forever. Reachable over GraphQL by anything holding `plans:write`,
+    /// which made it a remote denial of service rather than a latent flaw.
+    ///
+    /// The real deadline is 20 minutes, which no test should wait for, so this drives the shared
+    /// runner with a deliberately tiny override to prove the timeout path end to end, and separately
+    /// proves both entry points now agree on the bounded runner.
+    #[tokio::test]
+    async fn qa_gate_is_bounded_at_both_call_sites() {
+        let dir = tmp_dir("qa-gate-bounded");
+        let w = dir.to_string_lossy().to_string();
+
+        // 1. The timeout path itself: a command that never exits is killed and reported as a
+        //    distinct, non-zero outcome — never as a pass.
+        let (exit_code, output, _) =
+            run_one_gate_command_with_timeout("sleep 45", &w, std::time::Duration::from_millis(300))
+                .await
+                .expect("a hanging command is a gate RESULT, not a runner error");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+        assert_ne!(exit_code, 0, "a timeout must never read as a pass");
+        assert!(output.contains("did not finish"), "{output}");
+        assert!(output.contains("was killed"), "{output}");
+
+        // 2. The killed child must not outlive the call. This was `pgrep -f "sleep 45"` plus
+        //    `assert!(survivors.is_empty())`, and QA showed that instrument is wrong twice over:
+        //
+        //    FALSE POSITIVES. `pgrep -f` matches the full command line of EVERY process on the
+        //    box, so it fires on anything that merely mentions `sleep 45` — including the shell
+        //    that invoked the test run. QA reproduced it: 3/3 runs in isolation failed with
+        //    `pgrep found pids: 3768750`, which was the harness's own bash wrapper, and 5/5 runs
+        //    in a full-suite batch failed the same way. A gate that goes red for reasons outside
+        //    the repo is worse than no gate.
+        //
+        //    VACUOUS GREEN. The call ended `.unwrap_or_default()`, so a missing or failing `pgrep`
+        //    yielded an empty string and the assert-empty passed. On a box without pgrep the check
+        //    proved nothing at all.
+        //
+        //    Liveness is now measured by whether a descendant's own tick file keeps growing after
+        //    the deadline, which cannot collide with another process and cannot pass vacuously:
+        //    `qa_gate_timeout_kills_the_whole_process_group_not_just_the_shell` (nested
+        //    grandchild) and `qa_gate_timeout_kills_an_orphaned_grandchild_still_in_the_group`
+        //    (double fork, reparented, same group). Both pass, so the group kill itself is sound —
+        //    it was only ever this assertion that was broken. `qa_gate_setsid_escapes_the_group_kill`
+        //    pins the one documented escape.
+        //
+        //    Note `sh -c "sleep 45"` is the EASY case: a single simple command is `exec`ed, so the
+        //    shell is replaced and there is no grandchild to orphan. The tests named above are the
+        //    ones that exercise the hard shapes.
+
+        // 3. Both entry points reach the bounded runner, with a real (long) deadline, so neither
+        //    can be the one that still runs a command unbounded. A fast command proves the wiring
+        //    without waiting on the real timeout.
+        let plan = plan_with_test_commands(&w, Some(r#"["true"]"#));
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("run_test_gate must be bounded")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.gate_declared);
+        let phase = phase_with_test_commands(Some(r#"["true"]"#));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                failing_phase_test_command(&plan, &phase),
+            )
+            .await
+            .expect("the coordinator ready-check must be bounded")
+            .is_none()
+        );
+    }
+
+    /// The timeout constant is a real bound, not a placeholder someone zeroed.
+    #[test]
+    fn the_gate_timeout_is_bounded_and_sane() {
+        assert!(
+            TEST_GATE_COMMAND_TIMEOUT >= std::time::Duration::from_secs(60),
+            "a gate must be allowed to run a real suite"
+        );
+        assert!(
+            TEST_GATE_COMMAND_TIMEOUT <= std::time::Duration::from_secs(45 * 60),
+            "an unbounded-in-practice deadline is the bug this constant exists to prevent"
+        );
+    }
+
+    /// An unrunnable workspace is an Err from `run_test_gate` but a phase-FAILURE reason from
+    /// `failing_test_command`. Same condition, two different shapes — pinned so the divergence is
+    /// deliberate rather than discovered.
+    #[tokio::test]
+    async fn qa_gate_unrunnable_workspace_errors_while_the_coordinator_fails_the_phase() {
+        let dir = tmp_dir("qa-gate-ws");
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        for workspace in [
+            "/nonexistent-workspace-qa-xyz".to_string(),
+            file.to_string_lossy().to_string(),
+        ] {
+            let plan = plan_with_test_commands(&workspace, Some(r#"["true"]"#));
+            let err = run_test_gate(&plan, None)
+                .await
+                .expect_err("spawn must fail");
+            assert!(
+                err.contains("Could not run the test command"),
+                "{workspace}: {err}"
+            );
+            assert!(
+                failing_test_command(&plan, None).await.is_some(),
+                "{workspace}: the coordinator must still reject the phase"
+            );
+        }
+    }
+
+    /// A command that closes stdout and keeps writing stderr must not wedge the concurrent drain.
+    #[tokio::test]
+    async fn qa_gate_stdout_closed_early_still_captures_stderr() {
+        let dir = tmp_dir("qa-gate-closed");
+        let w = dir.to_string_lossy().to_string();
+        let plan = plan_with_test_commands(
+            &w,
+            Some(r#"["exec 1>&- ; echo LATE-STDERR 1>&2 ; echo '3 passed' 1>&2 ; exit 2"]"#),
+        );
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_test_gate(&plan, None),
+        )
+        .await
+        .expect("must not hang")
+        .expect("gate must run");
+        assert_eq!(run.exit_code, 2);
+        assert!(
+            run.output.contains("LATE-STDERR"),
+            "stderr must survive a closed stdout: {}",
+            run.output
+        );
+        assert_eq!(run.collected, Some(3));
+    }
+
+    /// Blank/whitespace gates resolve to NO gate, and a command that does not exist is a FAILURE
+    /// (sh reports 127), not an Err.
+    #[tokio::test]
+    async fn qa_gate_blank_whitespace_and_missing_commands() {
+        let dir = tmp_dir("qa-gate-blank");
+        let w = dir.to_string_lossy().to_string();
+        for raw in [r#"[""]"#, r#"["   "]"#, r#"["\t\n"]"#] {
+            let plan = plan_with_test_commands(&w, Some(raw));
+            let run = run_test_gate(&plan, None).await.expect("gate must run");
+            assert_eq!(run.commands_run, 0, "{raw} must resolve to no gate");
+            assert_eq!(run.exit_code, 0);
+            assert_eq!(run.command, None);
+        }
+        let plan = plan_with_test_commands(&w, Some(r#"["definitely-not-a-real-command-qa"]"#));
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 127, "{}", run.output);
+    }
+
+    /// A gate command is one shell script: a newline inside it runs every line.
+    #[tokio::test]
+    async fn qa_gate_command_with_a_newline_runs_every_line() {
+        let dir = tmp_dir("qa-gate-meta");
+        let w = dir.to_string_lossy().to_string();
+        let marker = dir.join("both-lines-ran");
+        let plan = plan_with_test_commands(
+            &w,
+            Some(&format!(
+                r#"["echo first\ntouch {}\nexit 6"]"#,
+                marker.to_string_lossy()
+            )),
+        );
+        let run = run_test_gate(&plan, None).await.expect("gate must run");
+        assert_eq!(run.exit_code, 6);
+        assert!(marker.exists(), "every line of a multi-line command runs");
+    }
+
+    /// A malformed gate is REPORTED, never silently treated as no gate. Was QA's
+    /// `qa_malformed_plan_gate_silently_leaves_the_phase_ungated`, which pinned the defect: every
+    /// payload below resolved to "no gate", so `failing_test_command` returned `None` and the phase
+    /// passed on no evidence, while `run_test_gate` reported `exitCode: 0` having run nothing —
+    /// over the API, indistinguishable from a gate that ran and passed.
+    ///
+    /// A silent downgrade from gated to ungated is the one failure an exit-code-only design cannot
+    /// notice, which is why "declared but unreadable" is now its own case.
+    #[tokio::test]
+    async fn qa_malformed_gate_is_reported_not_treated_as_ungated() {
+        let dir = tmp_dir("qa-gate-malformed");
+        let w = dir.to_string_lossy().to_string();
+        for raw in [
+            "not json",
+            r#"{"commands":["exit 1"]}"#,
+            r#"["exit 1", null]"#,
+            r#"[1,2]"#,
+            r#"["exit 1""#,
+        ] {
+            // The coordinator must refuse the phase rather than accept it unverified.
+            let plan = plan_with_test_commands(&w, Some(raw));
+            let reason = failing_test_command(&plan, Some(&phase_with_test_commands(None)))
+                .await
+                .unwrap_or_else(|| {
+                    panic!("malformed plan gate {raw:?} must not pass the phase silently")
+                });
+            assert!(reason.contains("could not be read"), "{raw:?}: {reason}");
+            assert!(
+                reason.contains("configuration error"),
+                "{raw:?}: must name it a config error, not a test failure: {reason}"
+            );
+
+            // And the API must not be able to read it as a pass.
+            let run = run_test_gate(&plan, None).await.expect("gate must run");
+            assert_eq!(run.commands_run, 0, "{raw:?} ran nothing");
+            assert!(
+                run.gate_declared,
+                "{raw:?} DECLARES a gate — reporting it as undeclared is the same silent downgrade"
+            );
+            assert_eq!(
+                run.exit_code, TEST_GATE_EXIT_MALFORMED,
+                "{raw:?} must not report a passing exit code"
+            );
+            assert_ne!(run.exit_code, 0, "{raw:?}");
+
+            // A malformed PHASE gate does not fall through to a healthy plan gate either —
+            // falling through would hide the typo behind whatever the other level happens to say.
+            let healthy = plan_with_test_commands(&w, Some(r#"["true"]"#));
+            let broken_phase = phase_with_test_commands(Some(raw));
+            let run = run_test_gate(&healthy, Some(&broken_phase))
+                .await
+                .expect("gate must run");
+            assert_eq!(run.exit_code, TEST_GATE_EXIT_MALFORMED, "{raw:?}");
+            assert!(
+                run.output.contains("phase declares a test gate"),
+                "{raw:?} must name the level that is broken: {}",
+                run.output
+            );
+        }
+    }
+
+    /// The third malformed direction, which the feature's own test does not cover: a malformed
+    /// PLAN gate underneath a HEALTHY phase gate.
+    ///
+    /// `effective_gate` consults the phase first, so the phase's commands win and the plan's typo
+    /// is never parsed — the gate runs normally and the broken plan value stays LATENT. That is
+    /// the right call (the plan's value is simply not in use), but it means the typo surfaces only
+    /// when some phase without its own gate reports ready, and then that phase is bounced. Pinned
+    /// so the asymmetry with the other two directions is a decision rather than a surprise.
+    #[tokio::test]
+    async fn qa_malformed_plan_gate_under_a_healthy_phase_gate_stays_latent() {
+        let dir = tmp_dir("qa-gate-latent");
+        let w = dir.to_string_lossy().to_string();
+        let plan = plan_with_test_commands(&w, Some("not json"));
+        let healthy_phase = phase_with_test_commands(Some(r#"["true"]"#));
+
+        // The phase's gate runs and passes; the plan's unreadable value is not consulted.
+        let run = run_test_gate(&plan, Some(&healthy_phase))
+            .await
+            .expect("gate must run");
+        assert!(run.gate_declared);
+        assert_eq!(run.exit_code, 0, "{}", run.output);
+        assert_eq!(run.commands_run, 1);
+        assert!(
+            failing_test_command(&plan, Some(&healthy_phase)).await.is_none(),
+            "a phase with its own healthy gate must not be bounced for the plan's typo"
+        );
+
+        // But a phase that declares NOTHING falls through to the plan and IS bounced, so the typo
+        // is not lost — only deferred to the phase it actually governs.
+        let reason = failing_test_command(&plan, Some(&phase_with_test_commands(None)))
+            .await
+            .expect("a phase inheriting a broken plan gate must be bounced");
+        assert!(reason.contains("could not be read"), "{reason}");
+    }
+
+    /// `gate_declared` is what separates "passed" from "there was nothing to pass".
+    #[tokio::test]
+    async fn gate_declared_distinguishes_a_pass_from_an_absent_gate() {
+        let dir = tmp_dir("qa-gate-declared");
+        let w = dir.to_string_lossy().to_string();
+
+        // No gate: exit 0, but nothing was proven.
+        let run = run_test_gate(&plan_with_test_commands(&w, None), None)
+            .await
+            .expect("no gate is not an error");
+        assert_eq!(run.exit_code, 0);
+        assert!(
+            !run.gate_declared,
+            "an absent gate must not look like a gate that passed"
+        );
+
+        // A real gate that passes: exit 0 AND declared.
+        let run = run_test_gate(&plan_with_test_commands(&w, Some(r#"["true"]"#)), None)
+            .await
+            .expect("gate must run");
+        assert_eq!(run.exit_code, 0);
+        assert!(run.gate_declared);
+
+        // So "proven" is `gate_declared && exit_code == 0`, and the two cases above differ on it
+        // while being identical on exit_code alone — which is the whole point of the field.
+    }
+
+    /// `parse_collected_count`'s "largest candidate wins" is documented as picking a runner's
+    /// grand total. For multi-binary cargo output there IS no grand total, so max != the number of
+    /// tests run, and any line shaped `<n> <keyword>` outranks a real count.
+    #[test]
+    fn qa_parse_collected_count_max_wins_is_not_a_grand_total() {
+        let cargo_workspace = "test result: ok. 500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+             test result: ok. 200 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        assert_eq!(
+            parse_collected_count(cargo_workspace),
+            Some(500),
+            "reports the biggest binary, not the 700 tests actually run"
+        );
+        assert_eq!(
+            parse_collected_count("5 passed\nwarning: 48129 skipped"),
+            Some(48129),
+            "any `<n> <keyword>` line outranks the real count"
+        );
+        assert_eq!(
+            parse_collected_count("Tests:       0 total"),
+            Some(0),
+            "a zero-collection suite parses as Some(0) — the one signal of that false green, \
+             which the design forbids acting on"
+        );
+    }
+
+    /// Seam (b): the GraphQL schema's field names for the gate types are checked against what the
+    /// host actually serializes, by reading the schema file. A renamed serde attribute or a
+    /// renamed GraphQL field breaks this instead of silently serving null.
+    #[test]
+    fn qa_graphql_schema_field_names_match_the_host_serialization() {
+        let schema = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../worker/schema/johnnyone-ai.graphql"
+        ))
+        .expect("read johnnyone-ai.graphql");
+
+        fn fields_of(schema: &str, type_name: &str) -> Vec<String> {
+            let header = format!("type {type_name} {{");
+            let start = schema
+                .find(&header)
+                .unwrap_or_else(|| panic!("no `{header}` in the schema"))
+                + header.len();
+            let body = &schema[start..];
+            let end = body.find("\n}").expect("unterminated type block");
+            body[..end]
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(|line| line.split(':').next())
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        }
+
+        let gate = TestGateRun {
+            gate_declared: true,
+            exit_code: 1,
+            collected: Some(2),
+            command: Some("x".into()),
+            commands_run: 1,
+            output: "o".into(),
+            truncated: true,
+        };
+        let json = serde_json::to_value(&gate).expect("serialize TestGateRun");
+        for field in fields_of(&schema, "TestGateRun") {
+            assert!(
+                json.get(&field).is_some(),
+                "GraphQL TestGateRun.{field} has no key in the host's JSON: {json}"
+            );
+        }
+
+        let mut phase = phase_with_test_commands(Some(r#"["a"]"#));
+        phase.test_commands_list = vec!["a".into()];
+        phase.effective_test_commands = vec!["a".into()];
+        let json = serde_json::to_value(&phase).expect("serialize phase");
+        for field in ["testCommands", "effectiveTestCommands"] {
+            assert!(
+                json.get(field).is_some() && json[field].is_array(),
+                "AgentPlanPhase.{field} must serialize as a list: {json}"
+            );
+        }
+        let mut plan = plan_with_test_commands("/w", Some(r#"["a"]"#));
+        plan.test_commands_list = vec!["a".into()];
+        let json = serde_json::to_value(&plan).expect("serialize plan");
+        assert!(json["testCommands"].is_array());
+    }
+
+    /// Seam: the COORDINATOR's ready-check must gate on the phase that reported ready.
+    ///
+    /// QA mutated the call site from `failing_test_command(&run.plan, Some(&phase))` to
+    /// `(&run.plan, None)` and the suite stayed green at 662/2 — the entire per-phase feature
+    /// reverted to plan-only gating, every phase gate passing, with no test noticing. The real fix
+    /// is structural: the coordinator now calls `failing_phase_test_command`, whose phase parameter
+    /// is NOT an `Option`, so that exact mutation is a compile error. This pins that the
+    /// coordinator keeps using that entry point, since nothing stops a future edit from switching
+    /// back to the `Option` form and passing `None`.
+    ///
+    /// Source-level, like `spawn_kloo_never_calls_attach_oneshot` in `task_loop.rs` — the
+    /// behavioural path is unreachable from a unit test (it needs a live tmux worker session past
+    /// `ensure_dev_worker_session` and `wait_for_worker_ready`), and an unreachable path is exactly
+    /// where this class of bug hides.
+    #[test]
+    fn the_coordinator_ready_check_requires_a_phase() {
+        let src = std::fs::read_to_string(file!()).expect("read own source");
+
+        // Slice the coordinator function's own body. NOT `split("#[cfg(test)]")` — this file has
+        // several test modules and the first one starts well ABOVE this function, so that split
+        // silently cut the coordinator out of the "implementation half" and the assertion below
+        // passed against text that did not contain the call site at all. A test that cannot see
+        // the thing it checks is worse than no test.
+        let start = src
+            .find("async fn run_development_worker_phase")
+            .expect("the coordinator phase driver must exist under this name");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .or_else(|| body[1..].find("\nfn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let coordinator = &body[..end];
+        assert!(
+            coordinator.contains("ensure_dev_worker_session"),
+            "sliced the wrong function body"
+        );
+
+        // The coordinator's gate call must be the phase-REQUIRED entry point.
+        assert!(
+            coordinator.contains("failing_phase_test_command(&run.plan, &phase)"),
+            "the coordinator must call the phase-required ready-check; found:\n{coordinator}"
+        );
+        // And must not reach the Option form at all — the shape QA mutated to pass `None`.
+        assert!(
+            !coordinator.contains("failing_test_command("),
+            "the coordinator must not call the Option form; `None` there silently reverts the \
+             whole per-phase gate to plan-only gating with every gate passing"
+        );
+
+        // And across the implementation: one core, and the wrapper is what calls it.
+        //
+        // These use COLUMN-0 anchors and a function-body slice rather than the hand-rolled
+        // `#[cfg(test)]` stripper this test used to carry. That stripper brace-matched from every
+        // `#[cfg(test)]`, including the one on `pub(crate) fn set_executor_config`, and it also
+        // tripped over `#[cfg(test)]` appearing inside this very test's own comments and string
+        // literals — it reported 2 definitions where there is 1. It was removed rather than
+        // tightened: a test module's code is always indented, so `"\nasync fn "` already
+        // distinguishes a real top-level definition from a mention of one, with nothing to get
+        // wrong.
+        assert_eq!(
+            src.matches("\nasync fn failing_test_command(").count(),
+            1,
+            "one top-level definition of the gate ready-check core"
+        );
+
+        // The wrapper's own body must be what calls the core.
+        let wrapper_at = src
+            .find("async fn failing_phase_test_command")
+            .expect("the phase-required wrapper must exist");
+        let wrapper_body = &src[wrapper_at..];
+        let wrapper_end = wrapper_body[1..]
+            .find("\n/// ")
+            .or_else(|| wrapper_body[1..].find("\nasync fn "))
+            .or_else(|| wrapper_body[1..].find("\nfn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(wrapper_body.len());
+        assert!(
+            wrapper_body[..wrapper_end].contains("failing_test_command(plan, Some(phase))"),
+            "the wrapper must delegate to the core with the phase it was given"
+        );
+    }
+
+    /// A config edit is a HUMAN action. Nothing pinned this, so a future reshuffle of the
+    /// `event_actor` match would silently re-attribute a person's edit to the engine — which is
+    /// what it did for `agent_plan_validation_config_updated` until this change.
+    #[test]
+    fn gate_and_config_events_are_attributed_to_the_user() {
+        for event_type in [
+            "agent_plan_test_commands_updated",
+            "agent_plan_validation_config_updated",
+        ] {
+            assert_eq!(
+                event_actor(event_type),
+                "user",
+                "{event_type} is a person's edit, not the coordinator's"
+            );
+        }
+        // Non-vacuous: the fallback really is something else.
+        assert_eq!(event_actor("some_unknown_engine_event"), "coordinator");
+    }
+
+    /// A read error that ends the drain is not EOF. Both produce a short capture; only one means
+    /// "the command printed nothing more", and conflating them makes a failure-truncated window
+    /// read as a complete one.
+    #[tokio::test]
+    async fn drain_capped_tail_reports_a_read_error_distinctly() {
+        // A clean EOF: no error, nothing truncated.
+        let (text, truncated, error) = drain_capped_tail(&b"hello"[..], 1024).await;
+        assert_eq!(text, "hello");
+        assert!(!truncated);
+        assert!(error.is_none(), "a clean EOF must not report an error");
+
+        // A reader that fails mid-stream: the bytes read so far are kept AND the error is named.
+        struct FailAfterFirst(bool);
+        impl tokio::io::AsyncRead for FailAfterFirst {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.0 {
+                    return std::task::Poll::Ready(Err(std::io::Error::other("pipe exploded")));
+                }
+                self.0 = true;
+                buf.put_slice(b"partial");
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let (text, _, error) = drain_capped_tail(FailAfterFirst(false), 1024).await;
+        assert_eq!(text, "partial", "bytes read before the error are kept");
+        assert!(
+            error.as_deref().unwrap_or_default().contains("pipe exploded"),
+            "{error:?}"
+        );
+    }
+
+    /// The tail window stays exactly `cap` bytes and holds the END of the stream, however much
+    /// output passes through it.
+    ///
+    /// This replaces `drain_capped_tail_is_linear_in_the_output`, which asserted a 5-second budget
+    /// to "prove" the window was a ring rather than a repeatedly-drained `Vec`. That test was
+    /// VACUOUS: QA reverted the implementation under it and it passed in 0.02s, because BOTH shapes
+    /// are linear — the `Vec` form was never quadratic (`drain_capped_tail`'s doc has the measured
+    /// numbers). A budget 250x looser than the thing it measures cannot distinguish anything.
+    ///
+    /// So this asserts the properties that actually matter and are actually checkable: the window's
+    /// size, and that it is the TAIL — which is where every test runner prints its summary, and
+    /// therefore the whole reason the cap keeps the end rather than the beginning.
+    #[tokio::test]
+    async fn drain_capped_tail_keeps_exactly_the_last_cap_bytes() {
+        let cap = 64 * 1024;
+        // Far more output than the cap, ending in a marker that must survive.
+        let marker = b"THE-VERY-END";
+        let mut data = vec![b'z'; 8 * 1024 * 1024];
+        let at = data.len() - marker.len();
+        data[at..].copy_from_slice(marker);
+
+        let (text, truncated, error) = drain_capped_tail(&data[..], cap).await;
+        assert_eq!(text.len(), cap, "the window must be exactly the cap");
+        assert!(truncated, "overflow must be reported");
+        assert!(error.is_none());
+        assert!(
+            text.ends_with("THE-VERY-END"),
+            "the kept window must be the TAIL, not the head"
+        );
+
+        // Under the cap, nothing is dropped and nothing is flagged.
+        let (text, truncated, _) = drain_capped_tail(&b"short"[..], cap).await;
+        assert_eq!(text, "short");
+        assert!(!truncated);
+
+        // Exactly at the cap is not truncation.
+        let exact = vec![b'a'; cap];
+        let (text, truncated, _) = drain_capped_tail(&exact[..], cap).await;
+        assert_eq!(text.len(), cap);
+        assert!(!truncated, "exactly cap bytes is not an overflow");
+    }
+
+    // ────── QA round 2: the process-group kill, attacked ──────
+    //
+    // These avoid `pgrep` entirely. `pgrep -f "sleep 45"` is a GLOBAL cmdline match: it sees other
+    // agents' and other runs' processes, and — worse — `.unwrap_or_default()` on a missing or
+    // failing `pgrep` yields an empty string, so an assert-empty passes VACUOUSLY on any box
+    // without pgrep. Instead each gate here writes ticks to its own file in its own temp dir, and
+    // liveness is "did the file grow after the deadline". That cannot collide with another process
+    // and cannot pass vacuously: a tree that survived leaves evidence.
+    //
+    // Every loop below is BOUNDED (`seq 1 60` at 50ms ≈ 3s) so a failing assertion cannot leak a
+    // runaway process onto the user's host.
+
+    /// Bytes in `path`, or 0 when it does not exist yet.
+    fn tick_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// A bounded tick-writer shell loop appending to `path`.
+    fn tick_loop(path: &std::path::Path) -> String {
+        format!(
+            "for i in $(seq 1 60); do echo tick >> {}; sleep 0.05; done",
+            path.to_string_lossy()
+        )
+    }
+
+    /// Our own zombie children, as `/proc` sees them. Reaping bugs show up here and nowhere else.
+    fn own_zombies() -> Vec<String> {
+        let me = std::process::id();
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // `pid (comm) state ppid ...` — comm can contain spaces, so split after the last ')'.
+            let Some(close) = stat.rfind(')') else { continue };
+            let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            if fields[0] == "Z" && fields[1].parse::<u32>() == Ok(me) {
+                out.push(format!("pid {} state Z ppid {}", name, fields[1]));
+            }
+        }
+        out
+    }
+
+    /// The timeout must kill the whole PROCESS GROUP, not just the shell.
+    ///
+    /// `sh -c "<cmd>"` forks `<cmd>` as a grandchild whenever the script is not a single exec-able
+    /// command, so killing the direct child orphans the grandchild: it is reparented and keeps
+    /// running. The fix puts the gate in its own process group and signals the group. Proven here
+    /// by a GRANDCHILD that writes ticks — if it survived the deadline, its file keeps growing.
+    #[tokio::test]
+    async fn qa_gate_timeout_kills_the_whole_process_group_not_just_the_shell() {
+        let dir = tmp_dir("qa-pg-kill");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // Nested `sh -c` forces a real grandchild; the trailing `; true` stops the outer shell
+        // from `exec`ing the inner one into its own process image.
+        let command = format!("sh -c '{}' ; true", tick_loop(&ticks));
+
+        let (exit_code, _output, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("a hanging gate is a RESULT, not a runner error");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+
+        // Non-vacuity: the grandchild must actually have been running, or this proves nothing.
+        let at_deadline = tick_len(&ticks);
+        assert!(
+            at_deadline > 0,
+            "the tick writer never ran, so this test would pass even with no kill at all"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let after = tick_len(&ticks);
+        assert_eq!(
+            after, at_deadline,
+            "the grandchild SURVIVED the deadline: ticks grew {at_deadline} -> {after}. \
+             The group kill did not reach it."
+        );
+    }
+
+    /// Double fork with the intermediate exiting: the writer is orphaned (its parent is gone and
+    /// it is reparented) but stays in the gate's PROCESS GROUP, so the group kill must still reach
+    /// it. Uses script files rather than nested quoting — a `sh -c` inside a `sh -c` inside a
+    /// `sh -c` is its own source of bugs, and a broken command would make this test vacuous.
+    #[tokio::test]
+    async fn qa_gate_timeout_kills_an_orphaned_grandchild_still_in_the_group() {
+        let dir = tmp_dir("qa-pg-orphan");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        let writer = dir.join("writer.sh");
+        let spawner = dir.join("spawner.sh");
+        std::fs::write(
+            &writer,
+            "#!/bin/sh\nfor i in $(seq 1 60); do echo tick >> \"$1\"; sleep 0.05; done\n",
+        )
+        .unwrap();
+        // Backgrounds the writer and exits at once, so the writer's parent dies and it is
+        // reparented while keeping the process group it inherited.
+        std::fs::write(
+            &spawner,
+            "#!/bin/sh\nsh \"$1\" \"$2\" >/dev/null 2>&1 &\n",
+        )
+        .unwrap();
+        let command = format!(
+            "sh {} {} {} ; sleep 30",
+            spawner.to_string_lossy(),
+            writer.to_string_lossy(),
+            ticks.to_string_lossy()
+        );
+        let (exit_code, _, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(600),
+        )
+        .await
+        .expect("gate must report");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+        let at_deadline = tick_len(&ticks);
+        assert!(
+            at_deadline > 0,
+            "the orphaned writer never ran, so this test would prove nothing"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let after = tick_len(&ticks);
+        assert_eq!(
+            after, at_deadline,
+            "an orphaned but in-group descendant SURVIVED the group kill: {at_deadline} -> {after}"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION: a gate that calls `setsid` leaves the process group and the group
+    /// kill cannot reach it. Pinned so the boundary of the guarantee is a measured fact rather than
+    /// an assumption. The writer is self-limiting (~3s) so nothing is left running either way.
+    #[tokio::test]
+    async fn qa_gate_setsid_escapes_the_group_kill() {
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("QA: setsid unavailable, skipping the escape probe");
+            return;
+        }
+        let dir = tmp_dir("qa-pg-setsid");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        let command = format!(
+            "setsid sh -c '{}' >/dev/null 2>&1 & sleep 30",
+            tick_loop(&ticks)
+        );
+        let (exit_code, _, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .expect("gate must report");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT);
+        let at_deadline = tick_len(&ticks);
+        assert!(at_deadline > 0, "the setsid writer never ran");
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let after = tick_len(&ticks);
+        eprintln!(
+            "QA: setsid escape — ticks {at_deadline} -> {after} after the group kill \
+             ({}escaped)",
+            if after > at_deadline { "" } else { "did NOT " }
+        );
+        assert!(
+            after > at_deadline,
+            "setsid no longer escapes the group kill — the guarantee got STRONGER; \
+             update this test and the docs"
+        );
+    }
+
+    /// A background job started by a SUCCESSFUL gate is not killed — and no longer blocks the gate.
+    ///
+    /// QA pinned the defect here: a background job that inherits the gate's stdout/stderr holds
+    /// those pipes open, and the capture waited for pipe EOF rather than for the command, so a
+    /// shell that exited 0 in milliseconds took 3.157s to return. In production a gate like
+    /// `npm test` leaving a watcher or dev server behind would have waited the FULL 20-minute
+    /// deadline and then been reported `exitCode: -3`, "did not finish" — a passing gate recorded
+    /// as a timeout, with the message blaming the command for being slow. The timeout bounded the
+    /// damage; the diagnosis was still wrong.
+    ///
+    /// Fixed by waiting on the COMMAND's exit and then allowing a short, bounded flush window for
+    /// output already in flight ([`TEST_GATE_PIPE_FLUSH_GRACE`]). Part (a) now asserts the gate
+    /// returns promptly; part (b) is unchanged and still pins that a successful gate's group is
+    /// never signalled, which is deliberate.
+    #[tokio::test]
+    async fn qa_gate_background_job_outlives_a_successful_gate() {
+        let dir = tmp_dir("qa-pg-bg");
+        let w = dir.to_string_lossy().to_string();
+
+        // (a) Background job INHERITS the pipes. The shell exits 0 in milliseconds and the pipes
+        //     stay open until the writer finishes (~3s), so this measures whether the gate waits
+        //     for the COMMAND or for the pipes.
+        let ticks_a = dir.join("ticks-a.txt");
+        let command = format!("sh -c '{}' & echo started", tick_loop(&ticks_a));
+        let started = std::time::Instant::now();
+        let (exit_code, output, _) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let inherited_elapsed = started.elapsed();
+        assert_eq!(exit_code, 0, "{output}");
+        eprintln!(
+            "gate with a pipe-inheriting background job returned after {:?} \
+             (the shell itself exited immediately; the background writer runs ~3s)",
+            inherited_elapsed
+        );
+        // The gate must NOT wait for the background writer. One flush grace is the allowance.
+        assert!(
+            inherited_elapsed < std::time::Duration::from_millis(1500),
+            "the gate waited for an inherited pipe instead of the command: returned in {:?}. \
+             A gate that leaves a watcher running would sit until the deadline and then be \
+             misreported as a timeout",
+            inherited_elapsed
+        );
+        // ...and the output the gate itself produced before exiting still arrives.
+        assert!(
+            output.contains("started"),
+            "the flush window must still capture what the command wrote: {output}"
+        );
+        // The background job is untouched by a successful gate — it is still running.
+        let during = tick_len(&ticks_a);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            tick_len(&ticks_a) > during,
+            "a successful gate must not kill a background job it started"
+        );
+
+        // (b) Background job REDIRECTS its stdio. Now the gate returns at once — and the job keeps
+        //     running afterwards, because a successful gate's group is never signalled.
+        let ticks_b = dir.join("ticks-b.txt");
+        let command = format!("sh -c '{}' >/dev/null 2>&1 & echo started", tick_loop(&ticks_b));
+        let started = std::time::Instant::now();
+        let (exit_code, _, _) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let redirected_elapsed = started.elapsed();
+        assert_eq!(exit_code, 0);
+        assert!(
+            redirected_elapsed < std::time::Duration::from_millis(1200),
+            "a redirected background job should not block the gate; took {:?}",
+            redirected_elapsed
+        );
+        let at_return = tick_len(&ticks_b);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let after = tick_len(&ticks_b);
+        eprintln!(
+            "QA: background job after a SUCCESSFUL gate — ticks {at_return} -> {after}"
+        );
+        assert!(
+            after > at_return,
+            "a background job survived a successful gate (expected: the group is only killed on \
+             timeout). If this now fails, successful gates kill their groups too — a behaviour \
+             change worth documenting."
+        );
+    }
+
+    /// Neither the normal path nor the timeout path may leave a zombie child behind.
+    #[tokio::test]
+    async fn qa_gate_reaps_on_both_the_normal_and_the_timeout_path() {
+        let dir = tmp_dir("qa-pg-reap");
+        let w = dir.to_string_lossy().to_string();
+        let before = own_zombies();
+
+        for _ in 0..3 {
+            let (code, _, _) =
+                run_one_gate_command_with_timeout("true", &w, std::time::Duration::from_secs(10))
+                    .await
+                    .expect("fast gate");
+            assert_eq!(code, 0);
+        }
+        let (code, _, _) = run_one_gate_command_with_timeout(
+            "sleep 30",
+            &w,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .expect("timeout gate");
+        assert_eq!(code, TEST_GATE_EXIT_TIMEOUT);
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let after = own_zombies();
+        assert!(
+            after.len() <= before.len(),
+            "gate runs left zombies behind.\nbefore: {before:?}\nafter:  {after:?}"
+        );
+    }
+
+    /// The group kill shells out to `kill(1)`, so a box without that binary has no containment.
+    ///
+    /// QA found this as a SILENT dependency: the call was `let _ = ... .status()`, so a missing
+    /// binary no-opped and a timed-out gate orphaned its grandchildren exactly as it did before the
+    /// process group existed — the defect invisibly restored. The status is now checked and an
+    /// un-executable `kill` logs at ERROR, so the failure is visible at runtime.
+    ///
+    /// This test stays, because a log line is not a gate: the dependency is still real, and pinning
+    /// it means a future minimal environment (a slim container, a stripped image) fails HERE rather
+    /// than leaking processes in production. The runtime log and this test cover different moments.
+    #[test]
+    fn the_group_kill_depends_on_the_kill_binary_being_present() {
+        let found = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v kill")
+            .output()
+            .map(|out| out.status.success() && !out.stdout.is_empty())
+            .unwrap_or(false);
+        assert!(
+            found,
+            "`kill` is not on PATH: run_one_gate_command_with_timeout's group kill is a \
+             `Command::new(\"kill\")`, so on this box a timed-out gate cannot signal its process \
+             group and would orphan its grandchildren. The runner logs that at ERROR rather than \
+             discarding it, but a log is not containment"
+        );
+    }
+
+    /// The group kill must run BEFORE the child is reaped, and nothing else pinned that.
+    ///
+    /// `kill -KILL -<pid>` means "the process group with this id". The pgid equals the shell's pid
+    /// only while the kernel still owns that pid — true while the shell is alive or an unreaped
+    /// zombie. `child.kill()` reaps it and releases the pid for reuse, so running the reap FIRST
+    /// would leave the negative-pid form able to signal a RECYCLED group: killing processes that
+    /// belong to someone else entirely. The current order is safe; swapping two adjacent statements
+    /// silently makes it unsafe, and no behavioural test can catch that (it needs a pid-reuse race
+    /// to lose). A source-order assertion can, cheaply.
+    #[test]
+    fn the_group_kill_runs_before_the_child_is_reaped() {
+        let src = std::fs::read_to_string(file!()).expect("read own source");
+        let start = src
+            .find("async fn run_one_gate_command_with_timeout")
+            .expect("the gate runner must exist under this name");
+        // The runner's own body: stop at the next item at column 0.
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\n/// ")
+            .or_else(|| body[1..].find("\nasync fn "))
+            .or_else(|| body[1..].find("\nfn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        // Strip `//` comment lines before searching. The doc comment ABOVE the kill block
+        // discusses `child.kill()` in prose, and prose sorts before code — the first version of
+        // this test matched that sentence and reported the order as wrong. Comments are not code.
+        let runner: String = body[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let runner = runner.as_str();
+
+        let group_kill = runner
+            .find("Command::new(\"kill\")")
+            .expect("the runner must signal the process group via kill(1)");
+        let reap = runner
+            .find("let _ = child.kill().await")
+            .expect("the runner must reap the shell");
+        assert!(
+            group_kill < reap,
+            "the group kill must precede child.kill(): reaping first releases the pid, after \
+             which the negative-pid group kill can signal a recycled group and kill processes \
+             that are not ours"
+        );
+        // And the group must be created, or the negative pid addresses the wrong group entirely.
+        assert!(
+            runner.contains("process_group(0)"),
+            "the gate must lead its own process group for the negative-pid kill to be correct"
+        );
+
+        // The drain tasks must be ABORTED, not left to detach.
+        //
+        // Dropping a `JoinHandle` detaches the task. For a gate that leaves a daemon holding its
+        // pipes, two drains would then live until that daemon exits, each pinning up to the cap —
+        // bounded per gate, unbounded across a long coordinator session. Nothing is lost by
+        // aborting, because the capture is shared and already read by this point.
+        //
+        // Source-level because tokio exposes no stable way to observe that a task is gone: there
+        // is no live-task count to assert on, and a detached drain's only symptom is memory that
+        // nothing in a unit test can attribute. Structural, and labelled as such.
+        for handle in ["drain_stdout.abort()", "drain_stderr.abort()"] {
+            assert!(
+                runner.contains(handle),
+                "the runner must abort its drain tasks rather than detaching them: missing {handle}"
+            );
+        }
+
+        // The deadline must bound the COMMAND only, with the flush grace outside it. Inside, a
+        // command that exited and was reaped within one grace-width of the deadline reported a
+        // timeout AND falsified the un-reaped precondition the group kill above depends on.
+        //
+        // This one matches a literal SHAPE, so it also trips on a semantically harmless refactor
+        // (binding the future to a local first). That is a deliberate trade: the property is "the
+        // deadline covers the wait and nothing else", which is not observable from outside without
+        // racing a 500ms window, and a false alarm that makes someone re-read this comment is
+        // cheaper than a silent return to the version where the group-kill precondition was false.
+        assert!(
+            runner.contains("timeout(deadline, child.wait())"),
+            "the deadline must bound child.wait() alone, not the wait plus the flush grace. \
+             (If you refactored the call shape without changing that, update this assertion.)"
+        );
+    }
+
+    /// The three reserved codes are distinct, negative, and non-zero, and no real UNIX exit status
+    /// can reach them — `ExitStatus::code()` is 0..=255 on unix. (The cfg(windows) shell is a
+    /// different story; see the report.)
+    #[test]
+    fn the_reserved_gate_exit_codes_cannot_collide_with_a_unix_exit_status() {
+        let reserved = [
+            TEST_GATE_EXIT_SIGNAL,
+            TEST_GATE_EXIT_MALFORMED,
+            TEST_GATE_EXIT_TIMEOUT,
+        ];
+        for code in reserved {
+            assert!(code < 0, "{code} must be negative to be unreachable");
+            assert_ne!(code, 0, "a reserved code must never read as a pass");
+        }
+        let mut sorted = reserved.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), reserved.len(), "reserved codes must be distinct");
+    }
+
+    /// Host-side enforcement of the explicit-clear rule, exercised through the SERVICE rather than
+    /// the resolver — the stated point of moving it down was that the RPC is safe on its own.
+    #[tokio::test]
+    async fn qa_update_test_commands_enforces_explicit_clear_on_the_host() {
+        let (state, root) = test_state();
+        let plan_path = root.join("plan");
+        scaffold_plan(&plan_path, "explicit clear");
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .expect("create plan");
+        let id = run.plan.id.clone();
+
+        // Seed a real gate so a bad call has something to destroy.
+        update_test_commands(&state, id.clone(), None, vec!["npm test".into()], false)
+            .expect("set the gate");
+
+        // Empty commands WITHOUT clear: rejected, and the gate survives.
+        let err = update_test_commands(&state, id.clone(), None, vec![], false)
+            .expect_err("an empty list without clear must be rejected");
+        assert!(err.contains("clear: true"), "{err}");
+        // Whitespace-only is the same shape once blanks are dropped.
+        let err = update_test_commands(&state, id.clone(), None, vec!["   ".into()], false)
+            .expect_err("a whitespace-only list without clear must be rejected");
+        assert!(err.contains("clear: true"), "{err}");
+        // Contradictory: clear AND commands.
+        let err = update_test_commands(&state, id.clone(), None, vec!["x".into()], true)
+            .expect_err("clear with commands must be rejected");
+        assert!(err.contains("not both"), "{err}");
+        // ...including when the command is blank. This used to be ACCEPTED and silently clear,
+        // because blanks were filtered before the contradiction check, so `clear: true` with
+        // `["npm test"]` was rejected while `clear: true` with `["   "]` went through. Whitespace
+        // must not decide whether a contradictory call is an error.
+        let err = update_test_commands(&state, id.clone(), None, vec!["   ".into()], true)
+            .expect_err("clear with a whitespace-only command is still contradictory");
+        assert!(err.contains("not both"), "{err}");
+        // The gate is still exactly what it was — no rejected call half-applied.
+        let run = get_plan(&state, &id).expect("get plan");
+        assert_eq!(run.plan.test_commands_list, vec!["npm test".to_string()]);
+
+        // clear: true with an empty list is the sanctioned removal, and writes NULL.
+        let run = update_test_commands(&state, id.clone(), None, vec![], true)
+            .expect("clear: true must remove the gate");
+        assert_eq!(run.plan.test_commands, None, "clearing must write NULL");
+        assert!(run.plan.test_commands_list.is_empty());
+
+        // The asymmetry QA documented here is GONE. `clear: true` with a whitespace-only list was
+        // accepted while `clear: true` with a real command was rejected, because blanks were
+        // filtered before the contradiction check — so whitespace decided whether a contradictory
+        // call was an error. The contradiction is now judged on what the caller sent, and the gate
+        // SURVIVES the rejection.
+        update_test_commands(&state, id.clone(), None, vec!["npm test".into()], false)
+            .expect("re-set the gate");
+        let err = update_test_commands(&state, id.clone(), None, vec!["  ".into()], true)
+            .expect_err("clear with a blank entry is still a contradiction");
+        assert!(err.contains("not both"), "{err}");
+        assert!(
+            err.contains("still counts as passing one"),
+            "the message must explain why a blank counts: {err}"
+        );
+        let run = get_plan(&state, &id).expect("read back");
+        assert_eq!(
+            run.plan.test_commands_list,
+            vec!["npm test".to_string()],
+            "a rejected call must not have half-applied"
+        );
+    }
+
+    // ────── QA round 3: the C1 shared-capture concurrency path ──────
+    //
+    // The capture is now an `Arc<Mutex<GateCapture>>` per stream, published after every read and
+    // read again from the grace-window path. These attack that: output loss, ordering, the cap and
+    // `truncated` while a writer is still active, UTF-8 cut at an arbitrary byte, lock contention,
+    // and whether the grace is concurrent or cumulative. Every writer below self-terminates so a
+    // failing assertion cannot leave a runaway process on the host.
+
+    /// The gate's OWN output must survive a pipe held open past the grace window, even when the
+    /// gate writes a lot immediately before exiting — the drain is then mid-stream when the grace
+    /// expires, which is the exact shape that lost output in the first cut of this fix.
+    #[tokio::test]
+    async fn qa_c1_a_large_final_write_survives_a_pipe_held_open_by_a_background_job() {
+        let dir = tmp_dir("qa-c1-bigwrite");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // 64 KiB of the gate's own output, then a marker, then exit — with a background job
+        // holding stdout open for ~3s afterwards.
+        let command = format!(
+            "sh -c '{}' & head -c 65536 /dev/zero | tr '\\0' 'q' ; echo END-OF-GATE-OUTPUT",
+            tick_loop(&ticks)
+        );
+        let started = std::time::Instant::now();
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let elapsed = started.elapsed();
+        assert_eq!(exit_code, 0, "{output}");
+        assert!(
+            !truncated,
+            "64 KiB is under the cap; nothing should have been discarded"
+        );
+        assert!(
+            output.contains("END-OF-GATE-OUTPUT"),
+            "the gate's final write was lost. captured {} bytes in {:?}",
+            output.len(),
+            elapsed
+        );
+        assert!(
+            output.matches('q').count() >= 65536,
+            "the bulk of the gate's output was lost: {} 'q' bytes of 65536",
+            output.matches('q').count()
+        );
+        // Non-vacuity: the background writer really was holding the pipe.
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+    }
+
+    /// A command that writes and exits immediately must never lose its output. Repeated, because
+    /// the failure mode is a race between `child.wait()` returning and the drains being polled.
+    #[tokio::test]
+    async fn qa_c1_a_fast_command_never_loses_its_output() {
+        let dir = tmp_dir("qa-c1-fast");
+        let w = dir.to_string_lossy().to_string();
+        for attempt in 0..40 {
+            let (exit_code, output, _) = run_one_gate_command_with_timeout(
+                "echo out-line ; echo err-line 1>&2",
+                &w,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .expect("gate must run");
+            assert_eq!(exit_code, 0);
+            assert!(
+                output.contains("out-line"),
+                "attempt {attempt}: lost stdout: {output:?}"
+            );
+            assert!(
+                output.contains("err-line"),
+                "attempt {attempt}: lost stderr: {output:?}"
+            );
+        }
+    }
+
+    /// A command that prints nothing yields an empty capture, not a spurious read error.
+    #[tokio::test]
+    async fn qa_c1_a_silent_command_reports_no_read_error() {
+        let dir = tmp_dir("qa-c1-silent");
+        let w = dir.to_string_lossy().to_string();
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout("true", &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        assert_eq!(exit_code, 0);
+        assert!(!truncated);
+        assert_eq!(output.trim(), "", "expected an empty capture, got {output:?}");
+        assert!(
+            !output.contains("[gate] reading"),
+            "a clean EOF must not report a read error: {output}"
+        );
+    }
+
+    /// The two flush graces run CONCURRENTLY. With a background job holding BOTH pipes, the gate
+    /// must cost one grace window, not two.
+    #[tokio::test]
+    async fn qa_c1_the_flush_grace_is_concurrent_not_cumulative() {
+        let dir = tmp_dir("qa-c1-grace");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // The background job inherits stdout AND stderr and holds both for ~3s.
+        let command = format!("sh -c '{}' 2>&1 & echo started", tick_loop(&ticks));
+        let started = std::time::Instant::now();
+        let (exit_code, output, _) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(20))
+                .await
+                .expect("gate must run");
+        let elapsed = started.elapsed();
+        assert_eq!(exit_code, 0, "{output}");
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+        let one = TEST_GATE_PIPE_FLUSH_GRACE;
+        assert!(
+            elapsed < one + std::time::Duration::from_millis(300),
+            "two held pipes cost {elapsed:?}; one grace is {one:?}, so this looks cumulative \
+             rather than concurrent"
+        );
+        assert!(
+            output.contains("started"),
+            "the gate's own output must still arrive: {output}"
+        );
+    }
+
+    /// Within a stream, bytes must stay in order, and the two streams must not interleave into
+    /// each other. Each stream has its own capture, so this pins that they stay separate while
+    /// both drains publish concurrently.
+    #[tokio::test]
+    async fn qa_c1_each_stream_keeps_its_own_order() {
+        let dir = tmp_dir("qa-c1-order");
+        let w = dir.to_string_lossy().to_string();
+        // 4000 numbered lines on stdout and 4000 lettered lines on stderr, concurrently, far more
+        // than one 8 KiB read each so both drains loop and contend for their locks.
+        let command = "seq 1 4000 & for i in $(seq 1 4000); do echo \"E$i\" 1>&2; done; wait";
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout(command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert_eq!(exit_code, 0);
+        assert!(!truncated, "this output is well under the cap");
+
+        // stdout's numbers must be strictly increasing in the capture.
+        let numbers: Vec<i64> = output
+            .lines()
+            .filter_map(|line| line.trim().parse::<i64>().ok())
+            .collect();
+        assert!(numbers.len() > 3000, "lost stdout lines: {}", numbers.len());
+        assert!(
+            numbers.windows(2).all(|pair| pair[1] > pair[0]),
+            "stdout bytes were reordered within the stream"
+        );
+        // stderr's markers likewise.
+        let es: Vec<i64> = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('E')?.parse::<i64>().ok())
+            .collect();
+        assert!(es.len() > 3000, "lost stderr lines: {}", es.len());
+        assert!(
+            es.windows(2).all(|pair| pair[1] > pair[0]),
+            "stderr bytes were reordered within the stream"
+        );
+        // And the streams are concatenated, not interleaved: every stderr marker comes after
+        // every stdout number in the combined capture.
+        let last_number = output.rfind(&format!("\n{}\n", numbers[numbers.len() - 1]));
+        let first_e = output.find("E1\n");
+        if let (Some(last_number), Some(first_e)) = (last_number, first_e) {
+            assert!(
+                last_number < first_e,
+                "stdout and stderr interleaved in the combined capture"
+            );
+        }
+    }
+
+    /// `truncated` must be exact at the cap boundary, including while a writer is still active on
+    /// the pipe during the grace window.
+    #[tokio::test]
+    async fn qa_c1_truncated_is_exact_at_the_cap_boundary() {
+        let dir = tmp_dir("qa-c1-cap");
+        let w = dir.to_string_lossy().to_string();
+        let cap = TEST_GATE_STREAM_CAP_BYTES;
+
+        // Exactly the cap: nothing discarded.
+        let command = format!("head -c {cap} /dev/zero | tr '\\0' 'a'");
+        let (_, _, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert!(!truncated, "exactly {cap} bytes must not report truncation");
+
+        // One byte over: discarded, and reported.
+        let over = cap + 1;
+        let command = format!("head -c {over} /dev/zero | tr '\\0' 'a'");
+        let (_, _, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert!(truncated, "{over} bytes must report truncation");
+
+        // And over the cap while a background job keeps the pipe open: the flag must still be
+        // published before the grace window ends.
+        let ticks = dir.join("ticks.txt");
+        let command = format!(
+            "sh -c '{}' & head -c {over} /dev/zero | tr '\\0' 'a' ; echo TAIL",
+            tick_loop(&ticks)
+        );
+        let (_, output, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(30))
+                .await
+                .expect("gate must run");
+        assert!(truncated, "truncation during the grace window must be reported");
+        assert!(output.contains("TAIL"), "the tail must survive: kept {} bytes", output.len());
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+    }
+
+    /// The window is cut at an arbitrary BYTE — by the cap at the front and by the grace window at
+    /// the back — so a multi-byte character can be split. That must cost at most a replacement
+    /// character at each edge, never a panic and never a mangled middle.
+    #[tokio::test]
+    async fn qa_c1_a_utf8_character_split_by_the_cap_costs_one_replacement_char() {
+        let dir = tmp_dir("qa-c1-utf8");
+        let w = dir.to_string_lossy().to_string();
+        let cap = TEST_GATE_STREAM_CAP_BYTES;
+        // Snowmen are 3 bytes each; 3 does not divide the cap, so the front cut lands mid-char.
+        let count = cap / 3 + 1000;
+        let command = format!("for i in $(seq 1 {count}); do printf '\\342\\230\\203'; done");
+        let (exit_code, output, truncated) =
+            run_one_gate_command_with_timeout(&command, &w, std::time::Duration::from_secs(60))
+                .await
+                .expect("gate must run");
+        assert_eq!(exit_code, 0);
+        assert!(truncated, "this output exceeds the cap");
+        let replacements = output.matches('\u{FFFD}').count();
+        let snowmen = output.matches('\u{2603}').count();
+        assert!(snowmen > 1000, "the characters themselves must survive: {snowmen}");
+        assert!(
+            replacements <= 2,
+            "a byte-boundary cut must cost at most one replacement char per edge, got \
+             {replacements} (snowmen: {snowmen})"
+        );
+    }
+
+    /// `GateCapture::take` runs while the drains may still hold their locks. A writer hammering the
+    /// pipe at a high rate maximises that contention; the call must still return promptly, and the
+    /// lock must never be held across an await (which would deadlock the grace window).
+    #[tokio::test]
+    async fn qa_c1_take_does_not_deadlock_against_a_hammering_drain() {
+        let dir = tmp_dir("qa-c1-contend");
+        let w = dir.to_string_lossy().to_string();
+        // A self-terminating writer that floods both streams as fast as sh can, inherited by a
+        // background job so it is still running when the grace window expires and `take` runs.
+        let command = "sh -c 'for i in $(seq 1 20000); do printf \"xxxxxxxxxxxxxxxx\"; \
+                       printf \"yyyyyyyyyyyyyyyy\" 1>&2; done' & echo started";
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run_one_gate_command_with_timeout(command, &w, std::time::Duration::from_secs(10)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let (exit_code, output, truncated) = outcome
+            .expect("take() deadlocked or blocked against a live drain")
+            .expect("gate must run");
+        assert_eq!(exit_code, 0, "{}", &output[..output.len().min(200)]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "contention cost {elapsed:?}; the lock may be held across an await"
+        );
+        // Both windows stayed exactly at the cap under concurrent publish-and-read: the
+        // contention did not corrupt a length or lose a window.
+        assert!(truncated, "this flood is well past the cap");
+        assert_eq!(
+            output.len(),
+            2 * TEST_GATE_STREAM_CAP_BYTES + 1,
+            "expected both windows full plus the separator"
+        );
+        assert!(
+            output.contains('x') && output.contains('y'),
+            "both streams must be represented"
+        );
+        // NOTE, and this is correct rather than a defect: `echo started` does NOT survive here.
+        // The window is a TAIL, the gate's own line was written FIRST, and a background job that
+        // floods past the cap during the grace window evicts it. So a gate that leaves a chatty
+        // daemon behind can have its own result pushed out of the capture by the daemon's output —
+        // `truncated` says so, but the useful bytes are gone. Under the cap it survives, which
+        // `qa_c1_a_large_final_write_survives_a_pipe_held_open_by_a_background_job` pins.
+    }
+
+    /// The deadline bounds the COMMAND, not the command plus the flush grace.
+    ///
+    /// QA pinned the defect here: the deadline used to cover `child.wait()` AND the 500ms flush
+    /// grace, so a command that exited 0 within one grace-width of the deadline was reported `-3`
+    /// with a message blaming it for being slow. The worse half was not the wrong outcome but the
+    /// false safety argument: the group-kill block asserts the kernel still owns the shell's pid
+    /// because it has not been reaped, and that is what makes the negative-pid kill unable to
+    /// signal a RECYCLED group. In that window `child.wait()` had already reaped it, so the
+    /// precondition the comment relies on was false.
+    ///
+    /// Fixed by bounding `child.wait()` alone and running the grace outside it. The timeout branch
+    /// is now reachable only with the child un-waited, which is exactly what the group-kill
+    /// argument requires. QA's note that this was a 500ms window in 1,200,000ms was why it did not
+    /// block the merge; it is fixed anyway, because the next person to shorten the deadline would
+    /// inherit a safety argument that is quietly untrue.
+    #[tokio::test]
+    async fn qa_c1_a_command_that_exits_inside_the_grace_window_is_not_a_timeout() {
+        let dir = tmp_dir("qa-c1-edge");
+        let w = dir.to_string_lossy().to_string();
+        let ticks = dir.join("ticks.txt");
+        // The command exits 0 at ~150ms; a background job holds the pipes so the grace runs its
+        // full 500ms, pushing completion past a 400ms deadline.
+        let command = format!("sh -c '{}' & sleep 0.15 ; echo done-early", tick_loop(&ticks));
+        let (exit_code, output, _) = run_one_gate_command_with_timeout(
+            &command,
+            &w,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("gate must report");
+        assert!(tick_len(&ticks) > 0, "the background writer never ran");
+        assert_eq!(
+            exit_code, 0,
+            "a command that EXITED 0 before the deadline must report 0; reporting \
+             {} means the flush grace is being counted against the deadline again",
+            TEST_GATE_EXIT_TIMEOUT
+        );
+        assert!(
+            !output.contains("did not finish"),
+            "and it must not be described as a timeout: {output}"
+        );
+        // The command's own line survives: it was written before the background flood, and here
+        // the flood stays under the cap.
+        assert!(output.contains("done-early"), "{output}");
+
+        // The other side of the same boundary: a command that genuinely overruns the deadline is
+        // still a timeout. Moving the grace out must not have moved the deadline out with it.
+        let slow = format!("sh -c '{}' & sleep 5 ; echo too-late", tick_loop(&dir.join("t2.txt")));
+        let (exit_code, output, _) = run_one_gate_command_with_timeout(
+            &slow,
+            &w,
+            std::time::Duration::from_millis(400),
+        )
+        .await
+        .expect("gate must report");
+        assert_eq!(exit_code, TEST_GATE_EXIT_TIMEOUT, "{output}");
+        assert!(output.contains("did not finish"), "{output}");
+    }
+
     #[tokio::test]
     async fn failing_test_command_reports_an_unrunnable_command() {
         let plan = plan_with_test_commands("/nonexistent-workspace-xyz", Some(r#"["true"]"#));
-        let reason = failing_test_command(&plan).await.expect("must report");
+        let reason = failing_test_command(&plan, None).await.expect("must report");
         assert!(reason.contains("could not run"), "{reason}");
     }
 
@@ -11846,6 +14649,7 @@ diff --git a/two.md b/two.md
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
+                test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
             },
@@ -11873,6 +14677,9 @@ diff --git a/two.md b/two.md
             findings_json: "[]".into(),
             created_at: "".into(),
             updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
         }
     }
 
@@ -11961,6 +14768,7 @@ mod validation_lens_tests {
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
+                test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
             },
@@ -13479,6 +16287,7 @@ mod small_mode_tests {
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
+                test_commands_list: Vec::new(),
             },
             phases: vec![],
             tasks: vec![],
@@ -15499,5 +18308,777 @@ mod prompt_delivery_tests {
             "a fifo is in-root but is not a regular file, so it must be skipped unread"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// QA B — adversarial tests on the spec-weakening classifier's new segment rule.
+///
+/// `is_worker_writable_store_file` decides whether a diff that removed lines from a plan-store
+/// file counts as the worker doing its job (evidence being rewritten) or as the worker weakening
+/// its own spec. It is the one piece of this branch that is live on every run today, so it gets
+/// attacked on its own rather than only through `plan_artifacts`.
+#[cfg(test)]
+mod qa_b_worker_writable_tests {
+    use super::is_worker_writable_store_file;
+
+    /// Every shape QA could find that is NOT genuinely a file inside an `artifacts/` directory
+    /// and is not one of the named progress files. Any `true` here is `artifacts/` acting as a
+    /// key to the rest of the store.
+    #[test]
+    fn qa_only_a_real_artifact_or_a_named_progress_file_is_worker_writable() {
+        for refused in [
+            // Traversal, in every position.
+            "phases/01-shell/artifacts/../../overview.md",
+            "phases/01-shell/artifacts/runs/../../../overview.md",
+            "artifacts/../overview.md",
+            "artifacts/../../../../etc/passwd",
+            "phases/../decisions.md",
+            // A `..` hidden inside a longer segment.
+            "phases/01-shell/artifacts/v1..2/overview.md",
+            // Windows separators — `\` is a legal filename byte on this host, so a path shaped
+            // like a Windows one must not be read as having separators at all.
+            "phases/01-shell\\artifacts\\x.png",
+            "artifacts\\..\\overview.md",
+            "phases\\01-shell\\artifacts\\status.md",
+            // Absolute / UNC / empty and `.` segments.
+            "/artifacts/x.png",
+            "//host/artifacts/x.png",
+            "artifacts//x.png",
+            "artifacts/./x.png",
+            "./artifacts/x.png",
+            "",
+            // `artifacts` naming a FILE, not a directory above one.
+            "artifacts",
+            "phases/01-shell/artifacts",
+            // Substring, case and suffix near-misses.
+            "artifactsx/summary.md",
+            "my-artifacts/summary.md",
+            "artifacts.bak/summary.md",
+            "Artifacts/summary.md",
+            "phases/01-shell/notartifacts/x.png",
+            // The spec files themselves, which is the whole point of the classifier.
+            "phases/02-acceptance/overview.md",
+            "phases/02-acceptance/tasks/02-02/prompt.md",
+            "plan.md",
+            "brief.md",
+            // A named progress file reached through a traversal is still refused: the name is
+            // right but the path is about a different file.
+            "phases/01-shell/artifacts/../../tasks/t1/status.md",
+            "phases/../status.yml",
+        ] {
+            assert!(
+                !is_worker_writable_store_file(refused),
+                "{refused:?} must NOT be classified as worker-writable"
+            );
+        }
+    }
+
+    /// The other direction: the fix must not have stopped classifying real worker output, which
+    /// would make the coordinator bounce a phase for rewriting its own evidence. These are the
+    /// shapes the store actually contains.
+    #[test]
+    fn qa_real_worker_output_is_still_worker_writable() {
+        for allowed in [
+            "artifacts/summary.md",
+            "artifacts/mocks/seat-meter.html",
+            "artifacts/screens-to-verify/aux-open.png",
+            "phases/02-acceptance/artifacts/cargo-test-lib.txt",
+            "phases/02-acceptance/artifacts/capture-library.mjs",
+            "phases/01-shell/artifacts/screenshots/nested/deep.png",
+            // Run-scoped: the shape this branch adds.
+            "phases/04-leases/artifacts/runs/4f0821/seat-meter.html",
+            "phases/04-leases/artifacts/runs/4f0821/nested/shot.png",
+            // A file literally called `artifacts` INSIDE an artifacts dir is still output.
+            "phases/01-shell/artifacts/artifacts",
+            // Odd but legal names.
+            "phases/01-shell/artifacts/v1.2.png",
+            "phases/01-shell/artifacts/report.md ",
+        ] {
+            assert!(
+                is_worker_writable_store_file(allowed),
+                "{allowed:?} must still be classified as worker-writable"
+            );
+        }
+    }
+}
+
+/// QA B — what `{{artifacts_path}}` actually does on a live run.
+///
+/// The branch's biggest self-declared gap is that nothing writes to the run-scoped path yet. These
+/// tests measure the three halves of that claim separately, because they are not all true in the
+/// same way: the VALUE is plumbed, the DIRECTORY really is created on every live render (so the
+/// branch is NOT inert), and no shipped template consumes the value (so no worker is told about
+/// it).
+#[cfg(test)]
+mod qa_b_template_tests {
+    use super::*;
+
+    fn qa_run(plan_path: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "RUN-7fe2".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: plan_path.into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+                test_commands: None,
+                test_commands_list: Vec::new(),
+                executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn qa_phase() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "RUN-7fe2".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
+        }
+    }
+
+    fn value_of<'a>(values: &'a [(&'static str, String)], key: &str) -> &'a str {
+        values
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("no template value named {key:?}"))
+    }
+
+    /// The branch is NOT a no-op for live runs: rendering a phase's template values CREATES the
+    /// run-scoped directory on disk, as a side effect, using the plan id as the run id.
+    ///
+    /// Every prompt builder goes through `phase_template_values` — the worker prompt, the
+    /// single-reviewer prompt, the replan planner prompt and EACH lens reviewer prompt — so a
+    /// reviewed phase renders it several times per phase. Pinned so "nothing writes to the
+    /// run-scoped path yet" cannot be read as "nothing changes on disk yet".
+    #[test]
+    fn qa_rendering_a_phases_values_creates_the_run_scoped_directory_today() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-live");
+        let run = qa_run(plan.to_str().unwrap());
+        let phase = qa_phase();
+        let phase_path = plan.join("phases/01-thing");
+        let tasks_path = phase_path.join("tasks");
+
+        let expected = plan.join("phases/01-thing/artifacts/runs/RUN-7fe2");
+        assert!(!expected.exists(), "nothing exists before the render");
+
+        let values = phase_template_values(&state, &run, &phase, &phase_path, &tasks_path);
+
+        assert_eq!(
+            value_of(&values, "artifacts_path"),
+            expected.to_string_lossy(),
+            "the value must be the run-scoped directory, not the champion's"
+        );
+        assert!(
+            expected.is_dir(),
+            "rendering the values must have CREATED {}",
+            expected.display()
+        );
+        // The run id used is the plan id, exactly as the module doc says.
+        assert_eq!(value_of(&values, "run_id"), "RUN-7fe2");
+        // And the champion's bare directory is created as a by-product (it is the parent's
+        // parent), which is what a reader of the old layout will now always find present.
+        assert!(plan.join("phases/01-thing/artifacts").is_dir());
+    }
+
+    /// When the directory cannot be created the render must still produce a usable path rather
+    /// than failing the phase. Forced deterministically by putting a FILE where the artifacts
+    /// directory would go.
+    #[test]
+    fn qa_an_uncreatable_artifacts_dir_falls_back_instead_of_failing_the_phase() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-fallback");
+        std::fs::create_dir_all(plan.join("phases/01-thing")).unwrap();
+        // `artifacts` is a regular file, so `create_dir_all` under it cannot succeed.
+        std::fs::write(plan.join("phases/01-thing/artifacts"), b"not a directory").unwrap();
+
+        let run = qa_run(plan.to_str().unwrap());
+        let values = phase_template_values(
+            &state,
+            &run,
+            &qa_phase(),
+            &plan.join("phases/01-thing"),
+            &plan.join("phases/01-thing/tasks"),
+        );
+        assert_eq!(
+            value_of(&values, "artifacts_path"),
+            plan.join("phases/01-thing/artifacts").to_string_lossy(),
+            "the fallback is the champion's bare directory"
+        );
+    }
+
+    /// A hostile phase id cannot make the render escape the plan store, and still yields a value.
+    #[test]
+    fn qa_an_unsafe_phase_id_cannot_escape_the_plan_store_through_the_template() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-escape");
+        let run = qa_run(plan.to_str().unwrap());
+        let mut phase = qa_phase();
+        phase.phase_id = "../../..".into();
+        // `phase_path` is what the caller computed; the artifacts value must NOT be derived from
+        // it by string concatenation that keeps the traversal.
+        let phase_path = plan.join("phases").join(&phase.phase_id);
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let artifacts = value_of(&values, "artifacts_path");
+        // Today this falls back to `<phase_path>/artifacts`, which still contains the traversal
+        // the CALLER introduced — so the guard protects the segment this module adds, not a
+        // phase id the caller already joined. Nothing outside the store is CREATED, which is the
+        // property that matters.
+        assert!(artifacts.contains("artifacts"), "{artifacts}");
+        assert!(
+            !plan.parent().unwrap().join("artifacts").exists(),
+            "no artifacts directory may be created above the plan store"
+        );
+    }
+
+    /// THE revert-guard for turning the run-scoped path on: the prompt an agent actually
+    /// receives names the run's real directory.
+    ///
+    /// Renders the shipped worker template against real phase values, so it fails if ANY link in
+    /// the chain is removed — the template line, the `artifacts_path` value in
+    /// `phase_template_values`, or the placeholder's spelling drifting between the two. Checking
+    /// the template alone would miss the last two: an unrendered `{{artifacts_path}}` reaching an
+    /// agent is worse than no instruction, because the agent would create a directory with that
+    /// literal name.
+    #[test]
+    fn qa_the_rendered_worker_prompt_names_this_runs_artifact_directory() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = crate::test_support::tmp_dir("qa-tmpl-rendered");
+        let run = qa_run(plan.to_str().unwrap());
+        let phase = qa_phase();
+        let phase_path = plan.join("phases/01-thing");
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let rendered =
+            planner_prompts::render_template(planner_prompts::DEFAULT_DEVELOPMENT_WORKER, &values);
+
+        let expected = plan.join("phases/01-thing/artifacts/runs/RUN-7fe2");
+        assert!(
+            rendered.contains(&*expected.to_string_lossy()),
+            "the rendered worker prompt must name {}; got:\n{}",
+            expected.display(),
+            rendered
+        );
+        // The reason travels with the path.
+        assert!(rendered.contains("overwrite each other's evidence"), "{rendered}");
+        // No placeholder may survive rendering — an agent handed a literal `{{artifacts_path}}`
+        // would create a directory called that.
+        assert!(
+            !rendered.contains("{{"),
+            "an unrendered placeholder reached the prompt:\n{rendered}"
+        );
+        // And the directory the prompt names really exists by the time the agent reads it.
+        assert!(expected.is_dir(), "{} was named but not created", expected.display());
+    }
+
+    /// FIXED (was `qa_no_shipped_template_consumes_the_artifacts_path_value`, QA round 2). The
+    /// shipped development worker template now DOES consume `{{artifacts_path}}`, so the value
+    /// reaches a live agent.
+    ///
+    /// QA's test was the measured half of "the live worker prompts are fingerprint-pinned, so
+    /// nothing writes there yet", and it was true until the coordinator carried the
+    /// commercial-prompt decision on 2026-10-14. Same fixture — exhaustive over every default
+    /// prompt in `PlannerPromptSettings` via serde, so a template added later cannot be missed
+    /// by a hand-written list — with the assertion inverted.
+    ///
+    /// **QA's non-vacuity half is kept and is still load-bearing**, now in both directions: the
+    /// same search must find the placeholders that were already wired (otherwise a `contains`
+    /// over this JSON proves nothing), and it must NOT find a placeholder that exists nowhere
+    /// (otherwise the positive assertion above would pass against any string at all).
+    #[test]
+    fn qa_the_shipped_worker_template_consumes_the_artifacts_path_value() {
+        let defaults = planner_prompts::PlannerPromptSettings::default();
+        let as_json = serde_json::to_string(&defaults).expect("settings serialise");
+        assert!(
+            as_json.contains("artifacts_path"),
+            "the shipped worker template must reference {{{{artifacts_path}}}} — without it the \
+             run-scoped directory is created on every phase and written to by nobody"
+        );
+        // It is the WORKER template specifically, and it carries the reason, not just the path.
+        assert!(
+            planner_prompts::DEFAULT_DEVELOPMENT_WORKER.contains("{{artifacts_path}}"),
+            "the development worker template is the one that had to change"
+        );
+        assert!(
+            planner_prompts::DEFAULT_DEVELOPMENT_WORKER.contains("overwrite each other's evidence"),
+            "the instruction must say WHY, or the next editor will drop it as redundant"
+        );
+        // Not sprayed: the planning templates have no phase and no run-scoped directory.
+        assert!(!planner_prompts::DEFAULT_PLANNING_PLANNER.contains("artifacts_path"));
+        assert!(!planner_prompts::DEFAULT_PLANNING_REVIEWER.contains("artifacts_path"));
+
+        // Sanity, kept from QA: the same search DOES find the placeholders that are wired, so
+        // the assertion above is not vacuous...
+        for wired in ["tasks_path", "phase_path", "plan_path", "run_id", "conventions_path"] {
+            assert!(as_json.contains(wired), "{wired} should be in a shipped template");
+        }
+        // ...and does NOT find one that is wired nowhere, so `contains` is really discriminating.
+        assert!(
+            !as_json.contains("fleet_busy_path"),
+            "a placeholder no template defines must not be found, or the search means nothing"
+        );
+    }
+}
+
+/// QA B round 2 — the end-to-end claim: with the prompt wired, does a real phase render write
+/// its evidence where every reader looks for it?
+///
+/// Round 1 measured that the value was plumbed and the directory created; round 3 wired the
+/// shipped worker prompt. Nobody had joined the two ends. The chain has SIX links and they are
+/// written by four different modules, so agreement between them is a property to measure, not to
+/// assume:
+///
+/// 1. the worker prompt the agent is handed NAMES a directory,
+/// 2. that directory exists when the agent reads the prompt,
+/// 3. a file the worker writes there is found by `resolve_phase_artifacts_dir`,
+/// 4. the LENS REVIEWER prompt names the same directory (the live reviewer is the `format!` in
+///    `lens_reviewer_prompt`, not `DEFAULT_DEVELOPMENT_REVIEWER`),
+/// 5. `is_worker_writable_store_file` classifies it as worker output, so the coordinator does
+///    not bounce the phase for writing there,
+/// 6. the review gate's evidence walk reaches it.
+///
+/// The path is taken OUT OF THE RENDERED PROMPT TEXT rather than recomputed, because what the
+/// agent is told is the only thing that actually determines where the bytes land.
+#[cfg(test)]
+mod qa_b_r2_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git must be available")
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    /// A plan store that looks like a real one: a phase, a task with a spec, and a git commit, so
+    /// the evidence walk's "untracked files under this phase" question has a meaningful answer.
+    fn committed_plan_store(tag: &str) -> PathBuf {
+        let dir = crate::test_support::tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-thing/tasks/t1")).unwrap();
+        std::fs::write(
+            dir.join("phases/01-thing/tasks/t1/prompt.md"),
+            "# Task\n- The seat meter must render\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("phases/01-thing/tasks/t1/status.yml"), "status: todo\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "qa@example.com"]);
+        git(&dir, &["config", "user.name", "qa"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    fn run_for(plan_path: &str) -> AgentPlanRun {
+        AgentPlanRun {
+            plan: AgentPlan {
+                id: "RUN-e2e".into(),
+                run_type: "development".into(),
+                title: "t".into(),
+                workspace_path: "/w".into(),
+                plan_path: plan_path.into(),
+                status: "in_progress".into(),
+                worker_session_id: None,
+                reviewer_session_id: None,
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                current_phase_id: None,
+                current_phase_index: 0,
+                error: None,
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                amend_brief: None,
+                phase_run_mode: "continue".into(),
+                initiative_id: "INIT".into(),
+                initiative_status: "development".into(),
+                health: "in-progress".into(),
+                briefing_session_id: None,
+                created_at: "".into(),
+                updated_at: "".into(),
+                validation_config: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+                test_commands: None,
+                test_commands_list: Vec::new(),
+                executor_config: None,
+                consecutive_non_pass_planning_rounds: None,
+            },
+            phases: vec![],
+            tasks: vec![],
+            events: vec![],
+        }
+    }
+
+    fn phase_for() -> AgentPlanPhase {
+        AgentPlanPhase {
+            id: "PH".into(),
+            plan_id: "RUN-e2e".into(),
+            phase_id: "01-thing".into(),
+            phase_title: "Thing".into(),
+            phase_index: 0,
+            status: "in_progress".into(),
+            worker_started_at: None,
+            worker_idle_at: None,
+            reviewer_started_at: None,
+            reviewer_idle_at: None,
+            gate_verdict: "pending".into(),
+            clarification_attempts: 0,
+            summary: None,
+            findings_json: "[]".into(),
+            created_at: "".into(),
+            updated_at: "".into(),
+            test_commands: None,
+            test_commands_list: Vec::new(),
+            effective_test_commands: Vec::new(),
+        }
+    }
+
+    /// The path the WORKER is told to write to, read back out of the rendered prompt.
+    ///
+    /// Parsed from the text rather than recomputed: a test that recomputes the value is testing
+    /// the same expression twice, and would stay green if the template named a different one.
+    fn artifacts_dir_the_prompt_names(rendered: &str) -> PathBuf {
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("Artifacts path"))
+            .expect("the worker prompt must carry an `Artifacts path` line");
+        let (_, value) = line.split_once(':').expect("`<label>: <path>`");
+        PathBuf::from(value.trim())
+    }
+
+    /// THE end-to-end test. All six links, one directory.
+    #[test]
+    fn qa_the_worker_writes_where_every_reader_looks() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = committed_plan_store("qa-e2e-chain");
+        let run = run_for(plan.to_str().unwrap());
+        let phase = phase_for();
+        let phase_path = plan.join("phases/01-thing");
+
+        // ── 1. the prompt the agent is handed ─────────────────────────────────────────────────
+        let values =
+            phase_template_values(&state, &run, &phase, &phase_path, &phase_path.join("tasks"));
+        let rendered =
+            planner_prompts::render_template(planner_prompts::DEFAULT_DEVELOPMENT_WORKER, &values);
+        let told = artifacts_dir_the_prompt_names(&rendered);
+
+        // It is this RUN's directory, not the champion's shared one — the whole point.
+        assert!(
+            told.ends_with("phases/01-thing/artifacts/runs/RUN-e2e"),
+            "the worker was told to write to {}",
+            told.display()
+        );
+        assert!(told.starts_with(&plan), "{} escapes the plan store", told.display());
+
+        // ── 2. it exists before the agent reads the prompt ────────────────────────────────────
+        assert!(told.is_dir(), "{} was named but not created", told.display());
+
+        // ── 3. the worker writes there; the reader finds it ───────────────────────────────────
+        std::fs::write(told.join("seat-meter.html"), b"<html>delivered</html>").unwrap();
+        // Migrated to the TYPED reader (round 5 ruling): `resolve_phase_artifacts_dir`'s `None`
+        // now means any of five things, so a caller that wants "where is the evidence" must ask
+        // the reader that can answer.
+        let artifacts =
+            plan_artifacts::phase_artifacts_state(&plan, &phase.phase_id, Some(&run.plan.id));
+        assert!(!artifacts.is_fault(), "the store must be healthy here: {artifacts:?}");
+        let read_back = artifacts
+            .found()
+            .expect("the reader must resolve the directory the worker was told to use")
+            .to_path_buf();
+        assert_eq!(
+            read_back, told,
+            "the writer and the reader disagree about where this run's evidence lives"
+        );
+        assert_eq!(
+            std::fs::read(read_back.join("seat-meter.html")).unwrap(),
+            b"<html>delivered</html>"
+        );
+
+        // ── 4. the LIVE reviewer is pointed at the same directory ─────────────────────────────
+        let lens = ValidationLens {
+            name: "Product".into(),
+            provider: "claude_code".into(),
+            model: None,
+            prompt: None,
+            vision: false,
+            blocking: true,
+        };
+        let reviewer = lens_reviewer_prompt(&state, &run, &phase, &lens, "SESSION-1");
+        assert!(
+            reviewer.contains(&*told.to_string_lossy()),
+            "the {} lens reviewer was not told where the evidence is; prompt:\n{}",
+            lens.name,
+            reviewer
+        );
+
+        // ── 5. the coordinator treats it as worker output, not spec-weakening ─────────────────
+        let rel = told
+            .strip_prefix(&plan)
+            .unwrap()
+            .join("seat-meter.html")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(rel, "phases/01-thing/artifacts/runs/RUN-e2e/seat-meter.html");
+        assert!(
+            is_worker_writable_store_file(&rel),
+            "{rel} must classify as worker output, or rewriting its own evidence parks the phase"
+        );
+
+        // ── 6. the review gate's evidence walk reaches it ─────────────────────────────────────
+        // An image nobody describes must still be CAUGHT when it is run-scoped, or every
+        // competing run passes the evidence check by having no evidence the gate can see.
+        std::fs::write(told.join("mystery.png"), b"undescribed pixels").unwrap();
+        let reason = evidence_provenance_reason(&plan.to_string_lossy(), "01-thing")
+            .expect("a run-scoped image nobody describes must be caught by the gate");
+        assert!(
+            reason.contains("runs/RUN-e2e/mystery.png"),
+            "the gate named something else: {reason}"
+        );
+
+        // And once described, it passes — same as the flat layout.
+        std::fs::write(
+            plan.join("phases/01-thing/tasks/t1/decisions.md"),
+            "mystery.png — the seat meter at width 2.\nseat-meter.html — the delivered page.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_provenance_reason(&plan.to_string_lossy(), "01-thing"),
+            None,
+            "described run-scoped evidence must pass the gate"
+        );
+    }
+
+    /// The chain must not depend on the CHAMPION directory existing or being empty.
+    ///
+    /// A first-ever run of a phase has no champion artifacts at all; a later run has some. Both
+    /// must land in their own directory and be read back from it, because the emptiness rule
+    /// added in round 2 changes which directory the reader prefers.
+    #[test]
+    fn qa_the_chain_holds_whether_or_not_the_champion_has_artifacts() {
+        let (state, _root) = crate::test_support::test_state();
+
+        for champion_has_artifacts in [false, true] {
+            let plan = committed_plan_store("qa-e2e-champ");
+            if champion_has_artifacts {
+                std::fs::create_dir_all(plan.join("phases/01-thing/artifacts")).unwrap();
+                std::fs::write(
+                    plan.join("phases/01-thing/artifacts/old-champion.png"),
+                    b"previous winner",
+                )
+                .unwrap();
+            }
+            let run = run_for(plan.to_str().unwrap());
+            let phase = phase_for();
+            let phase_path = plan.join("phases/01-thing");
+            let values = phase_template_values(
+                &state,
+                &run,
+                &phase,
+                &phase_path,
+                &phase_path.join("tasks"),
+            );
+            let told = artifacts_dir_the_prompt_names(&planner_prompts::render_template(
+                planner_prompts::DEFAULT_DEVELOPMENT_WORKER,
+                &values,
+            ));
+            std::fs::write(told.join("mine.png"), b"this run").unwrap();
+
+            let artifacts =
+                plan_artifacts::phase_artifacts_state(&plan, &phase.phase_id, Some(&run.plan.id));
+            assert!(!artifacts.is_fault(), "{artifacts:?}");
+            let read_back = artifacts.found().expect("resolves").to_path_buf();
+            assert_eq!(
+                read_back, told,
+                "champion_has_artifacts={champion_has_artifacts}: writer and reader disagree"
+            );
+            assert!(read_back.join("mine.png").is_file());
+            // This run must NOT read the champion's file as its own.
+            assert!(
+                !read_back.join("old-champion.png").exists(),
+                "champion_has_artifacts={champion_has_artifacts}: this run read the champion's \
+                 evidence as its own"
+            );
+        }
+    }
+
+    /// Two runs of one phase, both wired end-to-end: the defect the branch exists to close,
+    /// measured through the real prompt rather than through the path builder.
+    #[test]
+    fn qa_two_runs_told_by_the_prompt_do_not_clobber_each_other() {
+        let (state, _root) = crate::test_support::test_state();
+        let plan = committed_plan_store("qa-e2e-two");
+        let phase = phase_for();
+        let phase_path = plan.join("phases/01-thing");
+
+        let mut told = Vec::new();
+        for run_id in ["RUN-a", "RUN-b"] {
+            let mut run = run_for(plan.to_str().unwrap());
+            run.plan.id = run_id.to_string();
+            let values = phase_template_values(
+                &state,
+                &run,
+                &phase,
+                &phase_path,
+                &phase_path.join("tasks"),
+            );
+            let dir = artifacts_dir_the_prompt_names(&planner_prompts::render_template(
+                planner_prompts::DEFAULT_DEVELOPMENT_WORKER,
+                &values,
+            ));
+            // Both runs deliver the SAME filename, which is the realistic arena case.
+            std::fs::write(dir.join("seat-meter.html"), run_id.as_bytes()).unwrap();
+            told.push(dir);
+        }
+
+        assert_ne!(told[0], told[1], "two runs were told to use one directory");
+        assert_eq!(std::fs::read(told[0].join("seat-meter.html")).unwrap(), b"RUN-a");
+        assert_eq!(std::fs::read(told[1].join("seat-meter.html")).unwrap(), b"RUN-b");
+        // And each run reads back its own.
+        for (i, run_id) in ["RUN-a", "RUN-b"].iter().enumerate() {
+            let artifacts = plan_artifacts::phase_artifacts_state(&plan, "01-thing", Some(run_id));
+            assert!(!artifacts.is_fault(), "{artifacts:?}");
+            let dir = artifacts.found().expect("resolves").to_path_buf();
+            assert_eq!(dir, told[i]);
+            assert_eq!(
+                std::fs::read(dir.join("seat-meter.html")).unwrap(),
+                run_id.as_bytes()
+            );
+        }
+    }
+}
+
+/// QA B round 4 — the review gate is a THIRD reader, and it does not go through the taxonomy.
+#[cfg(test)]
+mod qa_b_r4_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git must be available")
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    fn committed_store(tag: &str) -> PathBuf {
+        let dir = crate::test_support::tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("phases/01-shell/tasks/t1")).unwrap();
+        std::fs::write(dir.join("phases/01-shell/tasks/t1/prompt.md"), "# Task\n- x\n").unwrap();
+        std::fs::write(dir.join("overview.md"), "# Plan\n").unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.email", "qa@example.com"]);
+        git(&dir, &["config", "user.name", "qa"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    /// FINDING (scope, not a defect introduced by this branch). `is_fault()` cannot help the one
+    /// production reader of phase evidence that exists, because that reader does not use the
+    /// taxonomy at all.
+    ///
+    /// `evidence_provenance_reason` finds evidence by asking git for untracked files under
+    /// `phases/<id>/` — it never calls `phase_artifacts_state` or `resolve_phase_artifacts_dir`.
+    /// So when an artifacts directory cannot be read, the new `Unreadable` state is never
+    /// consulted and the gate simply sees no evidence: an undescribed screenshot that would have
+    /// been caught is silently not caught, and the phase passes the provenance check.
+    ///
+    /// What a reviewer should conclude: "one reader" is true of the two functions in
+    /// `plan_artifacts`, not of the host. The taxonomy is the right shape and the arena's reader
+    /// should use it — but the existing review gate still has the R2-3 failure mode, in the
+    /// opposite direction (a check that silently passes rather than a phase that looks empty),
+    /// and closing that means routing the gate through the taxonomy too. Out of scope for this
+    /// branch; in scope for whoever wires the arena's gate.
+    #[test]
+    fn qa_documents_the_review_gate_does_not_use_the_artifacts_taxonomy() {
+        let plan = committed_store("qa-r4-gate");
+        let art = plan.join("phases/01-shell/artifacts/runs/RUN-1");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("mystery.png"), b"undescribed pixels").unwrap();
+
+        // Readable: the gate catches the undescribed image.
+        let caught = evidence_provenance_reason(&plan.to_string_lossy(), "01-shell")
+            .expect("an undescribed image must be caught while the directory is readable");
+        assert!(caught.contains("mystery.png"), "{caught}");
+        // And the taxonomy agrees there is evidence there.
+        assert!(matches!(
+            plan_artifacts::phase_artifacts_state(&plan, "01-shell", Some("RUN-1")),
+            plan_artifacts::ArtifactsState::Found(_)
+        ));
+
+        // Now make that directory unlistable. The image is still on disk.
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&art).is_err() {
+            // The taxonomy says FAULT, loudly and actionably.
+            let state = plan_artifacts::phase_artifacts_state(&plan, "01-shell", Some("RUN-1"));
+            assert!(
+                state.is_fault(),
+                "the typed reader must call this a fault; got {state:?}"
+            );
+            // The GATE, which does not ask it, now reports no problem at all.
+            assert_eq!(
+                evidence_provenance_reason(&plan.to_string_lossy(), "01-shell"),
+                None,
+                "the gate passes the phase because it cannot see the evidence it would have \
+                 rejected — the fault the taxonomy identified never reaches it"
+            );
+        }
+        std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Restored: the gate catches it again, so nothing about the store changed.
+        assert!(evidence_provenance_reason(&plan.to_string_lossy(), "01-shell").is_some());
     }
 }
