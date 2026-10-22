@@ -26,6 +26,17 @@ pub struct Session {
     /// offers "Detach" instead of "Close", and archive won't kill the tmux).
     #[serde(default)]
     pub attached_tmux: bool,
+    /// The terminal's REAL state as the host reports it: `none` | `attached` |
+    /// `detached` | `ended`. NOT the `attached_tmux` intent flag above — see
+    /// `services::sessions::reported_terminal_status`, which owns the decision.
+    /// Defaults to `"none"` so a raw row that never consulted tmux cannot claim
+    /// a terminal exists.
+    #[serde(default = "default_terminal_status")]
+    pub terminal_status: String,
+}
+
+fn default_terminal_status() -> String {
+    "none".to_string()
 }
 
 fn default_session_kind() -> String {

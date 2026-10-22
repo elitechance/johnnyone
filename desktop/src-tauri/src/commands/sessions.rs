@@ -1,5 +1,5 @@
-use crate::db::models::{CreateSessionInput, Session};
-use crate::services::sessions as session_service;
+use crate::db::models::CreateSessionInput;
+use crate::services::sessions::{self as session_service, Session};
 use crate::state::app_state::AppState;
 use tauri::State;
 
