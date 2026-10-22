@@ -60,12 +60,24 @@ describe('terminal.page.html — the arena is added, nothing is replaced', () =>
     // rule here fails the build. Every arena style lives in the new components' own inline sheets.
     // The byte count is the SOURCE file; the budget applies to the compiled output.
     //
-    // 74503 -> 74450 in the nav-seam round, and the direction is the point: the status bar's look
-    // LEFT this file for WorkspaceStatusbarComponent, which every workspace surface now renders so
-    // the chrome stops vanishing across the console/arena switch. Nothing was added, and the
-    // compiled sheet went from 47.85 kB to 47.52 kB. The pin is exact on purpose: this file cannot
-    // afford a rule.
-    expect(statSync(SCSS_PATH).size).toBe(74450);
+    // This used to PIN the exact size (74503, then 74450 after the status bar's look LEFT this file
+    // for WorkspaceStatusbarComponent, which every workspace surface now renders so the chrome stops
+    // vanishing across the console/arena switch). An exact equality cannot tell the two directions
+    // apart: it reports deleting dead rule blocks — a good thing, and what the last round did,
+    // cutting 34 blocks and ~8.7 kB — as a failure. So it is a BUDGET now: an upper bound.
+    //
+    // SCSS_BUDGET_BYTES is that bound. Today the file measures 65776 bytes, and the compiled sheet
+    // has historically tracked the source at roughly 0.64x (74450 -> 47.52 kB), so a 68000-byte
+    // source ceiling still maps to ~43.5 kB compiled — comfortably inside the 48 kB error budget,
+    // yet only ~2.2 kB above the measured size. That asymmetry is the whole point: it leaves honest
+    // room to keep deleting dead rules (a shrink is never a regression) while a few kB of new rules
+    // — the only thing this file genuinely cannot afford — trips it.
+    const SCSS_BUDGET_BYTES = 68000;
+    expect(
+      statSync(SCSS_PATH).size,
+      `terminal.page.scss is ${statSync(SCSS_PATH).size} bytes, over its ${SCSS_BUDGET_BYTES}-byte budget — ` +
+        'put new rules in the component that owns them, not here',
+    ).toBeLessThanOrEqual(SCSS_BUDGET_BYTES);
     expect(readFileSync(SCSS_PATH, 'utf8')).not.toContain('arena');
   });
 });
