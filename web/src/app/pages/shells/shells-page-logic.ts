@@ -63,6 +63,35 @@ export function shellSessionLabel(
 }
 
 /**
+ * What a shell row's terminal ACTUALLY is right now. `attachedTmux` alone cannot answer this — it is
+ * an INTENT flag ("this session is the kind that attaches to a tmux"), so a row keeps reading
+ * "attached tmux" after its pane has died (measured: `kloo-cli` was listed as attached while tmux
+ * reported only `j1`, `kloo`, `kord`, and three keystrokes typed into that pane vanished into a
+ * four-day-old snapshot). The host's LIVE `terminalStatus` is the truth; this folds the two into one
+ * decision so the template never has to weigh them itself.
+ */
+export type ShellRowState = 'attached' | 'detached' | 'ended' | 'shell';
+
+/**
+ * The row's state, from the intent plus the live status:
+ *  - not an attached-tmux session    → `'shell'` (a plain shell has no external pane to lose)
+ *  - `terminalStatus === 'ended'`    → `'ended'` (the terminal is gone; do not invite the user in)
+ *  - `terminalStatus === 'detached'` → `'detached'` (the pane exists; we are just not looking at it)
+ *  - `'attached'`, MISSING or unrecognised → `'attached'`
+ *
+ * The missing/unrecognised fallback is deliberate: an older host that never sends `terminalStatus`
+ * must keep behaving exactly as it does today, so absence is never read as a death.
+ */
+export function shellRowState(
+  s: Pick<AiSession, 'attachedTmux' | 'terminalStatus'>,
+): ShellRowState {
+  if (s.attachedTmux !== true) return 'shell';
+  if (s.terminalStatus === 'ended') return 'ended';
+  if (s.terminalStatus === 'detached') return 'detached';
+  return 'attached';
+}
+
+/**
  * Coarse relative time from two ISO strings. `nowIso` is a PARAMETER (no `Date.now()` inside) so the
  * unit test is deterministic — the component supplies the real "now". Invalid/empty input → `''`.
  *   < 60s → 'just now' · < 60m → 'Nm ago' · < 24h → 'Nh ago' · else 'Nd ago'

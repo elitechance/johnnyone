@@ -414,7 +414,7 @@ export class JohnnyApiService {
   private readonly sessionFields = `
     id title provider model workingDirectory status
     totalInputTokens totalOutputTokens totalCostCents
-    createdAt updatedAt attachedTmux
+    createdAt updatedAt attachedTmux terminalStatus
   `;
   private readonly agentPlanRunFields = `
     plan {

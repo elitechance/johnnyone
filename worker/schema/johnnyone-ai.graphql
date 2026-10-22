@@ -40,6 +40,10 @@ type AiSession {
   updatedAt: String!
   # True when this session attaches to an external tmux session (UI shows Detach).
   attachedTmux: Boolean!
+  # The LIVE terminal state reported by the host: 'none' | 'attached' | 'detached' | 'ended'.
+  # Unlike `attachedTmux` (an INTENT flag — "this session is the kind that attaches to a tmux"),
+  # this says whether the terminal actually exists right now; 'ended' means the pane is gone.
+  terminalStatus: String
 }
 
 type AiMessage {
