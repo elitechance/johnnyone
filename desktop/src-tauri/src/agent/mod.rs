@@ -3008,6 +3008,7 @@ impl AgentService {
             created_at: session.created_at,
             updated_at: session.updated_at,
             attached_tmux: session.attached_tmux,
+            terminal_status: session.terminal_status,
         }
     }
 
@@ -4838,5 +4839,65 @@ mod arena_exec_rpc_tests {
             Some(7),
             "and the arm must SCORE the run, not merely answer — the row carries the gate"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_view_tests {
+    //! `session_view` is the FIFTH hop: it builds the `RpcSessionView` that the
+    //! `list_sessions` RPC serialises, which the worker's `listAiSessions`
+    //! forwards verbatim. A field the DB row has, the service computes and the
+    //! GraphQL types declare still reads `null` on the client if THIS mapper
+    //! drops it — so pin both the carry and the camelCase wire key here.
+
+    use super::AgentService;
+
+    fn session_with_terminal_status(status: &str) -> crate::db::models::Session {
+        crate::db::models::Session {
+            id: "s-1".into(),
+            title: "a shell".into(),
+            provider: "shell".into(),
+            model: "".into(),
+            working_directory: "/tmp".into(),
+            status: "active".into(),
+            cli_session_id: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_cents: 0,
+            kind: "user".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+            attached_tmux: true,
+            terminal_status: status.into(),
+        }
+    }
+
+    #[test]
+    fn session_view_carries_terminal_status() {
+        let view = AgentService::session_view(session_with_terminal_status("ended"));
+        assert_eq!(
+            view.terminal_status, "ended",
+            "the RPC view must carry the terminal's live state, not drop it"
+        );
+        // The relay hands the worker JSON, so the WIRE key is what the client
+        // actually reads: `rename_all = "camelCase"` must land it as
+        // `terminalStatus`, and it must be a string (never null).
+        let json = serde_json::to_value(&view).expect("the view serialises");
+        assert_eq!(
+            json.get("terminalStatus").and_then(|v| v.as_str()),
+            Some("ended"),
+            "serialised RPC JSON must carry terminalStatus: {json}"
+        );
+    }
+
+    #[test]
+    fn session_view_carries_each_live_state_and_keeps_the_intent_flag_apart() {
+        for state in ["none", "attached", "detached", "ended"] {
+            let view = AgentService::session_view(session_with_terminal_status(state));
+            assert_eq!(view.terminal_status, state);
+            // Asked to attach (`attached_tmux: true`) yet reporting `none` /
+            // `ended` — neither field may stand in for the other.
+            assert!(view.attached_tmux);
+        }
     }
 }

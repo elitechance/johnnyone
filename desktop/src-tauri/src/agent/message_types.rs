@@ -381,6 +381,14 @@ pub struct RpcSessionView {
     pub created_at: String,
     pub updated_at: String,
     pub attached_tmux: bool,
+    /// The terminal's LIVE state as the host reports it: `none` | `attached` |
+    /// `detached` | `ended`. NOT the `attached_tmux` intent flag above — that
+    /// only records whether the session was ASKED to attach; this is what tmux
+    /// actually says right now (`services::sessions::reported_terminal_status`
+    /// owns the decision). Serialises as `terminalStatus` via the struct's
+    /// `rename_all = "camelCase"`, so the relay's `list_sessions` RPC JSON — and
+    /// the worker's `listAiSessions` which forwards it verbatim — carry it.
+    pub terminal_status: String,
 }
 
 /// Message view for RPC responses (camelCase for GraphQL compatibility).
