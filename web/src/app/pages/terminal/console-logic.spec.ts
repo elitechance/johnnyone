@@ -7,6 +7,7 @@ import {
   defaultLenses,
   consolePaneFor,
   CONSOLE_SEGMENTS,
+  consolePaneState,
   modeChip,
 } from './console-logic';
 
@@ -177,5 +178,63 @@ describe('modeChip', () => {
     expect(modeChip(null)).toBeNull();
     expect(modeChip('{"mode":"commercial"}')).toBeNull();
     expect(modeChip('')).toBeNull();
+  });
+});
+
+describe('consolePaneState', () => {
+  // The defect this pins: `/initiatives` rendered "No initiatives yet" (+ a New initiative button)
+  // for the ~2 s `listAgentPlans` was in flight, and again when the call FAILED, because
+  // `loadInitiatives()` started from an empty list and its `catch` set an empty list too. So the two
+  // assertions marked NOT-empty below ARE the bug; the ordering rules are what keep it fixed.
+
+  it('is loading while the list is in flight', () => {
+    expect(consolePaneState({ loading: true, failed: false, rowCount: 0, hasSelection: false })).toBe('loading');
+    expect(consolePaneState({ loading: true, failed: false, rowCount: 33, hasSelection: true })).toBe('loading');
+  });
+
+  it('is failed once the load has settled on an error', () => {
+    expect(consolePaneState({ loading: false, failed: true, rowCount: 0, hasSelection: false })).toBe('failed');
+    expect(consolePaneState({ loading: false, failed: true, rowCount: 33, hasSelection: true })).toBe('failed');
+  });
+
+  it('is empty only when a SUCCESSFUL load returned no rows', () => {
+    expect(consolePaneState({ loading: false, failed: false, rowCount: 0, hasSelection: false })).toBe('empty');
+    expect(consolePaneState({ loading: false, failed: false, rowCount: 0, hasSelection: true })).toBe('empty');
+  });
+
+  it('is unselected with rows but nothing picked', () => {
+    expect(consolePaneState({ loading: false, failed: false, rowCount: 33, hasSelection: false })).toBe('unselected');
+  });
+
+  it('is console with rows and a selection', () => {
+    expect(consolePaneState({ loading: false, failed: false, rowCount: 33, hasSelection: true })).toBe('console');
+  });
+
+  it('THE DEFECT: a load in flight with zero rows is NOT empty', () => {
+    expect(consolePaneState({ loading: true, failed: false, rowCount: 0, hasSelection: false })).not.toBe('empty');
+    expect(consolePaneState({ loading: true, failed: false, rowCount: 0, hasSelection: false })).toBe('loading');
+  });
+
+  it('THE DEFECT: a failed load with zero rows is NOT empty', () => {
+    expect(consolePaneState({ loading: false, failed: true, rowCount: 0, hasSelection: false })).not.toBe('empty');
+    expect(consolePaneState({ loading: false, failed: true, rowCount: 0, hasSelection: false })).toBe('failed');
+  });
+
+  it('loading beats failed: a retry in flight is not a failure', () => {
+    expect(consolePaneState({ loading: true, failed: true, rowCount: 0, hasSelection: false })).toBe('loading');
+    expect(consolePaneState({ loading: true, failed: true, rowCount: 33, hasSelection: true })).toBe('loading');
+  });
+
+  it('loading and failed both beat empty / unselected / console', () => {
+    for (const rowCount of [0, 5]) {
+      for (const hasSelection of [false, true]) {
+        expect(consolePaneState({ loading: true, failed: false, rowCount, hasSelection })).toBe('loading');
+        expect(consolePaneState({ loading: false, failed: true, rowCount, hasSelection })).toBe('failed');
+      }
+    }
+  });
+
+  it('treats a negative rowCount as no rows', () => {
+    expect(consolePaneState({ loading: false, failed: false, rowCount: -1, hasSelection: true })).toBe('empty');
   });
 });

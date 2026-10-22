@@ -129,6 +129,7 @@ import {
   lensSummary,
   lensSource,
   consolePaneFor,
+  consolePaneState,
   CONSOLE_SEGMENTS,
   InitiativeRow,
   LensChip,
@@ -136,6 +137,7 @@ import {
   LensSource,
   modeChip,
 } from './console-logic';
+import type { ConsolePaneState } from './console-logic';
 import { initiativeTimeline, windowTimeline, TimelineEvent } from './initiative-events-logic';
 import {
   resolvePrimarySessionId,
@@ -490,8 +492,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // The Work console wraps this page's existing pane shell in a master-detail grid. All row/summary/
   // file/segment decisions delegate to the pure `console-logic.ts` (D3/D6/D7/D8); the primitives are the
   // P2 `johnny-status-pill`/`johnny-lifecycle-bar`. No transcript/diff/pane-shell code is forked.
-  /** Initiatives from `listAgentPlans` (best-effort; empty when none/unauthorized). */
+  /** Initiatives from `listAgentPlans` (best-effort; the last good rows survive a failed reload). */
   protected readonly agentPlans = signal<AgentPlan[]>([]);
+  /**
+   * The load's own status — ONE signal, not a `loading`/`failed` boolean pair that could be both at
+   * once. `'loading'` before the request, `'ready'` on success, `'failed'` in the `catch`, and
+   * `initiativeListError` keeps whatever the failure was so the view can say something true.
+   */
+  protected readonly initiativeListStatus = signal<'loading' | 'ready' | 'failed'>('loading');
+  /** The surface that failed (`listAgentPlans`), NOT the exception text — see `retryInitiatives()`. */
+  protected readonly initiativeListError = signal<string | null>(null);
   /** The selected initiative id (drives the center lifecycle bar + right validation column). */
   protected readonly selectedInitiativeId = signal<string | null>(null);
   /** The `surface` query param (P4): `'shell'` opens the plain terminal surface (no initiative chrome).
@@ -507,6 +517,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly consoleRows = computed<InitiativeRow[]>(() =>
     initiativeRows(this.agentPlans(), this.selectedInitiativeId(), this.consoleNow()),
   );
+  /**
+   * Which of the five console states the surface is in (pure `consolePaneState` — the ordering that
+   * keeps a load in flight, or a failed one, from claiming "No initiatives yet").
+   */
+  protected readonly consoleState = computed<ConsolePaneState>(() =>
+    consolePaneState({
+      loading: this.initiativeListStatus() === 'loading',
+      failed: this.initiativeListStatus() === 'failed',
+      rowCount: this.consoleRows().length,
+      hasSelection: !!this.selectedInitiative(),
+    }),
+  );
+  /** Retry affordance for the `failed` state: re-runs the loader (which flips back to `loading`). */
+  protected retryInitiatives(): void {
+    void this.loadInitiatives();
+  }
   /** The selected initiative record (for the lifecycle bar + validation config). */
   // C1: resolve the selection by plan-run `id` OR group `initiativeId` so a `?initiativeId=<id>`
   // deep-link renders the terminal instead of stranding on the empty state (console-selection-logic).
@@ -3162,16 +3188,25 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
    * the plain pane shell. `consoleNow` is stamped once here so `formatRelTime` stays deterministic.
    */
   private async loadInitiatives(): Promise<void> {
+    // Announce the load BEFORE the request: `consolePaneState` gives `loading` precedence over both
+    // `failed` (a retry in flight is not a failure) and `empty`, so the console says "Loading" from
+    // the first paint instead of the empty copy for the ~2 s the call takes.
+    this.initiativeListStatus.set('loading');
+    this.initiativeListError.set(null);
     try {
       const plans = await firstValueFrom(this.api.listAgentPlans());
       this.consoleNow.set(new Date().toISOString());
       this.agentPlans.set(plans ?? []);
+      this.initiativeListStatus.set('ready');
       // Default the selection to the first initiative so the header/right column have context.
       if (!this.selectedInitiativeId() && plans && plans.length > 0) {
         this.selectedInitiativeId.set(plans[0].id);
       }
     } catch {
-      this.agentPlans.set([]);
+      // A failure is NOT "no initiatives": keep whatever the last good list was and record that the
+      // load failed, so the view can offer Retry instead of inviting a duplicate initiative.
+      this.initiativeListError.set('listAgentPlans');
+      this.initiativeListStatus.set('failed');
     }
   }
 

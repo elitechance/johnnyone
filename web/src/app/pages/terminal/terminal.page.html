@@ -34,7 +34,24 @@
           </div>
         </div>
       } @empty {
-        <div class="pane-empty">No initiatives yet.</div>
+        <!-- The list's own empty block used to be the ONLY thing this could say, so it said it while
+             the list was still loading and again when `listAgentPlans` failed. Branch on the pure
+             `consolePaneState` projection (`consoleState()`) instead — 'loading' / 'failed' / 'empty'
+             are three different screens, and only 'empty' may invite a new initiative here. -->
+        @switch (consoleState()) {
+          @case ('loading') {
+            <div class="pane-empty">Loading initiatives…</div>
+          }
+          @case ('failed') {
+            <div class="pane-empty">Could not load the initiatives list.</div>
+            <div class="pane-empty">
+              <button type="button" class="ia" (click)="retryInitiatives()">Retry</button>
+            </div>
+          }
+          @default {
+            <div class="pane-empty">No initiatives yet.</div>
+          }
+        }
       }
     </div>
   </aside>
@@ -823,15 +840,33 @@
       <!-- No initiative selected. Standalone terminals/shells live on /shells now, so the console
            does NOT surface floating session panes here — an active shell must not make an empty
            initiative list render a terminal. Show an initiative-oriented empty state instead. -->
+      <!-- One screen used to stand for three situations: `loadInitiatives()` started empty and its
+           `catch` set empty too, so this rendered "No initiatives yet" + New initiative for the ~2 s
+           the list was in flight AND when the call failed. It now renders the four non-console states
+           of the pure `consolePaneState` (`consoleState()`), each telling the truth, and offers
+           "New initiative" only where creating one is actually the right move. -->
       <section class="workspace-empty">
-        @if (consoleRows().length === 0) {
-          <div class="empty-title">No initiatives yet</div>
-          <div class="empty-copy">Create an initiative to start briefing, planning, and development.</div>
-        } @else {
-          <div class="empty-title">No initiative selected</div>
-          <div class="empty-copy">Pick an initiative from the list, or create a new one.</div>
+        @switch (consoleState()) {
+          @case ('loading') {
+            <div class="empty-title">Loading initiatives…</div>
+            <div class="empty-copy">Fetching your initiatives from the engine.</div>
+          }
+          @case ('failed') {
+            <div class="empty-title">Could not load the initiatives list</div>
+            <div class="empty-copy">The initiatives surface could not reach the engine. Try again.</div>
+            <button class="primary-action" (click)="retryInitiatives()">Retry</button>
+          }
+          @case ('empty') {
+            <div class="empty-title">No initiatives yet</div>
+            <div class="empty-copy">Create an initiative to start briefing, planning, and development.</div>
+            <button class="primary-action" (click)="newInitiative()">New initiative</button>
+          }
+          @default {
+            <div class="empty-title">No initiative selected</div>
+            <div class="empty-copy">Pick an initiative from the list, or create a new one.</div>
+            <button class="primary-action" (click)="newInitiative()">New initiative</button>
+          }
         }
-        <button class="primary-action" (click)="newInitiative()">New initiative</button>
       </section>
     }
     }

@@ -150,3 +150,31 @@ export function consolePaneFor(segment: string | null | undefined): ConsoleSegme
     ? (segment as ConsoleSegment)
     : 'console';
 }
+
+/**
+ * What the console surface may honestly show. One screen used to stand for three situations:
+ * `loadInitiatives()` started from an empty list and its `catch` set an empty list too, so
+ * `/initiatives` rendered "No initiatives yet" (plus a New initiative button) for the ~2 s the
+ * `listAgentPlans` call was in flight, and AGAIN when that call FAILED — inviting the user to create
+ * an initiative they already had 33 of.
+ */
+export type ConsolePaneState = 'loading' | 'failed' | 'empty' | 'unselected' | 'console';
+
+/**
+ * Decide which of those states the console is in. The ORDER is the entire point of the change:
+ * `loading` beats `failed` (a retry in flight is not a failure), and both beat `empty` — zero rows
+ * while the list is still arriving, or after the call blew up, is not "you have no initiatives".
+ * Only once the load has settled successfully do zero rows mean `empty`; rows with nothing selected
+ * mean `unselected` rather than the center pane.
+ */
+export function consolePaneState(input: {
+  loading: boolean;
+  failed: boolean;
+  rowCount: number;
+  hasSelection: boolean;
+}): ConsolePaneState {
+  if (input.loading) return 'loading';
+  if (input.failed) return 'failed';
+  if (input.rowCount <= 0) return 'empty';
+  return input.hasSelection ? 'console' : 'unselected';
+}
