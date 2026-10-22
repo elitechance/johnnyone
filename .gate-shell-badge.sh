@@ -60,4 +60,15 @@ printf '%s\n' "$out2" | grep -q 'Tests .*failed' || {
 echo "killed the mutation (every row reads 'attached'):"
 printf '%s\n' "$out2" | grep -E '^ *×' | head -5
 
-echo "GATE OK — the badge follows the terminal's real state and an ended shell says so"
+# 5. The ANGULAR BUILD must pass. vitest does not typecheck a template: the first
+#    attempt shipped a template calling shellRowState() that the component never
+#    exposed, and only `nx build web` saw it — after the deploy had started.
+cp "$BAK" "$LOGIC"
+build=$(npx nx build web --skip-nx-cache 2>&1)
+if printf '%s\n' "$build" | grep -qE 'ERROR|error TS|NG[0-9]+:'; then
+  echo "--- build errors ---"
+  printf '%s\n' "$build" | grep -E 'ERROR|error TS|NG[0-9]+:' | sed 's/\x1b\[[0-9;]*m//g' | sort -u | head -10
+  fail "the Angular build does not compile the template"
+fi
+
+echo "GATE OK — the badge follows the terminal's real state, an ended shell says so, and it COMPILES"

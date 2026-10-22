@@ -25,6 +25,7 @@ import {
   partitionShells,
   attachableTmux,
   shellSessionLabel,
+  shellRowState,
   formatRelTime,
   openIntent,
   clearTargetIds,
@@ -92,6 +93,7 @@ export class ShellsPage implements OnInit {
 
   // Expose the pure helpers to the template.
   protected readonly shellSessionLabel = shellSessionLabel;
+  protected readonly shellRowState = shellRowState;
   protected readonly formatRelTime = formatRelTime;
 
   constructor() {
