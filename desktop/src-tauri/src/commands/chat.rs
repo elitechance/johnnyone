@@ -1,6 +1,7 @@
 use crate::db::models::Message;
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, grok, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
+    StreamChunk,
 };
 use crate::services::{chat_host as chat_host_service, sessions as session_service};
 use crate::state::app_state::AppState;
@@ -101,6 +102,12 @@ pub async fn send_chat_message(
         }
         CliProvider::Shell => unreachable!("shell provider already rejected"),
         CliProvider::Kloo => unreachable!("kloo provider already rejected"),
+        // lokalai is a real chat provider: it answers questions over HTTP via
+        // curl, so it does real work here rather than being rejected.
+        CliProvider::Lokalai => {
+            let (endpoint, api_key) = lokalai::resolve_endpoint_and_key(&state).unwrap_or_default();
+            lokalai::build_config(&content, &working_dir, &model, &endpoint, &api_key)
+        }
     };
 
     // 5. Select the parser for this provider
@@ -112,6 +119,7 @@ pub async fn send_chat_message(
         CliProvider::Ollama => ollama_cli::parse_line,
         CliProvider::Shell => unreachable!("shell provider already rejected"),
         CliProvider::Kloo => unreachable!("kloo provider already rejected"),
+        CliProvider::Lokalai => lokalai::parse_line,
     };
 
     // 6. Spawn CLI subprocess
