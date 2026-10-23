@@ -182,7 +182,7 @@ pub struct SpawnRequest {
     pub task_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnResult {
     pub started: bool,
     pub exit_code: Option<i32>,
@@ -481,14 +481,39 @@ pub fn parse_tokens_json(raw: &str) -> Result<TokensReport, TokensError> {
     })
 }
 
-pub fn execute_budget_ms(n: usize) -> u64 {
-    let waves = n.div_ceil(4) as u64;
+/// Number of waves `run_waves` produces for jobs in these directories: jobs are
+/// packed greedily so that no two jobs sharing a working directory share a wave
+/// (no two verifies may run at once in the same directory). Eight jobs in one
+/// directory at width 4 are 8 waves, not 2; eight distinct directories at width
+/// 4 are 2 waves.
+pub fn wave_count(cwds: &[String], width: usize) -> usize {
+    let width = width.max(1);
+    let mut waves = 0usize;
+    let mut remaining: Vec<&String> = cwds.iter().collect();
+    while !remaining.is_empty() {
+        waves += 1;
+        let mut taken: Vec<&String> = Vec::with_capacity(width);
+        let mut rest: Vec<&String> = Vec::with_capacity(remaining.len());
+        for cwd in remaining.into_iter() {
+            if taken.len() < width && !taken.iter().any(|seen| *seen == cwd) {
+                taken.push(cwd);
+            } else {
+                rest.push(cwd);
+            }
+        }
+        remaining = rest;
+    }
+    waves
+}
+
+pub fn execute_budget_ms(cwds: &[String]) -> u64 {
+    let waves = wave_count(cwds, 4) as u64;
     (waves * VERIFY_TASK_TIMEOUT_MS + 5_000).min(600_000)
 }
 
-pub fn warm_budget_ms(n_pairs: usize) -> u64 {
-    let n = n_pairs.min(MAX_WARM_PAIRS);
-    let waves = n.div_ceil(4) as u64;
+pub fn warm_budget_ms(cwds: &[String]) -> u64 {
+    let n = cwds.len().min(MAX_WARM_PAIRS);
+    let waves = wave_count(&cwds[..n], 4) as u64;
     (waves * WARM_TIMEOUT_MS + 5_000).min(245_000)
 }
 
@@ -1132,12 +1157,20 @@ fn execute_phase(
     pair_keys.sort_by(|a, b| a.id.cmp(&b.id).then(a.cwd.cmp(&b.cwd)));
 
     let warm_n = pair_keys.len().min(MAX_WARM_PAIRS);
-    let w_budget = opts.warm_budget_ms.unwrap_or(warm_budget_ms(pair_keys.len()));
+    let warm_cwds: Vec<String> = pair_keys
+        .iter()
+        .map(|p| p.cwd.to_string_lossy().into_owned())
+        .collect();
+    let w_budget = opts
+        .warm_budget_ms
+        .unwrap_or_else(|| warm_budget_ms(&warm_cwds));
     let warm_started = Instant::now();
     let mut failed_pairs: HashSet<(String, String)> = HashSet::new();
     if warm_n > 0 {
         let to_warm: Vec<WarmPair> = pair_keys.iter().take(warm_n).cloned().collect();
-        let results = run_waves(&to_warm, 4, w_budget, |pair, started| {
+        let results = run_waves(&to_warm, 4, w_budget, |pair: &WarmPair| {
+            pair.cwd.to_string_lossy().into_owned()
+        }, |pair, started| {
             if !started {
                 return SpawnResult::never_started();
             }
@@ -1176,9 +1209,13 @@ fn execute_phase(
     }
     report.warm_ms = report.warm_ms.saturating_add(warm_started.elapsed().as_millis() as u64);
 
+    let exec_cwds: Vec<String> = eligible
+        .iter()
+        .map(|j| j.cwd.to_string_lossy().into_owned())
+        .collect();
     let e_budget = opts
         .execute_budget_ms
-        .unwrap_or(execute_budget_ms(eligible.len()));
+        .unwrap_or_else(|| execute_budget_ms(&exec_cwds));
     let exec_started = Instant::now();
     let to_run: Vec<EligibleJob> = eligible
         .iter()
@@ -1193,7 +1230,9 @@ fn execute_phase(
     // Warm-failed pairs already have verify_not_runnable. They are not
     // n_eligible (same as deferred): do not book them as executed.
 
-    let results = run_waves(&to_run, 4, e_budget, |job, started| {
+    let results = run_waves(&to_run, 4, e_budget, |job: &EligibleJob| {
+        job.cwd.to_string_lossy().into_owned()
+    }, |job, started| {
         if !started {
             return SpawnResult::never_started();
         }
@@ -1234,29 +1273,58 @@ fn execute_phase(
     report.verify_ms = report.verify_ms.saturating_add(exec_started.elapsed().as_millis() as u64);
 }
 
-fn run_waves<T: Clone + Send, F>(
+/// Run `jobs` in concurrent waves of at most `width`, where **no two jobs in a
+/// wave share a working directory** — no two verifies may run at the same time
+/// in the same directory (an Angular build wipes and rewrites `www/`, so
+/// concurrent builds in one directory delete each other's output, and a build
+/// that loses the race can leave output the next task's verify reads as a pass).
+///
+/// Each wave is packed greedily: walk the remaining jobs in order and take a
+/// job into the current wave only while the wave is under `width` AND no job
+/// already in it has the same `cwd_of`. Jobs in different directories still
+/// run `width`-wide, so the invariant costs no throughput where there is no
+/// conflict; a directory holding `n` jobs serialises them into `n` waves.
+/// Every job is run exactly once — packing never drops or duplicates one.
+pub fn run_waves<T: Clone + Send, F, K>(
     jobs: &[T],
     width: usize,
     budget_ms: u64,
+    cwd_of: K,
     work: F,
 ) -> Vec<(T, SpawnResult)>
 where
     F: Fn(&T, bool) -> SpawnResult + Sync,
+    K: Fn(&T) -> String + Sync,
 {
     let start = Instant::now();
     let width = width.max(1);
     let mut out = Vec::with_capacity(jobs.len());
-    let mut i = 0;
-    while i < jobs.len() {
+    let mut remaining: Vec<T> = jobs.to_vec();
+    while !remaining.is_empty() {
         if start.elapsed().as_millis() as u64 >= budget_ms {
-            for job in &jobs[i..] {
+            for job in &remaining {
                 out.push((job.clone(), SpawnResult::never_started()));
             }
             break;
         }
-        let end = (i + width).min(jobs.len());
-        // Concurrent 4-wide wave. Hosts that assert in-flight track spawn entry.
-        let batch: Vec<T> = jobs[i..end].to_vec();
+        // Greedy packing: under `width`, and no directory already in this wave.
+        let mut batch: Vec<T> = Vec::with_capacity(width);
+        let mut cwds: Vec<String> = Vec::with_capacity(width);
+        let mut rest: Vec<T> = Vec::with_capacity(remaining.len());
+        for job in remaining.into_iter() {
+            if batch.len() < width {
+                let cwd = cwd_of(&job);
+                if !cwds.iter().any(|seen| *seen == cwd) {
+                    cwds.push(cwd);
+                    batch.push(job);
+                    continue;
+                }
+            }
+            rest.push(job);
+        }
+        remaining = rest;
+        // Concurrent wave, one job per directory. Hosts that assert in-flight
+        // track spawn entry.
         let handles: Vec<(T, SpawnResult)> = std::thread::scope(|scope| {
             let mut joins = Vec::new();
             for job in &batch {
@@ -1269,7 +1337,6 @@ where
             joins.into_iter().map(|j| j.join().unwrap()).collect()
         });
         out.extend(handles);
-        i = end;
     }
     out
 }
@@ -3140,7 +3207,7 @@ mod tests {
         assert_eq!(report.verify_executed, 150);
         assert_eq!(report.verify_skipped, 0);
         assert!(report.passed, "{:?}", report.items);
-        assert!(report.verify_ms <= execute_budget_ms(150) + 5_000);
+        assert!(report.verify_ms <= execute_budget_ms(&vec!["x".to_string(); 150]) + 5_000);
         let tasks = host.tasks.lock().unwrap();
         assert_eq!(tasks.len(), 150);
         let expected = check_verify("cargo test a -- --exact").unwrap();
