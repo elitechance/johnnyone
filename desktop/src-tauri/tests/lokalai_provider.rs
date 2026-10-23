@@ -115,3 +115,123 @@ fn t7_lokalai_is_a_chat_provider_not_a_oneshot_executor() {
         "lokalai speaks HTTP; it stays a subprocess like every other provider"
     );
 }
+
+/// t8 — the one that matters, and the one t2 cannot cover.
+///
+/// t2 is an ABSENCE assertion: "the key is not in the argv". A request that
+/// carries no key at all satisfies it perfectly. The first implementation of
+/// this provider passed t2 and every other test here while putting
+/// `header = "Authorization: Bearer %{env:LOKALAI_API_KEY}"` in curl's config
+/// file — and curl does NOT expand `%{env:…}` there. Measured on curl 8.18.0:
+/// the header goes out as the literal text `Bearer %{env:LOKALAI_API_KEY}`,
+/// so every lokalai call would have 401'd with a green suite.
+///
+/// So this test runs the real curl against a real socket and reads what
+/// actually arrives. The working form is `variable = %NAME` plus
+/// `expand-header = "… {{NAME}}"`.
+#[test]
+fn t8_the_key_actually_arrives_in_the_authorization_header() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    const KEY: &str = "sk-lokalai-ARRIVES-INTACT";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a throwaway port");
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("curl must connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let cfg = lokalai::build_config(
+        "review this",
+        "/tmp",
+        "glm",
+        &format!("http://127.0.0.1:{port}/v1"),
+        KEY,
+    );
+
+    let mut cmd = std::process::Command::new(&cfg.command);
+    cmd.args(&cfg.args).current_dir(&cfg.working_directory);
+    for (name, value) in &cfg.env_vars {
+        cmd.env(name, value);
+    }
+    let _ = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let request = server.join().expect("the server thread must not panic");
+
+    assert!(
+        request.contains(&format!("Bearer {KEY}")),
+        "the Authorization header did not carry the key. What arrived:\n{request}"
+    );
+    assert!(
+        !request.contains("%{env:"),
+        "curl sent an UNEXPANDED %{{env:…}} placeholder — it does not expand those \
+         in a config file. Use `variable = %NAME` + `expand-header`. Request:\n{request}"
+    );
+    assert!(
+        !request.contains("{{"),
+        "an unexpanded {{{{…}}}} template reached the wire. Request:\n{request}"
+    );
+}
+
+/// t9 — building a request must not leave anything behind.
+///
+/// The first implementation wrote a mode-0600 curl config file per request and
+/// never deleted it. Twenty of them were sitting in the temp directory after a
+/// single afternoon of test runs; a long-running host leaks one per chat turn.
+///
+/// The config file is not needed at all. Neither of the two lines it carried
+/// holds a secret — `variable = %NAME` names an environment variable and
+/// `expand-header` is a template — so both belong in argv, where curl takes
+/// them as `--variable` and `--expand-header`. The key itself stays in the
+/// environment, which is what t2 and t8 pin.
+#[test]
+fn t9_building_a_request_leaves_no_file_behind() {
+    let before = leaked_config_files();
+
+    let cfg = lokalai::build_config(
+        "review this",
+        "/tmp",
+        "glm",
+        "https://lokalai.example/v1",
+        "sk-whatever",
+    );
+
+    let after = leaked_config_files();
+    assert_eq!(
+        after, before,
+        "build_config left {} new file(s) in the temp directory",
+        after.saturating_sub(before)
+    );
+
+    let argv = cfg.args.join(" ");
+    assert!(
+        !argv.contains("--config") && !argv.contains("-K"),
+        "the request still goes through a config file: {argv}"
+    );
+}
+
+fn leaked_config_files() -> usize {
+    std::fs::read_dir(std::env::temp_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("lokalai-curl-")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
