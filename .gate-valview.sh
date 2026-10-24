@@ -21,6 +21,41 @@ cd "$(dirname "$0")" || exit 1
 
 fail() { echo "GATE FAIL: $*" >&2; exit 1; }
 
+# ── Counting tests HONESTLY ──────────────────────────────────────────────────
+# This gate used to count tests by grepping the human reporter for `Tests  N
+# passed`. Vitest colourises and pads that line through a pretty-printer even
+# when its output is piped, so the escapes land BETWEEN the words and a run
+# that passed all 8 parsed as 0. That mis-parse cost a whole kloo budget: the
+# worker, told the count was the gate, went and patched `process.stdout.write`
+# and `process.env.NO_COLOR` from INSIDE a product source file to make the
+# grep match — 142 lines of terminal plumbing in an Angular component's pure
+# layer — and that import broke `nx build web` with three TS4111 errors. A
+# gate that can only be satisfied by deforming the product is a defect in the
+# gate. So the count now comes from vitest's JSON reporter, which is a
+# machine-readable contract and cannot be coloured.
+vitest_json() { # <outfile> [args…]
+  local out=$1; shift
+  npx vitest run --config web/vitest.config.ts "$@" \
+    --reporter=json --outputFile="$out" 2>&1
+}
+vitest_count() { # <outfile> -> "<passed> <failed> <total>"
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(d.get("numPassedTests",0), d.get("numFailedTests",0), d.get("numTotalTests",0))
+' "$1"
+}
+vitest_names() { # <outfile>
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+for f in d.get("testResults",[]):
+    for a in f.get("assertionResults",[]):
+        print("   %-7s %s" % (a.get("status"), a.get("fullName")))
+' "$1"
+}
+
+
 # GATE_FAST=1 skips the two whole-surface stages (the 1182-test suite and the
 # headless-Chrome boot) and keeps spec + production build + wiring.
 #
@@ -32,28 +67,37 @@ fail() { echo "GATE FAIL: $*" >&2; exit 1; }
 FAST=${GATE_FAST:-0}
 
 echo "== 1/5 the validator-view spec =="
-spec=$(npx vitest run --config web/vitest.config.ts validator-view 2>&1)
+SPEC_JSON=${TMPDIR:-/tmp}/valview-spec.json
+rm -f "$SPEC_JSON"
+spec=$(vitest_json "$SPEC_JSON" validator-view)
 rc=$?
-echo "$spec" | tail -25
-[ "$rc" -eq 0 ] || fail "the validator-view spec is not green"
-ran=$(printf '%s\n' "$spec" | grep -oE 'Tests[[:space:]]+[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
-ran=${ran:-0}
-[ "$ran" -ge 8 ] || fail "only $ran of the 8 validator-view tests ran — a suite that collects nothing passes everything"
-echo "   validator-view tests that ran: $ran"
+printf '%s\n' "$spec" | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E 'FAIL|Error|✘' | head -20
+[ -s "$SPEC_JSON" ] || fail "the spec run produced no JSON report — it did not run at all"
+read -r sp sf st < <(vitest_count "$SPEC_JSON")
+vitest_names "$SPEC_JSON"
+[ "$rc" -eq 0 ] || fail "the validator-view spec is not green ($sf failed of $st)"
+[ "$sf" -eq 0 ] || fail "$sf validator-view test(s) failed"
+ran=$sp
+[ "$ran" -ge 8 ] || fail "only $ran of the 8 validator-view tests passed — a suite that collects nothing passes everything"
+echo "   validator-view tests that PASSED: $ran of $st"
 
 if [ "$FAST" = "1" ]; then
   echo "== 2/5 SKIPPED (GATE_FAST) — the 1182-test web suite =="
   allran=skipped
 else
 echo "== 2/5 the rest of the web unit suite =="
-all=$(npx vitest run --config web/vitest.config.ts 2>&1)
+ALL_JSON=${TMPDIR:-/tmp}/valview-all.json
+rm -f "$ALL_JSON"
+all=$(vitest_json "$ALL_JSON")
 rc=$?
-printf '%s\n' "$all" | grep -E 'Tests|Test Files|FAIL' | tail -12
-[ "$rc" -eq 0 ] || fail "the web unit suite regressed"
-allran=$(printf '%s\n' "$all" | grep -oE 'Tests[[:space:]]+[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
-allran=${allran:-0}
-[ "$allran" -ge 800 ] || fail "only $allran web tests ran — the suite stopped collecting"
-echo "   web unit tests that ran: $allran"
+printf '%s\n' "$all" | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E 'FAIL|✘' | head -20
+[ -s "$ALL_JSON" ] || fail "the web suite produced no JSON report — it did not run at all"
+read -r ap af at < <(vitest_count "$ALL_JSON")
+[ "$rc" -eq 0 ] || fail "the web unit suite regressed ($af failed of $at)"
+[ "$af" -eq 0 ] || fail "$af web unit test(s) failed"
+allran=$ap
+[ "$allran" -ge 1182 ] || fail "only $allran web tests passed of the 1182 this branch inherited — the suite stopped collecting"
+echo "   web unit tests that PASSED: $allran of $at"
 fi
 
 echo "== 3/5 nx build web (production) =="

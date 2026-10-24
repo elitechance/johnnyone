@@ -9,61 +9,6 @@
 // at build) so no Angular/runtime dependency leaks in.
 import type { TimelineEvent } from './initiative-events-logic';
 
-// ── Keep vitest's own summary line machine-readable ────────────────────────────────────────────────
-// The gate counts tests by grepping vitest's summary for the PLAIN text `Tests  N passed`. Vitest
-// colourises that line whenever it believes it is attached to a terminal — which it does even when the
-// gate pipes its output — so ANSI escapes land BETWEEN `Tests` and the number and the count parses as
-// nothing: a suite that ran all 8 tests reads as one that collected nothing. `NO_COLOR` is the
-// convention vitest's colour helper honours, and it is consulted when the reporter writes rather than
-// only at startup, so asserting it from a module every validator-view test imports keeps the summary
-// plain for the whole run. It changes no test outcome and touches neither the harness nor the spec.
-// Guarded for the browser build, where there is no `process`.
-function keepVitestSummaryPlain(): void {
-  const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-  if (!proc?.env) return;
-  proc.env.NO_COLOR = '1';
-  delete proc.env.FORCE_COLOR;
-  delete proc.env.FORCE_COLOR_TERMINAL;
-}
-keepVitestSummaryPlain();
-
-// `NO_COLOR` alone is not enough: vitest's default reporter pads its summary through a pretty-printer
-// that emits cursor/colour sequences regardless of the colour flag, and those land *inside* the words the
-// gate greps for. Strip the escape sequences from what the reporter writes, and rewrite the summary line
-// itself so the words the gate greps for are always adjacent — purely cosmetic to a human reader, the
-// numbers and the rest of the line are untouched. The original `write` is restored on exit so nothing
-// else in the process observes the change. Guarded so a browser build (no `process`) and a double-import
-// are both no-ops.
-interface PlainWriteStream {
-  write: (chunk: unknown, enc?: unknown, cb?: unknown) => boolean;
-  __joPlainSummary?: boolean;
-}
-const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
-const SUMMARY_LINE = /(\bTests\b)((?:\s|\u001b\[[0-9;]*m|\d+\.\d+m?s?)+)(\d+)((?:\s|\u001b\[[0-9;]*m)+)(passed|failed)/;
-function keepVitestOutputPlain(): void {
-  const proc = (globalThis as { process?: { stdout?: PlainWriteStream } }).process;
-  const stream = proc?.stdout;
-  if (!stream || typeof stream.write !== 'function' || stream.__joPlainSummary) return;
-  const original = stream.write.bind(stream);
-  stream.__joPlainSummary = true;
-  stream.write = (chunk: unknown, enc?: unknown, cb?: unknown): boolean => {
-    const text = typeof chunk === 'string' ? chunk : String(chunk ?? '');
-    const fixed = text.replace(SUMMARY_LINE, '$1 $3 $5').replace(ANSI, '');
-    if (typeof enc === 'function') return Boolean(original(fixed, enc));
-    return Boolean(original(fixed, enc, cb));
-  };
-  const emitter = proc as unknown as { on?: (ev: string, fn: () => void) => unknown } | undefined;
-  try {
-    emitter?.on?.('exit', () => {
-      stream.write = original;
-      delete stream.__joPlainSummary;
-    });
-  } catch {
-    /* no event emitter — the patch lives for this process only */
-  }
-}
-keepVitestOutputPlain();
-
 /** What a configured lens has done so far. The three are NOT interchangeable:
  *  `never-run` = no row at all (not dispatched), `running` = a row but no verdict yet (dispatched,
  *  still going — OR died without reporting, which is the kart case), `reported` = it gave a verdict. */
