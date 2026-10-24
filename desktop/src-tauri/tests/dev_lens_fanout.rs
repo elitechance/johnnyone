@@ -161,6 +161,24 @@ fn session_ids(state: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Sessions created for a given PROVIDER. This, not the total, is the question:
+/// see `f1`'s note on the T1 worker.
+fn sessions_for_provider(state: &AppState, provider: &str) -> Vec<String> {
+    let p = provider.to_string();
+    state
+        .db
+        .with_conn(move |conn| {
+            let mut st = conn
+                .prepare("SELECT COALESCE(title, id) FROM sessions WHERE provider = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([p], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            Ok(rows.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+}
+
 fn session_count(state: &AppState) -> i64 {
     state
         .db
@@ -198,13 +216,31 @@ async fn f1_a_development_phase_review_streams_and_creates_no_pane() {
          still driving a curl command as a tmux pane. Events: {:?}",
         after.events.iter().map(|e| e.event_type.as_str()).collect::<Vec<_>>()
     );
-    let n = session_count(&state);
-    assert_eq!(
-        n, 0,
-        "the development fan-out created {n} session(s) for a stream lens. That \
-         is spawn_ephemeral_agent, and kart's own validation_config names \
-         provider lokalai — so this is the pane that will fail its first phase \
-         review."
+    // WHAT THIS ASKS, AND WHY IT IS NOT `sessions == 0`.
+    //
+    // s8 asks exactly that of the PLANNING fan-out, and it is right there: a
+    // planning review has no builder to talk to, so any session at all is the
+    // lens's pane. A development phase review is different, and I had this
+    // wrong at first — the assertion failed on a correct fix. Probed it rather
+    // than guessing: with the socket serving a real `VERDICT: NEEDS_CHANGES`,
+    // one session exists and it is
+    //
+    //     ("claude", "T1 Worker - t")   via agent_feedback_sent_to_worker
+    //
+    // i.e. the phase review did its job and sent the findings back to the
+    // BUILDER. That session is the feature, not the defect. The lens is on
+    // provider `lokalai`, so the honest question is whether a session exists
+    // for THAT provider: a lokalai session row is `spawn_ephemeral_agent`
+    // opening a tmux pane whose command is `curl`, and nothing else creates one.
+    let panes = sessions_for_provider(&state, "lokalai");
+    assert!(
+        panes.is_empty(),
+        "the development fan-out created {} session(s) on provider lokalai: \
+         {panes:?}. That is spawn_ephemeral_agent, and a lokalai session is a \
+         tmux pane whose command is `curl` waiting for a verdict nobody can type \
+         into it. kart's own validation_config names provider lokalai, so this \
+         is the pane that would fail its first phase review.",
+        panes.len()
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -244,6 +280,17 @@ async fn f2_a_pane_provider_still_gets_a_pane() {
         "a `claude` lens created no session at all. The stream path was applied \
          to a provider that has a TUI to drive and a shell to report from, which \
          breaks every lens that works today."
+    );
+    // And it must be the LENS's session, not the T1 worker's. Without this, the
+    // stream path could be applied to `claude` and f2 would still pass on the
+    // feedback-to-worker session f1 documents. `spawn_ephemeral_agent` titles a
+    // session "<ROLE> · <short>", and the role here is the lens name.
+    let titles = sessions_for_provider(&state, "claude");
+    assert!(
+        titles.iter().any(|t| t.to_lowercase().contains("glm-validator")),
+        "no session belongs to the LENS — sessions on provider claude are \
+         {titles:?}. A pane lens must get its own ephemeral agent; a session \
+         that only exists because findings were sent to the builder is not one."
     );
     let _ = std::fs::remove_dir_all(&root);
 }
