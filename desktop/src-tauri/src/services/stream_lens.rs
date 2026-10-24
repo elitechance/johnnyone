@@ -265,30 +265,150 @@ pub const LENS_MATERIAL_BUDGET_BYTES: usize = 80_000;
 ///    about the plan.
 /// How many files one directory-valued material path may contribute.
 ///
-/// SCAFFOLD ONLY — the value the specification in
-/// `tests/stream_lens_conventions.rs` reads; the expansion is not written yet.
+/// WHY 24. The byte budget beside it is [`LENS_MATERIAL_BUDGET_BYTES`] = 80,000
+/// characters, and the real conventions store is a handful of markdown files —
+/// `review-lenses.md`, a commit-style doc, a per-area directory or two: call it
+/// five to ten files of a few KB each, comfortably under 20k characters, so on a
+/// real store the BYTE budget is what bites and this count never fires. The
+/// count still earns its rail, because the byte budget cannot see it: 200 tiny
+/// one-line rule files are 200 section headers of prompt overhead — 200 places
+/// for a tool-less reviewer to lose the checklist — long before 80k characters
+/// are spent. 24 is loose enough never to cut a store anyone would call normal,
+/// and low enough that a conventions directory nobody pruned cannot become the
+/// majority of the prompt. Over the cap the cut is NAMED with the count left out
+/// (see [`expand_lens_docs`]), so it degrades the way `inline_material` degrades
+/// on bytes: visibly, and with an instruction to say so rather than guess.
 pub const LENS_MATERIAL_MAX_FILES: usize = 24;
+
+/// Walk a directory, collecting the paths of every file beneath it, RECURSIVELY,
+/// in SORTED path order.
+///
+/// Sorted because `read_dir` yields filesystem order, and a prompt whose sections
+/// shuffle between runs breaks the provider's prefix cache and makes two runs of
+/// the same plan incomparable. A directory that cannot be read surfaces through
+/// `Err`, so the caller can say so in the prompt instead of emitting a section
+/// that quietly contains nothing.
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        // `symlink_metadata`, not `metadata`: a symlink into a directory outside
+        // the conventions store must not be followed, and one pointing back at an
+        // ancestor must not be recursed into forever.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_files(&path, out)?;
+        } else if meta.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
 
 /// Turn one material path into the documents to inline for it.
 ///
-/// SCAFFOLD ONLY — this is today's behaviour (one `read_to_string`, whatever
-/// the path is), kept so the specification compiles and its reds are real. On
-/// the live 14:02:40 run this is what put
+/// THE DEFECT THIS FIXES, measured on the live 2026-10-24 14:02:40 run: the
+/// conventions path is a DIRECTORY, and the code this replaces called
+/// `read_to_string` on it, so the reviewer was handed
 /// `(this document could not be read from the host filesystem: Is a directory
-/// (os error 21))` in front of the reviewer where the review lenses should
-/// have been. See that test file's header.
-pub fn expand_lens_docs(label: &str, path: &std::path::Path, _max_files: usize) -> Vec<LensDoc> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(body) => body,
-        Err(error) => {
-            format!("(this document could not be read from the host filesystem: {error})")
-        }
-    };
-    vec![LensDoc {
+/// (os error 21))` where the review checklists should have been — while three
+/// planner prompts tell the planner those checklists live at
+/// `{{conventions_path}}/review-lenses.md`. See `tests/stream_lens_conventions.rs`.
+///
+/// The contract:
+///
+/// * a **file** is exactly ONE document carrying its own bytes, label and path
+///   unchanged — BRIEF, PLAN and METHODOLOGY behave exactly as they did;
+/// * a **directory** is one document PER FILE beneath it, recursively (the
+///   prompts say "every file under"), in sorted path order, each keeping the
+///   caller's label so the section is still recognisably CONVENTIONS and each
+///   carrying its OWN file path so the reviewer can cite `review-lenses.md`
+///   rather than "a blob of conventions";
+/// * at most `max_files` of them, and a cut is NAMED with the count left out — a
+///   reviewer judging a partial checklist must be able to say so, exactly as
+///   `inline_material` names a byte cut;
+/// * anything else (missing, unreadable) is still exactly ONE document whose body
+///   explains itself with the OS error. Returning an empty vector here would
+///   delete the section from the prompt, and a reviewer cannot report a
+///   limitation it was never shown — which is the only reason this bug was found.
+pub fn expand_lens_docs(label: &str, path: &std::path::Path, max_files: usize) -> Vec<LensDoc> {
+    let doc = |file: &std::path::Path, body: String| LensDoc {
         label: label.to_string(),
-        path: path.to_string_lossy().to_string(),
+        path: file.to_string_lossy().to_string(),
         body,
-    }]
+    };
+    // The honest degradation, shared by every failure below — kept word-for-word
+    // so a prompt captured before this fix reads the same way for a path that is
+    // genuinely unreadable.
+    let unreadable = |error: &std::io::Error| {
+        vec![doc(
+            path,
+            format!("(this document could not be read from the host filesystem: {error})"),
+        )]
+    };
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => return unreadable(&error),
+    };
+
+    if !meta.is_dir() {
+        // A plain file — BRIEF, PLAN and METHODOLOGY land here. One document,
+        // unchanged from before this fix.
+        return match std::fs::read_to_string(path) {
+            Ok(body) => vec![doc(path, body)],
+            Err(error) => unreadable(&error),
+        };
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    if let Err(error) = collect_files(path, &mut files) {
+        return unreadable(&error);
+    }
+
+    // A directory holding nothing still has to appear: an empty conventions store
+    // is a finding about the plan, a vanished section is not.
+    if files.is_empty() {
+        return vec![doc(
+            path,
+            "(empty — this directory exists and contains no files)".to_string(),
+        )];
+    }
+
+    let shown = files.iter().take(max_files);
+    let mut docs: Vec<LensDoc> = shown
+        .map(|file| {
+            // One unreadable file among many is a body that says so — not a
+            // dropped section, and not an abandoned conventions store.
+            let body = match std::fs::read_to_string(file) {
+                Ok(body) => body,
+                Err(error) => {
+                    format!("(this document could not be read from the host filesystem: {error})")
+                }
+            };
+            doc(file, body)
+        })
+        .collect();
+
+    let left_out = files.len() - docs.len();
+    if left_out > 0 {
+        docs.push(doc(
+            path,
+            format!(
+                "[… {left_out} more file(s) of {label} omitted: the directory \
+                 holds {} files and this lens's material is capped at \
+                 {max_files}. If what you can see is incomplete, say so and \
+                 return BLOCKED rather than reporting the missing files as \
+                 absent.]",
+                files.len()
+            ),
+        ));
+    }
+    docs
 }
 
 pub fn inline_material(docs: &[LensDoc], budget: usize) -> String {

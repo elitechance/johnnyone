@@ -6204,23 +6204,6 @@ async fn run_lens_fanout_review(
     handle_reviewer_output(state, run, phase, &merged).await
 }
 
-/// Read one file on behalf of a stream lens.
-///
-/// The HOST has a filesystem; the lens does not. A file that is missing or
-/// unreadable is never silently skipped and never an error that aborts the whole
-/// review — it becomes a body that SAYS it could not be read, so the reviewer
-/// reports the gap as a finding rather than defaulting to BLOCKED (the stream
-/// tail forbids BLOCKED-on-missing, and that instruction only holds if the gap
-/// is stated in the material itself).
-fn read_lens_doc_body(path: &Path) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(body) => body,
-        Err(error) => format!(
-            "(this document could not be read from the host filesystem: {error})"
-        ),
-    }
-}
-
 /// The material block for a stream lens: the four documents a pane lens is told
 /// to go and read, read HERE on the host and inlined as labelled sections.
 ///
@@ -6240,28 +6223,39 @@ fn stream_lens_material(state: &AppState, run: &AgentPlanRun) -> String {
             .unwrap_or_default()
     };
     let plan_root = Path::new(&run.plan.plan_path);
-    let docs: Vec<stream_lens::LensDoc> = vec![
-        stream_lens::LensDoc {
-            label: "BRIEF".to_string(),
-            path: plan_root.join("brief.md").to_string_lossy().to_string(),
-            body: read_lens_doc_body(&plan_root.join("brief.md")),
-        },
-        stream_lens::LensDoc {
-            label: "PLAN".to_string(),
-            path: run.plan.plan_path.clone(),
-            body: read_lens_doc_body(&plan_root.join("overview.md")),
-        },
-        stream_lens::LensDoc {
-            label: "METHODOLOGY".to_string(),
-            path: get("methodology_path"),
-            body: read_lens_doc_body(&Path::new(&get("methodology_path"))),
-        },
-        stream_lens::LensDoc {
-            label: "CONVENTIONS".to_string(),
-            path: get("conventions_path"),
-            body: read_lens_doc_body(&Path::new(&get("conventions_path"))),
-        },
-    ];
+    // Every path goes through the SAME expander, in the SAME order.
+    // `inline_material` spends its byte budget in order, so the brief — the
+    // user's intent — is expanded and rendered first and can never be the
+    // casualty of a large conventions directory. The first three are files, and
+    // an expander handed a file returns exactly the one document
+    // `read_lens_doc_body` used to build by hand, label and path unchanged.
+    // The fourth is the one that was broken: `conventions_path` is a DIRECTORY
+    // (every planner prompt says "every file under {{conventions_path}}"), so
+    // `read_to_string` on it returned `Is a directory (os error 21)` and the
+    // reviewer was measured against a checklist it had never been shown. The
+    // expander turns that directory into one document per file beneath it, each
+    // naming its own file, so `review-lenses.md` is text the lens can cite.
+    let mut docs: Vec<stream_lens::LensDoc> = Vec::new();
+    docs.extend(stream_lens::expand_lens_docs(
+        "BRIEF",
+        &plan_root.join("brief.md"),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(stream_lens::expand_lens_docs(
+        "PLAN",
+        &plan_root.join("overview.md"),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(stream_lens::expand_lens_docs(
+        "METHODOLOGY",
+        &Path::new(&get("methodology_path")),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(stream_lens::expand_lens_docs(
+        "CONVENTIONS",
+        &Path::new(&get("conventions_path")),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
     format!(
         "You are the review lens for a PLAN (a planning run). Judge whether the \
          PLAN itself is ready, and whether it is faithful to the accepted brief. \
