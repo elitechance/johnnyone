@@ -30,9 +30,18 @@ pub enum CliProvider {
     Kloo,
     /// `lokalai` — an OpenAI-compatible HTTP endpoint (glm among others) driven through
     /// `curl` with SSE streaming (`"stream": true`). A real chat provider: it answers
-    /// questions, so unlike `Kloo`/`Shell` it is a legal review lens. The API key never
-    /// reaches the spawned argv (`ps` is world-readable) — it lives in a mode-0600 curl
-    /// config file passed with `-K`.
+    /// questions, so unlike `Kloo`/`Shell` it is a legal review lens — but it has no
+    /// interactive pane, so a lens on this provider is driven as a STREAM, not a tmux
+    /// pane (see `services::stream_lens::lens_transport`).
+    ///
+    /// The API key never reaches the spawned argv (`ps` is world-readable) and never
+    /// touches the disk: it rides in the child's environment as `LOKALAI_API_KEY`
+    /// (`lokalai::API_KEY_ENV`), and argv carries only that variable's NAME — curl
+    /// imports it with `--variable %LOKALAI_API_KEY` and substitutes it into the
+    /// header with `--expand-header "Authorization: Bearer {{LOKALAI_API_KEY}}"`.
+    /// An earlier revision wrote a mode-0600 curl config file per request and leaked
+    /// one per chat turn; round 3 deleted it, and `tests/lokalai_provider.rs` t9
+    /// forbids `--config`/`-K` outright. Never log the key.
     Lokalai,
 }
 
