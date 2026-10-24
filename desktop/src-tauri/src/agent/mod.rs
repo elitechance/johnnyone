@@ -1308,6 +1308,7 @@ impl AgentService {
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
             "block_agent_plan" => Self::rpc_block_agent_plan(&req.params, state).await,
+            "unblock_agent_plan" => Self::rpc_unblock_agent_plan(&req.params, state).await,
             "manual_pass_agent_phase" => {
                 Self::rpc_manual_pass_agent_phase(&req.params, state).await
             }
@@ -2396,6 +2397,18 @@ impl AgentService {
             .unwrap_or("Blocked by user")
             .to_string();
         let run = crate::services::agent_plans::block_plan(state, id.to_string(), reason).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_unblock_agent_plan(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let run = crate::services::agent_plans::unblock_plan(state, id.to_string()).await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
