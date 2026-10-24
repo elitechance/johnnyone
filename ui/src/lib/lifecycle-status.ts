@@ -60,6 +60,30 @@ export function statusMeta(status: string | null | undefined): StatusMeta {
 }
 
 /** Map a `health` value to its `{ cssVar, label, className }`; unknown → fallback. */
+/** Health values meaning the run has STOPPED for a reason a human can act on. Anything else
+ *  (`in-progress`, `complete`, blank…) is healthy-ish: a stale error string beside a green badge
+ *  reads as a live failure, so it must not be shown. */
+const UNHEALTHY_HEALTH = new Set<string>(['needs-attention', 'blocked']);
+
+/**
+ * The one line a validator can act on, or null when there is nothing to say.
+ *
+ * Non-null only when the run is NOT healthy (`needs-attention`, `blocked`) AND the error is non-blank.
+ * The lifecycle bar used to read `HEALTH • needs-attention` and stop there while the reason
+ * (`can't find pane: %2375`) sat eleven rows down the Events column. A healthy run with a stale error
+ * returns null — showing an old failure beside a green badge reads as a live one. An unhealthy run with
+ * no reason returns null too: do not invent copy like "something went wrong", which tells the reader
+ * less than the badge already did.
+ */
+export function healthReason(
+  health: string | null | undefined,
+  error: string | null | undefined,
+): string | null {
+  if (!UNHEALTHY_HEALTH.has((health ?? '').trim())) return null;
+  const reason = (error ?? '').trim();
+  return reason || null;
+}
+
 export function healthMeta(health: string | null | undefined): StatusMeta {
   return HEALTH_META[key(health)] ?? unknownMeta((health ?? '').trim());
 }

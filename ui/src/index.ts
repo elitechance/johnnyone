@@ -114,6 +114,7 @@ export {
   STATUS_META,
   HEALTH_META,
   LIFECYCLE_STAGES,
+  healthReason,
 } from './lib/lifecycle-status';
 export type { StatusMeta, LifecycleStage } from './lib/lifecycle-status';
 export type { TerminalScreen } from './models/terminal.model';
