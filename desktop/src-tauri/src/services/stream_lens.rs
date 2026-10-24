@@ -263,6 +263,34 @@ pub const LENS_MATERIAL_BUDGET_BYTES: usize = 80_000;
 /// 5. an EMPTY document is still present and marked empty. A missing brief and
 ///    an empty brief are different facts, and only one of them is a finding
 ///    about the plan.
+/// How many files one directory-valued material path may contribute.
+///
+/// SCAFFOLD ONLY — the value the specification in
+/// `tests/stream_lens_conventions.rs` reads; the expansion is not written yet.
+pub const LENS_MATERIAL_MAX_FILES: usize = 24;
+
+/// Turn one material path into the documents to inline for it.
+///
+/// SCAFFOLD ONLY — this is today's behaviour (one `read_to_string`, whatever
+/// the path is), kept so the specification compiles and its reds are real. On
+/// the live 14:02:40 run this is what put
+/// `(this document could not be read from the host filesystem: Is a directory
+/// (os error 21))` in front of the reviewer where the review lenses should
+/// have been. See that test file's header.
+pub fn expand_lens_docs(label: &str, path: &std::path::Path, _max_files: usize) -> Vec<LensDoc> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) => {
+            format!("(this document could not be read from the host filesystem: {error})")
+        }
+    };
+    vec![LensDoc {
+        label: label.to_string(),
+        path: path.to_string_lossy().to_string(),
+        body,
+    }]
+}
+
 pub fn inline_material(docs: &[LensDoc], budget: usize) -> String {
     /// The notice naming what was dropped. Deliberately compact: it has to fit
     /// inside the very budget it is enforcing.
