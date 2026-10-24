@@ -395,6 +395,34 @@ async fn m6_the_fanout_puts_the_plan_body_on_the_wire() {
         workspace.join("plan").display(),
         &body.chars().take(2000).collect::<String>()
     );
+    // The tool-less statement must be ON THE WIRE, not merely present in the
+    // helper that builds it. Found by mutation: replacing
+    // `stream_lens_prompt_tail(...)` with an empty string in the fan-out left
+    // every one of these six tests green. m2 proves the HELPER says "no tools";
+    // nothing proved the fan-out actually appends it. That statement is the
+    // thing that stopped glm spending its whole reply on `<tool_call> …
+    // blocked`, so without it on the wire the live 02:00:07 BLOCKED can return
+    // with the material sitting right there in the prompt.
+    //
+    // Fifth instance of the same shape on this branch — module proved, caller
+    // unexamined — and the first one a mutation caught instead of production.
+    let wire = body.to_lowercase();
+    assert!(
+        wire.contains("no shell") || wire.contains("no tools") || wire.contains("no filesystem"),
+        "the prompt ON THE WIRE never tells the reviewer it has no tools. The \
+         material is there and the instruction is not, which is how a model \
+         that believes it can fetch files spends its reply on blocked tool \
+         calls.\n--- request body (first 2000) ---\n{}",
+        &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        wire.contains("verdict:"),
+        "the prompt ON THE WIRE never asks for a VERDICT line, so nothing the \
+         reviewer returns can be read back as a verdict and the review is \
+         recorded as an error.\n--- request body (first 2000) ---\n{}",
+        &body.chars().take(2000).collect::<String>()
+    );
+
     assert!(
         !body.to_lowercase().contains("read first"),
         "the prompt on the wire still opens with 'Read first:' — the material \
