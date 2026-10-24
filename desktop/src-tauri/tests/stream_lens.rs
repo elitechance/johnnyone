@@ -307,3 +307,115 @@ fn s7_the_stream_lens_prompt_asks_for_a_token_not_a_curl() {
          which it has no shell to run. Prompt tail was:\n{tail}"
     );
 }
+
+/// s8 — THE CALL SITE. The fan-out must actually take the Stream path.
+///
+/// WHY THIS TEST EXISTS, and it is not a happy story.
+///
+/// The first seven tests all went green, the gate passed four stages, the PR
+/// was opened, the host was rebuilt and restarted — and the very next review
+/// run produced this:
+///
+/// ```text
+/// 01:18:23  planning_review_started
+/// 01:18:38  coordinator_failed {"reason":"can't find pane: %2424"}
+/// ```
+///
+/// A new pane id and the identical defect, because
+/// `run_planning_lens_fanout_review` had never been touched. s1 proved the
+/// MAPPING, s4 proved the TRANSPORT, and nothing proved the CALL SITE consults
+/// either one. I wrote that blind spot down and shipped anyway.
+///
+/// So this test drives the real fan-out, on a real state, against a real socket:
+/// it asserts the verdict reached the plan's events AND that not one tmux
+/// session was created. A fan-out that still spawns a pane cannot pass it.
+#[tokio::test]
+async fn s8_the_fanout_takes_the_stream_path_and_creates_no_pane() {
+    use johnnyone_desktop_lib::db::Database;
+    use johnnyone_desktop_lib::services::agent_plans;
+    use johnnyone_desktop_lib::state::app_state::AppState;
+
+    let port = serve_once("HTTP/1.1 200 OK", "text/event-stream", SSE_NEEDS_CHANGES);
+    // `test_support` is `#[cfg(test)]`, so an integration test builds the state
+    // the same way it does: open a database (migrations run on open) and wire
+    // AppState around it. No live process, relay or Tauri handle.
+    let root = std::env::temp_dir().join(format!("s8-fanout-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("temp root");
+    let db = Database::open(&root.join("test.db")).expect("open db");
+    let state = AppState::new(db);
+    let plan_id = "s8-fanout-stream-path";
+    let workspace = root.join("ws");
+    std::fs::create_dir_all(workspace.join("plan/phases/00-x")).expect("plan dirs");
+    std::fs::write(workspace.join("plan/overview.md"), "# Plan\n").expect("overview");
+
+    // The lens resolves its endpoint from the provider_configs row, so point it
+    // at the throwaway socket instead of the real provider.
+    state
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO provider_configs (id, provider, cli_path, api_key, default_model, settings, is_available, updated_at)
+                 VALUES ('s8-cfg', 'lokalai', 'curl', 'sk-s8-test', 'glm', ?1, 1, datetime('now'))",
+                rusqlite::params![format!(
+                    "{{\"endpoint\":\"http://127.0.0.1:{port}/v1\"}}"
+                )],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status,
+                                          worker_session_id, reviewer_session_id, worker_provider,
+                                          reviewer_provider, current_phase_index, initiative_id,
+                                          initiative_status, health, validation_config)
+                 VALUES (?1, 'planning', 'the call site', ?2, ?3, 'planning_review_running',
+                         NULL, NULL, 'claude', 'claude', 0, ?1, 'planning', 'in-progress', ?4)",
+                rusqlite::params![
+                    plan_id,
+                    workspace.to_string_lossy(),
+                    workspace.join("plan").to_string_lossy(),
+                    r#"[{"name":"glm-validator","provider":"lokalai","model":"glm","blocking":true}]"#,
+                ],
+            )
+            .map_err(|e| e.to_string())
+        })
+        .expect("seed the plan and the provider config");
+
+    let run = agent_plans::get_plan(&state, plan_id).expect("the seeded plan must load");
+    let _ = agent_plans::run_planning_lens_fanout_review(&state, &run).await;
+
+    let after = agent_plans::get_plan(&state, plan_id).expect("reload the plan");
+    let verdicts: Vec<&str> = after
+        .events
+        .iter()
+        .filter(|e| e.event_type == "agent_lens_verdict")
+        .map(|e| e.payload_json.as_str())
+        .collect();
+
+    assert!(
+        verdicts.iter().any(|p| p.contains("NEEDS_CHANGES")),
+        "the fan-out produced no NEEDS_CHANGES verdict for a stream lens. It is \
+         still driving the lens as a tmux pane, which is the defect this whole \
+         branch exists to fix. Events seen: {:?}",
+        after
+            .events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // No session row may have been created: a stream lens has nothing to attach
+    // a terminal to, and `spawn_ephemeral_agent` is what made the dead pane.
+    let sessions: i64 = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .map_err(|e| e.to_string())
+        })
+        .expect("count sessions");
+    assert_eq!(
+        sessions, 0,
+        "the fan-out created {sessions} session(s) for a stream lens — that is \
+         spawn_ephemeral_agent, and its pane is what died as %2375 and %2424"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
