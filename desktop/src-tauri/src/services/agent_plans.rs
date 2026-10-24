@@ -6012,6 +6012,74 @@ async fn run_lens_fanout_review(
     handle_reviewer_output(state, run, phase, &merged).await
 }
 
+/// Read one file on behalf of a stream lens.
+///
+/// The HOST has a filesystem; the lens does not. A file that is missing or
+/// unreadable is never silently skipped and never an error that aborts the whole
+/// review — it becomes a body that SAYS it could not be read, so the reviewer
+/// reports the gap as a finding rather than defaulting to BLOCKED (the stream
+/// tail forbids BLOCKED-on-missing, and that instruction only holds if the gap
+/// is stated in the material itself).
+fn read_lens_doc_body(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) => format!(
+            "(this document could not be read from the host filesystem: {error})"
+        ),
+    }
+}
+
+/// The material block for a stream lens: the four documents a pane lens is told
+/// to go and read, read HERE on the host and inlined as labelled sections.
+///
+/// Order is load-bearing — `inline_material` spends the budget in order, so the
+/// brief (the user's intent) is never the casualty of a later, larger document.
+/// The budget is `stream_lens::LENS_MATERIAL_BUDGET_BYTES` (80,000 chars ≈
+/// 25–30k tokens of prose): generous against a ~128k-token window for a real
+/// plan store, hard enough to stop a runaway one, and any cut is NAMED with a
+/// count rather than silent.
+fn stream_lens_material(state: &AppState, run: &AgentPlanRun) -> String {
+    let values = planning_template_values(state, run);
+    let get = |k: &str| {
+        values
+            .iter()
+            .find(|(kk, _)| *kk == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let plan_root = Path::new(&run.plan.plan_path);
+    let docs: Vec<stream_lens::LensDoc> = vec![
+        stream_lens::LensDoc {
+            label: "BRIEF".to_string(),
+            path: plan_root.join("brief.md").to_string_lossy().to_string(),
+            body: read_lens_doc_body(&plan_root.join("brief.md")),
+        },
+        stream_lens::LensDoc {
+            label: "PLAN".to_string(),
+            path: run.plan.plan_path.clone(),
+            body: read_lens_doc_body(&plan_root.join("overview.md")),
+        },
+        stream_lens::LensDoc {
+            label: "METHODOLOGY".to_string(),
+            path: get("methodology_path"),
+            body: read_lens_doc_body(&Path::new(&get("methodology_path"))),
+        },
+        stream_lens::LensDoc {
+            label: "CONVENTIONS".to_string(),
+            path: get("conventions_path"),
+            body: read_lens_doc_body(&Path::new(&get("conventions_path"))),
+        },
+    ];
+    format!(
+        "You are the review lens for a PLAN (a planning run). Judge whether the \
+         PLAN itself is ready, and whether it is faithful to the accepted brief. \
+         Everything you must review is included below as labelled sections — the \
+         accepted brief, the plan, the methodology and the conventions — so \
+         judge only the material shown to you here.\n\n{}\n",
+        stream_lens::inline_material(&docs, stream_lens::LENS_MATERIAL_BUDGET_BYTES)
+    )
+}
+
 fn planning_lens_reviewer_prompt(
     state: &AppState,
     run: &AgentPlanRun,
@@ -6133,14 +6201,21 @@ pub async fn run_planning_lens_fanout_review(
             // place of the report-protocol tail: a lens cannot run a curl it has no
             // shell for, and cannot emit a token it was never shown.
             let report_tail = lens_report_instruction(&plan_id, &desc.name);
-            let prompt = match planning_lens_reviewer_prompt(state, run, lens, &plan_id)
-                .split_once(report_tail.as_str())
-            {
-                Some((head, _)) => {
-                    format!("{head}{}", stream_lens::stream_lens_prompt_tail(&desc.name))
-                }
-                None => planning_lens_reviewer_prompt(state, run, lens, &plan_id),
-            };
+            // THE MATERIAL, NOT THE PATHS. The pane prompt opens "Read first: …
+            // at {brief}; methodology at {methodology}; … then read the plan at
+            // {plan_output}" — four filesystem paths, which is right for a CLI
+            // agent holding Read and Bash and WRONG for one HTTP completion with
+            // no disk: on 2026-10-24 at 02:00:07 glm answered each of those
+            // instructions with a blocked tool call and returned BLOCKED.
+            // So the HOST reads the four documents and inlines their BODIES as
+            // labelled sections, then appends the stream tail (which shows the
+            // four verdict tokens in place of the curl it cannot run). The pane
+            // branch below is untouched — it still gets the path-based prompt.
+            let prompt = format!(
+                "{}{}",
+                stream_lens_material(state, run),
+                stream_lens::stream_lens_prompt_tail(&desc.name)
+            );
             // `tokio::spawn` needs an owned, `'static` future, so the seven
             // borrowed arguments are moved into the async block and borrowed there.
             let workspace = run.plan.workspace_path.clone();
