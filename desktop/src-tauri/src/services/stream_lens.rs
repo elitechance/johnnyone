@@ -396,36 +396,109 @@ pub fn expand_lens_docs(label: &str, path: &std::path::Path, max_files: usize) -
         )];
     }
 
-    let shown = files.iter().take(max_files);
-    let mut docs: Vec<LensDoc> = shown
+    let shown: Vec<LensDoc> = files
+        .iter()
+        .take(max_files)
         .map(|file| {
             // One unreadable file among many is a body that says so — not a
             // dropped section, and not an abandoned conventions store.
             let body = match std::fs::read_to_string(file) {
                 Ok(body) => body,
-                Err(error) => {
-                    format!("(this document could not be read from the host filesystem: {error})")
-                }
+                Err(error) => format!(
+                    "(this document could not be read from the host filesystem: {error})"
+                ),
             };
             doc(file, body)
         })
         .collect();
 
+    let mut docs = shown;
     let left_out = files.len() - docs.len();
     if left_out > 0 {
         docs.push(doc(
             path,
             format!(
-                "[… {left_out} more file(s) of {label} omitted: the directory \
-                 holds {} files and this lens's material is capped at \
-                 {max_files}. If what you can see is incomplete, say so and \
-                 return BLOCKED rather than reporting the missing files as \
-                 absent.]",
+                "[… {left_out} more file(s) of {label} omitted: the directory holds \
+                 {} files and this lens's material is capped at {max_files}. If what \
+                 you can see is incomplete, say so and return BLOCKED rather than \
+                 reporting the missing files as absent.]",
                 files.len()
             ),
         ));
     }
     docs
+}
+
+/// The material block for a stream lens reviewing ONE PHASE of a development run.
+///
+/// The planning sibling lives in `agent_plans.rs` (`stream_lens_material`); this
+/// is the same contract with the phase's own documents in front. A tool-less
+/// reviewer handed a path has nothing to follow it with — so the phase's
+/// overview, status and task files are read HERE and their BODIES ride the
+/// prompt, labelled, alongside the brief, the plan overview, the methodology and
+/// the conventions.
+///
+/// Built from `expand_lens_docs` + `inline_material` like the planning side, so
+/// it inherits the byte budget and the honest, NAMED truncation rather than
+/// inventing a second one. Budget order is load-bearing: the phase under review
+/// is what the lens is judging, so it is expanded first and can never be the
+/// casualty of a larger conventions store.
+pub fn development_lens_material(
+    lens_name: &str,
+    phase_id: &str,
+    phase_path: &std::path::Path,
+    tasks_path: &std::path::Path,
+    brief_path: &std::path::Path,
+    plan_overview_path: &std::path::Path,
+    methodology_path: &std::path::Path,
+    conventions_path: &std::path::Path,
+) -> String {
+    let mut docs: Vec<LensDoc> = Vec::new();
+    docs.extend(expand_lens_docs(
+        &format!("PHASE {phase_id} OVERVIEW"),
+        &phase_path.join("overview.md"),
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        &format!("PHASE {phase_id} STATUS"),
+        &phase_path.join("status.md"),
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        &format!("PHASE {phase_id} TASKS"),
+        tasks_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "BRIEF",
+        brief_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "PLAN",
+        plan_overview_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "METHODOLOGY",
+        methodology_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "CONVENTIONS",
+        conventions_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    format!(
+        "You are the `{lens_name}` review lens for phase {phase_id} of a development run. \
+         Judge the work this phase DELIVERED, and whether it is faithful to the accepted \
+         brief. Everything you must review is included below as labelled sections — this \
+         phase's overview, status and task files, the accepted brief, the plan overview, \
+         the methodology and the conventions — so judge only the material shown to you \
+         here. A document that is empty or unreadable is a finding to report, not a \
+         reason to stop.\n\n{}\n",
+        inline_material(&docs, LENS_MATERIAL_BUDGET_BYTES),
+    )
 }
 
 pub fn inline_material(docs: &[LensDoc], budget: usize) -> String {
