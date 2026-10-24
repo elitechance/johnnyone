@@ -3,12 +3,13 @@ use crate::db::models::{
     AgentPlan, AgentPlanEvent, AgentPlanPhase, AgentPlanTask, CreateAgentPlanInput,
     CreateBriefingInput, CreateSessionInput, ValidationLens,
 };
-use crate::providers::CliProvider;
+use crate::providers::{lokalai, CliProvider};
 use crate::events::{AgentPlanRunEvent, StreamEvent};
 use crate::services::plan_artifacts;
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
+use crate::services::stream_lens::{self, LensTransport};
 use crate::state::app_state::{AgentReport, AppState};
 use crate::terminal;
 use base64::{engine::general_purpose, Engine as _};
@@ -280,12 +281,87 @@ fn normalize_stage_provider(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Validate a caller-supplied **development-stage** provider with the SAME rule the run providers
+/// use. `normalize_stage_provider` runs first (a blank form field means "unbound" → SQL NULL, which
+/// inherits the planning row's provider and needs no check), then every non-blank value goes through
+/// `reject_oneshot_plan_provider` — the very helper `create_plan` applies to `worker_provider` /
+/// `reviewer_provider`. THE DEFECT THIS CLOSES: the `dev_*` columns were only trimmed, so
+/// `dev_worker_provider = 'kloo'` was accepted at creation and then refused hours later by
+/// `auto_start_development`, which feeds those same columns back into `create_plan` via
+/// `development_stage_providers` (the kart plan, 2026-10-24 14:02:40). One rule, applied twice —
+/// never a second copy of it that can drift.
+fn validate_stage_provider(value: Option<&str>) -> Result<Option<String>, String> {
+    let normalized = normalize_stage_provider(value);
+    if let Some(provider) = normalized.as_deref() {
+        reject_oneshot_plan_provider(provider)?;
+    }
+    Ok(normalized)
+}
+
 /// Which providers the development stage-run should use, given its planning row.
 ///
 /// Returns `(worker, reviewer)`. A `dev_*` column set on the planning row wins; NULL falls back to
 /// that row's own provider, which is the pre-existing single-agent behaviour (so initiatives created
 /// before migration 021 keep working unchanged). The two sides resolve independently: binding only
 /// the builder still leaves validation on the planning provider.
+/// Repair the development-stage binding on an existing **planning** row.
+///
+/// WHY THIS EXISTS. Validation at creation does nothing for the row that is already wrong, and no
+/// other plan mutation writes `dev_worker_provider` / `dev_reviewer_provider` — so before this, the
+/// only repair for the kart plan was a hand-written UPDATE against the running host's database.
+/// THE SAME RULE, NOT A SECOND COPY. Both values go through `validate_stage_provider`, i.e.
+/// `normalize_stage_provider` (blank ⇒ NULL ⇒ inherit the planning row's providers) followed by the
+/// very `reject_oneshot_plan_provider` `create_plan` applies to the run providers. A repair that
+/// could write `kloo` would just be a route around the rule it exists to repair.
+/// `None` writes SQL NULL (clearing is how a row goes back to inheriting).
+/// ONLY A PLANNING ROW. A development row is terminal in the stage chain — `auto_start_development`
+/// writes both columns NULL on the row it creates — so a binding there is never read.
+pub fn rebind_development_providers(
+    state: &AppState,
+    id: String,
+    dev_worker: Option<String>,
+    dev_reviewer: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    let dev_worker_provider = validate_stage_provider(dev_worker.as_deref())?;
+    let dev_reviewer_provider = validate_stage_provider(dev_reviewer.as_deref())?;
+    // Existence error first, then the stage check, both from the loaded row.
+    let current = get_plan(state, &id)?;
+    if current.plan.run_type != "planning" {
+        return Err(format!(
+            "Plan {} is a {} run, not a planning run; only a planning row hands off to a \
+             development stage-run, so it has no development-stage binding to rebind",
+            id, current.plan.run_type
+        ));
+    }
+    let (old_worker, old_reviewer) = (
+        current.plan.dev_worker_provider.clone(),
+        current.plan.dev_reviewer_provider.clone(),
+    );
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET dev_worker_provider = ?1, dev_reviewer_provider = ?2, \
+             updated_at = datetime('now') WHERE id = ?3",
+            params![dev_worker_provider, dev_reviewer_provider, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_plan_dev_providers_rebound",
+        json!({
+            "oldDevWorkerProvider": old_worker,
+            "oldDevReviewerProvider": old_reviewer,
+            "devWorkerProvider": dev_worker_provider,
+            "devReviewerProvider": dev_reviewer_provider,
+        }),
+    )?;
+    get_plan(state, &id)
+}
+
 pub fn development_stage_providers(planning: &AgentPlan) -> (String, String) {
     (
         planning
@@ -463,6 +539,10 @@ fn create_planning_run(
 ) -> Result<AgentPlanRun, String> {
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
+    // The development-stage columns are fed back into `create_plan` verbatim by
+    // `auto_start_development`, so they obey the run providers' rule at the write too.
+    let dev_worker_provider = validate_stage_provider(input.dev_worker_provider.as_deref())?;
+    let dev_reviewer_provider = validate_stage_provider(input.dev_reviewer_provider.as_deref())?;
     let workspace = normalize_path(Path::new(&input.workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
@@ -529,8 +609,8 @@ fn create_planning_run(
                 docs_scope,
                 reference_paths,
                 input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
-                normalize_stage_provider(input.dev_worker_provider.as_deref()),
-                normalize_stage_provider(input.dev_reviewer_provider.as_deref()),
+                dev_worker_provider,
+                dev_reviewer_provider,
             ],
         )
         .map_err(|e| format!("Failed to create planning run: {}", e))
@@ -560,6 +640,10 @@ pub async fn create_briefing_run(
 ) -> Result<AgentPlanRun, String> {
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
+    // Same rule on the development-stage columns (see `validate_stage_provider`) — a briefing row
+    // flips to planning on this same id and hands off exactly like any other planning row.
+    let dev_worker_provider = validate_stage_provider(input.dev_worker_provider.as_deref())?;
+    let dev_reviewer_provider = validate_stage_provider(input.dev_reviewer_provider.as_deref())?;
     let parsed_exec = parse_executor_config(input.executor_config.as_deref())?;
     // Belt-and-braces: reject_oneshot already errors on kloo, so this arm is
     // unreachable today. Keep it so a later change to oneshot policy cannot
@@ -636,8 +720,8 @@ pub async fn create_briefing_run(
                 chat_session.id,
                 input.brief.clone().unwrap_or_default(),
                 input.executor_config.clone(),
-                normalize_stage_provider(input.dev_worker_provider.as_deref()),
-                normalize_stage_provider(input.dev_reviewer_provider.as_deref()),
+                dev_worker_provider,
+                dev_reviewer_provider,
             ],
         )
         .map_err(|e| format!("Failed to create briefing run: {}", e))
@@ -1585,8 +1669,117 @@ pub async fn rerun_reviewer(state: AppState, id: String) -> Result<AgentPlanRun,
     get_plan(&state, &id)
 }
 
-async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun, String> {
+pub async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun, String> {
     start_planning_run_inner(state, id, false).await
+}
+
+/// Statuses a plan can never leave on its own — restoring one of these would put the
+/// plan straight back into a dead end, which is the bug with extra steps.
+const UNBLOCK_DEAD_ENDS: [&str; 4] = ["blocked", "stopped", "closed", "approved"];
+
+/// The status an unblock falls back to when no blocking event recorded a
+/// `statusBefore` (the `block_plan` path emits `agent_plan_blocked {"reason":…}` and
+/// no status at all).
+///
+/// WHY `planning_review_running`: it must be a status `start_planning_run_inner`
+/// actually acts on — it returns early and silently on `blocked`/`stopped`/`approved`,
+/// and `planning_review_running` is the one status in its "already in flight" branch
+/// that does something *without* needing a worker session. A plan parked in `blocked`
+/// by definition has no live planner session (the host restarted, or the agent asked
+/// for a human), so the sibling `planning_planner_running` would bail out with
+/// "Planning run has no planner session" and the plan would still be unrunnable.
+/// Re-running the lens fan-out is also the honest resume point: a plan gets blocked
+/// while waiting on a human *after* the planner produced something worth reviewing.
+const UNBLOCK_FALLBACK_STATUS: &str = "planning_review_running";
+
+/// Lift a plan out of `blocked`.
+///
+/// The restore target is the status recorded by the most recent blocking event that
+/// carries a `statusBefore` — the `agent_blocked` event records
+/// `{"statusBefore":"planning_planner_running"}`, and the events table survives a host
+/// restart where the caller's in-memory copy of the previous status does not. A
+/// recorded status that is itself a dead end (`blocked`, `stopped`, `closed`,
+/// `approved`) is not restored; neither is a missing one — in both cases the
+/// `UNBLOCK_FALLBACK_STATUS` is used and the event SAYS so, because a restored status
+/// and an invented one must not look identical in the timeline.
+///
+/// A plan that is not blocked is refused outright: a quiet success on `approved`
+/// would reopen finished work, and on `stopped` would restart a run a human
+/// deliberately killed.
+pub async fn unblock_plan(state: &AppState, id: String) -> Result<AgentPlanRun, String> {
+    let run = get_plan(state, &id)?;
+    if run.plan.status != "blocked" {
+        return Err(format!(
+            "plan {id} is not blocked (status {:?}), so there is nothing to unblock",
+            run.plan.status
+        ));
+    }
+
+    // Most recent blocking event that carries a recorded `statusBefore`.
+    let recorded: Option<String> = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT payload_json FROM agent_plan_events \
+                 WHERE plan_id = ?1 AND type IN ('agent_blocked', 'agent_plan_blocked') \
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })?
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .and_then(|value| {
+            value
+                .get("statusBefore")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+
+    let (target, source) = match recorded {
+        Some(previous) if !UNBLOCK_DEAD_ENDS.contains(&previous.as_str()) => {
+            (previous, "event".to_string())
+        }
+        _ => (
+            UNBLOCK_FALLBACK_STATUS.to_string(),
+            "fallback-default".to_string(),
+        ),
+    };
+
+    // `health_from_status` returns a `&'static str`; bind it to a local so the
+    // params slice cannot outlive a temporary.
+    let target_health = health_from_status(target.as_str());
+
+    // Guarded on the plan still being `blocked`, so a human who stopped or closed the
+    // run in the meantime is never overridden. `error` is cleared and health is
+    // derived from the restored status.
+    let restored = state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET status = ?1, health = ?2, error = NULL, updated_at = datetime('now') \
+             WHERE id = ?3 AND status = 'blocked'",
+            params![target, target_health, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    if restored == 0 {
+        return Err(format!(
+            "plan {id} is not blocked (its status changed under us), so there is nothing to unblock"
+        ));
+    }
+
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_unblocked",
+        json!({
+            "statusBefore": "blocked",
+            "statusAfter": target,
+            "statusAfterSource": source,
+        }),
+    )?;
+    get_plan(state, &id)
 }
 
 async fn start_planning_run_inner(
@@ -4846,9 +5039,17 @@ fn prompt_probe(prompt: &str) -> String {
 /// A first-run directory-trust modal, across the agent CLIs J1 drives.
 fn pane_awaiting_trust(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
+    // The modal's OWN question wording, matched as a phrase. A bare "do you trust"
+    // was the old match and it false-positives on ordinary agent prose — a review
+    // lens writing "do you trust this migration?" in its findings froze the run with
+    // "waiting on a folder-trust prompt" while the pane showed a finished review.
+    // A trust modal is a CLI's question to the human, so require the folder/directory
+    // noun next to the verb; agent prose addresses the reader, not a directory.
     lower.contains("trust this folder")
-        || lower.contains("do you trust")
+        || lower.contains("trust this directory")
         || lower.contains("trust the files in this folder")
+        || lower.contains("trust the files in this directory")
+        || lower.contains("do you trust")
 }
 
 /// Read a report's markdown attachment, if `evidence` names one.
@@ -5491,6 +5692,29 @@ fn review_body_path(session_id: &str) -> std::path::PathBuf {
         .join(format!("{session_id}.json"))
 }
 
+/// One in-flight lens in the planning fan-out, tagged with the TRANSPORT it is being
+/// driven over (see `stream_lens::lens_transport`).
+///
+/// `Pane` is today's path: a session + tmux pane whose verdict is waited for and which
+/// must be disposed. `Stream` is an HTTP provider (`lokalai`) driven as a streamed
+/// response — NO session row and NO pane, so there is nothing to dispose. `Failed`
+/// holds a lens whose spawn already failed, so its error is reported at collection
+/// time (after the other lenses were given the chance to answer) rather than swallowed.
+enum LensSlot {
+    Pane {
+        name: String,
+        session_id: String,
+    },
+    Stream {
+        name: String,
+        task: tokio::task::JoinHandle<Result<AgentReport, String>>,
+    },
+    Failed {
+        name: String,
+        error: String,
+    },
+}
+
 /// Instruction telling a lens to report its verdict AND reasons through the
 /// `reportAgentResult` API (summary + findings), never by printing to the screen.
 /// Uses GraphQL variables in a body file so the agent only edits simple JSON values.
@@ -5980,6 +6204,68 @@ async fn run_lens_fanout_review(
     handle_reviewer_output(state, run, phase, &merged).await
 }
 
+/// The material block for a stream lens: the four documents a pane lens is told
+/// to go and read, read HERE on the host and inlined as labelled sections.
+///
+/// Order is load-bearing — `inline_material` spends the budget in order, so the
+/// brief (the user's intent) is never the casualty of a later, larger document.
+/// The budget is `stream_lens::LENS_MATERIAL_BUDGET_BYTES` (80,000 chars ≈
+/// 25–30k tokens of prose): generous against a ~128k-token window for a real
+/// plan store, hard enough to stop a runaway one, and any cut is NAMED with a
+/// count rather than silent.
+fn stream_lens_material(state: &AppState, run: &AgentPlanRun) -> String {
+    let values = planning_template_values(state, run);
+    let get = |k: &str| {
+        values
+            .iter()
+            .find(|(kk, _)| *kk == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let plan_root = Path::new(&run.plan.plan_path);
+    // Every path goes through the SAME expander, in the SAME order.
+    // `inline_material` spends its byte budget in order, so the brief — the
+    // user's intent — is expanded and rendered first and can never be the
+    // casualty of a large conventions directory. The first three are files, and
+    // an expander handed a file returns exactly the one document
+    // `read_lens_doc_body` used to build by hand, label and path unchanged.
+    // The fourth is the one that was broken: `conventions_path` is a DIRECTORY
+    // (every planner prompt says "every file under {{conventions_path}}"), so
+    // `read_to_string` on it returned `Is a directory (os error 21)` and the
+    // reviewer was measured against a checklist it had never been shown. The
+    // expander turns that directory into one document per file beneath it, each
+    // naming its own file, so `review-lenses.md` is text the lens can cite.
+    let mut docs: Vec<stream_lens::LensDoc> = Vec::new();
+    docs.extend(stream_lens::expand_lens_docs(
+        "BRIEF",
+        &plan_root.join("brief.md"),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(stream_lens::expand_lens_docs(
+        "PLAN",
+        &plan_root.join("overview.md"),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(stream_lens::expand_lens_docs(
+        "METHODOLOGY",
+        &Path::new(&get("methodology_path")),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(stream_lens::expand_lens_docs(
+        "CONVENTIONS",
+        &Path::new(&get("conventions_path")),
+        stream_lens::LENS_MATERIAL_MAX_FILES,
+    ));
+    format!(
+        "You are the review lens for a PLAN (a planning run). Judge whether the \
+         PLAN itself is ready, and whether it is faithful to the accepted brief. \
+         Everything you must review is included below as labelled sections — the \
+         accepted brief, the plan, the methodology and the conventions — so \
+         judge only the material shown to you here.\n\n{}\n",
+        stream_lens::inline_material(&docs, stream_lens::LENS_MATERIAL_BUDGET_BYTES)
+    )
+}
+
 fn planning_lens_reviewer_prompt(
     state: &AppState,
     run: &AgentPlanRun,
@@ -6036,7 +6322,17 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
 /// lens against the whole plan, each on its own provider/model, awaited with `join_all`, gated over
 /// the blocking lenses (D4). Mirrors `run_lens_fanout_review` but has no phase (planning is a
 /// whole-plan review). EXTENDS the loop — only the arity and per-lens plumbing changed.
-async fn run_planning_lens_fanout_review(
+///
+/// `pub` so the call site itself can be driven by a spec (`tests/stream_lens.rs` s8).
+///
+/// TRANSPORT SPLIT (the `%2375` / `%2424` fix): each lens is driven over the transport its
+/// provider actually has — `stream_lens::lens_transport`. A pane lens keeps today's path byte for
+/// byte; a **stream** lens (an HTTP provider such as `lokalai`, whose command IS curl) is driven as
+/// a streamed response and creates NO session and NO tmux pane, because there is no interactive CLI
+/// to attach to and no shell to run a `reportAgentResult` curl from. Both branches yield the same
+/// `AgentReport`, so everything after the loop is unchanged, and a stream lens that errors
+/// propagates `?` exactly like a pane lens that errors — never a defaulted PASS.
+pub async fn run_planning_lens_fanout_review(
     state: &AppState,
     run: &AgentPlanRun,
 ) -> Result<(), String> {
@@ -6046,9 +6342,98 @@ async fn run_planning_lens_fanout_review(
     let plan_id = run.plan.id.clone();
     let _ = std::fs::create_dir_all(std::env::temp_dir().join("johnnyone-reviews"));
 
-    let mut sessions: Vec<(String, String)> = Vec::new(); // (lens name, session_id)
+    // One in-flight lens per configured lens, in config order. A pane lens is a
+    // (lens name, session id) pair whose verdict is waited for; a stream lens is
+    // a future already running, with NO session and NO pane behind it.
+    let mut slots: Vec<LensSlot> = Vec::new();
     for (lens, desc) in lenses.iter().zip(descriptors.iter()) {
-        let sid = spawn_ephemeral_agent(
+        let provider = match CliProvider::from_str(&desc.provider) {
+            Some(provider) => provider,
+            // Already rejected upstream by `lens_spawn_descriptors` (D13).
+            None => return Err(format!("Unknown provider '{}'", desc.provider)),
+        };
+        if stream_lens::lens_transport(provider) == LensTransport::Stream {
+            // THE STREAM PATH: no session, no pane, no self-reporting curl.
+            let (endpoint, api_key) = match lokalai::resolve_endpoint_and_key(state) {
+                Some(pair) => pair,
+                None => {
+                    slots.push(LensSlot::Failed {
+                        name: desc.name.clone(),
+                        error: format!(
+                            "stream lens '{}': {}",
+                            desc.name,
+                            stream_lens::resolve_lokalai_credentials(state).unwrap_err()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            // `glm` is an ALIAS from the kloo profile's own table and the endpoint
+            // only serves real ids (`glm` → `glm-5.3-flash`), so resolve it before it
+            // reaches the request body. An unrecognised name is the caller's choice
+            // and goes out unchanged — never substituted with a default.
+            // `resolve_endpoint_key_and_model` reads the kloo profile itself and
+            // returns the resolved model id (`glm` → `glm-5.3-flash`); an
+            // unrecognised name goes out unchanged — never a default.
+            let model = lokalai::resolve_endpoint_key_and_model(
+                state,
+                desc.model.as_deref().unwrap_or(""),
+            )
+            .and_then(|(_, _, model)| model)
+            // No profile to read the table from: the caller's name still stands.
+            .or_else(|| desc.model.clone())
+            .unwrap_or_default();
+            // The SAME plan-review prompt a pane lens gets, with the stream tail in
+            // place of the report-protocol tail: a lens cannot run a curl it has no
+            // shell for, and cannot emit a token it was never shown.
+            let report_tail = lens_report_instruction(&plan_id, &desc.name);
+            // THE MATERIAL, NOT THE PATHS. The pane prompt opens "Read first: …
+            // at {brief}; methodology at {methodology}; … then read the plan at
+            // {plan_output}" — four filesystem paths, which is right for a CLI
+            // agent holding Read and Bash and WRONG for one HTTP completion with
+            // no disk: on 2026-10-24 at 02:00:07 glm answered each of those
+            // instructions with a blocked tool call and returned BLOCKED.
+            // So the HOST reads the four documents and inlines their BODIES as
+            // labelled sections, then appends the stream tail (which shows the
+            // four verdict tokens in place of the curl it cannot run). The pane
+            // branch below is untouched — it still gets the path-based prompt.
+            let prompt = format!(
+                "{}{}",
+                stream_lens_material(state, run),
+                stream_lens::stream_lens_prompt_tail(&desc.name)
+            );
+            // `tokio::spawn` needs an owned, `'static` future, so the seven
+            // borrowed arguments are moved into the async block and borrowed there.
+            let workspace = run.plan.workspace_path.clone();
+            let lens_name = desc.name.clone();
+            let plan_run_id = plan_id.clone();
+            let task = tokio::spawn(async move {
+                stream_lens::run_stream_lens(
+                    &endpoint,
+                    &api_key,
+                    &model,
+                    &prompt,
+                    &workspace,
+                    &plan_run_id,
+                    &lens_name,
+                )
+                .await
+            });
+            let _ = append_event(
+                state,
+                &plan_id,
+                None,
+                "agent_lens_review_started",
+                json!({ "lens": desc.name }),
+            );
+            slots.push(LensSlot::Stream {
+                name: desc.name.clone(),
+                task,
+            });
+            continue;
+        }
+        // THE PANE PATH — today's path, unchanged.
+        match spawn_ephemeral_agent(
             state,
             &plan_id,
             &desc.name,
@@ -6057,28 +6442,66 @@ async fn run_planning_lens_fanout_review(
             working_dir.clone(),
             |sid| planning_lens_reviewer_prompt(state, run, lens, sid),
         )
-        .await?;
-        let _ = append_event(
-            state,
-            &plan_id,
-            None,
-            "agent_lens_review_started",
-            json!({ "lens": desc.name }),
-        );
-        sessions.push((desc.name.clone(), sid));
+        .await
+        {
+            Ok(sid) => {
+                let _ = append_event(
+                    state,
+                    &plan_id,
+                    None,
+                    "agent_lens_review_started",
+                    json!({ "lens": desc.name }),
+                );
+                slots.push(LensSlot::Pane {
+                    name: desc.name.clone(),
+                    session_id: sid,
+                });
+            }
+            Err(error) => slots.push(LensSlot::Failed {
+                name: desc.name.clone(),
+                error,
+            }),
+        }
     }
 
-    let futures = sessions
+    // Collect every verdict concurrently — order preserved so results[i] aligns with lenses[i].
+    let pane_futures: Vec<_> = slots
         .iter()
-        .map(|(name, sid)| wait_for_lens_verdict(state, sid, name));
-    let results = futures_util::future::join_all(futures).await;
+        .filter_map(|slot| match slot {
+            LensSlot::Pane { session_id, name } => {
+                Some(wait_for_lens_verdict(state, session_id, name))
+            }
+            _ => None,
+        })
+        .collect();
+    let pane_results = futures_util::future::join_all(pane_futures).await;
 
-    for (_, sid) in &sessions {
-        dispose_ephemeral_agent(state, sid).await;
+    // Tear the pane reviewers down regardless of outcome (a stream lens has
+    // nothing to dispose — it created no session).
+    for slot in &slots {
+        if let LensSlot::Pane { session_id, .. } = slot {
+            dispose_ephemeral_agent(state, session_id).await;
+        }
     }
 
+    let mut pane_results = pane_results.into_iter();
     let mut outcomes: Vec<(String, String, ReviewInsights)> = Vec::new();
-    for ((name, _sid), res) in sessions.iter().zip(results.into_iter()) {
+    for slot in slots.into_iter() {
+        let (name, res): (String, Result<AgentReport, String>) = match slot {
+            LensSlot::Pane { name, .. } => match pane_results.next() {
+                Some(res) => (name.clone(), res),
+                None => (name.clone(), Err(format!("lens '{name}' produced no verdict"))),
+            },
+            LensSlot::Stream { name, task } => match task.await {
+                Ok(Ok(report)) => (name.clone(), Ok(report)),
+                Ok(Err(error)) => (name.clone(), Err(error)),
+                Err(error) => (
+                    name.clone(),
+                    Err(format!("stream lens '{name}' failed: {error}")),
+                ),
+            },
+            LensSlot::Failed { name, error } => (name.clone(), Err(error)),
+        };
         let report = res?; // any lens escalation → needs_attention
         let verdict = report
             .verdict
@@ -6090,9 +6513,9 @@ async fn run_planning_lens_fanout_review(
             &plan_id,
             None,
             "agent_lens_verdict",
-            lens_verdict_payload(name, &verdict, &insights),
+            lens_verdict_payload(&name, &verdict, &insights),
         );
-        outcomes.push((name.clone(), verdict, insights));
+        outcomes.push((name, verdict, insights));
     }
 
     let gate = gate_verdict_over_blocking(&outcomes, &lenses);

@@ -4,6 +4,7 @@ pub mod cline;
 pub mod codex;
 pub mod grok;
 pub mod kloo_cli;
+pub mod lokalai;
 pub mod ollama_cli;
 pub mod output_parser;
 
@@ -27,6 +28,21 @@ pub enum CliProvider {
     /// `kloo --benchmark` oneshot executor (local-small / task.yml loop).
     /// Not a chat provider — spawn via `kloo_cli::build_config` + `cli_runner`.
     Kloo,
+    /// `lokalai` — an OpenAI-compatible HTTP endpoint (glm among others) driven through
+    /// `curl` with SSE streaming (`"stream": true`). A real chat provider: it answers
+    /// questions, so unlike `Kloo`/`Shell` it is a legal review lens — but it has no
+    /// interactive pane, so a lens on this provider is driven as a STREAM, not a tmux
+    /// pane (see `services::stream_lens::lens_transport`).
+    ///
+    /// The API key never reaches the spawned argv (`ps` is world-readable) and never
+    /// touches the disk: it rides in the child's environment as `LOKALAI_API_KEY`
+    /// (`lokalai::API_KEY_ENV`), and argv carries only that variable's NAME — curl
+    /// imports it with `--variable %LOKALAI_API_KEY` and substitutes it into the
+    /// header with `--expand-header "Authorization: Bearer {{LOKALAI_API_KEY}}"`.
+    /// An earlier revision wrote a mode-0600 curl config file per request and leaked
+    /// one per chat turn; round 3 deleted it, and `tests/lokalai_provider.rs` t9
+    /// forbids `--config`/`-K` outright. Never log the key.
+    Lokalai,
 }
 
 impl CliProvider {
@@ -39,6 +55,7 @@ impl CliProvider {
             Self::Grok => "grok",
             Self::Shell => "shell",
             Self::Kloo => "kloo",
+            Self::Lokalai => "lokalai",
         }
     }
 
@@ -51,6 +68,7 @@ impl CliProvider {
             "grok" => Some(Self::Grok),
             "shell" | "bash" | "sh" => Some(Self::Shell),
             "kloo" => Some(Self::Kloo),
+            "lokalai" => Some(Self::Lokalai),
             _ => None,
         }
     }
@@ -66,6 +84,8 @@ impl CliProvider {
             // fallback if $SHELL isn't set. Resolved in terminal.rs::provider_command.
             Self::Shell => "bash",
             Self::Kloo => "kloo",
+            // lokalai speaks HTTP; it stays a subprocess like every other provider.
+            Self::Lokalai => "curl",
         }
     }
 }
@@ -113,6 +133,8 @@ pub enum ChunkType {
     Stderr,
     /// System/init event (contains session_id, model info, etc.)
     System,
+    /// Incremental assistant text from a streaming (SSE) provider.
+    Assistant,
 }
 
 /// Configuration for spawning a CLI subprocess.
@@ -147,5 +169,12 @@ mod tests {
         assert_eq!(CliProvider::from_str("kloo"), Some(CliProvider::Kloo));
         assert_eq!(CliProvider::Kloo.as_str(), "kloo");
         assert_eq!(CliProvider::Kloo.default_command(), "kloo");
+    }
+
+    #[test]
+    fn lokalai_provider_resolves() {
+        assert_eq!(CliProvider::from_str("lokalai"), Some(CliProvider::Lokalai));
+        assert_eq!(CliProvider::Lokalai.as_str(), "lokalai");
+        assert_eq!(CliProvider::Lokalai.default_command(), "curl");
     }
 }

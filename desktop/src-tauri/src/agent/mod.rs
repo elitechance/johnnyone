@@ -5,7 +5,8 @@ pub mod registration;
 pub mod ws_client;
 
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, grok, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
+    StreamChunk,
 };
 use crate::services::{
     chat_host, providers as provider_service, sessions as session_service,
@@ -1256,6 +1257,9 @@ impl AgentService {
             "update_agent_plan_app_scope" => {
                 Self::rpc_update_agent_plan_app_scope(&req.params, state)
             }
+            "update_agent_plan_dev_providers" => {
+                Self::rpc_update_agent_plan_dev_providers(&req.params, state)
+            }
             "update_agent_plan_validation_config" => {
                 Self::rpc_update_agent_plan_validation_config(&req.params, state)
             }
@@ -1307,6 +1311,7 @@ impl AgentService {
             "stop_agent_plan" => Self::rpc_stop_agent_plan(&req.params, state).await,
             "delete_agent_plan" => Self::rpc_delete_agent_plan(&req.params, state).await,
             "block_agent_plan" => Self::rpc_block_agent_plan(&req.params, state).await,
+            "unblock_agent_plan" => Self::rpc_unblock_agent_plan(&req.params, state).await,
             "manual_pass_agent_phase" => {
                 Self::rpc_manual_pass_agent_phase(&req.params, state).await
             }
@@ -1777,6 +1782,35 @@ impl AgentService {
             state,
             id.to_string(),
             app_scope,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Repair the development-stage provider binding on a planning row. Both arguments are
+    /// optional — null/absent clears that side to SQL NULL (= inherit the planning row's own
+    /// provider). The oneshot refusal and the planning-row-only check live in the service, so the
+    /// relay and a local caller cannot disagree about them.
+    fn rpc_update_agent_plan_dev_providers(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let dev_worker = params
+            .get("devWorkerProvider")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string());
+        let dev_reviewer = params
+            .get("devReviewerProvider")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string());
+        let run = crate::services::agent_plans::rebind_development_providers(
+            state,
+            id.to_string(),
+            dev_worker,
+            dev_reviewer,
         )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
@@ -2395,6 +2429,18 @@ impl AgentService {
             .unwrap_or("Blocked by user")
             .to_string();
         let run = crate::services::agent_plans::block_plan(state, id.to_string(), reason).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_unblock_agent_plan(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let run = crate::services::agent_plans::unblock_plan(state, id.to_string()).await?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
@@ -3024,7 +3070,11 @@ impl AgentService {
     ) -> Option<crate::events::StreamEvent> {
         use crate::events::StreamEvent;
         let (kind, text, tool_name, data) = match chunk.chunk_type {
-            ChunkType::Text => ("text", Some(chunk.content.clone()), None, None),
+            // `Assistant` is the incremental-delta kind emitted by streaming HTTP
+            // providers (lokalai); it renders exactly like `Text`.
+            ChunkType::Text | ChunkType::Assistant => {
+                ("text", Some(chunk.content.clone()), None, None)
+            }
             ChunkType::ToolUse => (
                 "tool_call",
                 None,
@@ -3189,6 +3239,11 @@ impl AgentService {
             }
             CliProvider::Shell => unreachable!("shell provider already rejected"),
             CliProvider::Kloo => unreachable!("kloo provider already rejected"),
+            CliProvider::Lokalai => {
+                let (endpoint, api_key) = lokalai::resolve_endpoint_and_key(&state)
+                    .unwrap_or_default();
+                lokalai::build_config(&req.content, &working_dir, &model, &endpoint, &api_key)
+            }
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -3199,6 +3254,7 @@ impl AgentService {
             CliProvider::Ollama => ollama_cli::parse_line,
             CliProvider::Shell => unreachable!("shell provider already rejected"),
             CliProvider::Kloo => unreachable!("kloo provider already rejected"),
+            CliProvider::Lokalai => lokalai::parse_line,
         };
 
         let (_process, mut rx) =
