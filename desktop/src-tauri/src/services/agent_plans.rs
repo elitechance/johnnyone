@@ -1586,8 +1586,117 @@ pub async fn rerun_reviewer(state: AppState, id: String) -> Result<AgentPlanRun,
     get_plan(&state, &id)
 }
 
-async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun, String> {
+pub async fn start_planning_run(state: AppState, id: String) -> Result<AgentPlanRun, String> {
     start_planning_run_inner(state, id, false).await
+}
+
+/// Statuses a plan can never leave on its own — restoring one of these would put the
+/// plan straight back into a dead end, which is the bug with extra steps.
+const UNBLOCK_DEAD_ENDS: [&str; 4] = ["blocked", "stopped", "closed", "approved"];
+
+/// The status an unblock falls back to when no blocking event recorded a
+/// `statusBefore` (the `block_plan` path emits `agent_plan_blocked {"reason":…}` and
+/// no status at all).
+///
+/// WHY `planning_review_running`: it must be a status `start_planning_run_inner`
+/// actually acts on — it returns early and silently on `blocked`/`stopped`/`approved`,
+/// and `planning_review_running` is the one status in its "already in flight" branch
+/// that does something *without* needing a worker session. A plan parked in `blocked`
+/// by definition has no live planner session (the host restarted, or the agent asked
+/// for a human), so the sibling `planning_planner_running` would bail out with
+/// "Planning run has no planner session" and the plan would still be unrunnable.
+/// Re-running the lens fan-out is also the honest resume point: a plan gets blocked
+/// while waiting on a human *after* the planner produced something worth reviewing.
+const UNBLOCK_FALLBACK_STATUS: &str = "planning_review_running";
+
+/// Lift a plan out of `blocked`.
+///
+/// The restore target is the status recorded by the most recent blocking event that
+/// carries a `statusBefore` — the `agent_blocked` event records
+/// `{"statusBefore":"planning_planner_running"}`, and the events table survives a host
+/// restart where the caller's in-memory copy of the previous status does not. A
+/// recorded status that is itself a dead end (`blocked`, `stopped`, `closed`,
+/// `approved`) is not restored; neither is a missing one — in both cases the
+/// `UNBLOCK_FALLBACK_STATUS` is used and the event SAYS so, because a restored status
+/// and an invented one must not look identical in the timeline.
+///
+/// A plan that is not blocked is refused outright: a quiet success on `approved`
+/// would reopen finished work, and on `stopped` would restart a run a human
+/// deliberately killed.
+pub async fn unblock_plan(state: &AppState, id: String) -> Result<AgentPlanRun, String> {
+    let run = get_plan(state, &id)?;
+    if run.plan.status != "blocked" {
+        return Err(format!(
+            "plan {id} is not blocked (status {:?}), so there is nothing to unblock",
+            run.plan.status
+        ));
+    }
+
+    // Most recent blocking event that carries a recorded `statusBefore`.
+    let recorded: Option<String> = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT payload_json FROM agent_plan_events \
+                 WHERE plan_id = ?1 AND type IN ('agent_blocked', 'agent_plan_blocked') \
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })?
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+        .and_then(|value| {
+            value
+                .get("statusBefore")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+
+    let (target, source) = match recorded {
+        Some(previous) if !UNBLOCK_DEAD_ENDS.contains(&previous.as_str()) => {
+            (previous, "event".to_string())
+        }
+        _ => (
+            UNBLOCK_FALLBACK_STATUS.to_string(),
+            "fallback-default".to_string(),
+        ),
+    };
+
+    // `health_from_status` returns a `&'static str`; bind it to a local so the
+    // params slice cannot outlive a temporary.
+    let target_health = health_from_status(target.as_str());
+
+    // Guarded on the plan still being `blocked`, so a human who stopped or closed the
+    // run in the meantime is never overridden. `error` is cleared and health is
+    // derived from the restored status.
+    let restored = state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET status = ?1, health = ?2, error = NULL, updated_at = datetime('now') \
+             WHERE id = ?3 AND status = 'blocked'",
+            params![target, target_health, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    if restored == 0 {
+        return Err(format!(
+            "plan {id} is not blocked (its status changed under us), so there is nothing to unblock"
+        ));
+    }
+
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_unblocked",
+        json!({
+            "statusBefore": "blocked",
+            "statusAfter": target,
+            "statusAfterSource": source,
+        }),
+    )?;
+    get_plan(state, &id)
 }
 
 async fn start_planning_run_inner(
