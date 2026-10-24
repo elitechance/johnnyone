@@ -178,11 +178,18 @@ async fn u3_unblock_refuses_a_plan_that_is_not_blocked() {
         .await
         .expect_err("a second unblock must be refused, not silently applied");
 
+    // The actual status, NOT merely the words "not blocked". This assertion used
+    // to accept either, and that `||` let a real mutation through: removing the
+    // status guard entirely still passed, because the `WHERE status = 'blocked'`
+    // on the UPDATE catches the second call and returns its own refusal — which
+    // says "its status changed under us" and names no status at all. Both
+    // refusals contain "not blocked", so the loose assertion could not tell a
+    // guard that reports the status from a fallback that does not. The guard's
+    // whole value is the diagnostic, so the test has to demand the diagnostic.
     assert!(
-        err.to_lowercase().contains("planning_planner_running")
-            || err.to_lowercase().contains("not blocked"),
-        "the refusal does not say what the plan's status actually is, so the \
-         caller cannot tell a refusal from a failure: {err}"
+        err.contains("planning_planner_running"),
+        "the refusal does not NAME the plan's actual status, so the caller is \
+         told only that something is wrong, not what: {err}"
     );
 
     let after = agent_plans::get_plan(&state, &id).expect("reload");
