@@ -851,6 +851,15 @@ type Mutation {
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
   updateAgentPlanBlocked(id: ID!, reason: String!): AgentPlanRun!
+  # The way OUT of `blocked`. A reviewer that returns BLOCKED parks the plan there and
+  # of the plan mutations NONE clears it — updateAgentPlanBlocked only SETS it, and
+  # `start_planning_run_inner` returns early and silently on `blocked`, so every honest
+  # BLOCKED strands the run until a human runs a workaround. The host restores the
+  # status the plan's own `agent_blocked` event recorded (the events table survives a
+  # restart, the caller's variable does not) and falls back to `planning_review_running`
+  # when no transition was recorded — named in the `agent_unblocked` event, never a
+  # silent guess. Refused on a plan that is not blocked.
+  unblockAgentPlan(id: ID!): AgentPlanRun!
   updateAgentPhaseManualPass(id: ID!, phaseId: String!): AgentPlanRun!
   sendAgentFeedbackToWorker(id: ID!): AgentPlanRun!
   retryAgentReviewer(id: ID!): AgentPlanRun!
