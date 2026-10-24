@@ -287,6 +287,20 @@ fn normalize_stage_provider(value: Option<&str>) -> Option<String> {
 /// that row's own provider, which is the pre-existing single-agent behaviour (so initiatives created
 /// before migration 021 keep working unchanged). The two sides resolve independently: binding only
 /// the builder still leaves validation on the planning provider.
+/// Repair the development-stage binding on an existing **planning** row.
+///
+/// SCAFFOLD ONLY — this is the signature the specification in
+/// `tests/dev_stage_providers.rs` (d5) requires; the behaviour is not written
+/// yet. See that file's header for the live failure this closes.
+pub fn rebind_development_providers(
+    _state: &AppState,
+    _id: String,
+    _dev_worker: Option<String>,
+    _dev_reviewer: Option<String>,
+) -> Result<AgentPlanRun, String> {
+    Err("rebind_development_providers is not implemented".to_string())
+}
+
 pub fn development_stage_providers(planning: &AgentPlan) -> (String, String) {
     (
         planning
