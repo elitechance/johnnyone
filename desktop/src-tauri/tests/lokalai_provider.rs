@@ -235,3 +235,97 @@ fn leaked_config_files() -> usize {
         })
         .unwrap_or(0)
 }
+
+// THE DEFECT, measured against the live endpoint on 2026-10-23 before it could
+// cost a restart cycle:
+//
+// ```text
+// GET https://lokalai.silverjrom.app/v1/models  ->  6 ids
+//   boxb-qwen, boxb-qwen-131k, deepseek-v4.1-flash,
+//   glm-5.3-flash, qwen3.8-flash-next, qwen3.8-flash-next-132k-fast
+//
+// is "glm" a served id?       false
+// is "next" a served id?      false
+// ```
+//
+// The plan's own configuration speaks the arena's vocabulary:
+//
+// ```text
+// executor_config   {"mode":"local-small","provider":"lokalai","model":"next"}
+// validation_config [{"name":"glm-validator","provider":"lokalai","model":"glm",…}]
+// ```
+//
+// `next` and `glm` are ALIASES. They come from the kloo profile's own table at
+// `providers.lokalai.models` — `{"next":"qwen3.8-flash-next","glm":"glm-5.3-flash"}`
+// — and `request_body` puts whatever string it is handed straight into
+// `{"model": …}`. So the lens asks the endpoint for a model that does not
+// exist, and the arena's two names are exactly the two that fail.
+//
+// This is the same shape as the 401: a request that is well-formed, a suite
+// that is green, and nothing on the wire that the server would accept.
+
+/// a1 — an alias from the profile's own table resolves to the served id.
+#[test]
+fn a1_a_profile_alias_resolves_to_the_served_model_id() {
+    let profile = r#"{
+      "providers": {
+        "lokalai": {
+          "endpoint": "https://example.invalid/v1",
+          "models": { "next": "qwen3.8-flash-next", "glm": "glm-5.3-flash" },
+          "defaultModel": "next"
+        }
+      }
+    }"#;
+
+    assert_eq!(
+        lokalai::resolve_model_alias(profile, "glm").as_deref(),
+        Some("glm-5.3-flash"),
+        "the arena calls it glm; the endpoint serves glm-5.3-flash"
+    );
+    assert_eq!(
+        lokalai::resolve_model_alias(profile, "next").as_deref(),
+        Some("qwen3.8-flash-next"),
+        "the executor config says next, which is also an alias"
+    );
+}
+
+/// a2 — a served id is passed through untouched, and an unknown name is NOT
+/// rewritten into something else.
+///
+/// Paired with a1 so neither half is an assertion satisfied by nothing: a1
+/// proves aliases are translated, a2 proves nothing else is.
+#[test]
+fn a2_a_real_model_id_is_not_rewritten() {
+    let profile = r#"{"providers":{"lokalai":{"models":{"glm":"glm-5.3-flash"}}}}"#;
+
+    assert_eq!(
+        lokalai::resolve_model_alias(profile, "glm-5.3-flash").as_deref(),
+        Some("glm-5.3-flash"),
+        "an id that is already real must survive the lookup unchanged"
+    );
+    assert_eq!(
+        lokalai::resolve_model_alias(profile, "some-model-nobody-aliased").as_deref(),
+        Some("some-model-nobody-aliased"),
+        "an unaliased name is the caller's own choice — forward it, do not \
+         silently substitute a default. A fallback that replaces input is how a \
+         request ends up asking for the wrong model with no error anywhere."
+    );
+}
+
+/// a3 — the resolved id is what reaches the wire.
+///
+/// a1 and a2 are about a lookup. This one is about the request body, which is
+/// the only thing the server ever sees.
+#[test]
+fn a3_the_resolved_id_is_what_reaches_the_request_body() {
+    let body = lokalai::request_body("review it", "glm-5.3-flash");
+    assert!(
+        body.contains("\"model\":\"glm-5.3-flash\""),
+        "the request body did not carry the served id. Body was:\n{body}"
+    );
+    assert!(
+        !body.contains("\"model\":\"glm\""),
+        "the bare alias reached the wire — the endpoint serves no model called \
+         `glm` and will refuse this. Body was:\n{body}"
+    );
+}

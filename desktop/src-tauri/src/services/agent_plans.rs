@@ -4846,9 +4846,17 @@ fn prompt_probe(prompt: &str) -> String {
 /// A first-run directory-trust modal, across the agent CLIs J1 drives.
 fn pane_awaiting_trust(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
+    // The modal's OWN question wording, matched as a phrase. A bare "do you trust"
+    // was the old match and it false-positives on ordinary agent prose — a review
+    // lens writing "do you trust this migration?" in its findings froze the run with
+    // "waiting on a folder-trust prompt" while the pane showed a finished review.
+    // A trust modal is a CLI's question to the human, so require the folder/directory
+    // noun next to the verb; agent prose addresses the reader, not a directory.
     lower.contains("trust this folder")
-        || lower.contains("do you trust")
+        || lower.contains("trust this directory")
         || lower.contains("trust the files in this folder")
+        || lower.contains("trust the files in this directory")
+        || lower.contains("do you trust")
 }
 
 /// Read a report's markdown attachment, if `evidence` names one.
