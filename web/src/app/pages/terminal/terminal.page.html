@@ -90,6 +90,13 @@
           [devTotal]="taskRows().length"
           [phaseNn]="phaseNn()"
         ></johnny-lifecycle-bar>
+        <!-- Validator view: the health badge alone said `needs-attention` while the WHY (`can't find
+             pane: %2375`) sat eleven rows away in Events. `selHealthReason` is non-null ONLY when the
+             selected run is unhealthy AND carries a non-blank error (the pure `healthReason` decides),
+             so this line appears exactly when there is something to say — one line, not a panel. -->
+        @if (selHealthReason(); as reason) {
+          <div class="health-reason" title="{{ reason }}">{{ reason }}</div>
+        }
         <div class="init-top-row">
           <div class="path">{{ sel.workspacePath }}</div>
           <!-- Run controls, folded from the legacy /planning + /development pages: the console is now
@@ -904,8 +911,11 @@
         <span class="ct tnum">{{ consoleLenses().length }} lenses</span>
       </div>
       <div class="rgroup">
-        @for (lens of consoleLenses(); track lens.name) {
-          <div class="lens">
+        <!-- Configuration order is `consoleLenses()`; `consoleLensOutcomes()` is one-per-lens in that
+             same order, so `index` pairs them. The chips above stay what the lens IS; the strip below
+             says what it has DONE. -->
+        @for (lens of consoleLenses(); track lens.name; let i = $index) {
+          <div class="lens" [attr.data-lens-state]="consoleLensOutcomes()[i]?.state">
             <div class="lh"><span class="nm">{{ lens.name }}</span></div>
             <div class="meta">
               <span class="chip">{{ lens.provider }}</span>
@@ -914,6 +924,31 @@
               }
               <span class="chip" [class.block]="lens.blocking">{{ lens.blocking ? 'blocking' : 'warn-only' }}</span>
             </div>
+            @if (consoleLensOutcomes()[i]; as out) {
+              <div class="lens-outcome">
+                @switch (out.state) {
+                  @case ('reported') {
+                    <!-- Same `ev-verdict` classes as the Events rows: a BLOCKED here is the same colour
+                         as a BLOCKED in Events — one verdict palette for the whole console. -->
+                    <span class="ev-verdict" [attr.data-verdict]="out.verdict">{{ out.verdict }}</span>
+                    @if (out.at) {
+                      <span class="lo-when tnum">{{ out.at | date: 'h:mm a' }}</span>
+                    }
+                  }
+                  @case ('running') {
+                    <!-- The kart case, and the one that matters: dispatched, no verdict, possibly dead.
+                         A plain neutral marker — it must not read as healthy. -->
+                    <span class="lo-state lo-running">
+                      <span class="lo-dot" aria-hidden="true"></span>running · no verdict
+                    </span>
+                  }
+                  @default {
+                    <!-- Quietest of the three: nothing has happened for this lens. -->
+                    <span class="lo-state lo-never">never run</span>
+                  }
+                }
+              </div>
+            }
           </div>
         }
         @if (selectedInitiative(); as sel) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Gate for the validator-view change. Run from the worktree root.
 #
-# Five stages (GATE_FAST=1 skips 2 and 4, the two whole-surface ones):
+# Six stages (GATE_FAST=1 skips 2 and 4, the two whole-surface ones):
 #   1. the new pure specs pass, and the gate COUNTS that they ran
 #   2. the rest of the web unit suite does not regress
 #   3. `nx build web` — a REAL production build
@@ -66,7 +66,7 @@ for f in d.get("testResults",[]):
 # that is a box on the finish plan rather than an intention.
 FAST=${GATE_FAST:-0}
 
-echo "== 1/5 the validator-view spec =="
+echo "== 1/6 the validator-view spec =="
 SPEC_JSON=${TMPDIR:-/tmp}/valview-spec.json
 rm -f "$SPEC_JSON"
 spec=$(vitest_json "$SPEC_JSON" validator-view)
@@ -82,10 +82,10 @@ ran=$sp
 echo "   validator-view tests that PASSED: $ran of $st"
 
 if [ "$FAST" = "1" ]; then
-  echo "== 2/5 SKIPPED (GATE_FAST) — the 1182-test web suite =="
+  echo "== 2/6 SKIPPED (GATE_FAST) — the 1182-test web suite =="
   allran=skipped
 else
-echo "== 2/5 the rest of the web unit suite =="
+echo "== 2/6 the rest of the web unit suite =="
 ALL_JSON=${TMPDIR:-/tmp}/valview-all.json
 rm -f "$ALL_JSON"
 all=$(vitest_json "$ALL_JSON")
@@ -100,16 +100,16 @@ allran=$ap
 echo "   web unit tests that PASSED: $allran of $at"
 fi
 
-echo "== 3/5 nx build web (production) =="
+echo "== 3/6 nx build web (production) =="
 build=$(npx nx build web --skip-nx-cache 2>&1)
 rc=$?
 printf '%s\n' "$build" | tail -20
 [ "$rc" -eq 0 ] || fail "the production build failed — vitest does not typecheck templates, this stage does"
 
 if [ "$FAST" = "1" ]; then
-  echo "== 4/5 SKIPPED (GATE_FAST) — the headless-Chrome boot =="
+  echo "== 4/6 SKIPPED (GATE_FAST) — the headless-Chrome boot =="
 else
-echo "== 4/5 boot check: the built app renders in real headless Chrome =="
+echo "== 4/6 boot check: the built app renders in real headless Chrome =="
 if [ ! -x /usr/bin/google-chrome ]; then
   fail "no /usr/bin/google-chrome — the boot stage cannot run, and a gate that silently skips its only render check is worse than no gate"
 fi
@@ -146,7 +146,7 @@ fi
 printf '%s\n' "$boot" | grep -q "after console-arena-tab" || fail "the harness did not reach the console route — it did not actually boot the app"
 fi
 
-echo "== 5/5 the wiring: the page must actually USE what was written =="
+echo "== 5/6 the wiring: the page must actually USE what was written =="
 # WHY THIS STAGE EXISTS. Twice tonight a gate proved a module and said nothing
 # about its call site, and both times the work shipped with the defect
 # untouched: stream_lens passed seven tests while the fan-out still spawned
@@ -168,4 +168,29 @@ grep -qE "lensOutcome|lens-outcome|never run|never-run" "$TP/terminal.page.html"
   || fail "the template never renders a per-lens outcome — the VALIDATION panel is still a form"
 echo "   terminal.page.ts and .html reference both"
 
-echo "GATE PASS: $ran validator-view tests, $allran web tests, production build clean, app boots, page wired"
+echo "== 6/6 every class the template introduces must be STYLED =="
+# WHY THIS STAGE EXISTS. Stage 5 greps the template for the SYMBOLS and went
+# green on a render that introduced seven new classes with not one line of CSS
+# behind them: `.health-reason`, `.lens-outcome`, `.lo-state`, `.lo-running`,
+# `.lo-never`, `.lo-dot`, `.lo-when`. Unstyled markup renders as naked inline
+# text — the `running · no verdict` marker, whose whole job is to not read as
+# healthy, reads as nothing at all. A symbol check cannot see that; a human
+# can, and this is the cheapest part of what the human would see.
+#
+# It is STILL a shape check: it proves a rule exists for each class, not that
+# the result is legible. Legibility is the in-Chrome box and no local stage
+# ticks it.
+missing=""
+for cls in health-reason lens-outcome lo-state lo-running lo-never lo-dot lo-when; do
+  if grep -qE "(^|[^a-z-])${cls}([^a-z-]|$)" "$TP/terminal.page.html"; then
+    grep -qE "\\.${cls}\\b" "$TP/terminal.page.scss" || missing="$missing $cls"
+  fi
+done
+if [ -n "$missing" ]; then
+  fail "the template uses these classes and the stylesheet defines none of them:$missing
+Unstyled markup renders as naked inline text. The whole point of the running
+marker is that it must NOT read as healthy; with no CSS it reads as nothing."
+fi
+echo "   every class the template introduces has a rule"
+
+echo "GATE PASS: $ran validator-view tests, $allran web tests, production build clean, app boots, page wired, classes styled"
