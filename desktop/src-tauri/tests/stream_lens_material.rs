@@ -160,6 +160,14 @@ fn m2_the_prompt_never_tells_a_stream_lens_to_read_or_run_anything() {
     );
     let lower = prompt.to_lowercase();
 
+    // These are PHRASES, not bare command names. The first version of this list
+    // held "ls " and "cat ", and `"ls "` is a substring of **"tools "** — so the
+    // prompt could not say "you have no tools", which the very next assertion
+    // in this test REQUIRES, without failing this one. That contradiction is
+    // not a strict test, it is an impossible task: the worker spent 25 verify
+    // attempts and a 60-minute budget against an assertion no prompt could
+    // satisfy. An absence pattern has to be narrow enough that only the thing
+    // it forbids can match it.
     for banned in [
         "read first",
         "read the plan at",
@@ -167,8 +175,9 @@ fn m2_the_prompt_never_tells_a_stream_lens_to_read_or_run_anything() {
         "run the command",
         "use the read tool",
         "open the file",
-        "ls ",
-        "cat ",
+        "list the directory",
+        "`ls`",
+        "`cat`",
     ] {
         assert!(
             !lower.contains(banned),

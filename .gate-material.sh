@@ -23,6 +23,13 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
 MF=desktop/src-tauri/Cargo.toml
+
+# Build OFF the tmpfs: `/tmp` is a 30 GB tmpfs and this worktree's target reached
+# 9.5 GB. On 2026-10-24 cargo failed with `Disk quota exceeded (os error 122)`
+# in a sibling worktree and the gate reported a red the worker could not fix.
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/home/creepy/.cache/j1-cargo/lens}
+mkdir -p "$CARGO_TARGET_DIR" || fail "cannot create $CARGO_TARGET_DIR"
+echo "cargo target: $CARGO_TARGET_DIR"
 fail() { echo "GATE FAIL: $*" >&2; exit 1; }
 
 # "test result: ok. 6 passed; 0 failed; …" -> passed count

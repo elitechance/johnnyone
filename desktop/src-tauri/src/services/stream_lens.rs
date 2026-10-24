@@ -102,12 +102,19 @@ pub fn stream_lens_prompt_tail(lens_name: &str) -> String {
     format!(
         "\n\n---\n\
          You are the `{lens_name}` review lens, running as a single streamed \
-         response. You have no shell and no terminal: you CANNOT post your result \
-         anywhere, and nothing else will read your output except this response \
-         stream. Your review IS the report.\n\n\
+         response. You have no shell, no terminal, no filesystem and no tools \
+         of any kind — you cannot fetch anything, and you must not attempt to. \
+         Everything you need is in this prompt: the brief, the plan, the \
+         methodology and the conventions are included above, in full, as \
+         labelled sections. Judge only the material shown to you here, and do \
+         not ask for anything further. Never return BLOCKED because something \
+         appears to be missing — if a document is empty or cut short, that is \
+         a finding to report, not a reason to stop.\n\n\
+         You cannot post your result anywhere: nothing else will see your \
+         output except this response stream, so your review IS the report.\n\n\
          Write your review as free text: what you checked, what you found, and \
-         file:line evidence for every finding. Then end your response with \
-         EXACTLY one final line naming your verdict, in this form:\n\n\
+         which labelled document each finding sits in. End your response \
+         with EXACTLY one final line naming your verdict, in this form:\n\n\
          \x20   VERDICT: <token>\n\n\
          Where <token> is exactly one of these four, spelled exactly:\n\
          \x20   PASS — ship it as-is.\n\
@@ -207,6 +214,158 @@ pub fn resolve_lokalai_credentials(
         "lokalai: no endpoint and no API key — set them in the provider config or a kloo profile"
             .to_string()
     })
+}
+
+/// One document handed to a tool-less reviewer.
+///
+/// A stream lens has no filesystem, so the host reads the file and passes its
+/// BODY here. `path` is kept purely as provenance — it tells the reviewer (and
+/// a human reading the captured request) where the text came from, so a finding
+/// can cite `plan/overview.md` rather than "the second blob of text".
+#[derive(Debug, Clone)]
+pub struct LensDoc {
+    pub label: String,
+    pub path: String,
+    pub body: String,
+}
+
+/// The material budget for one stream lens's prompt, in BYTES.
+///
+/// WHY 80_000. The candidate models on this transport are served with context
+/// windows of roughly 128k TOKENS; a plan store's brief + overview + methodology
+/// + conventions is a few thousand tokens at the outside, so 80k CHARACTERS
+/// (~25–30k tokens of prose) leaves the rest of the window for the review the
+/// lens writes back. The number matters far less than the RAIL: what killed the
+/// 2026-10-24 run was a reviewer that could not see the plan at all, and the
+/// next failure to guard against is a prompt that grows without bound (a log
+/// pasted into `conventions/`) and dies in the context window. A budget generous
+/// enough never to fire on a real plan, but hard enough to stop a runaway store,
+/// is the property worth having. Truncation is always NAMED (see
+/// [`inline_material`]), so even too small a budget degrades into an honest
+/// BLOCKED rather than a wrong finding.
+pub const LENS_MATERIAL_BUDGET_BYTES: usize = 80_000;
+
+/// Render the documents a tool-less reviewer needs, inside `budget` BYTES.
+///
+/// The contract, in the order it matters:
+///
+/// 1. every document appears as a LABELLED section carrying its body, so the
+///    reviewer can say WHICH document a finding is against;
+/// 2. budget is spent IN ORDER — the brief is first and is therefore never the
+///    casualty of a later, larger document;
+/// 3. over budget the result is at most `budget` bytes, and what was dropped is
+///    NAMED with a count (`… 46,312 characters of PLAN omitted …`). A silent cut
+///    turns "the criteria were truncated" into "phase 3 has no criteria", which
+///    is a wrong finding shipped as a real one;
+/// 4. under budget nothing is altered and NOTHING is announced — a truncation
+///    notice on a complete plan would teach the reviewer to distrust complete
+///    plans;
+/// 5. an EMPTY document is still present and marked empty. A missing brief and
+///    an empty brief are different facts, and only one of them is a finding
+///    about the plan.
+pub fn inline_material(docs: &[LensDoc], budget: usize) -> String {
+    /// The notice naming what was dropped. Deliberately compact: it has to fit
+    /// inside the very budget it is enforcing.
+    fn omission(label: &str, remaining: usize) -> String {
+        format!(
+            "\n[… {remaining} characters of {label} omitted: the material was \
+             truncated to fit the lens's prompt budget. If what you can see is \
+             incomplete, say so and return BLOCKED rather than reporting the \
+             missing part as absent.]\n"
+        )
+    }
+
+    /// A document shown in full, header included. An empty body is MARKED empty
+    /// rather than rendered as nothing.
+    fn section(d: &LensDoc) -> String {
+        let body = if d.body.is_empty() {
+            "(empty — this document exists and contains nothing)".to_string()
+        } else {
+            d.body.clone()
+        };
+        format!(
+            "=== {label} · {path} · {n} characters ===\n{body}\n=== end of {label} ===\n",
+            label = d.label,
+            path = d.path,
+            n = d.body.chars().count(),
+            body = body,
+        )
+    }
+
+    /// The heading for a document whose body is being shown in PART — so a
+    /// reviewer can tell a complete plan from a partial one at a glance, rather
+    /// than only learning at the omission notice at the end.
+    fn partial_heading(d: &LensDoc, shown: usize) -> String {
+        format!(
+            "=== {label} · {path} · PARTIAL: first {shown} of {all} characters shown ===\n",
+            label = d.label,
+            path = d.path,
+            shown = shown,
+            all = d.body.chars().count(),
+        )
+    }
+
+    /// A later document squeezed out entirely still gets a section: header, the
+    /// notice naming its whole body, trailer. The cheapest shape that is neither
+    /// a silent skip nor a lie about what the reviewer is being handed.
+    fn stub(d: &LensDoc) -> String {
+        format!(
+            "=== {label} · {path} ===\n{notice}=== end of {label} ===\n",
+            label = d.label,
+            path = d.path,
+            notice = omission(&d.label, d.body.chars().count()),
+        )
+    }
+
+    let mut out = String::new();
+    for (i, d) in docs.iter().enumerate() {
+        let whole = section(d);
+        // Everything after this document still has to be PRESENT, so reserve the
+        // cheapest possible section for each of them (`stub` of an empty body).
+        // Anything tighter and a later document could be squeezed out of
+        // existence rather than shown as truncated — the silent skip this
+        // function exists to ban.
+        let reserve_bytes: usize = docs[i + 1..].iter().map(|later| stub(later).len()).sum();
+        if out.len() + whole.len() + reserve_bytes <= budget {
+            out.push_str(&whole);
+            continue;
+        }
+        // This document does not fit whole: a PARTIAL heading, as much body as is
+        // left once the reserve and the notice are paid for, then the notice
+        // naming the count. The heading says PARTIAL before the text does, so a
+        // reviewer never mistakes a cut plan for a short one.
+        let trailer = format!("=== end of {} ===\n", d.label);
+        let notice_room = omission(&d.label, d.body.chars().count()).len();
+        let heading_room = partial_heading(d, d.body.chars().count()).len();
+        let room = budget.saturating_sub(
+            out.len() + heading_room + trailer.len() + reserve_bytes + notice_room,
+        );
+        // Cut on a char boundary — a body is UTF-8, and a byte-slice panic in the
+        // coordinator loop would take the whole review down with it.
+        let mut cut = room.min(d.body.len());
+        while cut > 0 && !d.body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let shown = d.body[..cut].chars().count();
+        let omitted = d.body.chars().count() - shown;
+        out.push_str(&partial_heading(d, shown));
+        out.push_str(&d.body[..cut]);
+        out.push_str(&omission(&d.label, omitted));
+        out.push_str(&trailer);
+        // Budget is spent in order, so every later document still appears —
+        // named, empty, and counted. The reserve above pays for them; re-measure
+        // rather than trust it, and stop rather than emit a half-written header.
+        for later in &docs[i + 1..] {
+            let s = stub(later);
+            if out.len() + s.len() > budget {
+                break;
+            }
+            out.push_str(&s);
+        }
+        break;
+    }
+    debug_assert!(out.len() <= budget, "inline_material broke its own rail");
+    out
 }
 
 #[cfg(test)]
