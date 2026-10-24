@@ -1251,6 +1251,29 @@ ion-modal.workspace-picker .picker-empty {
     font-size: 11.5px;
     color: var(--jo-fg-faint);
   }
+  /* Validator view: WHY the run is unhealthy, printed under the badge that only says
+     `needs-attention`. Subordinate to that badge on purpose — smaller and quieter than the path
+     row under it, tinted with the same `--jo-warn` the blocked / NEEDS_CHANGES states already use,
+     so it reads as "this is the problem" without shouting over the lifecycle bar. The reason is a
+     raw host error (`can't find pane: %2375`) and can be arbitrarily long: ONE line here, clipped
+     with an ellipsis, the full text already on the element's `title`. `max-width: 100%` +
+     `min-width: 0` keep a long unbroken token from widening the center column — a flex item's
+     default `min-width: auto` would let it push the grid track instead of ellipsising. */
+  .health-reason {
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--jo-warn, #ffb454);
+    background: color-mix(in srgb, var(--jo-warn, #ffb454) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--jo-warn, #ffb454) 32%, transparent);
+    border-radius: 6px;
+    padding: 3px 8px;
+  }
   .init-run-actions {
     display: flex;
     gap: 8px;
@@ -1699,6 +1722,84 @@ ion-modal.workspace-picker .picker-empty {
   .chip.block {
     color: var(--jo-accent);
     border-color: color-mix(in srgb, var(--jo-accent) 30%, transparent);
+  }
+
+  /* Validator view: what the lens has DONE, as a band under the chips that say what it IS.
+     `.meta` above is transparent with bordered chips; this gets its own ground and top rule so the
+     two never read as one run-on row of chips. `margin-top: -3px` cancels most of the `.lens` gap
+     so the band sits against the chips and the separation is the band's own edge, not dead space;
+     the negative side/bottom margins push it to the row's edges so the ground spans the full width
+     of the lens row rather than stopping short of its padding. */
+  .lens-outcome {
+    margin: -3px -14px -11px;
+    padding: 7px 14px;
+    border-top: 1px solid var(--jo-border);
+    background: var(--jo-bg-elevated);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--jo-font-mono, ui-monospace, Menlo, Consolas, monospace);
+    font-size: 10.5px;
+    letter-spacing: 0.02em;
+  }
+
+  /* The two non-verdict states share a shape — a full-width quiet strip, left-aligned — so the
+     only thing that differs between them is colour and weight (see .lo-running / .lo-never). */
+  .lo-state {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    border-radius: 5px;
+    padding: 2px 7px;
+  }
+
+  /* The kart case: dispatched, no verdict, possibly dead. Amber — the console's "blocked / needs
+     attention" hue, the same token as `.stack-bar .seg.blocked` and the NEEDS_CHANGES verdict — so
+     an in-flight lens can never be mistaken for a passing one. Not green, not the accent. */
+  .lo-running {
+    background: color-mix(in srgb, var(--jo-warn, #ffb454) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--jo-warn, #ffb454) 34%, transparent);
+    color: var(--jo-warn, #ffb454);
+    font-weight: 600;
+  }
+
+  /* The marker inside it: an empty element, so it needs its own box to paint at all. Reuses the
+     `.pane-tab .live` pulse — a dispatched lens IS live-ish, and the motion says "still waiting"
+     rather than "finished". */
+  .lo-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--jo-warn, #ffb454);
+    animation: pane-live-pulse 1.4s ease-in-out infinite;
+  }
+
+  /* Nothing has happened. Visibly quieter than .lo-running: no fill, no weight, just a dashed
+     outline in the row's border colour and the faintest foreground token — present enough to
+     answer "did it run?", muted enough not to compete with the lens actually in flight. */
+  .lo-never {
+    background: transparent;
+    border: 1px dashed var(--jo-border);
+    color: var(--jo-fg-faint);
+    font-weight: 400;
+  }
+
+  /* Timestamp beside a reported verdict. Carries `.tnum` already so the digits align; the verdict
+     keeps all the emphasis, so this is just the faintest text in the band, pushed to the right. */
+  .lo-when {
+    margin-left: auto;
+    color: var(--jo-fg-faint);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .console-right .lens .lo-dot {
+    animation: none;
   }
 }
 

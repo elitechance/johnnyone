@@ -69,7 +69,13 @@ FAST=${GATE_FAST:-0}
 echo "== 1/6 the validator-view spec =="
 SPEC_JSON=${TMPDIR:-/tmp}/valview-spec.json
 rm -f "$SPEC_JSON"
-spec=$(vitest_json "$SPEC_JSON" validator-view)
+# `console-template` runs here, in the FAST half, and not only in the 1182-test
+# stage. It holds `terminal.page.scss`'s size budget, and a stylesheet change is
+# exactly the kind that trips it — which is what happened: the styling run
+# verified under GATE_FAST, never saw stage 2, and reported SUCCESS while the
+# file sat 2,126 bytes over budget. A cheap check that only runs in the
+# expensive half is a check the worker never sees.
+spec=$(vitest_json "$SPEC_JSON" validator-view console-template)
 rc=$?
 printf '%s\n' "$spec" | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E 'FAIL|Error|✘' | head -20
 [ -s "$SPEC_JSON" ] || fail "the spec run produced no JSON report — it did not run at all"
@@ -78,8 +84,8 @@ vitest_names "$SPEC_JSON"
 [ "$rc" -eq 0 ] || fail "the validator-view spec is not green ($sf failed of $st)"
 [ "$sf" -eq 0 ] || fail "$sf validator-view test(s) failed"
 ran=$sp
-[ "$ran" -ge 8 ] || fail "only $ran of the 8 validator-view tests passed — a suite that collects nothing passes everything"
-echo "   validator-view tests that PASSED: $ran of $st"
+[ "$ran" -ge 14 ] || fail "only $ran of the 14 spec tests passed — a suite that collects nothing passes everything"
+echo "   spec tests that PASSED: $ran of $st (validator-view + console-template)"
 
 if [ "$FAST" = "1" ]; then
   echo "== 2/6 SKIPPED (GATE_FAST) — the 1182-test web suite =="
