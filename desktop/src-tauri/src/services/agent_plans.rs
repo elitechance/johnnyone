@@ -6135,6 +6135,20 @@ fn merge_planning_lens_outcomes(
 /// provider/model, await them with `join_all` (N-arity — no hand-unrolled join), gate over the
 /// blocking lenses (D4), and route through the existing reviewer-output handler. EXTENDS the loop —
 /// the spawn/dispose/merge/verdict machinery is unchanged, only the arity and per-lens plumbing.
+/// Drive the DEVELOPMENT review fan-out for a run's current phase.
+///
+/// SCAFFOLD ONLY — the entry point the specification in
+/// `tests/dev_lens_fanout.rs` drives; it resolves the current phase and defers
+/// to `run_lens_fanout_review`, which is still pane-only. See that test file's
+/// header for the live failure this closes.
+pub async fn run_lens_fanout_review_for(
+    state: &AppState,
+    run: &AgentPlanRun,
+) -> Result<(), String> {
+    let phase = current_phase(run)?;
+    run_lens_fanout_review(state, run, &phase).await
+}
+
 async fn run_lens_fanout_review(
     state: &AppState,
     run: &AgentPlanRun,
