@@ -231,19 +231,36 @@ pub struct LensDoc {
 
 /// The material budget for one stream lens's prompt, in BYTES.
 ///
-/// WHY 80_000. The candidate models on this transport are served with context
-/// windows of roughly 128k TOKENS; a plan store's brief + overview + methodology
-/// + conventions is a few thousand tokens at the outside, so 80k CHARACTERS
-/// (~25–30k tokens of prose) leaves the rest of the window for the review the
-/// lens writes back. The number matters far less than the RAIL: what killed the
-/// 2026-10-24 run was a reviewer that could not see the plan at all, and the
-/// next failure to guard against is a prompt that grows without bound (a log
-/// pasted into `conventions/`) and dies in the context window. A budget generous
-/// enough never to fire on a real plan, but hard enough to stop a runaway store,
-/// is the property worth having. Truncation is always NAMED (see
+/// WHY 160_000. Sized against the material that actually exists, not against a
+/// guess. Measured 2026-10-24 by rendering the live kart plan, the real
+/// methodology and the real conventions store through `expand_lens_docs` +
+/// `inline_material`: 12 documents, 111,881 BODY BYTES (brief 5,467 + plan
+/// overview 6,351 + methodology 33,093 + nine conventions files 66,970), plus
+/// ~1,500 bytes of section headers/trailers — so ~113,400 bytes render today.
+/// The arithmetic the ceiling is checked against: 160,000 characters at the
+/// ~3.5 characters/token this prose runs at is ~45,700 tokens
+/// (160_000 / 3.5 ≈ 45,714), and the lens model (`glm-5.3-flash`) is configured
+/// at `maxContextTokens: 131072` (`~/etc/kloo.json`), so the material claims
+/// 45,700 / 131,072 ≈ 35% of the window and leaves ~85,400 tokens — 65% — for
+/// the assembled prompt and the review the lens writes back. That is the whole
+/// trade: enough headroom over the measured 113,400 (~46,600 bytes, ~41%) for a
+/// plan that grows and a conventions store that gains a file, and still far
+/// under the window, because a budget that cannot fit the window turns a cut
+/// checklist into a provider error. 80,000 was wrong for exactly the opposite
+/// reason: it was set the same day as the directory fix, when CONVENTIONS was 88
+/// characters of `Is a directory (os error 21)`, so it was sized against a third
+/// of the material that exists — and it cut `review-lenses.md` at 63% and
+/// reduced `ui.md` to a header. The number matters far less than the RAIL: what
+/// killed the 2026-10-24 run was a reviewer that could not see the plan at all,
+/// and the next failure to guard against is a prompt that grows without bound (a
+/// log pasted into `conventions/`) and dies in the context window. A budget
+/// generous enough never to fire on a real plan, but hard enough to stop a
+/// runaway store, is the property worth having. Truncation is always NAMED (see
 /// [`inline_material`]), so even too small a budget degrades into an honest
-/// BLOCKED rather than a wrong finding.
-pub const LENS_MATERIAL_BUDGET_BYTES: usize = 80_000;
+/// BLOCKED rather than a wrong finding. If you are raising this again, redo the
+/// arithmetic above against the configured `maxContextTokens` and re-measure the
+/// store — do not just double it.
+pub const LENS_MATERIAL_BUDGET_BYTES: usize = 160_000;
 
 /// Render the documents a tool-less reviewer needs, inside `budget` BYTES.
 ///
