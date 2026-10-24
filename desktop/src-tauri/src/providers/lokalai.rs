@@ -108,6 +108,50 @@ pub fn expand_key_reference(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Translate a kloo-profile model ALIAS into the id the endpoint serves.
+///
+/// THE DEFECT THIS FIXES, measured against the live endpoint before it could
+/// cost a restart cycle: `GET /v1/models` serves six ids (`boxb-qwen`,
+/// `boxb-qwen-131k`, `deepseek-v4.1-flash`, `glm-5.3-flash`, `qwen3.8-flash-next`,
+/// `qwen3.8-flash-next-132k-fast`), and NEITHER `glm` nor `next` is among them —
+/// yet those are exactly the two names the arena's own configuration speaks
+/// (`executor_config.model = "next"`, and the `glm-validator` lens's
+/// `model = "glm"`). They are aliases from the kloo profile's own table at
+/// `providers.lokalai.models`, and `request_body` puts whatever string it is
+/// handed straight into `{"model": …}`, so the lens asked for a model that does
+/// not exist. Same shape as the 401: a well-formed request, a green suite, and
+/// nothing on the wire the server would accept.
+///
+/// A name that is not an alias is the caller's own choice — forward it
+/// unchanged. Never substitute a default: a fallback that fires on unrecognised
+/// input sends the request to the wrong model with no error anywhere. A missing
+/// profile or a missing `models` table is not an error either — it just means
+/// there is nothing to translate, and the name goes out as given.
+pub fn resolve_model_alias(profile_json: &str, name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // A missing/unparseable profile, or one without a lokalai `models` table,
+    // means no translation is possible — the caller's name still stands.
+    let target = serde_json::from_str::<serde_json::Value>(profile_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("providers")?
+                .get("lokalai")?
+                .get("models")?
+                .get(name)?
+                .as_str()
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .map(str::to_string)
+        })
+        // Not an alias: already a real id, or the caller's own choice.
+        .unwrap_or_else(|| name.to_string());
+    Some(target)
+}
+
 /// The endpoint + key for a `lokalai` chat request.
 ///
 /// Order (first hit wins): the provider config row (`ProviderConfig.apiKey`,
@@ -115,17 +159,35 @@ pub fn expand_key_reference(raw: &str) -> Option<String> {
 /// profile's `providers.lokalai.{endpoint,apiKey}`. Returns `None` only when
 /// neither source has anything at all.
 pub fn resolve_endpoint_and_key(state: &AppState) -> Option<(String, String)> {
+    let (endpoint, api_key, _) = resolve_endpoint_key_and_model(state, "")?;
+    Some((endpoint, api_key))
+}
+
+/// The endpoint + key **and the model** for a `lokalai` chat request, with the
+/// model's alias already resolved against the kloo profile's own table.
+///
+/// The third element is `None` only when there is no profile at all to read the
+/// table from (or no name was given) — never when a name is simply
+/// unrecognised, which is not an error (see [`resolve_model_alias`]). A caller
+/// holding a model name from a lens or executor config should go through this
+/// rather than `resolve_endpoint_and_key`, so the name that reaches
+/// `request_body` is the one the endpoint actually serves.
+pub fn resolve_endpoint_key_and_model(
+    state: &AppState,
+    name: &str,
+) -> Option<(String, String, Option<String>)> {
     let (mut endpoint, mut api_key) = from_provider_config(state)
         .map(|(endpoint, key)| (endpoint.unwrap_or_default(), key.unwrap_or_default()))
         .unwrap_or_default();
 
+    let profile = read_kloo_profile();
     if endpoint.trim().is_empty() || api_key.trim().is_empty() {
-        if let Some(profile) = read_kloo_profile() {
+        if let Some(profile) = profile.as_deref() {
             if endpoint.trim().is_empty() {
-                endpoint = endpoint_from_profile_json(&profile).unwrap_or_default();
+                endpoint = endpoint_from_profile_json(profile).unwrap_or_default();
             }
             if api_key.trim().is_empty() {
-                api_key = api_key_from_profile_json(&profile).unwrap_or_default();
+                api_key = api_key_from_profile_json(profile).unwrap_or_default();
             }
         }
     }
@@ -133,7 +195,14 @@ pub fn resolve_endpoint_and_key(state: &AppState) -> Option<(String, String)> {
     if endpoint.trim().is_empty() && api_key.trim().is_empty() {
         return None;
     }
-    Some((endpoint, api_key))
+    let model = if name.trim().is_empty() {
+        None
+    } else {
+        profile
+            .as_deref()
+            .and_then(|profile| resolve_model_alias(profile, name))
+    };
+    Some((endpoint, api_key, model))
 }
 
 /// `ProviderConfig.apiKey` + `settings.endpoint` of the `lokalai` row.
@@ -200,6 +269,16 @@ pub fn build_config(
         "--silent".to_string(),
         "--show-error".to_string(),
         "--no-buffer".to_string(),
+        // Fail loudly on an HTTP error status. curl exits 0 on a 4xx/5xx
+        // otherwise, so a 401 streamed back as a JSON error body looked to the
+        // caller like a response that simply named no verdict — the exact
+        // invisibility that let PR #48's first round 401 every call while the
+        // suite stayed green. `--fail-with-body` exits 22 **and still prints
+        // the body**, which is what we want: the body carries the provider's
+        // own message, and `run_stream_lens` turns the non-zero exit into an
+        // Err naming the status. It is a flag, not a config file, so t9's
+        // ban on `--config`/`-K` still holds.
+        "--fail-with-body".to_string(),
         "--request".to_string(),
         "POST".to_string(),
         "--variable".to_string(),
