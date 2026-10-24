@@ -256,18 +256,36 @@ fn d5_an_existing_planning_row_can_be_rebound_under_the_same_rule() {
     assert_eq!(rebound.plan.dev_worker_provider.as_deref(), Some("claude"));
     assert_eq!(rebound.plan.dev_reviewer_provider.as_deref(), Some("claude"));
 
-    let err = agent_plans::rebind_development_providers(
-        &state,
-        id.clone(),
-        Some("kloo".to_string()),
-        None,
-    )
-    .err()
-    .expect("the repair must not be a way around the rule it exists to repair");
-    assert!(
-        err.contains("kloo") && err.contains("oneshot"),
-        "the rebind refusal must read like the creation refusal: {err}"
-    );
+    // BOTH sides, both names. A mutation that validated only the builder column
+    // survived this test on 2026-10-24 when it sent `kloo` as the worker alone —
+    // my spec's gap, not the implementation's, and the reviewer half is the half
+    // that failed on the live kart plan.
+    for name in ["kloo", "shell"] {
+        for (worker, reviewer) in [
+            (Some(name.to_string()), None),
+            (None, Some(name.to_string())),
+        ] {
+            let err = agent_plans::rebind_development_providers(
+                &state,
+                id.clone(),
+                worker.clone(),
+                reviewer.clone(),
+            )
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the repair accepted a oneshot provider {name:?} as \
+                     worker={worker:?} reviewer={reviewer:?} — it is a way around the \
+                     rule it exists to repair, and writes the same dead end the \
+                     kart plan is stuck in"
+                )
+            });
+            assert!(
+                err.contains(name) && err.contains("oneshot"),
+                "the rebind refusal must read like the creation refusal: {err}"
+            );
+        }
+    }
 
     // Clearing is how a row goes back to inheriting the planning providers.
     let cleared = agent_plans::rebind_development_providers(&state, id.clone(), None, None)
