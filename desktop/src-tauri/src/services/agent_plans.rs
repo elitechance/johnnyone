@@ -281,6 +281,23 @@ fn normalize_stage_provider(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Validate a caller-supplied **development-stage** provider with the SAME rule the run providers
+/// use. `normalize_stage_provider` runs first (a blank form field means "unbound" → SQL NULL, which
+/// inherits the planning row's provider and needs no check), then every non-blank value goes through
+/// `reject_oneshot_plan_provider` — the very helper `create_plan` applies to `worker_provider` /
+/// `reviewer_provider`. THE DEFECT THIS CLOSES: the `dev_*` columns were only trimmed, so
+/// `dev_worker_provider = 'kloo'` was accepted at creation and then refused hours later by
+/// `auto_start_development`, which feeds those same columns back into `create_plan` via
+/// `development_stage_providers` (the kart plan, 2026-10-24 14:02:40). One rule, applied twice —
+/// never a second copy of it that can drift.
+fn validate_stage_provider(value: Option<&str>) -> Result<Option<String>, String> {
+    let normalized = normalize_stage_provider(value);
+    if let Some(provider) = normalized.as_deref() {
+        reject_oneshot_plan_provider(provider)?;
+    }
+    Ok(normalized)
+}
+
 /// Which providers the development stage-run should use, given its planning row.
 ///
 /// Returns `(worker, reviewer)`. A `dev_*` column set on the planning row wins; NULL falls back to
@@ -289,16 +306,60 @@ fn normalize_stage_provider(value: Option<&str>) -> Option<String> {
 /// the builder still leaves validation on the planning provider.
 /// Repair the development-stage binding on an existing **planning** row.
 ///
-/// SCAFFOLD ONLY — this is the signature the specification in
-/// `tests/dev_stage_providers.rs` (d5) requires; the behaviour is not written
-/// yet. See that file's header for the live failure this closes.
+/// WHY THIS EXISTS. Validation at creation does nothing for the row that is already wrong, and no
+/// other plan mutation writes `dev_worker_provider` / `dev_reviewer_provider` — so before this, the
+/// only repair for the kart plan was a hand-written UPDATE against the running host's database.
+/// THE SAME RULE, NOT A SECOND COPY. Both values go through `validate_stage_provider`, i.e.
+/// `normalize_stage_provider` (blank ⇒ NULL ⇒ inherit the planning row's providers) followed by the
+/// very `reject_oneshot_plan_provider` `create_plan` applies to the run providers. A repair that
+/// could write `kloo` would just be a route around the rule it exists to repair.
+/// `None` writes SQL NULL (clearing is how a row goes back to inheriting).
+/// ONLY A PLANNING ROW. A development row is terminal in the stage chain — `auto_start_development`
+/// writes both columns NULL on the row it creates — so a binding there is never read.
 pub fn rebind_development_providers(
-    _state: &AppState,
-    _id: String,
-    _dev_worker: Option<String>,
-    _dev_reviewer: Option<String>,
+    state: &AppState,
+    id: String,
+    dev_worker: Option<String>,
+    dev_reviewer: Option<String>,
 ) -> Result<AgentPlanRun, String> {
-    Err("rebind_development_providers is not implemented".to_string())
+    let dev_worker_provider = validate_stage_provider(dev_worker.as_deref())?;
+    let dev_reviewer_provider = validate_stage_provider(dev_reviewer.as_deref())?;
+    // Existence error first, then the stage check, both from the loaded row.
+    let current = get_plan(state, &id)?;
+    if current.plan.run_type != "planning" {
+        return Err(format!(
+            "Plan {} is a {} run, not a planning run; only a planning row hands off to a \
+             development stage-run, so it has no development-stage binding to rebind",
+            id, current.plan.run_type
+        ));
+    }
+    let (old_worker, old_reviewer) = (
+        current.plan.dev_worker_provider.clone(),
+        current.plan.dev_reviewer_provider.clone(),
+    );
+
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agent_plans SET dev_worker_provider = ?1, dev_reviewer_provider = ?2, \
+             updated_at = datetime('now') WHERE id = ?3",
+            params![dev_worker_provider, dev_reviewer_provider, id],
+        )
+        .map_err(|e| e.to_string())
+    })?;
+
+    append_event(
+        state,
+        &id,
+        None,
+        "agent_plan_dev_providers_rebound",
+        json!({
+            "oldDevWorkerProvider": old_worker,
+            "oldDevReviewerProvider": old_reviewer,
+            "devWorkerProvider": dev_worker_provider,
+            "devReviewerProvider": dev_reviewer_provider,
+        }),
+    )?;
+    get_plan(state, &id)
 }
 
 pub fn development_stage_providers(planning: &AgentPlan) -> (String, String) {
@@ -478,6 +539,10 @@ fn create_planning_run(
 ) -> Result<AgentPlanRun, String> {
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
+    // The development-stage columns are fed back into `create_plan` verbatim by
+    // `auto_start_development`, so they obey the run providers' rule at the write too.
+    let dev_worker_provider = validate_stage_provider(input.dev_worker_provider.as_deref())?;
+    let dev_reviewer_provider = validate_stage_provider(input.dev_reviewer_provider.as_deref())?;
     let workspace = normalize_path(Path::new(&input.workspace_path))?;
     if !workspace.is_dir() {
         return Err("Workspace path is not a directory".to_string());
@@ -544,8 +609,8 @@ fn create_planning_run(
                 docs_scope,
                 reference_paths,
                 input.reviewer_setup_commands.as_deref().filter(|s| !s.trim().is_empty()),
-                normalize_stage_provider(input.dev_worker_provider.as_deref()),
-                normalize_stage_provider(input.dev_reviewer_provider.as_deref()),
+                dev_worker_provider,
+                dev_reviewer_provider,
             ],
         )
         .map_err(|e| format!("Failed to create planning run: {}", e))
@@ -575,6 +640,10 @@ pub async fn create_briefing_run(
 ) -> Result<AgentPlanRun, String> {
     reject_oneshot_plan_provider(&input.worker_provider)?;
     reject_oneshot_plan_provider(&input.reviewer_provider)?;
+    // Same rule on the development-stage columns (see `validate_stage_provider`) — a briefing row
+    // flips to planning on this same id and hands off exactly like any other planning row.
+    let dev_worker_provider = validate_stage_provider(input.dev_worker_provider.as_deref())?;
+    let dev_reviewer_provider = validate_stage_provider(input.dev_reviewer_provider.as_deref())?;
     let parsed_exec = parse_executor_config(input.executor_config.as_deref())?;
     // Belt-and-braces: reject_oneshot already errors on kloo, so this arm is
     // unreachable today. Keep it so a later change to oneshot policy cannot
@@ -651,8 +720,8 @@ pub async fn create_briefing_run(
                 chat_session.id,
                 input.brief.clone().unwrap_or_default(),
                 input.executor_config.clone(),
-                normalize_stage_provider(input.dev_worker_provider.as_deref()),
-                normalize_stage_provider(input.dev_reviewer_provider.as_deref()),
+                dev_worker_provider,
+                dev_reviewer_provider,
             ],
         )
         .map_err(|e| format!("Failed to create briefing run: {}", e))

@@ -823,6 +823,12 @@ type Mutation {
   updateAgentPlanPhasesRefresh(id: ID!): AgentPlanRun!
   updateAgentPlanTitle(id: ID!, title: String!): AgentPlanRun!
   updateAgentPlanAppScope(id: ID!, appScope: String): AgentPlanRun!
+  # Repair the DEVELOPMENT-stage provider binding on a planning row (the columns
+  # `auto_start_development` feeds into the development run). A null argument clears that
+  # side back to SQL NULL, i.e. "inherit the planning row's own provider". Refused on a
+  # development row (terminal in the stage chain) and on a oneshot name (kloo/shell) —
+  # the same rule creation applies, so this is a repair, never a way around it.
+  updateAgentPlanDevProviders(id: ID!, devWorkerProvider: String, devReviewerProvider: String): AgentPlanRun!
   # Overhaul phase 7 (D1). Persist the Initiative's ordered validation-lens array as a JSON string;
   # a null/empty config clears it (→ desktop resolves the default product/qa/lead template).
   updateAgentPlanValidationConfig(id: ID!, config: String): AgentPlanRun!

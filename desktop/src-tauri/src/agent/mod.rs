@@ -1257,6 +1257,9 @@ impl AgentService {
             "update_agent_plan_app_scope" => {
                 Self::rpc_update_agent_plan_app_scope(&req.params, state)
             }
+            "update_agent_plan_dev_providers" => {
+                Self::rpc_update_agent_plan_dev_providers(&req.params, state)
+            }
             "update_agent_plan_validation_config" => {
                 Self::rpc_update_agent_plan_validation_config(&req.params, state)
             }
@@ -1779,6 +1782,35 @@ impl AgentService {
             state,
             id.to_string(),
             app_scope,
+        )?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    /// Repair the development-stage provider binding on a planning row. Both arguments are
+    /// optional — null/absent clears that side to SQL NULL (= inherit the planning row's own
+    /// provider). The oneshot refusal and the planning-row-only check live in the service, so the
+    /// relay and a local caller cannot disagree about them.
+    fn rpc_update_agent_plan_dev_providers(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let dev_worker = params
+            .get("devWorkerProvider")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string());
+        let dev_reviewer = params
+            .get("devReviewerProvider")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string());
+        let run = crate::services::agent_plans::rebind_development_providers(
+            state,
+            id.to_string(),
+            dev_worker,
+            dev_reviewer,
         )?;
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
