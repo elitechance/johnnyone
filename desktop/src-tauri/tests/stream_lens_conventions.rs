@@ -93,15 +93,30 @@ fn c1_a_directory_is_inlined_as_its_files() {
          else entirely: {joined}"
     );
 
-    // Order must be stable: read_dir order is filesystem order, and a prompt
-    // whose sections shuffle between runs breaks the provider's prefix cache
-    // and makes two runs of the same plan incomparable.
+    // Order must be SORTED, not merely stable. Two mutations — dropping the
+    // sort, and reversing it — both survived a stability-only assertion on
+    // 2026-10-24, because `read_dir` happens to be stable within one run on
+    // this filesystem. Stability was never the point:
+    //
+    //   * the provider's prefix cache keys on the prompt's leading bytes, and
+    //   * the real conventions store is 66,970 bytes against an 80,000-byte
+    //     material budget, so `inline_material` WILL truncate — and the order
+    //     decides which conventions the reviewer gets to see. An order nobody
+    //     pinned means the file that falls off the end changes with the
+    //     filesystem.
+    let paths: Vec<String> = docs.iter().map(|d| d.path.clone()).collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(
+        paths, sorted,
+        "the expansion is not in sorted path order, so which conventions survive \
+         the byte budget is down to read_dir order"
+    );
     let second = expand_lens_docs("CONVENTIONS", &conv, LENS_MATERIAL_MAX_FILES);
     assert_eq!(
-        docs.iter().map(|d| d.path.clone()).collect::<Vec<_>>(),
+        paths,
         second.iter().map(|d| d.path.clone()).collect::<Vec<_>>(),
-        "two expansions of the same directory returned the files in different \
-         orders — read_dir order is not sorted order"
+        "two expansions of the same directory disagreed"
     );
 }
 
@@ -150,6 +165,32 @@ fn c3_too_many_files_are_cut_and_the_cut_is_named() {
         over,
         docs.len()
     );
+    // WHICH files survive the cut is decided by the order, and this is the only
+    // test with enough files to see it. Measured on 2026-10-24: `read_dir` over
+    // 30 files returns them in neither creation nor lexicographic order on
+    // either this tmpfs or this ext4 — on ext4 the order is hash-scrambled
+    // (`019, 021, 008, 004 …`). c1's two-file directory happened to come back
+    // sorted, which is why a mutation that DELETED the sort survived it. Here it
+    // cannot: the documents shown must be the lexicographically first
+    // `LENS_MATERIAL_MAX_FILES`, so the reviewer sees the same conventions on
+    // every host.
+    let shown: Vec<String> = docs
+        .iter()
+        .filter(|d| d.path.ends_with("-rule.md"))
+        .map(|d| d.path.clone())
+        .collect();
+    let mut expected: Vec<String> = (0..over)
+        .map(|i| conv.join(format!("{i:03}-rule.md")).to_string_lossy().to_string())
+        .collect();
+    expected.sort();
+    expected.truncate(LENS_MATERIAL_MAX_FILES);
+    assert_eq!(
+        shown, expected,
+        "the files kept past the cap are not the lexicographically first \
+         {LENS_MATERIAL_MAX_FILES} — so which conventions the reviewer sees is \
+         down to read_dir order, which is hash-scrambled on ext4"
+    );
+
     let joined: String = docs.iter().map(|d| d.body.clone()).collect();
     assert!(
         joined.contains("7 more") || joined.contains(&format!("{} more", over - LENS_MATERIAL_MAX_FILES)),
