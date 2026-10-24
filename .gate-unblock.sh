@@ -31,7 +31,7 @@ MF=desktop/src-tauri/Cargo.toml
 # the gate was failing on SPACE, not on the code, and reported a red the worker
 # could not have fixed. The real disk has 471 GB free, so the artifacts go
 # there and only the source stays in RAM.
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/home/creepy/.cache/j1-cargo/unblk}
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/home/creepy/.cache/j1-cargo/merged}
 mkdir -p "$CARGO_TARGET_DIR" || fail "cannot create $CARGO_TARGET_DIR"
 echo "cargo target: $CARGO_TARGET_DIR  ($(df -h --output=avail "$CARGO_TARGET_DIR" | tail -1 | tr -d ' ') free)"
 fail() { echo "GATE FAIL: $*" >&2; exit 1; }
