@@ -17,6 +17,7 @@ pub mod question_watch;
 pub mod relay;
 pub mod sessions;
 pub mod settings;
+pub mod stream_lens;
 pub mod task_check;
 pub mod task_loop;
 pub mod task_replan;

@@ -3,12 +3,13 @@ use crate::db::models::{
     AgentPlan, AgentPlanEvent, AgentPlanPhase, AgentPlanTask, CreateAgentPlanInput,
     CreateBriefingInput, CreateSessionInput, ValidationLens,
 };
-use crate::providers::CliProvider;
+use crate::providers::{lokalai, CliProvider};
 use crate::events::{AgentPlanRunEvent, StreamEvent};
 use crate::services::plan_artifacts;
 use crate::services::planner_prompts;
 use crate::services::sessions;
 use crate::services::settings as settings_service;
+use crate::services::stream_lens::{self, LensTransport};
 use crate::state::app_state::{AgentReport, AppState};
 use crate::terminal;
 use base64::{engine::general_purpose, Engine as _};
@@ -4846,9 +4847,17 @@ fn prompt_probe(prompt: &str) -> String {
 /// A first-run directory-trust modal, across the agent CLIs J1 drives.
 fn pane_awaiting_trust(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
+    // The modal's OWN question wording, matched as a phrase. A bare "do you trust"
+    // was the old match and it false-positives on ordinary agent prose — a review
+    // lens writing "do you trust this migration?" in its findings froze the run with
+    // "waiting on a folder-trust prompt" while the pane showed a finished review.
+    // A trust modal is a CLI's question to the human, so require the folder/directory
+    // noun next to the verb; agent prose addresses the reader, not a directory.
     lower.contains("trust this folder")
-        || lower.contains("do you trust")
+        || lower.contains("trust this directory")
         || lower.contains("trust the files in this folder")
+        || lower.contains("trust the files in this directory")
+        || lower.contains("do you trust")
 }
 
 /// Read a report's markdown attachment, if `evidence` names one.
@@ -5491,6 +5500,29 @@ fn review_body_path(session_id: &str) -> std::path::PathBuf {
         .join(format!("{session_id}.json"))
 }
 
+/// One in-flight lens in the planning fan-out, tagged with the TRANSPORT it is being
+/// driven over (see `stream_lens::lens_transport`).
+///
+/// `Pane` is today's path: a session + tmux pane whose verdict is waited for and which
+/// must be disposed. `Stream` is an HTTP provider (`lokalai`) driven as a streamed
+/// response — NO session row and NO pane, so there is nothing to dispose. `Failed`
+/// holds a lens whose spawn already failed, so its error is reported at collection
+/// time (after the other lenses were given the chance to answer) rather than swallowed.
+enum LensSlot {
+    Pane {
+        name: String,
+        session_id: String,
+    },
+    Stream {
+        name: String,
+        task: tokio::task::JoinHandle<Result<AgentReport, String>>,
+    },
+    Failed {
+        name: String,
+        error: String,
+    },
+}
+
 /// Instruction telling a lens to report its verdict AND reasons through the
 /// `reportAgentResult` API (summary + findings), never by printing to the screen.
 /// Uses GraphQL variables in a body file so the agent only edits simple JSON values.
@@ -6036,7 +6068,17 @@ Decide a single verdict for the {name} lens: PASS, NEEDS_CHANGES, or BLOCKED.{ex
 /// lens against the whole plan, each on its own provider/model, awaited with `join_all`, gated over
 /// the blocking lenses (D4). Mirrors `run_lens_fanout_review` but has no phase (planning is a
 /// whole-plan review). EXTENDS the loop — only the arity and per-lens plumbing changed.
-async fn run_planning_lens_fanout_review(
+///
+/// `pub` so the call site itself can be driven by a spec (`tests/stream_lens.rs` s8).
+///
+/// TRANSPORT SPLIT (the `%2375` / `%2424` fix): each lens is driven over the transport its
+/// provider actually has — `stream_lens::lens_transport`. A pane lens keeps today's path byte for
+/// byte; a **stream** lens (an HTTP provider such as `lokalai`, whose command IS curl) is driven as
+/// a streamed response and creates NO session and NO tmux pane, because there is no interactive CLI
+/// to attach to and no shell to run a `reportAgentResult` curl from. Both branches yield the same
+/// `AgentReport`, so everything after the loop is unchanged, and a stream lens that errors
+/// propagates `?` exactly like a pane lens that errors — never a defaulted PASS.
+pub async fn run_planning_lens_fanout_review(
     state: &AppState,
     run: &AgentPlanRun,
 ) -> Result<(), String> {
@@ -6046,9 +6088,91 @@ async fn run_planning_lens_fanout_review(
     let plan_id = run.plan.id.clone();
     let _ = std::fs::create_dir_all(std::env::temp_dir().join("johnnyone-reviews"));
 
-    let mut sessions: Vec<(String, String)> = Vec::new(); // (lens name, session_id)
+    // One in-flight lens per configured lens, in config order. A pane lens is a
+    // (lens name, session id) pair whose verdict is waited for; a stream lens is
+    // a future already running, with NO session and NO pane behind it.
+    let mut slots: Vec<LensSlot> = Vec::new();
     for (lens, desc) in lenses.iter().zip(descriptors.iter()) {
-        let sid = spawn_ephemeral_agent(
+        let provider = match CliProvider::from_str(&desc.provider) {
+            Some(provider) => provider,
+            // Already rejected upstream by `lens_spawn_descriptors` (D13).
+            None => return Err(format!("Unknown provider '{}'", desc.provider)),
+        };
+        if stream_lens::lens_transport(provider) == LensTransport::Stream {
+            // THE STREAM PATH: no session, no pane, no self-reporting curl.
+            let (endpoint, api_key) = match lokalai::resolve_endpoint_and_key(state) {
+                Some(pair) => pair,
+                None => {
+                    slots.push(LensSlot::Failed {
+                        name: desc.name.clone(),
+                        error: format!(
+                            "stream lens '{}': {}",
+                            desc.name,
+                            stream_lens::resolve_lokalai_credentials(state).unwrap_err()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            // `glm` is an ALIAS from the kloo profile's own table and the endpoint
+            // only serves real ids (`glm` → `glm-5.3-flash`), so resolve it before it
+            // reaches the request body. An unrecognised name is the caller's choice
+            // and goes out unchanged — never substituted with a default.
+            // `resolve_endpoint_key_and_model` reads the kloo profile itself and
+            // returns the resolved model id (`glm` → `glm-5.3-flash`); an
+            // unrecognised name goes out unchanged — never a default.
+            let model = lokalai::resolve_endpoint_key_and_model(
+                state,
+                desc.model.as_deref().unwrap_or(""),
+            )
+            .and_then(|(_, _, model)| model)
+            // No profile to read the table from: the caller's name still stands.
+            .or_else(|| desc.model.clone())
+            .unwrap_or_default();
+            // The SAME plan-review prompt a pane lens gets, with the stream tail in
+            // place of the report-protocol tail: a lens cannot run a curl it has no
+            // shell for, and cannot emit a token it was never shown.
+            let report_tail = lens_report_instruction(&plan_id, &desc.name);
+            let prompt = match planning_lens_reviewer_prompt(state, run, lens, &plan_id)
+                .split_once(report_tail.as_str())
+            {
+                Some((head, _)) => {
+                    format!("{head}{}", stream_lens::stream_lens_prompt_tail(&desc.name))
+                }
+                None => planning_lens_reviewer_prompt(state, run, lens, &plan_id),
+            };
+            // `tokio::spawn` needs an owned, `'static` future, so the seven
+            // borrowed arguments are moved into the async block and borrowed there.
+            let workspace = run.plan.workspace_path.clone();
+            let lens_name = desc.name.clone();
+            let plan_run_id = plan_id.clone();
+            let task = tokio::spawn(async move {
+                stream_lens::run_stream_lens(
+                    &endpoint,
+                    &api_key,
+                    &model,
+                    &prompt,
+                    &workspace,
+                    &plan_run_id,
+                    &lens_name,
+                )
+                .await
+            });
+            let _ = append_event(
+                state,
+                &plan_id,
+                None,
+                "agent_lens_review_started",
+                json!({ "lens": desc.name }),
+            );
+            slots.push(LensSlot::Stream {
+                name: desc.name.clone(),
+                task,
+            });
+            continue;
+        }
+        // THE PANE PATH — today's path, unchanged.
+        match spawn_ephemeral_agent(
             state,
             &plan_id,
             &desc.name,
@@ -6057,28 +6181,66 @@ async fn run_planning_lens_fanout_review(
             working_dir.clone(),
             |sid| planning_lens_reviewer_prompt(state, run, lens, sid),
         )
-        .await?;
-        let _ = append_event(
-            state,
-            &plan_id,
-            None,
-            "agent_lens_review_started",
-            json!({ "lens": desc.name }),
-        );
-        sessions.push((desc.name.clone(), sid));
+        .await
+        {
+            Ok(sid) => {
+                let _ = append_event(
+                    state,
+                    &plan_id,
+                    None,
+                    "agent_lens_review_started",
+                    json!({ "lens": desc.name }),
+                );
+                slots.push(LensSlot::Pane {
+                    name: desc.name.clone(),
+                    session_id: sid,
+                });
+            }
+            Err(error) => slots.push(LensSlot::Failed {
+                name: desc.name.clone(),
+                error,
+            }),
+        }
     }
 
-    let futures = sessions
+    // Collect every verdict concurrently — order preserved so results[i] aligns with lenses[i].
+    let pane_futures: Vec<_> = slots
         .iter()
-        .map(|(name, sid)| wait_for_lens_verdict(state, sid, name));
-    let results = futures_util::future::join_all(futures).await;
+        .filter_map(|slot| match slot {
+            LensSlot::Pane { session_id, name } => {
+                Some(wait_for_lens_verdict(state, session_id, name))
+            }
+            _ => None,
+        })
+        .collect();
+    let pane_results = futures_util::future::join_all(pane_futures).await;
 
-    for (_, sid) in &sessions {
-        dispose_ephemeral_agent(state, sid).await;
+    // Tear the pane reviewers down regardless of outcome (a stream lens has
+    // nothing to dispose — it created no session).
+    for slot in &slots {
+        if let LensSlot::Pane { session_id, .. } = slot {
+            dispose_ephemeral_agent(state, session_id).await;
+        }
     }
 
+    let mut pane_results = pane_results.into_iter();
     let mut outcomes: Vec<(String, String, ReviewInsights)> = Vec::new();
-    for ((name, _sid), res) in sessions.iter().zip(results.into_iter()) {
+    for slot in slots.into_iter() {
+        let (name, res): (String, Result<AgentReport, String>) = match slot {
+            LensSlot::Pane { name, .. } => match pane_results.next() {
+                Some(res) => (name.clone(), res),
+                None => (name.clone(), Err(format!("lens '{name}' produced no verdict"))),
+            },
+            LensSlot::Stream { name, task } => match task.await {
+                Ok(Ok(report)) => (name.clone(), Ok(report)),
+                Ok(Err(error)) => (name.clone(), Err(error)),
+                Err(error) => (
+                    name.clone(),
+                    Err(format!("stream lens '{name}' failed: {error}")),
+                ),
+            },
+            LensSlot::Failed { name, error } => (name.clone(), Err(error)),
+        };
         let report = res?; // any lens escalation → needs_attention
         let verdict = report
             .verdict
@@ -6090,9 +6252,9 @@ async fn run_planning_lens_fanout_review(
             &plan_id,
             None,
             "agent_lens_verdict",
-            lens_verdict_payload(name, &verdict, &insights),
+            lens_verdict_payload(&name, &verdict, &insights),
         );
-        outcomes.push((name.clone(), verdict, insights));
+        outcomes.push((name, verdict, insights));
     }
 
     let gate = gate_verdict_over_blocking(&outcomes, &lenses);
