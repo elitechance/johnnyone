@@ -263,8 +263,14 @@ pub fn build_config(
     // Everything curl needs goes in argv as flags: none of it is a secret. The
     // header is a TEMPLATE referencing the env var by name, and `--variable`
     // imports that name from the environment at request time, so the key itself
-    // is never in argv (t2) and never on disk (t9). `--data` carries the prompt
-    // body, which is not a secret either.
+    // is never in argv (t2) and never on disk (t9). The prompt body is not a
+    // secret either — but it still may NOT be an argument. Linux caps a SINGLE
+    // argv string at MAX_ARG_STRLEN = 131,072 bytes, and a lens prompt at its
+    // material budget (160,000) is bigger than that, so `--data <body>` made
+    // `spawn` fail with E2BIG before curl ran (`Argument list too long`, seen
+    // as `coordinator_failed`, not as a lens error). `--data @-` tells curl to
+    // read the body from stdin instead, and `spawn_cli` writes it there and
+    // closes the handle so curl sees EOF.
     let mut args: Vec<String> = vec![
         "--silent".to_string(),
         "--show-error".to_string(),
@@ -288,7 +294,8 @@ pub fn build_config(
         "--header".to_string(),
         "content-type: application/json".to_string(),
         "--data".to_string(),
-        body,
+        // Read the body from stdin — see the note above on MAX_ARG_STRLEN.
+        "@-".to_string(),
     ];
     args.push(url);
 
@@ -302,6 +309,7 @@ pub fn build_config(
         args,
         working_directory: working_directory.to_string(),
         env_vars,
+        stdin: Some(body),
     }
 }
 

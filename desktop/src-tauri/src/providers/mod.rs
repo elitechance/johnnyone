@@ -145,6 +145,16 @@ pub struct CliSpawnConfig {
     pub working_directory: String,
     /// Environment variables to set (empty value = unset the var).
     pub env_vars: Vec<(String, String)>,
+    /// Bytes to hand the child on its stdin, then close (so it sees EOF).
+    ///
+    /// WHY THIS EXISTS: Linux caps a SINGLE argv string at `MAX_ARG_STRLEN` =
+    /// 32 pages = 131,072 bytes, independently of the much larger `ARG_MAX`
+    /// total. A lens request body is routinely bigger than that, so passing it
+    /// as an argument (`--data <body>`) makes `spawn` fail with E2BIG before
+    /// the child ever runs — the user sees `Failed to spawn 'curl': Argument
+    /// list too long`, not a provider error. `None` means stdin stays
+    /// `Stdio::null()`, which is what every other provider wants.
+    pub stdin: Option<String>,
 }
 
 #[cfg(test)]

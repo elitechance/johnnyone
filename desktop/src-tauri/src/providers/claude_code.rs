@@ -46,6 +46,7 @@ pub fn build_config(
         working_directory: working_directory.to_string(),
         // Must unset CLAUDECODE to avoid "nested session" error when spawned from within Claude Code
         env_vars: vec![("CLAUDECODE".to_string(), String::new())],
+        stdin: None,
     }
 }
 

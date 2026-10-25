@@ -5,7 +5,7 @@
 #   1. the crate compiles, lib + tests
 #   2. the existing agent_plans suite does not regress
 #   3. tests/lokalai_provider.rs: 9 transport tests + 3 model-alias tests
-#   4. the 7 spec tests in tests/stream_lens.rs pass, and there are 7 of them
+#   4. the 8 spec tests in tests/stream_lens.rs pass, and there are 8 of them
 #
 # Stages 3 and 4 COUNT the tests that ran. A suite that collects nothing passes
 # everything, and `cargo test` exits 0 on "0 passed".
@@ -68,6 +68,6 @@ echo "$out" | tail -60
 printf '%s\n' "$out" | grep -E '^test s[0-9]' | sort
 ran=$(printf '%s\n' "$out" | grep -cE '^test s[0-9].* \.\.\. ok$')
 echo "   stream_lens tests that ran: $ran"
-[ "$ran" -ge 7 ] || fail "only $ran of the 7 spec tests ran — a suite that collects nothing passes everything"
+[ "$ran" -ge 8 ] || fail "only $ran of the 8 spec tests ran — a suite that collects nothing passes everything"
 
-echo "GATE PASS: compiles, $regpass agent_plans green, $lokran lokalai_provider green, $ran/7 stream_lens green"
+echo "GATE PASS: compiles, $regpass agent_plans green, $lokran lokalai_provider green, $ran/8 stream_lens green"
