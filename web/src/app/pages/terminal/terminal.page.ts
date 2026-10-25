@@ -139,6 +139,8 @@ import {
 } from './console-logic';
 import type { ConsolePaneState } from './console-logic';
 import { initiativeTimeline, windowTimeline, TimelineEvent } from './initiative-events-logic';
+import { lensOutcomes, type LensOutcome } from './lens-outcome';
+import { healthReason } from '../../../../../ui/src/lib/lifecycle-status';
 import {
   resolvePrimarySessionId,
   initiativeTabOf,
@@ -1229,6 +1231,20 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** Projected timeline rows (stage/lens/verdict/normalized-ISO) — reverse to newest-first for display. */
   protected readonly consoleTimeline = computed<TimelineEvent[]>(() =>
     [...windowTimeline(initiativeTimeline(this.initiativeEvents()))].reverse(),
+  );
+  /** The one actionable line beside the health badge (validator-view): non-null only when the selected
+   *  initiative is NOT healthy AND carries a non-blank error. A healthy run with a stale error string
+   *  returns null — `healthReason` is the one that decides, this only feeds it. */
+  protected readonly selHealthReason = computed<string | null>(() => {
+    const sel = this.selectedInitiative();
+    return healthReason(sel?.health ?? null, sel?.error ?? null);
+  });
+  /** One outcome per CONFIGURED lens, in configuration order — what each lens has actually done
+   *  (`never-run` / `running` / `reported` + its latest verdict), projected from the same timeline rows
+   *  the Events column renders. `consoleTimeline()` is newest-first; `lensOutcomes` picks the latest row
+   *  by instant whichever order the rows arrive in. */
+  protected readonly consoleLensOutcomes = computed<LensOutcome[]>(() =>
+    lensOutcomes(this.consoleLenses(), this.consoleTimeline()),
   );
   protected readonly planCheckJson = signal<string | null>(null);
   protected readonly preflightJson = signal<string | null>(null);
