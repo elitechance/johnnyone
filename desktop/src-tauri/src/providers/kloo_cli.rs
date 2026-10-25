@@ -120,6 +120,7 @@ pub fn build_config(req: &KlooRunRequest) -> Result<CliSpawnConfig, String> {
         .to_string_lossy()
         .into_owned(),
         env_vars: vec![],
+        stdin: None,
     })
 }
 

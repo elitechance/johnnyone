@@ -52,3 +52,4 @@ e2e-artifacts/*.png
 **/__pycache__/
 .overhaul-refs/
 docs/plans/overhaul-*/
+.kloo/

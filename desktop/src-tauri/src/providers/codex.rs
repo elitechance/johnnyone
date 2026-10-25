@@ -35,6 +35,7 @@ pub fn build_config(
         args,
         working_directory: working_directory.to_string(),
         env_vars: vec![],
+        stdin: None,
     }
 }
 

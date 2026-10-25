@@ -102,12 +102,19 @@ pub fn stream_lens_prompt_tail(lens_name: &str) -> String {
     format!(
         "\n\n---\n\
          You are the `{lens_name}` review lens, running as a single streamed \
-         response. You have no shell and no terminal: you CANNOT post your result \
-         anywhere, and nothing else will read your output except this response \
-         stream. Your review IS the report.\n\n\
+         response. You have no shell, no terminal, no filesystem and no tools \
+         of any kind — you cannot fetch anything, and you must not attempt to. \
+         Everything you need is in this prompt: the brief, the plan, the \
+         methodology and the conventions are included above, in full, as \
+         labelled sections. Judge only the material shown to you here, and do \
+         not ask for anything further. Never return BLOCKED because something \
+         appears to be missing — if a document is empty or cut short, that is \
+         a finding to report, not a reason to stop.\n\n\
+         You cannot post your result anywhere: nothing else will see your \
+         output except this response stream, so your review IS the report.\n\n\
          Write your review as free text: what you checked, what you found, and \
-         file:line evidence for every finding. Then end your response with \
-         EXACTLY one final line naming your verdict, in this form:\n\n\
+         which labelled document each finding sits in. End your response \
+         with EXACTLY one final line naming your verdict, in this form:\n\n\
          \x20   VERDICT: <token>\n\n\
          Where <token> is exactly one of these four, spelled exactly:\n\
          \x20   PASS — ship it as-is.\n\
@@ -207,6 +214,396 @@ pub fn resolve_lokalai_credentials(
         "lokalai: no endpoint and no API key — set them in the provider config or a kloo profile"
             .to_string()
     })
+}
+
+/// One document handed to a tool-less reviewer.
+///
+/// A stream lens has no filesystem, so the host reads the file and passes its
+/// BODY here. `path` is kept purely as provenance — it tells the reviewer (and
+/// a human reading the captured request) where the text came from, so a finding
+/// can cite `plan/overview.md` rather than "the second blob of text".
+#[derive(Debug, Clone)]
+pub struct LensDoc {
+    pub label: String,
+    pub path: String,
+    pub body: String,
+}
+
+/// The material budget for one stream lens's prompt, in BYTES.
+///
+/// WHY 160_000. Sized against the material that actually exists, not against a
+/// guess. Measured 2026-10-24 by rendering the live kart plan, the real
+/// methodology and the real conventions store through `expand_lens_docs` +
+/// `inline_material`: 12 documents, 111,881 BODY BYTES (brief 5,467 + plan
+/// overview 6,351 + methodology 33,093 + nine conventions files 66,970), plus
+/// ~1,500 bytes of section headers/trailers — so ~113,400 bytes render today.
+/// The arithmetic the ceiling is checked against: 160,000 characters at the
+/// ~3.5 characters/token this prose runs at is ~45,700 tokens
+/// (160_000 / 3.5 ≈ 45,714), and the lens model (`glm-5.3-flash`) is configured
+/// at `maxContextTokens: 131072` (`~/etc/kloo.json`), so the material claims
+/// 45,700 / 131,072 ≈ 35% of the window and leaves ~85,400 tokens — 65% — for
+/// the assembled prompt and the review the lens writes back. That is the whole
+/// trade: enough headroom over the measured 113,400 (~46,600 bytes, ~41%) for a
+/// plan that grows and a conventions store that gains a file, and still far
+/// under the window, because a budget that cannot fit the window turns a cut
+/// checklist into a provider error. 80,000 was wrong for exactly the opposite
+/// reason: it was set the same day as the directory fix, when CONVENTIONS was 88
+/// characters of `Is a directory (os error 21)`, so it was sized against a third
+/// of the material that exists — and it cut `review-lenses.md` at 63% and
+/// reduced `ui.md` to a header. The number matters far less than the RAIL: what
+/// killed the 2026-10-24 run was a reviewer that could not see the plan at all,
+/// and the next failure to guard against is a prompt that grows without bound (a
+/// log pasted into `conventions/`) and dies in the context window. A budget
+/// generous enough never to fire on a real plan, but hard enough to stop a
+/// runaway store, is the property worth having. Truncation is always NAMED (see
+/// [`inline_material`]), so even too small a budget degrades into an honest
+/// BLOCKED rather than a wrong finding. If you are raising this again, redo the
+/// arithmetic above against the configured `maxContextTokens` and re-measure the
+/// store — do not just double it.
+pub const LENS_MATERIAL_BUDGET_BYTES: usize = 160_000;
+
+/// Render the documents a tool-less reviewer needs, inside `budget` BYTES.
+///
+/// The contract, in the order it matters:
+///
+/// 1. every document appears as a LABELLED section carrying its body, so the
+///    reviewer can say WHICH document a finding is against;
+/// 2. budget is spent IN ORDER — the brief is first and is therefore never the
+///    casualty of a later, larger document;
+/// 3. over budget the result is at most `budget` bytes, and what was dropped is
+///    NAMED with a count (`… 46,312 characters of PLAN omitted …`). A silent cut
+///    turns "the criteria were truncated" into "phase 3 has no criteria", which
+///    is a wrong finding shipped as a real one;
+/// 4. under budget nothing is altered and NOTHING is announced — a truncation
+///    notice on a complete plan would teach the reviewer to distrust complete
+///    plans;
+/// 5. an EMPTY document is still present and marked empty. A missing brief and
+///    an empty brief are different facts, and only one of them is a finding
+///    about the plan.
+/// How many files one directory-valued material path may contribute.
+///
+/// WHY 24. The byte budget beside it is [`LENS_MATERIAL_BUDGET_BYTES`] = 80,000
+/// characters, and the real conventions store is a handful of markdown files —
+/// `review-lenses.md`, a commit-style doc, a per-area directory or two: call it
+/// five to ten files of a few KB each, comfortably under 20k characters, so on a
+/// real store the BYTE budget is what bites and this count never fires. The
+/// count still earns its rail, because the byte budget cannot see it: 200 tiny
+/// one-line rule files are 200 section headers of prompt overhead — 200 places
+/// for a tool-less reviewer to lose the checklist — long before 80k characters
+/// are spent. 24 is loose enough never to cut a store anyone would call normal,
+/// and low enough that a conventions directory nobody pruned cannot become the
+/// majority of the prompt. Over the cap the cut is NAMED with the count left out
+/// (see [`expand_lens_docs`]), so it degrades the way `inline_material` degrades
+/// on bytes: visibly, and with an instruction to say so rather than guess.
+pub const LENS_MATERIAL_MAX_FILES: usize = 24;
+
+/// Walk a directory, collecting the paths of every file beneath it, RECURSIVELY,
+/// in SORTED path order.
+///
+/// Sorted because `read_dir` yields filesystem order, and a prompt whose sections
+/// shuffle between runs breaks the provider's prefix cache and makes two runs of
+/// the same plan incomparable. A directory that cannot be read surfaces through
+/// `Err`, so the caller can say so in the prompt instead of emitting a section
+/// that quietly contains nothing.
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        // `symlink_metadata`, not `metadata`: a symlink into a directory outside
+        // the conventions store must not be followed, and one pointing back at an
+        // ancestor must not be recursed into forever.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_files(&path, out)?;
+        } else if meta.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Turn one material path into the documents to inline for it.
+///
+/// THE DEFECT THIS FIXES, measured on the live 2026-10-24 14:02:40 run: the
+/// conventions path is a DIRECTORY, and the code this replaces called
+/// `read_to_string` on it, so the reviewer was handed
+/// `(this document could not be read from the host filesystem: Is a directory
+/// (os error 21))` where the review checklists should have been — while three
+/// planner prompts tell the planner those checklists live at
+/// `{{conventions_path}}/review-lenses.md`. See `tests/stream_lens_conventions.rs`.
+///
+/// The contract:
+///
+/// * a **file** is exactly ONE document carrying its own bytes, label and path
+///   unchanged — BRIEF, PLAN and METHODOLOGY behave exactly as they did;
+/// * a **directory** is one document PER FILE beneath it, recursively (the
+///   prompts say "every file under"), in sorted path order, each keeping the
+///   caller's label so the section is still recognisably CONVENTIONS and each
+///   carrying its OWN file path so the reviewer can cite `review-lenses.md`
+///   rather than "a blob of conventions";
+/// * at most `max_files` of them, and a cut is NAMED with the count left out — a
+///   reviewer judging a partial checklist must be able to say so, exactly as
+///   `inline_material` names a byte cut;
+/// * anything else (missing, unreadable) is still exactly ONE document whose body
+///   explains itself with the OS error. Returning an empty vector here would
+///   delete the section from the prompt, and a reviewer cannot report a
+///   limitation it was never shown — which is the only reason this bug was found.
+pub fn expand_lens_docs(label: &str, path: &std::path::Path, max_files: usize) -> Vec<LensDoc> {
+    let doc = |file: &std::path::Path, body: String| LensDoc {
+        label: label.to_string(),
+        path: file.to_string_lossy().to_string(),
+        body,
+    };
+    // The honest degradation, shared by every failure below — kept word-for-word
+    // so a prompt captured before this fix reads the same way for a path that is
+    // genuinely unreadable.
+    let unreadable = |error: &std::io::Error| {
+        vec![doc(
+            path,
+            format!("(this document could not be read from the host filesystem: {error})"),
+        )]
+    };
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => return unreadable(&error),
+    };
+
+    if !meta.is_dir() {
+        // A plain file — BRIEF, PLAN and METHODOLOGY land here. One document,
+        // unchanged from before this fix.
+        return match std::fs::read_to_string(path) {
+            Ok(body) => vec![doc(path, body)],
+            Err(error) => unreadable(&error),
+        };
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    if let Err(error) = collect_files(path, &mut files) {
+        return unreadable(&error);
+    }
+
+    // A directory holding nothing still has to appear: an empty conventions store
+    // is a finding about the plan, a vanished section is not.
+    if files.is_empty() {
+        return vec![doc(
+            path,
+            "(empty — this directory exists and contains no files)".to_string(),
+        )];
+    }
+
+    let shown: Vec<LensDoc> = files
+        .iter()
+        .take(max_files)
+        .map(|file| {
+            // One unreadable file among many is a body that says so — not a
+            // dropped section, and not an abandoned conventions store.
+            let body = match std::fs::read_to_string(file) {
+                Ok(body) => body,
+                Err(error) => format!(
+                    "(this document could not be read from the host filesystem: {error})"
+                ),
+            };
+            doc(file, body)
+        })
+        .collect();
+
+    let mut docs = shown;
+    let left_out = files.len() - docs.len();
+    if left_out > 0 {
+        docs.push(doc(
+            path,
+            format!(
+                "[… {left_out} more file(s) of {label} omitted: the directory holds \
+                 {} files and this lens's material is capped at {max_files}. If what \
+                 you can see is incomplete, say so and return BLOCKED rather than \
+                 reporting the missing files as absent.]",
+                files.len()
+            ),
+        ));
+    }
+    docs
+}
+
+/// The material block for a stream lens reviewing ONE PHASE of a development run.
+///
+/// The planning sibling lives in `agent_plans.rs` (`stream_lens_material`); this
+/// is the same contract with the phase's own documents in front. A tool-less
+/// reviewer handed a path has nothing to follow it with — so the phase's
+/// overview, status and task files are read HERE and their BODIES ride the
+/// prompt, labelled, alongside the brief, the plan overview, the methodology and
+/// the conventions.
+///
+/// Built from `expand_lens_docs` + `inline_material` like the planning side, so
+/// it inherits the byte budget and the honest, NAMED truncation rather than
+/// inventing a second one. Budget order is load-bearing: the phase under review
+/// is what the lens is judging, so it is expanded first and can never be the
+/// casualty of a larger conventions store.
+pub fn development_lens_material(
+    lens_name: &str,
+    phase_id: &str,
+    phase_path: &std::path::Path,
+    tasks_path: &std::path::Path,
+    brief_path: &std::path::Path,
+    plan_overview_path: &std::path::Path,
+    methodology_path: &std::path::Path,
+    conventions_path: &std::path::Path,
+) -> String {
+    let mut docs: Vec<LensDoc> = Vec::new();
+    docs.extend(expand_lens_docs(
+        &format!("PHASE {phase_id} OVERVIEW"),
+        &phase_path.join("overview.md"),
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        &format!("PHASE {phase_id} STATUS"),
+        &phase_path.join("status.md"),
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        &format!("PHASE {phase_id} TASKS"),
+        tasks_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "BRIEF",
+        brief_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "PLAN",
+        plan_overview_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "METHODOLOGY",
+        methodology_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    docs.extend(expand_lens_docs(
+        "CONVENTIONS",
+        conventions_path,
+        LENS_MATERIAL_MAX_FILES,
+    ));
+    format!(
+        "You are the `{lens_name}` review lens for phase {phase_id} of a development run. \
+         Judge the work this phase DELIVERED, and whether it is faithful to the accepted \
+         brief. Everything you must review is included below as labelled sections — this \
+         phase's overview, status and task files, the accepted brief, the plan overview, \
+         the methodology and the conventions — so judge only the material shown to you \
+         here. A document that is empty or unreadable is a finding to report, not a \
+         reason to stop.\n\n{}\n",
+        inline_material(&docs, LENS_MATERIAL_BUDGET_BYTES),
+    )
+}
+
+pub fn inline_material(docs: &[LensDoc], budget: usize) -> String {
+    /// The notice naming what was dropped. Deliberately compact: it has to fit
+    /// inside the very budget it is enforcing.
+    fn omission(label: &str, remaining: usize) -> String {
+        format!(
+            "\n[… {remaining} characters of {label} omitted: the material was \
+             truncated to fit the lens's prompt budget. If what you can see is \
+             incomplete, say so and return BLOCKED rather than reporting the \
+             missing part as absent.]\n"
+        )
+    }
+
+    /// A document shown in full, header included. An empty body is MARKED empty
+    /// rather than rendered as nothing.
+    fn section(d: &LensDoc) -> String {
+        let body = if d.body.is_empty() {
+            "(empty — this document exists and contains nothing)".to_string()
+        } else {
+            d.body.clone()
+        };
+        format!(
+            "=== {label} · {path} · {n} characters ===\n{body}\n=== end of {label} ===\n",
+            label = d.label,
+            path = d.path,
+            n = d.body.chars().count(),
+            body = body,
+        )
+    }
+
+    /// The heading for a document whose body is being shown in PART — so a
+    /// reviewer can tell a complete plan from a partial one at a glance, rather
+    /// than only learning at the omission notice at the end.
+    fn partial_heading(d: &LensDoc, shown: usize) -> String {
+        format!(
+            "=== {label} · {path} · PARTIAL: first {shown} of {all} characters shown ===\n",
+            label = d.label,
+            path = d.path,
+            shown = shown,
+            all = d.body.chars().count(),
+        )
+    }
+
+    /// A later document squeezed out entirely still gets a section: header, the
+    /// notice naming its whole body, trailer. The cheapest shape that is neither
+    /// a silent skip nor a lie about what the reviewer is being handed.
+    fn stub(d: &LensDoc) -> String {
+        format!(
+            "=== {label} · {path} ===\n{notice}=== end of {label} ===\n",
+            label = d.label,
+            path = d.path,
+            notice = omission(&d.label, d.body.chars().count()),
+        )
+    }
+
+    let mut out = String::new();
+    for (i, d) in docs.iter().enumerate() {
+        let whole = section(d);
+        // Everything after this document still has to be PRESENT, so reserve the
+        // cheapest possible section for each of them (`stub` of an empty body).
+        // Anything tighter and a later document could be squeezed out of
+        // existence rather than shown as truncated — the silent skip this
+        // function exists to ban.
+        let reserve_bytes: usize = docs[i + 1..].iter().map(|later| stub(later).len()).sum();
+        if out.len() + whole.len() + reserve_bytes <= budget {
+            out.push_str(&whole);
+            continue;
+        }
+        // This document does not fit whole: a PARTIAL heading, as much body as is
+        // left once the reserve and the notice are paid for, then the notice
+        // naming the count. The heading says PARTIAL before the text does, so a
+        // reviewer never mistakes a cut plan for a short one.
+        let trailer = format!("=== end of {} ===\n", d.label);
+        let notice_room = omission(&d.label, d.body.chars().count()).len();
+        let heading_room = partial_heading(d, d.body.chars().count()).len();
+        let room = budget.saturating_sub(
+            out.len() + heading_room + trailer.len() + reserve_bytes + notice_room,
+        );
+        // Cut on a char boundary — a body is UTF-8, and a byte-slice panic in the
+        // coordinator loop would take the whole review down with it.
+        let mut cut = room.min(d.body.len());
+        while cut > 0 && !d.body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let shown = d.body[..cut].chars().count();
+        let omitted = d.body.chars().count() - shown;
+        out.push_str(&partial_heading(d, shown));
+        out.push_str(&d.body[..cut]);
+        out.push_str(&omission(&d.label, omitted));
+        out.push_str(&trailer);
+        // Budget is spent in order, so every later document still appears —
+        // named, empty, and counted. The reserve above pays for them; re-measure
+        // rather than trust it, and stop rather than emit a half-written header.
+        for later in &docs[i + 1..] {
+            let s = stub(later);
+            if out.len() + s.len() > budget {
+                break;
+            }
+            out.push_str(&s);
+        }
+        break;
+    }
+    debug_assert!(out.len() <= budget, "inline_material broke its own rail");
+    out
 }
 
 #[cfg(test)]
