@@ -5,7 +5,8 @@ pub mod registration;
 pub mod ws_client;
 
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, grok, ollama_cli, ChunkType, CliProvider, StreamChunk,
+    claude_code, cli_runner, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
+    StreamChunk,
 };
 use crate::services::{
     chat_host, providers as provider_service, sessions as session_service,
@@ -3024,7 +3025,11 @@ impl AgentService {
     ) -> Option<crate::events::StreamEvent> {
         use crate::events::StreamEvent;
         let (kind, text, tool_name, data) = match chunk.chunk_type {
-            ChunkType::Text => ("text", Some(chunk.content.clone()), None, None),
+            // `Assistant` is the incremental-delta kind emitted by streaming HTTP
+            // providers (lokalai); it renders exactly like `Text`.
+            ChunkType::Text | ChunkType::Assistant => {
+                ("text", Some(chunk.content.clone()), None, None)
+            }
             ChunkType::ToolUse => (
                 "tool_call",
                 None,
@@ -3189,6 +3194,11 @@ impl AgentService {
             }
             CliProvider::Shell => unreachable!("shell provider already rejected"),
             CliProvider::Kloo => unreachable!("kloo provider already rejected"),
+            CliProvider::Lokalai => {
+                let (endpoint, api_key) = lokalai::resolve_endpoint_and_key(&state)
+                    .unwrap_or_default();
+                lokalai::build_config(&req.content, &working_dir, &model, &endpoint, &api_key)
+            }
         };
 
         let parse_fn: fn(&str) -> Option<StreamChunk> = match provider {
@@ -3199,6 +3209,7 @@ impl AgentService {
             CliProvider::Ollama => ollama_cli::parse_line,
             CliProvider::Shell => unreachable!("shell provider already rejected"),
             CliProvider::Kloo => unreachable!("kloo provider already rejected"),
+            CliProvider::Lokalai => lokalai::parse_line,
         };
 
         let (_process, mut rx) =
