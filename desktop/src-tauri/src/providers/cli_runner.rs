@@ -72,7 +72,7 @@ where
 }
 
 async fn spawn_cli_inner<F>(
-    config: CliSpawnConfig,
+    mut config: CliSpawnConfig,
     session_id: String,
     parse_line: F,
     process_group: bool,
@@ -99,9 +99,16 @@ where
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
         .current_dir(&working_dir)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A body to hand the child on stdin (see `CliSpawnConfig::stdin` — a single
+    // argv string is capped at MAX_ARG_STRLEN, so a big request body has
+    // nowhere else to go). Otherwise stdin is /dev/null exactly as before.
+    if config.stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     if process_group {
         #[cfg(unix)]
         cmd.process_group(0);
@@ -121,6 +128,23 @@ where
 
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+    // Write the body and CLOSE the handle. Dropping it is what sends EOF; a
+    // child reading `--data @-` waits for that EOF, so keeping the handle alive
+    // (or leaving the write to a caller that never comes) hangs the lens
+    // forever — strictly worse than the E2BIG this replaces.
+    if let Some(body) = config.stdin.take() {
+        let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+        stdin
+            .write_all(body.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write stdin for '{}': {}", config.command, e))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush stdin for '{}': {}", config.command, e))?;
+        drop(stdin);
+    }
 
     let (tx, rx) = mpsc::channel::<StreamChunk>(256);
 
