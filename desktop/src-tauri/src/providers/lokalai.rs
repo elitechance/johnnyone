@@ -460,6 +460,12 @@ mod tests {
 
     #[test]
     fn header_and_body_are_argv_flags_not_a_config_file() {
+        // The body (prompt + model + stream:true) must travel via cfg.stdin,
+        // NOT in argv.  Linux caps a SINGLE argv string at MAX_ARG_STRLEN =
+        // 131,072 bytes, and a lens prompt at its material budget (160,000)
+        // is bigger than that, so `--data <body>` made `spawn` fail with
+        // E2BIG before curl ran.  `--data @-` tells curl to read the body
+        // from stdin instead, and `spawn_cli` writes it there.
         let cfg = build_config("hi", "/tmp", "glm", "https://lokalai.example/v1", "k");
         let joined = cfg.args.join(" ");
         assert!(cfg.args.iter().any(|a| a == "--variable"));
@@ -467,9 +473,17 @@ mod tests {
             .args
             .iter()
             .any(|a| a == "Authorization: Bearer {{LOKALAI_API_KEY}}"));
+        // The body is NOT in argv — it would blow MAX_ARG_STRLEN.
+        assert!(!joined.contains("\"stream\":true"), "body must not appear in argv: {joined}");
+        // --data uses the stdin redirect marker, not the body inline.
         assert!(cfg.args.iter().any(|a| a == "--data"));
-        assert!(joined.contains("\"stream\":true"));
+        assert!(cfg.args.iter().any(|a| a == "@-"), "argv must contain '@-' (stdin marker): {joined}");
         assert!(!joined.contains("--config") && !joined.contains("-K"));
+        // The body does reach the process via cfg.stdin.
+        let stdin_body = cfg.stdin.as_ref().expect("body must arrive via stdin (cfg.stdin)");
+        assert!(stdin_body.contains("\"stream\":true"), "stdin body missing stream:true");
+        assert!(stdin_body.contains("\"model\":\"glm\""), "stdin body missing model");
+        assert!(stdin_body.contains("hi"), "stdin body missing prompt text");
     }
 
     #[test]
