@@ -9,6 +9,7 @@ use johnnyone_desktop_lib::services::agent_plans;
 use johnnyone_desktop_lib::services::provider_preflight;
 use johnnyone_desktop_lib::services::question_watch;
 use johnnyone_desktop_lib::services::relay;
+use johnnyone_desktop_lib::services::session_watchdog;
 use johnnyone_desktop_lib::state::app_state::AppState;
 use johnnyone_desktop_lib::terminal;
 use tracing_subscriber::EnvFilter;
@@ -126,6 +127,12 @@ fn main() {
             // shares the one state.
             let question_state = app_state.clone();
             question_watch::spawn_question_watch(question_state);
+
+            // Session watchdog loop — a single 20s ticker for all sessions, checks per-session
+            // config and delivers nudges through the unified chat seam. Like `question_watch`,
+            // this is a long-lived task on Tauri's tokio runtime.
+            let watchdog_state = app_state.clone();
+            session_watchdog::spawn_session_watchdog(watchdog_state);
 
             // One read of the provider's model list, compared with the seat caps: a cap for a
             // family the provider will not serve is a pool that can be leased and never used.

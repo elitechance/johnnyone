@@ -461,6 +461,170 @@ fn publish_session_update(state: &AppState, session: &Session) {
     });
 }
 
+/// Read the watchdog settings for a session.
+pub fn get_session_watchdog_config(state: &AppState, id: &str) -> Result<WatchdogConfig, String> {
+    state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT watchdog_enabled, watchdog_interval_secs, watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count \
+             FROM sessions WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(WatchdogConfig {
+                    enabled: row.get::<_, i64>(0)? != 0,
+                    interval_secs: row.get::<_, i64>(1)? as u64,
+                    prompt: row.get(2)?,
+                    last_nudge_at: row.get(3)?,
+                    nudge_count: row.get::<_, i64>(4)? as u64,
+                })
+            },
+        )
+        .map_err(|e| format!("Session not found: {}", e))
+    })
+}
+
+/// Set the watchdog enabled/interval for a session. Clamps interval to [60, 3600].
+pub fn set_session_watchdog(
+    state: &AppState,
+    id: &str,
+    enabled: bool,
+    interval_secs: u64,
+) -> Result<(), String> {
+    let clamped = interval_secs.clamp(60, 3600);
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions SET watchdog_enabled = ?1, watchdog_interval_secs = ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![enabled as i64, clamped as i64, id],
+        )
+        .map_err(|e| format!("Failed to update watchdog: {}", e))
+    })?;
+    Ok(())
+}
+
+/// Set the watchdog prompt for a session. Rejects embedded \r and \n, and strings over 600 chars.
+pub fn set_session_watchdog_prompt(state: &AppState, id: &str, prompt: &str) -> Result<(), String> {
+    if prompt.chars().any(|c| c.is_control() && c != '\t') {
+        return Err("Watchdog prompt contains control characters".to_string());
+    }
+    if prompt.chars().count() > 600 {
+        return Err("Watchdog prompt exceeds 600 characters".to_string());
+    }
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions SET watchdog_prompt = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![prompt, id],
+        )
+        .map_err(|e| format!("Failed to update watchdog prompt: {}", e))
+    })?;
+    Ok(())
+}
+
+/// Bump the watchdog nudge counter and stamp the last-nudge timestamp.
+pub fn bump_watchdog_nudge(state: &AppState, id: &str) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE sessions SET watchdog_nudge_count = watchdog_nudge_count + 1, \
+             watchdog_last_nudge_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to bump watchdog nudge: {}", e))?;
+        Ok(())
+    })
+}
+
+/// Query the latest session_reports timestamp for a session, or None if no reports exist.
+pub fn latest_session_report_at(state: &AppState, id: &str) -> Result<Option<String>, String> {
+    state.db.with_conn(|conn| {
+        let result: Result<Option<String>, _> = conn.query_row(
+            "SELECT created_at FROM session_reports WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            params![id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(ts) => Ok(ts),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
+/// Configuration for the per-session watchdog.
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub prompt: String,
+    pub last_nudge_at: Option<String>,
+    pub nudge_count: u64,
+}
+
+/// Pure-function predicate: is the watchdog due right now?
+///
+/// `last` is an ISO-8601 or SQLite datetime string, or None if never nudged / no reports.
+/// `interval_secs` is the configured interval.
+pub fn watchdog_is_due(
+    now_utc: &chrono::DateTime<chrono::Utc>,
+    last: Option<&str>,
+    interval_secs: u64,
+) -> bool {
+    let Some(last_str) = last else {
+        // Never nudged and no reports — always due.
+        return true;
+    };
+    // Try RFC 3339 first, then SQLite datetime format.
+    if let Ok(last_ts) = chrono::DateTime::parse_from_rfc3339(last_str) {
+        let last_utc = last_ts.with_timezone(&chrono::Utc);
+        let elapsed = *now_utc - last_utc;
+        return elapsed.num_seconds() as u64 >= interval_secs;
+    }
+    if let Ok(last_ts) = chrono::NaiveDateTime::parse_from_str(last_str, "%Y-%m-%d %H:%M:%S") {
+        let last_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(last_ts, chrono::Utc);
+        let elapsed = *now_utc - last_utc;
+        return elapsed.num_seconds() as u64 >= interval_secs;
+    }
+    // Unparseable timestamp — treat as due.
+    true
+}
+
+/// Humanise a duration in seconds, e.g. 1204 → "20m 04s".
+pub fn humanise_duration(secs: u64) -> String {
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    format!("{minutes}m {seconds:02}s")
+}
+
+#[cfg(test)]
+mod session_watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_due_not_due_one_second_early() {
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:00:29Z").unwrap();
+        let due = watchdog_is_due(&now.with_timezone(&chrono::Utc), Some("2024-01-15T10:00:00Z"), 30);
+        assert!(!due, "should not be due 29s after last at interval 30");
+    }
+
+    #[test]
+    fn watchdog_due_exactly_on_boundary() {
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:00:30Z").unwrap();
+        let due = watchdog_is_due(&now.with_timezone(&chrono::Utc), Some("2024-01-15T10:00:00Z"), 30);
+        assert!(due, "should be due exactly at interval boundary (30s)");
+    }
+
+    #[test]
+    fn watchdog_due_after_interval() {
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:01:00Z").unwrap();
+        let due = watchdog_is_due(&now.with_timezone(&chrono::Utc), Some("2024-01-15T10:00:00Z"), 30);
+        assert!(due, "should be due after interval");
+    }
+
+    #[test]
+    fn watchdog_due_no_last_is_always_due() {
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:00:00Z").unwrap();
+        let due = watchdog_is_due(&now.with_timezone(&chrono::Utc), None, 3600);
+        assert!(due, "never nudged should be due");
+    }
+}
+
 #[cfg(test)]
 mod terminal_status_tests {
     use super::reported_terminal_status;
