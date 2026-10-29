@@ -9,7 +9,7 @@ use crate::providers::{
     StreamChunk,
 };
 use crate::services::{
-    chat_host, providers as provider_service, sessions as session_service,
+    agent_plans, chat_host, providers as provider_service, sessions as session_service,
     settings as settings_service,
 };
 use crate::state::app_state::AppState;
@@ -822,6 +822,7 @@ impl AgentService {
                     state,
                     session_id,
                     "update",
+                    "system",
                     "Key reference",
                     Some(&crate::terminal_keys::help_markdown()),
                 );
@@ -836,6 +837,7 @@ impl AgentService {
                         state,
                         session_id,
                         "update",
+                        "system",
                         &crate::terminal_keys::echo_line(&keys),
                         None,
                     ),
@@ -843,6 +845,7 @@ impl AgentService {
                         state,
                         session_id,
                         "blocked",
+                        "system",
                         &format!("Could not send keys: {error}"),
                         None,
                     ),
@@ -854,6 +857,7 @@ impl AgentService {
                     state,
                     session_id,
                     "blocked",
+                    "system",
                     &message,
                     None,
                 );
@@ -862,6 +866,64 @@ impl AgentService {
                 Ok(())
             }
         }
+    }
+
+    /// Unified delivery seam for BOTH human chat messages and watchdog nudges.
+    ///
+    /// Inserts a `session_reports` row with the given role, arms the shell report nudge
+    /// (only for `role == "user"`), then sends the text as terminal input followed by `\r`.
+    ///
+    /// Only `role == "user"` may consume the one-shot brief slot (`state.shell_briefed`).
+    /// A watchdog nudge arriving first must NOT burn the human's brief.
+    pub async fn deliver_chat_message(
+        state: &Arc<AppState>,
+        session_id: &str,
+        text: &str,
+        role: &str,
+    ) -> Result<(), String> {
+        let body = text.trim_end_matches(['\r', '\n']);
+        if body.is_empty() {
+            return Ok(());
+        }
+        // Always record a session_reports row with the actual role.
+        agent_plans::record_session_note(state, session_id, "prompt", role, body, None);
+
+        // Only `"user"` messages arm the nudge and consume the brief slot.
+        if role == "user" {
+            Self::arm_shell_report_nudge(state, session_id);
+            // On the FIRST user message, append the reporting brief.
+            {
+                let mut briefed = state.shell_briefed.lock().await;
+                if briefed.insert(session_id.to_string()) {
+                    let brief = format!(
+                        " [JohnnyOne: this conversation is being read on a phone console that shows ONLY what \
+                         you report — your terminal output is not visible there. After you answer, write your \
+                         reply as markdown (```mermaid fences render) to a file, then run: curl -s \
+                         127.0.0.1:7788/graphql -H 'content-type: application/json' -d \
+                         '{{\"query\":\"mutation{{reportAgentResult(sessionId:\\\"{session_id}\\\",\
+                         kind:\\\"update\\\",summary:\\\"ONE LINE NO QUOTES\\\",\
+                         evidence:\\\"/absolute/path/to/reply.md\\\")}}\"}}' — replace the summary and path, \
+                         and do this for every reply.]"
+                    );
+                    let _ = crate::terminal::send_terminal_input(
+                        state,
+                        session_id.to_string(),
+                        format!("{}{}\r", body, brief),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Send the text, which is also the transcript row's content.
+        let _ = crate::terminal::send_terminal_input(
+            state,
+            session_id.to_string(),
+            format!("{body}\r"),
+        )
+        .await;
+        Ok(())
     }
 
     async fn with_shell_brief(state: &Arc<AppState>, session_id: &str, data: String) -> String {
@@ -1359,6 +1421,8 @@ impl AgentService {
             "upsert_provider_config" => Self::rpc_upsert_provider_config(&req.params, state),
             "delete_provider_config" => Self::rpc_delete_provider_config(&req.params, state),
             "stop_ai_generation" => Self::rpc_stop_ai_generation(&req.params, state).await,
+            "update_session_watchdog" => Self::rpc_update_session_watchdog(&req.params, state),
+            "update_session_watchdog_prompt" => Self::rpc_update_session_watchdog_prompt(&req.params, state),
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };
 
@@ -1486,6 +1550,42 @@ impl AgentService {
             session_service::update_session_title(state, id.to_string(), title.to_string())?;
 
         serde_json::to_value(Self::session_view(session)).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_session_watchdog(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| "Missing 'enabled' parameter".to_string())?;
+        let interval_secs = params
+            .get("intervalSecs")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "Missing 'intervalSecs' parameter".to_string())?;
+        session_service::set_session_watchdog(state, id, enabled, interval_secs)?;
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    fn rpc_update_session_watchdog_prompt(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+        let prompt = params
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'prompt' parameter".to_string())?;
+        session_service::set_session_watchdog_prompt(state, id, prompt)?;
+        Ok(serde_json::json!({"ok": true}))
     }
 
     fn rpc_update_session_provider(

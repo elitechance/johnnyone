@@ -16,6 +16,7 @@ pub mod provider_preflight;
 pub mod question_watch;
 pub mod relay;
 pub mod sessions;
+pub mod session_watchdog;
 pub mod settings;
 pub mod stream_lens;
 pub mod task_check;

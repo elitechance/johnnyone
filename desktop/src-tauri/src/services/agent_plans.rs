@@ -4821,6 +4821,7 @@ pub async fn record_agent_report(
             state,
             &session_id,
             "blocked",
+            "system",
             "evidence attachment refused: path outside the allowed roots",
             None,
         );
@@ -5230,17 +5231,19 @@ pub fn record_session_note(
     state: &AppState,
     session_id: &str,
     kind: &str,
+    role: &str,
     summary: &str,
     markdown: Option<&str>,
 ) {
     let result = state.db.with_conn(|conn| {
         conn.execute(
             "INSERT INTO session_reports (id, session_id, kind, role, summary, markdown) \
-             VALUES (?1, ?2, ?3, 'system', ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 Uuid::new_v4().to_string(),
                 session_id,
                 kind,
+                role,
                 summary,
                 markdown,
             ],
