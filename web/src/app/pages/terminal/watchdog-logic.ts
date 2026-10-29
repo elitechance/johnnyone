@@ -6,6 +6,33 @@
 
 export type WatchdogChipState = 'off' | 'holding' | 'quiet' | 'nudged';
 
+/**
+ * Format a countdown in seconds to "M:SS", clamped at 0.
+ */
+export function formatCountdown(secs: number): string {
+  const clamped = Math.max(0, Math.round(secs));
+  const m = Math.floor(clamped / 60);
+  const s = clamped % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Compute the countdown seconds for the watchdog ETA display.
+ * Moves the Math.max arithmetic out of the template so the component
+ * does not need a `Math` alias.
+ */
+export function watchdogEtaSeconds(
+  state: WatchdogChipState,
+  intervalSecs: number,
+  paneSecsAgo: number,
+  quietSecs: number,
+): number {
+  if (state === 'holding') {
+    return Math.max(0, intervalSecs - paneSecsAgo);
+  }
+  return Math.max(0, intervalSecs - quietSecs);
+}
+
 export interface WatchdogChipInput {
   enabled: boolean;
   lastNudgeAt: string | null;

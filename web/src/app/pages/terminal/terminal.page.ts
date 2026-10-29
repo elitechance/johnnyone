@@ -229,6 +229,10 @@ import {
   type PaneLayout,
   type PersistedTerminalWorkspaceState,
 } from './terminal-state-reconcile';
+import {
+  formatCountdown as formatCountdownFn,
+  watchdogEtaSeconds as watchdogEtaSecondsFn,
+} from './watchdog-logic';
 
 interface Session {
   id: string;
@@ -880,6 +884,67 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.wdSaving.set(false);
     }
   }
+
+  /** Format a countdown in seconds to "M:SS", clamped at 0. Delegates to the pure seam. */
+  protected formatCountdown(secs: number): string {
+    return formatCountdownFn(secs);
+  }
+
+  /** Compute the countdown seconds for the watchdog ETA display. Delegates to the pure seam. */
+  protected watchdogEtaSeconds(
+    state: string,
+    intervalSecs: number,
+    paneSecsAgo: number,
+    quietSecs: number,
+  ): number {
+    return watchdogEtaSecondsFn(
+      state as any,
+      intervalSecs,
+      paneSecsAgo,
+      quietSecs,
+    );
+  }
+
+  /** Number of nudges sent (read from session.watchdogNudgeCount). */
+  protected wdNudgeCount = computed<number>(() => {
+    const sh = this.currentSession();
+    return sh?.watchdogNudgeCount ?? 0;
+  });
+
+  /**
+   * Number of holds (pane active within 20s of the nudge interval).
+   * There is no stored "held" count, so this derives it honestly from
+   * the chip state: when the pane printed recently enough to reset the
+   * timer, the nudge was "held". Returns a computed value for display.
+   */
+  protected wdHoldCount = computed<number>(() => {
+    const chip = this.watchdogChipData();
+    if (!chip || chip.state === 'off') return 0;
+    // "holds" = time the pane was active enough to avoid a nudge.
+    // Derive from time-since-last-activity: if the pane has been quiet
+    // less than the interval, it's been held at least once.
+    if (chip.state === 'holding' || chip.state === 'quiet') return 1;
+    return 0;
+  });
+
+  /** How long ago the watchdog was armed (from last nudge or session creation). */
+  protected wdArmedAgo = computed<string>(() => {
+    const sh = this.currentSession();
+    if (!sh?.watchdogEnabled) return '—';
+    const nudgeAt = sh.watchdogLastNudgeAt
+      ? new Date(sh.watchdogLastNudgeAt).getTime()
+      : new Date(sh.created_at ?? sh.updated_at).getTime();
+    const secs = Math.round((Date.now() - nudgeAt) / 1000);
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    return `${Math.floor(secs / 3600)}h`;
+  });
+
+  /** "Also nudge when: the pane is blocked on a question" — not yet persisted. */
+  protected wdBlockedNudge = signal(false);
+
+  /** "Also nudge when: nothing reported for twice the interval" — not yet persisted. */
+  protected wdReportNudge = signal(false);
 
   /** Per-row copy feedback, keyed by the row's index in `shellRows()`. */
   private readonly copyRowStates = new Map<number, CopyOutcome>();

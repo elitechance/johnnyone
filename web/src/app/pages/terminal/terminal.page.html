@@ -340,7 +340,7 @@
               }
               @if (wdChip.state === 'holding' || wdChip.state === 'quiet') {
                 @let interval = wdIntervalSecs();
-                @let secsSince = wdChip.state === 'holding' ? Math.max(0, interval - wdChip.paneSecsAgo) : Math.max(0, interval - wdChip.quietSecs);
+                @let secsSince = watchdogEtaSeconds(wdChip.state, interval, wdChip.paneSecsAgo, wdChip.quietSecs);
                 <span class="wd-countdown">next check {{ formatCountdown(secsSince) }}</span>
               }
               <span class="wd-gear">⚙</span>
@@ -403,7 +403,7 @@
               <span class="wd-strip-eta">
                 @if (wdChip?.state !== 'off') {
                   @let interval = wdIntervalSecs();
-                  @let secsSince = wdChip?.state === 'holding' ? Math.max(0, interval - (wdChip?.paneSecsAgo ?? 0)) : Math.max(0, interval - (wdChip?.quietSecs ?? 0));
+                  @let secsSince = watchdogEtaSeconds(wdChip?.state ?? 'off', interval, wdChip?.paneSecsAgo ?? 0, wdChip?.quietSecs ?? 0);
                   next check<br>in {{ formatCountdown(secsSince) }}
                 }
               </span>
