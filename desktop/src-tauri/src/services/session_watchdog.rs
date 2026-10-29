@@ -11,17 +11,22 @@ use std::time::Duration;
 ///
 /// Must run on the Tauri async runtime (`tauri::async_runtime::spawn`) so its tokio
 /// timers share the executor the rest of the host uses.
-pub async fn spawn_session_watchdog(state: AppState) {
-    let state = Arc::new(state);
-    tracing::info!("session watchdog loop starting (interval 20s)");
-    let mut ticker = tokio::time::interval(Duration::from_secs(20));
+pub fn spawn_session_watchdog(state: AppState) {
+    // `tauri::async_runtime::spawn`, NOT `tokio::spawn`: this is called from Tauri's `setup`,
+    // which runs on the main thread with no tokio reactor entered, so a bare `tokio::spawn`
+    // panics there with "there is no reactor running" and takes the host down on boot.
+    tauri::async_runtime::spawn(async move {
+        let state = Arc::new(state);
+        tracing::info!("session watchdog loop starting (interval 20s)");
+        let mut ticker = tokio::time::interval(Duration::from_secs(20));
 
-    loop {
-        ticker.tick().await;
-        if let Err(error) = tick(&state).await {
-            tracing::warn!(%error, "session watchdog tick failed");
+        loop {
+            ticker.tick().await;
+            if let Err(error) = tick(&state).await {
+                tracing::warn!(%error, "session watchdog tick failed");
+            }
         }
-    }
+    });
 }
 
 async fn tick(state: &Arc<AppState>) -> Result<(), String> {
