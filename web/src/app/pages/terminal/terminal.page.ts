@@ -911,22 +911,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return sh?.watchdogNudgeCount ?? 0;
   });
 
-  /**
-   * Number of holds (pane active within 20s of the nudge interval).
-   * There is no stored "held" count, so this derives it honestly from
-   * the chip state: when the pane printed recently enough to reset the
-   * timer, the nudge was "held". Returns a computed value for display.
-   */
-  protected wdHoldCount = computed<number>(() => {
-    const chip = this.watchdogChipData();
-    if (!chip || chip.state === 'off') return 0;
-    // "holds" = time the pane was active enough to avoid a nudge.
-    // Derive from time-since-last-activity: if the pane has been quiet
-    // less than the interval, it's been held at least once.
-    if (chip.state === 'holding' || chip.state === 'quiet') return 1;
-    return 0;
-  });
-
   /** How long ago the watchdog was armed (from last nudge or session creation). */
   protected wdArmedAgo = computed<string>(() => {
     const sh = this.currentSession();

@@ -482,8 +482,8 @@
                       (click)="toggleWatchdogEnabled()">Disarm</button>
             </div>
 
-            <!-- Footer: sent · held · armed -->
-            <div class="wd-footnote">{{ wdNudgeCount() }} sent · {{ wdHoldCount() }} held · armed {{ wdArmedAgo() }} ago. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
+            <!-- Footer: sent · armed -->
+            <div class="wd-footnote">{{ wdNudgeCount() }} sent · armed {{ wdArmedAgo() }} ago. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
           }
         </section>
       } @else if (sh) {
