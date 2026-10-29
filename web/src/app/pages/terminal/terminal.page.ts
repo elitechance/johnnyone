@@ -212,6 +212,7 @@ import {
   ShellView,
   isShellView,
   resolveShellRoute,
+  shellRoutePath,
   shellViewTogglePath,
 } from '../shells/shells-route';
 import {
@@ -242,6 +243,12 @@ interface Session {
   created_at: string;
   updated_at: string;
   attached_tmux: boolean;
+  /** Watchdog: periodic nudges for a quiet agent. All nullable for deploy-skew safety. */
+  watchdogEnabled?: boolean;
+  watchdogIntervalSecs?: number;
+  watchdogPrompt?: string;
+  watchdogLastNudgeAt?: string;
+  watchdogNudgeCount?: number;
 }
 
 interface Message {
@@ -782,6 +789,98 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private readonly shellClock = signal(0);
   private shellClockInterval: ReturnType<typeof setInterval> | null = null;
 
+  // ── Watchdog ──────────────────────────────────────────────────────────
+
+  /** The watchdog data for the chip above the composer. */
+  protected watchdogChipData(): null | {
+    state: string;
+    paneSecsAgo: number;
+    quietSecs: number;
+    nudgeSecsAgo: number;
+  } {
+    const sh = this.currentSession();
+    if (!sh) return null;
+    const now = Date.now();
+    const pane = this.terminalScreens()[sh.id];
+    const paneLastAt = pane ? (this.paneChangedAt.get(sh.id) ?? now) : now;
+    const paneSecsAgo = Math.round((now - paneLastAt) / 1000);
+    const nudgeAt = sh.watchdogLastNudgeAt ? new Date(sh.watchdogLastNudgeAt).getTime() : null;
+    const nudgeSecsAgo = nudgeAt !== null ? Math.round((now - nudgeAt) / 1000) : 999;
+
+    if (!sh.watchdogEnabled) return { state: 'off', paneSecsAgo, quietSecs: 0, nudgeSecsAgo };
+    if (nudgeSecsAgo < 60) return { state: 'nudged', paneSecsAgo, quietSecs: 0, nudgeSecsAgo };
+    if (paneSecsAgo < 20) return { state: 'holding', paneSecsAgo, quietSecs: 0, nudgeSecsAgo };
+    const quietSecs = Math.max(0, paneSecsAgo);
+    return { state: 'quiet', paneSecsAgo, quietSecs, nudgeSecsAgo };
+  }
+
+  /** Whether the watchdog is enabled for the current session. */
+  protected wdEnabled = signal(false);
+  /** The watchdog interval in seconds. */
+  protected wdIntervalSecs = signal(300);
+  /** The watchdog prompt. */
+  protected wdPrompt = signal('');
+  /** True while a save/nudge is in flight. */
+  protected wdSaving = signal(false);
+
+  /** True if nudging is enabled (watchdog on and not already saving). */
+  protected wdNudgeEnabled(): boolean {
+    return this.wdEnabled() && !this.wdSaving();
+  }
+
+  /** Toggle the watchdog on/off for the current session. */
+  protected async toggleWatchdogEnabled(): Promise<void> {
+    const sh = this.currentSession();
+    if (!sh) return;
+    this.wdSaving.set(true);
+    try {
+      const enabled = !this.wdEnabled();
+      await firstValueFrom(
+        this.api.updateSessionWatchdog(sh.id, enabled, this.wdIntervalSecs()),
+      );
+      this.wdEnabled.set(enabled);
+    } catch {
+      // nop — server rejected it
+    } finally {
+      this.wdSaving.set(false);
+    }
+  }
+
+  /** Save the watchdog settings (prompt + interval). */
+  protected async saveWatchdogSettings(): Promise<void> {
+    const sh = this.currentSession();
+    if (!sh) return;
+    this.wdSaving.set(true);
+    try {
+      await firstValueFrom(
+        this.api.updateSessionWatchdog(sh.id, this.wdEnabled(), this.wdIntervalSecs()),
+      );
+      await firstValueFrom(
+        this.api.updateSessionWatchdogPrompt(sh.id, this.wdPrompt()),
+      );
+    } catch {
+      // nop
+    } finally {
+      this.wdSaving.set(false);
+    }
+  }
+
+  /** Send a nudge to the agent now. */
+  protected async nudgeWatchdog(): Promise<void> {
+    const sh = this.currentSession();
+    if (!sh) return;
+    this.wdSaving.set(true);
+    try {
+      await firstValueFrom(
+        this.api.updateSessionWatchdog(sh.id, true, this.wdIntervalSecs()),
+      );
+    } catch {
+      // nop
+    } finally {
+      this.wdSaving.set(false);
+    }
+  }
+
   /** Per-row copy feedback, keyed by the row's index in `shellRows()`. */
   private readonly copyRowStates = new Map<number, CopyOutcome>();
   /** Pending "back to 'Copy'" resets, keyed by the same row index. */
@@ -847,7 +946,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
 
   /** Merged display rows: local echoes interleaved with reports, in send order. */
   protected shellRows(): Array<{
-    type: 'you' | 'agent' | 'error' | 'markdown';
+    type: 'you' | 'agent' | 'error' | 'markdown' | 'watchdog';
     text: string;
     tool?: string;
     at?: string;
@@ -857,7 +956,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const events = this.transcriptEventsFor(id);
     const echoes = this.shellEchoes().filter((e) => e.sessionId === id);
     const rows: Array<{
-      type: 'you' | 'agent' | 'error' | 'markdown';
+      type: 'you' | 'agent' | 'error' | 'markdown' | 'watchdog';
       text: string;
       tool?: string;
       at?: string;
@@ -871,15 +970,18 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         // A `code`/markdown event is the agent's written-up report (host read it from the
         // file it named), so it renders as rich markdown — mermaid fences included.
         const isMarkdown = ev.kind === 'code' && ev.language === 'markdown';
+        const isWatchdog = ev.role === 'watchdog';
         const stamped = (ev as unknown as { data?: { at?: string } }).data?.at;
         rows.push({
-          type: isMarkdown
-            ? 'markdown'
-            : (ev.kind as string) === 'prompt'
-              ? 'you'
-              : ev.kind === 'error'
-                ? 'error'
-                : 'agent',
+          type: isWatchdog
+            ? 'watchdog'
+            : isMarkdown
+              ? 'markdown'
+              : (ev.kind as string) === 'prompt'
+                ? 'you'
+                : ev.kind === 'error'
+                  ? 'error'
+                  : 'agent',
           text: ev.text ?? '',
           tool: ev.toolName,
           at: this.rowTime(stamped ?? this.eventStamps.get(ev)),
@@ -1257,6 +1359,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected readonly selectedCheckId = signal<string | null>(null);
   protected readonly selectedCheckRule = signal<string | null>(null);
   protected readonly modeChip = modeChip;
+  protected readonly shellRoutePath = shellRoutePath;
   protected readonly parsedPreflight = computed<PlanCheckReportLike | null>(() => {
     const raw = this.preflightJson();
     if (!raw) return null;

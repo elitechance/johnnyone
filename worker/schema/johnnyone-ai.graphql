@@ -44,6 +44,12 @@ type AiSession {
   # Unlike `attachedTmux` (an INTENT flag — "this session is the kind that attaches to a tmux"),
   # this says whether the terminal actually exists right now; 'ended' means the pane is gone.
   terminalStatus: String
+  # Watchdog: periodic nudges for a quiet agent. All nullable for deploy-skew safety.
+  watchdogEnabled: Boolean
+  watchdogIntervalSecs: Int
+  watchdogPrompt: String
+  watchdogLastNudgeAt: String
+  watchdogNudgeCount: Int
 }
 
 type AiMessage {
@@ -847,6 +853,10 @@ type Mutation {
   # what this reports is what the coordinator would see. Commands run sequentially from the plan's
   # workspacePath and stop at the first non-zero exit.
   runAgentPlanTestGate(id: ID!, phaseId: String): TestGateRun!
+  # Watchdog: per-shell periodic nudges for a quiet agent. Two mutations: the first arms/disarms
+  # + sets the interval; the second updates the prompt the host sends as the nudge message.
+  updateSessionWatchdog(sessionId: ID!, enabled: Boolean!, intervalSecs: Int!): Boolean!
+  updateSessionWatchdogPrompt(sessionId: ID!, prompt: String!): Boolean!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!
