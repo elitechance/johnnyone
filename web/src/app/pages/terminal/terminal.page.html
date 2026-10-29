@@ -144,6 +144,9 @@
         <button type="button" class="ps-view" [class.on]="shellView() === 'raw'"
                 [attr.aria-pressed]="shellView() === 'raw'"
                 (click)="setShellView('raw')">Raw</button>
+        <button type="button" class="ps-view" [class.on]="shellView() === 'watchdog'"
+                [attr.aria-pressed]="shellView() === 'watchdog'"
+                (click)="setShellView('watchdog')">Watchdog</button>
       </div>
       @if (sh) {
         <button class="ps-detach" (click)="closeTerminalPane(sh.id)">
@@ -169,14 +172,15 @@
               <article class="st-row"
                        [class.err]="row.type === 'error'"
                        [class.you]="row.type === 'you'"
-                       [class.md]="row.type === 'markdown'">
+                       [class.md]="row.type === 'markdown'"
+                       [class.wd]="row.type === 'watchdog'">
                 <span class="st-ic">{{
-                  row.type === 'error' ? '!' : row.type === 'you' ? '›' : row.type === 'markdown' ? '▤' : '¶'
+                  row.type === 'error' ? '!' : row.type === 'you' ? '›' : row.type === 'markdown' ? '▤' : row.type === 'watchdog' ? '⏱' : '¶'
                 }}</span>
                 <div class="st-bd">
                   <!-- Who and when, so a reply can be matched to the prompt it answers. -->
                   <div class="st-meta">
-                    <span class="st-who">{{ row.type === 'you' ? 'You' : 'Agent' }}</span>
+                    <span class="st-who">{{ row.type === 'you' ? 'You' : row.type === 'watchdog' ? 'Watchdog' : 'Agent' }}</span>
                     @if (row.at) { <span class="st-when">{{ row.at }}</span> }
                     <!-- Same rule as the message bubble: nothing to copy, no button. -->
                     @if (canCopyRow(row)) {
@@ -310,7 +314,8 @@
             </div>
           }
 
-          <!-- Watchdog chip — shows the per-shell watchdog state above the composer. -->
+          <!-- Watchdog chip — shows the per-shell watchdog state above the composer. Tapping opens
+               the Watchdog settings view. -->
           @let wdChip = watchdogChipData();
           @if (wdChip) {
             <div class="st-watchdog-chip" [class.wd-off]="wdChip.state === 'off'"
@@ -318,20 +323,27 @@
                  [class.wd-quiet]="wdChip.state === 'quiet'"
                  [class.wd-nudged]="wdChip.state === 'nudged'"
                  [routerLink]="shellRoutePath(currentSession()!.id, 'watchdog')">
+              <span class="wd-dot"></span>
               @switch (wdChip.state) {
                 @case ('off') {
-                  <span>Watchdog off · this shell is <strong>not being watched</strong></span>
+                  <b>Watchdog off</b> · this shell is <strong>not being watched</strong>
                 }
                 @case ('holding') {
-                  <span>Watchdog on · holding, pane active {{ wdChip.paneSecsAgo }}s ago</span>
+                  <b>Watchdog on</b> · holding, pane active {{ wdChip.paneSecsAgo }}s ago
                 }
                 @case ('quiet') {
-                  <span>Quiet {{ wdChip.quietSecs }} · nudging soon</span>
+                  <b>Quiet {{ wdChip.quietSecs }}</b> · nudging soon
                 }
                 @case ('nudged') {
-                  <span>Blocked on a question · nudged {{ wdChip.nudgeSecsAgo }}s ago</span>
+                  <b>Blocked on a question</b> · nudged {{ wdChip.nudgeSecsAgo }}s ago
                 }
               }
+              @if (wdChip.state === 'holding' || wdChip.state === 'quiet') {
+                @let interval = wdIntervalSecs();
+                @let secsSince = wdChip.state === 'holding' ? Math.max(0, interval - wdChip.paneSecsAgo) : Math.max(0, interval - wdChip.quietSecs);
+                <span class="wd-countdown">next check {{ formatCountdown(secsSince) }}</span>
+              }
+              <span class="wd-gear">⚙</span>
             </div>
           }
 
@@ -364,51 +376,114 @@
         </section>
       } @else if (sh && shellView() === 'watchdog') {
         <section class="terminal-surface watchdog-settings">
-          @let wd = currentSession();
-          @if (wd) {
-            <h2 class="wd-title">Watchdog</h2>
-            <p class="wd-sub">Nudge a quiet agent. The interval is managed on the engine; the prompt is the message sent.</p>
-
-            <label class="wd-field">
-              <span class="wd-label">Enabled</span>
-              <button type="button" class="wd-toggle" [class.on]="wdEnabled()"
-                      (click)="toggleWatchdogEnabled()">{{ wdEnabled() ? 'On' : 'Off' }}</button>
-            </label>
-
-            <label class="wd-field">
-              <span class="wd-label">Nudge interval</span>
-              <div class="wd-interval-picker">
-                @for (opt of [5, 10, 20, 30, 60]; track opt) {
-                  <button type="button" class="wd-interval-btn"
-                          [class.selected]="wdIntervalSecs() === opt * 60"
-                          [disabled]="wdEnabled()"
-                          [title]="wdEnabled() ? 'locked while armed — this session cannot change it' : ''"
-                          (click)="wdIntervalSecs.set(opt * 60)">{{ opt }}m</button>
+          @if (currentSession(); as wd) {
+            <!-- Status strip: says what the watchdog is doing and why. -->
+            @let wdChip = watchdogChipData();
+            <div class="wd-strip" [class.wd-strip-holding]="wdChip?.state === 'holding'"
+                 [class.wd-strip-off]="wdChip?.state === 'off'"
+                 [class.wd-strip-warn]="wdChip?.state === 'quiet' || wdChip?.state === 'nudged'">
+              <span class="wd-strip-ic">
+                {{ wdChip?.state === 'off' ? '○' : '●' }}
+              </span>
+              <span class="wd-strip-body">
+                @if (wdChip?.state === 'off') {
+                  <span class="wd-strip-lead">Watchdog off.</span>
+                  <span class="wd-strip-why">This shell is not being watched.</span>
+                } @else if (wdChip?.state === 'holding') {
+                  <span class="wd-strip-lead">Armed — holding.</span>
+                  <span class="wd-strip-why">The pane printed {{ wdChip?.paneSecsAgo }}s ago, so the session is working. A nudge only goes out once it has been quiet for the full interval.</span>
+                } @else if (wdChip?.state === 'quiet') {
+                  <span class="wd-strip-lead">Getting quiet — nudging soon.</span>
+                  <span class="wd-strip-why">The pane has been quiet for {{ wdChip?.quietSecs }}s.</span>
+                } @else if (wdChip?.state === 'nudged') {
+                  <span class="wd-strip-lead">Nudged.</span>
+                  <span class="wd-strip-why">The agent was blocked on a question.</span>
                 }
-              </div>
-              @if (wdEnabled()) {
-                <p class="wd-hint">locked while armed — this session cannot change it</p>
-              }
-            </label>
-
-            <label class="wd-field">
-              <span class="wd-label">Nudge prompt</span>
-              <textarea class="wd-textarea" [value]="wdPrompt()"
-                        (input)="wdPrompt.set($any($event.target).value)"
-                        maxlength="600" rows="4"></textarea>
-              <span class="wd-chars">{{ wdPrompt().length }} / 600</span>
-            </label>
-
-            <div class="wd-actions">
-              <button type="button" class="wd-save" [disabled]="wdSaving()"
-                      (click)="saveWatchdogSettings()">{{ wdSaving() ? 'Saving…' : 'Save' }}</button>
-              <button type="button" class="wd-nudge" [disabled]="wdSaving() || !wdNudgeEnabled()"
-                      (click)="nudgeWatchdog()">Nudge now</button>
-              @if (wdEnabled()) {
-                <button type="button" class="wd-disarm" [disabled]="wdSaving()"
-                        (click)="toggleWatchdogEnabled()">Disarm</button>
-              }
+              </span>
+              <span class="wd-strip-eta">
+                @if (wdChip?.state !== 'off') {
+                  @let interval = wdIntervalSecs();
+                  @let secsSince = wdChip?.state === 'holding' ? Math.max(0, interval - (wdChip?.paneSecsAgo ?? 0)) : Math.max(0, interval - (wdChip?.quietSecs ?? 0));
+                  next check<br>in {{ formatCountdown(secsSince) }}
+                }
+              </span>
             </div>
+
+            <!-- Watchdog toggle -->
+            <div class="wd-field">
+              <div class="wd-label">Watchdog<span class="wd-h">Nudges this shell when it goes quiet.</span></div>
+              <div>
+                <label class="wd-toggle-ctrl">
+                  <span class="wd-toggle-track" [class.on]="wdEnabled()"></span>
+                  <span class="wd-toggle-label">{{ wdEnabled() ? 'On' : 'Off' }}</span>
+                </label>
+                <div class="wd-hint">The nudge is typed into the pane as real input and appears in the Transcript as a Watchdog message.</div>
+              </div>
+            </div>
+
+            <!-- Nudge interval -->
+            <div class="wd-field">
+              <div class="wd-label">Nudge interval<span class="wd-h">Quiet time before a nudge.</span></div>
+              <div>
+                @let intervalLabel = (wdIntervalSecs() / 60) + ' min';
+                @if (wdEnabled()) {
+                  <div class="wd-locked"><span>🔒</span><span class="wd-locked-val">{{ intervalLabel }}</span><span class="wd-locked-reason">locked while armed — this session cannot change it</span></div>
+                }
+                <div class="wd-interval-picker" [class.wd-interval-dimmed]="wdEnabled()">
+                  @for (opt of [5, 10, 20, 30, 60]; track opt) {
+                    <button type="button" class="wd-interval-btn"
+                            [class.selected]="wdIntervalSecs() === opt * 60"
+                            [disabled]="wdEnabled()"
+                            (click)="wdIntervalSecs.set(opt * 60)">{{ opt }}m</button>
+                  }
+                </div>
+                <div class="wd-hint"><b>Why locked:</b> the interval exists only on the authenticated worker mutation. It is not a field on the host's localhost GraphQL, so an agent in this pane has no door to change it through. Turn the watchdog off to re-pick it.</div>
+              </div>
+            </div>
+
+            <!-- Nudge prompt -->
+            <div class="wd-field">
+              <div class="wd-label">Nudge prompt<span class="wd-h">What gets typed.</span></div>
+              <div>
+                <textarea class="wd-textarea" [value]="wdPrompt()"
+                          (input)="wdPrompt.set($any($event.target).value)"
+                          maxlength="600" rows="4" spellcheck="false"></textarea>
+                <div class="wd-chars">&#123;quiet&#125; · &#123;name&#125; · &#123;nudges&#125; are substituted<span>{{ wdPrompt().length }} / 600</span></div>
+                <div class="wd-hint"><b>This session may rewrite it</b> via <code>updateSessionWatchdogPrompt</code> on 127.0.0.1:7788.</div>
+              </div>
+            </div>
+
+            <!-- Also nudge when -->
+            <div class="wd-field">
+              <div class="wd-label">Also nudge when<span class="wd-h">Triggers besides the timer.</span></div>
+              <div>
+                <label class="wd-check-row">
+                  <input type="checkbox" [checked]="wdBlockedNudge()" (change)="wdBlockedNudge.set(!wdBlockedNudge())">
+                  the pane is blocked on a question <span class="wd-check-hint">— fires at once, ignores the interval</span>
+                </label>
+                <label class="wd-check-row">
+                  <input type="checkbox" [checked]="wdReportNudge()" (change)="wdReportNudge.set(!wdReportNudge())">
+                  nothing has been reported to the chat for twice the interval
+                </label>
+              </div>
+            </div>
+
+            <!-- Actions -->
+            <div class="wd-actions">
+              <button type="button" class="wd-save wd-btn" [disabled]="wdSaving()"
+                      (click)="saveWatchdogSettings()">{{ wdSaving() ? 'Saving…' : 'Save' }}</button>
+              <button type="button" class="wd-nudge wd-btn" [disabled]="wdSaving() || !wdNudgeEnabled()"
+                      (click)="nudgeWatchdog()">Nudge now</button>
+              <span class="wd-acts-spacer"></span>
+              @if (wd.watchdogLastNudgeAt) {
+                <span class="wd-saved-ts">saved 2 min ago</span>
+              }
+              <button type="button" class="wd-disarm wd-btn" [disabled]="wdSaving()"
+                      (click)="toggleWatchdogEnabled()">Disarm</button>
+            </div>
+
+            <!-- Footer: sent · held · armed -->
+            <div class="wd-footnote">{{ wdNudgeCount() }} sent · {{ wdHoldCount() }} held · armed {{ wdArmedAgo() }} ago. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
           }
         </section>
       } @else if (sh) {
