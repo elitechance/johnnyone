@@ -512,6 +512,19 @@ fn provider_config_writes_refused(field: &str) -> async_graphql::Error {
     ))
 }
 
+/// Build the host GraphQL schema and return its SDL string.
+/// Used by host_schema test to prove the correct mutations are exposed.
+pub(crate) fn schema_sdl() -> String {
+    let root = std::env::temp_dir().join(format!("schema_sdl-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    let db = crate::db::Database::open(&root.join("schema.db")).unwrap();
+    let state = crate::state::app_state::AppState::new(db);
+    let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+        .data(state)
+        .finish();
+    schema.sdl()
+}
+
 struct SubscriptionRoot;
 
 #[Subscription(rename_fields = "camelCase")]

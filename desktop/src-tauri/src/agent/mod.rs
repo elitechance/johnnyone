@@ -1287,7 +1287,7 @@ impl AgentService {
     }
 
     /// Handle an RPC request by dispatching to the appropriate query method.
-    async fn handle_rpc(req: &RpcRequest, state: &Arc<AppState>) -> RpcResponse {
+    pub(crate) async fn handle_rpc(req: &RpcRequest, state: &Arc<AppState>) -> RpcResponse {
         let result = match req.method.as_str() {
             "list_sessions" => Self::rpc_list_sessions(&req.params, state),
             "list_tmux_sessions" => Self::rpc_list_tmux_sessions().await,
@@ -1557,9 +1557,9 @@ impl AgentService {
         state: &Arc<AppState>,
     ) -> Result<serde_json::Value, String> {
         let id = params
-            .get("id")
+            .get("sessionId")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+            .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
         let enabled = params
             .get("enabled")
             .and_then(|v| v.as_bool())

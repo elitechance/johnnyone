@@ -68,7 +68,7 @@ fn watchdog_interval_clamp() {
         ).expect("query");
         interval
     });
-    assert_eq!(row2, 3600, "99999 should clamp to 3600");
+    assert_eq!(row2.unwrap(), 3600, "99999 should clamp to 3600");
 }
 
 // ===================================================================

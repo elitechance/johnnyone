@@ -8,6 +8,7 @@
 //! • watchdog_rpc_param — RPC accepts {sessionId: …} and errors on missing it
 //! • host_schema — SDL includes updateSessionWatchdogPrompt, NOT updateSessionWatchdog
 
+use crate::agent::message_types::RpcRequest;
 use crate::agent::AgentService;
 use crate::db::Database;
 use crate::services::sessions;
@@ -111,46 +112,75 @@ async fn watchdog_does_not_consume_brief() {
     let state = Arc::new(test_state("noburn"));
     sessions::set_session_watchdog(&state, "noburn", true, 120).unwrap();
     sessions::set_session_watchdog_prompt(&state, "noburn", "still there?").unwrap();
-    // watchdog first
+    // watchdog first — should NOT consume the brief slot
     AgentService::deliver_chat_message(&state, "noburn", "still there?", "watchdog").await.unwrap();
-    // user after watchdog still works (brief not burned)
-    let r = AgentService::deliver_chat_message(&state, "noburn", "hello", "user").await;
-    assert!(r.is_ok());
+    {
+        let briefed = state.shell_briefed.lock().await;
+        assert!(!briefed.contains("noburn"),
+            "watchdog delivery must NOT add session to shell_briefed");
+    }
+    // user after watchdog — MUST consume the brief slot
+    let _ = AgentService::deliver_chat_message(&state, "noburn", "hello", "user").await;
+    {
+        let briefed = state.shell_briefed.lock().await;
+        assert!(briefed.contains("noburn"),
+            "user delivery must add session to shell_briefed");
+    }
 }
 
 // ===================================================================
 // watchdog_rpc_param
 // ===================================================================
-// The RPC MUST read params["sessionId"], not params["id"].
-// The test proves the underlying API works; the RPC contract is verified by
-// source review (the handler functions use .get("sessionId")).
 #[test]
 fn watchdog_rpc_param() {
-    let state = Arc::new(test_state("rpc"));
+    let state = test_state("rpc");
     sessions::set_session_watchdog(&state, "rpc", true, 60).unwrap();
     sessions::set_session_watchdog_prompt(&state, "rpc", "hello").unwrap();
-    // The RPC delegates to these public functions. If the RPC used params["id"]
-    // it would fail when the worker sends params["sessionId"].
-    // The source code change (params["id"] -> params["sessionId"]) is the fix.
-    assert!(true, "RPC reads sessionId — verified by source");
+
+    // Build a req that the worker actually sends: {sessionId, enabled, intervalSecs}
+    let ok_req = RpcRequest {
+        request_id: "t1".into(),
+        method: "update_session_watchdog".into(),
+        params: serde_json::json!({"sessionId": "rpc", "enabled": true, "intervalSecs": 300}),
+    };
+    let state = Arc::new(state);
+    let resp = tokio::runtime::Runtime::new().unwrap().block_on(
+        AgentService::handle_rpc(&ok_req, &state)
+    );
+    assert!(resp.success, "valid sessionId must succeed: {:?}", resp.error);
+    // Verify the row actually changed
+    let iv: i64 = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT watchdog_interval_secs FROM sessions WHERE id = 'rpc'",
+            [],
+            |r| r.get(0),
+        ).map_err(|e| e.to_string())
+    }).unwrap();
+    assert_eq!(iv, 300, "watchdog interval must have been updated in DB");
+
+    // The same payload with sessionId renamed to id must ERROR — that catches
+    // a regression back to params["id"].
+    let bad_req = RpcRequest {
+        request_id: "t2".into(),
+        method: "update_session_watchdog".into(),
+        params: serde_json::json!({"id": "rpc", "enabled": true, "intervalSecs": 300}),
+    };
+    let resp2 = tokio::runtime::Runtime::new().unwrap().block_on(
+        AgentService::handle_rpc(&bad_req, &state)
+    );
+    assert!(!resp2.success, "missing sessionId must fail, got: {:?}", resp2.error);
+    assert!(resp2.error.as_ref().unwrap().contains("sessionId"),
+        "error must mention sessionId, got: {:?}", resp2.error);
 }
 
 // ===================================================================
 // host_schema
 // ===================================================================
-#[cfg(test)]
-mod host_schema_tests {
-    use super::*;
-
-    #[test]
-    fn host_schema() {
-        // The host router in host/mod.rs builds the async-graphql schema.
-        // It must include updateSessionWatchdogPrompt and NOT include
-        // updateSessionWatchdog (the interval endpoint is RPC-only).
-        // We verify this by building the schema via the host::router.
-        use async_graphql::{EmptySubscription, Schema, MergedObject};
-        // The schema is constructed in host::router() but the struct fields
-        // may not be publicly re-exported. We assert the convention.
-        assert!(true, "host_schema: see source — prompt exposed, interval not");
-    }
+#[test]
+fn host_schema() {
+    let sdl = crate::host::schema_sdl();
+    assert!(sdl.contains("updateSessionWatchdogPrompt("),
+        "SDL must contain updateSessionWatchdogPrompt( mutation, got SDL:\n{sdl}");
+    assert!(!sdl.contains("updateSessionWatchdog("),
+        "SDL must NOT contain updateSessionWatchdog( mutation (interval is RPC-only), got SDL:\n{sdl}");
 }
