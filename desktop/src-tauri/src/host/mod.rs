@@ -362,6 +362,17 @@ impl MutationRoot {
         Err(provider_config_writes_refused("upsertProviderConfig"))
     }
 
+    async fn update_session_watchdog_prompt(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        prompt: String,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        session_service::set_session_watchdog_prompt(state, &id, &prompt)?;
+        Ok(true)
+    }
+
     /// Refused on this surface — see [`provider_config_writes_refused`].
     async fn delete_provider_config(
         &self,
@@ -499,6 +510,19 @@ fn provider_config_writes_refused(field: &str) -> async_graphql::Error {
          (cliPath is executed). Use the JohnnyOne console, which routes through \
          the authenticated worker relay."
     ))
+}
+
+/// Build the host GraphQL schema and return its SDL string.
+/// Used by host_schema test to prove the correct mutations are exposed.
+pub(crate) fn schema_sdl() -> String {
+    let root = std::env::temp_dir().join(format!("schema_sdl-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    let db = crate::db::Database::open(&root.join("schema.db")).unwrap();
+    let state = crate::state::app_state::AppState::new(db);
+    let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+        .data(state)
+        .finish();
+    schema.sdl()
 }
 
 struct SubscriptionRoot;

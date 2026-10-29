@@ -550,6 +550,28 @@ export class JohnnyApiService {
       .pipe(map((data) => data.updateAiSessionProvider));
   }
 
+  updateSessionWatchdog(sessionId: string, enabled: boolean, intervalSecs: number): Observable<boolean> {
+    return this.gql
+      .mutate<{ updateSessionWatchdog: boolean }>(
+        `mutation UpdateSessionWatchdog($sessionId: ID!, $enabled: Boolean!, $intervalSecs: Int!) {
+          updateSessionWatchdog(sessionId: $sessionId, enabled: $enabled, intervalSecs: $intervalSecs)
+        }`,
+        { sessionId, enabled, intervalSecs }
+      )
+      .pipe(map((data) => data.updateSessionWatchdog));
+  }
+
+  updateSessionWatchdogPrompt(sessionId: string, prompt: string): Observable<boolean> {
+    return this.gql
+      .mutate<{ updateSessionWatchdogPrompt: boolean }>(
+        `mutation UpdateSessionWatchdogPrompt($sessionId: ID!, $prompt: String!) {
+          updateSessionWatchdogPrompt(sessionId: $sessionId, prompt: $prompt)
+        }`,
+        { sessionId, prompt }
+      )
+      .pipe(map((data) => data.updateSessionWatchdogPrompt));
+  }
+
   archiveSession(id: string): Observable<AiSession> {
     return this.gql
       .mutate<{ updateAiSessionArchived: AiSession }>(

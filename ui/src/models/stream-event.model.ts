@@ -7,6 +7,8 @@ export interface StreamEvent {
   /** Monotonic per turn/session, for ordering/dedup. */
   seq: number;
   kind: 'text' | 'tool_call' | 'tool_result' | 'code' | 'mermaid' | 'error' | string;
+  /** Optional role label from the agent (e.g. "watchdog"). */
+  role?: string;
   /** Prose / code body / mermaid source / error message. */
   text?: string;
   /** For kind:"code". */

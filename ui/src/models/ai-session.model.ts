@@ -18,6 +18,12 @@ export interface AiSession {
    * whether the terminal actually exists right now, and 'ended' means the pane is gone.
    */
   terminalStatus?: string;
+  /** Watchdog: periodic nudges for a quiet agent. All nullable for deploy-skew safety. */
+  watchdogEnabled?: boolean;
+  watchdogIntervalSecs?: number;
+  watchdogPrompt?: string;
+  watchdogLastNudgeAt?: string;
+  watchdogNudgeCount?: number;
 }
 
 export interface CreateAiSessionInput {

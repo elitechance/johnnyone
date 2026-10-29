@@ -310,6 +310,31 @@
             </div>
           }
 
+          <!-- Watchdog chip — shows the per-shell watchdog state above the composer. -->
+          @let wdChip = watchdogChipData();
+          @if (wdChip) {
+            <div class="st-watchdog-chip" [class.wd-off]="wdChip.state === 'off'"
+                 [class.wd-holding]="wdChip.state === 'holding'"
+                 [class.wd-quiet]="wdChip.state === 'quiet'"
+                 [class.wd-nudged]="wdChip.state === 'nudged'"
+                 [routerLink]="shellRoutePath(currentSession()!.id, 'watchdog')">
+              @switch (wdChip.state) {
+                @case ('off') {
+                  <span>Watchdog off · this shell is <strong>not being watched</strong></span>
+                }
+                @case ('holding') {
+                  <span>Watchdog on · holding, pane active {{ wdChip.paneSecsAgo }}s ago</span>
+                }
+                @case ('quiet') {
+                  <span>Quiet {{ wdChip.quietSecs }} · nudging soon</span>
+                }
+                @case ('nudged') {
+                  <span>Blocked on a question · nudged {{ wdChip.nudgeSecsAgo }}s ago</span>
+                }
+              }
+            </div>
+          }
+
           <!-- No (paste) handler here ON PURPOSE. This form sits inside `.workspace-shell`, whose
                own (paste) handler already stages the image — paste events bubble. Binding one here
                too ran both and staged every image TWICE. -->
@@ -336,6 +361,55 @@
               [disabled]="shellSending() || (!shellDraft.trim() && shellAttachments().length === 0)"
             >{{ shellSending() ? 'Sending…' : 'Send' }}</button>
           </form>
+        </section>
+      } @else if (sh && shellView() === 'watchdog') {
+        <section class="terminal-surface watchdog-settings">
+          @let wd = currentSession();
+          @if (wd) {
+            <h2 class="wd-title">Watchdog</h2>
+            <p class="wd-sub">Nudge a quiet agent. The interval is managed on the engine; the prompt is the message sent.</p>
+
+            <label class="wd-field">
+              <span class="wd-label">Enabled</span>
+              <button type="button" class="wd-toggle" [class.on]="wdEnabled()"
+                      (click)="toggleWatchdogEnabled()">{{ wdEnabled() ? 'On' : 'Off' }}</button>
+            </label>
+
+            <label class="wd-field">
+              <span class="wd-label">Nudge interval</span>
+              <div class="wd-interval-picker">
+                @for (opt of [5, 10, 20, 30, 60]; track opt) {
+                  <button type="button" class="wd-interval-btn"
+                          [class.selected]="wdIntervalSecs() === opt * 60"
+                          [disabled]="wdEnabled()"
+                          [title]="wdEnabled() ? 'locked while armed — this session cannot change it' : ''"
+                          (click)="wdIntervalSecs.set(opt * 60)">{{ opt }}m</button>
+                }
+              </div>
+              @if (wdEnabled()) {
+                <p class="wd-hint">locked while armed — this session cannot change it</p>
+              }
+            </label>
+
+            <label class="wd-field">
+              <span class="wd-label">Nudge prompt</span>
+              <textarea class="wd-textarea" [value]="wdPrompt()"
+                        (input)="wdPrompt.set($any($event.target).value)"
+                        maxlength="600" rows="4"></textarea>
+              <span class="wd-chars">{{ wdPrompt().length }} / 600</span>
+            </label>
+
+            <div class="wd-actions">
+              <button type="button" class="wd-save" [disabled]="wdSaving()"
+                      (click)="saveWatchdogSettings()">{{ wdSaving() ? 'Saving…' : 'Save' }}</button>
+              <button type="button" class="wd-nudge" [disabled]="wdSaving() || !wdNudgeEnabled()"
+                      (click)="nudgeWatchdog()">Nudge now</button>
+              @if (wdEnabled()) {
+                <button type="button" class="wd-disarm" [disabled]="wdSaving()"
+                        (click)="toggleWatchdogEnabled()">Disarm</button>
+              }
+            </div>
+          }
         </section>
       } @else if (sh) {
         <johnny-terminal-screen

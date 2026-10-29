@@ -11,11 +11,11 @@ import type { UrlMatchResult, UrlSegment } from '@angular/router';
  * this vitest config (no Angular plugin; see `terminal-reconcile-integration.spec.ts`).
  */
 
-/** The two renderings of one shell pane: reflowing prose vs. the fixed-width tmux mirror. */
-export type ShellView = 'transcript' | 'raw';
+/** The renderings of one shell pane: reflowing prose, the fixed-width tmux mirror, or the watchdog settings panel. */
+export type ShellView = 'transcript' | 'raw' | 'watchdog';
 
 /** Every accepted view segment, in the order the toggle presents them. */
-export const SHELL_VIEWS: readonly ShellView[] = ['transcript', 'raw'];
+export const SHELL_VIEWS: readonly ShellView[] = ['transcript', 'raw', 'watchdog'];
 
 /** Bare `/shells/:id` renders the transcript: it reflows at any width, while the raw pane is a
  *  fixed-width tmux mirror. Raw is now something you ask for by URL, not the default you land on. */
@@ -23,7 +23,7 @@ export const DEFAULT_SHELL_VIEW: ShellView = 'transcript';
 
 /** Narrowing guard for an untrusted, already-lowercased value (a hand-typed URL, a stale bookmark). */
 export function isShellView(v: string | null | undefined): v is ShellView {
-  return v === 'transcript' || v === 'raw';
+  return v === 'transcript' || v === 'raw' || v === 'watchdog';
 }
 
 /**
