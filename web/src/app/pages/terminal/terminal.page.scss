@@ -2318,6 +2318,13 @@ ion-modal.workspace-picker .picker-empty {
   b { color: var(--jo-fg-muted); font-weight: 600; }
   code { background: var(--jo-bg-raised); border: 1px solid var(--jo-line); border-radius: 3px; padding: 0 4px; font-size: 11px; color: var(--jo-fg-muted); }
 }
+.wd-h {
+  display: block;
+  font-size: 11px;
+  color: var(--jo-fg-faint);
+  font-weight: 400;
+  margin-top: 3px;
+}
 .wd-toggle {
   display: inline-flex;
   align-items: center;
@@ -2393,11 +2400,11 @@ ion-modal.workspace-picker .picker-empty {
   &::placeholder { color: var(--jo-fg-faint); }
 }
 .wd-chars {
-  display: block;
+  display: flex;
+  justify-content: space-between;
   margin-top: 6px;
   font-size: 11px;
   color: var(--jo-fg-faint);
-  text-align: right;
 }
 .wd-actions {
   display: flex;
