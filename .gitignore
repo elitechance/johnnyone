@@ -1,5 +1,8 @@
 # Dependencies
 node_modules/
+# …and a SYMLINK named node_modules, which the trailing slash above does NOT match. A worktree
+# that borrowed its dependencies via a symlink had it swept up by `git add -A` and committed.
+node_modules
 .npm
 
 # Build output
