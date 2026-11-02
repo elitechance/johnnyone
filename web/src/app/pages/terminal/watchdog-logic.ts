@@ -7,6 +7,39 @@
 export type WatchdogChipState = 'off' | 'holding' | 'quiet' | 'nudged';
 
 /**
+ * Parse a host timestamp into epoch milliseconds.
+ *
+ * The engine stores `datetime('now')` in SQLite, which is **UTC** formatted
+ * `YYYY-MM-DD HH:MM:SS` — a space separator and NO timezone designator. JS resolves
+ * that string as *local* time (`new Date('2026-11-02 20:33:38')`), so on a UTC-4 box
+ * every host timestamp lands four hours in the future and every elapsed calculation
+ * computed from it goes negative — the watchdog chip reported "armed -17320s ago" and
+ * its `nudgeSecsAgo < 60` gate was permanently true, so the chip sat stuck on
+ * "Blocked on a question · nudged Ns ago" for a nudge that never happened.
+ *
+ * Rules:
+ * - `null` / `undefined` / empty → `null`.
+ * - A string already carrying a zone (`Z`, or `+HH:MM` / `-HH:MM` after the time) is
+ *   parsed as-is — the producer already said what zone it means.
+ * - Otherwise it is a bare host timestamp: normalise the space separator to `T`,
+ *   append `Z`, and parse as UTC.
+ *
+ * Returns `null` when nothing was actually parsed (`NaN`), never a bogus number —
+ * a caller's `!== null` guard must not be fooled into computing elapsed time off 0.
+ */
+export function parseHostTimestamp(ts: string | null | undefined): number | null {
+  if (!ts) return null;
+  // Already zoned: a trailing `Z`, or an offset after the time component.
+  const ZONED = /\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+  if (ZONED.test(ts)) {
+    const zoned = Date.parse(ts);
+    return Number.isNaN(zoned) ? null : zoned;
+  }
+  const utc = Date.parse(ts.replace(' ', 'T') + 'Z');
+  return Number.isNaN(utc) ? null : utc;
+}
+
+/**
  * Format a countdown in seconds to "M:SS", clamped at 0.
  */
 export function formatCountdown(secs: number): string {
