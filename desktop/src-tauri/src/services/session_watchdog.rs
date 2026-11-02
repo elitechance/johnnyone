@@ -9,6 +9,18 @@ use std::time::Duration;
 /// checks whether it is due for a nudge. If so, and the pane is idle, delivers the
 /// configured prompt through `deliver_chat_message` with `role = "watchdog"`.
 ///
+/// The sweep's candidate SELECT, hoisted to a const so a test can run the REAL query against a
+/// row armed by the REAL `sessions::SET_WATCHDOG_SQL`.
+///
+/// The bug this guards: the write that arms a session and the query that selects nudge candidates
+/// live in different files, and nothing checked that the first satisfies the second — so arming a
+/// session left `watchdog_prompt = ''` (migration 027's default) and `AND watchdog_prompt != ''`
+/// skipped the row forever. `watchdog_nudge_count` was 0 on every live row while every unit test
+/// stayed green. Kept byte-identical to what `tick` used before the hoist; change no behaviour.
+pub(crate) const WATCHDOG_CANDIDATE_SQL: &str = "SELECT id, watchdog_interval_secs, \
+    watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count, title FROM sessions \
+    WHERE watchdog_enabled = 1 AND watchdog_prompt != '' AND status != 'archived'";
+
 /// Must run on the Tauri async runtime (`tauri::async_runtime::spawn`) so its tokio
 /// timers share the executor the rest of the host uses.
 pub fn spawn_session_watchdog(state: AppState) {
@@ -35,12 +47,7 @@ async fn tick(state: &Arc<AppState>) -> Result<(), String> {
     // Grab all session IDs that have watchdog enabled and a non-empty prompt.
     let candidates = state.db.with_conn(|conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT id, watchdog_interval_secs, watchdog_prompt, watchdog_last_nudge_at, \
-                 watchdog_nudge_count, title FROM sessions \
-                 WHERE watchdog_enabled = 1 AND watchdog_prompt != '' \
-                 AND status != 'archived'",
-            )
+            .prepare(WATCHDOG_CANDIDATE_SQL)
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
