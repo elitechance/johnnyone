@@ -590,6 +590,18 @@ struct AiSession {
     /// owns the decision. Optional on the wire: `None` means the host could not
     /// answer at all, and must stay `null` rather than becoming a string.
     terminal_status: Option<String>,
+    /// The per-session watchdog as migration 027 stores it, exposed as
+    /// `watchdogEnabled` / `watchdogIntervalSecs` / `watchdogPrompt` /
+    /// `watchdogLastNudgeAt` / `watchdogNudgeCount` via the type's
+    /// `rename_fields = "camelCase"`. The console reads these off the same
+    /// `listAiSessions` query that `queryPreferLocalHost` may route here, so a
+    /// field dropped in `From<Session>` shows the chip as "off" on an armed row.
+    watchdog_enabled: bool,
+    watchdog_interval_secs: i64,
+    watchdog_prompt: String,
+    /// `None` = this row has never been nudged — must stay `null` on the wire.
+    watchdog_last_nudge_at: Option<String>,
+    watchdog_nudge_count: i64,
 }
 
 impl From<Session> for AiSession {
@@ -612,6 +624,12 @@ impl From<Session> for AiSession {
             // lets the WIRE carry `null` for a client talking to an older host,
             // so wrap rather than reinterpret.
             terminal_status: Some(value.terminal_status),
+            watchdog_enabled: value.watchdog_enabled,
+            watchdog_interval_secs: value.watchdog_interval_secs,
+            watchdog_prompt: value.watchdog_prompt,
+            // Stays `Option<String>`: never-nudged is `null`, not an empty string.
+            watchdog_last_nudge_at: value.watchdog_last_nudge_at,
+            watchdog_nudge_count: value.watchdog_nudge_count,
         }
     }
 }
@@ -642,7 +660,59 @@ mod ai_session_tests {
             updated_at: "2024-01-01T00:00:00Z".into(),
             attached_tmux: true,
             terminal_status: status.into(),
+            watchdog_enabled: false,
+            watchdog_interval_secs: 1200,
+            watchdog_prompt: String::new(),
+            watchdog_last_nudge_at: None,
+            watchdog_nudge_count: 0,
         }
+    }
+
+    /// A fully-armed row — armed, on a 5-minute interval, with a prompt of the
+    /// user's own, already nudged once at a known time, and 7 nudges banked.
+    fn armed_session() -> Session {
+        Session {
+            watchdog_enabled: true,
+            watchdog_interval_secs: 300,
+            watchdog_prompt: "Report where {name} stands. Nudge {nudges}.".into(),
+            watchdog_last_nudge_at: Some("2024-01-15 10:00:00".into()),
+            watchdog_nudge_count: 7,
+            ..session_with_terminal_status("attached")
+        }
+    }
+
+    #[test]
+    fn ai_session_from_session_carries_the_watchdog_fields() {
+        let gql: AiSession = armed_session().into();
+        assert!(
+            gql.watchdog_enabled,
+            "the host's own GraphQL type must carry the armed flag"
+        );
+        assert_eq!(gql.watchdog_interval_secs, 300);
+        assert_eq!(
+            gql.watchdog_prompt,
+            "Report where {name} stands. Nudge {nudges}."
+        );
+        assert_eq!(
+            gql.watchdog_last_nudge_at.as_deref(),
+            Some("2024-01-15 10:00:00"),
+            "never-nudged is None; a stamped row must keep its timestamp"
+        );
+        assert_eq!(gql.watchdog_nudge_count, 7);
+    }
+
+    #[test]
+    fn ai_session_watchdog_last_nudge_at_stays_optional() {
+        // A row armed but never nudged must convert to None (wire `null`), not
+        // to an empty string the console would try to parse as a timestamp.
+        let gql: AiSession = Session {
+            watchdog_enabled: true,
+            ..session_with_terminal_status("attached")
+        }
+        .into();
+        assert!(gql.watchdog_enabled);
+        assert_eq!(gql.watchdog_last_nudge_at, None);
+        assert_eq!(gql.watchdog_nudge_count, 0);
     }
 
     #[test]

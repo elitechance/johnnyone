@@ -3155,6 +3155,11 @@ impl AgentService {
             updated_at: session.updated_at,
             attached_tmux: session.attached_tmux,
             terminal_status: session.terminal_status,
+            watchdog_enabled: session.watchdog_enabled,
+            watchdog_interval_secs: session.watchdog_interval_secs,
+            watchdog_prompt: session.watchdog_prompt,
+            watchdog_last_nudge_at: session.watchdog_last_nudge_at,
+            watchdog_nudge_count: session.watchdog_nudge_count,
         }
     }
 
@@ -5025,7 +5030,98 @@ mod session_view_tests {
             updated_at: "2024-01-01T00:00:00Z".into(),
             attached_tmux: true,
             terminal_status: status.into(),
+            watchdog_enabled: false,
+            watchdog_interval_secs: 1200,
+            watchdog_prompt: String::new(),
+            watchdog_last_nudge_at: None,
+            watchdog_nudge_count: 0,
         }
+    }
+
+    /// A fully-armed row — what the DB says for a session the watchdog is watching.
+    fn armed_session() -> crate::db::models::Session {
+        crate::db::models::Session {
+            watchdog_enabled: true,
+            watchdog_interval_secs: 300,
+            watchdog_prompt: "Report where {name} stands. Nudge {nudges}.".into(),
+            watchdog_last_nudge_at: Some("2024-01-15 10:00:00".into()),
+            watchdog_nudge_count: 7,
+            ..session_with_terminal_status("attached")
+        }
+    }
+
+    #[test]
+    fn session_view_carries_the_watchdog_fields() {
+        let session = armed_session();
+        let view = AgentService::session_view(session);
+        assert!(
+            view.watchdog_enabled,
+            "the RPC view must carry the armed flag, not report the watchdog off"
+        );
+        assert_eq!(view.watchdog_interval_secs, 300);
+        assert_eq!(
+            view.watchdog_prompt,
+            "Report where {name} stands. Nudge {nudges}."
+        );
+        assert_eq!(
+            view.watchdog_last_nudge_at.as_deref(),
+            Some("2024-01-15 10:00:00")
+        );
+        assert_eq!(view.watchdog_nudge_count, 7);
+
+        // The relay hands the worker JSON, so the WIRE keys are what the console
+        // actually reads: `rename_all = "camelCase"` must land `watchdogEnabled`
+        // (and friends). A correct struct that serialises snake_case is still
+        // invisible to the console.
+        let json = serde_json::to_value(&view).expect("the view serialises");
+        assert_eq!(
+            json.get("watchdogEnabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "serialised RPC JSON must carry watchdogEnabled: {json}"
+        );
+        assert_eq!(
+            json.get("watchdog_enabled"),
+            None,
+            "the wire must not carry the snake_case name: {json}"
+        );
+        assert_eq!(
+            json.get("watchdogIntervalSecs").and_then(|v| v.as_i64()),
+            Some(300)
+        );
+        assert_eq!(
+            json.get("watchdogPrompt").and_then(|v| v.as_str()),
+            Some("Report where {name} stands. Nudge {nudges}.")
+        );
+        assert_eq!(
+            json.get("watchdogLastNudgeAt").and_then(|v| v.as_str()),
+            Some("2024-01-15 10:00:00")
+        );
+        assert_eq!(
+            json.get("watchdogNudgeCount").and_then(|v| v.as_i64()),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn session_view_watchdog_defaults_to_off_for_a_cold_row() {
+        // A row nobody ever armed must serialise as explicitly OFF — false and 0,
+        // never absent/null, so the console renders "Watchdog off" rather than
+        // "unknown".
+        let view = AgentService::session_view(session_with_terminal_status("attached"));
+        let json = serde_json::to_value(&view).expect("the view serialises");
+        assert_eq!(
+            json.get("watchdogEnabled").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.get("watchdogLastNudgeAt"),
+            Some(&serde_json::Value::Null),
+            "never nudged stays null, not an empty string"
+        );
+        assert_eq!(
+            json.get("watchdogNudgeCount").and_then(|v| v.as_i64()),
+            Some(0)
+        );
     }
 
     #[test]

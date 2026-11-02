@@ -33,6 +33,23 @@ pub struct Session {
     /// a terminal exists.
     #[serde(default = "default_terminal_status")]
     pub terminal_status: String,
+    /// Per-session watchdog, as migration 027 stores it. The console's chip reads
+    /// these off `listAiSessions`; a field the row has but a mapper drops renders
+    /// as "Watchdog off" no matter what the DB says.
+    #[serde(default)]
+    pub watchdog_enabled: bool,
+    #[serde(default = "default_watchdog_interval")]
+    pub watchdog_interval_secs: i64,
+    #[serde(default)]
+    pub watchdog_prompt: String,
+    #[serde(default)]
+    pub watchdog_last_nudge_at: Option<String>,
+    #[serde(default)]
+    pub watchdog_nudge_count: i64,
+}
+
+fn default_watchdog_interval() -> i64 {
+    1200
 }
 
 fn default_terminal_status() -> String {

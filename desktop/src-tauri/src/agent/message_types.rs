@@ -389,6 +389,17 @@ pub struct RpcSessionView {
     /// `rename_all = "camelCase"`, so the relay's `list_sessions` RPC JSON — and
     /// the worker's `listAiSessions` which forwards it verbatim — carry it.
     pub terminal_status: String,
+    /// The per-session watchdog as migration 027 stores it, serialising as
+    /// `watchdogEnabled` / `watchdogIntervalSecs` / `watchdogPrompt` /
+    /// `watchdogLastNudgeAt` / `watchdogNudgeCount` via the same
+    /// `rename_all = "camelCase"`. The console's watchdog chip reads exactly
+    /// these off `listAiSessions`; drop one here and the chip says "off" while
+    /// the DB row is armed and already nudging.
+    pub watchdog_enabled: bool,
+    pub watchdog_interval_secs: i64,
+    pub watchdog_prompt: String,
+    pub watchdog_last_nudge_at: Option<String>,
+    pub watchdog_nudge_count: i64,
 }
 
 /// Message view for RPC responses (camelCase for GraphQL compatibility).
