@@ -415,6 +415,7 @@ export class JohnnyApiService {
     id title provider model workingDirectory status
     totalInputTokens totalOutputTokens totalCostCents
     createdAt updatedAt attachedTmux terminalStatus
+    watchdogEnabled watchdogIntervalSecs watchdogPrompt watchdogLastNudgeAt watchdogNudgeCount
   `;
   private readonly agentPlanRunFields = `
     plan {
