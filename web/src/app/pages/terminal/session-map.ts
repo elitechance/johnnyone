@@ -1,4 +1,4 @@
-import type { AiSession as SharedAiSession } from '../../../../../ui/src/services/johnny-api.service';
+import type { AiSession as SharedAiSession } from '@johnnyone/ui';
 
 /**
  * The terminal page's view-model for one session.
