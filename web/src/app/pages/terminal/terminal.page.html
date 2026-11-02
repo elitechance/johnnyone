@@ -407,6 +407,11 @@
                   next check<br>in {{ formatCountdown(secsSince) }}
                 }
               </span>
+              <!-- A refused save must be visible, not swallowed: the strip is where the user
+                   just clicked, so the refusal renders here with role="alert". -->
+              @if (wdError()) {
+                <span class="wd-error" role="alert">{{ wdError() }}</span>
+              }
             </div>
 
             <!-- Watchdog toggle -->

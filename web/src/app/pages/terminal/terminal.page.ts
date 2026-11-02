@@ -231,31 +231,12 @@ import {
 } from './terminal-state-reconcile';
 import {
   formatCountdown as formatCountdownFn,
+  runWatchdogAction,
   watchdogEtaSeconds as watchdogEtaSecondsFn,
   watchdogPromptAfterEnable,
   watchdogSettingsFromSession,
 } from './watchdog-logic';
-
-interface Session {
-  id: string;
-  title: string;
-  provider: string;
-  model: string;
-  working_directory: string;
-  status: 'active' | 'archived' | 'completed';
-  total_input_tokens: number;
-  total_output_tokens: number;
-  total_cost_cents: number;
-  created_at: string;
-  updated_at: string;
-  attached_tmux: boolean;
-  /** Watchdog: periodic nudges for a quiet agent. All nullable for deploy-skew safety. */
-  watchdogEnabled?: boolean;
-  watchdogIntervalSecs?: number;
-  watchdogPrompt?: string;
-  watchdogLastNudgeAt?: string;
-  watchdogNudgeCount?: number;
-}
+import { sessionStateFromApi, type Session } from './session-map';
 
 interface Message {
   id: string;
@@ -857,9 +838,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.wdError.set(null);
     try {
       const enabled = !this.wdEnabled();
-      await firstValueFrom(
-        this.api.updateSessionWatchdog(sh.id, enabled, this.wdIntervalSecs()),
-      );
+      this.wdError.set(await runWatchdogAction(
+        () => firstValueFrom(
+          this.api.updateSessionWatchdog(sh.id, enabled, this.wdIntervalSecs()),
+        ),
+        'Could not turn the watchdog on — the server refused.',
+      ));
+      if (this.wdError()) return;
       this.wdEnabled.set(enabled);
       // Arming a session whose prompt is empty used to look armed but never fire: the sweep
       // skips rows with `watchdog_prompt = ''`, and migration 027 defaults every row to ''.
@@ -868,8 +853,6 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       // typed instead of an empty box that reads armed-but-does-nothing. Chosen over re-reading
       // the session: one fewer relay round-trip, and no window where the box is blank.
       if (enabled) this.wdPrompt.set(watchdogPromptAfterEnable(sh.watchdogPrompt));
-    } catch {
-      this.wdError.set('Could not turn the watchdog on — the server refused.');
     } finally {
       this.wdSaving.set(false);
     }
@@ -882,14 +865,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.wdSaving.set(true);
     this.wdError.set(null);
     try {
-      await firstValueFrom(
-        this.api.updateSessionWatchdog(sh.id, this.wdEnabled(), this.wdIntervalSecs()),
-      );
-      await firstValueFrom(
-        this.api.updateSessionWatchdogPrompt(sh.id, this.wdPrompt()),
-      );
-    } catch {
-      this.wdError.set('Could not save the watchdog settings — the server refused.');
+      // One action, one error: the pair runs as a single unit so a refused interval or
+      // prompt lands in `wdError` (rendered by the strip) instead of a swallowed catch.
+      this.wdError.set(await runWatchdogAction(async () => {
+        await firstValueFrom(
+          this.api.updateSessionWatchdog(sh.id, this.wdEnabled(), this.wdIntervalSecs()),
+        );
+        await firstValueFrom(
+          this.api.updateSessionWatchdogPrompt(sh.id, this.wdPrompt()),
+        );
+      }, 'Could not save the watchdog settings — the server refused.'));
     } finally {
       this.wdSaving.set(false);
     }
@@ -902,11 +887,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.wdSaving.set(true);
     this.wdError.set(null);
     try {
-      await firstValueFrom(
-        this.api.updateSessionWatchdog(sh.id, true, this.wdIntervalSecs()),
-      );
-    } catch {
-      this.wdError.set('Could not nudge — the server refused.');
+      this.wdError.set(await runWatchdogAction(
+        () => firstValueFrom(
+          this.api.updateSessionWatchdog(sh.id, true, this.wdIntervalSecs()),
+        ),
+        'Could not nudge — the server refused.',
+      ));
     } finally {
       this.wdSaving.set(false);
     }
@@ -2161,27 +2147,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private mapApiSessionToState(session: SharedAiSession): Session {
-    return {
-      id: session.id,
-      title: session.title,
-      provider: session.provider,
-      model: session.model,
-      working_directory: session.workingDirectory || '',
-      status: session.status,
-      total_input_tokens: session.totalInputTokens,
-      total_output_tokens: session.totalOutputTokens,
-      total_cost_cents: session.totalCostCents,
-      created_at: session.createdAt,
-      updated_at: session.updatedAt,
-      attached_tmux: session.attachedTmux ?? false,
-      // Without these five the watchdog UI reads Off forever: the wire carries them, but the
-      // mapper stripped them before they ever reached currentSession().
-      watchdogEnabled: session.watchdogEnabled,
-      watchdogIntervalSecs: session.watchdogIntervalSecs,
-      watchdogPrompt: session.watchdogPrompt,
-      watchdogLastNudgeAt: session.watchdogLastNudgeAt,
-      watchdogNudgeCount: session.watchdogNudgeCount,
-    };
+    return sessionStateFromApi(session);
   }
 
   private mapApiMessageToState(message: SharedAiMessage): Message {

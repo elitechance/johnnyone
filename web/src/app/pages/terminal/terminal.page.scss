@@ -2318,6 +2318,21 @@ ion-modal.workspace-picker .picker-empty {
   b { color: var(--jo-fg-muted); font-weight: 600; }
   code { background: var(--jo-bg-raised); border: 1px solid var(--jo-line); border-radius: 3px; padding: 0 4px; font-size: 11px; color: var(--jo-fg-muted); }
 }
+/* A refused watchdog save. The strip is where the click happened, so the refusal belongs in it —
+   same `--jo-bad` idiom the failed/blocked chips already use, so it reads as a refusal and not
+   as another hint line. */
+.wd-error {
+  display: block;
+  flex: 1 0 100%;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--jo-bad, #ff6868);
+  background: color-mix(in srgb, var(--jo-bad, #ff6868) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--jo-bad, #ff6868) 34%, transparent);
+  border-left: 3px solid var(--jo-bad, #ff6868);
+  border-radius: 5px;
+  padding: 6px 8px;
+}
 .wd-h {
   display: block;
   font-size: 11px;

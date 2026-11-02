@@ -482,6 +482,33 @@ pub fn get_session_watchdog_config(state: &AppState, id: &str) -> Result<Watchdo
     })
 }
 
+/// The nudge prompt the host backfills when a session is armed without one.
+///
+/// The sweep in `services/session_watchdog.rs` selects
+/// `WHERE watchdog_enabled = 1 AND watchdog_prompt != ''`, and migration 027 defaults
+/// `watchdog_prompt` to `''`. So EVERY session written before someone typed a prompt — armed
+/// or not — was skipped forever, which is why `watchdog_nudge_count` is 0 on every live row:
+/// flipping `watchdog_enabled` to 1 did nothing. Arming now writes this default in the same
+/// statement, so "On" means armed-and-watching. Kept byte-identical to
+/// `DEFAULT_WATCHDOG_PROMPT` in `web/src/app/pages/terminal/watchdog-logic.ts`, because the
+/// textarea shows this text and the sweep types it. `{quiet}`, `{name}` and `{nudges}` are
+/// substituted by the sweep.
+pub(crate) const DEFAULT_WATCHDOG_PROMPT: &str =
+    "You have been quiet for {quiet}. Report where {name} stands right now: what you just \
+     finished, what you are working on, and anything blocking you. This is nudge {nudges}.";
+
+/// The single statement behind `set_session_watchdog`, hoisted to a const so a test can execute
+/// the REAL thing on a plain in-memory connection (this module has no AppState harness).
+///
+/// The `CASE` is the whole point: it backfills `DEFAULT_WATCHDOG_PROMPT` ONLY when enabling a
+/// row whose prompt is empty/NULL. Disarming must not wipe a prompt the user wrote, and a
+/// prompt the user HAS written must never be overwritten by ours.
+pub(crate) const SET_WATCHDOG_SQL: &str = "UPDATE sessions SET watchdog_enabled = ?1, \
+    watchdog_interval_secs = ?2, \
+    watchdog_prompt = CASE WHEN ?1 = 1 AND (watchdog_prompt IS NULL OR watchdog_prompt = '') \
+        THEN ?4 ELSE watchdog_prompt END, \
+    updated_at = datetime('now') WHERE id = ?3";
+
 /// Set the watchdog enabled/interval for a session. Clamps interval to [60, 3600].
 pub fn set_session_watchdog(
     state: &AppState,
@@ -492,8 +519,8 @@ pub fn set_session_watchdog(
     let clamped = interval_secs.clamp(60, 3600);
     state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE sessions SET watchdog_enabled = ?1, watchdog_interval_secs = ?2, updated_at = datetime('now') WHERE id = ?3",
-            params![enabled as i64, clamped as i64, id],
+            SET_WATCHDOG_SQL,
+            params![enabled as i64, clamped as i64, id, DEFAULT_WATCHDOG_PROMPT],
         )
         .map_err(|e| format!("Failed to update watchdog: {}", e))
     })?;
@@ -622,6 +649,172 @@ mod session_watchdog_tests {
         let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:00:00Z").unwrap();
         let due = watchdog_is_due(&now.with_timezone(&chrono::Utc), None, 3600);
         assert!(due, "never nudged should be due");
+    }
+}
+
+/// Executes the REAL `SET_WATCHDOG_SQL` against a throwaway in-memory database.
+///
+/// This module has no `AppState`/DB test harness and building one is out of scope, so the
+/// backfill is proven at the level that actually matters: the statement itself, on a connection
+/// with just the columns it touches. `set_session_watchdog` executes this same const, so the
+/// statement under test is the statement that ships.
+#[cfg(test)]
+mod watchdog_backfill_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    /// A connection holding one session `id='s1'` whose `watchdog_prompt` is `prompt`.
+    fn conn_with_session(prompt: &str) -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                watchdog_enabled       INTEGER NOT NULL DEFAULT 0,
+                watchdog_interval_secs INTEGER NOT NULL DEFAULT 1200,
+                watchdog_prompt        TEXT    NOT NULL DEFAULT '',
+                watchdog_last_nudge_at TEXT,
+                watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0,
+                updated_at             TEXT    NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("create sessions");
+        conn.execute(
+            "INSERT INTO sessions (id, watchdog_prompt) VALUES ('s1', ?1)",
+            params![prompt],
+        )
+        .expect("insert s1");
+        conn
+    }
+
+    fn prompt_of(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT watchdog_prompt FROM sessions WHERE id = 's1'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read back watchdog_prompt")
+    }
+
+    fn enabled_of(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT watchdog_enabled FROM sessions WHERE id = 's1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("read back watchdog_enabled")
+    }
+
+    fn interval_of(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT watchdog_interval_secs FROM sessions WHERE id = 's1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("read back watchdog_interval_secs")
+    }
+
+    /// Arming a session that has never had a prompt typed into it must backfill the default.
+    /// Without this, the sweep's `AND watchdog_prompt != ''` skips the row forever and the
+    /// toggle reads "On" while nothing is ever nudged.
+    #[test]
+    fn set_session_watchdog_backfills_default_prompt_when_enabling() {
+        // ── empty prompt + enable -> the default lands ─────────────────────────
+        let conn = conn_with_session("");
+        let changed = conn
+            .execute(
+                SET_WATCHDOG_SQL,
+                params![1i64, 300i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+            )
+            .expect("enable on an empty-prompt row");
+        assert_eq!(changed, 1, "the statement must hit exactly the one row");
+        assert_eq!(enabled_of(&conn), 1, "enabling must stick");
+        assert_eq!(interval_of(&conn), 300, "the clamped interval must be written");
+        assert_eq!(
+            prompt_of(&conn),
+            DEFAULT_WATCHDOG_PROMPT,
+            "arming an empty-prompt session must backfill the default the sweep will type"
+        );
+        assert!(
+            prompt_of(&conn).contains("{quiet}")
+                && prompt_of(&conn).contains("{name}")
+                && prompt_of(&conn).contains("{nudges}"),
+            "the backfilled prompt must carry the sweep's placeholders"
+        );
+
+        // ── the user's own prompt is NEVER overwritten ─────────────────────────
+        let conn = conn_with_session("my own words");
+        conn.execute(
+            SET_WATCHDOG_SQL,
+            params![1i64, 600i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+        )
+        .expect("enable on a written-prompt row");
+        assert_eq!(
+            prompt_of(&conn),
+            "my own words",
+            "arming must not clobber a prompt the user wrote"
+        );
+        assert_eq!(interval_of(&conn), 600, "the interval still updates alongside");
+
+        // ── disarming must not wipe the prompt ─────────────────────────────────
+        let conn = conn_with_session("");
+        conn.execute(
+            SET_WATCHDOG_SQL,
+            params![0i64, 300i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+        )
+        .expect("disable on an empty-prompt row");
+        assert_eq!(enabled_of(&conn), 0, "disabling must stick");
+        assert_eq!(
+            prompt_of(&conn),
+            "",
+            "disarming must not backfill — an unarmed session gets no prompt"
+        );
+
+        // ── disarm AFTER arming keeps the backfilled default ───────────────────
+        let conn = conn_with_session("");
+        conn.execute(
+            SET_WATCHDOG_SQL,
+            params![1i64, 300i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+        )
+        .expect("arm");
+        conn.execute(
+            SET_WATCHDOG_SQL,
+            params![0i64, 300i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+        )
+        .expect("disarm after arming");
+        assert_eq!(
+            prompt_of(&conn),
+            DEFAULT_WATCHDOG_PROMPT,
+            "disarming must not wipe the prompt the arm backfilled"
+        );
+    }
+
+    /// The clamp lives in `set_session_watchdog`, not in the SQL — pinned here so the hoisting
+    /// of the statement into a const cannot silently change what the caller passes.
+    #[test]
+    fn set_watchdog_sql_writes_whatever_interval_the_caller_clamped() {
+        let conn = conn_with_session("");
+        conn.execute(
+            SET_WATCHDOG_SQL,
+            params![1i64, 60i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+        )
+        .expect("enable at the floor of the clamp");
+        assert_eq!(interval_of(&conn), 60);
+        conn.execute(
+            SET_WATCHDOG_SQL,
+            params![1i64, 3600i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+        )
+        .expect("enable at the ceiling of the clamp");
+        assert_eq!(interval_of(&conn), 3600);
+    }
+
+    /// The host constant and the web seam must agree byte for byte — the textarea shows one and
+    /// the sweep types the other.
+    #[test]
+    fn default_watchdog_prompt_matches_the_text_the_web_seam_seeds() {
+        let expected = "You have been quiet for {quiet}. Report where {name} stands right now: \
+                        what you just finished, what you are working on, and anything blocking \
+                        you. This is nudge {nudges}.";
+        assert_eq!(DEFAULT_WATCHDOG_PROMPT, expected);
     }
 }
 

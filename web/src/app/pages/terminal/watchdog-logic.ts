@@ -154,6 +154,26 @@ export interface TranscriptRowEvent {
  * When the role is 'watchdog', returns 'watchdog'.
  * Otherwise applies the existing mapping rules.
  */
+/**
+ * Run one watchdog save and turn a rejection into a message the view can show.
+ *
+ * The three handlers used to end in `catch { /* nop *\/ }`, so a refused save left the toggle
+ * where it was and the strip said nothing — the user could click "Save" forever and the only
+ * evidence was a console line. This keeps the try/catch out of the component and returns the
+ * string that belongs in `wdError`: `null` on success, `failure` on rejection.
+ */
+export async function runWatchdogAction(
+  action: () => Promise<unknown>,
+  failure: string,
+): Promise<string | null> {
+  try {
+    await action();
+    return null;
+  } catch {
+    return failure;
+  }
+}
+
 export function transcriptRowType(ev: TranscriptRowEvent): 'you' | 'agent' | 'error' | 'markdown' | 'watchdog' {
   if (ev.role === 'watchdog') return 'watchdog';
   if (ev.kind === 'code' && ev.language === 'markdown') return 'markdown';
