@@ -64,6 +64,85 @@ export function watchdogChipState(input: WatchdogChipInput): WatchdogChipState {
   return 'quiet';
 }
 
+/**
+ * The nudge prompt the host backfills when a session is armed with an empty one.
+ *
+ * The sweep in `services/session_watchdog.rs` only considers sessions whose
+ * `watchdog_prompt != ''`, and migration 027 defaults that column to `''` — so
+ * arming a session that has never had a prompt typed into it used to flip
+ * `watchdog_enabled = 1` while the sweep skipped it forever: "On", but inert.
+ * The host now writes `DEFAULT_WATCHDOG_PROMPT` in the same statement that
+ * enables the session; this string is that constant, kept byte-identical so the
+ * textarea shows the text that will actually be typed instead of an empty box
+ * that reads armed-but-does-nothing. `{quiet}`, `{name}` and `{nudges}` are
+ * substituted by the sweep.
+ */
+export const DEFAULT_WATCHDOG_PROMPT =
+  'You have been quiet for {quiet}. Report where {name} stands right now: ' +
+  'what you just finished, what you are working on, and anything blocking you. ' +
+  'This is nudge {nudges}.';
+
+/**
+ * The prompt to show (and send) for a session after arming it.
+ *
+ * An empty stored prompt means the host is about to backfill `DEFAULT_WATCHDOG_PROMPT`,
+ * so the UI seeds the same text rather than leaving the box blank. A prompt the user
+ * has already written is returned untouched — never overwrite their words.
+ */
+export function watchdogPromptAfterEnable(storedPrompt: string | null | undefined): string {
+  return storedPrompt && storedPrompt.trim() !== '' ? storedPrompt : DEFAULT_WATCHDOG_PROMPT;
+}
+
+/** The three watchdog signals, hydrated from one session's watchdog fields. */
+export interface WatchdogSettings {
+  enabled: boolean;
+  intervalSecs: number;
+  prompt: string;
+}
+
+/** What the signals hold before any session has been seen. */
+export const WATCHDOG_SIGNAL_DEFAULTS: WatchdogSettings = {
+  enabled: false,
+  intervalSecs: 300,
+  prompt: '',
+};
+
+/**
+ * Seed the watchdog signals from a session.
+ *
+ * Nullable on the wire (deploy skew) and on rows written before migration 027, so
+ * every field falls back to the signal's initial value rather than to `undefined` —
+ * an `undefined` interval renders "NaN min" in the interval picker.
+ *
+ * `prompt` is taken verbatim from the session: hydration must not invent a prompt the
+ * server does not have, or the textarea would read 190/600 chars for a nudge that was
+ * never stored. Only arming (`watchdogPromptAfterEnable`) backfills the default.
+ */
+export function watchdogSettingsFromSession(session: {
+  watchdogEnabled?: boolean | null;
+  watchdogIntervalSecs?: number | null;
+  watchdogPrompt?: string | null;
+} | null | undefined): WatchdogSettings {
+  if (!session) return { ...WATCHDOG_SIGNAL_DEFAULTS };
+  return {
+    enabled: session.watchdogEnabled === true,
+    intervalSecs: session.watchdogIntervalSecs ?? WATCHDOG_SIGNAL_DEFAULTS.intervalSecs,
+    prompt: session.watchdogPrompt ?? WATCHDOG_SIGNAL_DEFAULTS.prompt,
+  };
+}
+
+/**
+ * Whether the watchdog signals should be re-seeded. True only when the session id
+ * CHANGED — the effect that hydrates the toggle must not re-run on every signal read,
+ * or it would overwrite the keystrokes of someone typing in the prompt textarea.
+ */
+export function shouldHydrateWatchdogSignals(
+  hydratedFor: string | null,
+  sessionId: string | null | undefined,
+): boolean {
+  return (sessionId ?? null) !== hydratedFor;
+}
+
 export interface TranscriptRowEvent {
   role?: string;
   kind: string;

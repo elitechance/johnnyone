@@ -232,6 +232,8 @@ import {
 import {
   formatCountdown as formatCountdownFn,
   watchdogEtaSeconds as watchdogEtaSecondsFn,
+  watchdogPromptAfterEnable,
+  watchdogSettingsFromSession,
 } from './watchdog-logic';
 
 interface Session {
@@ -826,6 +828,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected wdPrompt = signal('');
   /** True while a save/nudge is in flight. */
   protected wdSaving = signal(false);
+  /**
+   * Why the last arm/save/nudge failed, or null when the last one landed.
+   *
+   * All three handlers used to end in `catch { // nop — server rejected it }`, so a genuine
+   * server-side rejection (expired token, offline node, a session the host no longer has) was
+   * indistinguishable from success: the spinner stopped, the toggle stayed where it was, and the
+   * click simply looked like it did nothing. The message is set in each catch and cleared at the
+   * start of the next attempt, so a stale complaint never sits above a save that worked.
+   */
+  protected wdError = signal<string | null>(null);
+  /**
+   * Which session the three signals below were last seeded for — see the hydrate effect in the
+   * constructor. `null` until the first session is selected.
+   */
+  private wdHydratedFor: string | null = null;
 
   /** True if nudging is enabled (watchdog on and not already saving). */
   protected wdNudgeEnabled(): boolean {
@@ -837,14 +854,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const sh = this.currentSession();
     if (!sh) return;
     this.wdSaving.set(true);
+    this.wdError.set(null);
     try {
       const enabled = !this.wdEnabled();
       await firstValueFrom(
         this.api.updateSessionWatchdog(sh.id, enabled, this.wdIntervalSecs()),
       );
       this.wdEnabled.set(enabled);
+      // Arming a session whose prompt is empty used to look armed but never fire: the sweep
+      // skips rows with `watchdog_prompt = ''`, and migration 027 defaults every row to ''.
+      // The host now backfills DEFAULT_WATCHDOG_PROMPT in the same statement that enables the
+      // row, so seed the identical text client-side — the textarea shows what will actually be
+      // typed instead of an empty box that reads armed-but-does-nothing. Chosen over re-reading
+      // the session: one fewer relay round-trip, and no window where the box is blank.
+      if (enabled) this.wdPrompt.set(watchdogPromptAfterEnable(sh.watchdogPrompt));
     } catch {
-      // nop — server rejected it
+      this.wdError.set('Could not turn the watchdog on — the server refused.');
     } finally {
       this.wdSaving.set(false);
     }
@@ -855,6 +880,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const sh = this.currentSession();
     if (!sh) return;
     this.wdSaving.set(true);
+    this.wdError.set(null);
     try {
       await firstValueFrom(
         this.api.updateSessionWatchdog(sh.id, this.wdEnabled(), this.wdIntervalSecs()),
@@ -863,7 +889,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         this.api.updateSessionWatchdogPrompt(sh.id, this.wdPrompt()),
       );
     } catch {
-      // nop
+      this.wdError.set('Could not save the watchdog settings — the server refused.');
     } finally {
       this.wdSaving.set(false);
     }
@@ -874,12 +900,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const sh = this.currentSession();
     if (!sh) return;
     this.wdSaving.set(true);
+    this.wdError.set(null);
     try {
       await firstValueFrom(
         this.api.updateSessionWatchdog(sh.id, true, this.wdIntervalSecs()),
       );
     } catch {
-      // nop
+      this.wdError.set('Could not nudge — the server refused.');
     } finally {
       this.wdSaving.set(false);
     }
@@ -1680,6 +1707,34 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       });
     });
 
+    // Seed the watchdog controls from the session that just opened.
+    //
+    // wdEnabled / wdIntervalSecs / wdPrompt are plain signals that start at false/300/'', and
+    // nothing ever wrote them from the session — so every page load showed "Off" and the default
+    // interval no matter what the server had, and the user's first click silently flipped a
+    // watchdog that was already armed. Hydrate all three when a session becomes current.
+    //
+    // Keyed on the session ID ALONE, guarded by `wdHydratedFor` (same shape as the
+    // `shellActivityPollId` effect below): `currentSession()` is read for its id only, so the
+    // effect re-runs on a navigation but NOT when the session object is re-set with the same id.
+    // That distinction is the whole point — re-seeding on every signal read would overwrite the
+    // prompt textarea mid-typing, since `selectSession`/`loadSessions` re-set `currentSession`
+    // while the user is editing it.
+    //
+    // Not scoped to `plainShellMode()`: the watchdog view is reachable from the console panes too,
+    // and seeding from a session that is merely the current one is harmless there.
+    effect(() => {
+      const id = this.currentSession()?.id ?? null;
+      if (id === this.wdHydratedFor) return;
+      this.wdHydratedFor = id;
+      const wd = watchdogSettingsFromSession(this.currentSession());
+      this.wdEnabled.set(wd.enabled);
+      this.wdIntervalSecs.set(wd.intervalSecs);
+      this.wdPrompt.set(wd.prompt);
+      // A complaint from the previous shell's failed save is not this shell's problem.
+      this.wdError.set(null);
+    });
+
     // Entering the transcript refreshes the screen subscription rather than starting a poll.
     // The stream is change-driven — an idle pane publishes nothing — so once it stays up (see
     // VISUAL_UNSUBSCRIBE_GRACE_MS) there is nothing a poll adds except constant traffic.
@@ -2082,6 +2137,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       createdAt: s.created_at,
       updatedAt: s.updated_at,
       attachedTmux: s.attached_tmux,
+      watchdogEnabled: s.watchdogEnabled,
+      watchdogIntervalSecs: s.watchdogIntervalSecs,
+      watchdogPrompt: s.watchdogPrompt,
+      watchdogLastNudgeAt: s.watchdogLastNudgeAt,
+      watchdogNudgeCount: s.watchdogNudgeCount,
     };
   }
 
@@ -2114,6 +2174,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       created_at: session.createdAt,
       updated_at: session.updatedAt,
       attached_tmux: session.attachedTmux ?? false,
+      // Without these five the watchdog UI reads Off forever: the wire carries them, but the
+      // mapper stripped them before they ever reached currentSession().
+      watchdogEnabled: session.watchdogEnabled,
+      watchdogIntervalSecs: session.watchdogIntervalSecs,
+      watchdogPrompt: session.watchdogPrompt,
+      watchdogLastNudgeAt: session.watchdogLastNudgeAt,
+      watchdogNudgeCount: session.watchdogNudgeCount,
     };
   }
 
