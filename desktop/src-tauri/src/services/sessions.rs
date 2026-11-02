@@ -40,6 +40,16 @@ pub fn reported_terminal_status(
 /// terminal state off one struct instead of guessing from the `attached_tmux` INTENT flag.
 pub use crate::db::models::Session;
 
+/// THE session column list — every query that builds a `db::models::Session` reads its
+/// columns from here, so a column can never be added to the struct in one query and
+/// forgotten in the other. Order is load-bearing: the row readers below index by
+/// position, and the five `watchdog_*` columns sit last in migration 027's order.
+pub(crate) const SESSION_SELECT_COLUMNS: &str = "id, title, provider, model, \
+    working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, \
+    total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status, \
+    watchdog_enabled, watchdog_interval_secs, watchdog_prompt, watchdog_last_nudge_at, \
+    watchdog_nudge_count";
+
 /// Ask tmux ONCE which sessions exist, for a whole listing.
 ///
 /// `Some(names)` = the exact names tmux reported, so a row can pass
@@ -186,8 +196,8 @@ pub fn list_sessions_filtered(
             format!(" WHERE {}", clauses.join(" AND "))
         };
         let sql = format!(
-            "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status FROM sessions{} ORDER BY updated_at DESC",
-            where_sql
+            "SELECT {} FROM sessions{} ORDER BY updated_at DESC",
+            SESSION_SELECT_COLUMNS, where_sql
         );
 
         let params_dyn: Vec<&dyn rusqlite::ToSql> =
@@ -221,6 +231,11 @@ pub fn list_sessions_filtered(
                         tmux_alive,
                     )
                     .to_string(),
+                    watchdog_enabled: row.get::<_, i64>(15)? != 0,
+                    watchdog_interval_secs: row.get(16)?,
+                    watchdog_prompt: row.get(17)?,
+                    watchdog_last_nudge_at: row.get(18)?,
+                    watchdog_nudge_count: row.get(19)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -419,7 +434,10 @@ pub fn list_messages(
 fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, String> {
     let live = live_tmux_session_names();
     conn.query_row(
-        "SELECT id, title, provider, model, working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status FROM sessions WHERE id = ?1",
+        &format!(
+            "SELECT {} FROM sessions WHERE id = ?1",
+            SESSION_SELECT_COLUMNS
+        ),
         params![id],
         |row| {
             let attached_tmux: bool = row.get::<_, i64>(13)? != 0;
@@ -445,6 +463,11 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                     tmux_alive_for(conn, id, live.as_ref()),
                 )
                 .to_string(),
+                watchdog_enabled: row.get::<_, i64>(15)? != 0,
+                watchdog_interval_secs: row.get(16)?,
+                watchdog_prompt: row.get(17)?,
+                watchdog_last_nudge_at: row.get(18)?,
+                watchdog_nudge_count: row.get(19)?,
             })
         },
     )
@@ -973,5 +996,130 @@ mod terminal_status_tests {
                 }
             }
         }
+    }
+}
+
+/// Executes the REAL `SESSION_SELECT_COLUMNS` against a throwaway in-memory database.
+///
+/// This module has no `AppState` harness (and `list_sessions` / `query_session` need one, plus
+/// a tmux probe), so the read is proven at the level that actually matters: the column list
+/// itself, on a connection holding the columns migration 027 added. `list_sessions_filtered`
+/// and `query_session` interpolate this same const, so the statement under test is the
+/// statement that ships.
+#[cfg(test)]
+mod session_select_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    const WATCHDOG_COLUMNS: [&str; 5] = [
+        "watchdog_enabled",
+        "watchdog_interval_secs",
+        "watchdog_prompt",
+        "watchdog_last_nudge_at",
+        "watchdog_nudge_count",
+    ];
+
+    /// A session row shaped like the live one: armed, 5-minute interval, a prompt of the
+    /// user's own, one nudge delivered at a known time, 7 banked.
+    fn conn_with_armed_session() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id                 TEXT PRIMARY KEY,
+                title              TEXT NOT NULL DEFAULT 'New Session',
+                provider           TEXT NOT NULL DEFAULT 'claude_code',
+                model              TEXT NOT NULL DEFAULT '',
+                working_directory  TEXT NOT NULL DEFAULT '',
+                status             TEXT NOT NULL DEFAULT 'active',
+                cli_session_id     TEXT,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_cents   INTEGER NOT NULL DEFAULT 0,
+                kind               TEXT NOT NULL DEFAULT 'user',
+                created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                attached_tmux      INTEGER NOT NULL DEFAULT 0,
+                terminal_status    TEXT NOT NULL DEFAULT 'none',
+                watchdog_enabled       INTEGER NOT NULL DEFAULT 0,
+                watchdog_interval_secs INTEGER NOT NULL DEFAULT 1200,
+                watchdog_prompt        TEXT    NOT NULL DEFAULT '',
+                watchdog_last_nudge_at TEXT,
+                watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("create sessions");
+        conn.execute(
+            "INSERT INTO sessions (id, title, watchdog_enabled, watchdog_interval_secs,
+                                   watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count)
+             VALUES ('s1', 'a shell', 1, 300, 'Report where {name} stands.',
+                     '2024-01-15 10:00:00', 7)",
+            [],
+        )
+        .expect("insert armed s1");
+        conn
+    }
+
+    #[test]
+    fn list_sessions_select_reads_the_watchdog_columns() {
+        // 1) the shared column list NAMES all five — this is what a copy-pasted
+        //    per-query list gets wrong.
+        for column in WATCHDOG_COLUMNS {
+            assert!(
+                SESSION_SELECT_COLUMNS.contains(column),
+                "SESSION_SELECT_COLUMNS does not read {column}: {SESSION_SELECT_COLUMNS}"
+            );
+        }
+
+        // 2) the statement built from it PARSES and RETURNS them — a name in the
+        //    const that is not a real column, or in the wrong position, dies here.
+        let conn = conn_with_armed_session();
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE id = ?1",
+            SESSION_SELECT_COLUMNS
+        );
+        let row = conn
+            .query_row(&sql, params!["s1"], |row| {
+                Ok((
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, i64>(19)?,
+                ))
+            })
+            .expect("the shared column list must parse against the sessions table");
+        assert_eq!(row.0, 1, "watchdog_enabled must read as the armed flag");
+        assert_eq!(row.1, 300, "watchdog_interval_secs");
+        assert_eq!(row.2, "Report where {name} stands.", "watchdog_prompt");
+        assert_eq!(
+            row.3.as_deref(),
+            Some("2024-01-15 10:00:00"),
+            "watchdog_last_nudge_at"
+        );
+        assert_eq!(row.4, 7, "watchdog_nudge_count");
+    }
+
+    #[test]
+    fn list_sessions_select_never_nudged_row_reads_last_nudge_as_null() {
+        // The column is nullable in migration 027; a cold row must read None, not
+        // fail the row and get dropped by the listing's filter_map.
+        let conn = conn_with_armed_session();
+        conn.execute(
+            "UPDATE sessions SET watchdog_last_nudge_at = NULL, watchdog_nudge_count = 0 \
+             WHERE id = 's1'",
+            [],
+        )
+        .expect("clear the nudge stamp");
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE id = ?1",
+            SESSION_SELECT_COLUMNS
+        );
+        let (last, count) = conn
+            .query_row(&sql, params!["s1"], |row| {
+                Ok((row.get::<_, Option<String>>(18)?, row.get::<_, i64>(19)?))
+            })
+            .expect("a never-nudged row must still read");
+        assert_eq!(last, None, "never nudged reads as NULL");
+        assert_eq!(count, 0);
     }
 }
