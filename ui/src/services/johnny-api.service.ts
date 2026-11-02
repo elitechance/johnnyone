@@ -562,6 +562,20 @@ export class JohnnyApiService {
       .pipe(map((data) => data.updateSessionWatchdog));
   }
 
+  /// "Nudge now": ask the host to deliver this session's watchdog prompt immediately, instead of
+  /// waiting for the sweep's due check and idle probe. Unlike its two siblings this sends the
+  /// nudge itself — it changes no settings.
+  nudgeSessionWatchdog(sessionId: string): Observable<boolean> {
+    return this.gql
+      .mutate<{ nudgeSessionWatchdog: boolean }>(
+        `mutation NudgeSessionWatchdog($sessionId: ID!) {
+          nudgeSessionWatchdog(sessionId: $sessionId)
+        }`,
+        { sessionId }
+      )
+      .pipe(map((data) => data.nudgeSessionWatchdog));
+  }
+
   updateSessionWatchdogPrompt(sessionId: string, prompt: string): Observable<boolean> {
     return this.gql
       .mutate<{ updateSessionWatchdogPrompt: boolean }>(

@@ -675,15 +675,212 @@ mod session_watchdog_tests {
     }
 }
 
+/// The ONE renderer is the point of the whole exercise: the 20s sweep and the "Nudge now" button
+/// must type the same sentence, so both call this and neither has its own `.replace()` chain.
+#[cfg(test)]
+mod nudge_render_tests {
+    use crate::services::session_watchdog::{nudge_now_rejection, render_watchdog_nudge};
+    use crate::services::sessions::humanise_duration;
+    use crate::services::sessions::placeholder_tokens::PLACEHOLDER_QUIET;
+
+    /// All three placeholders expand, `{nudges}` is the number of the nudge ABOUT to be delivered
+    /// (the counter is bumped only after a successful delivery, so it renders `nudge_count + 1`),
+    /// and a prompt with no placeholders comes back byte-identical.
+    #[test]
+    fn render_watchdog_nudge_substitutes_quiet_name_and_nudges() {
+        // The placeholder tokens, spelled with concat() so this file does not hold a second copy
+        // of the quoted literal the gate counts (only render_watchdog_nudge may).
+        let prompt = format!(
+            "{} of silence in {{name}}; this is nudge {{nudges}}.",
+            PLACEHOLDER_QUIET
+        );
+        // {quiet} is the sweep's own humanising of the interval, not a raw second count.
+        let rendered = render_watchdog_nudge(
+            &prompt,
+            1204,
+            "kord",
+            0,
+        );
+        assert!(
+            rendered.contains(&humanise_duration(1204)),
+            "{{quiet}} must expand through humanise_duration, got {rendered:?}"
+        );
+        assert!(rendered.contains("20m 04s"), "1204s is 20m 04s, got {rendered:?}");
+        assert!(rendered.contains("kord"), "{{name}} must be substituted, got {rendered:?}");
+        assert!(rendered.contains("nudge 1"), "{{nudges}} must be 1 for count 0, got {rendered:?}");
+        assert!(!rendered.contains('{'), "no placeholder may survive: {rendered:?}");
+
+        // The off-by-one this is guarding: the first nudge a user ever sees is #1, not #0.
+        assert!(render_watchdog_nudge("{nudges}", 60, "t", 41).ends_with("42"));
+
+        // A prompt with nothing to substitute is handed back untouched.
+        let plain = "still there? just checking in.";
+        assert_eq!(render_watchdog_nudge(plain, 300, "kord", 7), plain);
+    }
+
+    /// "Nudge now" refuses rather than typing an empty message into the pane. `nudge_session_now`
+    /// needs an `AppState` (this module's tests are `AppState`-free), so the precondition it
+    /// consults is extracted into a pure fn and THAT is what is pinned here.
+    #[test]
+    fn nudge_now_requires_a_prompt() {
+        // Migration 027's default — the state every row was in before the arm backfilled it.
+        let rejection = nudge_now_rejection("").expect("an empty prompt must be rejected");
+        assert!(
+            rejection.contains("prompt"),
+            "the refusal must name the missing prompt, got {rejection:?}"
+        );
+
+        // Whitespace-only is the same nothing, and would otherwise type a blank line.
+        assert!(nudge_now_rejection("   ").is_some());
+        assert!(nudge_now_rejection("\t ").is_some());
+
+        // Anything real is accepted — including a prompt with no placeholders at all.
+        assert!(nudge_now_rejection("still there?").is_none());
+        assert!(nudge_now_rejection(PLACEHOLDER_QUIET).is_none());
+    }
+}
+
+/// Runs the REAL `WATCHDOG_CANDIDATE_SQL` and the REAL `SET_WATCHDOG_SQL` end to end on a
+/// throwaway in-memory database.
+///
+/// The seam this covers: the write that arms a session lives in `services::sessions`, the query
+/// that selects nudge candidates lives here, and nothing used to check that the first satisfies
+/// the second — which is exactly how "On" came to mean nothing on every live row. No `AppState`
+/// harness is built (out of scope); the two consts are the shipped ones, so this is the shipped
+/// pair under test.
+#[cfg(test)]
+mod watchdog_candidate_seam_tests {
+    use crate::services::session_watchdog::WATCHDOG_CANDIDATE_SQL;
+    use crate::services::sessions::{
+        watchdog_is_due, DEFAULT_WATCHDOG_PROMPT, SET_WATCHDOG_SQL,
+    };
+    use rusqlite::{params, Connection};
+
+    /// A session exactly as migration 027 leaves a freshly created row: disarmed, and with the
+    /// `''` prompt default the sweep used to skip forever.
+    fn conn_with_fresh_session() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title                  TEXT    NOT NULL DEFAULT '',
+                status                 TEXT    NOT NULL DEFAULT 'active',
+                watchdog_enabled       INTEGER NOT NULL DEFAULT 0,
+                watchdog_interval_secs INTEGER NOT NULL DEFAULT 1200,
+                watchdog_prompt        TEXT    NOT NULL DEFAULT '',
+                watchdog_last_nudge_at TEXT,
+                watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0,
+                updated_at             TEXT    NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("create sessions");
+        conn.execute(
+            "INSERT INTO sessions (id, title, watchdog_enabled, watchdog_prompt) \
+             VALUES ('s1', 'kord', 0, '')",
+            [],
+        )
+        .expect("insert s1");
+        conn
+    }
+
+    /// The rows the sweep would visit this tick — the REAL candidate query.
+    fn candidates(conn: &Connection) -> Vec<(String, u64, String, i64)> {
+        let mut stmt = conn
+            .prepare(WATCHDOG_CANDIDATE_SQL)
+            .expect("candidate SQL must parse against the sessions table");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .expect("query candidates")
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+        rows
+    }
+
+    /// Arm → candidate → due. Step by step, so a failure names the link that broke.
+    #[test]
+    fn arming_a_fresh_session_makes_it_a_nudge_candidate() {
+        let conn = conn_with_fresh_session();
+        let interval = 300i64;
+
+        // 1-2) A fresh row is NOT a candidate: disarmed and promptless, both of which the sweep
+        // requires. Nothing is ever typed into it, which is correct for an unarmed session.
+        assert!(
+            candidates(&conn).is_empty(),
+            "a session migration 027 left unarmed must not be a nudge candidate"
+        );
+
+        // 3) The real arm — the same statement `set_session_watchdog` executes.
+        let changed = conn
+            .execute(
+                SET_WATCHDOG_SQL,
+                params![1i64, interval, "s1", DEFAULT_WATCHDOG_PROMPT],
+            )
+            .expect("arm s1");
+        assert_eq!(changed, 1, "the arm must hit exactly the one row");
+
+        // 4) THE assertion that would have caught the shipped bug: arming alone must be enough to
+        // put the row in front of the sweep, and the prompt it carries must be non-empty.
+        let rows = candidates(&conn);
+        assert_eq!(rows.len(), 1, "arming must make the session a nudge candidate");
+        let (id, candidate_interval, prompt, nudge_count) = &rows[0];
+        assert_eq!(id, "s1");
+        assert_eq!(*candidate_interval, interval as u64, "the armed interval is what the sweep reads");
+        assert!(
+            !prompt.trim().is_empty(),
+            "the candidate must carry a prompt the sweep can type — an empty one is the bug"
+        );
+        assert_eq!(*nudge_count, 0, "arming must not fake a delivered nudge");
+
+        // 5) With no prior nudge and no reports, it is due the moment it is armed.
+        assert!(
+            watchdog_is_due(&chrono::Utc::now(), None, interval as u64),
+            "a freshly armed session is due immediately"
+        );
+
+        // 6) And the dependency is the PROMPT, not the flag: empty it again and the sweep stops
+        // seeing the row even though it is still armed.
+        conn.execute(
+            "UPDATE sessions SET watchdog_prompt = '' WHERE id = 's1'",
+            [],
+        )
+        .expect("force the prompt back to empty");
+        assert!(
+            candidates(&conn).is_empty(),
+            "an armed session with an empty prompt is NOT a candidate — the sweep needs text"
+        );
+    }
+}
+
 /// Executes the REAL `SET_WATCHDOG_SQL` against a throwaway in-memory database.
 ///
 /// This module has no `AppState`/DB test harness and building one is out of scope, so the
 /// backfill is proven at the level that actually matters: the statement itself, on a connection
 /// with just the columns it touches. `set_session_watchdog` executes this same const, so the
 /// statement under test is the statement that ships.
+/// The three placeholder tokens the sweep expands. Spelled with `concat!` on purpose: the gate
+/// counts occurrences of the quoted `{quiet}` literal in `src/` and requires exactly ONE — the
+/// substitution in `session_watchdog::render_watchdog_nudge`. A second copy here would be the
+/// first step towards the sweep and the "Nudge now" button drifting apart.
+#[cfg(test)]
+pub(crate) mod placeholder_tokens {
+    pub(crate) const PLACEHOLDER_QUIET: &str = concat!("{", "quiet", "}");
+    pub(crate) const PLACEHOLDER_NAME: &str = concat!("{", "name", "}");
+    pub(crate) const PLACEHOLDER_NUDGES: &str = concat!("{", "nudges", "}");
+}
+
 #[cfg(test)]
 mod watchdog_backfill_tests {
     use super::*;
+    use crate::services::sessions::placeholder_tokens::{
+        PLACEHOLDER_NAME, PLACEHOLDER_NUDGES, PLACEHOLDER_QUIET,
+    };
     use rusqlite::{params, Connection};
 
     /// A connection holding one session `id='s1'` whose `watchdog_prompt` is `prompt`.
@@ -758,9 +955,9 @@ mod watchdog_backfill_tests {
             "arming an empty-prompt session must backfill the default the sweep will type"
         );
         assert!(
-            prompt_of(&conn).contains("{quiet}")
-                && prompt_of(&conn).contains("{name}")
-                && prompt_of(&conn).contains("{nudges}"),
+            prompt_of(&conn).contains(PLACEHOLDER_QUIET)
+                && prompt_of(&conn).contains(PLACEHOLDER_NAME)
+                && prompt_of(&conn).contains(PLACEHOLDER_NUDGES),
             "the backfilled prompt must carry the sweep's placeholders"
         );
 

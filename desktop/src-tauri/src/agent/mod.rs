@@ -9,8 +9,8 @@ use crate::providers::{
     StreamChunk,
 };
 use crate::services::{
-    agent_plans, chat_host, providers as provider_service, sessions as session_service,
-    settings as settings_service,
+    agent_plans, chat_host, providers as provider_service, session_watchdog,
+    sessions as session_service, settings as settings_service,
 };
 use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
@@ -1423,6 +1423,11 @@ impl AgentService {
             "stop_ai_generation" => Self::rpc_stop_ai_generation(&req.params, state).await,
             "update_session_watchdog" => Self::rpc_update_session_watchdog(&req.params, state),
             "update_session_watchdog_prompt" => Self::rpc_update_session_watchdog_prompt(&req.params, state),
+            // The button that must DELIVER a nudge, so unlike its two siblings this arm awaits:
+            // `nudge_session_now` types into the pane through the same async seam the sweep uses.
+            "nudge_session_watchdog" => {
+                Self::rpc_nudge_session_watchdog(&req.params, state).await
+            }
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };
 
@@ -1569,6 +1574,21 @@ impl AgentService {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| "Missing 'intervalSecs' parameter".to_string())?;
         session_service::set_session_watchdog(state, id, enabled, interval_secs)?;
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    /// "Nudge now": deliver this session's watchdog prompt immediately, skipping the sweep's due
+    /// check and idle probe. The rules (what renders, what refuses) live in
+    /// `services::session_watchdog`, never here.
+    async fn rpc_nudge_session_watchdog(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
+        session_watchdog::nudge_session_now(state, id).await?;
         Ok(serde_json::json!({"ok": true}))
     }
 
