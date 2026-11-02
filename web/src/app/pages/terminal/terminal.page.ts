@@ -235,6 +235,7 @@ import {
   watchdogEtaSeconds as watchdogEtaSecondsFn,
   watchdogPromptAfterEnable,
   watchdogSettingsFromSession,
+  parseHostTimestamp,
 } from './watchdog-logic';
 import { sessionStateFromApi, type Session } from './session-map';
 
@@ -791,7 +792,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const pane = this.terminalScreens()[sh.id];
     const paneLastAt = pane ? (this.paneChangedAt.get(sh.id) ?? now) : now;
     const paneSecsAgo = Math.round((now - paneLastAt) / 1000);
-    const nudgeAt = sh.watchdogLastNudgeAt ? new Date(sh.watchdogLastNudgeAt).getTime() : null;
+    const nudgeAt = parseHostTimestamp(sh.watchdogLastNudgeAt);
     const nudgeSecsAgo = nudgeAt !== null ? Math.round((now - nudgeAt) / 1000) : 999;
 
     if (!sh.watchdogEnabled) return { state: 'off', paneSecsAgo, quietSecs: 0, nudgeSecsAgo };
@@ -928,9 +929,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   protected wdArmedAgo = computed<string>(() => {
     const sh = this.currentSession();
     if (!sh?.watchdogEnabled) return '—';
-    const nudgeAt = sh.watchdogLastNudgeAt
-      ? new Date(sh.watchdogLastNudgeAt).getTime()
-      : new Date(sh.created_at ?? sh.updated_at).getTime();
+    const nudgeAt = parseHostTimestamp(sh.watchdogLastNudgeAt)
+      ?? parseHostTimestamp(sh.created_at ?? sh.updated_at)
+      ?? Date.now();
     const secs = Math.round((Date.now() - nudgeAt) / 1000);
     if (secs < 60) return `${secs}s`;
     if (secs < 3600) return `${Math.floor(secs / 60)}m`;
