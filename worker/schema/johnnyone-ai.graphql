@@ -857,6 +857,7 @@ type Mutation {
   # + sets the interval; the second updates the prompt the host sends as the nudge message.
   updateSessionWatchdog(sessionId: ID!, enabled: Boolean!, intervalSecs: Int!): Boolean!
   updateSessionWatchdogPrompt(sessionId: ID!, prompt: String!): Boolean!
+  nudgeSessionWatchdog(sessionId: ID!): Boolean!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!
   deleteAgentPlan(id: ID!): Boolean!

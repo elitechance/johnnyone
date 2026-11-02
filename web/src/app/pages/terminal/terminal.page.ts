@@ -881,7 +881,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  /** Send a nudge to the agent now. */
+  /**
+   * Send a nudge to the agent now.
+   *
+   * This DELIVERS the prompt — it does not touch the settings. The old body re-saved
+   * `enabled`/`intervalSecs` through `updateSessionWatchdog` and sent nothing at all; the only
+   * code that ever typed a nudge was the 20s sweep.
+   */
   protected async nudgeWatchdog(): Promise<void> {
     const sh = this.currentSession();
     if (!sh) return;
@@ -889,10 +895,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.wdError.set(null);
     try {
       this.wdError.set(await runWatchdogAction(
-        () => firstValueFrom(
-          this.api.updateSessionWatchdog(sh.id, true, this.wdIntervalSecs()),
-        ),
-        'Could not nudge — the server refused.',
+        () => firstValueFrom(this.api.nudgeSessionWatchdog(sh.id)),
+        'Could not send the nudge — the server refused.',
       ));
     } finally {
       this.wdSaving.set(false);
