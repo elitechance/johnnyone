@@ -602,6 +602,9 @@ struct AiSession {
     /// `None` = this row has never been nudged — must stay `null` on the wire.
     watchdog_last_nudge_at: Option<String>,
     watchdog_nudge_count: i64,
+    /// Nudges the sweep decided WERE due but withheld (the idle probe saw the pane still
+    /// changing). Not a nudge sent — see `services::sessions::bump_watchdog_held`.
+    watchdog_held_count: i64,
 }
 
 impl From<Session> for AiSession {
@@ -630,6 +633,7 @@ impl From<Session> for AiSession {
             // Stays `Option<String>`: never-nudged is `null`, not an empty string.
             watchdog_last_nudge_at: value.watchdog_last_nudge_at,
             watchdog_nudge_count: value.watchdog_nudge_count,
+            watchdog_held_count: value.watchdog_held_count,
         }
     }
 }
@@ -665,6 +669,7 @@ mod ai_session_tests {
             watchdog_prompt: String::new(),
             watchdog_last_nudge_at: None,
             watchdog_nudge_count: 0,
+            watchdog_held_count: 0,
         }
     }
 

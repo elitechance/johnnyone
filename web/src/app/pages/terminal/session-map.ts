@@ -26,6 +26,8 @@ export interface Session {
   watchdogPrompt?: string;
   watchdogLastNudgeAt?: string;
   watchdogNudgeCount?: number;
+  /** Nudges the sweep decided were due but WITHHELD (pane still changing). 0/undefined = none. */
+  watchdogHeldCount?: number;
 }
 
 /**
@@ -57,5 +59,8 @@ export function sessionStateFromApi(session: SharedAiSession): Session {
     watchdogPrompt: session.watchdogPrompt,
     watchdogLastNudgeAt: session.watchdogLastNudgeAt,
     watchdogNudgeCount: session.watchdogNudgeCount,
+    // A held nudge is not a sent nudge; without this the console cannot tell "held back"
+    // from "quiet", which is the ambiguity that hid the original watchdog bug.
+    watchdogHeldCount: session.watchdogHeldCount,
   };
 }

@@ -400,6 +400,10 @@ pub struct RpcSessionView {
     pub watchdog_prompt: String,
     pub watchdog_last_nudge_at: Option<String>,
     pub watchdog_nudge_count: i64,
+    /// Nudges the sweep decided WERE due but withheld (the idle probe saw the pane still
+    /// changing). Serialises as `watchdogHeldCount` via the same `rename_all = "camelCase"` —
+    /// no manual rename.
+    pub watchdog_held_count: i64,
 }
 
 /// Message view for RPC responses (camelCase for GraphQL compatibility).

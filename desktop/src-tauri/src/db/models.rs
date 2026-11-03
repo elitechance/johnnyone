@@ -46,6 +46,11 @@ pub struct Session {
     pub watchdog_last_nudge_at: Option<String>,
     #[serde(default)]
     pub watchdog_nudge_count: i64,
+    /// Nudges the sweep decided WERE due but WITHHELD because the two-capture idle probe saw the
+    /// pane still changing (migration 028). NOT part of `watchdog_nudge_count`: a held nudge was
+    /// never delivered, and without this the console cannot tell "held back" from "quiet".
+    #[serde(default)]
+    pub watchdog_held_count: i64,
 }
 
 fn default_watchdog_interval() -> i64 {

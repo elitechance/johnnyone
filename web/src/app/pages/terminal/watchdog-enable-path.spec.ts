@@ -104,6 +104,27 @@ describe('watchdog hydration from the session', () => {
     expect(bare.working_directory).toBe('');
   });
 
+  it('carries the held count through to state', () => {
+    // A nudge the sweep decided WAS due but withheld (the idle probe saw the pane still changing)
+    // is counted by migration 028's `watchdog_held_count`. The original watchdog bug survived a
+    // full day because field-by-field mappers each dropped a value silently — this asserts the
+    // VALUES land, not just that the object has the key, so a mapper that strips it goes red.
+    const held = sessionStateFromApi(apiSession({
+      watchdogEnabled: true,
+      watchdogNudgeCount: 3,
+      watchdogHeldCount: 5,
+    }));
+
+    expect(held.watchdogHeldCount).toBe(5);
+    // A hold is NOT a nudge sent: the two counters stay independent all the way to state, or the
+    // footnote would read "8 sent" for 3 delivered nudges.
+    expect(held.watchdogNudgeCount).toBe(3);
+
+    // A row from a host predating migration 028 stays undefined rather than becoming a fake 0 —
+    // the template hides the clause at zero/undefined, so deploy-skew cannot invent holds.
+    expect(sessionStateFromApi(apiSession()).watchdogHeldCount).toBeUndefined();
+  });
+
   it('surfaces a rejected watchdog save', async () => {
     const FAILURE = 'Could not save the watchdog settings — the server refused.';
 

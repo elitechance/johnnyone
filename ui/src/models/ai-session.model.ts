@@ -24,6 +24,12 @@ export interface AiSession {
   watchdogPrompt?: string;
   watchdogLastNudgeAt?: string;
   watchdogNudgeCount?: number;
+  /**
+   * Nudges the sweep decided WERE due but withheld because the two-capture idle probe saw the pane
+   * still changing. Distinct from `watchdogNudgeCount` (nudges actually delivered): a held nudge is
+   * not a sent one, and without this the console cannot tell "held back" from "quiet".
+   */
+  watchdogHeldCount?: number;
 }
 
 export interface CreateAiSessionInput {

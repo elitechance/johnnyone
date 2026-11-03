@@ -929,6 +929,16 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return sh?.watchdogNudgeCount ?? 0;
   });
 
+  /**
+   * Nudges the sweep decided WERE due but withheld because the pane was still changing
+   * (session.watchdogHeldCount). Kept separate from `wdNudgeCount` — a held nudge was never
+   * delivered — and hidden at zero so a healthy session's footnote is unchanged.
+   */
+  protected wdHeldCount = computed<number>(() => {
+    const sh = this.currentSession();
+    return sh?.watchdogHeldCount ?? 0;
+  });
+
   /** How long ago the watchdog was armed (from last nudge or session creation). */
   protected wdArmedAgo = computed<string>(() => {
     const sh = this.currentSession();
@@ -2133,6 +2143,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       watchdogPrompt: s.watchdogPrompt,
       watchdogLastNudgeAt: s.watchdogLastNudgeAt,
       watchdogNudgeCount: s.watchdogNudgeCount,
+      // Same rule as the other watchdog fields: carried verbatim, and left `undefined` (not a
+      // fabricated 0) when the host predates migration 028.
+      watchdogHeldCount: s.watchdogHeldCount,
     };
   }
 
