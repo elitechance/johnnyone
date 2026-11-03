@@ -51,19 +51,19 @@ describe('watchdog nudge wire', () => {
   const last = () => gql.sent[gql.sent.length - 1];
 
   it('nudge now sends the nudge mutation, not a settings save', async () => {
-    gql.payload = { nudgeSessionWatchdog: true };
+    gql.payload = { sendSessionWatchdogNudge: true };
 
     // Exactly what TerminalPage.nudgeWatchdog() does: one action, wrapped so a refusal still
     // reaches `wdError`.
     const error = await runWatchdogAction(
-      async () => firstValueFrom(api.nudgeSessionWatchdog('s1')),
+      async () => firstValueFrom(api.sendSessionWatchdogNudge('s1')),
       'Could not send the nudge — the server refused.',
     );
     expect(error).toBeNull();
 
     expect(gql.sent.length, 'the button sends exactly one operation').toBe(1);
     const { op, variables } = last();
-    expect(op).toContain('nudgeSessionWatchdog');
+    expect(op).toContain('sendSessionWatchdogNudge');
     expect(op).toContain('$sessionId');
     expect(variables).toEqual({ sessionId: 's1' });
 
@@ -75,7 +75,7 @@ describe('watchdog nudge wire', () => {
   });
 
   it('still surfaces a refused nudge as an error message', async () => {
-    gql.payload = { nudgeSessionWatchdog: false };
+    gql.payload = { sendSessionWatchdogNudge: false };
     // A falsy result is not a rejection, so the refusal path is a thrown observable.
     await expect(
       runWatchdogAction(async () => {

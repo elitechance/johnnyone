@@ -895,7 +895,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.wdError.set(null);
     try {
       this.wdError.set(await runWatchdogAction(
-        () => firstValueFrom(this.api.nudgeSessionWatchdog(sh.id)),
+        () => firstValueFrom(this.api.sendSessionWatchdogNudge(sh.id)),
         'Could not send the nudge — the server refused.',
       ));
     } finally {
