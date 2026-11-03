@@ -404,6 +404,11 @@ pub struct RpcSessionView {
     /// changing). Serialises as `watchdogHeldCount` via the same `rename_all = "camelCase"` —
     /// no manual rename.
     pub watchdog_held_count: i64,
+    /// The two "Also nudge when" checkboxes (migration 029), serialising as `watchdogOnBlocked` /
+    /// `watchdogOnStaleReport` via the same `rename_all = "camelCase"`. Drop either here and the
+    /// console's checkbox reads unchecked while the sweep is firing on that trigger.
+    pub watchdog_on_blocked: bool,
+    pub watchdog_on_stale_report: bool,
 }
 
 /// Message view for RPC responses (camelCase for GraphQL compatibility).

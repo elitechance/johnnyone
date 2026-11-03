@@ -1428,6 +1428,9 @@ impl AgentService {
             "nudge_session_watchdog" => {
                 Self::rpc_nudge_session_watchdog(&req.params, state).await
             }
+            "update_session_watchdog_triggers" => {
+                Self::rpc_update_session_watchdog_triggers(&req.params, state)
+            }
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };
 
@@ -1589,6 +1592,28 @@ impl AgentService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
         session_watchdog::nudge_session_now(state, id).await?;
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    /// Persist the two "Also nudge when" checkboxes. Both flags in one call — they are two halves
+    /// of one setting and the console saves them together.
+    fn rpc_update_session_watchdog_triggers(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'sessionId' parameter".to_string())?;
+        let on_blocked = params
+            .get("onBlocked")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| "Missing 'onBlocked' parameter".to_string())?;
+        let on_stale_report = params
+            .get("onStaleReport")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| "Missing 'onStaleReport' parameter".to_string())?;
+        session_service::set_session_watchdog_triggers(state, id, on_blocked, on_stale_report)?;
         Ok(serde_json::json!({"ok": true}))
     }
 
@@ -3181,6 +3206,8 @@ impl AgentService {
             watchdog_last_nudge_at: session.watchdog_last_nudge_at,
             watchdog_nudge_count: session.watchdog_nudge_count,
             watchdog_held_count: session.watchdog_held_count,
+            watchdog_on_blocked: session.watchdog_on_blocked,
+            watchdog_on_stale_report: session.watchdog_on_stale_report,
         }
     }
 
@@ -5057,6 +5084,8 @@ mod session_view_tests {
             watchdog_last_nudge_at: None,
             watchdog_nudge_count: 0,
             watchdog_held_count: 0,
+            watchdog_on_blocked: false,
+            watchdog_on_stale_report: false,
         }
     }
 
@@ -5068,6 +5097,8 @@ mod session_view_tests {
             watchdog_prompt: "Report where {name} stands. Nudge {nudges}.".into(),
             watchdog_last_nudge_at: Some("2024-01-15 10:00:00".into()),
             watchdog_nudge_count: 7,
+            watchdog_on_blocked: true,
+            watchdog_on_stale_report: true,
             ..session_with_terminal_status("attached")
         }
     }

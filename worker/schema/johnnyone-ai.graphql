@@ -54,6 +54,10 @@ type AiSession {
   # NOT part of `watchdogNudgeCount` (nudges actually delivered): a held nudge is not a sent one,
   # and without this the console cannot tell "held back" from "quiet, nothing to say".
   watchdogHeldCount: Int
+  # The two "Also nudge when" checkboxes (migration 029). The sweep fires immediately when the pane
+  # is blocked on a question (ignoring the interval), and on a report gap of twice the interval.
+  watchdogOnBlocked: Boolean
+  watchdogOnStaleReport: Boolean
 }
 
 type AiMessage {
@@ -861,6 +865,8 @@ type Mutation {
   # + sets the interval; the second updates the prompt the host sends as the nudge message.
   updateSessionWatchdog(sessionId: ID!, enabled: Boolean!, intervalSecs: Int!): Boolean!
   updateSessionWatchdogPrompt(sessionId: ID!, prompt: String!): Boolean!
+  # The two "Also nudge when" checkboxes, saved together.
+  updateSessionWatchdogTriggers(sessionId: ID!, onBlocked: Boolean!, onStaleReport: Boolean!): Boolean!
   sendSessionWatchdogNudge(sessionId: ID!): Boolean!
   updateAgentPlanAmend(id: ID!, brief: String!): AgentPlanRun!
   updateAgentPlanStopped(id: ID!): AgentPlanRun!

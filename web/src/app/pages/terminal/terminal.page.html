@@ -463,11 +463,13 @@
               <div class="wd-label">Also nudge when<span class="wd-h">Triggers besides the timer.</span></div>
               <div>
                 <label class="wd-check-row">
-                  <input type="checkbox" [checked]="wdBlockedNudge()" (change)="wdBlockedNudge.set(!wdBlockedNudge())">
+                  <input type="checkbox" [checked]="wdBlockedNudge()" [disabled]="wdSaving()"
+                         (change)="toggleWdBlockedNudge()">
                   the pane is blocked on a question <span class="wd-check-hint">— fires at once, ignores the interval</span>
                 </label>
                 <label class="wd-check-row">
-                  <input type="checkbox" [checked]="wdReportNudge()" (change)="wdReportNudge.set(!wdReportNudge())">
+                  <input type="checkbox" [checked]="wdReportNudge()" [disabled]="wdSaving()"
+                         (change)="toggleWdReportNudge()">
                   nothing has been reported to the chat for twice the interval
                 </label>
               </div>

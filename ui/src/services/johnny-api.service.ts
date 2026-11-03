@@ -416,7 +416,7 @@ export class JohnnyApiService {
     totalInputTokens totalOutputTokens totalCostCents
     createdAt updatedAt attachedTmux terminalStatus
     watchdogEnabled watchdogIntervalSecs watchdogPrompt watchdogLastNudgeAt watchdogNudgeCount
-    watchdogHeldCount
+    watchdogHeldCount watchdogOnBlocked watchdogOnStaleReport
   `;
   private readonly agentPlanRunFields = `
     plan {
@@ -575,6 +575,26 @@ export class JohnnyApiService {
         { sessionId }
       )
       .pipe(map((data) => data.sendSessionWatchdogNudge));
+  }
+
+  /**
+   * Persist the two "Also nudge when" checkboxes. Both flags in ONE mutation — they are two halves
+   * of one setting, and saving them separately could leave a row where one checkbox stuck and its
+   * neighbour silently reverted on the next hydrate.
+   */
+  updateSessionWatchdogTriggers(
+    sessionId: string,
+    onBlocked: boolean,
+    onStaleReport: boolean
+  ): Observable<boolean> {
+    return this.gql
+      .mutate<{ updateSessionWatchdogTriggers: boolean }>(
+        `mutation UpdateSessionWatchdogTriggers($sessionId: ID!, $onBlocked: Boolean!, $onStaleReport: Boolean!) {
+          updateSessionWatchdogTriggers(sessionId: $sessionId, onBlocked: $onBlocked, onStaleReport: $onStaleReport)
+        }`,
+        { sessionId, onBlocked, onStaleReport }
+      )
+      .pipe(map((data) => data.updateSessionWatchdogTriggers));
   }
 
   updateSessionWatchdogPrompt(sessionId: string, prompt: string): Observable<boolean> {

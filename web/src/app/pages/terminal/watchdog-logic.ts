@@ -126,11 +126,15 @@ export function watchdogPromptAfterEnable(storedPrompt: string | null | undefine
   return storedPrompt && storedPrompt.trim() !== '' ? storedPrompt : DEFAULT_WATCHDOG_PROMPT;
 }
 
-/** The three watchdog signals, hydrated from one session's watchdog fields. */
+/** The watchdog signals, hydrated from one session's watchdog fields. */
 export interface WatchdogSettings {
   enabled: boolean;
   intervalSecs: number;
   prompt: string;
+  /** "Also nudge when: the pane is blocked on a question" (migration 029). */
+  onBlocked: boolean;
+  /** "...nothing has been reported for twice the interval" (migration 029). */
+  onStaleReport: boolean;
 }
 
 /** What the signals hold before any session has been seen. */
@@ -138,6 +142,8 @@ export const WATCHDOG_SIGNAL_DEFAULTS: WatchdogSettings = {
   enabled: false,
   intervalSecs: 300,
   prompt: '',
+  onBlocked: false,
+  onStaleReport: false,
 };
 
 /**
@@ -155,12 +161,18 @@ export function watchdogSettingsFromSession(session: {
   watchdogEnabled?: boolean | null;
   watchdogIntervalSecs?: number | null;
   watchdogPrompt?: string | null;
+  watchdogOnBlocked?: boolean | null;
+  watchdogOnStaleReport?: boolean | null;
 } | null | undefined): WatchdogSettings {
   if (!session) return { ...WATCHDOG_SIGNAL_DEFAULTS };
   return {
     enabled: session.watchdogEnabled === true,
     intervalSecs: session.watchdogIntervalSecs ?? WATCHDOG_SIGNAL_DEFAULTS.intervalSecs,
     prompt: session.watchdogPrompt ?? WATCHDOG_SIGNAL_DEFAULTS.prompt,
+    // Strict `=== true` for the same reason as `enabled`: absent (deploy skew, or a row predating
+    // migration 029) means unchecked, and `undefined` must never become a truthy checkbox.
+    onBlocked: session.watchdogOnBlocked === true,
+    onStaleReport: session.watchdogOnStaleReport === true,
   };
 }
 

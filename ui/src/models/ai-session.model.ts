@@ -30,6 +30,12 @@ export interface AiSession {
    * not a sent one, and without this the console cannot tell "held back" from "quiet".
    */
   watchdogHeldCount?: number;
+  /**
+   * The two "Also nudge when" checkboxes (migration 029). Nullable for deploy skew, like the rest of
+   * the watchdog block: absent reads as unchecked, which is what a pre-029 row means anyway.
+   */
+  watchdogOnBlocked?: boolean;
+  watchdogOnStaleReport?: boolean;
 }
 
 export interface CreateAiSessionInput {

@@ -36,7 +36,15 @@ describe('watchdog hydration from the session', () => {
       watchdogIntervalSecs: 600,
       watchdogPrompt: 'ping me',
     });
-    expect(armed).toEqual({ enabled: true, intervalSecs: 600, prompt: 'ping me' });
+    expect(armed).toEqual({
+      enabled: true,
+      intervalSecs: 600,
+      prompt: 'ping me',
+      // Migration 029's two flags hydrate as UNCHECKED when the wire omits them (a row
+      // predating 029, or deploy skew) — `undefined` must never become a checked box.
+      onBlocked: false,
+      onStaleReport: false,
+    });
 
     // No session at all (nothing selected yet) → the signals' own initial values.
     expect(watchdogSettingsFromSession(null)).toEqual(WATCHDOG_SIGNAL_DEFAULTS);
@@ -62,6 +70,37 @@ describe('watchdog hydration from the session', () => {
     expect(shouldHydrateWatchdogSignals('s1', null)).toBe(true);
     expect(shouldHydrateWatchdogSignals('s1', undefined)).toBe(true);
     expect(shouldHydrateWatchdogSignals(null, null)).toBe(false);
+
+    // The two migration-029 flags are part of the SAME hydration: an armed session whose wire
+    // omits them (a row predating 029, or deploy skew) seeds BOTH checkboxes unchecked — never
+    // `undefined`, which an `ion-checkbox` would render as a checked box.
+    expect(armed.onBlocked).toBe(false);
+    expect(armed.onStaleReport).toBe(false);
+    expect(WATCHDOG_SIGNAL_DEFAULTS.onBlocked).toBe(false);
+    expect(WATCHDOG_SIGNAL_DEFAULTS.onStaleReport).toBe(false);
+  });
+
+  it('hydrates the Also nudge when checkboxes from the session', () => {
+    // A session with both flags set lights both checkboxes — the console must show what the
+    // host actually has, not a pair of boxes that read false forever.
+    expect(
+      watchdogSettingsFromSession({ watchdogEnabled: true, watchdogOnBlocked: true, watchdogOnStaleReport: true }),
+    ).toMatchObject({ onBlocked: true, onStaleReport: true });
+
+    // Each flag independently: only the one the host reports comes back checked.
+    expect(watchdogSettingsFromSession({ watchdogOnBlocked: true }).onBlocked).toBe(true);
+    expect(watchdogSettingsFromSession({ watchdogOnBlocked: true }).onStaleReport).toBe(false);
+    expect(watchdogSettingsFromSession({ watchdogOnStaleReport: true }).onStaleReport).toBe(true);
+    expect(watchdogSettingsFromSession({ watchdogOnStaleReport: true }).onBlocked).toBe(false);
+
+    // null (a row predating migration 029) is unchecked, never a truthy checkbox.
+    expect(
+      watchdogSettingsFromSession({ watchdogOnBlocked: null, watchdogOnStaleReport: null }),
+    ).toMatchObject({ onBlocked: false, onStaleReport: false });
+
+    // And with no session at all the defaults are both unchecked.
+    expect(WATCHDOG_SIGNAL_DEFAULTS.onBlocked).toBe(false);
+    expect(WATCHDOG_SIGNAL_DEFAULTS.onStaleReport).toBe(false);
   });
 
   it('maps the watchdog fields through to state', () => {

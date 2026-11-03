@@ -28,6 +28,9 @@ export interface Session {
   watchdogNudgeCount?: number;
   /** Nudges the sweep decided were due but WITHHELD (pane still changing). 0/undefined = none. */
   watchdogHeldCount?: number;
+  /** The two "Also nudge when" checkboxes — off the wire, onto the page's session state. */
+  watchdogOnBlocked?: boolean;
+  watchdogOnStaleReport?: boolean;
 }
 
 /**
@@ -62,5 +65,9 @@ export function sessionStateFromApi(session: SharedAiSession): Session {
     // A held nudge is not a sent nudge; without this the console cannot tell "held back"
     // from "quiet", which is the ambiguity that hid the original watchdog bug.
     watchdogHeldCount: session.watchdogHeldCount,
+    // And the two trigger checkboxes: stripped here they render unchecked on a session whose sweep
+    // is firing on that very trigger.
+    watchdogOnBlocked: session.watchdogOnBlocked,
+    watchdogOnStaleReport: session.watchdogOnStaleReport,
   };
 }
