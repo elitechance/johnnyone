@@ -532,6 +532,12 @@ pub(crate) const SET_WATCHDOG_SQL: &str = "UPDATE sessions SET watchdog_enabled 
         THEN ?4 ELSE watchdog_prompt END, \
     updated_at = datetime('now') WHERE id = ?3";
 
+/// A write that matched no row is a failure, not a silent success: the
+/// caller passed an id that does not exist.
+pub fn session_write_result(rows: usize, id: &str) -> Result<(), String> {
+    if rows == 0 { Err(format!("No such session: {id}")) } else { Ok(()) }
+}
+
 /// Set the watchdog enabled/interval for a session. Clamps interval to [60, 3600].
 pub fn set_session_watchdog(
     state: &AppState,
@@ -541,13 +547,14 @@ pub fn set_session_watchdog(
 ) -> Result<(), String> {
     let clamped = interval_secs.clamp(60, 3600);
     state.db.with_conn(|conn| {
-        conn.execute(
-            SET_WATCHDOG_SQL,
-            params![enabled as i64, clamped as i64, id, DEFAULT_WATCHDOG_PROMPT],
-        )
-        .map_err(|e| format!("Failed to update watchdog: {}", e))
-    })?;
-    Ok(())
+        let rows = conn
+            .execute(
+                SET_WATCHDOG_SQL,
+                params![enabled as i64, clamped as i64, id, DEFAULT_WATCHDOG_PROMPT],
+            )
+            .map_err(|e| format!("Failed to update watchdog: {}", e))?;
+        session_write_result(rows, id)
+    })
 }
 
 /// Set the watchdog prompt for a session. Rejects embedded \r and \n, and strings over 600 chars.
@@ -559,13 +566,14 @@ pub fn set_session_watchdog_prompt(state: &AppState, id: &str, prompt: &str) -> 
         return Err("Watchdog prompt exceeds 600 characters".to_string());
     }
     state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE sessions SET watchdog_prompt = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![prompt, id],
-        )
-        .map_err(|e| format!("Failed to update watchdog prompt: {}", e))
-    })?;
-    Ok(())
+        let rows = conn
+            .execute(
+                "UPDATE sessions SET watchdog_prompt = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![prompt, id],
+            )
+            .map_err(|e| format!("Failed to update watchdog prompt: {}", e))?;
+        session_write_result(rows, id)
+    })
 }
 
 /// Bump the watchdog nudge counter and stamp the last-nudge timestamp.
@@ -1035,6 +1043,66 @@ mod watchdog_backfill_tests {
                         what you just finished, what you are working on, and anything blocking \
                         you. This is nudge {nudges}.";
         assert_eq!(DEFAULT_WATCHDOG_PROMPT, expected);
+    }
+
+    /// The prompt UPDATE behind `set_session_watchdog_prompt` must report that it hit nothing,
+    /// so an id that does not exist cannot come back as success.
+    #[test]
+    fn updating_the_watchdog_prompt_for_a_missing_session_is_an_error() {
+        let conn = conn_with_session("");
+        let prompt_sql =
+            "UPDATE sessions SET watchdog_prompt = ?1, updated_at = datetime('now') WHERE id = ?2";
+
+        // ── the missing id: 0 rows, and the helper says so ──────────────────────
+        let changed = conn
+            .execute(prompt_sql, params!("a prompt", "nope"))
+            .expect("update a nonexistent session");
+        assert_eq!(changed, 0, "an unknown id must match no row");
+        let err = session_write_result(changed, "nope")
+            .expect_err("0 rows affected is a failure, not a silent success");
+        assert!(
+            err.contains("nope"),
+            "the error must name the id that was not found: {err}"
+        );
+
+        // ── the real id: 1 row, and the helper accepts it ───────────────────────
+        let changed = conn
+            .execute(prompt_sql, params!("a prompt", "s1"))
+            .expect("update s1");
+        assert_eq!(changed, 1, "the statement must hit exactly the one row");
+        assert_eq!(session_write_result(changed, "s1"), Ok(()));
+    }
+
+    /// Same contract for the arm/disarm write: `SET_WATCHDOG_SQL` for an unknown id affects no
+    /// row, and that must surface as an error rather than an `Ok(())`.
+    #[test]
+    fn arming_the_watchdog_for_a_missing_session_is_an_error() {
+        let conn = conn_with_session("");
+
+        // ── the missing id: 0 rows, and the helper says so ──────────────────────
+        let changed = conn
+            .execute(
+                SET_WATCHDOG_SQL,
+                params![1i64, 300i64, "nope", DEFAULT_WATCHDOG_PROMPT],
+            )
+            .expect("arm a nonexistent session");
+        assert_eq!(changed, 0, "an unknown id must match no row");
+        let err = session_write_result(changed, "nope")
+            .expect_err("0 rows affected is a failure, not a silent success");
+        assert!(
+            err.contains("nope"),
+            "the error must name the id that was not found: {err}"
+        );
+
+        // ── the real id: 1 row, and the helper accepts it ───────────────────────
+        let changed = conn
+            .execute(
+                SET_WATCHDOG_SQL,
+                params![1i64, 300i64, "s1", DEFAULT_WATCHDOG_PROMPT],
+            )
+            .expect("arm s1");
+        assert_eq!(changed, 1, "the statement must hit exactly the one row");
+        assert_eq!(session_write_result(changed, "s1"), Ok(()));
     }
 }
 
