@@ -487,8 +487,9 @@
                       (click)="toggleWatchdogEnabled()">Disarm</button>
             </div>
 
-            <!-- Footer: sent · armed -->
-            <div class="wd-footnote">{{ wdNudgeCount() }} sent · armed {{ wdArmedAgo() }} ago. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
+            <!-- Footer: sent · held · armed. `held` = due but withheld by the idle probe; shown
+                 only above zero, so a healthy session's footnote reads exactly as before. -->
+            <div class="wd-footnote">{{ wdNudgeCount() }} sent@if (wdHeldCount() > 0) { · held {{ wdHeldCount() }}×} · armed {{ wdArmedAgo() }} ago. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
           }
         </section>
       } @else if (sh) {

@@ -48,7 +48,7 @@ pub(crate) const SESSION_SELECT_COLUMNS: &str = "id, title, provider, model, \
     working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, \
     total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status, \
     watchdog_enabled, watchdog_interval_secs, watchdog_prompt, watchdog_last_nudge_at, \
-    watchdog_nudge_count";
+    watchdog_nudge_count, watchdog_held_count";
 
 /// Ask tmux ONCE which sessions exist, for a whole listing.
 ///
@@ -236,6 +236,7 @@ pub fn list_sessions_filtered(
                     watchdog_prompt: row.get(17)?,
                     watchdog_last_nudge_at: row.get(18)?,
                     watchdog_nudge_count: row.get(19)?,
+                    watchdog_held_count: row.get(20)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -468,6 +469,7 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                 watchdog_prompt: row.get(17)?,
                 watchdog_last_nudge_at: row.get(18)?,
                 watchdog_nudge_count: row.get(19)?,
+                watchdog_held_count: row.get(20)?,
             })
         },
     )
@@ -585,6 +587,30 @@ pub fn bump_watchdog_nudge(state: &AppState, id: &str) -> Result<(), String> {
             params![id],
         )
         .map_err(|e| format!("Failed to bump watchdog nudge: {}", e))?;
+        Ok(())
+    })
+}
+
+/// The UPDATE half of a WITHHELD nudge, hoisted so a test can run the REAL statement against a
+/// seeded row without an `AppState` harness (see `watchdog_held_tests`).
+///
+/// Deliberately NOT `bump_watchdog_nudge` with one column swapped: a hold must leave BOTH nudge
+/// counters alone — `watchdog_nudge_count` counts nudges the agent actually received, and
+/// `watchdog_last_nudge_at` is what the due-check reads as "we just spoke". Stamping either would
+/// make a withheld nudge suppress the next one and lie to the console about what was sent.
+pub const BUMP_WATCHDOG_HELD_SQL: &str = "UPDATE sessions SET watchdog_held_count = \
+    watchdog_held_count + 1, updated_at = datetime('now') WHERE id = ?1";
+
+/// Record that the sweep found a nudge DUE for `id` and withheld it (the two-capture idle probe saw
+/// the pane still changing).
+///
+/// Called ONLY from that withholding branch. A session whose interval has not elapsed is not "held"
+/// — it is simply quiet — so `watchdog_is_due == false` must never reach here, or the count becomes
+/// a tick counter and stops meaning anything.
+pub fn bump_watchdog_held(state: &AppState, id: &str) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        conn.execute(BUMP_WATCHDOG_HELD_SQL, params![id])
+            .map_err(|e| format!("Failed to bump watchdog held count: {}", e))?;
         Ok(())
     })
 }
@@ -1276,16 +1302,25 @@ mod session_select_tests {
     use super::*;
     use rusqlite::{params, Connection};
 
-    const WATCHDOG_COLUMNS: [&str; 5] = [
+    const WATCHDOG_COLUMNS: [&str; 6] = [
         "watchdog_enabled",
         "watchdog_interval_secs",
         "watchdog_prompt",
         "watchdog_last_nudge_at",
         "watchdog_nudge_count",
+        // Migration 028: nudges the sweep decided were due but WITHHELD. Named here so the
+        // shared column list cannot quietly stop reading it — the failure mode that hid the
+        // original watchdog bug is a mapper dropping a column with no error anywhere.
+        "watchdog_held_count",
     ];
 
     /// A session row shaped like the live one: armed, 5-minute interval, a prompt of the
-    /// user's own, one nudge delivered at a known time, 7 banked.
+    /// user's own, one nudge delivered at a known time, 7 banked, and 2 nudges the sweep
+    /// decided were due and WITHHELD (migration 028).
+    ///
+    /// The held count is seeded NON-zero on purpose: `list_sessions_select_carries_the_held_count`
+    /// reads it back out of the SELECT, and a row defaulting to 0 would pass even if the mapper
+    /// hardcoded 0 or read the wrong index.
     fn conn_with_armed_session() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory sqlite");
         conn.execute_batch(
@@ -1309,15 +1344,17 @@ mod session_select_tests {
                 watchdog_interval_secs INTEGER NOT NULL DEFAULT 1200,
                 watchdog_prompt        TEXT    NOT NULL DEFAULT '',
                 watchdog_last_nudge_at TEXT,
-                watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0
+                watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0,
+                watchdog_held_count    INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create sessions");
         conn.execute(
             "INSERT INTO sessions (id, title, watchdog_enabled, watchdog_interval_secs,
-                                   watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count)
+                                   watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count,
+                                   watchdog_held_count)
              VALUES ('s1', 'a shell', 1, 300, 'Report where {name} stands.',
-                     '2024-01-15 10:00:00', 7)",
+                     '2024-01-15 10:00:00', 7, 2)",
             [],
         )
         .expect("insert armed s1");
@@ -1362,6 +1399,34 @@ mod session_select_tests {
             "watchdog_last_nudge_at"
         );
         assert_eq!(row.4, 7, "watchdog_nudge_count");
+    }
+
+    /// The sixth watchdog column must come back out of the SHARED SELECT at the index the two
+    /// `Ok(Session { .. })` builders read it at (20). This is the layer of the eight where the held
+    /// count is most easily lost — a column list that stops naming it, or a column added before it
+    /// that shifts every index after 19, makes the console read "held 0×" on a row the sweep is
+    /// actively holding, with no error anywhere.
+    #[test]
+    fn list_sessions_select_carries_the_held_count() {
+        let conn = conn_with_armed_session();
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE id = ?1",
+            SESSION_SELECT_COLUMNS
+        );
+        let held = conn
+            .query_row(&sql, params!["s1"], |row| row.get::<_, i64>(20))
+            .expect("the held count must read without failing the row");
+        assert_eq!(held, 2, "SESSION_SELECT_COLUMNS must carry watchdog_held_count");
+
+        // And a row predating migration 028's backfill still reads 0, not NULL — the column is
+        // NOT NULL DEFAULT 0, so a session can never be dropped from the listing over it.
+        conn.execute("UPDATE sessions SET watchdog_held_count = 0 WHERE id = 's1'", [])
+            .expect("zero the held count");
+        assert_eq!(
+            conn.query_row(&sql, params!["s1"], |row| row.get::<_, i64>(20))
+                .expect("a 0-held row must still read"),
+            0
+        );
     }
 
     #[test]

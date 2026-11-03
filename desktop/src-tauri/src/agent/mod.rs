@@ -3180,6 +3180,7 @@ impl AgentService {
             watchdog_prompt: session.watchdog_prompt,
             watchdog_last_nudge_at: session.watchdog_last_nudge_at,
             watchdog_nudge_count: session.watchdog_nudge_count,
+            watchdog_held_count: session.watchdog_held_count,
         }
     }
 
@@ -5055,6 +5056,7 @@ mod session_view_tests {
             watchdog_prompt: String::new(),
             watchdog_last_nudge_at: None,
             watchdog_nudge_count: 0,
+            watchdog_held_count: 0,
         }
     }
 

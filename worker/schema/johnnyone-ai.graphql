@@ -50,6 +50,10 @@ type AiSession {
   watchdogPrompt: String
   watchdogLastNudgeAt: String
   watchdogNudgeCount: Int
+  # Nudges the sweep decided WERE due but withheld because the pane was still changing.
+  # NOT part of `watchdogNudgeCount` (nudges actually delivered): a held nudge is not a sent one,
+  # and without this the console cannot tell "held back" from "quiet, nothing to say".
+  watchdogHeldCount: Int
 }
 
 type AiMessage {

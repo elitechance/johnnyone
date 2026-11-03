@@ -29,6 +29,9 @@ pub mod workflows;
 pub mod workspace_git;
 #[cfg(test)]
 mod fixture_spine;
+/// The withheld-nudge counter (migration 028): the real UPDATE, pure, no AppState harness.
+#[cfg(test)]
+mod watchdog_held_tests;
 /// QA A's adversarial tests against the workflow arena (migration 026).
 #[cfg(test)]
 mod workflows_qa_attacks;

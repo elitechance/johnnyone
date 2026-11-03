@@ -197,7 +197,13 @@ async fn tick(state: &Arc<AppState>) -> Result<(), String> {
         let a = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&first.content);
         let b = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&second.content);
         if a != b {
-            // Pane is still changing — skip.
+            // Pane is still changing — the nudge WAS due and is being withheld. Record it: without
+            // this, "held back" is indistinguishable from "quiet, nothing to say", which is exactly
+            // the silence that hid the original watchdog bug. NOT bumped when `watchdog_is_due`
+            // returned false above — a timer that has not elapsed is not a hold.
+            if let Err(error) = sessions::bump_watchdog_held(state, id) {
+                tracing::warn!(session_id = %id, %error, "watchdog held bump failed");
+            }
             continue;
         }
 
