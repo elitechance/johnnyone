@@ -16,7 +16,7 @@ interface WorkerEnv {
 
 // Watchdog: "Nudge now" — deliver this session's watchdog prompt immediately, skipping the
 // sweep's due check and idle probe. Thin pass-through to the host `nudge_session_watchdog` RPC.
-export default async function nudgeSessionWatchdog(
+export default async function sendSessionWatchdogNudge(
   _parent: unknown,
   args: { sessionId: string },
   ctx: ResolverContext,
