@@ -605,6 +605,11 @@ struct AiSession {
     /// Nudges the sweep decided WERE due but withheld (the idle probe saw the pane still
     /// changing). Not a nudge sent — see `services::sessions::bump_watchdog_held`.
     watchdog_held_count: i64,
+    /// The two "Also nudge when" checkboxes (migration 029), exposed as `watchdogOnBlocked` /
+    /// `watchdogOnStaleReport` via the type's `rename_fields = "camelCase"`. The console hydrates
+    /// its checkboxes from these; dropped here they read unchecked on every page load.
+    watchdog_on_blocked: bool,
+    watchdog_on_stale_report: bool,
 }
 
 impl From<Session> for AiSession {
@@ -634,6 +639,8 @@ impl From<Session> for AiSession {
             watchdog_last_nudge_at: value.watchdog_last_nudge_at,
             watchdog_nudge_count: value.watchdog_nudge_count,
             watchdog_held_count: value.watchdog_held_count,
+            watchdog_on_blocked: value.watchdog_on_blocked,
+            watchdog_on_stale_report: value.watchdog_on_stale_report,
         }
     }
 }
@@ -670,6 +677,8 @@ mod ai_session_tests {
             watchdog_last_nudge_at: None,
             watchdog_nudge_count: 0,
             watchdog_held_count: 0,
+            watchdog_on_blocked: false,
+            watchdog_on_stale_report: false,
         }
     }
 
@@ -682,6 +691,8 @@ mod ai_session_tests {
             watchdog_prompt: "Report where {name} stands. Nudge {nudges}.".into(),
             watchdog_last_nudge_at: Some("2024-01-15 10:00:00".into()),
             watchdog_nudge_count: 7,
+            watchdog_on_blocked: true,
+            watchdog_on_stale_report: true,
             ..session_with_terminal_status("attached")
         }
     }

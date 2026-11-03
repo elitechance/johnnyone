@@ -48,7 +48,7 @@ pub(crate) const SESSION_SELECT_COLUMNS: &str = "id, title, provider, model, \
     working_directory, status, cli_session_id, total_input_tokens, total_output_tokens, \
     total_cost_cents, kind, created_at, updated_at, attached_tmux, terminal_status, \
     watchdog_enabled, watchdog_interval_secs, watchdog_prompt, watchdog_last_nudge_at, \
-    watchdog_nudge_count, watchdog_held_count";
+    watchdog_nudge_count, watchdog_held_count, watchdog_on_blocked, watchdog_on_stale_report";
 
 /// Ask tmux ONCE which sessions exist, for a whole listing.
 ///
@@ -237,6 +237,8 @@ pub fn list_sessions_filtered(
                     watchdog_last_nudge_at: row.get(18)?,
                     watchdog_nudge_count: row.get(19)?,
                     watchdog_held_count: row.get(20)?,
+                    watchdog_on_blocked: row.get::<_, i64>(21)? != 0,
+                    watchdog_on_stale_report: row.get::<_, i64>(22)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -470,6 +472,8 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                 watchdog_last_nudge_at: row.get(18)?,
                 watchdog_nudge_count: row.get(19)?,
                 watchdog_held_count: row.get(20)?,
+                watchdog_on_blocked: row.get::<_, i64>(21)? != 0,
+                watchdog_on_stale_report: row.get::<_, i64>(22)? != 0,
             })
         },
     )
@@ -615,6 +619,37 @@ pub fn bump_watchdog_held(state: &AppState, id: &str) -> Result<(), String> {
     })
 }
 
+/// The UPDATE half of the two "Also nudge when" checkboxes, hoisted so a test can run the REAL
+/// statement against a seeded row without an `AppState` harness.
+///
+/// Both flags in ONE statement: they are two halves of one setting, and the console saves them from
+/// a single pair of checkboxes — writing them separately could leave a row where one checkbox was
+/// persisted and its neighbour silently dropped.
+pub(crate) const SET_WATCHDOG_TRIGGERS_SQL: &str = "UPDATE sessions SET watchdog_on_blocked = ?1, \
+    watchdog_on_stale_report = ?2, updated_at = datetime('now') WHERE id = ?3";
+
+/// Set the two "Also nudge when" trigger flags for a session.
+///
+/// Goes through `session_write_result`, so an id that matches no row is REFUSED rather than a silent
+/// success — otherwise the console's checkbox would flip back to off on the next hydrate with no
+/// error shown, which is the failure mode the watchdog writes have had twice already.
+pub fn set_session_watchdog_triggers(
+    state: &AppState,
+    id: &str,
+    on_blocked: bool,
+    on_stale_report: bool,
+) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        let rows = conn
+            .execute(
+                SET_WATCHDOG_TRIGGERS_SQL,
+                params![on_blocked as i64, on_stale_report as i64, id],
+            )
+            .map_err(|e| format!("Failed to update watchdog triggers: {}", e))?;
+        session_write_result(rows, id)
+    })
+}
+
 /// Query the latest session_reports timestamp for a session, or None if no reports exist.
 pub fn latest_session_report_at(state: &AppState, id: &str) -> Result<Option<String>, String> {
     state.db.with_conn(|conn| {
@@ -667,6 +702,28 @@ pub fn watchdog_is_due(
     }
     // Unparseable timestamp — treat as due.
     true
+}
+
+/// Seconds elapsed since a host timestamp (`datetime('now')` / RFC 3339), or `None` when the string
+/// is absent or unparseable.
+///
+/// Deliberately `None` — not "very old" — for an unparseable stamp: the stale-report trigger uses
+/// this, and treating garbage as ancient would fire a nudge on every tick for a row whose clock we
+/// cannot read. `watchdog_is_due` takes the opposite policy (unparseable ⇒ due) because there the
+/// conservative choice is to speak rather than stay silent forever.
+pub fn host_timestamp_age_secs(
+    now_utc: &chrono::DateTime<chrono::Utc>,
+    ts: &str,
+) -> Option<u64> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return Some((*now_utc - parsed.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64);
+    }
+    chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| {
+            let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
+            (*now_utc - utc).num_seconds().max(0) as u64
+        })
 }
 
 /// Humanise a duration in seconds, e.g. 1204 → "20m 04s".
@@ -804,6 +861,8 @@ mod watchdog_candidate_seam_tests {
                 watchdog_prompt        TEXT    NOT NULL DEFAULT '',
                 watchdog_last_nudge_at TEXT,
                 watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0,
+                watchdog_on_blocked    INTEGER NOT NULL DEFAULT 0,
+                watchdog_on_stale_report INTEGER NOT NULL DEFAULT 0,
                 updated_at             TEXT    NOT NULL DEFAULT (datetime('now'))
             );",
         )
@@ -1345,16 +1404,19 @@ mod session_select_tests {
                 watchdog_prompt        TEXT    NOT NULL DEFAULT '',
                 watchdog_last_nudge_at TEXT,
                 watchdog_nudge_count   INTEGER NOT NULL DEFAULT 0,
-                watchdog_held_count    INTEGER NOT NULL DEFAULT 0
+                watchdog_held_count    INTEGER NOT NULL DEFAULT 0,
+                watchdog_on_blocked    INTEGER NOT NULL DEFAULT 0,
+                watchdog_on_stale_report INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create sessions");
         conn.execute(
             "INSERT INTO sessions (id, title, watchdog_enabled, watchdog_interval_secs,
                                    watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count,
-                                   watchdog_held_count)
+                                   watchdog_held_count, watchdog_on_blocked,
+                                   watchdog_on_stale_report)
              VALUES ('s1', 'a shell', 1, 300, 'Report where {name} stands.',
-                     '2024-01-15 10:00:00', 7, 2)",
+                     '2024-01-15 10:00:00', 7, 2, 1, 0)",
             [],
         )
         .expect("insert armed s1");

@@ -952,11 +952,57 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return `${Math.floor(secs / 3600)}h`;
   });
 
-  /** "Also nudge when: the pane is blocked on a question" — not yet persisted. */
+  /**
+   * "Also nudge when: the pane is blocked on a question" — now persisted (migration 029) and read
+   * by the sweep, which fires immediately on a pane sitting on a question, ignoring the interval.
+   * Hydrated from the session; see the id-guarded effect in the constructor.
+   */
   protected wdBlockedNudge = signal(false);
 
-  /** "Also nudge when: nothing reported for twice the interval" — not yet persisted. */
+  /**
+   * "Also nudge when: nothing reported for twice the interval" — persisted and read by the sweep as
+   * `WatchdogTrigger::StaleReport`. Hydrated from the session alongside `wdBlockedNudge`.
+   */
   protected wdReportNudge = signal(false);
+
+  /**
+   * Flip one "Also nudge when" checkbox and PERSIST the pair.
+   *
+   * The two `(change)` handlers used to be `wdBlockedNudge.set(!wdBlockedNudge())` — a local signal
+   * flip that wrote nothing, so the checkbox unchecked itself on the next page load and the sweep
+   * never saw the flag. Both flags go up in ONE mutation (they are two halves of one setting), and
+   * the signals only move once the server has accepted it, so a refusal leaves the checkbox where it
+   * was and puts the reason in `wdError` — exactly like `toggleWatchdogEnabled`.
+   */
+  protected async saveWatchdogTriggers(nextBlocked: boolean, nextStaleReport: boolean): Promise<void> {
+    const sh = this.currentSession();
+    if (!sh) return;
+    this.wdSaving.set(true);
+    this.wdError.set(null);
+    try {
+      this.wdError.set(await runWatchdogAction(
+        () => firstValueFrom(
+          this.api.updateSessionWatchdogTriggers(sh.id, nextBlocked, nextStaleReport),
+        ),
+        'Could not save the nudge triggers — the server refused.',
+      ));
+      if (this.wdError()) return;
+      this.wdBlockedNudge.set(nextBlocked);
+      this.wdReportNudge.set(nextStaleReport);
+    } finally {
+      this.wdSaving.set(false);
+    }
+  }
+
+  /** Toggled "the pane is blocked on a question" — persists with its sibling still as it stands. */
+  protected toggleWdBlockedNudge(): void {
+    void this.saveWatchdogTriggers(!this.wdBlockedNudge(), this.wdReportNudge());
+  }
+
+  /** Toggled "nothing has been reported for twice the interval". */
+  protected toggleWdReportNudge(): void {
+    void this.saveWatchdogTriggers(this.wdBlockedNudge(), !this.wdReportNudge());
+  }
 
   /** Per-row copy feedback, keyed by the row's index in `shellRows()`. */
   private readonly copyRowStates = new Map<number, CopyOutcome>();
@@ -1732,6 +1778,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.wdEnabled.set(wd.enabled);
       this.wdIntervalSecs.set(wd.intervalSecs);
       this.wdPrompt.set(wd.prompt);
+      // The two trigger checkboxes were plain `signal(false)` that nothing ever wrote, so they read
+      // unchecked on every load no matter what the row said — defect 3 of the original bug.
+      this.wdBlockedNudge.set(wd.onBlocked);
+      this.wdReportNudge.set(wd.onStaleReport);
       // A complaint from the previous shell's failed save is not this shell's problem.
       this.wdError.set(null);
     });

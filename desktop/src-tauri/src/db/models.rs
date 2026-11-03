@@ -51,6 +51,13 @@ pub struct Session {
     /// never delivered, and without this the console cannot tell "held back" from "quiet".
     #[serde(default)]
     pub watchdog_held_count: i64,
+    /// The console's "Also nudge when: the pane is blocked on a question" checkbox (migration 029).
+    /// The sweep fires immediately on a pane sitting on a question, ignoring the interval.
+    #[serde(default)]
+    pub watchdog_on_blocked: bool,
+    /// ...and "...nothing has been reported to the chat for twice the interval" (migration 029).
+    #[serde(default)]
+    pub watchdog_on_stale_report: bool,
 }
 
 fn default_watchdog_interval() -> i64 {

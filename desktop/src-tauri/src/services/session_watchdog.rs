@@ -18,8 +18,72 @@ use std::time::Duration;
 /// skipped the row forever. `watchdog_nudge_count` was 0 on every live row while every unit test
 /// stayed green. Kept byte-identical to what `tick` used before the hoist; change no behaviour.
 pub(crate) const WATCHDOG_CANDIDATE_SQL: &str = "SELECT id, watchdog_interval_secs, \
-    watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count, title FROM sessions \
+    watchdog_prompt, watchdog_last_nudge_at, watchdog_nudge_count, title, watchdog_on_blocked, \
+    watchdog_on_stale_report FROM sessions \
     WHERE watchdog_enabled = 1 AND watchdog_prompt != '' AND status != 'archived'";
+
+/// Which trigger (if any) should fire a nudge for a session on this tick.
+///
+/// The three real reasons plus "nothing yet", as ONE decision so the precedence between the
+/// timer and the two "Also nudge when" checkboxes lives in exactly one place and is testable
+/// without an `AppState` harness or a tmux pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogTrigger {
+    /// The interval has elapsed since the last nudge / most recent report.
+    Timer,
+    /// The "blocked" checkbox is on and the pane is sitting on a question — fires at once.
+    Blocked,
+    /// The "stale report" checkbox is on and nothing has been reported for twice the interval.
+    StaleReport,
+    /// No trigger applies; skip this session this tick.
+    NotDue,
+}
+
+/// Decide whether a nudge is due for one session, and WHY.
+///
+/// Precedence, in order:
+/// 1. `on_blocked && pane_is_asking` → [`WatchdogTrigger::Blocked`], IGNORING the interval
+///    entirely. A pane waiting on an answer is stuck no matter how recently it last spoke, and
+///    waiting out the interval to notice is the whole complaint the checkbox answers.
+/// 2. `on_stale_report` and `latest_report_at` older than **2 × interval** →
+///    [`WatchdogTrigger::StaleReport`]. Twice, deliberately: at one interval the timer trigger
+///    usually fires anyway, so the checkbox only means something beyond that.
+/// 3. [`sessions::watchdog_is_due`] → [`WatchdogTrigger::Timer`].
+/// 4. otherwise → [`WatchdogTrigger::NotDue`].
+///
+/// `last` is the later of `watchdog_last_nudge_at` and `latest_report_at`, as the sweep computes
+/// it. A `None` means "never nudged and nothing reported", which `watchdog_is_due` reads as due.
+/// A missing `latest_report_at` is never "stale" — a session that has never reported is covered by
+/// rule 3, not by a stale-report rule that would fire on every tick.
+pub fn watchdog_trigger_decision(
+    now_utc: &chrono::DateTime<chrono::Utc>,
+    last: Option<&str>,
+    interval_secs: u64,
+    latest_report_at: Option<&str>,
+    pane_is_asking: bool,
+    on_blocked: bool,
+    on_stale_report: bool,
+) -> WatchdogTrigger {
+    if on_blocked && pane_is_asking {
+        return WatchdogTrigger::Blocked;
+    }
+
+    if on_stale_report {
+        if let Some(report_at) = latest_report_at {
+            if let Some(age_secs) = sessions::host_timestamp_age_secs(now_utc, report_at) {
+                if age_secs >= interval_secs.saturating_mul(2) {
+                    return WatchdogTrigger::StaleReport;
+                }
+            }
+        }
+    }
+
+    if sessions::watchdog_is_due(now_utc, last, interval_secs) {
+        return WatchdogTrigger::Timer;
+    }
+
+    WatchdogTrigger::NotDue
+}
 
 /// Must run on the Tauri async runtime (`tauri::async_runtime::spawn`) so its tokio
 /// timers share the executor the rest of the host uses.
@@ -120,6 +184,174 @@ pub async fn nudge_session_now(state: &Arc<AppState>, id: &str) -> Result<(), St
     Ok(())
 }
 
+#[cfg(test)]
+mod watchdog_trigger_tests {
+    use super::WatchdogTrigger::{Blocked, NotDue, StaleReport, Timer};
+    use super::*;
+
+    /// A fixed clock, so the assertions do not race two `Utc::now()` reads. Deriving the "past"
+    /// timestamps from a second `now` leaves the age a hair under the whole second intended, which
+    /// is precisely the boundary the 2× stale test is about.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2024-01-15T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// `now - secs`, as the SQLite `datetime('now')` string the host actually stores.
+    fn ago_secs(secs: i64) -> String {
+        (now() - chrono::Duration::seconds(secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    /// The checkbox that promises "fires at once, ignores the interval" must keep that promise: the
+    /// interval has NOT elapsed here (nudged 10s ago on a 300s timer), yet a pane sitting on a
+    /// question is exactly the case worth interrupting.
+    #[test]
+    fn watchdog_trigger_fires_at_once_when_blocked_on_a_question() {
+        let last = ago_secs(10);
+        let report = ago_secs(10);
+        assert_eq!(
+            watchdog_trigger_decision(
+                &now(),
+                Some(&last),
+                300,
+                Some(&report),
+                true, // the pane is asking
+                true, // on_blocked
+                false,
+            ),
+            Blocked,
+            "a blocked pane must fire immediately, not after the remaining 290s"
+        );
+
+        // And with the pane NOT asking, the same row is simply not due yet.
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&last), 300, Some(&report), false, true, false),
+            NotDue,
+            "the blocked trigger must not fire on a pane that is not asking"
+        );
+    }
+
+    /// The stale-report trigger means "twice the interval", so the boundary is 2× and not 1× — at
+    /// 1× the timer trigger would have fired anyway and the checkbox would mean nothing.
+    #[test]
+    fn watchdog_trigger_fires_when_reports_are_stale_for_twice_the_interval() {
+        // Interval 300 ⇒ the threshold is 600s of silence.
+        let last = ago_secs(60);
+        let just_under = ago_secs(599);
+        assert_eq!(
+            watchdog_trigger_decision(
+                &now(),
+                Some(&last),
+                300,
+                Some(&just_under),
+                false,
+                false,
+                true, // on_stale_report
+            ),
+            NotDue,
+            "599s of silence is not yet twice the 300s interval"
+        );
+
+        let just_over = ago_secs(601);
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&last), 300, Some(&just_over), false, false, true),
+            StaleReport,
+            "601s of silence is past twice the interval"
+        );
+
+        // Exactly on the boundary counts as stale (>=, matching `watchdog_is_due`).
+        let exactly = ago_secs(600);
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&last), 300, Some(&exactly), false, false, true),
+            StaleReport
+        );
+
+        // A session that has NEVER reported is not "stale" — the timer owns that case.
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&last), 300, None, false, false, true),
+            NotDue,
+            "no report at all must not read as a stale report"
+        );
+    }
+
+    /// Both checkboxes off ⇒ neither special trigger may fire, no matter how blocked the pane looks
+    /// or how stale the reports are. The timer is still free to fire — that is not a checkbox.
+    #[test]
+    fn watchdog_trigger_respects_the_checkboxes_being_off() {
+        // Blocked pane, ancient reports, both flags false, and the timer NOT elapsed.
+        let last = ago_secs(10);
+        let stale = ago_secs(3600);
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&last), 300, Some(&stale), true, false, false),
+            NotDue,
+            "a blocked pane must not fire with the checkbox off"
+        );
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&last), 300, Some(&stale), false, false, false),
+            NotDue,
+            "a stale report must not fire with the checkbox off"
+        );
+
+        // Same inputs, timer elapsed ⇒ Timer, and never Blocked/StaleReport.
+        let old = ago_secs(301);
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&old), 300, Some(&stale), true, false, false),
+            Timer,
+            "with both checkboxes off the only reason left is the timer"
+        );
+
+        // Precedence: blocked outranks a stale report, which outranks the timer.
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&old), 300, Some(&stale), true, true, true),
+            Blocked
+        );
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&old), 300, Some(&stale), false, false, true),
+            StaleReport
+        );
+        assert_eq!(
+            watchdog_trigger_decision(&now(), Some(&old), 300, Some(&old), false, false, false),
+            Timer
+        );
+    }
+
+    /// The sweep reads the two flags off `WATCHDOG_CANDIDATE_SQL`, so a candidate row must CARRY
+    /// them — a SELECT that drops a column makes both checkboxes decoration again, silently.
+    #[test]
+    fn watchdog_candidate_sql_selects_both_trigger_flags() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        for migration in [
+            include_str!("../../migrations/001_initial.sql"),
+            include_str!("../../migrations/027_add_session_watchdog.sql"),
+            include_str!("../../migrations/028_add_watchdog_held_count.sql"),
+            include_str!("../../migrations/029_add_watchdog_triggers.sql"),
+        ] {
+            conn.execute_batch(migration).expect("migration applies");
+        }
+        conn.execute(
+            "INSERT INTO sessions (id, title, provider, watchdog_enabled, watchdog_prompt, \
+             watchdog_on_blocked, watchdog_on_stale_report) \
+             VALUES ('s1', 'kord', 'claude_code', 1, 'Report.', 1, 0)",
+            [],
+        )
+        .expect("seed an armed row");
+
+        let (on_blocked, on_stale) = conn
+            .query_row(WATCHDOG_CANDIDATE_SQL, [], |row| {
+                Ok((row.get::<_, i64>(6)? != 0, row.get::<_, i64>(7)? != 0))
+            })
+            .expect("the candidate row must read without failing");
+        assert!(on_blocked, "WATCHDOG_CANDIDATE_SQL must select watchdog_on_blocked");
+        assert!(
+            !on_stale,
+            "WATCHDOG_CANDIDATE_SQL must select watchdog_on_stale_report at index 7"
+        );
+    }
+}
+
 async fn tick(state: &Arc<AppState>) -> Result<(), String> {
     let now = chrono::Utc::now();
 
@@ -137,6 +369,11 @@ async fn tick(state: &Arc<AppState>) -> Result<(), String> {
                     row.get::<_, Option<String>>(3)?, // last_nudge_at
                     row.get::<_, i64>(4)? as u64, // nudge_count
                     row.get::<_, String>(5)?,   // title
+                    // The two "Also nudge when" checkboxes. Selected here because the sweep is the
+                    // only reader, and a candidate row that never carries them means the checkboxes
+                    // are decoration — which is exactly what they were before migration 029.
+                    row.get::<_, i64>(6)? != 0, // on_blocked
+                    row.get::<_, i64>(7)? != 0, // on_stale_report
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -145,7 +382,9 @@ async fn tick(state: &Arc<AppState>) -> Result<(), String> {
         Ok(rows)
     })?;
 
-    for (id, interval_secs, prompt, last_nudge_at, nudge_count, title) in &candidates {
+    for (id, interval_secs, prompt, last_nudge_at, nudge_count, title, on_blocked, on_stale_report) in
+        &candidates
+    {
         // Eligibility: same rule as `session_wants_brief`.
         let wants_brief = state.db.with_conn(|conn| {
             conn.query_row(
@@ -179,8 +418,11 @@ async fn tick(state: &Arc<AppState>) -> Result<(), String> {
 
         let interval = *interval_secs;
 
-        // Skip if not yet due.
-        if !sessions::watchdog_is_due(&now, last_ts, interval) {
+        // Cheap pre-check on the timer alone, so a session that is simply not due yet does not pay
+        // for two pane captures every 20s. The AUTHORITATIVE decision — including the two checkbox
+        // triggers, which can fire when the timer has NOT elapsed — is made below, after the
+        // captures, because `pane_is_asking` needs the second one.
+        if !*on_blocked && !*on_stale_report && !sessions::watchdog_is_due(&now, last_ts, interval) {
             continue;
         }
 
@@ -196,7 +438,29 @@ async fn tick(state: &Arc<AppState>) -> Result<(), String> {
         };
         let a = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&first.content);
         let b = crate::services::agent_plans::normalize_terminal_snapshot_for_idle(&second.content);
-        if a != b {
+
+        // The ONE decision, made on the SECOND capture: the timer, the blocked checkbox (via the
+        // real `pane_question` detector — not a second, divergent guess at what "asking" means),
+        // and the stale-report checkbox, with their precedence resolved in `session_watchdog`.
+        let trigger = watchdog_trigger_decision(
+            &now,
+            last_ts,
+            interval,
+            latest_report.as_deref(),
+            crate::services::pane_question::pane_is_asking(&second.content).is_some(),
+            *on_blocked,
+            *on_stale_report,
+        );
+
+        if trigger == WatchdogTrigger::NotDue {
+            continue;
+        }
+
+        // `Timer` and `StaleReport` still respect the idle probe — a nudge typed into a pane that is
+        // mid-turn lands in the middle of the agent's own output. `Blocked` deliberately does NOT:
+        // a pane sitting on a question is not moving, so the probe would either be pointless or (for
+        // a spinner-ish redraw) suppress the one case worth interrupting.
+        if trigger != WatchdogTrigger::Blocked && a != b {
             // Pane is still changing — the nudge WAS due and is being withheld. Record it: without
             // this, "held back" is indistinguishable from "quiet, nothing to say", which is exactly
             // the silence that hid the original watchdog bug. NOT bumped when `watchdog_is_due`
