@@ -226,6 +226,9 @@ export async function runWatchdogAction(
     // handler is not the server's verdict, and quoting it would put words in the host's mouth, so
     // the ":" form is reserved for a real GraphQL error and anything else reads as plain `failure`.
     if (!isServerRefusal(err)) return failure;
+    // Drop the trailing "." off the canned failure and lead in with ":" so the two read as one
+    // sentence: "…the server refused: Watchdog prompt contains control characters". A non-Error
+    // throw (a string, a rejection payload) has no usable message and falls through above.
     return `${failure.replace(/\.\s*$/, '')}: ${reason}`;
   }
 }
@@ -238,9 +241,7 @@ export async function runWatchdogAction(
 function isServerRefusal(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   const name = (err as { name?: unknown }).name;
-  if (typeof name === 'string' && name.includes('GraphQL')) return true;
-  const errors = (err as { errors?: unknown }).errors;
-  return Array.isArray(errors) && errors.length > 0;
+  return typeof name === 'string' && name.includes('GraphQL');
 }
 
 /**

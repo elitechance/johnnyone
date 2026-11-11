@@ -13,6 +13,7 @@
 // `@analogjs/vitest-angular`, so a `templateUrl` component cannot be instantiated), so these
 // drive the pure seam directly — the same idiom as `watchdog-nudge-now.spec.ts`.
 import { describe, it, expect } from 'vitest';
+import { GraphQLRequestError } from '../../../../../ui/src/services/graphql-client';
 import {
   normalizeWatchdogPrompt,
   runWatchdogAction,
@@ -23,8 +24,13 @@ describe('runWatchdogAction error surface', () => {
   const FAILURE = 'Could not save the watchdog settings — the server refused.';
 
   it('appends the server message when the action throws an Error', async () => {
+    // What the save path actually throws: `GraphQLRequestError`, whose `.message` IS the
+    // server's text. A bare `new Error(...)` is deliberately NOT quoted back (see
+    // `isServerRefusal`) — only a verdict the server issued may be shown as the server's.
     const msg = await runWatchdogAction(async () => {
-      throw new Error('Watchdog prompt contains control characters');
+      throw new GraphQLRequestError([
+        { message: 'Watchdog prompt contains control characters' },
+      ]);
     }, FAILURE);
     expect(msg).toContain('Could not save the watchdog settings');
     expect(msg).toContain('Watchdog prompt contains control characters');
