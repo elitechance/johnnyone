@@ -115,8 +115,12 @@ describe('Watchdog mutations return Boolean! (not the host {ok:true} payload)', 
       '../../resolvers/ai/update-session-watchdog-prompt'
     );
     await resolver(null, { sessionId: 's9', prompt: 'Check in.' }, mockCtx as any);
+    // The host handler `rpc_update_session_watchdog_prompt` reads `id` (unlike its three watchdog
+    // siblings, which read `sessionId`), so the Worker maps `sessionId -> id` here. This expectation
+    // used to assert `sessionId: 's9'` — that encoded the bug and made the console's prompt save
+    // always fail with `Missing 'id' parameter`.
     expect(rpcSpy).toHaveBeenCalledWith(mockCtx, 'update_session_watchdog_prompt', {
-      sessionId: 's9',
+      id: 's9',
       prompt: 'Check in.',
     });
   });
