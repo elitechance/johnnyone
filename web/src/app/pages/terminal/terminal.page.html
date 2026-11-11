@@ -418,10 +418,12 @@
             <div class="wd-field">
               <div class="wd-label">Watchdog<span class="wd-h">Nudges this shell when it goes quiet.</span></div>
               <div>
-                <label class="wd-toggle-ctrl">
+                <button type="button" class="wd-toggle-ctrl" role="switch"
+                        [attr.aria-checked]="wdEnabled()" [disabled]="wdSaving()"
+                        (click)="toggleWatchdogEnabled()">
                   <span class="wd-toggle-track" [class.on]="wdEnabled()"></span>
                   <span class="wd-toggle-label">{{ wdEnabled() ? 'On' : 'Off' }}</span>
-                </label>
+                </button>
                 <div class="wd-hint">The nudge is typed into the pane as real input and appears in the Transcript as a Watchdog message.</div>
               </div>
             </div>
@@ -485,8 +487,10 @@
               @if (wd.watchdogLastNudgeAt) {
                 <span class="wd-saved-ts">saved 2 min ago</span>
               }
-              <button type="button" class="wd-disarm wd-btn" [disabled]="wdSaving()"
-                      (click)="toggleWatchdogEnabled()">Disarm</button>
+              @if (wdEnabled()) {
+                <button type="button" class="wd-disarm wd-btn" [disabled]="wdSaving()"
+                        (click)="toggleWatchdogEnabled()">Disarm</button>
+              }
             </div>
 
             <!-- Footer: sent · held · armed. `held` = due but withheld by the idle probe; shown
