@@ -219,6 +219,33 @@ export async function runWatchdogAction(
   }
 }
 
+/**
+ * The session as it is AFTER a watchdog enable/disable succeeded.
+ *
+ * `toggleWatchdogEnabled` set the `wdEnabled`/`wdPrompt` signals but left `currentSession()`
+ * holding the session as loaded, and the status banner (`watchdogChipData()`) plus the footnote
+ * (`wdArmedAgo`) read THAT — so the strip kept saying "Watchdog off. This shell is not being
+ * watched." under a switch that had just flipped to On, until a page reload.
+ *
+ * Returns a NEW object (never mutates the caller's session — the same shape also sits in the
+ * `sessions()` list, and mutating an object a signal holds would not notify): `watchdogEnabled`
+ * is the value that was just saved, and arming also records the prompt that was just seeded
+ * (`watchdogPromptAfterEnable`) so the banner and the textarea agree. Disarming keeps the
+ * session's existing `watchdogPrompt` — the host leaves it stored, and the next arm offers the
+ * user's own words back. Every other field is copied unchanged.
+ */
+export function sessionAfterWatchdogToggle<T extends { watchdogEnabled?: boolean | null; watchdogPrompt?: string | null }>(
+  session: T,
+  enabled: boolean,
+  prompt: string,
+): T {
+  return {
+    ...session,
+    watchdogEnabled: enabled,
+    ...(enabled ? { watchdogPrompt: prompt } : {}),
+  };
+}
+
 export function transcriptRowType(ev: TranscriptRowEvent): 'you' | 'agent' | 'error' | 'markdown' | 'watchdog' {
   if (ev.role === 'watchdog') return 'watchdog';
   if (ev.kind === 'code' && ev.language === 'markdown') return 'markdown';
