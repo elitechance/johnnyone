@@ -81,6 +81,8 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/ai/update-agent-plan-amend.ts',
   'resolvers/ai/update-agent-plan-app-scope.ts',
   'resolvers/ai/update-agent-plan-blocked.ts',
+  'resolvers/ai/unblock-agent-plan.ts',
+  'resolvers/ai/update-agent-plan-dev-providers.ts',
   'resolvers/ai/update-agent-plan-phases-refresh.ts',
   'resolvers/ai/update-agent-plan-stopped.ts',
   'resolvers/ai/update-agent-plan-test-commands.ts',
@@ -95,6 +97,11 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/ai/update-setting.ts',
   'resolvers/ai/upsert-provider-config.ts',
   'resolvers/ai/validate-workspace-plan.ts',
+  // --- session watchdog (desktop migrations 027-029) ---
+  'resolvers/ai/send-session-watchdog-nudge.ts',
+  'resolvers/ai/update-session-watchdog.ts',
+  'resolvers/ai/update-session-watchdog-prompt.ts',
+  'resolvers/ai/update-session-watchdog-triggers.ts',
   // --- the workflow arena (desktop migration 026) ---
   'resolvers/ai/run-workflow-run-phase.ts',
   'resolvers/ai/create-workflow-version.ts',
