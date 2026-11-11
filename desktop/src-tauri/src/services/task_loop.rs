@@ -661,10 +661,20 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
 
             let attempt_n = row_ref(&file, &task_id)?.attempts.len() as u32 + 1;
             let started = Utc::now().to_rfc3339();
-            let wrapped = crate::services::planner_prompts::wrap_leaf_prompt(
+            let mut wrapped = crate::services::planner_prompts::wrap_leaf_prompt(
                 &ctx.leaf_wrapper,
                 &prompt,
             );
+            // O1: a retry after a Model-class failure carries what the last
+            // attempts saw. Built from the persisted row (survives resume);
+            // attempt 1 / infra-only history ⇒ None ⇒ prompt unchanged.
+            if let Some(fb) = crate::services::task_check::retry_feedback(
+                &spec,
+                &row_ref(&file, &task_id)?.attempts,
+            ) {
+                wrapped.push_str("\n\n");
+                wrapped.push_str(&fb);
+            }
             let req = KlooRunRequest {
                 workspace: ctx.workspace.to_string_lossy().into_owned(),
                 prompt: wrapped,
@@ -724,6 +734,12 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
 
             let post_hashes = hash_files(host, &ctx.workspace, &spec.files);
             let post_contents = read_files(host, &ctx.workspace, &spec.files);
+            // Spawn failures changed nothing we can attribute (infra).
+            let changed = if spawn_fail.is_some() {
+                Vec::new()
+            } else {
+                crate::services::task_check::delta_paths(&result, &pre_spawn_dirty)
+            };
             let inputs = CheckInputs {
                 pre_spawn_dirty,
                 pre_hashes,
@@ -759,7 +775,12 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                     failure_code: result.failure_code.clone(),
                     exit_code: Some(exit_code),
                     class: class.map(class_str).map(str::to_string),
-                    checks: Some(checks_json(&report)),
+                    checks: Some(attempt_checks_json(
+                        &report,
+                        &result,
+                        spawn_fail.is_some(),
+                        changed,
+                    )),
                 });
             }
             save_and_project(ctx, &mut file)?;
@@ -915,6 +936,28 @@ fn checks_json(report: &CheckReport) -> serde_json::Value {
             serde_json::json!({ "check": f.check, "reason": f.reason })
         }).collect::<Vec<_>>(),
     })
+}
+
+/// Per-attempt `checks` record: [`checks_json`] (`passed`/`failed`, unchanged)
+/// plus the additive keys of master plan §4 — `saw`/`sawSpecific` (omitted
+/// when there is no SAW or the spawn itself failed) and `changed`.
+fn attempt_checks_json(
+    report: &CheckReport,
+    result: &KlooResult,
+    spawn_failed: bool,
+    changed: Vec<String>,
+) -> serde_json::Value {
+    let mut v = checks_json(report);
+    if let Some(obj) = v.as_object_mut() {
+        if !spawn_failed {
+            if let Some(saw) = crate::services::task_check::attempt_saw(report, result) {
+                obj.insert("saw".into(), serde_json::Value::String(saw.text));
+                obj.insert("sawSpecific".into(), serde_json::Value::Bool(saw.specific));
+            }
+        }
+        obj.insert("changed".into(), serde_json::json!(changed));
+    }
+    v
 }
 
 fn load_prompt(phase_dir: &Path, task_id: &str) -> Result<String, String> {
@@ -1521,6 +1564,14 @@ mod tests {
         )
     }
 
+    /// Like [`fail_json`] but with kloo's `failure_detail` (the failing verify
+    /// line). `message` must not contain `"` or `\\` (embedded verbatim).
+    fn fail_json_detail(path: &str, code: &str, message: &str) -> String {
+        format!(
+            "KLOO_RESULT_JSON {{\"success\":false,\"failure_code\":\"{code}\",\"files_changed\":{{\"count\":1,\"paths\":[\"{path}\"]}},\"off_scope_edits\":0,\"verify\":{{\"command\":\"true\",\"passed\":false,\"exit_code\":1}},\"failure_detail\":{{\"source\":\"verify\",\"class\":\"verify_failed\",\"message\":\"{message}\"}}}}"
+        )
+    }
+
     struct ScriptedHost {
         workspace: PathBuf,
         status: Arc<Mutex<String>>,
@@ -1594,6 +1645,24 @@ mod tests {
                 std::fs::write(ws.join(&rel), &body).unwrap();
                 Ok(SpawnOutcome {
                     stdout: fail_json(&rel, &code),
+                    exit_code: 10,
+                })
+            }));
+        }
+
+        fn push_fail_detail(&mut self, rel: &str, body: &str, code: &str, message: &str) {
+            let ws = self.workspace.clone();
+            let rel = rel.to_string();
+            let body = body.to_string();
+            let code = code.to_string();
+            let message = message.to_string();
+            self.spawn_scripts.push_back(Box::new(move |_req| {
+                if let Some(parent) = Path::new(&rel).parent() {
+                    let _ = std::fs::create_dir_all(ws.join(parent));
+                }
+                std::fs::write(ws.join(&rel), &body).unwrap();
+                Ok(SpawnOutcome {
+                    stdout: fail_json_detail(&rel, &code, &message),
                     exit_code: 10,
                 })
             }));
@@ -2054,6 +2123,91 @@ mod tests {
         host.push_pass("a.rs", "fn a() {}\n");
         let _ = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
         assert_eq!(host.spawned_prompts, vec!["BODY".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retry_prompt_carries_previous_saw_and_dead_ends() {
+        // Required test 1 (O1): attempt 2 of a task that failed on a Model-class
+        // verify carries attempt 1's SAW; attempt 1's prompt is untouched.
+        let root = tmp("retry-fb");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "pub fn add")),
+            "BODY",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_fail_detail(
+            "a.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
+            "verify_failed",
+            "assertion failed: add(2, 2) == 4",
+        );
+        host.push_pass("a.rs", "pub fn add(a: i32, b: i32) -> i32 { a + b }\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+
+        assert_eq!(host.spawned_prompts.len(), 2, "{:?}", host.spawned_prompts);
+        let (first, second) = (&host.spawned_prompts[0], &host.spawned_prompts[1]);
+        assert!(!first.contains("RETRY FEEDBACK"), "{first}");
+        assert!(!first.contains("SAW"), "{first}");
+        assert!(!first.contains("DEAD ENDS"), "{first}");
+        assert!(
+            second.contains("assertion failed: add(2, 2) == 4"),
+            "retry prompt must carry attempt 1's SAW: {second}"
+        );
+        assert!(second.contains("DEAD ENDS  attempt 1"), "{second}");
+        assert!(
+            second.contains("EXPECTED   `cargo test spec -- --exact` exits 0"),
+            "{second}"
+        );
+        assert!(second.contains("FENCE      a.rs"), "{second}");
+        assert!(second.starts_with(first.as_str()), "block must be appended: {second}");
+        assert!(second.contains("\n\n--- RETRY FEEDBACK (attempt 2) ---\n"), "{second}");
+
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        let a1 = file.tasks[0].attempts[0].checks.as_ref().expect("checks");
+        assert_eq!(a1["saw"], "assertion failed: add(2, 2) == 4");
+        assert_eq!(a1["sawSpecific"], true);
+        assert_eq!(a1["changed"], serde_json::json!(["a.rs"]));
+        assert_eq!(a1["passed"], false);
+        assert!(a1["failed"].is_array());
+        // a passing attempt records its delta and no SAW
+        let a2 = file.tasks[0].attempts[1].checks.as_ref().expect("checks");
+        assert!(a2.get("saw").is_none(), "{a2}");
+        assert_eq!(a2["changed"], serde_json::json!(["a.rs"]));
+        // the loop never rewrites prompt.md
+        let on_disk = std::fs::read_to_string(ctx.phase_dir.join("tasks/01-a/prompt.md")).unwrap();
+        assert_eq!(on_disk, "BODY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn infra_retry_without_model_failure_has_no_block() {
+        let root = tmp("retry-infra");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "BODY",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_stdout("lots of logs\nno result line\n", 0);
+        host.push_pass("a.rs", "fn a() {}\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+        assert_eq!(host.spawned_prompts.len(), 2);
+        assert!(!host.spawned_prompts[1].contains("RETRY FEEDBACK"), "{}", host.spawned_prompts[1]);
+        assert_eq!(host.spawned_prompts[0], host.spawned_prompts[1]);
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        let a1 = &file.tasks[0].attempts[0];
+        assert_eq!(a1.class.as_deref(), Some("infra"));
+        let c = a1.checks.as_ref().unwrap();
+        assert!(c.get("saw").is_none(), "spawn failure records no SAW: {c}");
+        assert_eq!(c["changed"], serde_json::json!([]));
         let _ = std::fs::remove_dir_all(&root);
     }
 
