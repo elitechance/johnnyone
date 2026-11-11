@@ -214,9 +214,70 @@ export async function runWatchdogAction(
   try {
     await action();
     return null;
-  } catch {
-    return failure;
+  } catch (err) {
+    // The API client throws `GraphQLRequestError`, an `Error` whose `.message` IS the server's
+    // text ("Watchdog prompt contains control characters"). Without it the strip could only say
+    // "the server refused" and the user had to guess which of a dozen refusals it was.
+    const reason = err instanceof Error && err.message.trim() ? err.message.trim() : '';
+    if (!reason) return failure;
+    // Only a verdict the SERVER actually issued may be quoted back. `GraphQLRequestError` is the
+    // one type whose `.message` is the engine/worker's own text — its constructor sets `name` and
+    // it carries `errors[]`. A bare `new Error('boom')` from a transport failure or a bug in the
+    // handler is not the server's verdict, and quoting it would put words in the host's mouth, so
+    // the ":" form is reserved for a real GraphQL error and anything else reads as plain `failure`.
+    if (!isServerRefusal(err)) return failure;
+    return `${failure.replace(/\.\s*$/, '')}: ${reason}`;
   }
+}
+
+/**
+ * True when the thrown value carries the engine/worker's own verdict — the `GraphQLRequestError`
+ * the API client raises when the response comes back with `errors[]` (its `.message` is exactly the
+ * server's text, joined with "; "). Anything else is a local failure and reads as plain `failure`.
+ */
+function isServerRefusal(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = (err as { name?: unknown }).name;
+  if (typeof name === 'string' && name.includes('GraphQL')) return true;
+  const errors = (err as { errors?: unknown }).errors;
+  return Array.isArray(errors) && errors.length > 0;
+}
+
+/**
+ * Normalise a watchdog prompt for the wire.
+ *
+ * The host rejects ANY control character except tab, but the prompt is a textarea — so pressing
+ * Enter, or pasting a multi-line block, made every subsequent Save fail with a refusal the user
+ * could not edit their way out of. Newlines carry no meaning in a nudge that gets typed into a
+ * pane, so a run of control characters (other than `\t`) collapses to a single space, runs of
+ * spaces collapse to one, and the ends are trimmed. A single-line prompt is untouched.
+ */
+export function normalizeWatchdogPrompt(s: string): string {
+  return s
+    .replace(/[\u0000-\u0008\u000A-\u001F\u007F]+/g, ' ')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * The footnote text for the watchdog's last-nudge line.
+ *
+ * It used to read "armed {{ wdArmedAgo() }} ago" off a fallback to the session's `created_at`, so
+ * a shell created 33 days ago claimed the watchdog had been armed for 792h. No armed-at timestamp
+ * is stored anywhere, so the only honest clock is the last nudge — and when there hasn't been one,
+ * say so instead of inventing a duration.
+ */
+export function watchdogLastNudgeText(
+  enabled: boolean,
+  lastNudgeAt: number | null,
+  now: number,
+): string {
+  if (!enabled) return 'off';
+  if (lastNudgeAt === null) return 'no nudge yet';
+  const secs = Math.round((now - lastNudgeAt) / 1000);
+  if (secs < 60) return `last nudge ${secs}s ago`;
+  if (secs < 3600) return `last nudge ${Math.floor(secs / 60)}m ago`;
+  return `last nudge ${Math.floor(secs / 3600)}h ago`;
 }
 
 /**
