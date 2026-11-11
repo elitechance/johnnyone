@@ -27,8 +27,11 @@ export default async function updateSessionWatchdogPrompt(
   // Returning the object verbatim makes graphql-js reject it AFTER the write has landed, so the
   // client reports failure for a successful write. Keep the `await` — dropping it would swallow a
   // host-side rejection and report success for a failed write, which is this bug mirrored.
+  // NOTE: the host handler `rpc_update_session_watchdog_prompt` reads `id`, NOT `sessionId` like
+  // the other watchdog RPCs — the host is the odd one out, so the Worker maps it here until the
+  // engine is rebuilt to standardise on `sessionId`.
   await desktopRpc<{ ok: boolean }>(ctx, 'update_session_watchdog_prompt', {
-    sessionId: args.sessionId,
+    id: args.sessionId,
     prompt: args.prompt,
   });
   return true;
