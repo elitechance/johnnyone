@@ -280,6 +280,44 @@ pub fn one_line(s: &str, max: usize) -> String {
     }
 }
 
+/// Normalize a SAW so "the same failure" compares equal across runs:
+/// lowercase; every whitespace token containing `/` or `\\` → `<path>`; every
+/// run of ASCII digits → `#`; whitespace collapsed; trimmed.
+pub fn normalize_saw(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for tok in lower.split_whitespace() {
+        if tok.contains('/') || tok.contains('\\') {
+            out.push("<path>".into());
+            continue;
+        }
+        let mut t = String::with_capacity(tok.len());
+        let mut in_digits = false;
+        for c in tok.chars() {
+            if c.is_ascii_digit() {
+                if !in_digits {
+                    t.push('#');
+                }
+                in_digits = true;
+            } else {
+                t.push(c);
+                in_digits = false;
+            }
+        }
+        out.push(t);
+    }
+    out.join(" ")
+}
+
+/// Fingerprint of a failure: normalized SAW + sorted, de-duplicated changed
+/// set, hashed with [`digest_bytes`]. Equal ⇔ "failed the same way" (O2).
+pub fn failure_fingerprint(saw: &str, changed: &[String]) -> String {
+    let mut files: Vec<&str> = changed.iter().map(String::as_str).collect();
+    files.sort_unstable();
+    files.dedup();
+    digest_bytes(format!("{}\n{}", normalize_saw(saw), files.join("\n")).as_bytes())
+}
+
 /// Per-field cap for the retry-feedback block (master plan §4).
 pub const FEEDBACK_FIELD_MAX: usize = 300;
 
@@ -487,6 +525,9 @@ pub enum Step {
         attempt_index: usize,
     },
     Exhausted,
+    /// The last two Model-class attempts failed the same way (equal
+    /// fingerprints): stop now, route like [`Step::Exhausted`] (O2).
+    StuckSameFailure,
     StopShape,
     RetryInfra {
         model: String,
@@ -602,6 +643,43 @@ impl Ladder {
             }
         }
         Step::Exhausted
+    }
+}
+
+/// Stuck ⇔ among Model-class attempts (others skipped) there are ≥ 2 and the
+/// last two both carry a fingerprint and they are equal. `fingerprints[i]`
+/// belongs to `history[i]`; a length mismatch is never stuck (fail safe).
+pub fn is_stuck_same_failure(history: &[Attempt], fingerprints: &[Option<String>]) -> bool {
+    if history.len() != fingerprints.len() {
+        return false;
+    }
+    let model_fps: Vec<&Option<String>> = history
+        .iter()
+        .zip(fingerprints)
+        .filter(|(a, _)| a.class == Some(FailureClass::Model))
+        .map(|(_, fp)| fp)
+        .collect();
+    match model_fps.as_slice() {
+        [.., Some(a), Some(b)] => a == b,
+        _ => false,
+    }
+}
+
+impl Ladder {
+    /// [`Ladder::next_attempt`] plus the O2 guard: after a Model failure whose
+    /// fingerprint repeats the previous Model failure, return
+    /// [`Step::StuckSameFailure`] even while slots remain. Every other case
+    /// delegates unchanged.
+    pub fn next_attempt_guarded(
+        &self,
+        history: &[Attempt],
+        fingerprints: &[Option<String>],
+        class: Option<FailureClass>,
+    ) -> Step {
+        if class == Some(FailureClass::Model) && is_stuck_same_failure(history, fingerprints) {
+            return Step::StuckSameFailure;
+        }
+        self.next_attempt(history, class)
     }
 }
 
@@ -1572,6 +1650,189 @@ mod tests {
         assert!(out.contains(
             "; files contain \"pub fn add\", \"pub fn sub\"; files do not contain \"todo!()\""
         ), "{out}");
+    }
+
+    // ---- 01/01 failure fingerprint ----------------------------------------
+
+    #[test]
+    fn normalize_saw_strips_digits_paths_whitespace() {
+        assert_eq!(
+            normalize_saw("error at src/a.rs:12:5\n  expected 4,  got 5"),
+            "error at <path> expected #, got #"
+        );
+        assert_eq!(normalize_saw("  Panicked AT C:\\x\\y.rs  line 1234 "), "panicked at <path> line #");
+    }
+
+    #[test]
+    fn fingerprint_equal_when_only_line_numbers_differ() {
+        let changed = vec!["src/add.rs".to_string()];
+        assert_eq!(
+            failure_fingerprint("assertion failed: add(2, 2) == 4 at line 12:5", &changed),
+            failure_fingerprint("assertion failed: add(2, 2) == 4 at line 40:9", &changed)
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_on_different_message() {
+        let changed = vec!["src/add.rs".to_string()];
+        assert_ne!(
+            failure_fingerprint("error[E0425]: cannot find value `b` in this scope", &changed),
+            failure_fingerprint("error[E0308]: mismatched types", &changed)
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_on_different_changed_set() {
+        let saw = "assertion failed: add(2, 2) == 4";
+        assert_ne!(
+            failure_fingerprint(saw, &["a.rs".to_string()]),
+            failure_fingerprint(saw, &["a.rs".to_string(), "b.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_changed_order_and_dups() {
+        let saw = "boom";
+        assert_eq!(
+            failure_fingerprint(saw, &["b".to_string(), "a".to_string(), "a".to_string()]),
+            failure_fingerprint(saw, &["a".to_string(), "b".to_string()])
+        );
+    }
+
+    // ---- 01/02 stuck step ---------------------------------------------------
+
+    fn att(label: &str, class: FailureClass) -> Attempt {
+        Attempt {
+            label: label.into(),
+            model: format!("m/{label}"),
+            class: Some(class),
+            infra_retry: false,
+        }
+    }
+
+    fn fp(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn stuck_when_last_two_model_fingerprints_equal() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        let fps = vec![fp("X"), fp("X")];
+        assert!(is_stuck_same_failure(&hist, &fps));
+        // default ladder still has claude + opus slots, yet the guard stops
+        assert!(matches!(
+            Ladder::default().next_attempt(&hist, Some(FailureClass::Model)),
+            Step::Run { .. }
+        ));
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
+
+    #[test]
+    fn not_stuck_when_fingerprints_differ() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model)];
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &[fp("X")], Some(FailureClass::Model)),
+            Ladder::default().next_attempt(&hist, Some(FailureClass::Model))
+        );
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        match Ladder::default().next_attempt_guarded(&hist, &[fp("X"), fp("Y")], Some(FailureClass::Model)) {
+            Step::Run { label, .. } => assert_eq!(label, "claude"),
+            s => panic!("{s:?}"),
+        }
+        // after a single model failure the next step is qwen attempt 2
+        let one = vec![att("qwen3-coder", FailureClass::Model)];
+        match Ladder::default().next_attempt_guarded(&one, &[fp("X")], Some(FailureClass::Model)) {
+            Step::Run { label, attempt_index, .. } => {
+                assert_eq!(label, "qwen3-coder");
+                assert_eq!(attempt_index, 2);
+            }
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
+    fn not_stuck_when_a_fingerprint_is_none() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        for fps in [vec![fp("X"), None], vec![None, fp("X")], vec![None, None]] {
+            assert!(!is_stuck_same_failure(&hist, &fps), "{fps:?}");
+            assert!(matches!(
+                Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+                Step::Run { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn infra_between_same_failures_still_stuck() {
+        let hist = vec![
+            att("qwen3-coder", FailureClass::Model),
+            att("qwen3-coder", FailureClass::Infra),
+            att("qwen3-coder", FailureClass::Model),
+        ];
+        let fps = vec![fp("X"), None, fp("X")];
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
+
+    #[test]
+    fn stuck_across_tiers() {
+        let hist = vec![
+            att("qwen3-coder", FailureClass::Model),
+            att("qwen3-coder", FailureClass::Model),
+            att("claude", FailureClass::Model),
+        ];
+        let fps = vec![fp("X"), fp("Y"), fp("Y")];
+        // without the guard opus would run next
+        match Ladder::default().next_attempt(&hist, Some(FailureClass::Model)) {
+            Step::Run { label, .. } => assert_eq!(label, "opus"),
+            s => panic!("{s:?}"),
+        }
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
+
+    #[test]
+    fn guard_ignores_non_model_class() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        let fps = vec![fp("X"), fp("X")];
+        let l = Ladder::default();
+        assert_eq!(
+            l.next_attempt_guarded(&hist, &fps, Some(FailureClass::Infra)),
+            l.next_attempt(&hist, Some(FailureClass::Infra))
+        );
+        assert_eq!(l.next_attempt_guarded(&hist, &fps, Some(FailureClass::Shape)), Step::StopShape);
+        assert_eq!(l.next_attempt_guarded(&hist, &fps, None), l.next_attempt(&hist, None));
+    }
+
+    #[test]
+    fn length_mismatch_is_not_stuck() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        assert!(!is_stuck_same_failure(&hist, &[fp("X")]));
+        assert!(!is_stuck_same_failure(&hist, &[fp("X"), fp("X"), fp("X")]));
+        assert!(!is_stuck_same_failure(&[], &[]));
+        assert!(matches!(
+            Ladder::default().next_attempt_guarded(&hist, &[fp("X")], Some(FailureClass::Model)),
+            Step::Run { .. }
+        ));
+    }
+
+    #[test]
+    fn executor_ladder_stuck_before_third_attempt() {
+        let l = Ladder::for_executor(Some("m"));
+        let hist = vec![att("m", FailureClass::Model), att("m", FailureClass::Model)];
+        // slot 3 of 3 is still unused
+        assert!(matches!(l.next_attempt(&hist, Some(FailureClass::Model)), Step::Run { .. }));
+        assert_eq!(
+            l.next_attempt_guarded(&hist, &[fp("X"), fp("X")], Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
     }
 }
 
