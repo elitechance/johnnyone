@@ -236,6 +236,7 @@ import {
   watchdogPromptAfterEnable,
   watchdogSettingsFromSession,
   parseHostTimestamp,
+  sessionAfterWatchdogToggle,
 } from './watchdog-logic';
 import { sessionStateFromApi, type Session } from './session-map';
 
@@ -854,6 +855,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       // typed instead of an empty box that reads armed-but-does-nothing. Chosen over re-reading
       // the session: one fewer relay round-trip, and no window where the box is blank.
       if (enabled) this.wdPrompt.set(watchdogPromptAfterEnable(sh.watchdogPrompt));
+      // The signals above are not what the banner reads: `watchdogChipData()` and the `wdArmedAgo`
+      // footnote go through `currentSession().watchdogEnabled`, i.e. the session AS LOADED, so the
+      // strip kept saying "Watchdog off. This shell is not being watched." under a switch that had
+      // just flipped to On — until a reload. Write the saved values back onto the session (a NEW
+      // object; the same one is in `sessions()`, and mutating it in place would skip notification).
+      const next = sessionAfterWatchdogToggle(sh, enabled, this.wdPrompt());
+      this.currentSession.set(next);
+      this.upsertSession(next);
     } finally {
       this.wdSaving.set(false);
     }
