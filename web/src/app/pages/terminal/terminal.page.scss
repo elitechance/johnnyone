@@ -2324,6 +2324,9 @@ ion-modal.workspace-picker .picker-empty {
 .wd-error {
   display: block;
   flex: 1 0 100%;
+  // Last on the wrapped line, so the refusal lands below the icon/body/eta row instead of
+  // stealing their width.
+  order: 10;
   font-size: 12px;
   font-weight: 600;
   color: var(--jo-bad, #ff6868);
@@ -2455,6 +2458,9 @@ ion-modal.workspace-picker .picker-empty {
 /* ── Status strip ── */
 .wd-strip {
   display: flex;
+  // The error line is `flex: 1 0 100%`, so without wrapping it claims the whole row and squeezes
+  // the strip body into a narrow column. Wrapping lets the error drop onto its own line instead.
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
@@ -2481,7 +2487,9 @@ ion-modal.workspace-picker .picker-empty {
 }
 .wd-strip.wd-strip-warn .wd-strip-ic { background: color-mix(in srgb, var(--jo-warn) 20%, transparent); color: var(--jo-warn); }
 .wd-strip.wd-strip-off .wd-strip-ic { background: #18212e; color: var(--jo-fg-faint); }
-.wd-strip-body { flex: 1; }
+// `flex: 1 1 0` + `min-width: 0` so a long "why" sentence wraps inside the body instead of pushing
+// the eta column out — a flex item's default `min-width: auto` refuses to shrink below its text.
+.wd-strip-body { flex: 1 1 0; min-width: 0; }
 .wd-strip-lead { font-weight: 600; }
 .wd-strip-why { color: var(--jo-fg-muted); font-size: 12px; }
 .wd-strip-eta { font-family: var(--jo-font-mono, ui-monospace, monospace); font-size: 12px; color: var(--jo-fg-muted); text-align: right; white-space: nowrap; }

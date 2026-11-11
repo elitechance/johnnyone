@@ -233,7 +233,9 @@ import {
   formatCountdown as formatCountdownFn,
   runWatchdogAction,
   watchdogEtaSeconds as watchdogEtaSecondsFn,
+  watchdogLastNudgeText,
   watchdogPromptAfterEnable,
+  normalizeWatchdogPrompt,
   watchdogSettingsFromSession,
   parseHostTimestamp,
   sessionAfterWatchdogToggle,
@@ -874,6 +876,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     if (!sh) return;
     this.wdSaving.set(true);
     this.wdError.set(null);
+    // The host refuses any control character except tab, but this is a textarea — so pressing
+    // Enter, or pasting a multi-line block, made every save fail with a refusal the user could
+    // not edit their way out of. Normalise before sending, and write the normalised text back so
+    // the textarea shows exactly what the host received.
+    const prompt = normalizeWatchdogPrompt(this.wdPrompt());
+    this.wdPrompt.set(prompt);
     try {
       // One action, one error: the pair runs as a single unit so a refused interval or
       // prompt lands in `wdError` (rendered by the strip) instead of a swallowed catch.
@@ -882,7 +890,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
           this.api.updateSessionWatchdog(sh.id, this.wdEnabled(), this.wdIntervalSecs()),
         );
         await firstValueFrom(
-          this.api.updateSessionWatchdogPrompt(sh.id, this.wdPrompt()),
+          this.api.updateSessionWatchdogPrompt(sh.id, prompt),
         );
       }, 'Could not save the watchdog settings — the server refused.'));
     } finally {
@@ -948,17 +956,21 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     return sh?.watchdogHeldCount ?? 0;
   });
 
-  /** How long ago the watchdog was armed (from last nudge or session creation). */
+  /**
+   * The footnote's watchdog clock.
+   *
+   * It used to fall back to the session's `created_at`, so a shell created 33 days ago claimed the
+   * watchdog had been "armed 792h ago" — no armed-at timestamp is stored anywhere, so that number
+   * was invented. The only honest clock is the last nudge, and when there hasn't been one the
+   * helper says so rather than guessing.
+   */
   protected wdArmedAgo = computed<string>(() => {
     const sh = this.currentSession();
-    if (!sh?.watchdogEnabled) return '—';
-    const nudgeAt = parseHostTimestamp(sh.watchdogLastNudgeAt)
-      ?? parseHostTimestamp(sh.created_at ?? sh.updated_at)
-      ?? Date.now();
-    const secs = Math.round((Date.now() - nudgeAt) / 1000);
-    if (secs < 60) return `${secs}s`;
-    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
-    return `${Math.floor(secs / 3600)}h`;
+    return watchdogLastNudgeText(
+      !!sh?.watchdogEnabled,
+      parseHostTimestamp(sh?.watchdogLastNudgeAt),
+      Date.now(),
+    );
   });
 
   /**
