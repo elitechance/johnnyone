@@ -37,8 +37,11 @@ import {
   addSuppressed,
   applySuppression,
   pruneSuppressed,
+  renameIntent,
+  sessionsWithTitle,
   type SuppressionEntries,
 } from './shells-page-logic';
+import { promptSessionRename } from './session-rename-prompt';
 
 /**
  * The Shells destination (`/shells`, overhaul P6). "See your launched shells in one place" — a LIST of
@@ -273,6 +276,37 @@ export class ShellsPage implements OnInit {
     }
     await this.refresh();
     if (summary) this.loadError.set(summary);
+  }
+
+  /**
+   * Rename one row's DISPLAY title (✎) through the shared prompt and the existing
+   * `updateAiSessionTitle` mutation. Works on ended rows too — the transcript is kept, and
+   * `update_session_title` needs no live tmux (it never renames the tmux session).
+   *
+   * `busy` is taken BEFORE the prompt opens, so a double-tap on ✎ cannot stack two alerts.
+   *
+   * NO `refresh()` afterwards, unlike `clearOne`: the worker caches `list_sessions` for 5s per isolate,
+   * so an immediate read can be served the OLD title and visibly undo the rename. The row's title is
+   * patched locally instead — title only (`sessionsWithTitle`), never a row swap from the mutation
+   * result, which is the trap that loses `attachedTmux`. The next ordinary refresh reconciles.
+   * A failure goes to the page's error banner and leaves the row untouched.
+   */
+  async renameOne(s: AiSession): Promise<void> {
+    if (this.busy()) return;
+    this.busy.set(true);
+    try {
+      const input = await promptSessionRename(this.alertCtrl, s.title);
+      const intent = renameIntent(s.title, input);
+      if (!intent) return;
+      await firstValueFrom(this.api.updateSessionTitle(s.id, intent.title));
+      this.sessions.update((rows) => sessionsWithTitle(rows, s.id, intent.title));
+      // Clear only our OWN earlier failure; an unrelated refresh/Clear banner is still true.
+      if (this.loadError()?.startsWith('Could not rename shell: ')) this.loadError.set(null);
+    } catch (err) {
+      this.loadError.set('Could not rename shell: ' + this.normalizeError(err));
+    } finally {
+      this.busy.set(false);
+    }
   }
 
   /** Open a listed shell on the existing terminal surface (navigation only — no embedded terminal). */

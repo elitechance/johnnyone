@@ -45,7 +45,8 @@
           @switch (shellRowState(s)) {
             @case ('ended') {
               <!-- An ended row does not invite you in: no `Open ▸`, and the sub says plainly that the
-                   terminal is gone. The ✕ stays — clearing the list is how you get rid of it. -->
+                   terminal is gone. The ✎ and ✕ stay — an ended transcript can still be named, and
+                   clearing the list is how you get rid of it. -->
               <div class="row ended">
                 <div class="ic dead">
                   <ion-icon name="help-circle-outline"></ion-icon>
@@ -57,6 +58,7 @@
                   </div>
                   <div class="sub">Terminal ended — its tmux session is gone, so there is nothing to open. The transcript is still kept.</div>
                 </div>
+                <button type="button" class="ia" title="Rename shell" aria-label="Rename shell" [disabled]="busy()" (click)="renameOne(s); $event.stopPropagation()">✎</button>
                 <button type="button" class="ia danger" title="Clear this shell" aria-label="Clear this shell" [disabled]="busy()" (click)="clearOne(s); $event.stopPropagation()">✕</button>
               </div>
             }
@@ -75,6 +77,7 @@
                   <div class="sub">{{ formatRelTime((s.updatedAt || s.createdAt), nowIso()) }}</div>
                 </div>
                 <div class="act">Open ▸</div>
+                <button type="button" class="ia" title="Rename shell" aria-label="Rename shell" [disabled]="busy()" (click)="renameOne(s); $event.stopPropagation()">✎</button>
                 <button type="button" class="ia danger" title="Clear this shell" aria-label="Clear this shell" [disabled]="busy()" (click)="clearOne(s); $event.stopPropagation()">✕</button>
               </div>
             }

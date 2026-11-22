@@ -147,3 +147,8 @@
     cursor: default;
   }
 }
+
+// ✎ + ✕ read as one action pair: pull the second button in from the row's 12px flex gap.
+.ia + .ia {
+  margin-left: -6px;
+}

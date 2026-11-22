@@ -215,6 +215,8 @@ import {
   shellRoutePath,
   shellViewTogglePath,
 } from '../shells/shells-route';
+import { renameIntent } from '../shells/shells-page-logic';
+import { promptSessionRename } from '../shells/session-rename-prompt';
 import {
   clampRailWidth,
   clampRightWidth,
@@ -404,6 +406,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   // State
   sessions = signal<Session[]>([]);
   currentSession = signal<Session | null>(null);
+  /** A top-bar rename is open or in flight — disables the ✎ so a double-tap cannot stack alerts. */
+  protected readonly renamingShell = signal(false);
   messages = signal<Message[]>([]);
   isStreaming = signal(false);
   streamingContent = signal('');
@@ -2630,28 +2634,46 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  async onSessionRenamed(id: string): Promise<void> {
-    const target = this.sessions().find((session) => session.id === id);
-    if (!target) return;
-
-    const nextTitle = window.prompt('Enter a new session name:', target.title);
-    if (nextTitle === null) return;
-
-    const trimmedTitle = nextTitle.trim();
-    if (!trimmedTitle || trimmedTitle === target.title) return;
-
+  /**
+   * Rename the open shell's DISPLAY title from the plain-shell top bar (✎) — the same shared prompt and
+   * `renameIntent` seam the `/shells` rows use, over the existing `updateAiSessionTitle` mutation
+   * (which never renames the tmux session). The guard is taken BEFORE the prompt so a double-tap
+   * cannot open two alerts. On success the list row and `currentSession` are updated from the result
+   * right away; the relay's published session update would re-apply the same data, but it is not
+   * guaranteed to arrive (reconnects, a backgrounded phone). A failure is a danger toast and leaves
+   * the title as it was. Replaces an older, uncalled rename handler that used the browser's blocking
+   * native prompt dialog.
+   */
+  async renameCurrentShell(): Promise<void> {
+    const sh = this.currentSession();
+    if (!sh || this.renamingShell()) return;
+    this.renamingShell.set(true);
     try {
+      const input = await promptSessionRename(this.alertCtrl, sh.title);
+      const intent = renameIntent(sh.title, input);
+      if (!intent) return;
       const updated = this.mapApiSessionToState(
-        await firstValueFrom(this.api.updateSessionTitle(id, trimmedTitle))
+        await firstValueFrom(this.api.updateSessionTitle(sh.id, intent.title)),
       );
       this.upsertSession(updated);
-
-      if (this.currentSession()?.id === id) {
-        this.currentSession.set(updated);
-      }
+      if (this.currentSession()?.id === sh.id) this.currentSession.set(updated);
     } catch (err) {
-      console.error('Failed to rename session:', err);
+      await this.showShellRenameToast(err);
+    } finally {
+      this.renamingShell.set(false);
     }
+  }
+
+  /** Top-bar rename failure — same shape as `showRunResumeToast`. */
+  private async showShellRenameToast(err: unknown): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err);
+    const toast = await this.toastCtrl.create({
+      message: `Rename failed: ${message}`,
+      duration: 4000,
+      color: 'danger',
+      position: 'bottom',
+    });
+    await toast.present();
   }
 
   onMessageSent(text: string): void {
