@@ -36,6 +36,7 @@ const MIGRATION_026: &str = include_str!("../../migrations/026_add_workflow_aren
 const MIGRATION_027: &str = include_str!("../../migrations/027_add_session_watchdog.sql");
 const MIGRATION_028: &str = include_str!("../../migrations/028_add_watchdog_held_count.sql");
 const MIGRATION_029: &str = include_str!("../../migrations/029_add_watchdog_triggers.sql");
+const MIGRATION_030: &str = include_str!("../../migrations/030_add_plan_findings.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -105,6 +106,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (27, "027_add_session_watchdog", MIGRATION_027),
         (28, "028_add_watchdog_held_count", MIGRATION_028),
         (29, "029_add_watchdog_triggers", MIGRATION_029),
+        (30, "030_add_plan_findings", MIGRATION_030),
     ];
 
     // Guard the shared version namespace. Versions are hand-assigned integers, and branches that
@@ -226,6 +228,60 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    #[test]
+    fn migration_030_creates_plan_findings() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run_migrations(&conn).expect("first run_migrations");
+        run_migrations(&conn).expect("second run_migrations (idempotent)");
+
+        assert_eq!(
+            column_names(&conn, "plan_findings"),
+            vec![
+                "plan_id", "id", "phase_id", "lens", "severity", "state", "round_opened",
+                "round_updated", "claim", "expected", "saw", "where_", "fence", "evidence",
+                "waive_reason", "reopen_count", "last_saw", "created_at", "updated_at",
+            ]
+        );
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_plan_findings_phase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1, "idx_plan_findings_phase missing");
+
+        insert_legacy_row(&conn, "p1", "development", "phase_review_running");
+        let insert = |id: &str, severity: &str, state: &str| {
+            conn.execute(
+                "INSERT INTO plan_findings
+                    (plan_id, id, phase_id, lens, severity, state, round_opened, round_updated, claim)
+                 VALUES ('p1', ?1, '00-x', 'qa', ?2, ?3, 1, 1, 'c')",
+                params![id, severity, state],
+            )
+        };
+        insert("F-00-x-1", "blocking", "open").expect("valid row inserts");
+        assert!(insert("F-00-x-2", "blocking", "bogus").is_err(), "state CHECK must reject 'bogus'");
+        assert!(insert("F-00-x-3", "nit", "open").is_err(), "severity CHECK must reject 'nit'");
+        assert!(insert("F-00-x-1", "followup", "open").is_err(), "duplicate (plan_id,id) must fail");
+
+        let (reopen_count, expected, where_): (i64, String, String) = conn
+            .query_row(
+                "SELECT reopen_count, expected, where_ FROM plan_findings WHERE plan_id='p1' AND id='F-00-x-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((reopen_count, expected.as_str(), where_.as_str()), (0, "", ""));
+
+        conn.execute("DELETE FROM agent_plans WHERE id='p1'", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plan_findings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "ON DELETE CASCADE must remove the plan's findings");
     }
 
     #[test]
