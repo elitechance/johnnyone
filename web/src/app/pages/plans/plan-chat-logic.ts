@@ -8,6 +8,8 @@
  * DOM-free and Angular-free.
  */
 
+import { shellRoutePath } from '../shells/shells-route';
+
 /** One entry of `messages.tool_calls` (phase 02 task 08: `{id, name, input, result?}`). */
 export interface ToolCall {
   id?: string;
@@ -190,7 +192,44 @@ export function composerState(initiativeStatus: string | null | undefined, strea
   return { disabled: false, placeholder: 'Discuss the plan…' };
 }
 
-/** The chat card pill suffix: `idle` / `working` / `retired` (D1: no tmux name). */
+/** The chat card pill label (D1, 2026-11-23: the plan agent runs visibly in its own tmux pane). */
+export const AGENT_PILL_LABEL = 'Plan agent · claude_code · tmux';
+
+/** The agent's tmux pane, as the chat card shows it: its session name and the Raw view link. */
+export interface AgentPane {
+  /** `johnnyone_<sid>` — for `tmux attach -r -t <name>` (the copy button). */
+  name: string;
+  /** The existing Raw terminal surface for the session (`/shells/<sid>/raw`). */
+  link: string;
+}
+
+/**
+ * The agent's pane, or `null` when there is nothing to show: no session, no chat message yet (the
+ * pane is created by the FIRST turn), or the agent is retired (its pane is killed on
+ * accept/delete/replace). The pane is view-only — chat stays the only way to talk to the agent,
+ * and J1 never reads data from the pane.
+ */
+export function agentPane(
+  sessionId: string | null | undefined,
+  initiativeStatus: string | null | undefined,
+  messageCount: number,
+): AgentPane | null {
+  const sid = (sessionId ?? '').trim();
+  if (!sid || (initiativeStatus ?? '') !== 'briefing' || !(messageCount >= 1)) return null;
+  return { name: `johnnyone_${sid}`, link: shellRoutePath(sid, 'raw') };
+}
+
+/** State of the pane-name Copy button. */
+export type CopyState = 'idle' | 'copied' | 'failed';
+
+/** The Copy button's text. A failed clipboard write says so (and the page selects the name). */
+export function copyLabel(state: CopyState): string {
+  if (state === 'copied') return 'Copied';
+  if (state === 'failed') return 'Copy failed: name selected, press Ctrl/⌘+C';
+  return 'Copy';
+}
+
+/** The chat card pill suffix: `idle` / `working` / `retired`. */
 export function agentState(initiativeStatus: string | null | undefined, streaming: boolean): 'idle' | 'working' | 'retired' {
   if ((initiativeStatus ?? '') !== 'briefing') return 'retired';
   return streaming ? 'working' : 'idle';

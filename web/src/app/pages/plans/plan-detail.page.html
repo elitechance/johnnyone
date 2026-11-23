@@ -20,7 +20,7 @@
       <!-- S11 loading: skeletons in the chat card and in three brief rows. -->
       <div class="split" data-pane="chat" aria-busy="true">
         <ion-card class="card chat-card">
-          <div class="ch">Plan agent · claude_code</div>
+          <div class="ch">{{ agentLabel }}</div>
           <ion-card-content>
             <ion-skeleton-text [animated]="true" style="width: 40%"></ion-skeleton-text>
             <ion-skeleton-text [animated]="true" style="width: 85%"></ion-skeleton-text>
@@ -85,8 +85,16 @@
         <ion-card class="card chat-card">
           <div class="ch">
             <span class="agent-pill" [attr.data-state]="agent()">
-              <span class="tick"></span>Plan agent · claude_code · {{ agent() }}
+              <span class="tick"></span>{{ agentLabel }} · {{ agent() }}
             </span>
+            @if (agentPane(); as pane) {
+              <code #paneNameEl class="pane-name" [title]="'tmux attach -r -t ' + pane.name">{{ pane.name }}</code>
+              <button type="button" class="pane-copy" [class.failed]="paneCopy() === 'failed'"
+                      (click)="copyPaneName(pane.name, paneNameEl)" [attr.aria-label]="'Copy ' + pane.name">
+                {{ copyLabel(paneCopy()) }}
+              </button>
+              <a class="pane-link" [routerLink]="pane.link" title="Watch the plan agent's tmux pane (view-only)">View pane ↗</a>
+            }
             @if (chat.isStreaming()) {<ion-spinner name="dots" class="ch-spin"></ion-spinner>}
           </div>
           <johnny-chat-window

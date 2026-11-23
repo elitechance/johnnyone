@@ -31,6 +31,8 @@ export interface Session {
   /** The two "Also nudge when" checkboxes — off the wire, onto the page's session state. */
   watchdogOnBlocked?: boolean;
   watchdogOnStaleReport?: boolean;
+  /** Engine-computed: a Plans-tab plan agent (view-only pane; no close/rename/watchdog). */
+  planAgent?: boolean;
 }
 
 /**
@@ -69,5 +71,6 @@ export function sessionStateFromApi(session: SharedAiSession): Session {
     // is firing on that very trigger.
     watchdogOnBlocked: session.watchdogOnBlocked,
     watchdogOnStaleReport: session.watchdogOnStaleReport,
+    planAgent: session.planAgent === true,
   };
 }

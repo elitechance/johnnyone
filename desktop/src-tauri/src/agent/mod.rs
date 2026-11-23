@@ -5,7 +5,7 @@ pub mod registration;
 pub mod ws_client;
 
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
+    claude_code, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
     StreamChunk,
 };
 use crate::services::{
@@ -730,7 +730,7 @@ impl AgentService {
                 let st = Arc::clone(state);
                 tokio::spawn(async move {
                     let result =
-                        crate::terminal::kill_terminal_session(&st, &kill.session_id).await;
+                        crate::terminal::kill_terminal_session_human(&st, &kill.session_id).await;
 
                     let ack = TerminalCommandAck {
                         request_id: kill.request_id,
@@ -3379,6 +3379,7 @@ impl AgentService {
 
     fn session_view(session: crate::db::models::Session) -> RpcSessionView {
         RpcSessionView {
+            plan_agent: session.plan_agent,
             id: session.id,
             title: session.title,
             provider: session.provider,
@@ -3650,9 +3651,17 @@ impl AgentService {
         };
 
         let (process, mut rx) =
-            cli_runner::spawn_cli(config, req.session_id.clone(), parse_fn).await?;
+            crate::services::plan_agent_tmux::spawn_chat_turn(
+                &state,
+                config,
+                req.session_id.clone(),
+                parse_fn,
+                plan_extras.is_some(),
+            )
+            .await?;
         // Registered like the host chat path so `chat_host::stop_generation` (Stop, and the plan
         // agent's retire on accept/delete — 02/09) can end an in-flight relay turn.
+        let turn_id = process.turn_id();
         state
             .active_processes
             .lock()
@@ -3736,7 +3745,8 @@ impl AgentService {
         }
 
         // The turn is over: drop the registration (a Stop may already have removed + killed it).
-        state.active_processes.lock().await.remove(&req.session_id);
+        // Only THIS turn's handle: a later turn may already be registered for the session.
+        let _ = crate::services::chat_host::take_own_process(&state.active_processes, &req.session_id, turn_id).await;
         let tool_calls = crate::services::chat_host::fold_tool_calls(&tool_chunks);
 
         // Send completion message
@@ -5340,6 +5350,7 @@ mod session_view_tests {
             watchdog_held_count: 0,
             watchdog_on_blocked: false,
             watchdog_on_stale_report: false,
+            plan_agent: false,
         }
     }
 
@@ -5353,6 +5364,7 @@ mod session_view_tests {
             watchdog_nudge_count: 7,
             watchdog_on_blocked: true,
             watchdog_on_stale_report: true,
+            plan_agent: false,
             ..session_with_terminal_status("attached")
         }
     }

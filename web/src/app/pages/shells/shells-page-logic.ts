@@ -379,3 +379,16 @@ export function renameIntent(
 export function sessionsWithTitle(sessions: AiSession[], id: string, title: string): AiSession[] {
   return sessions.map((s) => (s.id === id ? { ...s, title } : s));
 }
+
+/** The Raw/Transcript banner for a plan agent's pane (D1, 2026-11-23). */
+export const PLAN_AGENT_VIEW_ONLY_NOTE = "View-only: talk to the plan agent in its plan's chat.";
+
+/**
+ * A Plans-tab plan agent's session, from the engine-computed `planAgent` flag (never guessed from
+ * the title, which a rename could change). Its tmux pane is VIEW-ONLY (the engine refuses input,
+ * close, archive and delete for it), so the shell surface shows a banner and hides input, close,
+ * rename and the watchdog. A UI hint only: the engine enforces the rules whatever this returns.
+ */
+export function isPlanAgentShell(s: { planAgent?: boolean | null } | null | undefined): boolean {
+  return s?.planAgent === true;
+}

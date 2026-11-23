@@ -15,6 +15,7 @@ pub mod mcp_tokens;
 pub mod pane_question;
 pub mod plan_artifacts;
 pub mod plan_agent;
+pub mod plan_agent_tmux;
 pub mod plan_check;
 pub mod plan_mcp;
 pub mod planner_prompts;

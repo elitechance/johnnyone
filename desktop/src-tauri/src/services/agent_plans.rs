@@ -5897,9 +5897,8 @@ pub(crate) async fn retire_agent_session_with(
     })?;
     let owner = session_plan_owner(state, session_id);
     let attached = row.as_ref().map(|(_, attached)| *attached).unwrap_or(false);
-    // The Plans-tab plan agent runs headless (one `claude --print` per turn, D1): it never has a
-    // pane, so the pane seam is not asked to kill anything for it.
-    let headless_plan_agent = owner.as_ref().is_some_and(|(_, role)| role == "plan_agent");
+    // The Plans-tab plan agent runs its turns in its own `johnnyone_<sid>` pane (D1, 2026-11-23),
+    // so it is released exactly like any other owned agent: the pane is killed below.
 
     // (b) Archive FIRST (compare-and-set: only an active row flips). Once archived, the
     // `ensure_terminal_session` guard refuses to resurrect the pane, so no attach/input racing
@@ -5912,10 +5911,8 @@ pub(crate) async fn retire_agent_session_with(
     };
 
     // (c) Release the runtime — but never kill a pane the user owns (or one that cannot exist).
-    let pane_killed = if attached || headless_plan_agent {
-        if attached {
-            tracing::info!(%session_id, %reason, "retiring attached session — leaving external tmux running");
-        }
+    let pane_killed = if attached {
+        tracing::info!(%session_id, %reason, "retiring attached session — leaving external tmux running");
         unregister_review_session(state, session_id);
         state.agent_reports.lock().await.remove(session_id);
         false

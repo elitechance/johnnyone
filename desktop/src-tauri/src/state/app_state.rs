@@ -84,6 +84,9 @@ pub struct AppState {
     pub tool_executions: Arc<Mutex<Vec<ToolExecutionRecord>>>,
     /// Currently running CLI subprocesses, keyed by session_id.
     pub active_processes: Arc<Mutex<HashMap<String, CliProcess>>>,
+    /// Plan agents with a turn in flight (`services::plan_agent_tmux::claim_turn`): one turn per
+    /// plan agent at a time, so a second send can never respawn the pane under a running turn.
+    pub plan_agent_turns: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Broadcast channel sender for shutdown signals.
     pub shutdown_tx: broadcast::Sender<()>,
     /// Broadcast channel for session deletion events (sends session ID).
@@ -175,6 +178,7 @@ impl AppState {
             node_name,
             tool_executions: Arc::new(Mutex::new(Vec::new())),
             active_processes: Arc::new(Mutex::new(HashMap::new())),
+            plan_agent_turns: Arc::new(std::sync::Mutex::new(HashSet::new())),
             shutdown_tx,
             session_deleted_tx,
             session_updated_tx,
@@ -222,6 +226,7 @@ impl AppState {
             node_name,
             tool_executions: Arc::new(Mutex::new(Vec::new())),
             active_processes: Arc::new(Mutex::new(HashMap::new())),
+            plan_agent_turns: Arc::new(std::sync::Mutex::new(HashSet::new())),
             shutdown_tx,
             session_deleted_tx,
             session_updated_tx,

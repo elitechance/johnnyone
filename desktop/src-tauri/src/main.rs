@@ -17,6 +17,24 @@ use johnnyone_desktop_lib::terminal;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
+    // The plan agent's tmux pane pipes its turn's stream-json through this binary to render a
+    // human-readable view (`plan_agent_tmux::run_view_filter`). Handled before anything else: no
+    // logging, no DB, no Tauri.
+    // `args_os`: a non-UTF-8 argv must never panic here. The probe is the script's handshake
+    // (`plan_agent_tmux::PROBE_TOKEN`) before it execs this binary as the viewer.
+    {
+        use johnnyone_desktop_lib::services::plan_agent_tmux::{run_view_filter, PROBE_FLAG, PROBE_TOKEN, VIEW_FLAG};
+        let first = std::env::args_os().nth(1);
+        if first.as_deref() == Some(std::ffi::OsStr::new(PROBE_FLAG)) {
+            println!("{PROBE_TOKEN}");
+            return;
+        }
+        if first.as_deref() == Some(std::ffi::OsStr::new(VIEW_FLAG)) {
+            run_view_filter();
+            return;
+        }
+    }
+
     // Initialize tracing/logging
     tracing_subscriber::fmt()
         .with_env_filter(

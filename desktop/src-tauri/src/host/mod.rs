@@ -772,6 +772,9 @@ struct AiSession {
     /// its checkboxes from these; dropped here they read unchecked on every page load.
     watchdog_on_blocked: bool,
     watchdog_on_stale_report: bool,
+    /// `planAgent`: a Plans-tab plan agent's session — its pane is view-only, it can't be closed,
+    /// archived or renamed from a terminal, and it has no watchdog.
+    plan_agent: bool,
 }
 
 impl From<Session> for AiSession {
@@ -803,6 +806,7 @@ impl From<Session> for AiSession {
             watchdog_held_count: value.watchdog_held_count,
             watchdog_on_blocked: value.watchdog_on_blocked,
             watchdog_on_stale_report: value.watchdog_on_stale_report,
+            plan_agent: value.plan_agent,
         }
     }
 }
@@ -841,6 +845,7 @@ mod ai_session_tests {
             watchdog_held_count: 0,
             watchdog_on_blocked: false,
             watchdog_on_stale_report: false,
+            plan_agent: false,
         }
     }
 
@@ -855,6 +860,7 @@ mod ai_session_tests {
             watchdog_nudge_count: 7,
             watchdog_on_blocked: true,
             watchdog_on_stale_report: true,
+            plan_agent: false,
             ..session_with_terminal_status("attached")
         }
     }

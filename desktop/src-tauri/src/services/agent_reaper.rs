@@ -588,6 +588,26 @@ mod tests {
         LiveTmuxSession { name: format!("johnnyone_{id}"), created_unix: NOW - age, attached_clients: 0 }
     }
 
+    /// Plan agent in tmux (D1, 2026-11-23): a live plan agent's `johnnyone_<sid>` pane is kept
+    /// (active row, no worker/reviewer link); once the agent is retired (archived) or its row is
+    /// gone, the pane is swept like any other owned orphan.
+    #[tokio::test]
+    async fn plan_agent_pane_kept_while_live_swept_once_retired() {
+        use crate::services::plan_mcp::fixture::{plan, use_store};
+        let (state, _r) = crate::test_support::test_state();
+        let store = use_store(&state);
+        let p = plan(&state, &store, "A").await;
+        let live = vec![LiveTmuxSession { name: format!("johnnyone_{}", p.session), created_unix: NOW - 3600, attached_clients: 0 }];
+        let facts = load_sweep_facts(&state, &[p.session.clone()]).unwrap();
+        assert!(select_orphan_sessions(&live, &facts, NOW, BOOT).is_empty(), "a live plan agent's pane is kept");
+        crate::services::sessions::mark_session_archived(&state, &p.session).unwrap();
+        let facts = load_sweep_facts(&state, &[p.session.clone()]).unwrap();
+        let v = select_orphan_sessions(&live, &facts, NOW, BOOT);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].reason, OrphanReason::SessionArchived);
+        assert_eq!(v[0].session_id, p.session);
+    }
+
     fn row(id: &str, archived: bool) -> SessionFacts {
         SessionFacts { session_id: id.into(), archived, attached_tmux: false, created_unix: NOW - 3600 }
     }

@@ -528,7 +528,7 @@ export class JohnnyApiService {
     totalInputTokens totalOutputTokens totalCostCents
     createdAt updatedAt attachedTmux terminalStatus
     watchdogEnabled watchdogIntervalSecs watchdogPrompt watchdogLastNudgeAt watchdogNudgeCount
-    watchdogHeldCount watchdogOnBlocked watchdogOnStaleReport
+    watchdogHeldCount watchdogOnBlocked watchdogOnStaleReport planAgent
   `;
   private readonly agentPlanRunFields = `
     plan {

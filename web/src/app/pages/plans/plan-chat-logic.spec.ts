@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  AGENT_PILL_LABEL,
+  agentPane,
+  copyLabel,
   agentState,
   composerState,
   extractChoices,
@@ -88,5 +91,29 @@ describe('plan-chat-logic', () => {
     expect(agentState('briefing', false)).toBe('idle');
     expect(agentState('briefing', true)).toBe('working');
     expect(agentState('planning', true)).toBe('retired');
+  });
+
+  it('labels the pill as a tmux agent and shows the live pane: tmux name + Raw link', () => {
+    expect(AGENT_PILL_LABEL).toBe('Plan agent · claude_code · tmux');
+    expect(agentPane('abc-123', 'briefing', 1)).toEqual({ name: 'johnnyone_abc-123', link: '/shells/abc-123/raw' });
+    expect(agentPane(' abc-123 ', 'briefing', 7)?.name).toBe('johnnyone_abc-123');
+    // No session yet, or the agent is retired (its pane is killed) → nothing.
+    expect(agentPane(null, 'briefing', 3)).toBeNull();
+    expect(agentPane('  ', 'briefing', 3)).toBeNull();
+    expect(agentPane('abc-123', 'planning', 3)).toBeNull();
+    expect(agentPane('abc-123', undefined, 3)).toBeNull();
+  });
+
+  it('hides the pane until the first chat message (the first turn creates it)', () => {
+    expect(agentPane('abc-123', 'briefing', 0)).toBeNull();
+    expect(agentPane('abc-123', 'briefing', NaN)).toBeNull();
+    expect(agentPane('abc-123', 'briefing', 1)).not.toBeNull();
+  });
+
+  it('labels the Copy button, with a visible fallback when the clipboard write fails', () => {
+    expect(copyLabel('idle')).toBe('Copy');
+    expect(copyLabel('copied')).toBe('Copied');
+    expect(copyLabel('failed')).toContain('Copy failed');
+    expect(copyLabel('failed')).toContain('selected');
   });
 });

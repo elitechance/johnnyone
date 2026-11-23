@@ -36,6 +36,11 @@ export interface AiSession {
    */
   watchdogOnBlocked?: boolean;
   watchdogOnStaleReport?: boolean;
+  /**
+   * A Plans-tab plan agent's session (engine-computed): its pane is view-only, and the shell
+   * surface hides input, close, rename and the watchdog. Absent (older engine) = not a plan agent.
+   */
+  planAgent?: boolean;
 }
 
 export interface CreateAiSessionInput {

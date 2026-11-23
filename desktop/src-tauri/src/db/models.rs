@@ -58,6 +58,10 @@ pub struct Session {
     /// ...and "...nothing has been reported to the chat for twice the interval" (migration 029).
     #[serde(default)]
     pub watchdog_on_stale_report: bool,
+    /// This session is (or was) a Plans-tab plan agent: some plan's `briefing_session_id`. Its tmux
+    /// pane is view-only and it can't be closed/archived from a terminal (plan agent in tmux, D1).
+    #[serde(default)]
+    pub plan_agent: bool,
 }
 
 fn default_watchdog_interval() -> i64 {

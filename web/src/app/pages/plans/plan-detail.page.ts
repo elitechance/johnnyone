@@ -72,7 +72,7 @@ import {
   type OutlinePhaseCard,
   type OutlineTaskRow,
 } from './plan-brief-logic';
-import { agentState, composerState, extractChoices, toolSummary } from './plan-chat-logic';
+import { AGENT_PILL_LABEL, type CopyState, agentPane, agentState, copyLabel, composerState, extractChoices, toolSummary } from './plan-chat-logic';
 import { POLL_MS, hasNewerVersion, isDeletedUpdate, pollEnabled, shouldRefetch, turnCompleted } from './plan-live-logic';
 
 type Pane = 'chat' | 'brief' | 'outline';
@@ -186,6 +186,39 @@ export class PlanDetailPage implements OnInit, OnDestroy {
   protected readonly composer = computed(() =>
     composerState(this.frozen() ? 'planning' : this.plan()?.initiativeStatus, this.chat.isStreaming()),
   );
+  protected readonly agentLabel = AGENT_PILL_LABEL;
+  /** The agent's tmux pane (name + Raw view link), once its first turn created it and while it is live. */
+  protected readonly agentPane = computed(() =>
+    agentPane(
+      this.plan()?.briefingSessionId,
+      this.frozen() ? 'planning' : this.plan()?.initiativeStatus,
+      this.chat.messages().length,
+    ),
+  );
+  protected readonly paneCopy = signal<CopyState>('idle');
+  protected readonly copyLabel = copyLabel;
+
+  /**
+   * Copy `johnnyone_<sid>` for `tmux attach -r -t …`. When the clipboard is unavailable (no secure
+   * context, permission denied) the button says so and the name is SELECTED for a manual copy.
+   */
+  protected async copyPaneName(name: string, el?: HTMLElement): Promise<void> {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(name);
+      this.paneCopy.set('copied');
+      setTimeout(() => this.paneCopy.set('idle'), 1500);
+    } catch {
+      this.paneCopy.set('failed');
+      if (el) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      }
+    }
+  }
   protected readonly agent = computed(() =>
     agentState(this.frozen() ? 'planning' : this.plan()?.initiativeStatus, this.chat.isStreaming()),
   );

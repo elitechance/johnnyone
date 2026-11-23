@@ -18,7 +18,8 @@ const SCSS = readFileSync(resolve(here, 'terminal.page.scss'), 'utf8');
 
 /** The `<header class="plain-shell-topbar">…</header>` block. */
 function topbar(): string {
-  const start = HTML.indexOf('<header class="plain-shell-topbar">');
+  // The header also carries `[class.pa-bar]` (plan agent in tmux), so match the opening prefix.
+  const start = HTML.indexOf('<header class="plain-shell-topbar"');
   expect(start, 'the plain-shell top bar exists').toBeGreaterThan(-1);
   return HTML.slice(start, HTML.indexOf('</header>', start) + '</header>'.length);
 }
@@ -45,12 +46,14 @@ function scssRule(selector: string): string {
 }
 
 describe('top bar ✎ (template)', () => {
-  it('sits inside @if (sh) directly after the ps-name span and before the provider ps-dim span', () => {
+  it('sits inside @if (sh && !topViewOnly) directly after the ps-name span and before the provider ps-dim span', () => {
     const bar = topbar();
     const nameEnd = bar.indexOf('</span>', bar.indexOf('class="ps-name"')) + '</span>'.length;
     const after = bar.slice(nameEnd).trimStart();
-    expect(after.startsWith('@if (sh) {'), 'the next thing after .ps-name is the @if (sh) guard').toBe(true);
-    const afterGuard = after.slice('@if (sh) {'.length).trimStart();
+    // Hidden for a plan agent (its session is renamed only with its plan).
+    const guard = '@if (sh && !topViewOnly) {';
+    expect(after.startsWith(guard), 'the next thing after .ps-name is the session guard').toBe(true);
+    const afterGuard = after.slice(guard.length).trimStart();
     expect(afterGuard.startsWith('<button type="button" class="ps-rename"'), 'then the ✎ button').toBe(true);
     const renameAt = bar.indexOf('class="ps-rename"');
     expect(renameAt).toBeLessThan(bar.indexOf('@if (sh?.provider)'));
