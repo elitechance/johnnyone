@@ -1,8 +1,9 @@
 //! Deterministic five-check, failure classifier, and escalation cursor.
-//! Pure: no `std::fs`, no process, no network.
+//! Pure: no filesystem access, no subprocess, no network.
 
 use crate::providers::kloo_cli::KlooResult;
 use crate::services::task_spec::TaskSpec;
+use crate::services::task_state::AttemptRecord;
 use std::collections::HashMap;
 
 pub const CHECK_EXIT: &str = "exit";
@@ -71,20 +72,9 @@ pub fn run_checks(
         });
     }
 
-    let dirty: std::collections::HashSet<&str> = inputs
-        .pre_spawn_dirty
-        .iter()
-        .map(String::as_str)
-        .collect();
     let allowed: std::collections::HashSet<&str> =
         spec.files.iter().map(String::as_str).collect();
-    let delta: Vec<&str> = result
-        .files_changed
-        .paths
-        .iter()
-        .map(String::as_str)
-        .filter(|p| !dirty.contains(p))
-        .collect();
+    let delta = attempt_delta(result, &inputs.pre_spawn_dirty);
     for path in &delta {
         if !allowed.contains(path) {
             failed.push(CheckFail {
@@ -187,6 +177,222 @@ pub fn run_checks(
         passed: failed.is_empty(),
         failed,
     }
+}
+
+/// The ONE definition of "what this attempt changed": kloo's reported
+/// `files_changed.paths` minus paths already dirty before the spawn. Used by
+/// [`run_checks`] (scope check) and [`delta_paths`] (recorded `changed`).
+fn attempt_delta<'a>(result: &'a KlooResult, pre_spawn_dirty: &[String]) -> Vec<&'a str> {
+    let dirty: std::collections::HashSet<&str> =
+        pre_spawn_dirty.iter().map(String::as_str).collect();
+    result
+        .files_changed
+        .paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !dirty.contains(p))
+        .collect()
+}
+
+/// Sorted, de-duplicated delta paths of an attempt (recorded as `checks.changed`).
+pub fn delta_paths(result: &KlooResult, pre_spawn_dirty: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = attempt_delta(result, pre_spawn_dirty)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The one-line reason an attempt failed, and whether it is specific enough
+/// to compare across attempts (generic SAWs are never fingerprinted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saw {
+    pub text: String,
+    pub specific: bool,
+}
+
+/// SAW precedence (master plan §4):
+/// 1. kloo `failure_detail.message` (non-empty string) → specific;
+/// 2. first failing J1 content check (`must_contain`, `must_not_contain`, `changed`) → specific;
+/// 3. `failure_code`, else first failing check reason → not specific;
+/// 4. nothing → `None`.
+pub fn attempt_saw(report: &CheckReport, result: &KlooResult) -> Option<Saw> {
+    if let Some(msg) = result
+        .failure_detail
+        .as_ref()
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.trim().is_empty())
+    {
+        return Some(Saw {
+            text: msg.to_string(),
+            specific: true,
+        });
+    }
+    if let Some(f) = report.failed.iter().find(|f| {
+        f.check == CHECK_MUST_CONTAIN || f.check == CHECK_MUST_NOT_CONTAIN || f.check == CHECK_CHANGED
+    }) {
+        return Some(Saw {
+            text: f.reason.clone(),
+            specific: true,
+        });
+    }
+    if let Some(code) = result.failure_code.as_deref().filter(|c| !c.is_empty()) {
+        return Some(Saw {
+            text: code.to_string(),
+            specific: false,
+        });
+    }
+    report.failed.first().map(|f| Saw {
+        text: f.reason.clone(),
+        specific: false,
+    })
+}
+
+/// Single-line, bounded rendering: control chars (incl. `\r` `\n` `\t`) → space,
+/// whitespace runs collapsed, trimmed, then cut to `max` chars on a char
+/// boundary with `…` appended when cut (so at most `max + 1` chars).
+pub fn one_line(s: &str, max: usize) -> String {
+    let mut flat = String::with_capacity(s.len());
+    let mut prev_space = true; // drops leading whitespace
+    for c in s.chars() {
+        let c = if c.is_control() || c.is_whitespace() { ' ' } else { c };
+        if c == ' ' {
+            if !prev_space {
+                flat.push(' ');
+            }
+            prev_space = true;
+        } else {
+            flat.push(c);
+            prev_space = false;
+        }
+    }
+    let flat = flat.trim_end();
+    match flat.char_indices().nth(max) {
+        Some((cut, _)) => {
+            let mut out = flat[..cut].trim_end().to_string();
+            out.push('…');
+            out
+        }
+        None => flat.to_string(),
+    }
+}
+
+/// Normalize a SAW so "the same failure" compares equal across runs:
+/// lowercase; every whitespace token containing `/` or `\\` → `<path>`; every
+/// run of ASCII digits → `#`; whitespace collapsed; trimmed.
+pub fn normalize_saw(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for tok in lower.split_whitespace() {
+        if tok.contains('/') || tok.contains('\\') {
+            out.push("<path>".into());
+            continue;
+        }
+        let mut t = String::with_capacity(tok.len());
+        let mut in_digits = false;
+        for c in tok.chars() {
+            if c.is_ascii_digit() {
+                if !in_digits {
+                    t.push('#');
+                }
+                in_digits = true;
+            } else {
+                t.push(c);
+                in_digits = false;
+            }
+        }
+        out.push(t);
+    }
+    out.join(" ")
+}
+
+/// Fingerprint of a failure: normalized SAW + sorted, de-duplicated changed
+/// set, hashed with [`digest_bytes`]. Equal ⇔ "failed the same way" (O2).
+pub fn failure_fingerprint(saw: &str, changed: &[String]) -> String {
+    let mut files: Vec<&str> = changed.iter().map(String::as_str).collect();
+    files.sort_unstable();
+    files.dedup();
+    digest_bytes(format!("{}\n{}", normalize_saw(saw), files.join("\n")).as_bytes())
+}
+
+/// Per-field cap for the retry-feedback block (master plan §4).
+pub const FEEDBACK_FIELD_MAX: usize = 300;
+
+const NO_REASON: &str = "no reason recorded";
+
+/// `checks.saw` recorded on the attempt (absent on rows written before SAW capture).
+fn recorded_saw(rec: &AttemptRecord) -> Option<&str> {
+    rec.checks
+        .as_ref()
+        .and_then(|c| c.get("saw"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn feedback_line(label: &str, value: &str) -> String {
+    format!("{:<10} {}", label, one_line(value, FEEDBACK_FIELD_MAX))
+}
+
+/// `EXPECTED / SAW / FENCE / DEAD ENDS` block for the attempt about to run,
+/// built only from Model-class attempts (D5). `None` when there are none.
+/// Pure and deterministic.
+pub fn retry_feedback(spec: &TaskSpec, attempts: &[AttemptRecord]) -> Option<String> {
+    let model: Vec<&AttemptRecord> = attempts
+        .iter()
+        .filter(|a| a.class.as_deref() == Some("model"))
+        .collect();
+    let last = model.last()?;
+
+    let mut expected = format!("`{}` exits 0", spec.verify);
+    let quote = |xs: &[String]| {
+        xs.iter()
+            .map(|x| format!("\"{x}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !spec.must_contain.is_empty() {
+        expected.push_str(&format!("; files contain {}", quote(&spec.must_contain)));
+    }
+    if !spec.must_not_contain.is_empty() {
+        expected.push_str(&format!(
+            "; files do not contain {}",
+            quote(&spec.must_not_contain)
+        ));
+    }
+
+    let mut lines = vec![
+        format!("--- RETRY FEEDBACK (attempt {}) ---", attempts.len() + 1),
+        feedback_line("EXPECTED", &expected),
+        feedback_line(
+            "SAW",
+            recorded_saw(last)
+                .or(last.failure_code.as_deref().filter(|c| !c.is_empty()))
+                .unwrap_or(NO_REASON),
+        ),
+        feedback_line("FENCE", &spec.files.join(", ")),
+    ];
+    for rec in &model {
+        let code = rec
+            .failure_code
+            .clone()
+            .filter(|c| !c.is_empty())
+            .or_else(|| rec.class.clone())
+            .unwrap_or_default();
+        lines.push(feedback_line(
+            "DEAD ENDS",
+            &format!(
+                "attempt {} ({}, {}): {}",
+                rec.attempt,
+                rec.tier,
+                code,
+                recorded_saw(rec).unwrap_or(NO_REASON)
+            ),
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +525,9 @@ pub enum Step {
         attempt_index: usize,
     },
     Exhausted,
+    /// The last two Model-class attempts failed the same way (equal
+    /// fingerprints): stop now, route like [`Step::Exhausted`] (O2).
+    StuckSameFailure,
     StopShape,
     RetryInfra {
         model: String,
@@ -434,6 +643,43 @@ impl Ladder {
             }
         }
         Step::Exhausted
+    }
+}
+
+/// Stuck ⇔ among Model-class attempts (others skipped) there are ≥ 2 and the
+/// last two both carry a fingerprint and they are equal. `fingerprints[i]`
+/// belongs to `history[i]`; a length mismatch is never stuck (fail safe).
+pub fn is_stuck_same_failure(history: &[Attempt], fingerprints: &[Option<String>]) -> bool {
+    if history.len() != fingerprints.len() {
+        return false;
+    }
+    let model_fps: Vec<&Option<String>> = history
+        .iter()
+        .zip(fingerprints)
+        .filter(|(a, _)| a.class == Some(FailureClass::Model))
+        .map(|(_, fp)| fp)
+        .collect();
+    match model_fps.as_slice() {
+        [.., Some(a), Some(b)] => a == b,
+        _ => false,
+    }
+}
+
+impl Ladder {
+    /// [`Ladder::next_attempt`] plus the O2 guard: after a Model failure whose
+    /// fingerprint repeats the previous Model failure, return
+    /// [`Step::StuckSameFailure`] even while slots remain. Every other case
+    /// delegates unchanged.
+    pub fn next_attempt_guarded(
+        &self,
+        history: &[Attempt],
+        fingerprints: &[Option<String>],
+        class: Option<FailureClass>,
+    ) -> Step {
+        if class == Some(FailureClass::Model) && is_stuck_same_failure(history, fingerprints) {
+            return Step::StuckSameFailure;
+        }
+        self.next_attempt(history, class)
     }
 }
 
@@ -1123,6 +1369,471 @@ mod tests {
             FailureClass::Shape
         );
     }
+
+    // ---- 00/01 SAW capture -------------------------------------------------
+
+    fn fail(check: &str, reason: &str) -> CheckFail {
+        CheckFail {
+            check: check.into(),
+            reason: reason.into(),
+        }
+    }
+
+    fn failing_report(fails: Vec<CheckFail>) -> CheckReport {
+        CheckReport {
+            passed: fails.is_empty(),
+            failed: fails,
+        }
+    }
+
+    fn with_detail(mut r: KlooResult, detail: serde_json::Value) -> KlooResult {
+        r.success = false;
+        r.failure_code = Some("verify_failed".into());
+        r.failure_detail = Some(detail);
+        r
+    }
+
+    #[test]
+    fn attempt_saw_prefers_kloo_failure_detail_message() {
+        let result = with_detail(
+            ok_result(&["src/add.rs"]),
+            serde_json::json!({"source":"verify","class":"verify_failed",
+                "message":"cargo test add: assertion failed: add(2, 2) == 4"}),
+        );
+        let report = failing_report(vec![
+            fail(CHECK_EXIT, "exit_code=1 success=false"),
+            fail(CHECK_MUST_CONTAIN, "must_contain \"pub fn add\" not found in files[]"),
+        ]);
+        assert_eq!(
+            attempt_saw(&report, &result),
+            Some(Saw {
+                text: "cargo test add: assertion failed: add(2, 2) == 4".into(),
+                specific: true,
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_saw_falls_back_to_content_check() {
+        let mut result = ok_result(&["src/add.rs"]);
+        result.success = false;
+        result.failure_code = Some("verify_failed".into());
+        let report = failing_report(vec![
+            fail(CHECK_VERIFY, "verify.passed=Some(false) postchecks_ok=true"),
+            fail(CHECK_MUST_CONTAIN, "must_contain \"pub fn add\" not found in files[]"),
+        ]);
+        assert_eq!(
+            attempt_saw(&report, &result),
+            Some(Saw {
+                text: "must_contain \"pub fn add\" not found in files[]".into(),
+                specific: true,
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_saw_generic_is_not_specific() {
+        let mut result = ok_result(&["src/add.rs"]);
+        result.success = false;
+        result.failure_code = Some("budget_exceeded".into());
+        let report = failing_report(vec![
+            fail(CHECK_EXIT, "exit_code=10 success=false"),
+            fail(CHECK_VERIFY, "verify.passed=Some(false) postchecks_ok=true"),
+        ]);
+        assert_eq!(
+            attempt_saw(&report, &result),
+            Some(Saw {
+                text: "budget_exceeded".into(),
+                specific: false,
+            })
+        );
+        // no code at all → first failing reason, still generic
+        result.failure_code = None;
+        assert_eq!(
+            attempt_saw(&report, &result),
+            Some(Saw {
+                text: "exit_code=10 success=false".into(),
+                specific: false,
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_saw_none_on_pass() {
+        let report = failing_report(vec![]);
+        assert_eq!(attempt_saw(&report, &ok_result(&["src/add.rs"])), None);
+    }
+
+    #[test]
+    fn attempt_saw_ignores_empty_or_non_string_message() {
+        let content = failing_report(vec![fail(
+            CHECK_MUST_NOT_CONTAIN,
+            "must_not_contain \"todo!()\" still present in src/add.rs",
+        )]);
+        for detail in [
+            serde_json::json!({"message": ""}),
+            serde_json::json!({"message": "   "}),
+            serde_json::json!({"message": 3}),
+            serde_json::json!("not an object"),
+        ] {
+            let result = with_detail(ok_result(&["src/add.rs"]), detail.clone());
+            // falls through to step 2 (content check)
+            assert_eq!(
+                attempt_saw(&content, &result),
+                Some(Saw {
+                    text: "must_not_contain \"todo!()\" still present in src/add.rs".into(),
+                    specific: true,
+                }),
+                "detail {detail}"
+            );
+            // and to step 3 (code) when there is no content check
+            let generic = failing_report(vec![fail(CHECK_VERIFY, "verify.passed=Some(false) postchecks_ok=true")]);
+            assert_eq!(
+                attempt_saw(&generic, &result),
+                Some(Saw {
+                    text: "verify_failed".into(),
+                    specific: false,
+                }),
+                "detail {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn delta_paths_sorted_dedup_minus_dirty() {
+        let result = ok_result(&["src/z.rs", "src/a.rs", "README.md", "src/a.rs", "src/m.rs"]);
+        let dirty = vec!["README.md".to_string()];
+        assert_eq!(
+            delta_paths(&result, &dirty),
+            vec!["src/a.rs".to_string(), "src/m.rs".into(), "src/z.rs".into()]
+        );
+        assert!(delta_paths(&ok_result(&[]), &dirty).is_empty());
+    }
+
+    // ---- 00/02 retry feedback builder -------------------------------------
+
+    fn rec(
+        n: u32,
+        tier: &str,
+        class: &str,
+        code: Option<&str>,
+        saw: Option<&str>,
+    ) -> AttemptRecord {
+        AttemptRecord {
+            tier: tier.into(),
+            model: format!("m/{tier}"),
+            attempt: n,
+            started_at: None,
+            ended_at: None,
+            failure_code: code.map(str::to_string),
+            exit_code: Some(1),
+            class: Some(class.into()),
+            checks: saw.map(|s| {
+                serde_json::json!({"passed": false, "failed": [], "saw": s,
+                    "sawSpecific": true, "changed": ["src/add.rs"]})
+            }),
+        }
+    }
+
+    #[test]
+    fn retry_feedback_none_without_model_attempts() {
+        let spec = spec_add();
+        assert_eq!(retry_feedback(&spec, &[]), None);
+        let infra = vec![
+            rec(1, "qwen3-coder", "infra", Some("model_error"), Some("model_error")),
+            rec(2, "qwen3-coder", "infra", None, None),
+        ];
+        assert_eq!(retry_feedback(&spec, &infra), None);
+    }
+
+    #[test]
+    fn retry_feedback_has_all_four_fields() {
+        let spec = spec_add();
+        let attempts = vec![rec(
+            1,
+            "qwen3-coder",
+            "model",
+            Some("verify_failed"),
+            Some("assertion failed: add(2, 2) == 4"),
+        )];
+        let out = retry_feedback(&spec, &attempts).expect("block");
+        assert!(out.starts_with("--- RETRY FEEDBACK (attempt 2) ---\n"), "{out}");
+        assert!(
+            out.contains("EXPECTED   `cargo test add -- --exact` exits 0"),
+            "{out}"
+        );
+        assert!(out.contains("files contain \"pub fn add\""), "{out}");
+        assert!(out.contains("SAW        assertion failed: add(2, 2) == 4"), "{out}");
+        assert!(out.contains("FENCE      src/add.rs"), "{out}");
+        assert!(
+            out.contains("DEAD ENDS  attempt 1 (qwen3-coder, verify_failed): assertion failed: add(2, 2) == 4"),
+            "{out}"
+        );
+        assert_eq!(out.lines().count(), 5);
+
+        // a 1000-char SAW never balloons a line: 11-char label + 300 + '…'
+        let long = "x".repeat(1000);
+        let attempts = vec![
+            attempts[0].clone(),
+            rec(2, "qwen3-coder", "model", Some("verify_failed"), Some(&long)),
+        ];
+        let out = retry_feedback(&spec, &attempts).expect("block");
+        assert!(out.starts_with("--- RETRY FEEDBACK (attempt 3) ---"));
+        for line in out.lines() {
+            assert!(line.chars().count() <= 312, "line too long ({}): {line}", line.chars().count());
+        }
+        assert!(out.lines().any(|l| l.starts_with("SAW        xxx") && l.ends_with('…')));
+    }
+
+    #[test]
+    fn retry_feedback_one_dead_end_per_model_attempt() {
+        let spec = spec_add();
+        let attempts = vec![
+            rec(1, "qwen3-coder", "model", Some("verify_failed"), Some("first saw")),
+            rec(2, "qwen3-coder", "infra", Some("model_error"), Some("model_error")),
+            rec(3, "qwen3-coder", "model", Some("postcheck_failed"), Some("third saw")),
+        ];
+        let out = retry_feedback(&spec, &attempts).expect("block");
+        let dead: Vec<&str> = out.lines().filter(|l| l.starts_with("DEAD ENDS  ")).collect();
+        assert_eq!(dead.len(), 2, "{out}");
+        assert_eq!(dead[0], "DEAD ENDS  attempt 1 (qwen3-coder, verify_failed): first saw");
+        assert_eq!(dead[1], "DEAD ENDS  attempt 3 (qwen3-coder, postcheck_failed): third saw");
+        assert!(out.lines().any(|l| l == "SAW        third saw"), "{out}");
+        assert!(out.starts_with("--- RETRY FEEDBACK (attempt 4) ---"));
+    }
+
+    #[test]
+    fn retry_feedback_old_rows_without_saw_fall_back_to_code() {
+        let spec = spec_add();
+        let attempts = vec![rec(1, "qwen3-coder", "model", Some("verify_failed"), None)];
+        let out = retry_feedback(&spec, &attempts).expect("block");
+        assert!(out.lines().any(|l| l == "SAW        verify_failed"), "{out}");
+        assert!(out.lines().any(|l| {
+            l == "DEAD ENDS  attempt 1 (qwen3-coder, verify_failed): no reason recorded"
+        }), "{out}");
+        // neither SAW nor code → "no reason recorded", class stands in for the code
+        let bare = vec![rec(1, "qwen3-coder", "model", None, None)];
+        let out = retry_feedback(&spec, &bare).expect("block");
+        assert!(out.lines().any(|l| l == "SAW        no reason recorded"), "{out}");
+        assert!(out.lines().any(|l| l == "DEAD ENDS  attempt 1 (qwen3-coder, model): no reason recorded"), "{out}");
+    }
+
+    #[test]
+    fn one_line_truncates_on_char_boundary() {
+        let s: String = "é🙂\n".repeat(140); // 420 chars, multi-byte, embedded newlines
+        let out = one_line(&s, 300);
+        assert!(out.chars().count() <= 301, "{}", out.chars().count());
+        assert!(out.ends_with('…'));
+        assert!(!out.contains('\n') && !out.contains('\r') && !out.contains('\t'));
+        assert!(out.starts_with("é🙂 é🙂"));
+        // control chars and whitespace runs collapse to one space
+        assert_eq!(one_line("  a\r\n\tb\u{7}  c  ", 300), "a b c");
+        // short input untouched (no ellipsis)
+        assert_eq!(one_line("short", 300), "short");
+        assert_eq!(one_line(&"y".repeat(300), 300), "y".repeat(300));
+    }
+
+    #[test]
+    fn retry_feedback_omits_empty_must_clauses() {
+        let mut spec = spec_add();
+        spec.must_contain.clear();
+        spec.must_not_contain.clear();
+        let attempts = vec![rec(1, "qwen3-coder", "model", Some("verify_failed"), Some("boom"))];
+        let out = retry_feedback(&spec, &attempts).expect("block");
+        assert!(!out.contains("files contain"), "{out}");
+        assert!(!out.contains("files do not contain"), "{out}");
+        assert!(out.lines().any(|l| l == "EXPECTED   `cargo test add -- --exact` exits 0"), "{out}");
+        // and both clauses render when present
+        spec.must_contain = vec!["pub fn add".into(), "pub fn sub".into()];
+        spec.must_not_contain = vec!["todo!()".into()];
+        let out = retry_feedback(&spec, &attempts).expect("block");
+        assert!(out.contains(
+            "; files contain \"pub fn add\", \"pub fn sub\"; files do not contain \"todo!()\""
+        ), "{out}");
+    }
+
+    // ---- 01/01 failure fingerprint ----------------------------------------
+
+    #[test]
+    fn normalize_saw_strips_digits_paths_whitespace() {
+        assert_eq!(
+            normalize_saw("error at src/a.rs:12:5\n  expected 4,  got 5"),
+            "error at <path> expected #, got #"
+        );
+        assert_eq!(normalize_saw("  Panicked AT C:\\x\\y.rs  line 1234 "), "panicked at <path> line #");
+    }
+
+    #[test]
+    fn fingerprint_equal_when_only_line_numbers_differ() {
+        let changed = vec!["src/add.rs".to_string()];
+        assert_eq!(
+            failure_fingerprint("assertion failed: add(2, 2) == 4 at line 12:5", &changed),
+            failure_fingerprint("assertion failed: add(2, 2) == 4 at line 40:9", &changed)
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_on_different_message() {
+        let changed = vec!["src/add.rs".to_string()];
+        assert_ne!(
+            failure_fingerprint("error[E0425]: cannot find value `b` in this scope", &changed),
+            failure_fingerprint("error[E0308]: mismatched types", &changed)
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_on_different_changed_set() {
+        let saw = "assertion failed: add(2, 2) == 4";
+        assert_ne!(
+            failure_fingerprint(saw, &["a.rs".to_string()]),
+            failure_fingerprint(saw, &["a.rs".to_string(), "b.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn fingerprint_ignores_changed_order_and_dups() {
+        let saw = "boom";
+        assert_eq!(
+            failure_fingerprint(saw, &["b".to_string(), "a".to_string(), "a".to_string()]),
+            failure_fingerprint(saw, &["a".to_string(), "b".to_string()])
+        );
+    }
+
+    // ---- 01/02 stuck step ---------------------------------------------------
+
+    fn att(label: &str, class: FailureClass) -> Attempt {
+        Attempt {
+            label: label.into(),
+            model: format!("m/{label}"),
+            class: Some(class),
+            infra_retry: false,
+        }
+    }
+
+    fn fp(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn stuck_when_last_two_model_fingerprints_equal() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        let fps = vec![fp("X"), fp("X")];
+        assert!(is_stuck_same_failure(&hist, &fps));
+        // default ladder still has claude + opus slots, yet the guard stops
+        assert!(matches!(
+            Ladder::default().next_attempt(&hist, Some(FailureClass::Model)),
+            Step::Run { .. }
+        ));
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
+
+    #[test]
+    fn not_stuck_when_fingerprints_differ() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model)];
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &[fp("X")], Some(FailureClass::Model)),
+            Ladder::default().next_attempt(&hist, Some(FailureClass::Model))
+        );
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        match Ladder::default().next_attempt_guarded(&hist, &[fp("X"), fp("Y")], Some(FailureClass::Model)) {
+            Step::Run { label, .. } => assert_eq!(label, "claude"),
+            s => panic!("{s:?}"),
+        }
+        // after a single model failure the next step is qwen attempt 2
+        let one = vec![att("qwen3-coder", FailureClass::Model)];
+        match Ladder::default().next_attempt_guarded(&one, &[fp("X")], Some(FailureClass::Model)) {
+            Step::Run { label, attempt_index, .. } => {
+                assert_eq!(label, "qwen3-coder");
+                assert_eq!(attempt_index, 2);
+            }
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
+    fn not_stuck_when_a_fingerprint_is_none() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        for fps in [vec![fp("X"), None], vec![None, fp("X")], vec![None, None]] {
+            assert!(!is_stuck_same_failure(&hist, &fps), "{fps:?}");
+            assert!(matches!(
+                Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+                Step::Run { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn infra_between_same_failures_still_stuck() {
+        let hist = vec![
+            att("qwen3-coder", FailureClass::Model),
+            att("qwen3-coder", FailureClass::Infra),
+            att("qwen3-coder", FailureClass::Model),
+        ];
+        let fps = vec![fp("X"), None, fp("X")];
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
+
+    #[test]
+    fn stuck_across_tiers() {
+        let hist = vec![
+            att("qwen3-coder", FailureClass::Model),
+            att("qwen3-coder", FailureClass::Model),
+            att("claude", FailureClass::Model),
+        ];
+        let fps = vec![fp("X"), fp("Y"), fp("Y")];
+        // without the guard opus would run next
+        match Ladder::default().next_attempt(&hist, Some(FailureClass::Model)) {
+            Step::Run { label, .. } => assert_eq!(label, "opus"),
+            s => panic!("{s:?}"),
+        }
+        assert_eq!(
+            Ladder::default().next_attempt_guarded(&hist, &fps, Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
+
+    #[test]
+    fn guard_ignores_non_model_class() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        let fps = vec![fp("X"), fp("X")];
+        let l = Ladder::default();
+        assert_eq!(
+            l.next_attempt_guarded(&hist, &fps, Some(FailureClass::Infra)),
+            l.next_attempt(&hist, Some(FailureClass::Infra))
+        );
+        assert_eq!(l.next_attempt_guarded(&hist, &fps, Some(FailureClass::Shape)), Step::StopShape);
+        assert_eq!(l.next_attempt_guarded(&hist, &fps, None), l.next_attempt(&hist, None));
+    }
+
+    #[test]
+    fn length_mismatch_is_not_stuck() {
+        let hist = vec![att("qwen3-coder", FailureClass::Model), att("qwen3-coder", FailureClass::Model)];
+        assert!(!is_stuck_same_failure(&hist, &[fp("X")]));
+        assert!(!is_stuck_same_failure(&hist, &[fp("X"), fp("X"), fp("X")]));
+        assert!(!is_stuck_same_failure(&[], &[]));
+        assert!(matches!(
+            Ladder::default().next_attempt_guarded(&hist, &[fp("X")], Some(FailureClass::Model)),
+            Step::Run { .. }
+        ));
+    }
+
+    #[test]
+    fn executor_ladder_stuck_before_third_attempt() {
+        let l = Ladder::for_executor(Some("m"));
+        let hist = vec![att("m", FailureClass::Model), att("m", FailureClass::Model)];
+        // slot 3 of 3 is still unused
+        assert!(matches!(l.next_attempt(&hist, Some(FailureClass::Model)), Step::Run { .. }));
+        assert_eq!(
+            l.next_attempt_guarded(&hist, &[fp("X"), fp("X")], Some(FailureClass::Model)),
+            Step::StuckSameFailure
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1303,4 +2014,5 @@ ctx: 32768
             ["--".to_string(), "implement add()".to_string()]
         );
     }
+
 }

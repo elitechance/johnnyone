@@ -637,15 +637,26 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
             if is_cancelled(&host.plan_status()) {
                 return Ok(PhaseLoopOutcome::Cancelled);
             }
-            let history = attempts_to_history(row_ref(&file, &task_id)?.attempts.as_slice());
-            let step =
-                Ladder::for_executor(ctx.exec_model.as_deref()).next_attempt(&history, last_class);
+            let (history, fingerprints) = {
+                let records = row_ref(&file, &task_id)?.attempts.as_slice();
+                (attempts_to_history(records), attempt_fingerprints(records))
+            };
+            let step = Ladder::for_executor(ctx.exec_model.as_deref()).next_attempt_guarded(
+                &history,
+                &fingerprints,
+                last_class,
+            );
             let (model, label) = match step {
                 Step::Run { model, label, .. } | Step::RetryInfra { model, label } => {
                     (model, label)
                 }
                 Step::StopShape => {
                     fail_task(ctx, host, &mut file, &task_id, "planner", None, None)?;
+                    break;
+                }
+                Step::StuckSameFailure => {
+                    // Defensive: the Model branch below normally stops first.
+                    stop_stuck_task(ctx, host, &mut file, &task_id)?;
                     break;
                 }
                 Step::Exhausted => {
@@ -661,10 +672,20 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
 
             let attempt_n = row_ref(&file, &task_id)?.attempts.len() as u32 + 1;
             let started = Utc::now().to_rfc3339();
-            let wrapped = crate::services::planner_prompts::wrap_leaf_prompt(
+            let mut wrapped = crate::services::planner_prompts::wrap_leaf_prompt(
                 &ctx.leaf_wrapper,
                 &prompt,
             );
+            // O1: a retry after a Model-class failure carries what the last
+            // attempts saw. Built from the persisted row (survives resume);
+            // attempt 1 / infra-only history ⇒ None ⇒ prompt unchanged.
+            if let Some(fb) = crate::services::task_check::retry_feedback(
+                &spec,
+                &row_ref(&file, &task_id)?.attempts,
+            ) {
+                wrapped.push_str("\n\n");
+                wrapped.push_str(&fb);
+            }
             let req = KlooRunRequest {
                 workspace: ctx.workspace.to_string_lossy().into_owned(),
                 prompt: wrapped,
@@ -724,6 +745,12 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
 
             let post_hashes = hash_files(host, &ctx.workspace, &spec.files);
             let post_contents = read_files(host, &ctx.workspace, &spec.files);
+            // Spawn failures changed nothing we can attribute (infra).
+            let changed = if spawn_fail.is_some() {
+                Vec::new()
+            } else {
+                crate::services::task_check::delta_paths(&result, &pre_spawn_dirty)
+            };
             let inputs = CheckInputs {
                 pre_spawn_dirty,
                 pre_hashes,
@@ -759,7 +786,13 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                     failure_code: result.failure_code.clone(),
                     exit_code: Some(exit_code),
                     class: class.map(class_str).map(str::to_string),
-                    checks: Some(checks_json(&report)),
+                    checks: Some(attempt_checks_json(
+                        &report,
+                        &result,
+                        spawn_fail.is_some(),
+                        class,
+                        changed,
+                    )),
                 });
             }
             save_and_project(ctx, &mut file)?;
@@ -837,8 +870,17 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                     break;
                 }
                 Some(FailureClass::Model) => {
-                    let hist = attempts_to_history(row_ref(&file, &task_id)?.attempts.as_slice());
-                    match next_attempt(&hist, Some(FailureClass::Model)) {
+                    let (hist, fps) = {
+                        let records = row_ref(&file, &task_id)?.attempts.as_slice();
+                        (attempts_to_history(records), attempt_fingerprints(records))
+                    };
+                    // Default ladder kept here (pre-existing; see phase 01
+                    // discoveries) — the stuck answer does not depend on slots.
+                    match Ladder::default().next_attempt_guarded(
+                        &hist,
+                        &fps,
+                        Some(FailureClass::Model),
+                    ) {
                         Step::Run { label: next_label, .. } => {
                             if next_label != label {
                                 host.emit(
@@ -854,6 +896,11 @@ pub async fn run_kloo_phase_with<H: LoopHost>(
                             }
                         }
                         Step::RetryInfra { .. } => {}
+                        Step::StuckSameFailure => {
+                            // O2: same failure twice — stop while slots remain.
+                            stop_stuck_task(ctx, host, &mut file, &task_id)?;
+                            break;
+                        }
                         Step::Exhausted | Step::StopShape => {
                             fail_task(
                                 ctx,
@@ -915,6 +962,106 @@ fn checks_json(report: &CheckReport) -> serde_json::Value {
             serde_json::json!({ "check": f.check, "reason": f.reason })
         }).collect::<Vec<_>>(),
     })
+}
+
+/// Per-attempt `checks` record: [`checks_json`] (`passed`/`failed`, unchanged)
+/// plus the additive keys of master plan §4 — `saw`/`sawSpecific` (omitted
+/// when there is no SAW or the spawn itself failed), `changed`, and
+/// `fingerprint` — only for a Model-class attempt with a *specific* SAW (D3).
+fn attempt_checks_json(
+    report: &CheckReport,
+    result: &KlooResult,
+    spawn_failed: bool,
+    class: Option<FailureClass>,
+    changed: Vec<String>,
+) -> serde_json::Value {
+    let mut v = checks_json(report);
+    if let Some(obj) = v.as_object_mut() {
+        if !spawn_failed {
+            if let Some(saw) = crate::services::task_check::attempt_saw(report, result) {
+                if class == Some(FailureClass::Model) && saw.specific {
+                    obj.insert(
+                        "fingerprint".into(),
+                        serde_json::Value::String(
+                            crate::services::task_check::failure_fingerprint(&saw.text, &changed),
+                        ),
+                    );
+                }
+                obj.insert("saw".into(), serde_json::Value::String(saw.text));
+                obj.insert("sawSpecific".into(), serde_json::Value::Bool(saw.specific));
+            }
+        }
+        obj.insert("changed".into(), serde_json::json!(changed));
+    }
+    v
+}
+
+/// `checks.fingerprint` per attempt (parallel to `attempts_to_history`);
+/// `None` for rows without one (generic SAW, non-model, or pre-O2 rows).
+fn attempt_fingerprints(records: &[AttemptRecord]) -> Vec<Option<String>> {
+    records
+        .iter()
+        .map(|r| {
+            r.checks
+                .as_ref()
+                .and_then(|c| c.get("fingerprint"))
+                .and_then(|f| f.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+pub const STUCK_SAME_FAILURE: &str = "stuck_same_failure";
+
+/// O2 stop: rewrite the last attempt's code to `stuck_same_failure` (prior
+/// kloo code kept in `checks.priorFailureCode`, human line in
+/// `checks.reason`) — `fail_task` only fills a `None` code (D4) — then route
+/// to the planner exactly like a Model-class `Exhausted`.
+fn stop_stuck_task<H: LoopHost>(
+    ctx: &KlooPhaseCtx,
+    host: &mut H,
+    file: &mut TaskRunFile,
+    task_id: &str,
+) -> Result<(), String> {
+    let reason = {
+        let row = row_mut(file, task_id)?;
+        let last = row
+            .attempts
+            .last_mut()
+            .ok_or_else(|| format!("stuck task {task_id} has no attempts"))?;
+        let saw = last
+            .checks
+            .as_ref()
+            .and_then(|c| c.get("saw"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let reason = format!(
+            "same failure twice: {}",
+            crate::services::task_check::one_line(
+                &saw,
+                crate::services::task_check::FEEDBACK_FIELD_MAX
+            )
+        );
+        let prior = last.failure_code.replace(STUCK_SAME_FAILURE.to_string());
+        let checks = last.checks.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = checks.as_object_mut() {
+            if let Some(p) = prior {
+                obj.insert("priorFailureCode".into(), serde_json::Value::String(p));
+            }
+            obj.insert("reason".into(), serde_json::Value::String(reason.clone()));
+        }
+        reason
+    };
+    fail_task(
+        ctx,
+        host,
+        file,
+        task_id,
+        "planner",
+        Some(STUCK_SAME_FAILURE),
+        Some(&reason),
+    )
 }
 
 fn load_prompt(phase_dir: &Path, task_id: &str) -> Result<String, String> {
@@ -1521,6 +1668,14 @@ mod tests {
         )
     }
 
+    /// Like [`fail_json`] but with kloo's `failure_detail` (the failing verify
+    /// line). `message` must not contain `"` or `\\` (embedded verbatim).
+    fn fail_json_detail(path: &str, code: &str, message: &str) -> String {
+        format!(
+            "KLOO_RESULT_JSON {{\"success\":false,\"failure_code\":\"{code}\",\"files_changed\":{{\"count\":1,\"paths\":[\"{path}\"]}},\"off_scope_edits\":0,\"verify\":{{\"command\":\"true\",\"passed\":false,\"exit_code\":1}},\"failure_detail\":{{\"source\":\"verify\",\"class\":\"verify_failed\",\"message\":\"{message}\"}}}}"
+        )
+    }
+
     struct ScriptedHost {
         workspace: PathBuf,
         status: Arc<Mutex<String>>,
@@ -1531,6 +1686,7 @@ mod tests {
         spawned_providers: Vec<Option<String>>,
         commits: Vec<String>,
         events: Vec<String>,
+        event_codes: Vec<(String, Option<String>)>,
         index: HashMap<(String, String), String>,
         stop_after_commits: Option<usize>,
         commit_returns_none: bool,
@@ -1549,6 +1705,7 @@ mod tests {
                 spawned_providers: vec![],
                 commits: vec![],
                 events: vec![],
+                event_codes: vec![],
                 index: HashMap::new(),
                 stop_after_commits: None,
                 commit_returns_none: false,
@@ -1594,6 +1751,24 @@ mod tests {
                 std::fs::write(ws.join(&rel), &body).unwrap();
                 Ok(SpawnOutcome {
                     stdout: fail_json(&rel, &code),
+                    exit_code: 10,
+                })
+            }));
+        }
+
+        fn push_fail_detail(&mut self, rel: &str, body: &str, code: &str, message: &str) {
+            let ws = self.workspace.clone();
+            let rel = rel.to_string();
+            let body = body.to_string();
+            let code = code.to_string();
+            let message = message.to_string();
+            self.spawn_scripts.push_back(Box::new(move |_req| {
+                if let Some(parent) = Path::new(&rel).parent() {
+                    let _ = std::fs::create_dir_all(ws.join(parent));
+                }
+                std::fs::write(ws.join(&rel), &body).unwrap();
+                Ok(SpawnOutcome {
+                    stdout: fail_json_detail(&rel, &code, &message),
                     exit_code: 10,
                 })
             }));
@@ -1685,12 +1860,14 @@ mod tests {
             _task_id: &str,
             _tier: Option<&str>,
             _attempt: Option<u32>,
-            _failure_code: Option<&str>,
+            failure_code: Option<&str>,
             _commit_sha: Option<&str>,
             _route: Option<&str>,
             _checks: Option<serde_json::Value>,
         ) {
             self.events.push(event_type.to_string());
+            self.event_codes
+                .push((event_type.to_string(), failure_code.map(str::to_string)));
         }
     }
 
@@ -2058,6 +2235,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_prompt_carries_previous_saw_and_dead_ends() {
+        // Required test 1 (O1): attempt 2 of a task that failed on a Model-class
+        // verify carries attempt 1's SAW; attempt 1's prompt is untouched.
+        let root = tmp("retry-fb");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "pub fn add")),
+            "BODY",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_fail_detail(
+            "a.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
+            "verify_failed",
+            "assertion failed: add(2, 2) == 4",
+        );
+        host.push_pass("a.rs", "pub fn add(a: i32, b: i32) -> i32 { a + b }\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+
+        assert_eq!(host.spawned_prompts.len(), 2, "{:?}", host.spawned_prompts);
+        let (first, second) = (&host.spawned_prompts[0], &host.spawned_prompts[1]);
+        assert!(!first.contains("RETRY FEEDBACK"), "{first}");
+        assert!(!first.contains("SAW"), "{first}");
+        assert!(!first.contains("DEAD ENDS"), "{first}");
+        assert!(
+            second.contains("assertion failed: add(2, 2) == 4"),
+            "retry prompt must carry attempt 1's SAW: {second}"
+        );
+        assert!(second.contains("DEAD ENDS  attempt 1"), "{second}");
+        assert!(
+            second.contains("EXPECTED   `cargo test spec -- --exact` exits 0"),
+            "{second}"
+        );
+        assert!(second.contains("FENCE      a.rs"), "{second}");
+        assert!(second.starts_with(first.as_str()), "block must be appended: {second}");
+        assert!(second.contains("\n\n--- RETRY FEEDBACK (attempt 2) ---\n"), "{second}");
+
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        let a1 = file.tasks[0].attempts[0].checks.as_ref().expect("checks");
+        assert_eq!(a1["saw"], "assertion failed: add(2, 2) == 4");
+        assert_eq!(a1["sawSpecific"], true);
+        assert_eq!(a1["changed"], serde_json::json!(["a.rs"]));
+        assert_eq!(a1["passed"], false);
+        assert!(a1["failed"].is_array());
+        // a passing attempt records its delta and no SAW
+        let a2 = file.tasks[0].attempts[1].checks.as_ref().expect("checks");
+        assert!(a2.get("saw").is_none(), "{a2}");
+        assert_eq!(a2["changed"], serde_json::json!(["a.rs"]));
+        // the loop never rewrites prompt.md
+        let on_disk = std::fs::read_to_string(ctx.phase_dir.join("tasks/01-a/prompt.md")).unwrap();
+        assert_eq!(on_disk, "BODY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn infra_retry_without_model_failure_has_no_block() {
+        let root = tmp("retry-infra");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "fn a")),
+            "BODY",
+        );
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_stdout("lots of logs\nno result line\n", 0);
+        host.push_pass("a.rs", "fn a() {}\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+        assert_eq!(host.spawned_prompts.len(), 2);
+        assert!(!host.spawned_prompts[1].contains("RETRY FEEDBACK"), "{}", host.spawned_prompts[1]);
+        assert_eq!(host.spawned_prompts[0], host.spawned_prompts[1]);
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        let a1 = &file.tasks[0].attempts[0];
+        assert_eq!(a1.class.as_deref(), Some("infra"));
+        let c = a1.checks.as_ref().unwrap();
+        assert!(c.get("saw").is_none(), "spawn failure records no SAW: {c}");
+        assert_eq!(c["changed"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn shape_missing_file_does_not_escalate() {
         let root = tmp("shape-dep");
         let (ctx, _) = ctx_for(&root, "00-x");
@@ -2286,8 +2548,14 @@ mod tests {
         );
         std::fs::write(ctx.workspace.join("a.rs"), "old\n").unwrap();
         let mut host = ScriptedHost::new(ctx.workspace.clone());
-        host.push_fail("a.rs", "fn nope() {}\n", "verify_failed");
-        host.push_fail("a.rs", "fn still() {}\n", "verify_failed");
+        // Distinct failures (O2: identical ones would now stop early).
+        host.push_fail_detail(
+            "a.rs",
+            "fn nope() {}\n",
+            "verify_failed",
+            "error[E0425]: cannot find function `add` in this scope",
+        );
+        host.push_fail_detail("a.rs", "fn still() {}\n", "verify_failed", "error[E0308]: mismatched types");
         host.push_pass("a.rs", "pub fn add() {}\n");
         let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
         assert_eq!(out, PhaseLoopOutcome::AllDone);
@@ -2311,6 +2579,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_failure_twice_stops_before_ladder_exhausted() {
+        // Required test 2 (O2): two Model failures differing only by line number
+        // stop the task on qwen; claude + opus slots are never spent.
+        let root = tmp("stuck");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "pub fn add")),
+            "01-a",
+        );
+        write_task(
+            &ctx.phase_dir,
+            "02-b",
+            Some(&yml("02-b", "b.rs", "cargo test spec -- --exact", "01-a", Some("b.rs"), "fn b")),
+            "02-b",
+        );
+        std::fs::write(ctx.workspace.join("a.rs"), "old\n").unwrap();
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_fail_detail(
+            "a.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { a - b }\n",
+            "verify_failed",
+            "assertion failed: add(2, 2) == 4 at src/a.rs:12",
+        );
+        host.push_fail_detail(
+            "a.rs",
+            "pub fn add(a: i32, b: i32) -> i32 { b - a }\n",
+            "verify_failed",
+            "assertion failed: add(2, 2) == 4 at src/a.rs:40",
+        );
+        host.push_pass("a.rs", "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"); // must NOT be consumed
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(
+            host.spawned_models.len(),
+            2,
+            "claude + opus slots must stay unused: {:?}",
+            host.spawned_models
+        );
+        assert_eq!(host.spawned_models, vec!["qwen/qwen3-coder", "qwen/qwen3-coder"]);
+        assert_eq!(host.spawn_scripts.len(), 1, "the scripted pass must not be consumed");
+        assert_eq!(
+            out,
+            PhaseLoopOutcome::Partial {
+                failed: vec!["01-a".into()],
+                blocked: vec!["02-b".into()],
+                first_route: Some("planner".into()),
+                first_task_id: Some("01-a".into()),
+            }
+        );
+
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        let row = file.tasks.iter().find(|t| t.id == "01-a").unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.route.as_deref(), Some("planner"));
+        assert_eq!(row.attempts.len(), 2);
+        let last = row.attempts.last().unwrap();
+        assert_eq!(last.failure_code.as_deref(), Some("stuck_same_failure"));
+        let lc = last.checks.as_ref().expect("checks");
+        assert_eq!(lc["priorFailureCode"], "verify_failed");
+        assert!(
+            lc["reason"].as_str().unwrap().starts_with("same failure twice:"),
+            "{lc}"
+        );
+        let fp1 = &row.attempts[0].checks.as_ref().unwrap()["fingerprint"];
+        let fp2 = &lc["fingerprint"];
+        assert!(fp1.is_string(), "{fp1}");
+        assert!(fp2.is_string(), "{fp2}");
+        assert_eq!(fp1, fp2);
+        assert_eq!(
+            file.tasks.iter().find(|t| t.id == "02-b").unwrap().status,
+            "blocked"
+        );
+        assert!(host.event_codes.contains(&(
+            "agent_phase_task_failed".to_string(),
+            Some("stuck_same_failure".to_string())
+        )), "{:?}", host.event_codes);
+        assert!(
+            !host.events.iter().any(|e| e == "agent_phase_task_escalated"),
+            "{:?}",
+            host.events
+        );
+        // routed exactly like a Model-class Exhausted
+        assert_eq!(crate::services::task_replan::amendment_rule_for(row), "exhausted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn different_failures_continue_to_next_slot() {
+        // Required test 3: different failures are progress — the ladder climbs.
+        let root = tmp("not-stuck");
+        let (ctx, _) = ctx_for(&root, "00-x");
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "pub fn add")),
+            "01-a",
+        );
+        std::fs::write(ctx.workspace.join("a.rs"), "old\n").unwrap();
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_fail_detail(
+            "a.rs",
+            "pub fn add() { b }\n",
+            "verify_failed",
+            "error[E0425]: cannot find value `b` in this scope",
+        );
+        host.push_fail_detail("a.rs", "pub fn add() -> u8 { 1i32 }\n", "verify_failed", "error[E0308]: mismatched types");
+        host.push_pass("a.rs", "pub fn add() {}\n");
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        assert_eq!(out, PhaseLoopOutcome::AllDone);
+        assert_eq!(
+            host.spawned_models,
+            vec!["qwen/qwen3-coder", "qwen/qwen3-coder", "anthropic/claude-sonnet-5"]
+        );
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        assert_eq!(file.tasks[0].succeeded_tier.as_deref(), Some("claude"));
+        let fps: Vec<_> = file.tasks[0].attempts[..2]
+            .iter()
+            .map(|a| a.checks.as_ref().unwrap()["fingerprint"].clone())
+            .collect();
+        assert!(fps[0].is_string() && fps[1].is_string());
+        assert_ne!(fps[0], fps[1]);
+        assert!(!host.event_codes.iter().any(|(_, c)| c.as_deref() == Some("stuck_same_failure")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn executor_ladder_same_failure_stops_at_two_of_three() {
+        let root = tmp("stuck-exec");
+        let (mut ctx, _) = ctx_for(&root, "00-x");
+        ctx.exec_model = Some("local/m".into());
+        write_task(
+            &ctx.phase_dir,
+            "01-a",
+            Some(&yml("01-a", "a.rs", "cargo test spec -- --exact", "", Some("a.rs"), "pub fn add")),
+            "01-a",
+        );
+        std::fs::write(ctx.workspace.join("a.rs"), "old\n").unwrap();
+        let mut host = ScriptedHost::new(ctx.workspace.clone());
+        host.push_fail_detail("a.rs", "pub fn add() { 1 }\n", "verify_failed", "assertion failed: add(2, 2) == 4 at line 7");
+        host.push_fail_detail("a.rs", "pub fn add() { 2 }\n", "verify_failed", "assertion failed: add(2, 2) == 4 at line 9");
+        host.push_pass("a.rs", "pub fn add() {}\n"); // slot 3 — must stay unused
+        let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
+        match out {
+            PhaseLoopOutcome::Partial { failed, first_route, .. } => {
+                assert_eq!(failed, vec!["01-a"]);
+                assert_eq!(first_route.as_deref(), Some("planner"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(host.spawned_models, vec!["local/m", "local/m"]);
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        assert_eq!(
+            file.tasks[0].attempts.last().unwrap().failure_code.as_deref(),
+            Some("stuck_same_failure")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn exhausted_model_routes_planner_and_blocks() {
         let root = tmp("exh");
         let (ctx, _) = ctx_for(&root, "00-x");
@@ -2328,8 +2756,14 @@ mod tests {
         );
         std::fs::write(ctx.workspace.join("a.rs"), "old\n").unwrap();
         let mut host = ScriptedHost::new(ctx.workspace.clone());
-        for _ in 0..4 {
-            host.push_fail("a.rs", "fn nope() {}\n", "verify_failed");
+        // Four distinct failures (O2: identical ones would now stop early).
+        for msg in [
+            "error[E0425]: cannot find function `add` in this scope",
+            "error[E0308]: mismatched types",
+            "assertion failed: add(2, 2) == 4",
+            "error[E0061]: this function takes 2 arguments but 1 argument was supplied",
+        ] {
+            host.push_fail_detail("a.rs", "fn nope() {}\n", "verify_failed", msg);
         }
         let out = run_kloo_phase_with(&ctx, &mut host).await.unwrap();
         match out {
@@ -2775,6 +3209,15 @@ mod tests {
         }
         assert_eq!(host.spawned_models.len(), 4);
         assert_eq!(host.spawned_models[3], "anthropic/claude-opus-5");
+        // D3: a generic SAW (postcheck_failed, no detail) is never fingerprinted,
+        // so identical generic failures still climb the whole ladder.
+        let file = load_tasks(&tasks_json_path(&ctx.runs_dir), &ctx.plan_id, &ctx.phase_id).unwrap();
+        let a = &file.tasks.iter().find(|t| t.id == "01-a").unwrap().attempts;
+        assert_eq!(a.len(), 4);
+        for rec in a {
+            let c = rec.checks.as_ref().expect("checks");
+            assert!(c.get("fingerprint").is_none(), "generic SAW must not be fingerprinted: {c}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
