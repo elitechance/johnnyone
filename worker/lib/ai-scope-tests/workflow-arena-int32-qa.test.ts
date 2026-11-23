@@ -38,6 +38,22 @@ const schemaSources = import.meta.glob('../../schema/johnnyone-ai.graphql', {
 }) as Record<string, string>;
 const schemaSource = Object.values(schemaSources)[0] ?? '';
 
+/**
+ * The arena's declarations: the bodies of `type Workflow`, `type WorkflowRun` and
+ * `type WorkflowSearchState`, plus every schema line that names a Workflow operation.
+ */
+function arenaDeclarations(sdl: string): string {
+  const parts: string[] = [];
+  for (const name of ['Workflow', 'WorkflowRun', 'WorkflowSearchState']) {
+    const m = new RegExp(`type ${name} \\{[^}]*\\}`).exec(sdl);
+    if (m) parts.push(m[0]);
+  }
+  for (const line of sdl.split('\n')) {
+    if (/Workflow/.test(line)) parts.push(line + '\n');
+  }
+  return parts.join('\n');
+}
+
 const OVER_I32 = 2_147_483_648; // i32::MAX + 1
 const MAX_SAFE = 9_007_199_254_740_991; // Number.MAX_SAFE_INTEGER
 
@@ -58,7 +74,12 @@ describe('QA A — the arena numeric fields and 32-bit overflow', () => {
         decl,
       );
     }
-    // And the 32-bit forms must be GONE, so a revert cannot pass this file.
+    // And the 32-bit forms must be GONE from the ARENA declarations, so a revert cannot pass this
+    // file. Scoped to the arena's own types plus every line naming a Workflow operation (its
+    // mutation arguments): a whole-file substring check also banned unrelated fields such as the
+    // Plans tab's `BriefVersion.version: Int!` (a dense per-plan counter, not an arena i64).
+    const arenaSource = arenaDeclarations(schemaSource);
+    expect(arenaSource, 'the arena slice must hold the declarations above').toContain('version: Float!');
     for (const gone of [
       'seed: Int!',
       'gateExit: Int\n',
@@ -68,7 +89,7 @@ describe('QA A — the arena numeric fields and 32-bit overflow', () => {
       'consecutiveRejections: Int!',
       'strikeLimit: Int!',
     ]) {
-      expect(schemaSource, `${gone.trim()} must no longer appear`).not.toContain(gone);
+      expect(arenaSource, `${gone.trim()} must no longer appear`).not.toContain(gone);
     }
     // The mutation arguments too — an `Int!` argument refuses the value at input coercion.
     expect(schemaSource).toContain('gateExit: Float!');

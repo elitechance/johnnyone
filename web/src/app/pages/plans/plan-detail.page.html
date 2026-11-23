@@ -1,0 +1,290 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-buttons slot="start">
+      <ion-back-button defaultHref="/plans" text=""></ion-back-button>
+    </ion-buttons>
+    <ion-title>
+      <span class="hd">
+        <span class="hd-title">{{ plan()?.title || 'Plan' }}</span>
+        @if (plan(); as p) {
+          <johnny-status-pill kind="status" [value]="p.initiativeStatus"></johnny-status-pill>
+        }
+      </span>
+    </ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  @switch (state()) {
+    @case ('loading') {
+      <!-- S11 loading: skeletons in the chat card and in three brief rows. -->
+      <div class="split" data-pane="chat" aria-busy="true">
+        <ion-card class="card chat-card">
+          <div class="ch">Plan agent · claude_code</div>
+          <ion-card-content>
+            <ion-skeleton-text [animated]="true" style="width: 40%"></ion-skeleton-text>
+            <ion-skeleton-text [animated]="true" style="width: 85%"></ion-skeleton-text>
+            <ion-skeleton-text [animated]="true" style="width: 70%"></ion-skeleton-text>
+          </ion-card-content>
+        </ion-card>
+        <ion-card class="card brief-card">
+          <div class="ch">Brief</div>
+          <ion-card-content>
+            @for (i of [1, 2, 3]; track i) {
+              <ion-skeleton-text [animated]="true" style="width: 30%"></ion-skeleton-text>
+              <ion-skeleton-text [animated]="true"></ion-skeleton-text>
+            }
+          </ion-card-content>
+        </ion-card>
+      </div>
+    }
+    @case ('error') {
+      <ion-card class="state-card" color="danger">
+        <ion-card-content>
+          <ion-icon name="alert-circle-outline"></ion-icon>
+          <span class="msg">{{ error() }}</span>
+          <ion-button fill="outline" color="light" size="small" (click)="load()">Retry</ion-button>
+        </ion-card-content>
+      </ion-card>
+    }
+    @case ('not-found') {
+      <ion-card class="state-card empty">
+        <ion-card-content>
+          <ion-icon name="search-outline" class="big"></ion-icon>
+          <h2>Plan not found</h2>
+          <p>It was deleted, or the link is wrong.</p>
+          <ion-button fill="outline" routerLink="/plans">← Back to Plans</ion-button>
+        </ion-card-content>
+      </ion-card>
+    }
+    @default {
+      @if (frozen()) {
+        <!-- S9: frozen after Start planning. -->
+        <div class="frozen">
+          <ion-icon name="lock-closed-outline"></ion-icon>
+          <span><b>Frozen at v{{ frozenAt() }}</b> — planning started.</span>
+          <a [routerLink]="['/initiatives']" [queryParams]="{ initiativeId: id() }">Open initiative →</a>
+        </div>
+      }
+
+      <!-- Phone (< 900px): one pane at a time. -->
+      <ion-segment class="phone-seg" [value]="pane()" (ionChange)="setPane($any($event).detail.value)">
+        <ion-segment-button value="chat"><ion-label>Chat</ion-label></ion-segment-button>
+        <ion-segment-button value="brief">
+          <ion-label>Brief</ion-label>
+          @if (badges().brief) {<ion-badge color="warning">{{ badges().brief }} changed</ion-badge>}
+        </ion-segment-button>
+        <ion-segment-button value="outline">
+          <ion-label>Outline</ion-label>
+          @if (badges().outline) {<ion-badge color="warning">{{ badges().outline }}</ion-badge>}
+        </ion-segment-button>
+      </ion-segment>
+
+      <div class="split" [attr.data-pane]="pane()">
+        <!-- ───────── CHAT ───────── -->
+        <ion-card class="card chat-card">
+          <div class="ch">
+            <span class="agent-pill" [attr.data-state]="agent()">
+              <span class="tick"></span>Plan agent · claude_code · {{ agent() }}
+            </span>
+            @if (chat.isStreaming()) {<ion-spinner name="dots" class="ch-spin"></ion-spinner>}
+          </div>
+          <johnny-chat-window
+            class="chat"
+            [messages]="messages()"
+            [isStreaming]="chat.isStreaming()"
+            [streamingMessageId]="chat.streamingMessageId()"
+            [disabled]="composer().disabled"
+            [placeholder]="composer().placeholder"
+            [bubbleDisplay]="bubbleDisplay"
+            emptyTitle="Tell the plan agent what you want to build."
+            emptyDescription="It drafts the brief and the outline on the right, one versioned change at a time."
+            (messageSent)="send($event)"
+          >
+            <div chat-meta class="chips-row">
+              @for (c of choices(); track c) {
+                <ion-chip outline="true" (click)="send(c)">{{ c }}</ion-chip>
+              }
+            </div>
+          </johnny-chat-window>
+          <ion-note class="scope">
+            MCP scope: <b>this plan only, while it is a draft.</b> Tools: brief.get/update/versions, outline.*,
+            plan.check, repo.search (read-only). It can't write code, run commands or start planning.
+          </ion-note>
+        </ion-card>
+
+        <!-- ───────── BRIEF ───────── -->
+        <ion-card class="card brief-card">
+          <div class="ch">Brief <span class="r">plan/brief.md is generated from these fields</span></div>
+          <div class="versions">
+            <span class="vl">versions</span>
+            @for (c of chips(); track c.version) {
+              <app-version-chip [chip]="c" [selected]="selectedVersion() === c.version" (click)="showDiff(c.version)" />
+            }
+            @if (selectedVersion() !== null) {
+              <ion-button fill="clear" size="small" class="back" (click)="clearDiff()">Back to latest</ion-button>
+            }
+          </div>
+
+          @if (selectedVersion() !== null) {
+            <!-- S7: the diff of the tapped version against the one before it. Read-only. -->
+            <div class="diff">
+              <div class="diff-h">
+                v{{ (selectedVersion() ?? 1) - 1 }} → v{{ selectedVersion() }}
+                @if (diffLoading()) {<ion-spinner name="dots"></ion-spinner>}
+              </div>
+              @if (selectedVersion() === 1) {
+                <p class="diff-note">v1 is the first version — it was seeded from your ask.</p>
+              } @else {
+                @for (s of diffModel().sections; track s.title) {
+                  <div class="diff-f">{{ s.title }}</div>
+                  @for (d of s.del; track $index) {<del>{{ d }}</del>}
+                  @for (a of s.ins; track $index) {<ins>{{ a }}</ins>}
+                }
+                @if (diffModel().unchangedNote) {<p class="diff-note">{{ diffModel().unchangedNote }}</p>}
+              }
+            </div>
+          }
+
+          <div class="fields">
+            @for (r of rows(); track r.key) {
+              <app-brief-field [row]="r" [editing]="editing() === r.key">
+                <span field-actions>
+                  @if (r.canUndo) {
+                    <ion-button fill="clear" size="small" class="undo" [disabled]="busy()" (click)="undo(r)">
+                      <ion-icon slot="start" name="arrow-undo-outline"></ion-icon>undo
+                    </ion-button>
+                  }
+                  @if (!frozen() && editing() !== r.key) {
+                    <ion-button fill="clear" size="small" [attr.aria-label]="'Edit ' + r.label" (click)="startEdit(r)">
+                      <ion-icon slot="icon-only" name="create-outline"></ion-icon>
+                    </ion-button>
+                  }
+                </span>
+                <div field-editor class="editor">
+                  @if (r.isList) {
+                    <div class="where-edit">
+                      @for (w of r.chips; track w) {
+                        <ion-chip>
+                          <ion-label>{{ w }}</ion-label>
+                          <ion-icon name="close-outline" [attr.aria-label]="'Remove ' + w" (click)="removeWhere(w)"></ion-icon>
+                        </ion-chip>
+                      }
+                    </div>
+                    <ion-textarea
+                      [(ngModel)]="newWhere"
+                      [autoGrow]="true"
+                      rows="1"
+                      placeholder="+ path (one per line)"
+                      aria-label="Add a path"
+                    ></ion-textarea>
+                    <div class="ed-actions">
+                      <ion-button fill="outline" size="small" (click)="cancelEdit()">Done</ion-button>
+                      <ion-button size="small" [disabled]="busy()" (click)="addWhere()">Add</ion-button>
+                    </div>
+                  } @else {
+                    <ion-textarea [(ngModel)]="editText" [autoGrow]="true" rows="3" [attr.aria-label]="r.label"></ion-textarea>
+                    <div class="ed-actions">
+                      <ion-button fill="outline" size="small" (click)="cancelEdit()">Cancel</ion-button>
+                      <ion-button size="small" [disabled]="busy()" (click)="saveField(r)">Save</ion-button>
+                    </div>
+                  }
+                </div>
+              </app-brief-field>
+            }
+          </div>
+
+          <div class="ch sep">Brief check <span class="r">plan.check · run by code</span></div>
+          <div class="checks">
+            @for (c of checkList(); track c.rule) {
+              <div class="check" [attr.data-tone]="c.tone"><span class="ic">{{ c.icon }}</span>{{ c.text }}</div>
+            } @empty {
+              <div class="check muted">No check results yet.</div>
+            }
+          </div>
+        </ion-card>
+
+        <!-- ───────── OUTLINE ───────── -->
+        <ion-card class="card outline-card">
+          <div class="ch">
+            Draft outline
+            <span class="r">
+              @if (!frozen()) {
+                <ion-button fill="clear" size="small" [disabled]="busy()" (click)="addPhase()">
+                  <ion-icon slot="start" name="add-outline"></ion-icon>Phase
+                </ion-button>
+              }
+            </span>
+          </div>
+          <div class="outline">
+            @for (p of outline(); track p.id; let pi = $index) {
+              <div class="phasecard">
+                <app-outline-row kind="phase" [num]="p.id" [title]="p.title" [tag]="p.agentTag" [added]="p.added">
+                  @if (!frozen()) {
+                    <span row-actions>
+                      <ion-button fill="clear" size="small" aria-label="Move up" [disabled]="busy() || p.first" (click)="moveItem(p, pi, -1)">
+                        <ion-icon slot="icon-only" name="arrow-up-outline"></ion-icon>
+                      </ion-button>
+                      <ion-button fill="clear" size="small" aria-label="Move down" [disabled]="busy() || p.last" (click)="moveItem(p, pi, 1)">
+                        <ion-icon slot="icon-only" name="arrow-down-outline"></ion-icon>
+                      </ion-button>
+                      <ion-button fill="clear" size="small" aria-label="Rename" [disabled]="busy()" (click)="renameItem(p)">
+                        <ion-icon slot="icon-only" name="create-outline"></ion-icon>
+                      </ion-button>
+                      <ion-button fill="clear" size="small" color="danger" aria-label="Delete" [disabled]="busy()" (click)="deleteItem(p)">
+                        <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+                      </ion-button>
+                    </span>
+                  }
+                </app-outline-row>
+                @for (t of p.tasks; track t.id; let ti = $index) {
+                  <app-outline-row kind="task" [num]="t.num" [title]="t.title" [tag]="t.agentTag" [added]="t.added">
+                    @if (!frozen()) {
+                      <span row-actions>
+                        <ion-button fill="clear" size="small" aria-label="Move up" [disabled]="busy() || t.first" (click)="moveItem(t, ti, -1)">
+                          <ion-icon slot="icon-only" name="arrow-up-outline"></ion-icon>
+                        </ion-button>
+                        <ion-button fill="clear" size="small" aria-label="Move down" [disabled]="busy() || t.last" (click)="moveItem(t, ti, 1)">
+                          <ion-icon slot="icon-only" name="arrow-down-outline"></ion-icon>
+                        </ion-button>
+                        <ion-button fill="clear" size="small" aria-label="Rename" [disabled]="busy()" (click)="renameItem(t)">
+                          <ion-icon slot="icon-only" name="create-outline"></ion-icon>
+                        </ion-button>
+                        <ion-button fill="clear" size="small" color="danger" aria-label="Delete" [disabled]="busy()" (click)="deleteItem(t)">
+                          <ion-icon slot="icon-only" name="trash-outline"></ion-icon>
+                        </ion-button>
+                      </span>
+                    }
+                  </app-outline-row>
+                }
+                @if (!frozen()) {
+                  <ion-button fill="clear" size="small" class="add-task" [disabled]="busy()" (click)="addTask(p)">
+                    <ion-icon slot="start" name="add-outline"></ion-icon>Task
+                  </ion-button>
+                }
+              </div>
+            } @empty {
+              <p class="outline-empty">No outline yet — ask the plan agent to draft one, or add a phase.</p>
+            }
+          </div>
+        </ion-card>
+      </div>
+    }
+  }
+</ion-content>
+
+@if (state() === 'ready' || state() === 'frozen') {
+  <ion-footer class="sticky">
+    <ion-toolbar>
+      <div class="bar">
+        <span class="sum"><b>{{ summary() }}</b></span>
+        @if (gate().showQueue || queued()) {
+          <ion-button fill="outline" size="small" aria-label="Queue planning" [disabled]="busy()" (click)="queuePlanning()">
+            @if (queued()) {Queued ✓<span class="long">&nbsp;· cancel</span>} @else {Queue<span class="long">&nbsp;planning</span>}
+          </ion-button>
+        }
+        <ion-button size="small" [disabled]="!gate().canStart || busy()" (click)="startPlanning()">Start planning</ion-button>
+      </div>
+    </ion-toolbar>
+  </ion-footer>
+}

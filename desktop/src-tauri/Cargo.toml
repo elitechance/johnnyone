@@ -18,7 +18,7 @@ path = "src/main.rs"
 async-graphql = { version = "7", features = ["chrono", "uuid"] }
 async-graphql-axum = "7"
 axum = { version = "0.8", features = ["json"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "limit"] }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
 tokio = { version = "1", features = ["full"] }
@@ -42,6 +42,12 @@ tauri-plugin-dialog = "2"
 arboard = "3"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Plan-agent MCP tokens (brief §"MCP security" 1): 256-bit token from the OS RNG, only its SHA-256
+# is stored, compared in constant time. All three were already in Cargo.lock transitively at these
+# versions — promoting them adds no crate to the build.
+sha2 = "0.10"
+subtle = "2.6"
+getrandom = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

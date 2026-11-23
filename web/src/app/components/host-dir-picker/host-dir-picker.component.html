@@ -1,0 +1,47 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>{{ heading() }}</ion-title>
+    <ion-buttons slot="end">
+      <ion-button (click)="cancel.emit()">Cancel</ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+<ion-content>
+  <div class="dir-browser">
+    <div class="dir-path" [title]="shownPath()">
+      @for (c of crumbs(); track c.relPath; let last = $last) {
+        <button type="button" class="crumb" [class.on]="last" (click)="navigate.emit(c.relPath)">{{ c.label }}</button>
+        @if (!last) {<span class="sep">/</span>}
+      } @empty {
+        {{ shownPath() }}
+      }
+      @if (loading()) {
+        <ion-spinner name="dots" class="dir-spin"></ion-spinner>
+      }
+    </div>
+    @if (error()) {
+      <ion-note color="danger" class="dir-error">{{ error() }}</ion-note>
+    }
+    <ion-list>
+      @if (parent() !== null) {
+        <ion-item button detail="false" (click)="up()">
+          <ion-label>📁 ..</ion-label>
+        </ion-item>
+      }
+      @for (d of dirs(); track d.path) {
+        <ion-item button detail="false" (click)="navigate.emit(d.path)">
+          <ion-label>📁 {{ d.name }}</ion-label>
+        </ion-item>
+      } @empty {
+        @if (!loading()) {
+          <ion-item lines="none"><ion-label class="dir-empty">No sub-folders here.</ion-label></ion-item>
+        }
+      }
+    </ion-list>
+  </div>
+</ion-content>
+<div class="dir-actions">
+  <ion-button expand="block" [disabled]="!chooseEnabled()" (click)="useCurrent()">
+    Use this folder
+  </ion-button>
+</div>

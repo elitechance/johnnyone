@@ -214,43 +214,14 @@
     <!-- Workspace directory browser (task: workspace dir is an explorer, not free text). -->
     <ion-modal [isOpen]="dirBrowserOpen()" (didDismiss)="closeDirBrowser()">
       <ng-template>
-        <ion-header>
-          <ion-toolbar>
-            <ion-title>Pick a workspace folder</ion-title>
-            <ion-buttons slot="end">
-              <ion-button (click)="closeDirBrowser()">Cancel</ion-button>
-            </ion-buttons>
-          </ion-toolbar>
-        </ion-header>
-        <ion-content>
-          <div class="dir-browser">
-            <div class="dir-path">{{ dirListing()?.path ? (dirListing()!.root + '/' + dirListing()!.path) : dirListing()?.root || '…' }}</div>
-            @if (dirError()) {
-              <ion-note color="danger" class="dir-error">{{ dirError() }}</ion-note>
-            }
-            <ion-list>
-              @if (dirListing()?.path) {
-                <ion-item button detail="false" (click)="dirUp()">
-                  <ion-label>📁 ..</ion-label>
-                </ion-item>
-              }
-              @for (d of browserDirs(); track d.path) {
-                <ion-item button detail="false" (click)="browseTo(d.path)">
-                  <ion-label>📁 {{ d.name }}</ion-label>
-                </ion-item>
-              } @empty {
-                @if (!dirLoading()) {
-                  <ion-item lines="none"><ion-label class="dir-empty">No sub-folders here.</ion-label></ion-item>
-                }
-              }
-            </ion-list>
-          </div>
-        </ion-content>
-        <div class="dir-actions">
-          <ion-button expand="block" [disabled]="!dirListing()" (click)="useCurrentDir()">
-            Use this folder
-          </ion-button>
-        </div>
+        <app-host-dir-picker
+          [listing]="pickerListing()"
+          [loading]="pickerLoading()"
+          [error]="pickerError()"
+          (navigate)="browseTo($event)"
+          (choose)="useDir($event)"
+          (cancel)="closeDirBrowser()"
+        />
       </ng-template>
     </ion-modal>
 </ion-content>

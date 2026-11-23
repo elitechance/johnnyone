@@ -22,6 +22,18 @@
       <div class="message-content">{{ message.content }}</div>
     }
 
+    @if (compactToolRows.length) {
+      <div class="tool-rows" data-testid="tool-rows">
+        @for (row of compactToolRows; track $index) {
+          <div class="tool-row" [attr.data-tone]="row.tone">
+            <span class="tool-row-name">{{ row.label }}</span>
+            <span class="tool-row-detail">{{ row.detail }}</span>
+            <span class="tool-row-mark">{{ row.mark }}</span>
+          </div>
+        }
+      </div>
+    }
+
     @if (hasToolCalls) {
       <div class="tool-calls">
         @for (toolCall of parsedToolCalls; track toolCall.id) {

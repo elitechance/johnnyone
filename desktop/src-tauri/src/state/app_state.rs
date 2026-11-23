@@ -140,6 +140,9 @@ pub struct AppState {
     /// run starter, which snapshots `fleet_busy` / `seats_held` from it. Per family, never
     /// pooled across families.
     pub lease_pool: crate::services::leases::SharedLeasePool,
+    /// Rejected plan-agent MCP calls per initiative (phase 02 task 06), seeded from the
+    /// `agent_mcp_rejected` event count on first use. Feeds the `count` in each rejection event.
+    pub mcp_rejections: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl AppState {
@@ -194,6 +197,7 @@ impl AppState {
             coordinator_loops: Arc::new(std::sync::Mutex::new(HashSet::new())),
             kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             lease_pool,
+            mcp_rejections: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -240,6 +244,7 @@ impl AppState {
             coordinator_loops: Arc::new(std::sync::Mutex::new(HashSet::new())),
             kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             lease_pool,
+            mcp_rejections: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

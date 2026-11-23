@@ -33,6 +33,14 @@ describe('which nav destination a URL lights', () => {
     }
   });
 
+  it('lights only Plans on the plans routes, and leaves /briefing under Work', () => {
+    expect(litNavItemIds('/plans')).toEqual(['plans']);
+    expect(litNavItemIds('/plans/abc')).toEqual(['plans']);
+    expect(litNavItemIds('/plans/abc?x=1')).toEqual(['plans']);
+    expect(litNavItemIds('/briefing/new')).toEqual(['work']);
+    expect(litNavItemIds('/plansx')).toEqual([]);
+  });
+
   it('keeps the destinations the rail already lit', () => {
     expect(litNavItemIds('/settings/prompts')).toEqual(['settings']);
     expect(litNavItemIds('/briefing/new')).toEqual(['work']);

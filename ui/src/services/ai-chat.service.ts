@@ -129,6 +129,16 @@ export class AiChatService {
   }
 
   /**
+   * Re-read the current session's messages from the host. The live relay message carries only the
+   * text; the stored row also carries `toolCalls`, so a page that shows tool calls refetches once a
+   * turn completes (Plans tab).
+   */
+  refreshMessages(): void {
+    const id = this.currentSession()?.id;
+    if (id) this.fetchMessages(id);
+  }
+
+  /**
    * Clean up all subscriptions. Call when the service consumer is destroyed.
    */
   teardownSubscriptions(): void {

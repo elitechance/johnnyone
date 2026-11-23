@@ -83,6 +83,25 @@ const SCOPE_GATED: Record<string, string> = {
   // Lifting a halt overrules the search's own refusal, so it carries the write scope too.
   'update-workflow-search-resumed.ts': 'plans:write',
   'record-workflow-rejection.ts': 'plans:write',
+
+  // ── Plans tab (initiative 8ad3ae71, phase 01): draft plans + versioned brief ──
+  // Reads expose the brief, its history and the files it names; writes create versions (author
+  // `you`), edit the outline, and can queue a planner start — so they carry the write scope.
+  'list-draft-plans.ts': 'plans:read',
+  'get-brief-version.ts': 'plans:read',
+  'list-brief-versions.ts': 'plans:read',
+  'get-brief-diff.ts': 'plans:read',
+  'get-brief-check.ts': 'plans:read',
+  'create-draft-plan.ts': 'plans:write',
+  'create-draft-plan-duplicate.ts': 'plans:write',
+  'update-brief-field.ts': 'plans:write',
+  'reset-brief-to-version.ts': 'plans:write',
+  'add-outline-phase.ts': 'plans:write',
+  'add-outline-task.ts': 'plans:write',
+  'update-outline-item.ts': 'plans:write',
+  'update-outline-item-position.ts': 'plans:write',
+  'delete-outline-item.ts': 'plans:write',
+  'update-planning-queue.ts': 'plans:write',
 };
 
 /** Live, non-vacuous: tolerates the `<T>` type argument every real call uses. */

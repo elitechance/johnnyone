@@ -818,6 +818,21 @@ fn session_is_archived(state: &AppState, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Plans tab (validator follow-up F2): a plan's agent runs headless through the j1 MCP server only
+/// (D1/D2). A tmux pane would start an unrestricted interactive CLI that also outlives the agent's
+/// retire (no pane is ever killed for it), so it never gets one.
+fn refuse_plan_agent_pane(state: &AppState, session_id: &str) -> Result<(), String> {
+    if crate::services::plan_agent::is_plan_agent_session(state, session_id) {
+        return Err("plan-agent sessions have no terminal; use the plan's chat".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn refuse_plan_agent_pane_for_test(state: &AppState, session_id: &str) -> Result<(), String> {
+    refuse_plan_agent_pane(state, session_id)
+}
+
 async fn ensure_terminal_session(
     state: &AppState,
     session_id: &str,
@@ -829,6 +844,7 @@ async fn ensure_terminal_session(
             "session {session_id} is archived; refusing to resurrect it"
         ));
     }
+    refuse_plan_agent_pane(state, session_id)?;
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
 
@@ -880,6 +896,7 @@ async fn ensure_terminal_session_for_input(
             "session {session_id} is archived; refusing to resurrect it"
         ));
     }
+    refuse_plan_agent_pane(state, session_id)?;
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
 

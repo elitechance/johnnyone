@@ -37,6 +37,22 @@ import {
 /** How long the confirmed "Copied" state stays up before it clears itself. */
 const COPY_FEEDBACK_MS = 2000;
 
+/**
+ * Optional, additive display tweaks for a host page (Plans tab, initiative 8ad3ae71). Absent = the
+ * bubble renders exactly as before. `toolRow` swaps the raw JSON tool-call list for one compact line
+ * per call (`brief.update outcome · v2`); `assistantLabel` renames the assistant ("Plan agent").
+ */
+export interface BubbleToolRow {
+  label: string;
+  detail: string;
+  mark: string;
+  tone: 'ok' | 'warn' | 'pending' | string;
+}
+export interface BubbleDisplay {
+  assistantLabel?: string;
+  toolRow?: (call: { id?: string; name: string; input?: unknown; result?: string }) => BubbleToolRow;
+}
+
 /** What the copy button shows right now — nothing until it is first clicked. */
 export type CopyState = CopyOutcome | null;
 
@@ -51,6 +67,8 @@ export type CopyState = CopyOutcome | null;
 export class MessageBubbleComponent implements AfterViewChecked, OnDestroy {
   @Input({ required: true }) message!: AiMessage;
   @Input() isStreamingMessage = false;
+  /** Optional host display tweaks (see {@link BubbleDisplay}); null = default rendering. */
+  @Input() display: BubbleDisplay | null = null;
   private readonly host: ElementRef<HTMLElement> = inject(ElementRef);
   private readonly cdr: ChangeDetectorRef = inject(ChangeDetectorRef);
 
@@ -147,6 +165,7 @@ export class MessageBubbleComponent implements AfterViewChecked, OnDestroy {
   }
 
   get hasToolCalls(): boolean {
+    if (this.display?.toolRow) return false;
     return !!this.message.toolCalls && this.message.toolCalls.length > 0;
   }
 
@@ -162,7 +181,21 @@ export class MessageBubbleComponent implements AfterViewChecked, OnDestroy {
     }
   }
 
+  /** Compact tool rows, when the host supplied a `toolRow` formatter. */
+  get compactToolRows(): BubbleToolRow[] {
+    const fmt = this.display?.toolRow;
+    if (!fmt || !this.message.toolCalls) return [];
+    try {
+      const calls = JSON.parse(this.message.toolCalls);
+      return Array.isArray(calls) ? calls.filter((c) => c && typeof c.name === 'string').map((c) => fmt(c)) : [];
+    } catch (err) {
+      console.warn('[message-bubble] unparseable tool_calls payload', this.message.id, err);
+      return [];
+    }
+  }
+
   get roleLabel(): string {
+    if (this.isAssistant && this.display?.assistantLabel) return this.display.assistantLabel;
     switch (this.message.role) {
       case 'user':
         return 'You';

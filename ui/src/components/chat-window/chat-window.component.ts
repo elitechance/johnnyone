@@ -11,6 +11,7 @@ import {
 import { CommonModule } from '@angular/common';
 import { AiMessage } from '../../models/ai-message.model';
 import { MessageBubbleComponent } from '../message-bubble/message-bubble.component';
+import type { BubbleDisplay } from '../message-bubble/message-bubble.component';
 import { MessageComposerComponent } from '../message-composer/message-composer.component';
 
 @Component({
@@ -37,6 +38,8 @@ export class ChatWindowComponent implements AfterViewChecked {
    * Defaults to true — existing callers are unaffected.
    */
   @Input() showComposer = true;
+  /** Optional per-bubble display tweaks, passed to every `johnny-message-bubble` (null = default). */
+  @Input() bubbleDisplay: BubbleDisplay | null = null;
 
   @Output() messageSent = new EventEmitter<string>();
 

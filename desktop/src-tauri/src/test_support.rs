@@ -196,6 +196,14 @@ pub fn tmp_dir(tag: &str) -> PathBuf {
     d
 }
 
+/// Write a fixture file (creating parent dirs), panicking on failure.
+pub fn write_fixture_file(path: &Path, body: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
+    }
+    std::fs::write(path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+}
+
 /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the broadcast
 /// channels with no live process, relay, or Tauri handle. Returns the state plus its temp root so
 /// callers can clean up / point `files_root` at it.

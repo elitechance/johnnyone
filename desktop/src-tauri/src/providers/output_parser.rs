@@ -34,7 +34,24 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
             })
         }
         "assistant" => {
-            let content = extract_assistant_text(&v)?;
+            // A tool call arrives as its own assistant line whose content block is `tool_use`
+            // (phase 02 task 08: captured so the chat shows the plan agent's MCP calls). Content is
+            // left empty so streamed deltas never echo tool plumbing into the bubble text.
+            let Some(content) = extract_assistant_text(&v) else {
+                let (name, input) = extract_tool_use(&v)?;
+                return Some(StreamChunk {
+                    chunk_type: ChunkType::ToolUse,
+                    content: String::new(),
+                    tool_name: Some(name),
+                    tool_input: Some(input),
+                    tool_output: None,
+                    cost_usd: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    is_final: false,
+                    session_id: None,
+                });
+            };
             let session_id = v
                 .get("session_id")
                 .and_then(|s| s.as_str())
@@ -171,9 +188,54 @@ pub fn parse_claude_code_line(line: &str) -> Option<StreamChunk> {
                 session_id: None,
             })
         }
+        // The tool's answer comes back as a `user` line with a `tool_result` block.
+        "user" => {
+            let output = extract_tool_result(&v)?;
+            Some(StreamChunk {
+                chunk_type: ChunkType::ToolResult,
+                content: String::new(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: Some(output),
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                is_final: false,
+                session_id: None,
+            })
+        }
         // Ignore rate_limit_event and other unknown types
         _ => None,
     }
+}
+
+/// The first `tool_use` block of a Claude Code assistant message: `(name, input)`.
+fn extract_tool_use(v: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    let blocks = v.get("message")?.get("content")?.as_array()?;
+    let block = blocks
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))?;
+    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+    let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+    Some((name, input))
+}
+
+/// The text of the first `tool_result` block of a Claude Code user message (a string, or the
+/// joined `text` parts of an array).
+fn extract_tool_result(v: &serde_json::Value) -> Option<String> {
+    let blocks = v.get("message")?.get("content")?.as_array()?;
+    let block = blocks
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))?;
+    Some(match block.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    })
 }
 
 /// Extract text content from a Claude Code assistant message.

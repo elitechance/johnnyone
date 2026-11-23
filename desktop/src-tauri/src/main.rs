@@ -7,6 +7,7 @@ use johnnyone_desktop_lib::host;
 use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
 use johnnyone_desktop_lib::services::agent_reaper;
+use johnnyone_desktop_lib::services::brief_store;
 use johnnyone_desktop_lib::services::provider_preflight;
 use johnnyone_desktop_lib::services::question_watch;
 use johnnyone_desktop_lib::services::relay;
@@ -150,6 +151,11 @@ fn main() {
             // behind. Every row-backed kill archives the row and writes `agent_session_retired`.
             // Like the watchdog, a long-lived task on Tauri's tokio runtime.
             agent_reaper::spawn_orphan_sweep(app_state.clone(), engine_started_unix);
+
+            // Plans tab (00/08): every 60 s, start each queued briefing whose conflicting
+            // initiatives have finished (`brief_store::release_queued_briefs` → `accept_brief`).
+            // Isolated from the planning/development loop by design.
+            brief_store::spawn_planning_queue_release(app_state.clone());
 
             // One read of the provider's model list, compared with the seat caps: a cap for a
             // family the provider will not serve is a pool that can be leased and never used.

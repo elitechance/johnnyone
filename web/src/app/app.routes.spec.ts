@@ -71,6 +71,27 @@ describe('appRoutes — shells declarations', () => {
   });
 });
 
+describe('appRoutes — plans declarations', () => {
+  const list = appRoutes.find((r) => r.path === 'plans');
+  const detail = appRoutes.find((r) => r.path === 'plans/:id');
+
+  it('declares /plans and /plans/:id as lazy, guarded, titled routes', () => {
+    for (const r of [list, detail]) {
+      expect(r).toBeDefined();
+      expect(typeof r?.loadComponent).toBe('function');
+      expect(r?.canActivate?.length).toBe(1);
+    }
+    expect(list?.title).toBe('Plans');
+    expect(detail?.title).toBe('Plan');
+  });
+
+  it('places both before the wildcard', () => {
+    const wildcard = appRoutes.findIndex((r) => r.path === '**');
+    expect(appRoutes.indexOf(list!)).toBeLessThan(wildcard);
+    expect(appRoutes.indexOf(detail!)).toBeLessThan(wildcard);
+  });
+});
+
 describe('appRoutes — real navigation over the shipped table', () => {
   let router: Router;
 
@@ -159,6 +180,26 @@ describe('appRoutes — real navigation over the shipped table', () => {
 
   it('/shells/x/raw/extra is NOT a shell — four segments fall through to the wildcard', async () => {
     await router.navigateByUrl('/shells/x/raw/extra');
+    expect(router.url).toBe('/initiatives');
+  });
+
+  it('/plans resolves the plans list route', async () => {
+    expect(await router.navigateByUrl('/plans')).toBe(true);
+    expect(router.url).toBe('/plans');
+    expect(leaf().routeConfig?.path).toBe('plans');
+    expect(TestBed.inject(Title).getTitle()).toBe('Plans');
+  });
+
+  it('/plans/<uuid> resolves the plan detail route with the id param', async () => {
+    const id = '00000000-0000-0000-0000-000000000000';
+    expect(await router.navigateByUrl(`/plans/${id}`)).toBe(true);
+    expect(router.url).toBe(`/plans/${id}`);
+    expect(leaf().routeConfig?.path).toBe('plans/:id');
+    expect(leaf().paramMap.get('id')).toBe(id);
+  });
+
+  it('/plans/x/y is not a plan — it falls through to the wildcard', async () => {
+    await router.navigateByUrl('/plans/x/y');
     expect(router.url).toBe('/initiatives');
   });
 

@@ -20,6 +20,22 @@ File ops are request/response → relay-RPC. Stream events are fire-and-forget
 push → envelope. Shell input already rides the envelope (`terminal_command`); a
 relay-RPC read-output (`capture_terminal`) was added for deterministic reads.
 
+### The local host API (:7788) and /mcp
+
+The web never calls `127.0.0.1:7788` directly. That listener serves the **unauthenticated**
+local GraphQL host API, which is guarded only against browser pages by `origin_guard`. It also
+serves the plan agent's `POST /mcp`, the first **authenticated** route on `:7788`, which has the
+opposite browser policy:
+
+- any `Origin` is refused;
+- the `Host` must be on the allow-list;
+- the body must be POST with JSON;
+- it emits no CORS headers;
+- every request needs a hashed per-session bearer token.
+
+`/mcp` is merged beside the guarded GraphQL router, never inside it. See
+[mcp-security.md](mcp-security.md) for the threat model, the controls and the tests that pin them.
+
 ## 1. Host file manager
 
 Full CRUD over a single, user-configurable browse root, reachable from the web

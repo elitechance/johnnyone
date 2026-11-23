@@ -169,32 +169,6 @@
   }
 }
 
-/* Workspace directory browser modal. */
-.dir-browser {
-  padding: 8px 12px;
-
-  .dir-path {
-    font-family: var(--ion-font-family-monospace, monospace);
-    font-size: 12px;
-    color: var(--jo-fg-muted, #8a92a0);
-    word-break: break-all;
-    padding: 6px 4px 10px;
-  }
-  .dir-error {
-    display: block;
-    padding: 4px;
-  }
-  .dir-empty {
-    color: var(--jo-fg-muted, #8a92a0);
-    font-style: italic;
-    font-size: 13px;
-  }
-}
-.dir-actions {
-  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
-  border-top: 1px solid var(--jo-border, #262b33);
-}
-
 /* Finalize-brief review modal. */
 .brief-review-content {
   --padding-start: 16px;

@@ -188,6 +188,9 @@ npm run deploy:web    # nx build web && lokal cf worker deploy --env prod && lok
 ## Safety rules & sharp edges
 
 - **Only ever kill `johnnyone_*` tmux sessions** — NEVER the user's own named sessions.
+- **`/mcp` on :7788 is the plan agent's only write path; read [`docs/mcp-security.md`](docs/mcp-security.md)
+  before touching it** (or the plan agent's launch flags, `repo_search`, or `mcp_tokens`). It is the one
+  authenticated route on the host: no Origin, Host allow-list, no CORS, hashed per-session token.
 - Plan store (`.johnnyone/initiatives/`) and design docs (`.johnnyone/overhaul/`) live at the **Workspace
   root**, not in this repo, and are gitignored here — don't commit them.
 - A resolver's filename **verb prefix** decides Query vs Mutation in the lokal CLI. A new verb (e.g.

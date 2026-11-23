@@ -132,6 +132,22 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/list-api-keys.ts',
   'resolvers/revoke-api-key.ts',
   'resolvers/update-git-action.ts',
+  // Plans tab (initiative 8ad3ae71, phase 01): draft plans + versioned brief, all relay-to-host.
+  'resolvers/ai/list-draft-plans.ts',
+  'resolvers/ai/get-brief-version.ts',
+  'resolvers/ai/list-brief-versions.ts',
+  'resolvers/ai/get-brief-diff.ts',
+  'resolvers/ai/get-brief-check.ts',
+  'resolvers/ai/create-draft-plan.ts',
+  'resolvers/ai/create-draft-plan-duplicate.ts',
+  'resolvers/ai/update-brief-field.ts',
+  'resolvers/ai/reset-brief-to-version.ts',
+  'resolvers/ai/add-outline-phase.ts',
+  'resolvers/ai/add-outline-task.ts',
+  'resolvers/ai/update-outline-item.ts',
+  'resolvers/ai/update-outline-item-position.ts',
+  'resolvers/ai/delete-outline-item.ts',
+  'resolvers/ai/update-planning-queue.ts',
 ];
 
 describe('resolver auth audit', () => {

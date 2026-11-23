@@ -1,0 +1,443 @@
+/* Mobile: the global .botnav is position:fixed at the bottom (~56px). Lift the page above it (the
+   same fix as terminal.page.scss), or the sticky Start/Queue bar and the last rows render behind it. */
+@media (max-width: 900px) {
+  :host {
+    bottom: calc(56px + env(safe-area-inset-bottom));
+  }
+}
+
+.hd {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  .hd-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+/* ── layout: 08's split (chat | brief + outline); one pane at a time under 900px ── */
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  grid-template-areas:
+    'chat brief'
+    'chat outline';
+  grid-template-rows: auto 1fr;
+  gap: 12px;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 12px;
+  align-items: start;
+}
+.chat-card {
+  grid-area: chat;
+}
+.brief-card {
+  grid-area: brief;
+}
+.outline-card {
+  grid-area: outline;
+}
+
+.phone-seg {
+  display: none;
+  margin: 10px 12px 0;
+  width: auto;
+  ion-badge {
+    margin-left: 6px;
+    font-size: 10px;
+  }
+}
+
+@media (max-width: 899px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: 'pane';
+    grid-template-rows: auto;
+    padding: 8px;
+  }
+  .chat-card,
+  .brief-card,
+  .outline-card {
+    grid-area: pane;
+    display: none;
+  }
+  .split[data-pane='chat'] .chat-card,
+  .split[data-pane='brief'] .brief-card,
+  .split[data-pane='outline'] .outline-card {
+    display: block;
+  }
+  .phone-seg {
+    display: flex;
+  }
+}
+
+/* ── cards ── */
+.card {
+  margin: 0;
+  border: 1px solid var(--jo-border, var(--ion-color-step-150));
+  border-radius: 12px;
+  box-shadow: none;
+  min-width: 0;
+}
+.ch {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--jo-border, var(--ion-color-step-150));
+  font: 600 11px var(--ion-font-family-monospace, monospace);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--jo-fg-muted, var(--ion-color-medium));
+  .r {
+    margin-left: auto;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+  }
+  &.sep {
+    border-top: 1px solid var(--jo-border, var(--ion-color-step-150));
+  }
+}
+.ch-spin {
+  height: 14px;
+}
+
+/* chat */
+.chat-card {
+  display: flex;
+  flex-direction: column;
+}
+.agent-pill {
+  --sc: var(--jo-good, var(--ion-color-success));
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--sc);
+  background: color-mix(in srgb, var(--sc) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--sc) 34%, transparent);
+  .tick {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--sc);
+  }
+  &[data-state='working'] {
+    --sc: var(--jo-accent, var(--ion-color-warning));
+  }
+  &[data-state='retired'] {
+    --sc: var(--jo-fg-muted, var(--ion-color-medium));
+  }
+}
+.chat {
+  display: block;
+  height: calc(100vh - 290px);
+  min-height: 420px;
+}
+@media (max-width: 899px) {
+  .chat {
+    height: calc(100vh - 330px);
+    min-height: 360px;
+  }
+}
+.chips-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 10px;
+  &:empty {
+    display: none;
+  }
+  ion-chip {
+    font-size: 12px;
+    height: 28px;
+  }
+}
+.scope {
+  display: block;
+  padding: 6px 14px 10px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+/* brief */
+.versions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--jo-border, var(--ion-color-step-150));
+  .vl {
+    font: 10.5px var(--ion-font-family-monospace, monospace);
+    color: var(--jo-fg-faint, var(--ion-color-medium));
+    margin-right: 4px;
+  }
+  .back {
+    margin-left: auto;
+  }
+}
+.diff {
+  margin: 10px 14px 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px dashed var(--jo-border-strong, var(--ion-color-step-250));
+  font-size: 12.5px;
+  .diff-h {
+    font: 600 11px var(--ion-font-family-monospace, monospace);
+    color: var(--jo-fg-muted, var(--ion-color-medium));
+    margin-bottom: 4px;
+  }
+  .diff-f {
+    font: 600 10.5px var(--ion-font-family-monospace, monospace);
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin-top: 8px;
+    color: var(--jo-fg-muted, var(--ion-color-medium));
+  }
+  del,
+  ins {
+    display: block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+  }
+  del {
+    background: color-mix(in srgb, var(--jo-bad, var(--ion-color-danger)) 14%, transparent);
+    &::before {
+      content: '− ';
+    }
+  }
+  ins {
+    background: color-mix(in srgb, var(--jo-good, var(--ion-color-success)) 14%, transparent);
+    &::before {
+      content: '+ ';
+    }
+  }
+  .diff-note {
+    margin: 8px 0 0;
+    color: var(--jo-fg-faint, var(--ion-color-medium));
+    font-size: 12px;
+  }
+}
+.fields {
+  padding: 10px 14px 4px;
+}
+.undo {
+  --color: var(--jo-accent, var(--ion-color-warning));
+  font-size: 11px;
+  height: 22px;
+}
+.editor {
+  margin-top: 6px;
+  ion-textarea {
+    --background: var(--jo-bg-raised, var(--ion-color-step-50));
+    --padding-start: 8px;
+    --padding-end: 8px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .where-edit {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    margin-bottom: 4px;
+    ion-chip {
+      font: 11.5px var(--ion-font-family-monospace, monospace);
+    }
+  }
+  .ed-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 6px;
+  }
+}
+.checks {
+  padding: 6px 14px 12px;
+}
+.check {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  padding: 3px 0;
+  overflow-wrap: anywhere;
+  .ic {
+    font-weight: 700;
+    width: 14px;
+    flex: none;
+  }
+  &[data-tone='ok'] .ic {
+    color: var(--jo-good, var(--ion-color-success));
+  }
+  &[data-tone='warn'] .ic {
+    color: var(--jo-warn, var(--ion-color-warning));
+  }
+  &[data-tone='fail'] .ic {
+    color: var(--jo-bad, var(--ion-color-danger));
+  }
+  &.muted {
+    color: var(--jo-fg-faint, var(--ion-color-medium));
+  }
+}
+
+/* outline */
+.outline {
+  padding: 10px 12px 12px;
+}
+.phasecard {
+  border: 1px solid var(--jo-border, var(--ion-color-step-150));
+  border-radius: 10px;
+  margin-bottom: 10px;
+  overflow: hidden;
+  ion-button {
+    height: 26px;
+    margin: 0;
+  }
+  .add-task {
+    margin: 2px 0 4px 10px;
+    font-size: 12px;
+  }
+}
+.outline-empty {
+  margin: 4px 2px;
+  font-size: 13px;
+  color: var(--jo-fg-faint, var(--ion-color-medium));
+}
+
+/* states */
+.state-card {
+  max-width: 620px;
+  margin: 24px auto;
+  ion-card-content {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+  .msg {
+    flex: 1 1 220px;
+  }
+  &.empty ion-card-content {
+    flex-direction: column;
+    text-align: center;
+  }
+  .big {
+    font-size: 32px;
+  }
+  h2 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+  }
+  p {
+    margin: 0;
+  }
+}
+.frozen {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 1280px;
+  margin: 12px auto 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--jo-st-planning, var(--ion-color-primary)) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--jo-st-planning, var(--ion-color-primary)) 34%, transparent);
+  a {
+    color: var(--jo-accent, var(--ion-color-primary));
+  }
+}
+@media (max-width: 1303px) {
+  .frozen {
+    margin-left: 12px;
+    margin-right: 12px;
+  }
+}
+
+/* sticky bar: one line on a phone too (a wrapped second row hides under the app's bottom nav) */
+.sticky .bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 4px 12px calc(4px + env(safe-area-inset-bottom));
+  .sum {
+    flex: 1 1 160px;
+    font-size: 13px;
+  }
+}
+@media (max-width: 599px) {
+  .sticky .bar {
+    flex-wrap: nowrap;
+    gap: 4px;
+    padding-left: 8px;
+    padding-right: 8px;
+    .sum {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    ion-button {
+      flex: none;
+      font-size: 11px;
+    }
+    .long {
+      display: none;
+    }
+  }
+}
+
+/* Compact MCP tool rows inside the shared message bubble (opt-in via `bubbleDisplay.toolRow`; the 08
+   mock's .tool). Styled HERE, not in the bubble: the ui library is in the initial bundle and only this
+   page uses the rows. */
+.chat-card ::ng-deep {
+  .tool-rows {
+    margin-top: 7px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .tool-row {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    font: 11px/1.4 var(--ion-font-family-monospace, ui-monospace, monospace);
+    background: rgba(0, 0, 0, 0.18);
+    border-radius: 6px;
+    padding: 4px 7px;
+    color: var(--jo-fg-muted, var(--ion-color-medium));
+    overflow-wrap: anywhere;
+  }
+  .tool-row-name {
+    color: var(--jo-st-briefing, var(--ion-color-tertiary));
+    white-space: nowrap;
+  }
+  .tool-row-mark {
+    margin-left: auto;
+    white-space: nowrap;
+    color: var(--jo-good, var(--ion-color-success));
+  }
+  .tool-row[data-tone='warn'] .tool-row-mark {
+    color: var(--jo-warn, var(--ion-color-warning));
+  }
+  .tool-row[data-tone='pending'] .tool-row-mark {
+    color: var(--jo-fg-faint, var(--ion-color-medium));
+  }
+}

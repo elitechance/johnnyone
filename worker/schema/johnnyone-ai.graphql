@@ -183,8 +183,153 @@ type AgentPlan {
   # key, and nullable degrades to null instead of failing non-null coercion on every
   # AgentPlan-returning operation. Null or empty = no plan-level gate (opt-in).
   testCommands: [String!]
+  # Plans tab (desktop migration 031). Nullable for deploy skew like briefingSessionId: an older
+  # desktop returns JSON without these keys and they degrade to null.
+  # The brief_versions.version frozen by Start planning (null until accept / never versioned).
+  acceptedBriefVersion: Int
+  # JSON array of initiative ids a queued Start planning waits on; null = not queued.
+  planningQueuedAfter: String
   createdAt: String!
   updatedAt: String!
+}
+
+# --- Plans tab (initiative 8ad3ae71): draft plans with a structured, versioned brief ---
+# A draft plan IS a briefing Initiative (an AgentPlan at initiativeStatus 'briefing'). Every write
+# below is a human edit (author 'you'); the plan agent writes through the host's /mcp route instead.
+# Brief field KEYS used as arguments and in `changed` lists are the snake_case brief keys:
+# outcome | why | where | done_when | out_of_scope | decided. Outline ids are identities: phases
+# 'NN', tasks 'NN/MM', never reused.
+
+type BriefFields {
+  outcome: String!
+  why: String!
+  where: [String!]!
+  doneWhen: String!
+  outOfScope: String!
+  decided: String!
+}
+
+type OutlineTask {
+  id: String!
+  title: String!
+  # 'you' | 'agent'
+  author: String!
+  # The brief version that added this item.
+  addedIn: Int!
+}
+
+type OutlinePhase {
+  id: String!
+  title: String!
+  author: String!
+  addedIn: Int!
+  tasks: [OutlineTask!]!
+  nextTask: Int
+}
+
+type BriefOutline {
+  phases: [OutlinePhase!]!
+  nextPhase: Int
+}
+
+type BriefVersion {
+  initiativeId: ID!
+  version: Int!
+  # 'you' | 'agent'
+  author: String!
+  changeNote: String!
+  # Field keys / 'outline:<id>' that differ from the previous version.
+  changed: [String!]!
+  createdAt: String!
+  fields: BriefFields!
+  outline: BriefOutline!
+  initiativeStatus: String!
+  acceptedBriefVersion: Int
+}
+
+type BriefVersionMeta {
+  version: Int!
+  author: String!
+  changeNote: String!
+  changed: [String!]!
+  createdAt: String!
+}
+
+type FieldDiff {
+  field: String!
+  changed: Boolean!
+  removed: [String!]!
+  added: [String!]!
+}
+
+type OutlineItemRef {
+  id: String!
+  title: String!
+}
+
+type OutlineRename {
+  id: String!
+  before: String!
+  after: String!
+}
+
+type OutlineDiff {
+  added: [OutlineItemRef!]!
+  removed: [OutlineItemRef!]!
+  renamed: [OutlineRename!]!
+  moved: [String!]!
+}
+
+type BriefDiff {
+  fields: [FieldDiff!]!
+  outline: OutlineDiff!
+}
+
+type BriefCheckItem {
+  # outcome_one_sentence | done_when_runnable | out_of_scope_present | where_exists | file_conflict
+  rule: String!
+  # 'ok' | 'warn' | 'fail'
+  status: String!
+  detail: String!
+  paths: [String!]!
+  # Only for file_conflict: the running initiatives that overlap (what Queue planning waits on).
+  initiativeIds: [String!]!
+}
+
+type BriefCheckSummary {
+  ok: Int!
+  warn: Int!
+  fail: Int!
+}
+
+type DraftPlanLatest {
+  version: Int!
+  author: String!
+  createdAt: String!
+}
+
+type DraftPlan {
+  id: ID!
+  title: String!
+  workspacePath: String!
+  updatedAt: String!
+  # Null only for a legacy briefing row that was never versioned.
+  latest: DraftPlanLatest
+  checkSummary: BriefCheckSummary!
+  queuedAfter: [String!]!
+}
+
+type BriefWriteResult {
+  version: Int!
+  changedFields: [String!]!
+  # The affected outline id (the NEW id for an add); null for field writes.
+  id: String
+}
+
+input CreateDraftPlanInput {
+  title: String!
+  workspacePath: String!
+  ask: String
 }
 
 type AgentPlanPhase {
@@ -740,6 +885,13 @@ type WorkflowSearchState {
 
 type Query {
   listDesktopNodes: [DesktopNode!]!
+  # Plans tab: draft plans + their versioned brief (host RPC via the relay).
+  listDraftPlans: [DraftPlan!]!
+  # version omitted = latest.
+  getBriefVersion(initiativeId: ID!, version: Int): BriefVersion!
+  listBriefVersions(initiativeId: ID!): [BriefVersionMeta!]!
+  getBriefDiff(initiativeId: ID!, fromVersion: Int!, toVersion: Int!): BriefDiff!
+  getBriefCheck(initiativeId: ID!): [BriefCheckItem!]!
   listAiSessions(status: String): [AiSession!]!
   listTmuxSessions: [TmuxSession!]!
   # A session's reports, oldest->newest, so a freshly-opened transcript is not blank.
@@ -893,6 +1045,23 @@ type Mutation {
   createBriefingInitiative(input: CreateBriefingInput!): AgentPlanRun!
   acceptInitiativeBrief(input: AcceptBriefInput!): AgentPlanRun!
   addInitiativeReferencePath(initiativeId: ID!, path: String!): AgentPlanRun!
+  # --- Plans tab (initiative 8ad3ae71) — human writes, author 'you'. Verb-safe names
+  # (no duplicate-/revert-/move- prefixes). Rename/delete reuse updateAgentPlanTitle/deleteAgentPlan;
+  # Start planning reuses acceptInitiativeBrief.
+  createDraftPlan(input: CreateDraftPlanInput!): AgentPlanRun!
+  createDraftPlanDuplicate(initiativeId: ID!): AgentPlanRun!
+  # op: 'value' (replace; `values` for where, `value` otherwise) | 'add' | 'remove' (take `value`).
+  updateBriefField(initiativeId: ID!, field: String!, op: String!, value: String, values: [String!]): BriefWriteResult!
+  # field given = undo that one field to `version`; omitted = revert the whole brief. Always a NEW version.
+  resetBriefToVersion(initiativeId: ID!, version: Int!, field: String): BriefWriteResult!
+  addOutlinePhase(initiativeId: ID!, title: String!): BriefWriteResult!
+  addOutlineTask(initiativeId: ID!, phaseId: String!, title: String!): BriefWriteResult!
+  updateOutlineItem(initiativeId: ID!, id: String!, title: String!): BriefWriteResult!
+  # Reorders within the same parent only (ids are identities).
+  updateOutlineItemPosition(initiativeId: ID!, id: String!, toIndex: Int!): BriefWriteResult!
+  deleteOutlineItem(initiativeId: ID!, id: String!): BriefWriteResult!
+  # Non-empty ids = queue Start planning after those (current file_conflict) initiatives; null = clear.
+  updatePlanningQueue(initiativeId: ID!, afterInitiativeIds: [ID!]): AgentPlanRun!
   # --- The workflow arena (desktop migration 026) ---
   # A new version is never born champion; becoming one is updateWorkflowChampion's job.
   # `repo` is NOT an argument — see repoIdentity. The host derives it from `workspacePath`, because

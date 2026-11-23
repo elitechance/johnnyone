@@ -36,6 +36,11 @@ pub async fn send_chat_message_blocking(
         .map_err(|e| format!("Session not found: {}", e))
         })?;
 
+    // Plans tab 02/07: a plan's agent session runs claude_code with the j1 MCP config and
+    // least-privilege flags; any other provider, or a plan that left briefing, refuses the turn
+    // before anything is stored or spawned.
+    let plan_extras = plan_agent_turn_extras(state, &session_id, &provider_str)?;
+
     let user_msg_id = Uuid::new_v4().to_string();
     let user_message = state.db.with_conn(|conn| {
         conn.execute(
@@ -91,9 +96,14 @@ pub async fn send_chat_message_blocking(
     let cli_path_ref = cli_path.as_deref();
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
-        CliProvider::ClaudeCode => {
-            claude_code::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
-        }
+        CliProvider::ClaudeCode => claude_code::build_config_with(
+            &content,
+            &working_dir,
+            &model,
+            cli_path_ref,
+            cli_sid_ref,
+            plan_extras.as_ref(),
+        ),
         CliProvider::Codex => {
             codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
         }
@@ -152,6 +162,7 @@ pub async fn send_chat_message_blocking(
     let mut finish_reason = "stop".to_string();
     let mut saw_final_chunk = false;
     let mut should_kill_process = false;
+    let mut tool_chunks: Vec<StreamChunk> = Vec::new();
 
     loop {
         let chunk = match timeout(stream_idle_timeout, rx.recv()).await {
@@ -182,6 +193,10 @@ pub async fn send_chat_message_blocking(
 
         if chunk.chunk_type == ChunkType::Text {
             full_content.push_str(&chunk.content);
+        }
+
+        if matches!(chunk.chunk_type, ChunkType::ToolUse | ChunkType::ToolResult) {
+            tool_chunks.push(chunk.clone());
         }
 
         if chunk.chunk_type == ChunkType::Stderr {
@@ -280,10 +295,11 @@ pub async fn send_chat_message_blocking(
         });
     }
 
+    let tool_calls = fold_tool_calls(&tool_chunks);
     let assistant_message = state.db.with_conn(|conn| {
         conn.execute(
-            "UPDATE messages SET content = ?1, input_tokens = ?2, output_tokens = ?3, cost_cents = ?4, finish_reason = ?5 WHERE id = ?6",
-            params![full_content, total_input_tokens, total_output_tokens, total_cost_cents, finish_reason, assistant_msg_id],
+            "UPDATE messages SET content = ?1, input_tokens = ?2, output_tokens = ?3, cost_cents = ?4, finish_reason = ?5, tool_calls = ?7 WHERE id = ?6",
+            params![full_content, total_input_tokens, total_output_tokens, total_cost_cents, finish_reason, assistant_msg_id, tool_calls],
         )
         .map_err(|e| format!("Failed to update assistant message: {}", e))?;
 
@@ -400,6 +416,60 @@ async fn send_simulated_chat_message(
     })
 }
 
+/// Plan-agent extras for one chat turn, shared by this host path and the relay path
+/// (`AgentService::handle_relay_chat`). `Ok(None)` for every non-plan session (unchanged behaviour);
+/// `Err` refuses the turn: a plan session on another provider, or a plan that left briefing.
+pub fn plan_agent_turn_extras(
+    state: &AppState,
+    session_id: &str,
+    provider: &str,
+) -> Result<Option<claude_code::LaunchExtras>, String> {
+    match CliProvider::from_str(provider) {
+        Some(CliProvider::ClaudeCode) => crate::services::plan_agent::plan_agent_extras(state, session_id),
+        _ if crate::services::plan_agent::is_plan_agent_session(state, session_id) => {
+            Err(crate::services::plan_agent::PLAN_AGENT_PROVIDER_ONLY.to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Max chars of a tool result kept in `messages.tool_calls`.
+pub const TOOL_RESULT_MAX_CHARS: usize = 400;
+
+/// Fold a turn's tool chunks into the `messages.tool_calls` JSON the web's `message-bubble` renders:
+/// `[{id:"t<n>", name, input, result?}]`. Each `ToolUse` opens a call; each `ToolResult` answers the
+/// oldest still-open call (results arrive in call order), clipped to [`TOOL_RESULT_MAX_CHARS`].
+/// `None` when the turn used no tools. Pure.
+pub fn fold_tool_calls(chunks: &[StreamChunk]) -> Option<String> {
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    let mut open: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for c in chunks {
+        match c.chunk_type {
+            ChunkType::ToolUse => {
+                calls.push(serde_json::json!({
+                    "id": format!("t{}", calls.len() + 1),
+                    "name": c.tool_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                    "input": c.tool_input.clone().unwrap_or_else(|| serde_json::json!({})),
+                }));
+                open.push_back(calls.len() - 1);
+            }
+            ChunkType::ToolResult => {
+                if let Some(i) = open.pop_front() {
+                    let text = c.tool_output.clone().unwrap_or_else(|| c.content.clone());
+                    let clipped: String = text.chars().take(TOOL_RESULT_MAX_CHARS).collect();
+                    calls[i]["result"] = serde_json::Value::String(clipped);
+                }
+            }
+            _ => {}
+        }
+    }
+    if calls.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&calls).ok()
+    }
+}
+
 pub async fn stop_generation(state: &AppState, session_id: String) -> Result<(), String> {
     let mut processes = state.active_processes.lock().await;
     if let Some(mut proc) = processes.remove(&session_id) {
@@ -432,4 +502,79 @@ fn query_message(conn: &rusqlite::Connection, id: &str) -> Result<Message, Strin
         },
     )
     .map_err(|e| format!("Message not found: {}", e))
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::*;
+
+    fn chunk(kind: ChunkType, name: Option<&str>, input: Option<serde_json::Value>, output: Option<&str>) -> StreamChunk {
+        StreamChunk {
+            chunk_type: kind,
+            content: String::new(),
+            tool_name: name.map(str::to_string),
+            tool_input: input,
+            tool_output: output.map(str::to_string),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            is_final: false,
+            session_id: None,
+        }
+    }
+
+    fn text(t: &str) -> StreamChunk {
+        StreamChunk { content: t.to_string(), ..chunk(ChunkType::Text, None, None, None) }
+    }
+
+    #[test]
+    fn fold_tool_calls_pairs_results() {
+        let chunks = vec![
+            text("Let me update the brief."),
+            chunk(ChunkType::ToolUse, Some("mcp__j1__brief_update"), Some(serde_json::json!({"field": "why", "add": "x"})), None),
+            chunk(ChunkType::ToolResult, None, None, Some("{\"version\":3}")),
+            chunk(ChunkType::ToolUse, Some("mcp__j1__brief_get"), None, None),
+            chunk(ChunkType::ToolUse, Some("mcp__j1__plan_check"), Some(serde_json::json!({})), None),
+            chunk(ChunkType::ToolResult, None, None, Some("brief")),
+            chunk(ChunkType::ToolResult, None, None, Some("check")),
+            text("Done."),
+        ];
+        let v: serde_json::Value = serde_json::from_str(&fold_tool_calls(&chunks).unwrap()).unwrap();
+        let calls = v.as_array().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["id"], "t1");
+        assert_eq!(calls[0]["name"], "mcp__j1__brief_update");
+        assert_eq!(calls[0]["input"]["field"], "why");
+        assert_eq!(calls[0]["result"], "{\"version\":3}");
+        assert_eq!((calls[1]["id"].as_str(), calls[1]["result"].as_str()), (Some("t2"), Some("brief")));
+        assert_eq!(calls[1]["input"], serde_json::json!({}), "missing input → an empty object");
+        assert_eq!((calls[2]["id"].as_str(), calls[2]["result"].as_str()), (Some("t3"), Some("check")));
+        // A call whose result never came keeps no `result` key.
+        let v: serde_json::Value = serde_json::from_str(
+            &fold_tool_calls(&[chunk(ChunkType::ToolUse, Some("x"), None, None)]).unwrap(),
+        )
+        .unwrap();
+        assert!(v[0].get("result").is_none());
+    }
+
+    #[test]
+    fn fold_tool_calls_none_without_tools() {
+        assert_eq!(fold_tool_calls(&[]), None);
+        assert_eq!(fold_tool_calls(&[text("hello"), text(" world")]), None);
+        // A stray result with no call is ignored.
+        assert_eq!(fold_tool_calls(&[chunk(ChunkType::ToolResult, None, None, Some("r"))]), None);
+    }
+
+    #[test]
+    fn fold_tool_calls_truncates_result() {
+        let long = "é".repeat(TOOL_RESULT_MAX_CHARS + 50);
+        let chunks = vec![
+            chunk(ChunkType::ToolUse, Some("mcp__j1__repo_search"), Some(serde_json::json!({"query": "q"})), None),
+            chunk(ChunkType::ToolResult, None, None, Some(&long)),
+        ];
+        let v: serde_json::Value = serde_json::from_str(&fold_tool_calls(&chunks).unwrap()).unwrap();
+        let r = v[0]["result"].as_str().unwrap();
+        assert_eq!(r.chars().count(), TOOL_RESULT_MAX_CHARS);
+        assert!(long.starts_with(r));
+    }
 }
