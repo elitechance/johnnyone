@@ -29,9 +29,10 @@
 //! fixture from a failing test survives for inspection.
 //!
 //! **The sweep never touches a directory a live process is sitting in.** Two reasons: the suite
-//! leaks live `claude` processes whose cwd is a fixture (see the note on
-//! `replan_tests::kloo_needs_changes_parks_instead_of_alldone_loop`), and deleting the ground out
-//! from under someone else's process is not this harness's business.
+//! used to leak live `claude` processes whose cwd is a fixture (the pre-I19 kloo NEEDS_CHANGES park
+//! test, since replaced by `replan_tests::kloo_needs_changes_bridges_into_guided_replan`, which
+//! runs on a test ReplanCtrl and spawns nothing), and deleting the ground out from under someone
+//! else's process is not this harness's business.
 
 use crate::db::Database;
 use crate::state::app_state::AppState;
@@ -96,8 +97,9 @@ fn sweep_exited_roots(base: &Path, mine: &Path) {
         // race is not a failure worth failing a test suite over.
         if any_live_cwd_inside(&path) {
             // MEASURED, and the reason this branch exists: every stale root on this machine has
-            // a dead owner AND exactly one live process inside it — a `claude` leaked by
-            // `replan_tests::kloo_needs_changes_parks_instead_of_alldone_loop`, whose cwd is
+            // a dead owner AND exactly one live process inside it — a `claude` leaked by the
+            // pre-I19 kloo NEEDS_CHANGES park test (now `kloo_needs_changes_bridges_into_guided_replan`,
+            // which no longer spawns), whose cwd is
             // `<root>/state-N/ws`. Skipping the whole root therefore reclaimed nothing at all:
             // three consecutive suite runs left three 120 MB roots standing.
             //

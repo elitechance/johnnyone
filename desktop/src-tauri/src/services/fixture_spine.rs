@@ -90,7 +90,7 @@ fn fixture_spine_verifies_are_narrow() {
 /// block and its own `error: test failed, to rerun pass \`--lib\`` into the PARENT's test stream —
 /// roughly 1,700 lines of them. Reading that output, the parent's one real failure is invisible among
 /// a dozen deliberate ones that look identical, and on 2026-10-14 it cost a wrong diagnosis: the
-/// genuine failure (`kloo_needs_changes_parks_instead_of_alldone_loop`, environment-dependent) was
+/// genuine failure (the pre-I19 kloo NEEDS_CHANGES park test, environment-dependent) was
 /// reported as "just the fixture failing on purpose", because the `failures: add_works` block nearest
 /// the summary belonged to a child.
 ///
