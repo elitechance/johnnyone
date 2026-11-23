@@ -1,4 +1,5 @@
 pub mod agent_plans;
+pub mod agent_reaper;
 pub mod atomic_fs;
 pub mod chat_host;
 pub mod coordinator_flight;
