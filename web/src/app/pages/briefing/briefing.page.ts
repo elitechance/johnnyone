@@ -8,7 +8,6 @@ import {
   IonTitle,
   IonContent,
   IonButton,
-  IonButtons,
   IonInput,
   IonTextarea,
   IonItem,
@@ -26,6 +25,7 @@ import {
   IonSpinner,
 } from '@ionic/angular/standalone';
 import { JohnnyApiService, DetectedCliTool, DirListing } from '@johnnyone/ui';
+import { HostDirPickerComponent } from '../../components/host-dir-picker/host-dir-picker.component';
 import { firstValueFrom } from 'rxjs';
 import {
   LensDraft,
@@ -75,7 +75,6 @@ import {
     IonLabel,
     IonList,
     IonNote,
-    IonButtons,
     IonSelect,
     IonSelectOption,
     IonToggle,
@@ -85,6 +84,7 @@ import {
     IonCardTitle,
     IonCardContent,
     IonSpinner,
+    HostDirPickerComponent,
   ],
   templateUrl: './briefing.page.html',
   styleUrls: ['./briefing.page.scss'],
@@ -129,11 +129,13 @@ export class BriefingPage implements OnInit {
   // the new initiative right after it is created, so each initiative owns its own config from birth.
   protected readonly createLenses = signal<LensDraft[]>(defaultLenses());
 
-  // Host directory browser (workspace picker) — navigates via listDir instead of free-text entry.
+  // Host directory browser (workspace picker) — navigates via listDir instead of free-text entry. The
+  // picker itself is the shared presentational `app-host-dir-picker` (also used by the New-plan modal);
+  // this page stays the container that calls `listDir`.
   protected readonly dirBrowserOpen = signal(false);
-  protected readonly dirListing = signal<DirListing | null>(null);
-  protected readonly dirLoading = signal(false);
-  protected readonly dirError = signal<string | null>(null);
+  protected readonly pickerListing = signal<DirListing | null>(null);
+  protected readonly pickerLoading = signal(false);
+  protected readonly pickerError = signal<string | null>(null);
 
   ngOnInit(): void {
     // Populate the agent dropdown from the host's detected CLIs.
@@ -181,39 +183,20 @@ export class BriefingPage implements OnInit {
     this.dirBrowserOpen.set(false);
   }
   protected async browseTo(relPath: string): Promise<void> {
-    this.dirLoading.set(true);
-    this.dirError.set(null);
+    this.pickerLoading.set(true);
+    this.pickerError.set(null);
     try {
       const listing = await firstValueFrom(this.api.listDir(relPath));
-      this.dirListing.set(listing);
+      this.pickerListing.set(listing);
     } catch (err) {
-      this.dirError.set(err instanceof Error ? err.message : String(err));
+      this.pickerError.set(err instanceof Error ? err.message : String(err));
     } finally {
-      this.dirLoading.set(false);
+      this.pickerLoading.set(false);
     }
   }
-  /** Directories in the current listing (files are hidden — we pick a folder). */
-  protected browserDirs = computed(() =>
-    (this.dirListing()?.entries ?? []).filter((e) => e.kind === 'dir'),
-  );
-  /** Go up one level from the current relative path (no-op at the root). */
-  protected async dirUp(): Promise<void> {
-    const cur = this.dirListing()?.path ?? '';
-    if (!cur) return;
-    const parent = cur.includes('/') ? cur.slice(0, cur.lastIndexOf('/')) : '';
-    await this.browseTo(parent);
-  }
-  /** Absolute path of the currently-browsed directory (root + relative). */
-  private currentAbsoluteDir(): string {
-    const l = this.dirListing();
-    if (!l) return '';
-    const root = (l.root || '').replace(/\/+$/, '');
-    return l.path ? `${root}/${l.path}` : root;
-  }
-  /** Choose the currently-open directory as the workspace path. */
-  protected useCurrentDir(): void {
-    const abs = this.currentAbsoluteDir();
-    if (abs) this.createWorkspacePath = abs;
+  /** The picker chose a folder (absolute path): use it as the workspace path. */
+  protected useDir(absPath: string): void {
+    if (absPath) this.createWorkspacePath = absPath;
     this.dirBrowserOpen.set(false);
   }
 

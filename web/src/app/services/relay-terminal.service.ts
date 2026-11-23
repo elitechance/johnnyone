@@ -94,6 +94,11 @@ export class RelayTerminalService {
     this.streamSubscriptions.set(sessionId, current - 1);
   }
 
+  /** Is the relay socket open right now? (Plans tab: the 5 s poll runs only while it is not.) */
+  isConnected(): boolean {
+    return !!this.socket && this.socket.readyState === WS_OPEN;
+  }
+
   agentPlanRuns(): Observable<AgentPlanRunUpdate> {
     return this.agentPlanRunSubject.asObservable();
   }

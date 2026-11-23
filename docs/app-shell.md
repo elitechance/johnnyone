@@ -98,16 +98,26 @@ including the unknown-value fallback.
 
 ## 3. Nav rail + responsive nav (phase 03)
 
-`web/src/app/nav-items.ts` is the **single source** for the four global
-destinations, so the widescreen icon rail (`.gnav`) and the mobile bottom nav
-(`.botnav`) render from one list and can't drift (D4/D12):
+`web/src/app/nav-items.ts` is the **single source** for the global destinations
+(six since the Plans tab), so the widescreen icon rail (`.gnav`) and the mobile
+bottom nav (`.botnav`) render from one list and can't drift (D4/D12):
 
-| id | label | icon | path (existing route) |
-|---|---|---|---|
-| `work` | Work | `apps-outline` | `/terminal` |
-| `files` | Files | `folder-outline` | `/files` |
-| `shells` | Shells | `code-working-outline` | `/shells` |
-| `settings` | Settings | `settings-outline` | `/settings` |
+| id | label | icon | path | owns |
+|---|---|---|---|---|
+| `work` | Work | `apps-outline` | `/initiatives` | `/initiatives`, `/terminal`, `/briefing` |
+| `plans` | Plans | `document-text-outline` | `/plans` | `/plans` |
+| `arena` | Arena | `trophy-outline` | `/workflows` | `/workflows` |
+| `files` | Files | `folder-outline` | `/files` | `/files` |
+| `shells` | Shells | `code-working-outline` | `/shells` | `/shells` |
+| `settings` | Settings | `settings-outline` | `/settings` | `/settings` |
+
+**The sixth item (Plans tab, initiative 8ad3ae71, D9).** The brief asks for a
+global Plans tab, so it is not folded under Work and no existing entry is
+removed. The cost: at a 400px viewport the bottom nav goes from five items of
+80px to six of about 66px. Every caption is at most 8 characters ("Settings" is
+the longest and "Plans" is 5); `nav-items.spec.ts` pins that bound, so a longer
+label fails the build instead of overflowing the bar. Plans lights only on
+`/plans` and `/plans/:id`, and `/briefing` stays under Work.
 
 `NAV_ITEMS` is pure (no Angular import) so `nav-items.spec.ts` can pin it. Every
 `path` targets an **existing** route — no new routes are added; "Work" simply

@@ -37,6 +37,7 @@ const MIGRATION_027: &str = include_str!("../../migrations/027_add_session_watch
 const MIGRATION_028: &str = include_str!("../../migrations/028_add_watchdog_held_count.sql");
 const MIGRATION_029: &str = include_str!("../../migrations/029_add_watchdog_triggers.sql");
 const MIGRATION_030: &str = include_str!("../../migrations/030_add_plan_findings.sql");
+const MIGRATION_031: &str = include_str!("../../migrations/031_add_brief_versions.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -54,6 +55,13 @@ pub fn health_from_status(status: &str) -> &'static str {
 
 /// Run all pending migrations. Uses a simple version table to track applied migrations.
 pub fn run_migrations(conn: &Connection) -> Result<(), String> {
+    run_migrations_through(conn, i64::MAX)
+}
+
+/// Apply pending migrations whose version is `<= max_version`. Production always passes
+/// `i64::MAX` (via [`run_migrations`]); tests pass a lower bound to build a DB exactly as an
+/// older release left it, then upgrade it (e.g. `migration_031_applies_on_030_db`).
+fn run_migrations_through(conn: &Connection, max_version: i64) -> Result<(), String> {
     // Create the migration tracking table
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -107,6 +115,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
         (28, "028_add_watchdog_held_count", MIGRATION_028),
         (29, "029_add_watchdog_triggers", MIGRATION_029),
         (30, "030_add_plan_findings", MIGRATION_030),
+        (31, "031_add_brief_versions", MIGRATION_031),
     ];
 
     // Guard the shared version namespace. Versions are hand-assigned integers, and branches that
@@ -135,6 +144,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), String> {
     }
 
     for (version, name, sql) in migrations {
+        if version > max_version {
+            continue;
+        }
         if !applied.contains(&version) {
             tracing::info!(version = version, name = name, "Applying migration");
             conn.execute_batch(sql)
@@ -407,5 +419,136 @@ mod tests {
         assert_eq!(health_from_status("draft"), "in-progress");
         assert_eq!(health_from_status("approved"), "complete");
         assert_eq!(health_from_status("done"), "complete");
+    }
+
+    // ── Migration 031 (Plans tab, phase 00 task 01): brief_versions + mcp_tokens + 2 columns ──
+
+    fn migrated_031() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run_migrations(&conn).expect("first run_migrations");
+        run_migrations(&conn).expect("second run_migrations (idempotent)");
+        conn
+    }
+
+    #[test]
+    fn migration_031_creates_tables_and_columns() {
+        let conn = migrated_031();
+        assert_eq!(
+            column_names(&conn, "brief_versions"),
+            vec![
+                "initiative_id", "version", "author", "fields_json", "outline_json",
+                "changed_json", "change_note", "created_at",
+            ]
+        );
+        assert_eq!(
+            column_names(&conn, "mcp_tokens"),
+            vec!["token_hash", "session_id", "initiative_id", "role", "created_at", "revoked_at"]
+        );
+        let cols = column_names(&conn, "agent_plans");
+        for expected in ["accepted_brief_version", "planning_queued_after"] {
+            assert!(cols.iter().any(|c| c == expected), "agent_plans missing {expected}: {cols:?}");
+        }
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_mcp_tokens_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1, "idx_mcp_tokens_active missing");
+    }
+
+    #[test]
+    fn migration_031_rejects_bad_author_and_role() {
+        let conn = migrated_031();
+        insert_legacy_row(&conn, "p1", "planning", "draft");
+        let ok = conn.execute(
+            "INSERT INTO brief_versions (initiative_id, version, author, fields_json, outline_json) VALUES ('p1', 1, 'you', '{}', '{}')",
+            [],
+        );
+        assert!(ok.is_ok(), "author='you' must be accepted: {ok:?}");
+        let bad_author = conn.execute(
+            "INSERT INTO brief_versions (initiative_id, version, author, fields_json, outline_json) VALUES ('p1', 2, 'bot', '{}', '{}')",
+            [],
+        );
+        assert!(bad_author.is_err(), "author='bot' must violate the CHECK");
+        let bad_role = conn.execute(
+            "INSERT INTO mcp_tokens (token_hash, session_id, initiative_id, role) VALUES ('h1', 's1', 'p1', 'admin')",
+            [],
+        );
+        assert!(bad_role.is_err(), "role='admin' must violate the CHECK");
+    }
+
+    #[test]
+    fn mcp_tokens_one_live_token_per_initiative() {
+        let conn = migrated_031();
+        insert_legacy_row(&conn, "p1", "planning", "draft");
+        let insert = |hash: &str, revoked: Option<&str>| {
+            conn.execute(
+                "INSERT INTO mcp_tokens (token_hash, session_id, initiative_id, role, revoked_at) VALUES (?1, 's1', 'p1', 'plan_agent', ?2)",
+                params![hash, revoked],
+            )
+        };
+        insert("h1", None).expect("first live token");
+        assert!(insert("h2", None).is_err(), "a second live token must violate the partial unique index");
+        insert("h3", Some("2026-11-23 00:00:00")).expect("a revoked token is not constrained");
+        conn.execute("UPDATE mcp_tokens SET revoked_at = datetime('now') WHERE token_hash = 'h1'", [])
+            .unwrap();
+        insert("h4", None).expect("a new live token after revoking the old one");
+    }
+
+    #[test]
+    fn brief_versions_cascade_on_plan_delete() {
+        let conn = migrated_031();
+        insert_legacy_row(&conn, "p1", "planning", "draft");
+        for v in 1..=3 {
+            conn.execute(
+                "INSERT INTO brief_versions (initiative_id, version, author, fields_json, outline_json) VALUES ('p1', ?1, 'agent', '{}', '{}')",
+                params![v],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO mcp_tokens (token_hash, session_id, initiative_id, role) VALUES ('h1', 's1', 'p1', 'plan_agent')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM agent_plans WHERE id='p1'", []).unwrap();
+        let versions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM brief_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(versions, 0, "ON DELETE CASCADE must remove the plan's brief versions");
+        let tokens: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mcp_tokens", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tokens, 0, "ON DELETE CASCADE must remove the plan's MCP tokens");
+    }
+
+    #[test]
+    fn migration_031_applies_on_030_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run_migrations_through(&conn, 30).expect("migrate to 030");
+        assert!(
+            !column_names(&conn, "agent_plans").iter().any(|c| c == "accepted_brief_version"),
+            "a 030 DB must not have the 031 columns yet"
+        );
+        insert_legacy_row(&conn, "keep", "planning", "draft");
+        run_migrations(&conn).expect("upgrade 030 → 031");
+        let max: i64 = conn
+            .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max, 31);
+        let (title, accepted, queued): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT title, accepted_brief_version, planning_queued_after FROM agent_plans WHERE id='keep'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "t", "the pre-existing row survives the upgrade");
+        assert_eq!(accepted, None);
+        assert_eq!(queued, None);
     }
 }

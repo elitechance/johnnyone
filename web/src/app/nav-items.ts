@@ -14,7 +14,7 @@
 import { ARENA_RETURN_PARAM, stripReturnParam } from './pages/arena/arena-nav';
 
 export interface NavItem {
-  id: 'work' | 'arena' | 'files' | 'shells' | 'settings';
+  id: 'work' | 'plans' | 'arena' | 'files' | 'shells' | 'settings';
   /** Caption shown under the icon (rail `.cap` / bottom-nav label). */
   label: string;
   /** Registered ionicon name. */
@@ -38,6 +38,12 @@ export interface NavItem {
    * inside one initiative's tab bar is not a global entry, and making Work merely light up on
    * `/workflows` would have fixed the lit state while leaving the entry problem untouched.
    *
+   * PLANS IS THE SIXTH DESTINATION (Plans tab, initiative 8ad3ae71, D9). The brief asks for a
+   * global tab, so it is not folded under Work. At a 400px viewport six items are 400/6 ≈ 66px
+   * each (down from 80px with five). Every caption is ≤ 8 characters ("Settings" is the longest
+   * and already fit 80px; "Plans" is 5), and `nav-items.spec.ts` pins that bound. `/plans` and
+   * `/plans/:id` are owned by Plans only; `/briefing` stays under Work.
+   *
    * The 3-step setup wizard at `/initiatives/:id/arena` stays owned by WORK, not by Arena. It is a
    * route inside one initiative, its back link returns to that initiative's console, and today it
    * already lights Work correctly — re-measured, it is not a defect and nothing here changes it.
@@ -56,6 +62,8 @@ export const NAV_ITEMS: NavItem[] = [
     path: '/initiatives',
     owns: ['/initiatives', '/terminal', '/briefing'],
   },
+  // Draft plans (Plans tab): briefing-stage initiatives edited with the plan agent.
+  { id: 'plans', label: 'Plans', icon: 'document-text-outline', path: '/plans', owns: ['/plans'] },
   // The arena. `owns` is the `/workflows` tree only; see the note on `owns` for why the per-
   // initiative setup wizard stays under Work.
   { id: 'arena', label: 'Arena', icon: 'trophy-outline', path: '/workflows', owns: ['/workflows'] },

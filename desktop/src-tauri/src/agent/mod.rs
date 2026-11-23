@@ -12,6 +12,8 @@ use crate::services::{
     agent_plans, chat_host, providers as provider_service, session_watchdog,
     sessions as session_service, settings as settings_service,
 };
+use crate::services::brief_model::OutlineOp as BriefOutlineOp;
+use crate::services::brief_store::{Author as BriefAuthor, CreateDraftPlanInput as DraftPlanCreateInput};
 use crate::state::app_state::AppState;
 use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
@@ -1400,6 +1402,24 @@ impl AgentService {
             "create_briefing_run" => Self::rpc_create_briefing_run(&req.params, state).await,
             "initiative_upload_chunk" => Self::rpc_initiative_upload_chunk(&req.params, state),
             "accept_brief" => Self::rpc_accept_brief(&req.params, state).await,
+            // ── Plans tab (initiative 8ad3ae71, phase 01): draft plans, brief, outline, check,
+            // queue. Every write here is a human edit (author `you`); the plan agent never
+            // reaches these arms (it writes through the authenticated /mcp route, phase 02).
+            "list_draft_plans" => Self::rpc_list_draft_plans(state),
+            "create_draft_plan" => Self::rpc_create_draft_plan(&req.params, state).await,
+            "duplicate_draft_plan" => Self::rpc_duplicate_draft_plan(&req.params, state).await,
+            "get_brief_version" => Self::rpc_get_brief_version(&req.params, state),
+            "list_brief_versions" => Self::rpc_list_brief_versions(&req.params, state),
+            "update_brief_field" => Self::rpc_update_brief_field(&req.params, state),
+            "reset_brief_to_version" => Self::rpc_reset_brief_to_version(&req.params, state),
+            "get_brief_diff" => Self::rpc_get_brief_diff(&req.params, state),
+            "get_brief_check" => Self::rpc_get_brief_check(&req.params, state),
+            "add_outline_phase" => Self::rpc_add_outline_phase(&req.params, state),
+            "add_outline_task" => Self::rpc_add_outline_task(&req.params, state),
+            "update_outline_item" => Self::rpc_update_outline_item(&req.params, state),
+            "update_outline_item_position" => Self::rpc_update_outline_item_position(&req.params, state),
+            "delete_outline_item" => Self::rpc_delete_outline_item(&req.params, state),
+            "update_planning_queue" => Self::rpc_update_planning_queue(&req.params, state),
             "add_initiative_reference_path" => {
                 Self::rpc_add_initiative_reference_path(&req.params, state)
             }
@@ -2984,6 +3004,178 @@ impl AgentService {
         serde_json::to_value(run).map_err(|e| e.to_string())
     }
 
+    // ── Plans tab (phase 01 task 02): param-pullers, one service call each ──
+
+    fn rpc_list_draft_plans(state: &Arc<AppState>) -> Result<serde_json::Value, String> {
+        let rows = crate::services::brief_store::list_draft_plans(state)?;
+        serde_json::to_value(rows).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_create_draft_plan(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let input = DraftPlanCreateInput {
+            title: rpc_str(params, "title")?.to_string(),
+            workspace_path: rpc_str(params, "workspacePath")?.to_string(),
+            ask: rpc_opt_str(params, "ask").map(str::to_string),
+        };
+        let run = crate::services::brief_store::create_draft_plan(state, input).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    async fn rpc_duplicate_draft_plan(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let run = crate::services::brief_store::duplicate_draft_plan(state, id).await?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_brief_version(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        // Absent / null = latest; a present non-integer is an error, not a silent "latest".
+        let version = match params.get("version") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(v.as_i64().ok_or_else(|| "'version' must be an integer".to_string())?),
+        };
+        let v = crate::services::brief_store::get_version(state, id, version)?;
+        serde_json::to_value(v).map_err(|e| e.to_string())
+    }
+
+    fn rpc_list_brief_versions(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let v = crate::services::brief_store::list_versions(state, id)?;
+        serde_json::to_value(v).map_err(|e| e.to_string())
+    }
+
+    fn rpc_update_brief_field(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let field = rpc_str(params, "field")?;
+        let op = rpc_str(params, "op")?;
+        let r = crate::services::brief_store::update_field_named(
+            state,
+            id,
+            field,
+            op,
+            params.get("value"),
+            params.get("values"),
+            &BriefAuthor::You,
+            "",
+        )?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    }
+
+    fn rpc_reset_brief_to_version(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let version = rpc_i64(params, "version")?;
+        // Absent / null = whole-brief revert. A present value (even "") is parsed as a field key,
+        // so a malformed field errors instead of silently reverting the whole brief.
+        let field = params.get("field").and_then(|v| v.as_str());
+        let r = crate::services::brief_store::revert_named(state, id, version, field, &BriefAuthor::You)?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_brief_diff(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let from = rpc_i64(params, "fromVersion")?;
+        let to = rpc_i64(params, "toVersion")?;
+        let d = crate::services::brief_store::diff_versions(state, id, from, to)?;
+        serde_json::to_value(d).map_err(|e| e.to_string())
+    }
+
+    fn rpc_get_brief_check(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let items = crate::services::brief_store::check_latest(state, id)?;
+        serde_json::to_value(items).map_err(|e| e.to_string())
+    }
+
+    fn rpc_add_outline_phase(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let op = BriefOutlineOp::AddPhase { title: rpc_str(params, "title")?.to_string() };
+        crate::services::brief_store::outline_op_json(state, id, op, &BriefAuthor::You)
+    }
+
+    fn rpc_add_outline_task(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let op = BriefOutlineOp::AddTask {
+            phase_id: rpc_str(params, "phaseId")?.to_string(),
+            title: rpc_str(params, "title")?.to_string(),
+        };
+        crate::services::brief_store::outline_op_json(state, id, op, &BriefAuthor::You)
+    }
+
+    fn rpc_update_outline_item(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let op = BriefOutlineOp::Update {
+            id: rpc_str(params, "id")?.to_string(),
+            title: rpc_str(params, "title")?.to_string(),
+        };
+        crate::services::brief_store::outline_op_json(state, id, op, &BriefAuthor::You)
+    }
+
+    fn rpc_update_outline_item_position(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let to_index = rpc_i64(params, "toIndex")?;
+        let to_index = usize::try_from(to_index).map_err(|_| "'toIndex' must be ≥ 0".to_string())?;
+        let op = BriefOutlineOp::Move { id: rpc_str(params, "id")?.to_string(), to_index };
+        crate::services::brief_store::outline_op_json(state, id, op, &BriefAuthor::You)
+    }
+
+    fn rpc_delete_outline_item(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        let op = BriefOutlineOp::Delete { id: rpc_str(params, "id")?.to_string() };
+        crate::services::brief_store::outline_op_json(state, id, op, &BriefAuthor::You)
+    }
+
+    fn rpc_update_planning_queue(
+        params: &serde_json::Value,
+        state: &Arc<AppState>,
+    ) -> Result<serde_json::Value, String> {
+        let id = rpc_str(params, "initiativeId")?;
+        // null / absent = clear the queue; an array = queue after those initiatives.
+        let after = params
+            .get("afterInitiativeIds")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+        let run = crate::services::brief_store::queue_planning_run(state, id, after)?;
+        serde_json::to_value(run).map_err(|e| e.to_string())
+    }
+
     /// Overhaul P4 (D6): record a ▤ Reference host path on a briefing Initiative. Thin wrapper over
     /// `agent_plans::add_initiative_reference_path`.
     fn rpc_add_initiative_reference_path(
@@ -3255,6 +3447,40 @@ impl AgentService {
         })
     }
 
+    /// Refuse a relayed chat turn without spawning: one final `error` delta carrying `message`, then
+    /// the usual completion, so the web stops its streaming state and shows the reason.
+    async fn send_relay_chat_refusal(
+        req: &RelayChatRequest,
+        ws_write: &Arc<Mutex<ws_client::WsWrite>>,
+        message: &str,
+    ) -> Result<(), String> {
+        tracing::info!(session_id = %req.session_id, %message, "relay chat turn refused");
+        let delta = AgentEnvelope {
+            message: AgentMessage::RelayChatDelta(RelayChatDelta {
+                relay_id: req.relay_id.clone(),
+                session_id: req.session_id.clone(),
+                delta: message.to_string(),
+                chunk_type: "error".to_string(),
+                is_final: true,
+            }),
+        };
+        let complete = AgentEnvelope {
+            message: AgentMessage::RelayChatComplete(RelayChatComplete {
+                relay_id: req.relay_id.clone(),
+                session_id: req.session_id.clone(),
+                message_id: uuid::Uuid::new_v4().to_string(),
+            }),
+        };
+        for envelope in [delta, complete] {
+            let msg = serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
+            let mut writer = ws_write.lock().await;
+            let _ = writer
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await;
+        }
+        Ok(())
+    }
+
     /// Handle a relayed chat request from mobile.
     /// Spawns a CLI subprocess and streams deltas back via WebSocket.
     async fn handle_relay_chat(
@@ -3362,13 +3588,26 @@ impl AgentService {
             return Err("kloo is a oneshot executor, not a chat provider".to_string());
         }
 
+        // Plans tab 02/07: a plan's agent session gets the j1 MCP config + least-privilege flags; a
+        // plan that left briefing (or a non-claude provider on a plan session) refuses the turn
+        // with an error delta and spawns nothing.
+        let plan_extras =
+            match crate::services::chat_host::plan_agent_turn_extras(&state, &req.session_id, &provider_str) {
+                Ok(x) => x,
+                Err(message) => {
+                    Self::send_relay_chat_refusal(&req, &ws_write, &message).await?;
+                    return Ok(());
+                }
+            };
+
         let config = match provider {
-            CliProvider::ClaudeCode => claude_code::build_config(
+            CliProvider::ClaudeCode => claude_code::build_config_with(
                 &req.content,
                 &working_dir,
                 &model,
                 cli_path_ref,
                 cli_sid_ref,
+                plan_extras.as_ref(),
             ),
             CliProvider::Codex => codex::build_config(
                 &req.content,
@@ -3410,8 +3649,15 @@ impl AgentService {
             CliProvider::Lokalai => lokalai::parse_line,
         };
 
-        let (_process, mut rx) =
+        let (process, mut rx) =
             cli_runner::spawn_cli(config, req.session_id.clone(), parse_fn).await?;
+        // Registered like the host chat path so `chat_host::stop_generation` (Stop, and the plan
+        // agent's retire on accept/delete — 02/09) can end an in-flight relay turn.
+        state
+            .active_processes
+            .lock()
+            .await
+            .insert(req.session_id.clone(), process);
 
         // Stream chunks back through WebSocket as relay deltas
         let mut full_content = String::new();
@@ -3423,10 +3669,14 @@ impl AgentService {
         // Monotonic ordering key for the structured StreamEvent lane (overhaul P2, D6). Per-turn;
         // full per-session global sequencing is a Phase-3 concern.
         let mut stream_seq: u64 = 0;
+        let mut tool_chunks: Vec<StreamChunk> = Vec::new();
 
         while let Some(chunk) = rx.recv().await {
             if chunk.chunk_type == ChunkType::Text {
                 full_content.push_str(&chunk.content);
+            }
+            if matches!(chunk.chunk_type, ChunkType::ToolUse | ChunkType::ToolResult) {
+                tool_chunks.push(chunk.clone());
             }
 
             if (chunk.chunk_type == ChunkType::System || chunk.chunk_type == ChunkType::Result)
@@ -3485,6 +3735,10 @@ impl AgentService {
             }
         }
 
+        // The turn is over: drop the registration (a Stop may already have removed + killed it).
+        state.active_processes.lock().await.remove(&req.session_id);
+        let tool_calls = crate::services::chat_host::fold_tool_calls(&tool_chunks);
+
         // Send completion message
         let complete = RelayChatComplete {
             relay_id: req.relay_id.clone(),
@@ -3528,8 +3782,8 @@ impl AgentService {
             ).map_err(|e| e.to_string())?;
 
             conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents) VALUES (?1, ?2, 'assistant', ?3, 'stop', ?4, ?5, ?6)",
-                rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents],
+                "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents, tool_calls) VALUES (?1, ?2, 'assistant', ?3, 'stop', ?4, ?5, ?6, ?7)",
+                rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents, tool_calls],
             ).map_err(|e| e.to_string())?;
 
             if matches!(
@@ -5204,5 +5458,202 @@ mod session_view_tests {
             // `ended` — neither field may stand in for the other.
             assert!(view.attached_tmux);
         }
+    }
+}
+
+// ── RPC param helpers (Plans tab, phase 01): the existing `Missing 'x' parameter` style ──
+
+fn rpc_str<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("Missing '{}' parameter", key))
+}
+
+fn rpc_opt_str<'a>(params: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    params.get(key).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
+}
+
+fn rpc_i64(params: &serde_json::Value, key: &str) -> Result<i64, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| format!("Missing '{}' parameter", key))
+}
+
+/// Plans tab phase 01 task 02: the draft-plan / brief / outline RPC arms, driven in-process through
+/// `AgentService::handle_rpc` exactly as the relay calls them (no CLI, no tmux).
+#[cfg(test)]
+mod plans_rpc_tests {
+    use super::*;
+    use crate::services::settings as settings_service;
+    use crate::test_support::{test_state, tmp_dir};
+    use serde_json::{json, Value};
+
+    async fn rpc(state: &Arc<AppState>, method: &str, params: Value) -> Result<Value, String> {
+        let req = RpcRequest { request_id: "t".into(), method: method.into(), params };
+        let resp = AgentService::handle_rpc(&req, state).await;
+        if resp.success {
+            Ok(resp.data.unwrap_or(Value::Null))
+        } else {
+            Err(resp.error.unwrap_or_default())
+        }
+    }
+
+    async fn setup() -> (Arc<AppState>, String) {
+        let (state, _root) = test_state();
+        let store = tmp_dir("prpc-store").canonicalize().unwrap();
+        settings_service::set_setting(
+            &state,
+            settings_service::KEY_INITIATIVES_DIR.to_string(),
+            store.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        let ws = tmp_dir("prpc-ws");
+        let state = Arc::new(state);
+        let run = rpc(
+            &state,
+            "create_draft_plan",
+            json!({"title": "Plan", "workspacePath": ws.to_string_lossy(), "ask": "Ship it."}),
+        )
+        .await
+        .expect("create_draft_plan");
+        let id = run["plan"]["id"].as_str().unwrap().to_string();
+        (state, id)
+    }
+
+    #[tokio::test]
+    async fn rpc_brief_roundtrip() {
+        let (state, id) = setup().await;
+        let listed = rpc(&state, "list_draft_plans", json!({})).await.unwrap();
+        assert_eq!(listed[0]["id"], json!(id));
+        assert_eq!(listed[0]["latest"]["version"], json!(1));
+
+        let w = rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "outcome", "op": "value", "value": "Ship the tab."})).await.unwrap();
+        assert_eq!(w, json!({"version": 2, "changedFields": ["outcome"]}));
+        let w = rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "where", "op": "value", "values": ["web", "desktop"]})).await.unwrap();
+        assert_eq!(w["version"], json!(3));
+        rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "done_when", "op": "add", "value": "cargo test"})).await.unwrap();
+
+        let v = rpc(&state, "get_brief_version", json!({"initiativeId": id})).await.unwrap();
+        assert_eq!((v["version"].clone(), v["author"].clone()), (json!(4), json!("you")));
+        assert_eq!(v["fields"]["where"], json!(["web", "desktop"]));
+        assert_eq!(v["fields"]["doneWhen"], json!("cargo test"), "GraphQL camelCase field names");
+        assert!(v["fields"].get("done_when").is_none());
+        assert_eq!(v["initiativeStatus"], json!("briefing"));
+        assert_eq!(rpc(&state, "get_brief_version", json!({"initiativeId": id, "version": 2})).await.unwrap()["fields"]["outcome"], json!("Ship the tab."));
+
+        let r = rpc(&state, "reset_brief_to_version", json!({"initiativeId": id, "version": 1, "field": "outcome"})).await.unwrap();
+        assert_eq!(r, json!({"version": 5, "changedFields": ["outcome"]}));
+        let r = rpc(&state, "reset_brief_to_version", json!({"initiativeId": id, "version": 1})).await.unwrap();
+        assert_eq!(r["version"], json!(6));
+        let metas = rpc(&state, "list_brief_versions", json!({"initiativeId": id})).await.unwrap();
+        assert_eq!(metas.as_array().unwrap().len(), 6);
+        assert_eq!(metas[4]["changeNote"], json!("undo outcome"));
+
+        let check = rpc(&state, "get_brief_check", json!({"initiativeId": id})).await.unwrap();
+        assert_eq!(check.as_array().unwrap().len(), 5);
+        assert_eq!(check[0]["rule"], json!("outcome_one_sentence"));
+
+        // Bad wire values surface the model's message.
+        let e = rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "nope", "op": "value", "value": "x"})).await.unwrap_err();
+        assert!(e.contains("unknown brief field"), "{e}");
+        let e = rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "why", "op": "zap", "value": "x"})).await.unwrap_err();
+        assert!(e.contains("unknown op"), "{e}");
+
+        // Duplicate over RPC.
+        let copy = rpc(&state, "duplicate_draft_plan", json!({"initiativeId": id})).await.unwrap();
+        assert_eq!(copy["plan"]["title"], json!("Plan (copy)"));
+    }
+
+    #[tokio::test]
+    async fn rpc_outline_roundtrip() {
+        let (state, id) = setup().await;
+        let a = rpc(&state, "add_outline_phase", json!({"initiativeId": id, "title": "Store"})).await.unwrap();
+        assert_eq!(a, json!({"version": 2, "changedFields": ["outline:00"], "id": "00"}));
+        rpc(&state, "add_outline_phase", json!({"initiativeId": id, "title": "API"})).await.unwrap();
+        let t = rpc(&state, "add_outline_task", json!({"initiativeId": id, "phaseId": "00", "title": "Migration"})).await.unwrap();
+        assert_eq!(t["id"], json!("00/01"));
+        rpc(&state, "update_outline_item", json!({"initiativeId": id, "id": "00/01", "title": "Migration 031"})).await.unwrap();
+        rpc(&state, "update_outline_item_position", json!({"initiativeId": id, "id": "01", "toIndex": 0})).await.unwrap();
+        let e = rpc(&state, "update_outline_item_position", json!({"initiativeId": id, "id": "01", "toIndex": -1})).await.unwrap_err();
+        assert!(e.contains("toIndex"), "{e}");
+        rpc(&state, "delete_outline_item", json!({"initiativeId": id, "id": "00/01"})).await.unwrap();
+        let v = rpc(&state, "get_brief_version", json!({"initiativeId": id})).await.unwrap();
+        assert_eq!(v["version"], json!(7));
+        let phases = v["outline"]["phases"].as_array().unwrap();
+        assert_eq!(phases.iter().map(|p| p["id"].clone()).collect::<Vec<_>>(), vec![json!("01"), json!("00")]);
+        assert!(phases[1]["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(phases[1]["author"], json!("you"));
+    }
+
+    #[tokio::test]
+    async fn rpc_get_brief_diff() {
+        let (state, id) = setup().await;
+        rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "why", "op": "add", "value": "Briefs drift."})).await.unwrap();
+        rpc(&state, "add_outline_phase", json!({"initiativeId": id, "title": "Store"})).await.unwrap();
+        let d = rpc(&state, "get_brief_diff", json!({"initiativeId": id, "fromVersion": 1, "toVersion": 3})).await.unwrap();
+        let why = d["fields"].as_array().unwrap().iter().find(|f| f["field"] == "why").unwrap().clone();
+        assert_eq!((why["changed"].clone(), why["added"].clone()), (json!(true), json!(["Briefs drift."])));
+        assert_eq!(d["outline"]["added"], json!([{"id": "00", "title": "Store"}]));
+        let e = rpc(&state, "get_brief_diff", json!({"initiativeId": id, "fromVersion": 1, "toVersion": 9})).await.unwrap_err();
+        assert!(e.contains("not found"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn rpc_missing_param_errors() {
+        let (state, id) = setup().await;
+        let cases = [
+            ("create_draft_plan", json!({"title": "x"}), "workspacePath"),
+            ("duplicate_draft_plan", json!({}), "initiativeId"),
+            ("get_brief_version", json!({}), "initiativeId"),
+            ("list_brief_versions", json!({}), "initiativeId"),
+            ("update_brief_field", json!({"initiativeId": id, "op": "value"}), "field"),
+            ("update_brief_field", json!({"initiativeId": id, "field": "why"}), "op"),
+            ("reset_brief_to_version", json!({"initiativeId": id}), "version"),
+            ("get_brief_diff", json!({"initiativeId": id, "fromVersion": 1}), "toVersion"),
+            ("get_brief_check", json!({}), "initiativeId"),
+            ("add_outline_phase", json!({"initiativeId": id}), "title"),
+            ("add_outline_task", json!({"initiativeId": id, "title": "t"}), "phaseId"),
+            ("update_outline_item", json!({"initiativeId": id, "title": "t"}), "id"),
+            ("update_outline_item_position", json!({"initiativeId": id, "id": "00"}), "toIndex"),
+            ("delete_outline_item", json!({"initiativeId": id}), "id"),
+            ("update_planning_queue", json!({}), "initiativeId"),
+        ];
+        for (method, params, key) in cases {
+            let e = rpc(&state, method, params).await.unwrap_err();
+            assert_eq!(e, format!("Missing '{}' parameter", key), "{method}");
+        }
+        // Malformed values are errors, not silent fallbacks.
+        let e = rpc(&state, "reset_brief_to_version", json!({"initiativeId": id, "version": 1, "field": ""})).await.unwrap_err();
+        assert!(e.contains("unknown brief field"), "{e}");
+        let e = rpc(&state, "get_brief_version", json!({"initiativeId": id, "version": "2"})).await.unwrap_err();
+        assert!(e.contains("'version' must be an integer"), "{e}");
+        assert_eq!(rpc(&state, "get_brief_version", json!({"initiativeId": id, "version": null})).await.unwrap()["version"], json!(1));
+        // Nothing was written by the failed calls.
+        assert_eq!(rpc(&state, "get_brief_version", json!({"initiativeId": id})).await.unwrap()["version"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn rpc_writes_after_accept_fail_with_frozen_message() {
+        let (state, id) = setup().await;
+        rpc(&state, "update_brief_field", json!({"initiativeId": id, "field": "why", "op": "value", "value": "w"})).await.unwrap();
+        crate::services::agent_plans::freeze_and_flip_brief(&state, &id, None).expect("freeze");
+        let frozen = "the plan left briefing; the brief is frozen at v2";
+        let writes = [
+            ("update_brief_field", json!({"initiativeId": id, "field": "why", "op": "value", "value": "late"})),
+            ("reset_brief_to_version", json!({"initiativeId": id, "version": 1})),
+            ("add_outline_phase", json!({"initiativeId": id, "title": "late"})),
+            ("update_planning_queue", json!({"initiativeId": id, "afterInitiativeIds": null})),
+        ];
+        for (method, params) in writes {
+            assert_eq!(rpc(&state, method, params).await.unwrap_err(), frozen, "{method}");
+        }
+        // Reads still work, and expose the frozen version.
+        let v = rpc(&state, "get_brief_version", json!({"initiativeId": id})).await.unwrap();
+        assert_eq!((v["acceptedBriefVersion"].clone(), v["initiativeStatus"].clone()), (json!(2), json!("planning")));
+        // A plan that left briefing no longer lists as a draft.
+        let listed = rpc(&state, "list_draft_plans", json!({})).await.unwrap();
+        assert!(listed.as_array().unwrap().iter().all(|r| r["id"] != json!(id)));
     }
 }

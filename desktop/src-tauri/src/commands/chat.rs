@@ -43,6 +43,12 @@ pub async fn send_chat_message(
         .map_err(|e| format!("Session not found: {}", e))
         })?;
 
+    // Plans tab 02/07 (validator follow-up F1): this Tauri command is a third chat path. A plan's
+    // agent session gets the same j1 MCP config + least-privilege flags as `chat_host` and the relay,
+    // and is refused after accept or on a non-claude provider — before anything is stored.
+    let plan_extras =
+        crate::services::chat_host::plan_agent_turn_extras(&state, &session_id, &provider_str)?;
+
     // 2. Save user message to SQLite
     let user_msg_id = Uuid::new_v4().to_string();
     let user_message = state.db.with_conn(|conn| {
@@ -87,9 +93,14 @@ pub async fn send_chat_message(
     let cli_path_ref = cli_path.as_deref();
     let cli_sid_ref = cli_session_id.as_deref();
     let config = match provider {
-        CliProvider::ClaudeCode => {
-            claude_code::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
-        }
+        CliProvider::ClaudeCode => claude_code::build_config_with(
+            &content,
+            &working_dir,
+            &model,
+            cli_path_ref,
+            cli_sid_ref,
+            plan_extras.as_ref(),
+        ),
         CliProvider::Codex => {
             codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
         }

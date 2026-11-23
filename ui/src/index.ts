@@ -67,6 +67,24 @@ export type {
   // `web/src/app/pages/arena/arena-api.service.ts`, which only the lazy arena chunk injects.
   TestGateRun,
 } from './services/johnny-api.service';
+// Plans tab (initiative 8ad3ae71): draft plans + the structured, versioned brief.
+export type {
+  BriefAuthor,
+  BriefCheckItem,
+  BriefDiff,
+  BriefFieldKey,
+  BriefFieldOp,
+  BriefFields,
+  BriefOutline,
+  BriefVersion,
+  BriefVersionMeta,
+  BriefWriteResult,
+  CreateDraftPlanInput,
+  DraftPlan,
+  FieldDiff,
+  OutlinePhase,
+  OutlineTask,
+} from './services/johnny-api.service';
 export { AiChatService } from './services/ai-chat.service';
 export type {
   ChatBackend,
@@ -78,6 +96,7 @@ export type {
 // ── Components ───────────────────────────────────────────────────────────────
 export { ChatWindowComponent } from './components/chat-window/chat-window.component';
 export { MessageBubbleComponent } from './components/message-bubble/message-bubble.component';
+export type { BubbleDisplay, BubbleToolRow } from './components/message-bubble/message-bubble.component';
 export { MessageComposerComponent } from './components/message-composer/message-composer.component';
 export { ToolExecutionCardComponent } from './components/tool-execution-card/tool-execution-card.component';
 export { SessionListComponent } from './components/session-list/session-list.component';

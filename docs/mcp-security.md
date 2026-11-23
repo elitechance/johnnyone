@@ -1,0 +1,238 @@
+# MCP security — the plan agent's `/mcp` endpoint
+
+> Plans tab, initiative 8ad3ae71, phase 02. Required by the user's brief section "MCP security"
+> (2026-11-23). This is the durable record of what protects `POST 127.0.0.1:7788/mcp`, which code
+> enforces each control, and which test pins it. **Read this before touching `/mcp`, the plan agent's
+> launch flags, `repo_search`, or the `mcp_tokens` table.**
+
+The Plans-tab **plan agent** is a claude_code chat session (one `claude --print --resume` process per
+turn on the existing chat paths, no tmux pane). Its ONLY write path into J1 is the MCP server at
+`POST 127.0.0.1:7788/mcp` (Streamable HTTP, JSON responses). It exposes ten tools: `brief_get`,
+`brief_update`, `brief_versions`, the five outline tools, `plan_check` and the read-only
+`repo_search`. Everything else on `:7788` (the GraphQL host API) is **unauthenticated by design**.
+`/mcp` is the first authenticated route there and must not inherit that trust.
+
+> **Upcoming change (user decision 2026-11-23, D1):** the plan agent will run in a tmux pane, delivered by the follow-up
+> initiative "plan agent in tmux". Structured stream-json stays the data path; the pane is for visibility only. The token
+> rules below do not change: the token stays only in the 0600 `mcp.json`, and the pane's command line holds the config
+> PATH, never the token. When the pane lands, `terminal.rs::refuse_plan_agent_pane` and the no-pane-kill branch of the
+> retire path change together, so that retiring the agent also kills its pane.
+
+## Threat model
+
+**Who can reach `127.0.0.1:7788`.**
+
+- **Any local process** of any user on this machine. The listener binds loopback, so other
+  machines can't connect, but every local program can.
+- **Browser pages, indirectly.** Any site the user visits can `fetch()` loopback.
+  - A CORS-"simple" `POST` (e.g. `text/plain`) needs no preflight.
+  - DNS rebinding lets a hostile domain resolve to `127.0.0.1`, so its requests carry a foreign `Host`.
+  - Without the controls below, a page could drive `/mcp` the same way it once could drive `/graphql`.
+
+**What a plan agent could misuse.**
+
+- **Its own tools**, to touch a plan other than its own. Scope must come from the token, never from
+  arguments.
+- **Other plans' `mcp.json` token files.** They live in the plan store
+  (`<initiatives_dir>/<id>/plan-agent/mcp.json`). A workspace can be an ANCESTOR of the plan store
+  (e.g. `/home/…/Workspace`), so a generic file-read tool would let plan A's agent read plan B's
+  token. This was the round-1 Lead finding.
+- **Files outside its workspace** (`~/.ssh`, `.env`, other repos), through a built-in Read/Grep/Glob
+  tool or a `..`/symlink escape in a search path.
+- **Command execution or file writes**, via a built-in Bash/Write/Edit tool or a tool that shells out.
+
+**Out of scope.**
+
+- **A local attacker running as the same OS user.** Such an attacker can read the `0600` config file
+  (or `/proc`, or the SQLite DB) directly; file permissions cannot stop the file's own owner. The
+  controls narrow what the *agent* and *other users/pages* can do. They are not a sandbox against
+  the user's own account.
+- **Model misbehaviour inside the agent's own plan.** It can only edit its own brief through
+  versioned, attributed, undoable writes.
+
+## Controls
+
+| id | control | code path | tests |
+|---|---|---|---|
+| C1 | Per-session bearer token: 256 bits from the OS RNG, only its SHA-256 is stored, compared in constant time (`subtle`); every request (incl. `initialize`) must present it; the token's session must exist, be active and still be the plan's briefing_session_id | desktop/src-tauri/src/services/mcp_tokens.rs::mint, mcp_tokens.rs::verify, host/mcp.rs::authorize | `token_is_256_bits_hex`, `only_hash_is_stored`, `verify_rejects_malformed_unknown_revoked`, `missing_token_401`, `malformed_token_401`, `unknown_token_401`, `revoked_token_401`, `archived_session_rejected`, `deleted_session_rejected`, `replaced_session_rejected` |
+| C2 | The raw token lives only in a 0600 `mcp.json` inside a 0700 per-plan dir, exactly once, in `mcpServers.j1.headers.Authorization`; argv carries the file PATH only; never in env, logs or events (`RawToken` has a redacting Debug and no Display/Serialize) | mcp_tokens.rs::write_mcp_config, mcp_tokens.rs::RawToken, plan_agent.rs::plan_agent_extras, cli_runner.rs::log_spawn | `mcp_config_file_is_0600_in_0700_dir`, `mcp_config_token_only_in_authorization_header`, `raw_token_debug_is_redacted`, `launch_args_never_contain_token`, `logged_launch_args_contain_no_token`, `token_absent_from_events_and_logs` |
+| C3 | Scope comes from the token only: no tool schema has an initiative/plan id, every schema is `additionalProperties:false`, arguments are validated against the SAME schema `tools/list` advertises; no tool executes a command or writes a file | plan_mcp.rs::TOOLS, plan_mcp.rs::validate, host/mcp.rs::tools_call | `token_a_cannot_touch_plan_b`, `initiative_id_argument_is_a_validation_error`, `every_tool_rejects_unknown_and_mistyped_args`, `every_schema_uses_supported_keywords`, `no_tool_writes_outside_db`, `tools_call_brief_update_increments_version_author_agent` |
+| C4 | Revoke on accept (Start planning), delete, any retire, and replacement; a plan that left briefing answers 403 with the frozen version; revoking deletes `mcp.json` | agent_plans.rs::freeze_and_flip_brief, agent_plans.rs::freeze_flip_and_retire_agent, agent_plans.rs::delete_plan_with, agent_plans.rs::retire_agent_session_with, plan_agent.rs::retire_plan_agent_with, plan_agent.rs::replace_plan_agent_session, mcp_tokens.rs::revoke_for_initiative | `accept_revokes_token_and_retires_session`, `delete_revokes_token_and_retires_session`, `retire_revokes_token`, `new_session_token_revokes_old`, `mint_revokes_previous_live_token`, `replacement_stops_and_retires_old_session`, `retired_session_cannot_call_mcp`, `call_after_accept_rejected` |
+| C5 | Transport guard before any parsing: POST only (405), ANY Origin refused (403), Host must be 127.0.0.1 or localhost on the bound port (421), Content-Type application/json (415), body at most 256 KiB incl. chunked (413); `/mcp` is merged beside, not inside, the CORS-enabled origin guard so it never emits an access-control header | host/mcp.rs::check_request, host/mcp.rs::mcp_router, host/mod.rs::router | `check_request_table`, `origin_header_rejected`, `bad_host_rejected`, `non_post_rejected`, `options_preflight_rejected_without_cors`, `non_json_rejected`, `oversized_body_rejected`, `no_cors_headers_on_mcp`, `graphql_route_unchanged` |
+| C6 | Least-privilege agent. PRIMARY: `--tools ""`, an allow-list of NO built-in tools (the CLI then reports zero tools; it cannot go stale when a CLI release adds one). Extra layers: `--allowedTools` is exactly the ten `mcp__j1__*` tools, `--strict-mcp-config` (only the j1 server), `--disallowedTools` lists every built-in that reads/writes/executes/fetches/delegates (incl. Agent, LSP, Skill), `--permission-mode default` (never bypassPermissions); ordinary chats get none of these flags; refused after accept and on any non-claude provider | providers/claude_code.rs::build_config_with, claude_code.rs::PLAN_AGENT_DISALLOWED_TOOLS, chat_host.rs::plan_agent_turn_extras (used by chat_host, agent/mod.rs::handle_relay_chat and commands/chat.rs::send_chat_message), terminal.rs::refuse_plan_agent_pane (no tmux pane for a plan agent) | `plan_agent_args_least_privilege`, `allowed_tools_are_mcp_j1_only`, `plain_chat_args_unchanged`, `plan_agent_deny_list_matches_the_probe`, `extras_err_after_accept`, `extras_none_for_non_plan_session`, `system_prompt_mentions_tools_only_and_choices_line`, `no_tmux_created`, `plan_agent_session_gets_no_terminal_pane` |
+| C7 | `repo_search` is read-only and jailed: relative paths only, no `..`, canonicalized start must stay in the workspace, symlinked dirs never followed, symlinked files only when they resolve inside; hard exclusions on the canonical path (initiatives dir, any `.johnnyone` or `plan-agent` component, `mcp.json`, `.env*`); output, line and time caps; an in-process walker, no subprocess | services/repo_search.rs::repo_search_until, repo_search.rs::is_excluded, repo_search.rs::check_relative | `repo_search_finds_literal_case_insensitive`, `repo_search_dotdot_refused`, `repo_search_absolute_refused`, `repo_search_symlink_escape_refused`, `repo_search_output_capped`, `repo_search_time_capped`, `repo_search_skips_ignored_dirs`, `repo_search_never_returns_mcp_tokens`, `repo_search_excludes_real_initiatives_dir_inside_workspace` |
+| C8 | Audit: every accepted write is a brief_version_created event with author agent + sessionId; every refused call that resolves to a plan is an agent_mcp_rejected {reason, method, tool, count} event (fixed labels only — client text is never echoed); planless refusals are a `tracing` warn with a global counter; rejections never page Discord | plan_mcp.rs::record_rejection, brief_store.rs::write_version, agent_plans.rs::event_summary | `accepted_write_event_has_agent_and_session`, `rejection_event_has_reason_and_count_no_token`, `rejection_renders_in_timeline`, `unknown_method_32601`, `token_absent_from_events_and_logs` |
+
+The caller always gets ONE undistinguished `401 {"code":-32001,"message":"unauthorized"}` for
+any token/session failure. The precise reason goes only to the audit, so the endpoint is not an
+oracle for guessing tokens. Tool-level failures the model can fix (unknown outline id, `no change`,
+over a cap) return `result.isError = true`. Schema and argument failures return JSON-RPC `-32602`.
+
+### Input limits
+
+Both writers (human GraphQL/RPC and agent MCP) go through `brief_model::apply_field_op` /
+apply_outline_op, so one set of caps guards both. The MCP schemas mirror the same numbers as
+`maxLength`/`maxItems`:
+
+- a text field holds at most 4,000 characters;
+- `where` holds at most 50 items of at most 300 characters each;
+- an outline holds at most 20 phases × 30 tasks;
+- a title holds at most 200 characters.
+
+Single-line values (`where` items, titles) refuse newlines and control characters. When
+render_brief_md builds the planner's input, it escapes any line that would add markdown structure:
+a leading `#`, a code fence, or a setext/thematic rule. Pinned by
+`over_cap_values_are_rejected_with_a_clear_error` and
+`injected_title_cannot_add_a_heading_or_section`.
+
+## Token lifecycle
+
+```mermaid
+sequenceDiagram
+  participant W as Web (chat turn)
+  participant H as Host chat path (chat_host / relay)
+  participant T as mcp_tokens
+  participant F as plan-agent/mcp.json (0600, dir 0700)
+  participant C as claude --print (plan agent)
+  participant M as /mcp (guard + handle_mcp)
+  participant S as brief_store
+  W->>H: send a message to the plan's briefing session
+  H->>T: plan_agent_extras: live token for (plan, session)? file present?
+  T->>T: mint: 256-bit token, revoke older live token, store SHA-256 only
+  T->>F: write {"mcpServers":{"j1":{"headers":{"Authorization":"Bearer …"}}}}
+  H->>C: spawn with --mcp-config <PATH> --strict-mcp-config --allowedTools mcp__j1__* (no token in argv/env)
+  C->>F: reads the config file
+  C->>M: POST /mcp, Authorization: Bearer <token>
+  M->>M: transport guard (POST, no Origin, Host, JSON, ≤256 KiB)
+  M->>T: verify: 64 hex, hash, constant-time compare, not revoked
+  M->>M: session active AND == briefing_session_id; plan in briefing
+  M->>S: tool runs with TokenScope (author agent, sessionId)
+  S-->>M: {version, changed_fields}
+  Note over W,S: Start planning / delete / retire / replace
+  H->>T: revoke_for_initiative / revoke_for_session (revoked_at set)
+  T->>F: delete mcp.json
+  C->>M: any later request with the old token
+  M-->>C: 401 unauthorized (or 403 frozen if only the plan flipped)
+```
+
+## Operations
+
+All commands assume the default DB `~/.local/share/johnnyone/johnnyone.db` and the plan store
+`/home/creepy/Documents/Workspace/.johnnyone/initiatives` (the `initiatives_dir` setting).
+
+**Revoke one plan's token.** The clean way is to delete the plan (it revokes, deletes the file and
+retires the agent) or to Start planning. By hand:
+
+```bash
+sqlite3 ~/.local/share/johnnyone/johnnyone.db \
+  "UPDATE mcp_tokens SET revoked_at=datetime('now') WHERE initiative_id='<id>' AND revoked_at IS NULL"
+rm -rf /home/creepy/Documents/Workspace/.johnnyone/initiatives/<id>/plan-agent/
+```
+
+The next chat turn mints a fresh token and rewrites the file (only while the plan is in briefing).
+
+**Revoke every token.**
+
+```bash
+sqlite3 ~/.local/share/johnnyone/johnnyone.db \
+  "UPDATE mcp_tokens SET revoked_at=datetime('now') WHERE revoked_at IS NULL"
+rm -rf /home/creepy/Documents/Workspace/.johnnyone/initiatives/*/plan-agent/
+```
+
+**Read the audit.** The initiative's timeline shows `MCP call rejected: <reason> (×n)`. Or query it:
+
+```bash
+sqlite3 ~/.local/share/johnnyone/johnnyone.db \
+  "SELECT created_at, payload_json FROM agent_plan_events WHERE type='agent_mcp_rejected' ORDER BY created_at DESC LIMIT 20"
+```
+
+Planless refusals (no/unknown token, transport guard) are only in the engine log
+(`/tmp/johnnyone-desktop.log`, target `mcp`, `MCP call rejected reason=… count=…`).
+
+**Live checks** (engine running):
+
+- No token → 401: `curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:7788/mcp -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'` prints `401`.
+- Any Origin → 403: `curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:7788/mcp -H 'content-type: application/json' -H 'Origin: http://evil.example' -d '{}'` prints `403`.
+- A rebinding Host → 421: `curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:7788/mcp -H 'Host: evil.example:7788' -H 'content-type: application/json' -d '{}'` prints `421`.
+- A token used after Start planning → 403 (frozen) or 401 (revoked): take the Bearer value from a plan's `mcp.json` before you accept, then run `curl -s -X POST http://127.0.0.1:7788/mcp -H 'content-type: application/json' -H "Authorization: Bearer $TOKEN" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'`. After accept it returns `401` `unauthorized`, because accept revokes the token. Only if the plan flipped without the revoke does it return `403` `the plan left briefing; the brief is frozen at v<n>`.
+
+## Never do
+
+- Never add an `initiativeId`, `planId` or any other scope argument to an MCP tool; scope comes from the token.
+- Never put the token (or its hash) on a command line, in an env var, in a log line, in an event payload or in an error message.
+- Never store the raw token; only `sha256_hex(raw)` goes into `mcp_tokens`.
+- Never wrap `/mcp` in `origin_guard::guard_layers` or any CORS layer, and never relax its "any Origin → 403" rule.
+- Never let `/mcp` answer a GET, an OPTIONS preflight or a non-JSON body, and never raise the body cap without a reason recorded here.
+- Never accept a token for a plan that is not in `briefing`, for an archived or deleted session, or for a session that is no longer the plan's `briefing_session_id`.
+- Never give the plan agent a built-in tool: never drop `--tools ""` or `--strict-mcp-config`, and never run it with `bypassPermissions`.
+- Never remove a hard exclusion from `repo_search`, never let it follow a symlinked directory, and never make it spawn a process (`rg` or anything else).
+- Never write a tool that executes a command or writes a file; brief changes go through `brief_store::write_version` only.
+- Never echo client-supplied text (method names, tool names, arguments) into an `agent_mcp_rejected` event.
+- Never add a chat or terminal path that runs a plan-agent session without `plan_agent_turn_extras` (every claude spawn for it must carry the j1 flags), and never give it a tmux pane.
+- Never skip the revoke when adding a new way for a plan to leave briefing or for a plan-agent session to end.
+
+## Test index
+
+- `token_is_256_bits_hex`
+- `only_hash_is_stored`
+- `verify_rejects_malformed_unknown_revoked`
+- `missing_token_401`
+- `malformed_token_401`
+- `unknown_token_401`
+- `revoked_token_401`
+- `archived_session_rejected`
+- `deleted_session_rejected`
+- `replaced_session_rejected`
+- `mcp_config_file_is_0600_in_0700_dir`
+- `mcp_config_token_only_in_authorization_header`
+- `raw_token_debug_is_redacted`
+- `launch_args_never_contain_token`
+- `logged_launch_args_contain_no_token`
+- `token_absent_from_events_and_logs`
+- `token_a_cannot_touch_plan_b`
+- `initiative_id_argument_is_a_validation_error`
+- `every_tool_rejects_unknown_and_mistyped_args`
+- `every_schema_uses_supported_keywords`
+- `no_tool_writes_outside_db`
+- `tools_call_brief_update_increments_version_author_agent`
+- `accept_revokes_token_and_retires_session`
+- `delete_revokes_token_and_retires_session`
+- `retire_revokes_token`
+- `new_session_token_revokes_old`
+- `mint_revokes_previous_live_token`
+- `replacement_stops_and_retires_old_session`
+- `retired_session_cannot_call_mcp`
+- `call_after_accept_rejected`
+- `check_request_table`
+- `origin_header_rejected`
+- `bad_host_rejected`
+- `non_post_rejected`
+- `options_preflight_rejected_without_cors`
+- `non_json_rejected`
+- `oversized_body_rejected`
+- `no_cors_headers_on_mcp`
+- `graphql_route_unchanged`
+- `plan_agent_args_least_privilege`
+- `allowed_tools_are_mcp_j1_only`
+- `plain_chat_args_unchanged`
+- `plan_agent_deny_list_matches_the_probe`
+- `extras_err_after_accept`
+- `extras_none_for_non_plan_session`
+- `system_prompt_mentions_tools_only_and_choices_line`
+- `no_tmux_created`
+- `plan_agent_session_gets_no_terminal_pane`
+- `repo_search_finds_literal_case_insensitive`
+- `repo_search_dotdot_refused`
+- `repo_search_absolute_refused`
+- `repo_search_symlink_escape_refused`
+- `repo_search_output_capped`
+- `repo_search_time_capped`
+- `repo_search_skips_ignored_dirs`
+- `repo_search_never_returns_mcp_tokens`
+- `repo_search_excludes_real_initiatives_dir_inside_workspace`
+- `accepted_write_event_has_agent_and_session`
+- `rejection_event_has_reason_and_count_no_token`
+- `rejection_renders_in_timeline`
+- `unknown_method_32601`
+- `over_cap_values_are_rejected_with_a_clear_error`
+- `injected_title_cannot_add_a_heading_or_section`

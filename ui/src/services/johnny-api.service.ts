@@ -3,6 +3,7 @@ import { SessionReport } from '../models/stream-event.model';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { GraphQLClient } from './graphql-client';
+import { plansDocument } from './plans-api-documents';
 import { AiSession } from '../models/ai-session.model';
 import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
 import { ToolDefinition, ToolExecution } from '../models/tool.model';
@@ -152,8 +153,119 @@ export interface AgentPlan {
   /** The coordinator's own test gate at PLAN level (migration 023). Nullable for deploy skew; null
    *  or empty = no plan-level gate. Prefer `AgentPlanPhase.effectiveTestCommands` for display. */
   testCommands?: string[] | null;
+  /** Plans tab (migration 031): the brief version frozen by Start planning. Null until accept. */
+  acceptedBriefVersion?: number | null;
+  /** Plans tab: JSON array of initiative ids a queued Start planning waits on; null = not queued. */
+  planningQueuedAfter?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// ── Plans tab (initiative 8ad3ae71): draft plans + structured, versioned brief ──
+// Field KEYS (arguments, `changed`, `FieldDiff.field`) are the snake_case brief keys below; the
+// `BriefFields` object uses the GraphQL camelCase names.
+
+export type BriefFieldKey = 'outcome' | 'why' | 'where' | 'done_when' | 'out_of_scope' | 'decided';
+export type BriefFieldOp = 'value' | 'add' | 'remove';
+export type BriefAuthor = 'you' | 'agent' | string;
+
+export interface BriefFields {
+  outcome: string;
+  why: string;
+  where: string[];
+  doneWhen: string;
+  outOfScope: string;
+  decided: string;
+}
+
+export interface OutlineTask {
+  id: string;
+  title: string;
+  author: BriefAuthor;
+  addedIn: number;
+}
+
+export interface OutlinePhase {
+  id: string;
+  title: string;
+  author: BriefAuthor;
+  addedIn: number;
+  tasks: OutlineTask[];
+  nextTask?: number | null;
+}
+
+export interface BriefOutline {
+  phases: OutlinePhase[];
+  nextPhase?: number | null;
+}
+
+export interface BriefVersion {
+  initiativeId: string;
+  version: number;
+  author: BriefAuthor;
+  changeNote: string;
+  changed: string[];
+  createdAt: string;
+  fields: BriefFields;
+  outline: BriefOutline;
+  initiativeStatus: string;
+  acceptedBriefVersion?: number | null;
+}
+
+export interface BriefVersionMeta {
+  version: number;
+  author: BriefAuthor;
+  changeNote: string;
+  changed: string[];
+  createdAt: string;
+}
+
+export interface FieldDiff {
+  field: BriefFieldKey | string;
+  changed: boolean;
+  removed: string[];
+  added: string[];
+}
+
+export interface BriefDiff {
+  fields: FieldDiff[];
+  outline: {
+    added: { id: string; title: string }[];
+    removed: { id: string; title: string }[];
+    renamed: { id: string; before: string; after: string }[];
+    moved: string[];
+  };
+}
+
+export interface BriefCheckItem {
+  rule: string;
+  status: 'ok' | 'warn' | 'fail' | string;
+  detail: string;
+  paths: string[];
+  initiativeIds: string[];
+}
+
+export interface DraftPlan {
+  id: string;
+  title: string;
+  workspacePath: string;
+  updatedAt: string;
+  latest?: { version: number; author: BriefAuthor; createdAt: string } | null;
+  checkSummary: { ok: number; warn: number; fail: number };
+  queuedAfter: string[];
+}
+
+export interface BriefWriteResult {
+  version: number;
+  changedFields: string[];
+  /** The affected outline id (the new id for an add); null for field writes. */
+  id?: string | null;
+}
+
+export interface CreateDraftPlanInput {
+  title: string;
+  workspacePath: string;
+  ask?: string | null;
 }
 
 export interface AgentPlanPhase {
@@ -424,7 +536,7 @@ export class JohnnyApiService {
       workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
       brief appScope docsScope referencePaths amendBrief validationConfig executorConfig phaseRunMode
       initiativeId initiativeStatus health briefingSessionId
-      consecutiveNonPassPlanningRounds testCommands
+      consecutiveNonPassPlanningRounds testCommands acceptedBriefVersion planningQueuedAfter
       createdAt updatedAt
     }
     phases {
@@ -952,7 +1064,7 @@ export class JohnnyApiService {
             workerProvider reviewerProvider currentPhaseId currentPhaseIndex error
             brief appScope docsScope referencePaths
             initiativeId initiativeStatus health validationConfig executorConfig briefingSessionId
-            consecutiveNonPassPlanningRounds
+            consecutiveNonPassPlanningRounds acceptedBriefVersion planningQueuedAfter
             createdAt updatedAt
           }
         }`,
@@ -1081,6 +1193,155 @@ export class JohnnyApiService {
         { initiativeId, path }
       )
       .pipe(map((data) => data.addInitiativeReferencePath));
+  }
+
+  // ── Plans tab (initiative 8ad3ae71) ───────────────────────────────────
+  // Documents live in `plans-api-documents.ts` (pinned to the schema by plans-api-contract.spec.ts).
+  // Rename / delete / Start planning reuse updateAgentPlanTitle / deleteAgentPlan / acceptInitiativeBrief.
+
+  listDraftPlans(): Observable<DraftPlan[]> {
+    return this.gql
+      .query<{ listDraftPlans: DraftPlan[] }>(plansDocument('listDraftPlans', this.agentPlanRunFields))
+      .pipe(map((data) => data.listDraftPlans));
+  }
+
+  /** One brief version; `version` omitted = latest. */
+  getBriefVersion(initiativeId: string, version?: number | null): Observable<BriefVersion> {
+    return this.gql
+      .query<{ getBriefVersion: BriefVersion }>(plansDocument('getBriefVersion', this.agentPlanRunFields), {
+        initiativeId,
+        version: version ?? null,
+      })
+      .pipe(map((data) => data.getBriefVersion));
+  }
+
+  listBriefVersions(initiativeId: string): Observable<BriefVersionMeta[]> {
+    return this.gql
+      .query<{ listBriefVersions: BriefVersionMeta[] }>(plansDocument('listBriefVersions', this.agentPlanRunFields), {
+        initiativeId,
+      })
+      .pipe(map((data) => data.listBriefVersions));
+  }
+
+  getBriefDiff(initiativeId: string, fromVersion: number, toVersion: number): Observable<BriefDiff> {
+    return this.gql
+      .query<{ getBriefDiff: BriefDiff }>(plansDocument('getBriefDiff', this.agentPlanRunFields), {
+        initiativeId,
+        fromVersion,
+        toVersion,
+      })
+      .pipe(map((data) => data.getBriefDiff));
+  }
+
+  getBriefCheck(initiativeId: string): Observable<BriefCheckItem[]> {
+    return this.gql
+      .query<{ getBriefCheck: BriefCheckItem[] }>(plansDocument('getBriefCheck', this.agentPlanRunFields), {
+        initiativeId,
+      })
+      .pipe(map((data) => data.getBriefCheck));
+  }
+
+  createDraftPlan(input: CreateDraftPlanInput): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ createDraftPlan: AgentPlanRun }>(plansDocument('createDraftPlan', this.agentPlanRunFields), { input })
+      .pipe(map((data) => data.createDraftPlan));
+  }
+
+  createDraftPlanDuplicate(initiativeId: string): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ createDraftPlanDuplicate: AgentPlanRun }>(
+        plansDocument('createDraftPlanDuplicate', this.agentPlanRunFields),
+        { initiativeId }
+      )
+      .pipe(map((data) => data.createDraftPlanDuplicate));
+  }
+
+  /** Human edit of one field (author you). `op='value'` takes `values` for `where`, `value` otherwise. */
+  updateBriefField(
+    initiativeId: string,
+    field: BriefFieldKey,
+    op: BriefFieldOp,
+    value?: string | null,
+    values?: string[] | null
+  ): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ updateBriefField: BriefWriteResult }>(plansDocument('updateBriefField', this.agentPlanRunFields), {
+        initiativeId,
+        field,
+        op,
+        value: value ?? null,
+        values: values ?? null,
+      })
+      .pipe(map((data) => data.updateBriefField));
+  }
+
+  /** `field` given = undo that field to `version`; omitted = revert the whole brief. Always a new version. */
+  resetBriefToVersion(initiativeId: string, version: number, field?: BriefFieldKey | null): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ resetBriefToVersion: BriefWriteResult }>(plansDocument('resetBriefToVersion', this.agentPlanRunFields), {
+        initiativeId,
+        version,
+        field: field ?? null,
+      })
+      .pipe(map((data) => data.resetBriefToVersion));
+  }
+
+  addOutlinePhase(initiativeId: string, title: string): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ addOutlinePhase: BriefWriteResult }>(plansDocument('addOutlinePhase', this.agentPlanRunFields), {
+        initiativeId,
+        title,
+      })
+      .pipe(map((data) => data.addOutlinePhase));
+  }
+
+  addOutlineTask(initiativeId: string, phaseId: string, title: string): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ addOutlineTask: BriefWriteResult }>(plansDocument('addOutlineTask', this.agentPlanRunFields), {
+        initiativeId,
+        phaseId,
+        title,
+      })
+      .pipe(map((data) => data.addOutlineTask));
+  }
+
+  updateOutlineItem(initiativeId: string, id: string, title: string): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ updateOutlineItem: BriefWriteResult }>(plansDocument('updateOutlineItem', this.agentPlanRunFields), {
+        initiativeId,
+        id,
+        title,
+      })
+      .pipe(map((data) => data.updateOutlineItem));
+  }
+
+  /** Reorder within the same parent (ids are identities). */
+  updateOutlineItemPosition(initiativeId: string, id: string, toIndex: number): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ updateOutlineItemPosition: BriefWriteResult }>(
+        plansDocument('updateOutlineItemPosition', this.agentPlanRunFields),
+        { initiativeId, id, toIndex }
+      )
+      .pipe(map((data) => data.updateOutlineItemPosition));
+  }
+
+  deleteOutlineItem(initiativeId: string, id: string): Observable<BriefWriteResult> {
+    return this.gql
+      .mutate<{ deleteOutlineItem: BriefWriteResult }>(plansDocument('deleteOutlineItem', this.agentPlanRunFields), {
+        initiativeId,
+        id,
+      })
+      .pipe(map((data) => data.deleteOutlineItem));
+  }
+
+  /** Queue Start planning after the conflicting initiatives; `null` clears the queue. */
+  updatePlanningQueue(initiativeId: string, afterInitiativeIds: string[] | null): Observable<AgentPlanRun> {
+    return this.gql
+      .mutate<{ updatePlanningQueue: AgentPlanRun }>(plansDocument('updatePlanningQueue', this.agentPlanRunFields), {
+        initiativeId,
+        afterInitiativeIds,
+      })
+      .pipe(map((data) => data.updatePlanningQueue));
   }
 
   /** Upload a briefing attachment chunk into <id>/attachments/ (host `initiative_upload_chunk`). */

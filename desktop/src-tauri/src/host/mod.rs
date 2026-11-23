@@ -25,11 +25,13 @@ use axum::{
 };
 use tokio_stream::wrappers::BroadcastStream;
 
+pub mod mcp;
 pub mod origin_guard;
 
 type JohnnyHostSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
 pub fn router(state: AppState) -> Router {
+    let mcp_state = state.clone();
     let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(state)
         .finish();
@@ -48,12 +50,18 @@ pub fn router(state: AppState) -> Router {
     // local attacker — a request with no `Origin` is allowed on purpose so the
     // baked agent `curl`s keep working, and a local process can omit `Origin`
     // just as easily. See `origin_guard`'s module docs.
+    //
+    // `/mcp` (the plan agent's MCP endpoint) is MERGED BESIDE the guarded GraphQL router, not inside
+    // it: `origin_guard` allows loopback/webview origins and installs CORS, while `/mcp` must refuse
+    // ANY Origin and emit no CORS header. It carries its own transport guard and a per-session
+    // bearer token — see `mcp` and docs/mcp-security.md (D14).
     origin_guard::guard_layers(
         Router::new()
             .route("/graphql", get(graphql_playground).post(graphql_handler))
             .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone())),
     )
     .with_state(schema)
+    .merge(mcp::mcp_router(mcp_state))
 }
 
 /// `HeaderMap` must come BEFORE `GraphQLRequest`: the latter consumes the body,

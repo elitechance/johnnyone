@@ -20,6 +20,7 @@
     @for (message of messages; track trackByMessageId($index, message)) {
       <johnny-message-bubble
         [message]="message"
+        [display]="bubbleDisplay"
         [isStreamingMessage]="isStreamingMessage(message, $index)"
         class="message-item">
       </johnny-message-bubble>

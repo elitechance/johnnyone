@@ -234,6 +234,15 @@ pub struct AgentPlan {
     /// column — filled on list/get. `None` until attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_non_pass_planning_rounds: Option<i64>,
+    /// Migration 031: the `brief_versions.version` frozen by Start planning (`accept_brief`).
+    /// NULL until accept, and on every row that never had a versioned brief. Appended after
+    /// `test_commands` in every SELECT feeding `agent_plan_from_row` — order is load-bearing.
+    #[serde(default)]
+    pub accepted_brief_version: Option<i64>,
+    /// Migration 031: JSON array of initiative ids a queued Start planning waits on; NULL = not
+    /// queued. Released by `brief_store::release_queued_briefs` (60 s tick).
+    #[serde(default)]
+    pub planning_queued_after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,6 +434,8 @@ mod tests {
             test_commands_list: Vec::new(),
             executor_config: None,
             consecutive_non_pass_planning_rounds: None,
+            accepted_brief_version: None,
+            planning_queued_after: None,
         }
     }
 

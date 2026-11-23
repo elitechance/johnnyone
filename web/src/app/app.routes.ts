@@ -151,6 +151,22 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/arena/workflow-detail.shell').then((m) => m.WorkflowDetailShell),
   },
+  // Plans tab (initiative 8ad3ae71): draft plans = briefing-stage initiatives. The list, then one
+  // plan's chat + structured brief. Lazy authGuard routes, like /files and /shells. `plans/:id` is a
+  // two-segment path, so neither route can shadow the other (proven in app.routes.spec.ts).
+  {
+    path: 'plans',
+    title: 'Plans',
+    canActivate: [authGuard],
+    loadComponent: () => import('./pages/plans/plans.page').then((m) => m.PlansPage),
+  },
+  {
+    path: 'plans/:id',
+    title: 'Plan',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./pages/plans/plan-detail.page').then((m) => m.PlanDetailPage),
+  },
   // Developer console — authenticated UI for the partner API surface
   // (auth/keys, agent-session CRUD, live WSS terminal). The public docs live
   // at /integration; this is the logged-in console that drives the same API.

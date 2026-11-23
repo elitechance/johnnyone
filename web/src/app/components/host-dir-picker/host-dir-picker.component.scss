@@ -1,0 +1,56 @@
+:host {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.dir-browser {
+  padding: 8px 12px;
+
+  .dir-path {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px;
+    font-family: var(--ion-font-family-monospace, monospace);
+    font-size: 12px;
+    color: var(--jo-fg-muted, var(--ion-color-medium));
+    word-break: break-all;
+    padding: 6px 4px 10px;
+  }
+  .crumb {
+    background: none;
+    border: 0;
+    padding: 2px 3px;
+    font: inherit;
+    color: var(--ion-color-primary);
+    cursor: pointer;
+    border-radius: 4px;
+    &.on {
+      color: var(--jo-fg-strong, var(--ion-text-color));
+      font-weight: 600;
+    }
+  }
+  .sep {
+    opacity: 0.6;
+  }
+  .dir-spin {
+    width: 18px;
+    height: 12px;
+    margin-left: 6px;
+  }
+  .dir-error {
+    display: block;
+    padding: 4px;
+  }
+  .dir-empty {
+    color: var(--jo-fg-muted, var(--ion-color-medium));
+    font-style: italic;
+    font-size: 13px;
+  }
+}
+
+.dir-actions {
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--jo-border, var(--ion-color-step-150));
+}

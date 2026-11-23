@@ -1,0 +1,157 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Plans</ion-title>
+    <ion-buttons slot="end">
+      <ion-button fill="clear" color="medium" size="small" aria-label="Refresh" title="Refresh" (click)="load()">
+        <ion-icon slot="icon-only" name="refresh-outline"></ion-icon>
+      </ion-button>
+      <ion-button fill="solid" color="primary" size="small" (click)="openNew()">
+        <ion-icon slot="start" name="add-outline"></ion-icon>
+        New plan
+      </ion-button>
+    </ion-buttons>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content>
+  <ion-refresher slot="fixed" (ionRefresh)="handleRefresh($event)">
+    <ion-refresher-content></ion-refresher-content>
+  </ion-refresher>
+
+  <div class="plans-wrap">
+    <div class="plans-head">
+      <h1>Plans</h1>
+      @if (state() === 'ready') {
+        <ion-badge class="count-pill">{{ countLabel() }}</ion-badge>
+      }
+      <span class="sub">Draft a brief with the plan agent, then start planning.</span>
+    </div>
+
+    @switch (state()) {
+      @case ('loading') {
+        <div class="plans-grid" aria-busy="true">
+          @for (i of [1, 2, 3]; track i) {
+            <ion-card class="plan-card">
+              <ion-card-header>
+                <ion-skeleton-text [animated]="true" style="width: 70%"></ion-skeleton-text>
+              </ion-card-header>
+              <ion-card-content>
+                <ion-skeleton-text [animated]="true" style="width: 40%"></ion-skeleton-text>
+                <ion-skeleton-text [animated]="true" style="width: 55%"></ion-skeleton-text>
+              </ion-card-content>
+            </ion-card>
+          }
+        </div>
+      }
+      @case ('error') {
+        <ion-card class="plans-error" color="danger">
+          <ion-card-content>
+            <ion-icon name="alert-circle-outline"></ion-icon>
+            <span class="msg">{{ error() }}</span>
+            <ion-button fill="outline" color="light" size="small" (click)="load()">Retry</ion-button>
+          </ion-card-content>
+        </ion-card>
+      }
+      @case ('empty') {
+        <ion-card class="plans-empty">
+          <ion-card-content>
+            <ion-icon name="document-text-outline" class="big"></ion-icon>
+            <h2>No draft plans yet</h2>
+            <p>Draft a brief with the plan agent, then start planning.</p>
+            <ion-button (click)="openNew()">
+              <ion-icon slot="start" name="add-outline"></ion-icon>
+              New plan
+            </ion-button>
+          </ion-card-content>
+        </ion-card>
+      }
+      @default {
+        <div class="plans-grid">
+          @for (c of cards(); track c.id) {
+            <ion-card class="plan-card" button (click)="open(c)">
+              <ion-card-header>
+                <ion-card-title>{{ c.title }}</ion-card-title>
+                <ion-card-subtitle [title]="c.workspacePath">{{ c.workspaceLabel }}</ion-card-subtitle>
+              </ion-card-header>
+              <ion-card-content>
+                <div class="meta">
+                  <span class="ver" [class.agent]="c.authorClass === 'agent'" [class.you]="c.authorClass === 'you'">{{ c.versionLine }}</span>
+                </div>
+                <div class="checks">
+                  @if (c.check.ok) {<ion-badge color="success">✓ {{ c.check.ok }}</ion-badge>}
+                  @if (c.check.warn) {<ion-badge color="warning">! {{ c.check.warn }}</ion-badge>}
+                  @if (c.check.fail) {<ion-badge color="danger">✗ {{ c.check.fail }}</ion-badge>}
+                  @if (c.queued) {<ion-badge color="medium">queued</ion-badge>}
+                </div>
+                <div class="acts">
+                  <ion-button fill="clear" size="small" [disabled]="busyId() === c.id" (click)="rename(c, $event)">
+                    <ion-icon slot="start" name="create-outline"></ion-icon>Rename
+                  </ion-button>
+                  <ion-button fill="clear" size="small" [disabled]="busyId() === c.id" (click)="duplicate(c, $event)">
+                    <ion-icon slot="start" name="copy-outline"></ion-icon>Duplicate
+                  </ion-button>
+                  <ion-button fill="clear" size="small" color="danger" [disabled]="busyId() === c.id" (click)="remove(c, $event)">
+                    <ion-icon slot="start" name="trash-outline"></ion-icon>Delete
+                  </ion-button>
+                </div>
+              </ion-card-content>
+            </ion-card>
+          }
+        </div>
+      }
+    }
+  </div>
+
+  <!-- S4 · New plan: title + the shared workspace picker (same component as /briefing/new). -->
+  <ion-modal [isOpen]="newOpen()" (didDismiss)="closeNew()">
+    <ng-template>
+      <ion-header>
+        <ion-toolbar>
+          <ion-title>New plan</ion-title>
+          <ion-buttons slot="end">
+            <ion-button (click)="closeNew()">Cancel</ion-button>
+          </ion-buttons>
+        </ion-toolbar>
+      </ion-header>
+      <ion-content class="ion-padding">
+        <ion-list lines="full">
+          <ion-item>
+            <ion-input
+              label="Title"
+              labelPlacement="stacked"
+              placeholder="e.g. Plans tab"
+              [maxlength]="200"
+              [value]="newTitle"
+              (ionInput)="onTitle($any($event).detail.value)"
+            ></ion-input>
+          </ion-item>
+          <ion-item button detail="true" (click)="openPicker()">
+            <ion-icon name="folder-open-outline" slot="start"></ion-icon>
+            <div class="ws">
+              <div class="ws-label">Workspace</div>
+              <div class="ws-value" [class.unset]="!newWorkspace()">{{ newWorkspace() || 'Pick a folder…' }}</div>
+            </div>
+          </ion-item>
+        </ion-list>
+        <ion-note class="new-help">The plan agent works in this folder (read-only search). Create is enabled once both are set.</ion-note>
+        <div class="new-actions">
+          <ion-button fill="outline" (click)="closeNew()">Cancel</ion-button>
+          <ion-button [disabled]="!canCreate()" (click)="create()">Create</ion-button>
+        </div>
+      </ion-content>
+    </ng-template>
+  </ion-modal>
+
+  <ion-modal [isOpen]="pickerOpen()" (didDismiss)="closePicker()">
+    <ng-template>
+      <app-host-dir-picker
+        [listing]="pickerListing()"
+        [loading]="pickerLoading()"
+        [error]="pickerError()"
+        (navigate)="browseTo($event)"
+        (choose)="chooseDir($event)"
+        (cancel)="closePicker()"
+      />
+    </ng-template>
+  </ion-modal>
+</ion-content>

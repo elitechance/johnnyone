@@ -71,6 +71,18 @@ where
     spawn_cli_inner(config, session_id, parse_line, true).await
 }
 
+/// The one log line written before every CLI spawn. Its args are safe to log by construction: a
+/// plan-agent turn carries only the PATH of its MCP config, never the token (phase 02 task 07,
+/// pinned by `logged_launch_args_contain_no_token`).
+pub(crate) fn log_spawn(config: &CliSpawnConfig, working_dir: &str) {
+    tracing::info!(
+        cmd = %config.command,
+        args = ?config.args,
+        cwd = %working_dir,
+        "Spawning CLI subprocess"
+    );
+}
+
 async fn spawn_cli_inner<F>(
     mut config: CliSpawnConfig,
     session_id: String,
@@ -89,12 +101,7 @@ where
         config.working_directory.clone()
     };
 
-    tracing::info!(
-        cmd = %config.command,
-        args = ?config.args,
-        cwd = %working_dir,
-        "Spawning CLI subprocess"
-    );
+    log_spawn(&config, &working_dir);
 
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)

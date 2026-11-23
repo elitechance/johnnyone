@@ -767,17 +767,38 @@ pub fn compose_accepted_brief(
 /// Flip the row `briefing → planning` and store the composed brief — the SAME row (D1). DB-only so it
 /// is unit-testable against in-memory SQLite without spawning an agent (D8). `updated_at` uses the
 /// same `datetime('now')` idiom as the other UPDATEs in this file.
+///
+/// Plans tab (00/07): `accepted_version` is the `brief_versions.version` frozen by this accept
+/// (`None` on the legacy, never-versioned path, where the column stays NULL). The SAME UPDATE also
+/// clears `planning_queued_after` — starting planning (manually or from the queue) ends any queue.
+pub(crate) fn apply_brief_acceptance_at(
+    conn: &rusqlite::Connection,
+    id: &str,
+    composed: &str,
+    accepted_version: Option<i64>,
+) -> Result<(), String> {
+    // Compare-and-set on `briefing`: a manual Start planning and the queue-release tick (00/08) can
+    // race; exactly one flips the row, the other gets the same error as the up-front guard.
+    let changed = conn
+        .execute(
+            "UPDATE agent_plans SET brief = ?2, initiative_status = 'planning', accepted_brief_version = ?3, planning_queued_after = NULL, updated_at = datetime('now') WHERE id = ?1 AND initiative_status = 'briefing'",
+            params![id, composed, accepted_version],
+        )
+        .map_err(|e| format!("Failed to apply brief acceptance: {}", e))?;
+    if changed == 0 {
+        return Err("Initiative is not in briefing".to_string());
+    }
+    Ok(())
+}
+
+/// The legacy (unversioned) acceptance — kept under its original name for the pre-existing test.
+#[cfg(test)]
 fn apply_brief_acceptance(
     conn: &rusqlite::Connection,
     id: &str,
     composed: &str,
 ) -> Result<(), String> {
-    conn.execute(
-        "UPDATE agent_plans SET brief = ?2, initiative_status = 'planning', updated_at = datetime('now') WHERE id = ?1",
-        params![id, composed],
-    )
-    .map_err(|e| format!("Failed to apply brief acceptance: {}", e))?;
-    Ok(())
+    apply_brief_acceptance_at(conn, id, composed, None)
 }
 
 /// Record a ▤ Reference host path on a briefing Initiative (overhaul P4, D6): append `path` to the
@@ -817,6 +838,41 @@ pub async fn accept_brief(
     id: &str,
     final_brief: Option<String>,
 ) -> Result<AgentPlanRun, String> {
+    freeze_flip_and_retire_agent(state, &LivePanes, id, final_brief).await?;
+    // Existing kickoff (start_planning_run, 819): attaches the planner terminal + sends the prompt
+    // built from `user_brief = run.plan.brief` — now the composed accepted brief.
+    start_planning_run(state.clone(), id.to_string()).await?;
+    get_plan(state, id)
+}
+
+/// [`freeze_and_flip_brief`] then retire the plan agent (Plans tab 02/09, brief §"MCP security" 4):
+/// its MCP token is revoked (`mcp.json` deleted), an in-flight turn is stopped and its session is
+/// archived with `agent_session_retired {reason:'plan_accepted'}`. Everything [`accept_brief`] does
+/// before the planner spawn, so it is testable with a fake pane seam.
+pub(crate) async fn freeze_flip_and_retire_agent(
+    state: &AppState,
+    panes: &dyn AgentPanes,
+    id: &str,
+    final_brief: Option<String>,
+) -> Result<(), String> {
+    freeze_and_flip_brief(state, id, final_brief)?;
+    crate::services::plan_agent::retire_plan_agent_with(state, panes, id, "plan_accepted").await;
+    Ok(())
+}
+
+/// Everything [`accept_brief`] does BEFORE the planner spawn (D8: assertable without a live agent):
+/// guard `briefing`, pick the draft, compose, flip the same row to `planning`, write `brief.md`,
+/// provision the T1 planner session, emit the events.
+///
+/// Plans tab (00/07): when the plan has `brief_versions`, the draft is `render_brief_md(latest)` —
+/// `final_brief` and the agent `brief.md` are ignored — the latest version is frozen in
+/// `accepted_brief_version`, and `brief_frozen {version, checkFailures}` records any failed
+/// `brief_check` rules (D11: never refused on them; the UI already asked "Start anyway").
+pub(crate) fn freeze_and_flip_brief(
+    state: &AppState,
+    id: &str,
+    final_brief: Option<String>,
+) -> Result<(), String> {
     let plan = get_plan(state, id)?.plan;
     if plan.initiative_status != "briefing" {
         return Err("Initiative is not in briefing".to_string());
@@ -853,17 +909,55 @@ pub async fn accept_brief(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let draft = final_brief
-        .as_deref()
-        .or(agent_brief.as_deref())
-        .or(plan.brief.as_deref())
-        .unwrap_or("");
+    // Versioned brief (Plans tab): the latest version, rendered server-side, IS the draft.
+    let frozen: Option<(i64, String, Vec<String>)> =
+        if crate::services::brief_store::version_count(state, id)? > 0 {
+            let latest = crate::services::brief_store::get_version(state, id, None)?;
+            if final_brief.is_some() {
+                tracing::debug!(%id, version = latest.version, "accept_brief: finalBrief ignored; the versioned brief is rendered instead");
+            }
+            let ctx = crate::services::brief_check::gather_ctx(state, id, &latest.fields)
+                .unwrap_or_default();
+            let failures = crate::services::brief_check::failed_rules(
+                &crate::services::brief_check::check(&latest.fields, &ctx),
+            );
+            Some((
+                latest.version,
+                crate::services::brief_model::render_brief_md(&latest.fields, &latest.outline),
+                failures,
+            ))
+        } else {
+            None
+        };
+    let draft = match &frozen {
+        Some((_, rendered, _)) => rendered.as_str(),
+        None => final_brief
+            .as_deref()
+            .or(agent_brief.as_deref())
+            .or(plan.brief.as_deref())
+            .unwrap_or(""),
+    };
     let composed = compose_accepted_brief(draft, &attachments, &refs);
 
     // Flip the SAME row briefing→planning and store the composed brief BEFORE any spawn (D8).
+    let accepted_version = frozen.as_ref().map(|(v, _, _)| *v);
     state
         .db
-        .with_conn(|conn| apply_brief_acceptance(conn, id, &composed))?;
+        .with_conn(|conn| apply_brief_acceptance_at(conn, id, &composed, accepted_version))?;
+    // The plan left briefing: its agent's MCP token dies with it (02/09). Best effort — the
+    // briefing check on every MCP call already refuses a surviving token with 403.
+    if let Err(error) = crate::services::mcp_tokens::revoke_for_initiative(state, id, "accepted") {
+        tracing::warn!(%id, %error, "accept: MCP token revoke failed");
+    }
+    if let Some((version, _, failures)) = &frozen {
+        append_event(
+            state,
+            id,
+            None,
+            "brief_frozen",
+            json!({ "version": version, "checkFailures": failures }),
+        )?;
+    }
 
     // Provision the planner on THIS row — reuse create_planning_run's primitives (309-336): ensure the
     // plan dir exists and create the T1 planner (kind='agent') session, then point worker_session_id
@@ -910,11 +1004,7 @@ pub async fn accept_brief(
         "brief_accepted",
         json!({ "plannerSessionId": planner_session.id }),
     )?;
-
-    // Existing kickoff (start_planning_run, 819): attaches the planner terminal + sends the prompt
-    // built from `user_brief = run.plan.brief` — now the composed accepted brief.
-    start_planning_run(state.clone(), id.to_string()).await?;
-    get_plan(state, id)
+    Ok(())
 }
 
 pub fn list_plans(
@@ -924,7 +1014,7 @@ pub fn list_plans(
     only_existing: bool,
 ) -> Result<Vec<AgentPlan>, String> {
     let mut rows = state.db.with_conn(|conn| {
-        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config, dev_worker_provider, dev_reviewer_provider, test_commands FROM agent_plans
+        let sql = "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config, dev_worker_provider, dev_reviewer_provider, test_commands, accepted_brief_version, planning_queued_after FROM agent_plans
             WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR run_type = ?2)
             ORDER BY updated_at DESC";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -948,7 +1038,7 @@ pub fn get_plan(state: &AppState, id: &str) -> Result<AgentPlanRun, String> {
     sync_task_statuses_from_files(state, id)?;
     let plan = state.db.with_conn(|conn| {
         conn.query_row(
-            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config, dev_worker_provider, dev_reviewer_provider, test_commands FROM agent_plans WHERE id = ?1",
+            "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config, dev_worker_provider, dev_reviewer_provider, test_commands, accepted_brief_version, planning_queued_after FROM agent_plans WHERE id = ?1",
             params![id],
             agent_plan_from_row,
         )
@@ -1538,6 +1628,11 @@ pub fn update_plan_title(
 }
 
 pub async fn delete_plan(state: &AppState, id: String) -> Result<bool, String> {
+    delete_plan_with(state, &LivePanes, id).await
+}
+
+/// [`delete_plan`] with the pane seam injected (the plan-agent retire is asserted without tmux).
+pub(crate) async fn delete_plan_with(state: &AppState, panes: &dyn AgentPanes, id: String) -> Result<bool, String> {
     let run = get_plan(state, &id)?;
 
     if let Some(session_id) = run.plan.worker_session_id {
@@ -1550,6 +1645,9 @@ pub async fn delete_plan(state: &AppState, id: String) -> Result<bool, String> {
     }
     // Also tear down any ephemeral lens/docs agents for this plan (previously leaked).
     dispose_plan_review_sessions(state, &id).await;
+    // Plans tab 02/09: the plan agent (briefing_session_id) — revoke its MCP token, stop a running
+    // turn, archive its session. Before `closed`, so the retire event lands on a live row.
+    crate::services::plan_agent::retire_plan_agent_with(state, panes, &id, "plan_deleted").await;
 
     state.db.with_conn(|conn| {
         conn.execute(
@@ -5762,8 +5860,9 @@ fn session_plan_owner(state: &AppState, session_id: &str) -> Option<(String, Str
             conn.query_row(
                 "SELECT id, CASE WHEN worker_session_id = ?1 \
                     THEN (CASE WHEN run_type = 'planning' THEN 'planner' ELSE 'worker' END) \
-                    ELSE 'reviewer' END \
-                 FROM agent_plans WHERE worker_session_id = ?1 OR reviewer_session_id = ?1 \
+                    WHEN reviewer_session_id = ?1 THEN 'reviewer' \
+                    ELSE 'plan_agent' END \
+                 FROM agent_plans WHERE worker_session_id = ?1 OR reviewer_session_id = ?1 OR briefing_session_id = ?1 \
                  ORDER BY created_at DESC LIMIT 1",
                 params![session_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -5798,6 +5897,9 @@ pub(crate) async fn retire_agent_session_with(
     })?;
     let owner = session_plan_owner(state, session_id);
     let attached = row.as_ref().map(|(_, attached)| *attached).unwrap_or(false);
+    // The Plans-tab plan agent runs headless (one `claude --print` per turn, D1): it never has a
+    // pane, so the pane seam is not asked to kill anything for it.
+    let headless_plan_agent = owner.as_ref().is_some_and(|(_, role)| role == "plan_agent");
 
     // (b) Archive FIRST (compare-and-set: only an active row flips). Once archived, the
     // `ensure_terminal_session` guard refuses to resurrect the pane, so no attach/input racing
@@ -5809,15 +5911,23 @@ pub(crate) async fn retire_agent_session_with(
         _ => false,
     };
 
-    // (c) Release the runtime — but never kill a pane the user owns.
-    let pane_killed = if attached {
-        tracing::info!(%session_id, %reason, "retiring attached session — leaving external tmux running");
+    // (c) Release the runtime — but never kill a pane the user owns (or one that cannot exist).
+    let pane_killed = if attached || headless_plan_agent {
+        if attached {
+            tracing::info!(%session_id, %reason, "retiring attached session — leaving external tmux running");
+        }
         unregister_review_session(state, session_id);
         state.agent_reports.lock().await.remove(session_id);
         false
     } else {
         release_agent_runtime(state, panes, session_id).await
     };
+
+    // (c2) Plans tab 02/09: any MCP token this session holds dies with it (covers every retire path,
+    // incl. the reaper). Idempotent; a failure is logged — the session check refuses it anyway.
+    if let Err(error) = crate::services::mcp_tokens::revoke_for_session(state, session_id, "retired") {
+        tracing::warn!(%session_id, %error, "retire: MCP token revoke failed");
+    }
 
     // (d) Event only on change.
     let changed = was_active || pane_killed;
@@ -5854,6 +5964,9 @@ fn retired_reason_text(reason: &str) -> std::borrow::Cow<'_, str> {
         "replaced_by_replan_planner" => Cow::Borrowed("replaced by the replan planner"),
         "replan_finished" => Cow::Borrowed("replan finished"),
         "replaced_archived_session" => Cow::Borrowed("replaced by a fresh session"),
+        "plan_accepted" => Cow::Borrowed("plan accepted"),
+        "plan_deleted" => Cow::Borrowed("plan deleted"),
+        "plan_agent_replaced" => Cow::Borrowed("plan agent replaced"),
         "orphan_sweep:session_archived" => Cow::Borrowed("orphan sweep: session already archived"),
         "orphan_sweep:plan_terminal" => Cow::Borrowed("orphan sweep: plan finished"),
         "orphan_sweep:stale_ephemeral" => {
@@ -5991,7 +6104,7 @@ async fn notify_discord(
 
 /// Map a plan event to a Discord notification, or `None` to skip (most events stay
 /// in-app only). Returns (severity, headline-with-emoji, reason).
-fn discord_message_for(
+pub(crate) fn discord_message_for(
     event_type: &str,
     phase_id: Option<&str>,
     payload: &serde_json::Value,
@@ -9711,7 +9824,7 @@ pub(crate) fn normalize_task_status(status: &str) -> String {
     }
 }
 
-fn normalize_path(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn normalize_path(path: &Path) -> Result<PathBuf, String> {
     if path.exists() {
         path.canonicalize()
             .map_err(|e| format!("Invalid path: {}", e))
@@ -10714,21 +10827,23 @@ fn publish_plan_deleted(state: &AppState, plan_id: &str) {
     });
 }
 
+/// Directory names a workspace walk never descends into (build output, VCS, dependency trees).
+/// Shared by [`all_workspace_files`] and the plan agent's `repo_search` (phase 02 task 05).
+pub(crate) const WORKSPACE_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    ".angular",
+    ".nx",
+    ".wrangler",
+];
+
 fn all_workspace_files(workspace_path: &str) -> Result<Vec<HostFileEntry>, String> {
     let root = normalize_path(Path::new(workspace_path))?;
     let mut entries = Vec::new();
     let mut stack = vec![root.clone()];
-    let ignored: HashSet<&str> = [
-        ".git",
-        "node_modules",
-        "target",
-        "dist",
-        ".angular",
-        ".nx",
-        ".wrangler",
-    ]
-    .into_iter()
-    .collect();
+    let ignored: HashSet<&str> = WORKSPACE_IGNORED_DIRS.iter().copied().collect();
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -11224,6 +11339,9 @@ fn agent_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentPlan> {
         test_commands,
         test_commands_list,
         consecutive_non_pass_planning_rounds: None,
+        // Migration 031, appended after test_commands — SELECT order is load-bearing.
+        accepted_brief_version: row.get(30)?,
+        planning_queued_after: row.get(31)?,
     })
 }
 
@@ -11346,6 +11464,15 @@ pub(crate) fn event_actor(event_type: &str) -> &'static str {
         // both belong here.
         | "agent_plan_validation_config_updated"
         | "agent_plan_test_commands_updated" => "user",
+        // Plans tab (00/07): the plan agent's rejected MCP calls are its own actor; the web's
+        // `actorLabel` passes unknown actors through verbatim. Brief versions/freeze/queue are
+        // engine bookkeeping — the author (`you`/`agent`) lives in the summary instead.
+        "agent_mcp_rejected" => "plan_agent",
+        "brief_version_created"
+        | "brief_frozen"
+        | "brief_planning_queued"
+        | "brief_planning_unqueued"
+        | "brief_planning_queue_failed" => "coordinator",
         _ => "coordinator",
     }
 }
@@ -11459,6 +11586,61 @@ pub(crate) fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value)
             _ => "Renamed run".to_string(),
         },
         "planning_run_created" => "Created planning run".to_string(),
+        // ── Plans tab (00/07): versioned brief events ──
+        "brief_version_created" => {
+            let version = payload.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+            let author = payload_str(payload, "author").unwrap_or_else(|| "you".to_string());
+            let detail = payload_str(payload, "note")
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| {
+                    payload
+                        .get("changedFields")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                        .filter(|s| !s.is_empty())
+                });
+            match detail {
+                Some(d) => format!("Brief v{} · {} · {}", version, author, d),
+                None => format!("Brief v{} · {}", version, author),
+            }
+        }
+        "brief_frozen" => {
+            let version = payload.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+            let failed = payload
+                .get("checkFailures")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            match failed {
+                0 => format!("Brief frozen at v{}", version),
+                1 => format!("Brief frozen at v{} · started over 1 failed check", version),
+                n => format!("Brief frozen at v{} · started over {} failed checks", version, n),
+            }
+        }
+        "brief_planning_queued" => {
+            let names = |key: &str| -> Vec<String> {
+                payload
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default()
+            };
+            let titles = names("afterTitles");
+            let shown = if titles.is_empty() { names("after") } else { titles };
+            format!("Planning queued after {}", shown.join(", "))
+        }
+        "brief_planning_unqueued" => "Planning queue cleared".to_string(),
+        "brief_planning_queue_failed" => match payload_str(payload, "error") {
+            Some(e) => format!("Queued planning failed to start: {}", e),
+            None => "Queued planning failed to start".to_string(),
+        },
+        "agent_mcp_rejected" => {
+            let reason = payload_str(payload, "reason").unwrap_or_else(|| "unknown".to_string());
+            match payload.get("count").and_then(|v| v.as_i64()) {
+                Some(n) if n > 1 => format!("MCP call rejected: {} (×{})", reason, n),
+                _ => format!("MCP call rejected: {}", reason),
+            }
+        }
         "agent_plan_stopped" => "Stopped run".to_string(),
         "agent_plan_closed" => "Closed run".to_string(),
         "agent_plan_blocked" => match payload_str(payload, "reason") {
@@ -12542,6 +12724,8 @@ mod store_tests {
             dev_reviewer_provider: dev_reviewer.map(str::to_string),
             executor_config: None,
             consecutive_non_pass_planning_rounds: None,
+            accepted_brief_version: None,
+            planning_queued_after: None,
         }
     }
 
@@ -15277,7 +15461,7 @@ diff --git a/two.md b/two.md
 
         let plan = conn
             .query_row(
-                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config, dev_worker_provider, dev_reviewer_provider, test_commands FROM agent_plans WHERE id='B'",
+                "SELECT id, run_type, title, workspace_path, plan_path, status, worker_session_id, reviewer_session_id, worker_provider, reviewer_provider, current_phase_id, current_phase_index, error, brief, app_scope, docs_scope, reference_paths, amend_brief, phase_run_mode, initiative_id, initiative_status, health, briefing_session_id, created_at, updated_at, validation_config, executor_config, dev_worker_provider, dev_reviewer_provider, test_commands, accepted_brief_version, planning_queued_after FROM agent_plans WHERE id='B'",
                 [],
                 agent_plan_from_row,
             )
@@ -15565,6 +15749,49 @@ diff --git a/two.md b/two.md
         assert_eq!(count, 1, "no new row created on accept");
     }
 
+    // ── Plans tab 00/01: migration 031 columns surface on AgentPlan (NULL until used) ──
+    #[test]
+    fn get_plan_exposes_new_columns_as_null() {
+        let (state, root) = test_state();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_provider, reviewer_provider, initiative_id, initiative_status) \
+                     VALUES ('INIT', 'planning', 't', '/w', '/p-none', 'draft', 'claude_code', 'claude_code', 'INIT', 'briefing')",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let plan = get_plan(&state, "INIT").expect("get_plan").plan;
+        assert_eq!(plan.accepted_brief_version, None);
+        assert_eq!(plan.planning_queued_after, None);
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json.get("acceptedBriefVersion"), Some(&serde_json::Value::Null));
+        assert_eq!(json.get("planningQueuedAfter"), Some(&serde_json::Value::Null));
+        // list_plans feeds the same mapper through its own SELECT list.
+        let listed = list_plans(&state, None, None, false).unwrap();
+        let row = listed.iter().find(|p| p.id == "INIT").expect("listed");
+        assert_eq!(row.accepted_brief_version, None);
+
+        // And a value round-trips through the positional mapper (index 30/31).
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET accepted_brief_version = 7, planning_queued_after = '[\"X\"]' WHERE id='INIT'",
+                    [],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let plan = get_plan(&state, "INIT").unwrap().plan;
+        assert_eq!(plan.accepted_brief_version, Some(7));
+        assert_eq!(plan.planning_queued_after.as_deref(), Some("[\"X\"]"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── Task 02-01: add_initiative_reference_path appends a normalized host path ───────
     #[tokio::test]
     async fn add_initiative_reference_path_appends() {
@@ -15808,6 +16035,8 @@ diff --git a/two.md b/two.md
                 test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
+                accepted_brief_version: None,
+                planning_queued_after: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -15927,6 +16156,8 @@ mod validation_lens_tests {
                 test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
+                accepted_brief_version: None,
+                planning_queued_after: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -17440,6 +17671,8 @@ mod small_mode_tests {
                 validation_config: None,
                 executor_config: executor_config.map(str::to_string),
                 consecutive_non_pass_planning_rounds: None,
+                accepted_brief_version: None,
+                planning_queued_after: None,
                 dev_worker_provider: None,
                 dev_reviewer_provider: None,
                 test_commands: None,
@@ -19794,6 +20027,8 @@ mod qa_b_template_tests {
                 test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
+                accepted_brief_version: None,
+                planning_queued_after: None,
             },
             phases: vec![],
             tasks: vec![],
@@ -20099,6 +20334,8 @@ mod qa_b_r2_tests {
                 test_commands_list: Vec::new(),
                 executor_config: None,
                 consecutive_non_pass_planning_rounds: None,
+                accepted_brief_version: None,
+                planning_queued_after: None,
             },
             phases: vec![],
             tasks: vec![],
