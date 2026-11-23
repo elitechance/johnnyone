@@ -578,3 +578,106 @@ describe('suppression window', () => {
     });
   });
 });
+
+// ── Rename (task 01, initiative 6672dfab) ───────────────────────────────────────────────────────
+import { SESSION_TITLE_MAX, renameIntent, sessionsWithTitle } from './shells-page-logic';
+
+describe('renameIntent', () => {
+  it('SESSION_TITLE_MAX is 120', () => {
+    expect(SESSION_TITLE_MAX).toBe(120);
+  });
+
+  it('null input (prompt cancelled) → null', () => {
+    expect(renameIntent('build', null)).toBeNull();
+  });
+
+  it('undefined input (prompt dismissed) → null', () => {
+    expect(renameIntent('build', undefined)).toBeNull();
+  });
+
+  it('blank input → null', () => {
+    expect(renameIntent('a', '')).toBeNull();
+  });
+
+  it('whitespace-only input → null', () => {
+    expect(renameIntent('a', '   \t ')).toBeNull();
+  });
+
+  it('unchanged title → null', () => {
+    expect(renameIntent('build', 'build')).toBeNull();
+  });
+
+  it('unchanged title with surrounding spaces in the input → null', () => {
+    expect(renameIntent('build', '  build  ')).toBeNull();
+  });
+
+  it('unchanged title with surrounding spaces in the current title → null', () => {
+    expect(renameIntent('  build ', 'build')).toBeNull();
+  });
+
+  it('a new title → { title }', () => {
+    expect(renameIntent('build', 'deploy')).toEqual({ title: 'deploy' });
+  });
+
+  it('a new title is trimmed', () => {
+    expect(renameIntent('build', '  deploy  ')).toEqual({ title: 'deploy' });
+  });
+
+  it('no current title (null) → { title }', () => {
+    expect(renameIntent(null, 'x')).toEqual({ title: 'x' });
+  });
+
+  it('empty current title → { title }', () => {
+    expect(renameIntent('', 'x')).toEqual({ title: 'x' });
+  });
+
+  it('121-char input is capped to exactly 120 chars', () => {
+    const out = renameIntent('build', 'a'.repeat(121));
+    expect(out?.title.length).toBe(120);
+  });
+
+  it('a cap that lands on a space leaves no trailing space', () => {
+    const out = renameIntent('build', 'a'.repeat(119) + ' bcd');
+    expect(out).not.toBeNull();
+    expect(out!.title.length).toBeLessThanOrEqual(120);
+    expect(out!.title.endsWith(' ')).toBe(false);
+    expect(out!.title).toBe('a'.repeat(119));
+  });
+});
+
+describe('sessionsWithTitle', () => {
+  const rows = () => [
+    { ...session({ id: 'a', title: 'one', provider: 'shell' }) },
+    { ...session({ id: 'b', title: 'two', attachedTmux: true }), terminalStatus: 'detached' },
+    { ...session({ id: 'c', title: 'three', provider: 'shell' }) },
+  ];
+
+  it('renames only the matching row; others are the same references', () => {
+    const input = rows();
+    const out = sessionsWithTitle(input, 'a', 'renamed');
+    expect(out).not.toBe(input);
+    expect(out.map((s) => s.title)).toEqual(['renamed', 'two', 'three']);
+    expect(out[1]).toBe(input[1]);
+    expect(out[2]).toBe(input[2]);
+  });
+
+  it('preserves attachedTmux and terminalStatus on the renamed row', () => {
+    const out = sessionsWithTitle(rows(), 'b', 'kloo');
+    expect(out[1].title).toBe('kloo');
+    expect(out[1].attachedTmux).toBe(true);
+    expect(out[1].terminalStatus).toBe('detached');
+    expect(out[1].updatedAt).toBe('2026-07-03T10:00:00Z');
+  });
+
+  it('does not mutate the input array or its rows', () => {
+    const input = rows();
+    const before = JSON.parse(JSON.stringify(input));
+    sessionsWithTitle(input, 'b', 'changed');
+    expect(input).toEqual(before);
+  });
+
+  it('unknown id → content equal to the input', () => {
+    const input = rows();
+    expect(sessionsWithTitle(input, 'zzz', 'x')).toEqual(input);
+  });
+});

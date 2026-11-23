@@ -413,6 +413,31 @@ ion-modal.workspace-picker .picker-empty {
     .ps-name {
       color: var(--jo-fg-strong);
       font-weight: 600;
+      // A long title truncates instead of wrapping the bar at 360px.
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    // ✎ right after the name — the console `.ia` icon button, in the bar's token vocabulary.
+    .ps-rename {
+      width: 22px;
+      height: 22px;
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 1px solid var(--jo-border);
+      border-radius: 6px;
+      background: var(--jo-bg-raised, #0d1420);
+      color: var(--jo-fg-muted);
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+
+      &:hover:not([disabled]) { background: var(--jo-bg-hover); color: var(--jo-fg-strong); }
+      &[disabled] { opacity: 0.4; cursor: default; }
     }
     .ps-dim {
       color: var(--jo-fg-faint);

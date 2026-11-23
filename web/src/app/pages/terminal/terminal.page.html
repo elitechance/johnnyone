@@ -130,6 +130,9 @@
     <header class="plain-shell-topbar">
       <span class="ps-chip">{{ sh?.attached_tmux ? 'tmux' : 'shell' }}</span>
       <span class="ps-name">{{ sh?.title || 'Shell' }}</span>
+      @if (sh) {
+        <button type="button" class="ps-rename" title="Rename shell" aria-label="Rename shell" [disabled]="renamingShell()" (click)="renameCurrentShell()">✎</button>
+      }
       @if (sh?.provider) {
         <span class="ps-dim">· {{ providerLabel(sh!.provider) }}</span>
       }

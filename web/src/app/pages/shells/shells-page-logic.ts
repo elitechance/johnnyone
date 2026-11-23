@@ -332,3 +332,50 @@ export function pruneSuppressed(
   }
   return next;
 }
+
+// ── Rename (display title only) ─────────────────────────────────────────────────────────────────
+// Both rename surfaces — a `/shells` row and the plain-shell top bar — decide through `renameIntent`,
+// so cancel / blank / unchanged / over-long behave identically wherever the ✎ is tapped. The title is
+// a DISPLAY field only: `update_session_title` (`sessions.rs`) never renames the tmux session, whose
+// name `johnnyone_<id>` is the attach identity.
+
+/**
+ * Longest title a rename will save. The alert input also carries `maxlength`, but that is UX — a
+ * paste or a programmatic value can bypass it, so this cap in `renameIntent` is the guarantee.
+ */
+export const SESSION_TITLE_MAX = 120;
+
+/**
+ * What a rename prompt's result should DO, or `null` when it must send no request at all:
+ *  1. `input == null` — the prompt was cancelled or dismissed
+ *  2. the input is trimmed, cut to `SESSION_TITLE_MAX`, and trimmed again (a cut that lands on a
+ *     space must not save a trailing space)
+ *  3. nothing left — a blank title is never saved (the label would just fall back to "Shell")
+ *  4. equal to the trimmed current title — unchanged; `shellSessionLabel` trims for display, so a
+ *     whitespace-only difference is invisible and not worth a round trip
+ *  5. otherwise `{ title }`
+ * Over-long input is truncated rather than rejected: a rejected Save would read as a dead button.
+ */
+export function renameIntent(
+  current: string | null | undefined,
+  input: string | null | undefined,
+): { title: string } | null {
+  if (input == null) return null;
+  const t = input.trim().slice(0, SESSION_TITLE_MAX).trim();
+  if (t === '') return null;
+  if (t === (current ?? '').trim()) return null;
+  return { title: t };
+}
+
+/**
+ * The session list with ONE row's `title` replaced, as a new array. A title-only patch, never a row
+ * swap from the mutation result — the same trap `sessionsWithoutIds` documents: a partial/older row
+ * shape can drop `attachedTmux` / `terminalStatus` and make `isShellSession`/`shellRowState` change
+ * their answer. Every untouched row is the same object; the input is never mutated.
+ *
+ * Why patch locally at all: the worker caches `list_sessions` per isolate (5s), so an immediate
+ * `refresh()` can be served the OLD title and visibly revert the rename the user just saved.
+ */
+export function sessionsWithTitle(sessions: AiSession[], id: string, title: string): AiSession[] {
+  return sessions.map((s) => (s.id === id ? { ...s, title } : s));
+}
