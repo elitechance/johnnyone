@@ -8605,6 +8605,17 @@ pub(crate) async fn handle_reviewer_output(
     phase: &AgentPlanPhase,
     output: &str,
 ) -> Result<(), String> {
+    handle_reviewer_output_with(state, run, phase, output, &ReplanCtrl::live()).await
+}
+
+/// Test seam: same as `handle_reviewer_output` with an injectable ReplanCtrl; production passes `ReplanCtrl::live`.
+async fn handle_reviewer_output_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    output: &str,
+    ctrl: &ReplanCtrl<'_>,
+) -> Result<(), String> {
     let verdict = parse_verdict(output);
     let review = parse_review_insights(output);
     match verdict.as_deref() {
@@ -8647,12 +8658,12 @@ pub(crate) async fn handle_reviewer_output(
                 let summary = review.summary.clone().unwrap_or_else(|| summarize_output(output));
                 return escalate_phase_no_converge(state, run, phase, round, "NEEDS_CHANGES", &summary).await;
             }
-            // Both modes route through send_reviewer_feedback_to_worker: for a claude
+            // Both modes route through send_reviewer_feedback_to_worker_with: for a claude
             // worker it injects the feedback into the live session; for kloo/local-small
             // it bridges the reviewer's insights into a guided replan (I19) so the amend
             // planner turns them into corrective qwen3.8-flash-next tasks. (kloo mode used to park
             // here, before the bridge existed.)
-            send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
+            send_reviewer_feedback_to_worker_with(state, run, phase, output, &review, ctrl).await
         }
         Some("BLOCKED") => {
             state.db.with_conn(|conn| {
@@ -8696,7 +8707,7 @@ pub(crate) async fn handle_reviewer_output(
             if crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
                 return park_kloo_review(state, run, phase, "BLOCKED", &review).await;
             }
-            send_reviewer_feedback_to_worker(state, run, phase, output, &review).await
+            send_reviewer_feedback_to_worker_with(state, run, phase, output, &review, ctrl).await
         }
         _ => clarify_or_needs_attention(state, run, phase).await,
     }
@@ -8736,12 +8747,16 @@ async fn park_kloo_review(
     )
 }
 
-pub(crate) async fn send_reviewer_feedback_to_worker(
+/// Sends a phase reviewer's non-pass verdict back for rework. Takes the ReplanCtrl so tests can
+/// drive the kloo bridge without a real spawn; production reaches it only via
+/// `handle_reviewer_output`, which passes `ReplanCtrl::live`.
+async fn send_reviewer_feedback_to_worker_with(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     reviewer_output: &str,
     review: &ReviewInsights,
+    ctrl: &ReplanCtrl<'_>,
 ) -> Result<(), String> {
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
@@ -8780,7 +8795,7 @@ pub(crate) async fn send_reviewer_feedback_to_worker(
             phase,
             "reviewer-feedback",
             "reviewer",
-            &ReplanCtrl::live(),
+            ctrl,
         )
         .await;
     }
@@ -18150,8 +18165,11 @@ mod replan_tests {
         );
     }
 
+    // I19 (commit 07726ec) replaced the kloo NEEDS_CHANGES "park" with a bridge into a guided
+    // replan, so the old park assertions were retired. This pins the bridge instead, driven
+    // through the test ctrl so no real amend-planner CLI is launched in tmux.
     #[tokio::test]
-    async fn kloo_needs_changes_parks_instead_of_alldone_loop() {
+    async fn kloo_needs_changes_bridges_into_guided_replan() {
         let (state, root, _store, _ws, run) = harness();
         set_executor_config(&state, &run.plan.id, r#"{"mode":"local-small"}"#).unwrap();
         state
@@ -18166,25 +18184,71 @@ mod replan_tests {
             .unwrap();
         let run = get_plan(&state, &run.plan.id).unwrap();
         let phase = run.phases.iter().find(|p| p.phase_id == "00-x").unwrap();
-        handle_reviewer_output(
+        let log = Mutex::new(Vec::new());
+        let host = SilentHost;
+        // No fake planner: with spawn:false the bridge stops at begin_phase_replan, and the
+        // replan arm (the only place a fake planner runs) is not entered here (plan D3).
+        let ctrl = test_ctrl(&log, None, &host);
+        handle_reviewer_output_with(
             &state,
             &run,
             phase,
             "VERDICT: NEEDS_CHANGES\nSUMMARY: missing evidence\nFINDINGS:\n- no screenshot\n",
+            &ctrl,
         )
         .await
         .unwrap();
         let after = get_plan(&state, &run.plan.id).unwrap();
-        assert_eq!(after.plan.status, "needs_attention");
-        assert_ne!(after.plan.status, "phase_worker_running");
-        assert!(after
-            .events
-            .iter()
-            .any(|e| e.event_type == "agent_phase_needs_attention"));
-        assert!(!after
-            .events
-            .iter()
-            .any(|e| e.event_type == "agent_feedback_sent_to_worker"));
+
+        let guidance = task_replan::load_human_comment(&replan_runs_dir(&state, &after, "00-x"));
+        assert!(
+            guidance
+                .as_deref()
+                .is_some_and(|text| text.contains("no screenshot")),
+            "reviewer findings should be queued as replan guidance, got {guidance:?}"
+        );
+        assert!(
+            after
+                .events
+                .iter()
+                .any(|e| e.event_type == "agent_feedback_sent_to_worker"),
+            "expected an agent_feedback_sent_to_worker event"
+        );
+        assert!(
+            after.events.iter().any(|e| {
+                e.event_type == "agent_phase_replan_started"
+                    && serde_json::from_str::<serde_json::Value>(&e.payload_json)
+                        .map(|p| p["taskId"] == "reviewer-feedback" && p["route"] == "reviewer")
+                        .unwrap_or(false)
+            }),
+            "expected agent_phase_replan_started with taskId reviewer-feedback and route reviewer"
+        );
+        // "phase_replan_running" implies not "phase_worker_running": no all-done loop back to a worker.
+        assert_eq!(
+            after.plan.status, "phase_replan_running",
+            "review NEEDS_CHANGES should begin a replan, not loop back to a worker"
+        );
+        assert!(
+            !after
+                .events
+                .iter()
+                .any(|e| e.event_type == "agent_phase_needs_attention"),
+            "kloo NEEDS_CHANGES no longer parks (I19)"
+        );
+        assert!(
+            *log.lock().unwrap() == vec![1],
+            "the injected test ctrl, not ReplanCtrl::live, should reach begin_phase_replan; spawn_log = {:?}",
+            log.lock().unwrap()
+        );
+        if let Some(sid) = after.plan.worker_session_id.as_deref() {
+            let live = std::process::Command::new("tmux")
+                .args(["has-session", "-t", &format!("johnnyone_{sid}")])
+                .status();
+            assert!(
+                !matches!(live, Ok(status) if status.success()),
+                "no real tmux session should exist for replan session {sid}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
