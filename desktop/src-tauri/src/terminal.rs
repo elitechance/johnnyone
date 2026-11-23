@@ -304,6 +304,18 @@ pub async fn stop_terminal_capture(state: &AppState, session_id: &str) {
 }
 
 pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result<(), String> {
+    kill_terminal_session_checked(state, session_id)
+        .await
+        .map(|_| ())
+}
+
+/// `kill_terminal_session`, reporting whether a live `johnnyone_<id>` pane existed and was
+/// killed (`true`) or there was nothing to kill (`false`). The retire helper uses the flag to
+/// decide whether retirement changed anything (idempotent, event only on change).
+pub async fn kill_terminal_session_checked(
+    state: &AppState,
+    session_id: &str,
+) -> Result<bool, String> {
     stop_terminal_capture(state, session_id).await;
     state
         .terminal_visual_subscribers
@@ -312,6 +324,7 @@ pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result
         .remove(session_id);
 
     let tmux_session_name = tmux_session_name(session_id);
+    let mut killed = false;
     if tmux_has_session(&tmux_session_name).await {
         run_tmux(vec![
             "kill-session".to_string(),
@@ -320,11 +333,12 @@ pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result
         ])
         .await
         .map(|_| ())?;
+        killed = true;
     }
 
     detach_terminal_row(&state.db, session_id)?;
 
-    Ok(())
+    Ok(killed)
 }
 
 /// One row whose `terminal_status` claims `'attached'`, as startup reconciliation reads it.
@@ -1123,6 +1137,75 @@ fn parse_session_names(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// `(name, session_created unix secs, session_attached client count)` for every tmux session, out
+/// of `list-sessions -F '#{session_name}\t#{session_created}\t#{session_attached}'`.
+///
+/// Pure. Split from the RIGHT so a name containing a tab still parses; only the line terminator is
+/// stripped (a name may contain spaces). A line whose two numeric fields do not parse is SKIPPED,
+/// never defaulted: a defaulted `created = 0` would look ancient and pass the orphan grace window,
+/// so a malformed line must never become a kill.
+pub fn parse_session_inventory(output: &str) -> Vec<(String, i64, u32)> {
+    output
+        .lines()
+        .map(|line| line.trim_end_matches(['\r', '\n']))
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.rsplitn(3, '\t');
+            let attached = parts.next()?.trim().parse::<u32>().ok()?;
+            let created = parts.next()?.trim().parse::<i64>().ok()?;
+            let name = parts.next()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), created, attached))
+        })
+        .collect()
+}
+
+/// Every tmux session with its age and attached-client count (one `list-sessions` call).
+///
+/// `Err` means tmux itself could not be asked — the same distinction [`tmux_session_names`]
+/// documents. The orphan sweep treats it as "reap nothing".
+pub async fn list_tmux_inventory() -> Result<Vec<(String, i64, u32)>, String> {
+    let out = run_tmux(vec![
+        "list-sessions".to_string(),
+        "-F".to_string(),
+        "#{session_name}\t#{session_created}\t#{session_attached}".to_string(),
+    ])
+    .await?;
+    Ok(parse_session_inventory(&out))
+}
+
+/// The J1 session id owned by a tmux session name — `Some(id)` ONLY for exactly
+/// `johnnyone_<canonical hyphenated lowercase uuid>`, the inverse of [`tmux_session_name`] for every
+/// id J1 mints (`Uuid::new_v4().to_string()`). Everything else is foreign: `j1`, `kord`,
+/// `johnnyone_`, `johnnyone_scratch`, `johnnyone_<uuid>-x`, simple-form or upper-case uuids.
+pub fn owned_session_id_from_tmux_name(name: &str) -> Option<String> {
+    let suffix = name.strip_prefix("johnnyone_")?;
+    let parsed = uuid::Uuid::parse_str(suffix).ok()?;
+    let canonical = parsed.hyphenated().to_string();
+    (canonical == suffix).then_some(canonical)
+}
+
+/// Kill an OWNED orphan pane that has no session row (so there is no id-keyed
+/// `kill_terminal_session` to go through). Refuses — before running any tmux — a name that is not
+/// exactly `johnnyone_<uuid>`, and kills with the exact `=` target so tmux prefix matching can
+/// never reach the user's sessions. `Ok(true)` when `kill-session` ran.
+pub async fn kill_owned_orphan_pane(name: &str) -> Result<bool, String> {
+    if owned_session_id_from_tmux_name(name).is_none() {
+        return Err(format!(
+            "kill_owned_orphan_pane: '{name}' is not an owned johnnyone_<uuid> name; refusing"
+        ));
+    }
+    run_tmux(vec![
+        "kill-session".to_string(),
+        "-t".to_string(),
+        tmux_session_target(name),
+    ])
+    .await?;
+    Ok(true)
+}
+
 /// Does a tmux session with EXACTLY this name exist?
 ///
 /// Decided by string equality in Rust, not by tmux's target parser. `tmux has-session -t <name>`
@@ -1649,6 +1732,71 @@ fn tmux_session_name(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_session_inventory_reads_name_created_attached() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let out = format!("j1\t1700000000\t1\njohnnyone_{id}\t1700000100\t0\n");
+        assert_eq!(
+            parse_session_inventory(&out),
+            vec![
+                ("j1".to_string(), 1_700_000_000, 1),
+                (format!("johnnyone_{id}"), 1_700_000_100, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_session_inventory_keeps_name_with_spaces_and_tabs() {
+        let out = "my work session\t1700000000\t0\r\nodd\tname\t1700000001\t2\n";
+        assert_eq!(
+            parse_session_inventory(out),
+            vec![
+                ("my work session".to_string(), 1_700_000_000, 0),
+                ("odd\tname".to_string(), 1_700_000_001, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_session_inventory_skips_malformed_lines() {
+        let out = "only-name\n\nbad\tnotanumber\t0\nbad2\t1700000000\tx\n\t1700000000\t0\nok\t5\t0\n";
+        assert_eq!(parse_session_inventory(out), vec![("ok".to_string(), 5, 0)]);
+    }
+
+    #[test]
+    fn owned_name_round_trips_tmux_session_name() {
+        for _ in 0..50 {
+            let id = uuid::Uuid::new_v4().to_string();
+            assert_eq!(owned_session_id_from_tmux_name(&tmux_session_name(&id)), Some(id));
+        }
+    }
+
+    #[test]
+    fn owned_name_rejects_foreign_and_malformed() {
+        let id = uuid::Uuid::new_v4();
+        let rejected = [
+            "j1".to_string(),
+            "kord".to_string(),
+            "guard".to_string(),
+            "johnnyone_".to_string(),
+            "johnnyone_abc".to_string(),
+            format!("johnnyone_{id}-x"),
+            format!("johnnyone_{}", id.to_string().to_uppercase()),
+            format!("johnnyone_{}", id.simple()),
+            format!("xjohnnyone_{id}"),
+            format!("JOHNNYONE_{id}"),
+        ];
+        for name in rejected {
+            assert_eq!(owned_session_id_from_tmux_name(&name), None, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_owned_orphan_pane_refuses_foreign_name_without_tmux() {
+        let err = kill_owned_orphan_pane("j1").await.expect_err("foreign name refused");
+        assert!(err.contains("not an owned johnnyone_<uuid> name"), "{err}");
+    }
 
     #[test]
     fn normalize_unescapes_json_newlines() {

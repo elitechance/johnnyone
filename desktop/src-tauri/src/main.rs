@@ -6,6 +6,7 @@ use johnnyone_desktop_lib::db::Database;
 use johnnyone_desktop_lib::host;
 use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
+use johnnyone_desktop_lib::services::agent_reaper;
 use johnnyone_desktop_lib::services::provider_preflight;
 use johnnyone_desktop_lib::services::question_watch;
 use johnnyone_desktop_lib::services::relay;
@@ -73,6 +74,14 @@ fn main() {
             commands::settings::set_setting,
         ])
         .setup(move |_app| {
+            // The engine's boot instant, captured FIRST — before any coordinator loop resumes — so
+            // the orphan sweep's stale-ephemeral rule never mistakes a lens spawned after boot for
+            // one left over from the previous engine.
+            let engine_started_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
             // Background work that the old standalone `johnnyone-host` binary
             // used to do — now folded into the desktop app so users only run
             // one binary.
@@ -84,7 +93,9 @@ fn main() {
             //      SQLite, with optional JOHNNYONE_* env overrides) register
             //      this machine with the worker and keep a WebSocket open for
             //      relay-RPC.
-            //   3) Local axum GraphQL listener on 127.0.0.1:7788 — what the
+            //   3) The orphan sweep (`agent_reaper`): at boot and every 10 min, retire
+            //      `johnnyone_<uuid>` panes no running job owns (never foreign names).
+            //   4) Local axum GraphQL listener on 127.0.0.1:7788 — what the
             //      embedded host-app Angular UI fetches against. (Will move
             //      to Tauri `invoke()` later; this is the minimal port-over.)
             let state_for_resume = app_state.clone();
@@ -133,6 +144,12 @@ fn main() {
             // this is a long-lived task on Tauri's tokio runtime.
             let watchdog_state = app_state.clone();
             session_watchdog::spawn_session_watchdog(watchdog_state);
+
+            // Orphan sweep — a boot pass, then every 10 minutes: retire `johnnyone_<uuid>` panes
+            // whose row is archived/gone, whose plan finished, or that an engine restart left
+            // behind. Every row-backed kill archives the row and writes `agent_session_retired`.
+            // Like the watchdog, a long-lived task on Tauri's tokio runtime.
+            agent_reaper::spawn_orphan_sweep(app_state.clone(), engine_started_unix);
 
             // One read of the provider's model list, compared with the seat caps: a cap for a
             // family the provider will not serve is a pool that can be leased and never used.

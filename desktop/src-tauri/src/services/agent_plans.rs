@@ -1056,9 +1056,14 @@ pub async fn start_plan(
 
     terminal::attach_terminal_headless(&state, worker_session_id.clone(), 120, 36).await?;
     // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
-    // attach if a legacy run still has one.
+    // attach if a legacy run still has an ACTIVE one (an archived row cannot be attached).
     if let Some(reviewer_session_id) = run.plan.reviewer_session_id.clone() {
-        terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+        if matches!(
+            resolve_plan_session(&state, Some(&reviewer_session_id))?,
+            SessionResolution::Reuse(_)
+        ) {
+            terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+        }
     }
     sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
 
@@ -1082,6 +1087,9 @@ pub async fn start_plan(
         json!({}),
     )?;
 
+    // Re-read: `ensure_dev_worker_session` may have minted a fresh worker (the stored one was
+    // retired at completion), and the prompt's report curl must name the CURRENT session.
+    let run = get_plan(&state, &id)?;
     let prompt = worker_phase_prompt(&state, &run, &phase)?;
     deliver_agent_prompt(&state, &worker_session_id, &prompt).await?;
 
@@ -1154,13 +1162,21 @@ pub async fn run_initiative_from_phase(
                 text,
             );
         }
-        // During replan the pointer is the amend planner — do not inject into it.
-        let delivered = run.plan.status != "phase_replan_running"
-            && run.plan.worker_session_id.is_some();
-        if delivered {
-            if let Some(session_id) = run.plan.worker_session_id.clone() {
-                terminal::send_terminal_input(&state, session_id, format!("{}\r", text)).await?;
+        // During replan the pointer is the amend planner — do not inject into it. Inject only
+        // into a LIVE (active-row) session: a retired/stopped one is not revived here, because
+        // `start_plan` may then decline to run (approved planning, stopped, kloo target) and the
+        // minted agent would sit unused. Such a comment is queued instead, as for no session.
+        let live_session = match run.plan.worker_session_id.as_deref() {
+            Some(sid) if run.plan.status != "phase_replan_running" => {
+                match resolve_plan_session(&state, Some(sid))? {
+                    SessionResolution::Reuse(id) => Some(id),
+                    SessionResolution::Mint { .. } => None,
+                }
             }
+            _ => None,
+        };
+        if let Some(session_id) = live_session {
+            terminal::send_terminal_input(&state, session_id, format!("{}\r", text)).await?;
         } else {
             append_event(
                 &state,
@@ -1595,13 +1611,10 @@ pub async fn manual_pass_phase(
 pub async fn send_feedback_to_worker(state: AppState, id: String) -> Result<AgentPlanRun, String> {
     let run = get_plan(&state, &id)?;
     if run.plan.run_type == "planning" {
-        let planner_session_id = run
-            .plan
-            .worker_session_id
-            .clone()
-            .ok_or_else(|| "Planning run has no planner session".to_string())?;
-        let prompt = planning_continue_prompt(&run);
-        terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
+        let planner_session_id = ensure_planner_session(&state, &run).await?;
+        let minted = run.plan.worker_session_id.as_deref() != Some(planner_session_id.as_str());
+        let run = get_plan(&state, &id)?;
+        send_planner_continue(&state, &run, &planner_session_id, minted).await?;
         state.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE agent_plans SET status = 'planning_planner_running', updated_at = datetime('now') WHERE id = ?1",
@@ -1797,14 +1810,11 @@ async fn start_planning_run_inner(
         "planning_planner_running" | "planning_review_running"
     ) && !force_planner_prompt {
         if run.plan.status == "planning_planner_running" {
-            let planner_session_id = run
-                .plan
-                .worker_session_id
-                .clone()
-                .ok_or_else(|| "Planning run has no planner session".to_string())?;
-            let prompt = planning_continue_prompt(&run);
+            let planner_session_id = ensure_planner_session(&state, &run).await?;
+            let minted = run.plan.worker_session_id.as_deref() != Some(planner_session_id.as_str());
+            let run = get_plan(&state, &id)?;
             terminal::attach_terminal_headless(&state, planner_session_id.clone(), 120, 36).await?;
-            terminal::send_terminal_input(&state, planner_session_id, format!("{}\r", prompt)).await?;
+            send_planner_continue(&state, &run, &planner_session_id, minted).await?;
             append_event(
                 &state,
                 &id,
@@ -1825,17 +1835,21 @@ async fn start_planning_run_inner(
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
-    let planner_session_id = run
-        .plan
-        .worker_session_id
-        .clone()
-        .ok_or_else(|| "Planning run has no planner session".to_string())?;
+    // Amend after approval reaches here with a retired planner: mint a fresh one.
+    let planner_session_id = ensure_planner_session(&state, &run).await?;
+    // Re-read so the prompt's report curl names the (possibly new) planner session.
+    let run = get_plan(&state, &id)?;
 
     terminal::attach_terminal_headless(&state, planner_session_id.clone(), 120, 36).await?;
     // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
-    // attach if a legacy run still has one.
+    // attach if a legacy run still has an ACTIVE one (an archived row cannot be attached).
     if let Some(reviewer_session_id) = run.plan.reviewer_session_id.clone() {
-        terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+        if matches!(
+            resolve_plan_session(&state, Some(&reviewer_session_id))?,
+            SessionResolution::Reuse(_)
+        ) {
+            terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
+        }
     }
     sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
 
@@ -4049,12 +4063,77 @@ async fn unclaimed_findings_ready_gate(
     Ok(true)
 }
 
-async fn ensure_dev_worker_session(
+/// What to do with a plan's stored long-lived session before reusing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionResolution {
+    /// The stored session is active — use it.
+    Reuse(String),
+    /// Create a fresh session. `retire_old` names a stored session that is archived or whose row
+    /// is gone (retired at job end, or stopped): it is retired (normally a silent no-op) and
+    /// replaced, because `ensure_terminal_session` refuses to resurrect an archived row.
+    Mint { retire_old: Option<String> },
+}
+
+/// Pure DB decision behind `ensure_dev_worker_session` / `ensure_planner_session`.
+pub(crate) fn resolve_plan_session(
+    state: &AppState,
+    stored: Option<&str>,
+) -> Result<SessionResolution, String> {
+    let Some(id) = stored else {
+        return Ok(SessionResolution::Mint { retire_old: None });
+    };
+    let status: Option<String> = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })?;
+    Ok(match status.as_deref() {
+        Some("active") => SessionResolution::Reuse(id.to_string()),
+        _ => SessionResolution::Mint { retire_old: Some(id.to_string()) },
+    })
+}
+
+/// The stored session's `setup_commands`, so a minted replacement runs the same pane setup.
+fn session_setup_commands(state: &AppState, session_id: &str) -> Option<String> {
+    state
+        .db
+        .with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT setup_commands FROM sessions WHERE id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten())
+        })
+        .unwrap_or(None)
+}
+
+/// Make sure the plan's worker column names an ACTIVE session; mint (and point the column at) a
+/// fresh one otherwise. Returns `(session_id, minted)`. Does not attach.
+async fn resolve_or_mint_worker_column(
     state: &AppState,
     run: &AgentPlanRun,
-) -> Result<String, String> {
-    if let Some(id) = run.plan.worker_session_id.clone() {
-        return Ok(id);
+    title: String,
+) -> Result<(String, bool), String> {
+    let stored = current_worker_session_id(state, &run.plan.id)
+        .or_else(|| run.plan.worker_session_id.clone());
+    let retire_old = match resolve_plan_session(state, stored.as_deref())? {
+        SessionResolution::Reuse(id) => return Ok((id, false)),
+        SessionResolution::Mint { retire_old } => retire_old,
+    };
+    let setup_commands = retire_old
+        .as_deref()
+        .and_then(|old| session_setup_commands(state, old));
+    if let Some(old) = retire_old.as_deref() {
+        if let Err(error) = retire_agent_session(state, old, "replaced_archived_session").await {
+            tracing::warn!(%error, plan_id = %run.plan.id, "retire replaced session failed");
+        }
     }
     let session = sessions::create_session(
         state,
@@ -4062,9 +4141,9 @@ async fn ensure_dev_worker_session(
             provider: Some(run.plan.worker_provider.clone()),
             model: default_model_for_provider(&run.plan.worker_provider),
             working_directory: Some(run.plan.workspace_path.clone()),
-            title: Some(format!("T1 Worker - {}", run.plan.title)),
+            title: Some(title),
             kind: Some("agent".to_string()),
-            setup_commands: None,
+            setup_commands,
             tmux_session_name: None,
         },
     )?;
@@ -4075,11 +4154,53 @@ async fn ensure_dev_worker_session(
         )
         .map_err(|e| e.to_string())
     })?;
+    Ok((session.id, true))
+}
+
+/// The plan's CURRENT worker column (not a possibly stale snapshot).
+fn current_worker_session_id(state: &AppState, plan_id: &str) -> Option<String> {
+    state
+        .db
+        .with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT worker_session_id FROM agent_plans WHERE id = ?1",
+                    params![plan_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten())
+        })
+        .unwrap_or(None)
+}
+
+/// The planning run's planner session, minting `T1 Planner - {title}` when the stored one was
+/// retired (approval), archived (stop) or deleted. A minted pane is attached and given the
+/// startup wait before it is returned.
+async fn ensure_planner_session(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
+    let (id, minted) =
+        resolve_or_mint_worker_column(state, run, format!("T1 Planner - {}", run.plan.title)).await?;
+    if minted {
+        terminal::attach_terminal_headless(state, id.clone(), 120, 36).await?;
+        sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
+    }
+    Ok(id)
+}
+
+async fn ensure_dev_worker_session(
+    state: &AppState,
+    run: &AgentPlanRun,
+) -> Result<String, String> {
+    let (id, minted) =
+        resolve_or_mint_worker_column(state, run, format!("T1 Worker - {}", run.plan.title)).await?;
+    if !minted {
+        return Ok(id);
+    }
     // Brand-new pane can swallow the first prompt without this wait
     // (every other send path in this file sleeps after attach).
-    terminal::attach_terminal_headless(state, session.id.clone(), 120, 36).await?;
+    terminal::attach_terminal_headless(state, id.clone(), 120, 36).await?;
     sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
-    Ok(session.id)
+    Ok(id)
 }
 
 async fn follow_kloo_outcome(
@@ -4347,7 +4468,10 @@ async fn archive_replan_planner(state: &AppState, plan_id: &str) {
         .ok()
         .flatten();
     if let Some(sid) = sid {
-        let _ = sessions::archive_session(state, sid).await;
+        // Retire BEFORE clearing the column, so the owner lookup still attributes the event.
+        if let Err(error) = retire_agent_session(state, &sid, "replan_finished").await {
+            tracing::warn!(%error, plan_id, "retire replan planner failed");
+        }
     }
     let _ = state.db.with_conn(|conn| {
         conn.execute(
@@ -4459,11 +4583,15 @@ async fn spawn_replan_planner(
         return Ok(());
     }
     // Reload so a retry in this arm sees the session we just wrote, not the
-    // stale `run` snapshot. Archive that prior session before replacing it
+    // stale `run` snapshot. Retire that prior session before replacing it
     // (QA-4 / Lead): stop_plan only knows the latest worker_session_id.
     if let Ok(current) = get_plan(state, &run.plan.id) {
         if let Some(old) = current.plan.worker_session_id {
-            let _ = sessions::archive_session(state, old).await;
+            if let Err(error) =
+                retire_agent_session(state, &old, "replaced_by_replan_planner").await
+            {
+                tracing::warn!(%error, plan_id = %run.plan.id, "retire replaced worker failed");
+            }
         }
     }
     let session = sessions::create_session(
@@ -5572,10 +5700,167 @@ async fn spawn_ephemeral_agent(
 /// Tear down an ephemeral agent: unregister, drop any pending report, kill its
 /// terminal, and delete the session.
 async fn dispose_ephemeral_agent(state: &AppState, session_id: &str) {
+    release_agent_runtime(state, &LivePanes, session_id).await;
+    let _ = sessions::delete_session(state, session_id.to_string()).await;
+}
+
+/// Boxed future returned by an [`AgentPanes`] kill (same `Pin<Box<dyn Future>>` idiom as
+/// `auto_start_development`; no extra crate).
+pub(crate) type PaneKillFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>>;
+
+/// The pane-kill seam shared by `dispose_ephemeral_agent` and `retire_agent_session`. Production
+/// uses [`LivePanes`]; unit tests use a recording fake so no test touches tmux.
+pub(crate) trait AgentPanes: Send + Sync {
+    /// Kill the session's owned `johnnyone_<id>` pane. `Ok(true)` only when a pane existed.
+    fn kill<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> PaneKillFuture<'a>;
+}
+
+/// The real tmux: `terminal::kill_terminal_session_checked`.
+pub(crate) struct LivePanes;
+
+impl AgentPanes for LivePanes {
+    fn kill<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> PaneKillFuture<'a> {
+        Box::pin(terminal::kill_terminal_session_checked(state, session_id))
+    }
+}
+
+/// The runtime half of ending an agent, shared by dispose (then delete the row) and retire (then
+/// archive the row): unregister its review-session link, drop any pending report, kill its pane.
+/// Returns whether a live pane was killed; a kill error is logged, never returned.
+async fn release_agent_runtime(state: &AppState, panes: &dyn AgentPanes, session_id: &str) -> bool {
     unregister_review_session(state, session_id);
     state.agent_reports.lock().await.remove(session_id);
-    let _ = terminal::kill_terminal_session(state, session_id).await;
-    let _ = sessions::delete_session(state, session_id.to_string()).await;
+    match panes.kill(state, session_id).await {
+        Ok(killed) => killed,
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "release_agent_runtime: pane kill failed");
+            false
+        }
+    }
+}
+
+/// Which plan owns this session, and the role to show for it: an ephemeral review-session row's
+/// registered role (checked first, like `plan_role_for_session`), else `planner` for the worker
+/// column of a planning run, `worker` for the worker column of any other run, `reviewer` for the
+/// reviewer column. A display lookup only — `plan_role_for_session` stays the report spoof guard.
+fn session_plan_owner(state: &AppState, session_id: &str) -> Option<(String, String)> {
+    state
+        .db
+        .with_conn(|conn| {
+            let registered = conn
+                .query_row(
+                    "SELECT plan_id, role FROM agent_plan_review_sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if registered.is_some() {
+                return Ok(registered);
+            }
+            conn.query_row(
+                "SELECT id, CASE WHEN worker_session_id = ?1 \
+                    THEN (CASE WHEN run_type = 'planning' THEN 'planner' ELSE 'worker' END) \
+                    ELSE 'reviewer' END \
+                 FROM agent_plans WHERE worker_session_id = ?1 OR reviewer_session_id = ?1 \
+                 ORDER BY created_at DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .unwrap_or(None)
+}
+
+/// End a long-lived agent at the end of its job: kill its owned pane, ARCHIVE its row (the row and
+/// its `messages` transcript are kept) and append `agent_session_retired {sessionId, role, reason}`
+/// to the owning plan. Idempotent: returns `Ok(true)` only when something changed (the row went
+/// active → archived, or a live pane was killed), and writes the event only then. An
+/// `attached_tmux` row (the user's own tmux) is archived but never killed.
+pub(crate) async fn retire_agent_session_with(
+    state: &AppState,
+    panes: &dyn AgentPanes,
+    session_id: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    // (a) Facts first — the owner lookup must precede teardown, which deletes the
+    // review-session row it reads.
+    let row: Option<(String, bool)> = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT status, attached_tmux FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    })?;
+    let owner = session_plan_owner(state, session_id);
+    let attached = row.as_ref().map(|(_, attached)| *attached).unwrap_or(false);
+
+    // (b) Archive FIRST (compare-and-set: only an active row flips). Once archived, the
+    // `ensure_terminal_session` guard refuses to resurrect the pane, so no attach/input racing
+    // the kill below can bring it back.
+    let was_active = match row {
+        Some((status, _)) if status == "active" => {
+            sessions::mark_session_archived(state, session_id)?.is_some()
+        }
+        _ => false,
+    };
+
+    // (c) Release the runtime — but never kill a pane the user owns.
+    let pane_killed = if attached {
+        tracing::info!(%session_id, %reason, "retiring attached session — leaving external tmux running");
+        unregister_review_session(state, session_id);
+        state.agent_reports.lock().await.remove(session_id);
+        false
+    } else {
+        release_agent_runtime(state, panes, session_id).await
+    };
+
+    // (d) Event only on change.
+    let changed = was_active || pane_killed;
+    if changed {
+        match &owner {
+            Some((plan_id, role)) => append_event(
+                state,
+                plan_id,
+                None,
+                "agent_session_retired",
+                json!({ "sessionId": session_id, "role": role, "reason": reason }),
+            )?,
+            None => tracing::info!(%session_id, %reason, "agent_session_retired"),
+        }
+    }
+    Ok(changed)
+}
+
+/// [`retire_agent_session_with`] against the real tmux.
+pub(crate) async fn retire_agent_session(
+    state: &AppState,
+    session_id: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    retire_agent_session_with(state, &LivePanes, session_id, reason).await
+}
+
+/// Human text for an `agent_session_retired` reason (master plan §8). Unknown reasons verbatim.
+fn retired_reason_text(reason: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match reason {
+        "plan_approved" => Cow::Borrowed("plan approved"),
+        "plan_completed" => Cow::Borrowed("plan completed"),
+        "replaced_by_replan_planner" => Cow::Borrowed("replaced by the replan planner"),
+        "replan_finished" => Cow::Borrowed("replan finished"),
+        "replaced_archived_session" => Cow::Borrowed("replaced by a fresh session"),
+        "orphan_sweep:session_archived" => Cow::Borrowed("orphan sweep: session already archived"),
+        "orphan_sweep:plan_terminal" => Cow::Borrowed("orphan sweep: plan finished"),
+        "orphan_sweep:stale_ephemeral" => {
+            Cow::Borrowed("orphan sweep: left over from an engine restart")
+        }
+        other => Cow::Borrowed(other),
+    }
 }
 
 /// Dispose EVERY ephemeral review/docs agent registered for a plan (the 3 lens
@@ -8635,10 +8920,32 @@ async fn escalate_phase(
     )
 }
 
+/// Test seam for the planning → development handoff, mirroring [`ReplanCtrl`]. `spawn_dev: false`
+/// does everything `auto_start_development` does except `tokio::spawn(start_plan …)`, so a unit
+/// test never attaches a pane.
+pub(crate) struct PlanningHandoffCtrl {
+    pub spawn_dev: bool,
+}
+
+impl PlanningHandoffCtrl {
+    fn live() -> Self {
+        Self { spawn_dev: true }
+    }
+}
+
 async fn handle_planning_reviewer_output(
     state: &AppState,
     run: &AgentPlanRun,
     output: &str,
+) -> Result<(), String> {
+    handle_planning_reviewer_output_with(state, run, output, &PlanningHandoffCtrl::live()).await
+}
+
+async fn handle_planning_reviewer_output_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    output: &str,
+    ctrl: &PlanningHandoffCtrl,
 ) -> Result<(), String> {
     let verdict = parse_verdict(output);
     let review = parse_review_insights(output);
@@ -8668,7 +8975,18 @@ async fn handle_planning_reviewer_output(
             )?;
             // Continuous SDLC (D-auto): hand the approved plan straight to development — no manual step.
             // `auto_start_development` returns a boxed future (breaks the async-recursion type cycle).
-            auto_start_development(state, run).await
+            let handoff = auto_start_development(state, run, ctrl.spawn_dev).await;
+            // The planner's job ended with the approval, and the development row now exists (or
+            // its creation failed and was recorded) — retire it either way. Re-read the row: an
+            // amend may have swapped the planner since `run` was loaded.
+            if let Ok(current) = get_plan(state, &run.plan.id) {
+                if let Some(sid) = current.plan.worker_session_id.as_deref() {
+                    if let Err(error) = retire_agent_session(state, sid, "plan_approved").await {
+                        tracing::warn!(%error, plan_id = %run.plan.id, "retire planner on approval failed");
+                    }
+                }
+            }
+            handoff
         }
         Some("NEEDS_CHANGES") | Some("BLOCKED") => {
             let verdict = verdict.unwrap();
@@ -8761,6 +9079,7 @@ fn copy_initiative_json_fields(state: &AppState, from: &AgentPlan, to_id: &str) 
 fn auto_start_development<'a>(
     state: &'a AppState,
     planning: &'a AgentPlanRun,
+    spawn_dev: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
     // Returns a BOXED future (rather than an `async fn`) to break the async-recursion type cycle:
     // this transitively calls start_plan → spawn_coordinator_loop → coordinator_loop →
@@ -8821,6 +9140,9 @@ fn auto_start_development<'a>(
     // attach + phase kickoff and must not be folded into the (tokio::spawn'd, Send-bound) planning
     // coordinator future; spawning it also lets planning-review completion return promptly. (The
     // async-recursion type cycle is broken by boxing this fn's future at the call site.)
+    if !spawn_dev {
+        return Ok(());
+    }
     let state_clone = state.clone();
     let dev_id = dev.plan.id.clone();
     tokio::spawn(async move {
@@ -9031,8 +9353,13 @@ async fn send_ledger_feedback_with(
         Some(_) => run.plan.worker_session_id.clone().unwrap_or_default(),
         None => ensure_dev_worker_session(state, run).await?,
     };
+    // Re-read so the report curl names the current (possibly freshly minted) worker.
+    let run_now = match ctrl.worker_sink {
+        Some(_) => None,
+        None => Some(get_plan(state, &run.plan.id)?),
+    };
     let prompt = append_worker_report(
-        run,
+        run_now.as_ref().unwrap_or(run),
         findings::worker_feedback_prompt(
             round,
             &phase.phase_id,
@@ -9178,6 +9505,7 @@ async fn pass_phase(
         if !crate::services::task_loop::phase_is_kloo_mode(&next_path) {
             let refreshed = get_plan(state, plan_id)?;
             let worker_session_id = ensure_dev_worker_session(state, &refreshed).await?;
+            let refreshed = get_plan(state, plan_id)?; // report curl names the current worker
             let prompt = worker_phase_prompt(state, &refreshed, &next)?;
             terminal::send_terminal_input(state, worker_session_id, format!("{}\r", prompt)).await?;
         }
@@ -9202,6 +9530,21 @@ async fn pass_phase(
                     "agent_docs_commit_failed",
                     json!({ "reason": err }),
                 );
+            }
+            // The dev worker's job ended with the final phase; the docs-commit agent has now
+            // finished (committed, skipped or failed). Retire the worker — logged, never
+            // returned, so a completed plan never turns into an error.
+            match get_plan(state, plan_id) {
+                Ok(current) => {
+                    if let Some(sid) = current.plan.worker_session_id.as_deref() {
+                        if let Err(error) = retire_agent_session(state, sid, "plan_completed").await {
+                            tracing::warn!(plan_id, %error, "retire dev worker on completion failed");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(plan_id, %error, "retire dev worker: could not re-read the plan");
+                }
             }
         }
     } else {
@@ -9636,6 +9979,23 @@ fn planning_template_values(state: &AppState, run: &AgentPlanRun) -> Vec<(&'stat
             super::git_history::diff_head(&run.plan.plan_path).unwrap_or_default(),
         ),
     ]
+}
+
+/// Nudge the planner to continue. A freshly MINTED planner (the stored one was retired) has no
+/// context, so it gets the full planner prompt — which also bakes its own report curl — instead
+/// of the one-line continue.
+async fn send_planner_continue(
+    state: &AppState,
+    run: &AgentPlanRun,
+    planner_session_id: &str,
+    minted: bool,
+) -> Result<(), String> {
+    if minted {
+        let prompt = planning_planner_prompt(state, run)?;
+        return deliver_agent_prompt(state, planner_session_id, &prompt).await;
+    }
+    let prompt = planning_continue_prompt(run);
+    terminal::send_terminal_input(state, planner_session_id.to_string(), format!("{}\r", prompt)).await
 }
 
 fn planning_continue_prompt(run: &AgentPlanRun) -> String {
@@ -11252,6 +11612,11 @@ pub(crate) fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value)
         }
         "agent_docs_commit_failed" => "Docs commit failed".to_string(),
         "agent_single_phase_completed" => "Completed the selected phase only".to_string(),
+        "agent_session_retired" => {
+            let role = payload_str(payload, "role").unwrap_or_else(|| "agent".into());
+            let reason = payload_str(payload, "reason").unwrap_or_default();
+            format!("Retired the {} session — {}", role, retired_reason_text(&reason))
+        }
         // Human run/resume guidance. When the comment rode a resume that named a target
         // phase, surface it: "Resume · <PHASE> + comment: <text>"; otherwise "Comment: <text>".
         "human_comment" => {
@@ -12114,13 +12479,13 @@ mod store_tests {
 
     /// Full in-process harness: `Database::open` runs migrations; `AppState::new` wires the rest
     /// (broadcast channels) with no live process, relay, or Tauri handle.
-    fn test_state() -> (AppState, PathBuf) {
+    pub(super) fn test_state() -> (AppState, PathBuf) {
         let root = tmp_dir("state");
         let db = Database::open(&root.join("test.db")).expect("open db");
         (AppState::new(db), root)
     }
 
-    fn input(run_type: Option<&str>, workspace: &str, plan_path: &str) -> CreateAgentPlanInput {
+    pub(super) fn input(run_type: Option<&str>, workspace: &str, plan_path: &str) -> CreateAgentPlanInput {
         CreateAgentPlanInput {
             run_type: run_type.map(|s| s.to_string()),
             title: None,
@@ -14740,7 +15105,7 @@ diff --git a/two.md b/two.md
     }
 
     /// Scaffold a minimal parseable plan at `plan_dir` (overview + one phase + one task).
-    fn scaffold_plan(plan_dir: &Path, title: &str) {
+    pub(super) fn scaffold_plan(plan_dir: &Path, title: &str) {
         std::fs::create_dir_all(plan_dir.join("phases/01-x/tasks/01-y")).unwrap();
         std::fs::write(plan_dir.join("overview.md"), format!("# {}\n", title)).unwrap();
         std::fs::write(plan_dir.join("phases/01-x/overview.md"), "# Phase X\n").unwrap();
@@ -15850,7 +16215,7 @@ mod plan_check_gate_tests {
     };
     use crate::services::task_loop::{followup_after_kloo_phase, KlooPhaseFollowup, PhaseLoopOutcome};
 
-    fn gate_state() -> (AppState, PathBuf, PathBuf, PathBuf) {
+    pub(super) fn gate_state() -> (AppState, PathBuf, PathBuf, PathBuf) {
         let (state, root) = {
             let root = {
                 let d = std::env::temp_dir().join(format!(
@@ -20798,5 +21163,780 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert_eq!(f.plan_status(), "approved", "single-phase run: phase passed");
         assert_eq!(sink.lock().unwrap().len(), 1, "only R1 was sent back");
         no_worker_tmux();
+    }
+}
+
+/// Phase 00 of the "retire agent sessions" initiative: `retire_agent_session`, its job-end call
+/// sites, swap/revive, and the stop/delete regression pins. No test here spawns a CLI or creates
+/// a tmux pane: retire goes through `FakePanes`, and the call-site tests drive the real functions
+/// on rows that never had a pane (their only tmux contact is the read-only `has-session` probe).
+#[cfg(test)]
+pub(crate) mod session_lifecycle_tests {
+    use super::*;
+    use super::plan_check_gate_tests::gate_state;
+    use super::store_tests::{input, scaffold_plan, test_state};
+
+    /// Records every kill request and answers with a fixed "a pane existed" flag.
+    pub(crate) struct FakePanes {
+        killed: std::sync::Mutex<Vec<String>>,
+        had_pane: bool,
+    }
+
+    impl FakePanes {
+        pub(crate) fn new(had_pane: bool) -> Self {
+            Self { killed: std::sync::Mutex::new(Vec::new()), had_pane }
+        }
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.killed.lock().unwrap().clone()
+        }
+    }
+
+    impl AgentPanes for FakePanes {
+        fn kill<'a>(&'a self, _state: &'a AppState, session_id: &'a str) -> PaneKillFuture<'a> {
+            self.killed.lock().unwrap().push(session_id.to_string());
+            let had = self.had_pane;
+            Box::pin(async move { Ok(had) })
+        }
+    }
+
+    fn standalone_session(state: &AppState) -> String {
+        sessions::create_session(
+            state,
+            CreateSessionInput {
+                provider: Some("shell".to_string()),
+                model: None,
+                working_directory: None,
+                title: Some("standalone".to_string()),
+                kind: Some("agent".to_string()),
+                setup_commands: None,
+                tmux_session_name: None,
+            },
+        )
+        .expect("create session")
+        .id
+    }
+
+    fn session_status(state: &AppState, id: &str) -> Option<String> {
+        state
+            .db
+            .with_conn(|conn| {
+                conn.query_row("SELECT status FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+                    .optional()
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    /// `(type, payload)` for every event of the plan, in insertion (rowid) order.
+    fn events(state: &AppState, plan_id: &str) -> Vec<(String, serde_json::Value)> {
+        state
+            .db
+            .with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT type, payload_json FROM agent_plan_events WHERE plan_id = ?1 ORDER BY rowid")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![plan_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .map(|(t, p)| (t, serde_json::from_str(&p).unwrap_or(serde_json::Value::Null)))
+                    .collect::<Vec<_>>();
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    fn retired_events(state: &AppState, plan_id: &str) -> Vec<serde_json::Value> {
+        events(state, plan_id)
+            .into_iter()
+            .filter(|(t, _)| t == "agent_session_retired")
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    fn position(state: &AppState, plan_id: &str, event_type: &str) -> usize {
+        events(state, plan_id)
+            .iter()
+            .position(|(t, _)| t == event_type)
+            .unwrap_or_else(|| panic!("event {event_type} missing"))
+    }
+
+    fn all_events_count(state: &AppState) -> i64 {
+        state
+            .db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM agent_plan_events", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    /// A one-phase development run built from a scaffolded plan (has a `T1 Worker` row, no pane).
+    fn dev_run(tag: &str) -> (AppState, PathBuf, AgentPlanRun) {
+        let (state, root) = test_state();
+        let plan_path = root.join(format!("plan-{tag}"));
+        scaffold_plan(&plan_path, tag);
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .expect("create dev plan");
+        (state, root, run)
+    }
+
+    fn set_run_mode(state: &AppState, plan_id: &str, mode: &str) {
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agent_plans SET phase_run_mode = ?1 WHERE id = ?2",
+                    params![mode, plan_id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+    }
+
+    fn planning_run(state: &AppState, root: &Path, ws: &Path) -> AgentPlanRun {
+        create_plan(
+            state,
+            CreateAgentPlanInput {
+                run_type: Some("planning".into()),
+                title: Some("lifecycle".into()),
+                workspace_path: ws.to_string_lossy().into(),
+                plan_path: root.join("unused").to_string_lossy().into(),
+                worker_provider: "claude_code".into(),
+                reviewer_provider: "claude_code".into(),
+                brief: None,
+                app_scope: None,
+                docs_scope: None,
+                reference_paths: None,
+                worker_setup_commands: None,
+                reviewer_setup_commands: None,
+                dev_worker_provider: None,
+                dev_reviewer_provider: None,
+            },
+        )
+        .expect("create planning run")
+    }
+
+    // ── 00/01: the helper ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn retire_archives_row_and_appends_event() {
+        let (state, root, run) = dev_run("retire-basic");
+        let sid = run.plan.worker_session_id.clone().unwrap();
+        let panes = FakePanes::new(true);
+        let changed = retire_agent_session_with(&state, &panes, &sid, "plan_completed").await.unwrap();
+        assert!(changed);
+        assert_eq!(panes.calls(), vec![sid.clone()]);
+        assert_eq!(session_status(&state, &sid).as_deref(), Some("archived"));
+        let ev = retired_events(&state, &run.plan.id);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0], json!({ "sessionId": sid, "role": "worker", "reason": "plan_completed" }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_keeps_row_and_messages() {
+        let (state, root, run) = dev_run("retire-keeps");
+        let sid = run.plan.worker_session_id.clone().unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content) VALUES ('m1', ?1, 'assistant', 'transcript')",
+                    params![sid],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(false), &sid, "plan_completed").await.unwrap();
+        assert_eq!(session_status(&state, &sid).as_deref(), Some("archived"), "row kept, archived");
+        let content: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row("SELECT content FROM messages WHERE id = 'm1'", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(content, "transcript");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_is_idempotent_no_duplicate_event() {
+        let (state, root, run) = dev_run("retire-idem");
+        let sid = run.plan.worker_session_id.clone().unwrap();
+        let panes = FakePanes::new(false);
+        assert!(retire_agent_session_with(&state, &panes, &sid, "plan_completed").await.unwrap());
+        assert!(!retire_agent_session_with(&state, &panes, &sid, "plan_completed").await.unwrap());
+        assert_eq!(retired_events(&state, &run.plan.id).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_unregisters_review_session_and_drops_pending_report() {
+        let (state, root, run) = dev_run("retire-unreg");
+        let sid = standalone_session(&state);
+        register_review_session(&state, &run.plan.id, &sid, "qa").unwrap();
+        state.agent_reports.lock().await.insert(
+            sid.clone(),
+            AgentReport {
+                kind: "verdict".into(),
+                verdict: Some("PASS".into()),
+                role: Some("qa".into()),
+                findings: None,
+                summary: None,
+                severity: None,
+                reason: None,
+                evidence: None,
+            },
+        );
+        retire_agent_session_with(&state, &FakePanes::new(false), &sid, "orphan_sweep:stale_ephemeral")
+            .await
+            .unwrap();
+        assert!(plan_role_for_session(&state, &sid).is_err(), "review-session link removed");
+        assert!(!state.agent_reports.lock().await.contains_key(&sid), "pending report dropped");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_never_kills_attached_tmux_session() {
+        let (state, root, run) = dev_run("retire-attached");
+        let sid = run.plan.worker_session_id.clone().unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute("UPDATE sessions SET attached_tmux = 1 WHERE id = ?1", params![sid])
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let panes = FakePanes::new(true);
+        retire_agent_session_with(&state, &panes, &sid, "plan_completed").await.unwrap();
+        assert!(panes.calls().is_empty(), "the user's tmux is never killed");
+        assert_eq!(session_status(&state, &sid).as_deref(), Some("archived"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_without_owner_plan_writes_no_event() {
+        let (state, root) = test_state();
+        let sid = standalone_session(&state);
+        assert!(retire_agent_session_with(&state, &FakePanes::new(true), &sid, "plan_completed")
+            .await
+            .unwrap());
+        assert_eq!(session_status(&state, &sid).as_deref(), Some("archived"));
+        assert_eq!(all_events_count(&state), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_role_is_planner_for_planning_run_and_worker_for_development_run() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(false), &planner, "plan_approved").await.unwrap();
+        assert_eq!(retired_events(&state, &planning.plan.id)[0]["role"], "planner");
+
+        let plan_path = root.join("dev-plan");
+        scaffold_plan(&plan_path, "dev");
+        let dev = create_plan(
+            &state,
+            input(Some("development"), &ws.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .unwrap();
+        let worker = dev.plan.worker_session_id.clone().unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(false), &worker, "plan_completed").await.unwrap();
+        assert_eq!(retired_events(&state, &dev.plan.id)[0]["role"], "worker");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retire_of_lens_session_reports_its_registered_role() {
+        let (state, root, run) = dev_run("retire-lens");
+        let sid = standalone_session(&state);
+        register_review_session(&state, &run.plan.id, &sid, "qa").unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(true), &sid, "orphan_sweep:stale_ephemeral")
+            .await
+            .unwrap();
+        let ev = retired_events(&state, &run.plan.id);
+        assert_eq!(ev.len(), 1, "owner resolved before the review-session row was removed");
+        assert_eq!(ev[0]["role"], "qa");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn plan_role_for_session_unchanged_for_planner() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        assert_eq!(plan_role_for_session(&state, &planner).unwrap(), "worker");
+        assert_eq!(
+            session_plan_owner(&state, &planner),
+            Some((planning.plan.id.clone(), "planner".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn dispose_ephemeral_agent_still_deletes_row() {
+        let (state, root, run) = dev_run("dispose");
+        let sid = standalone_session(&state);
+        register_review_session(&state, &run.plan.id, &sid, "lead").unwrap();
+        dispose_ephemeral_agent(&state, &sid).await;
+        assert_eq!(session_status(&state, &sid), None, "row deleted");
+        assert!(plan_role_for_session(&state, &sid).is_err());
+        assert!(retired_events(&state, &run.plan.id).is_empty(), "dispose writes no retired event");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retired_event_labels_match_plan() {
+        let cases = [
+            ("planner", "plan_approved", "Retired the planner session — plan approved"),
+            ("worker", "plan_completed", "Retired the worker session — plan completed"),
+            ("worker", "replaced_by_replan_planner", "Retired the worker session — replaced by the replan planner"),
+            ("worker", "replan_finished", "Retired the worker session — replan finished"),
+            ("worker", "replaced_archived_session", "Retired the worker session — replaced by a fresh session"),
+            ("worker", "orphan_sweep:session_archived", "Retired the worker session — orphan sweep: session already archived"),
+            ("planner", "orphan_sweep:plan_terminal", "Retired the planner session — orphan sweep: plan finished"),
+            ("qa", "orphan_sweep:stale_ephemeral", "Retired the qa session — orphan sweep: left over from an engine restart"),
+            ("docs", "something_new", "Retired the docs session — something_new"),
+        ];
+        for (role, reason, want) in cases {
+            let payload = json!({ "sessionId": "s", "role": role, "reason": reason });
+            let event = AgentPlanEvent {
+                id: "e".into(),
+                plan_id: "p".into(),
+                phase_id: None,
+                phase_index: None,
+                phase_title: None,
+                event_type: "agent_session_retired".into(),
+                actor: String::new(),
+                category: String::new(),
+                summary: String::new(),
+                status_before: None,
+                status_after: None,
+                reason: None,
+                verdict: None,
+                task_id: None,
+                clarification_attempt: None,
+                payload_json: payload.to_string(),
+                created_at: String::new(),
+            };
+            assert_eq!(event_summary(&event, &payload), want, "reason {reason}");
+            assert_eq!(event_status_transition("agent_session_retired", &payload), (None, None));
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_session_archived_is_compare_and_set() {
+        let (state, root) = test_state();
+        let sid = standalone_session(&state);
+        assert!(sessions::mark_session_archived(&state, &sid).unwrap().is_some());
+        assert!(sessions::mark_session_archived(&state, &sid).unwrap().is_none());
+        assert!(sessions::mark_session_archived(&state, "no-such-id").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Orchestrator note (2026-11-23): killing only the pane is not enough, because
+    /// `ensure_terminal_session` resurrects any NON-archived row on the next attach. A retired
+    /// session must be archived, and every attach/input path must then refuse it.
+    #[tokio::test]
+    async fn retired_session_is_archived_and_terminal_refuses_to_resurrect_it() {
+        let (state, root, run) = dev_run("no-resurrect");
+        let sid = run.plan.worker_session_id.clone().unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(true), &sid, "plan_completed").await.unwrap();
+        assert_eq!(session_status(&state, &sid).as_deref(), Some("archived"));
+        let attach = terminal::attach_terminal_headless(&state, sid.clone(), 120, 36).await;
+        let err = attach.expect_err("attach must refuse an archived session");
+        assert!(err.contains("archived; refusing to resurrect"), "{err}");
+        let input = terminal::send_terminal_input(&state, sid.clone(), "hi\r".into()).await;
+        let err = input.expect_err("input must refuse an archived session");
+        assert!(err.contains("archived; refusing to resurrect"), "{err}");
+        assert_eq!(session_status(&state, &sid).as_deref(), Some("archived"), "still archived");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Records the row status AT kill time, to pin archive-before-kill.
+    struct StatusAtKill(std::sync::Mutex<Option<String>>);
+
+    impl AgentPanes for StatusAtKill {
+        fn kill<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> PaneKillFuture<'a> {
+            *self.0.lock().unwrap() = session_status(state, session_id);
+            Box::pin(async move { Ok(true) })
+        }
+    }
+
+    /// Validator finding: archiving AFTER the kill left a window where an attach/input passed
+    /// the archived-guard and recreated the pane. The row must already be archived when the
+    /// pane is killed.
+    #[tokio::test]
+    async fn retire_archives_before_killing_the_pane() {
+        let (state, root, run) = dev_run("archive-first");
+        let sid = run.plan.worker_session_id.clone().unwrap();
+        let panes = StatusAtKill(std::sync::Mutex::new(None));
+        assert!(retire_agent_session_with(&state, &panes, &sid, "plan_completed").await.unwrap());
+        assert_eq!(panes.0.lock().unwrap().as_deref(), Some("archived"));
+        assert_eq!(retired_events(&state, &run.plan.id).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn session_count(state: &AppState) -> i64 {
+        state
+            .db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    /// Validator finding: a Run/Resume comment on a run whose session was retired must not
+    /// mint (and leave running) a fresh agent that `start_plan` then never uses — e.g. an
+    /// approved planning run, where `start_planning_run_inner` returns early. It is queued.
+    #[tokio::test]
+    async fn run_comment_on_retired_session_is_queued_not_minted() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                update_plan_status_and_health(conn, &planning.plan.id, "approved", None)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(false), &planner, "plan_approved")
+            .await
+            .unwrap();
+        let before = session_count(&state);
+        let after_run = run_initiative_from_phase(
+            state.clone(),
+            planning.plan.id.clone(),
+            None,
+            None,
+            Some("please also cover X".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_run.plan.status, "approved");
+        assert_eq!(session_count(&state), before, "no session minted");
+        assert_eq!(after_run.plan.worker_session_id.as_deref(), Some(planner.as_str()));
+        let queued = events(&state, &planning.plan.id)
+            .into_iter()
+            .find(|(t, _)| t == "human_comment_queued")
+            .expect("comment queued");
+        assert_eq!(queued.1["reason"], "no_worker_session");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 00/02: planner retired on approval ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn planning_pass_retires_planner_after_dev_run_created() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        scaffold_plan(Path::new(&planning.plan.plan_path), "lifecycle");
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        let run = get_plan(&state, &planning.plan.id).unwrap();
+        handle_planning_reviewer_output_with(
+            &state,
+            &run,
+            "VERDICT: PASS\nSUMMARY: ok\n",
+            &PlanningHandoffCtrl { spawn_dev: false },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(get_plan(&state, &planning.plan.id).unwrap().plan.status, "approved");
+        let dev_id: String = state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT id FROM agent_plans WHERE initiative_id = ?1 AND run_type = 'development'",
+                    params![planning.plan.initiative_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .expect("development row exists");
+        assert_eq!(session_status(&state, &planner).as_deref(), Some("archived"));
+        let ev = retired_events(&state, &planning.plan.id);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0], json!({ "sessionId": planner, "role": "planner", "reason": "plan_approved" }));
+        assert!(
+            position(&state, &planning.plan.id, "planning_gate_result")
+                < position(&state, &planning.plan.id, "agent_session_retired")
+        );
+        position(&state, &dev_id, "development_autostarted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn planning_pass_with_failed_autostart_still_retires_planner() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        // No overview.md / phases: create_plan(development) fails.
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        let run = get_plan(&state, &planning.plan.id).unwrap();
+        handle_planning_reviewer_output_with(
+            &state,
+            &run,
+            "VERDICT: PASS\nSUMMARY: ok\n",
+            &PlanningHandoffCtrl { spawn_dev: false },
+        )
+        .await
+        .unwrap();
+        position(&state, &planning.plan.id, "development_autostart_failed");
+        assert_eq!(session_status(&state, &planner).as_deref(), Some("archived"));
+        assert_eq!(retired_events(&state, &planning.plan.id).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn planning_needs_changes_keeps_planner() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        scaffold_plan(Path::new(&planning.plan.plan_path), "lifecycle");
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        // NEEDS_CHANGES types feedback into the planner. Point the row at an absent EXTERNAL
+        // tmux name so that send errors ("not running") instead of creating a real pane.
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE sessions SET attached_tmux = 1, tmux_session_name = ?1 WHERE id = ?2",
+                    params![format!("j1test-absent-{}", Uuid::new_v4()), planner],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let run = get_plan(&state, &planning.plan.id).unwrap();
+        // The feedback send is expected to fail (no pane); the verdict handling before it is
+        // what this test pins.
+        let _ = handle_planning_reviewer_output_with(
+            &state,
+            &run,
+            "VERDICT: NEEDS_CHANGES\nSUMMARY: fix it\n",
+            &PlanningHandoffCtrl { spawn_dev: false },
+        )
+        .await;
+        assert_eq!(session_status(&state, &planner).as_deref(), Some("active"));
+        assert!(retired_events(&state, &planning.plan.id).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 00/03: dev worker retired on completion ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn plan_completion_retires_worker_after_docs_commit() {
+        let (state, root, run) = dev_run("complete");
+        set_run_mode(&state, &run.plan.id, "continue");
+        let worker = run.plan.worker_session_id.clone().unwrap();
+        pass_phase(&state, &run.plan.id, "01-x", "passed", "PASS").await.unwrap();
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("archived"));
+        let ev = retired_events(&state, &run.plan.id);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0], json!({ "sessionId": worker, "role": "worker", "reason": "plan_completed" }));
+        let completed = position(&state, &run.plan.id, "agent_plan_completed");
+        let docs = position(&state, &run.plan.id, "agent_docs_commit_skipped");
+        let retired = position(&state, &run.plan.id, "agent_session_retired");
+        assert!(completed < docs && docs < retired, "{completed} < {docs} < {retired}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn intermediate_phase_pass_keeps_worker() {
+        let (state, root) = test_state();
+        let plan_path = root.join("plan-two");
+        scaffold_plan(&plan_path, "two");
+        // Phase 2 is kloo-mode (has a task.yml), so passing phase 1 types nothing into a pane.
+        std::fs::create_dir_all(plan_path.join("phases/02-k/tasks/01-a")).unwrap();
+        std::fs::write(plan_path.join("phases/02-k/overview.md"), "# Phase K\n").unwrap();
+        std::fs::write(plan_path.join("phases/02-k/tasks/01-a/prompt.md"), "# Task A\n").unwrap();
+        std::fs::write(plan_path.join("phases/02-k/tasks/01-a/task.yml"), "id: 01-a\n").unwrap();
+        let run = create_plan(
+            &state,
+            input(Some("development"), &root.to_string_lossy(), &plan_path.to_string_lossy()),
+        )
+        .unwrap();
+        assert_eq!(run.phases.len(), 2);
+        set_run_mode(&state, &run.plan.id, "continue");
+        let worker = run.plan.worker_session_id.clone().unwrap();
+        pass_phase(&state, &run.plan.id, "01-x", "passed", "PASS").await.unwrap();
+        position(&state, &run.plan.id, "agent_phase_unlocked");
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("active"));
+        assert!(retired_events(&state, &run.plan.id).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn single_phase_mode_completion_keeps_worker() {
+        let (state, root, run) = dev_run("single");
+        set_run_mode(&state, &run.plan.id, "single");
+        let worker = run.plan.worker_session_id.clone().unwrap();
+        pass_phase(&state, &run.plan.id, "01-x", "passed", "PASS").await.unwrap();
+        position(&state, &run.plan.id, "agent_single_phase_completed");
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("active"));
+        assert!(retired_events(&state, &run.plan.id).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn plan_completion_retire_error_does_not_fail_pass_phase() {
+        let (state, root, run) = dev_run("retire-err");
+        set_run_mode(&state, &run.plan.id, "continue");
+        let worker = run.plan.worker_session_id.clone().unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM sessions WHERE id = ?1", params![worker])
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        pass_phase(&state, &run.plan.id, "01-x", "passed", "PASS")
+            .await
+            .expect("completion stays Ok even when the worker row is gone");
+        position(&state, &run.plan.id, "agent_plan_completed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 00/04: swap and revive ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_reuses_active_session() {
+        let (state, root) = test_state();
+        let sid = standalone_session(&state);
+        assert_eq!(
+            resolve_plan_session(&state, Some(&sid)).unwrap(),
+            SessionResolution::Reuse(sid.clone())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resolve_mints_when_none() {
+        let (state, root) = test_state();
+        assert_eq!(
+            resolve_plan_session(&state, None).unwrap(),
+            SessionResolution::Mint { retire_old: None }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resolve_mints_and_names_archived_old() {
+        let (state, root) = test_state();
+        let sid = standalone_session(&state);
+        sessions::mark_session_archived(&state, &sid).unwrap();
+        assert_eq!(
+            resolve_plan_session(&state, Some(&sid)).unwrap(),
+            SessionResolution::Mint { retire_old: Some(sid.clone()) }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn resolve_mints_and_names_missing_row() {
+        let (state, root) = test_state();
+        assert_eq!(
+            resolve_plan_session(&state, Some("gone")).unwrap(),
+            SessionResolution::Mint { retire_old: Some("gone".into()) }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn replan_swap_retires_previous_worker_with_event() {
+        let (state, root, run) = dev_run("replan-swap");
+        let old = run.plan.worker_session_id.clone().unwrap();
+        let phase = run.phases[0].clone();
+        let amend = root.join("amend.md");
+        let ctrl = ReplanCtrl { spawn: false, ..ReplanCtrl::live() };
+        spawn_replan_planner(&state, &run, &phase, &amend, None, &ctrl).await.unwrap();
+        assert_eq!(session_status(&state, &old).as_deref(), Some("archived"));
+        let now = get_plan(&state, &run.plan.id).unwrap().plan.worker_session_id.unwrap();
+        assert_ne!(now, old, "the column points at the new amend planner");
+        assert_eq!(session_status(&state, &now).as_deref(), Some("active"));
+        let ev = retired_events(&state, &run.plan.id);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["sessionId"], old);
+        assert_eq!(ev[0]["reason"], "replaced_by_replan_planner");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn archive_replan_planner_retires_with_event() {
+        let (state, root, run) = dev_run("replan-finish");
+        let planner = run.plan.worker_session_id.clone().unwrap();
+        archive_replan_planner(&state, &run.plan.id).await;
+        assert_eq!(session_status(&state, &planner).as_deref(), Some("archived"));
+        assert_eq!(get_plan(&state, &run.plan.id).unwrap().plan.worker_session_id, None);
+        let ev = retired_events(&state, &run.plan.id);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["reason"], "replan_finished");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 00/05: stop/delete regression pins ──────────────────────────────────────────
+
+    fn review_rows(state: &AppState, plan_id: &str) -> i64 {
+        state
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM agent_plan_review_sessions WHERE plan_id = ?1",
+                    params![plan_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stop_plan_behaviour_unchanged() {
+        let (state, root, run) = dev_run("stop");
+        let worker = run.plan.worker_session_id.clone().unwrap();
+        let lens = standalone_session(&state);
+        register_review_session(&state, &run.plan.id, &lens, "qa").unwrap();
+        let stopped = stop_plan(&state, run.plan.id.clone()).await.unwrap();
+        assert_eq!(stopped.plan.status, "stopped");
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("archived"), "archived, not deleted");
+        assert_eq!(review_rows(&state, &run.plan.id), 0);
+        assert_eq!(session_status(&state, &lens), None, "ephemeral lens row deleted");
+        position(&state, &run.plan.id, "agent_plan_stopped");
+        assert!(retired_events(&state, &run.plan.id).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn delete_plan_behaviour_unchanged() {
+        let (state, root, run) = dev_run("delete");
+        let worker = run.plan.worker_session_id.clone().unwrap();
+        let lens = standalone_session(&state);
+        register_review_session(&state, &run.plan.id, &lens, "qa").unwrap();
+        assert!(delete_plan(&state, run.plan.id.clone()).await.unwrap());
+        assert_eq!(get_plan(&state, &run.plan.id).unwrap().plan.status, "closed");
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("archived"), "archived, not deleted");
+        assert_eq!(review_rows(&state, &run.plan.id), 0);
+        assert_eq!(session_status(&state, &lens), None, "ephemeral lens row deleted");
+        assert!(retired_events(&state, &run.plan.id).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stop_then_start_mints_fresh_worker() {
+        let (state, root, run) = dev_run("stop-start");
+        let old = run.plan.worker_session_id.clone().unwrap();
+        stop_plan(&state, run.plan.id.clone()).await.unwrap();
+        let stored = get_plan(&state, &run.plan.id).unwrap().plan.worker_session_id;
+        assert_eq!(
+            resolve_plan_session(&state, stored.as_deref()).unwrap(),
+            SessionResolution::Mint { retire_old: Some(old) }
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

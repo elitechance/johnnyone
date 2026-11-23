@@ -340,16 +340,36 @@ pub async fn archive_session(state: &AppState, id: String) -> Result<Session, St
         tracing::warn!(%error, session_id = %id, "kill_terminal_session failed during archive");
     }
 
-    let session = state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE sessions SET status = 'archived', updated_at = datetime('now') WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|e| format!("Failed to archive session: {}", e))?;
-
-        query_session(conn, &id)
-    })?;
+    if let Some(session) = mark_session_archived(state, &id)? {
+        return Ok(session);
+    }
+    // Already archived (or gone): behave as before — re-read the row and publish it.
+    let session = state.db.with_conn(|conn| query_session(conn, &id))?;
     publish_session_update(state, &session);
+    Ok(session)
+}
+
+/// Compare-and-set archive: flip `active → archived` and publish the update. Returns the
+/// archived session only when THIS call changed the row; `Ok(None)` when the row is missing or
+/// was already archived. No process or pane teardown — callers own that (`archive_session`,
+/// `agent_plans::retire_agent_session_with`).
+pub(crate) fn mark_session_archived(state: &AppState, id: &str) -> Result<Option<Session>, String> {
+    let session = state.db.with_conn(|conn| {
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET status = 'archived', updated_at = datetime('now') \
+                 WHERE id = ?1 AND status = 'active'",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to archive session: {}", e))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        query_session(conn, id).map(Some)
+    })?;
+    if let Some(session) = &session {
+        publish_session_update(state, session);
+    }
     Ok(session)
 }
 
