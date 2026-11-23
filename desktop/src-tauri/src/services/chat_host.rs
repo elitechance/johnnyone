@@ -1,7 +1,7 @@
 use crate::db::models::Message;
 use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
+    claude_code, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
     StreamChunk,
 };
 use crate::simulator;
@@ -135,8 +135,18 @@ pub async fn send_chat_message_blocking(
         CliProvider::Lokalai => lokalai::parse_line,
     };
 
-    let (process, mut rx) = cli_runner::spawn_cli(config, session_id.clone(), parse_fn).await?;
+    let (process, mut rx) = // A plan-agent turn runs visibly in its `johnnyone_<sid>` pane; its data still comes only from
+    // the turn's stream-json (`plan_agent_tmux`). Every other turn is the headless `spawn_cli`.
+    crate::services::plan_agent_tmux::spawn_chat_turn(
+        state,
+        config,
+        session_id.clone(),
+        parse_fn,
+        plan_extras.is_some(),
+    )
+    .await?;
 
+    let turn_id = process.turn_id();
     {
         let mut processes = state.active_processes.lock().await;
         processes.insert(session_id.clone(), process);
@@ -254,12 +264,10 @@ pub async fn send_chat_message_blocking(
         }
     }
 
-    {
-        let mut processes = state.active_processes.lock().await;
-        if let Some(mut proc) = processes.remove(&session_id) {
-            if should_kill_process && proc.is_running() {
-                let _ = proc.kill().await;
-            }
+    // Only THIS turn's handle: a later turn may already be registered under the same session.
+    if let Some(mut proc) = take_own_process(&state.active_processes, &session_id, turn_id).await {
+        if should_kill_process && proc.is_running() {
+            let _ = proc.kill().await;
         }
     }
 
@@ -425,11 +433,34 @@ pub fn plan_agent_turn_extras(
     provider: &str,
 ) -> Result<Option<claude_code::LaunchExtras>, String> {
     match CliProvider::from_str(provider) {
-        Some(CliProvider::ClaudeCode) => crate::services::plan_agent::plan_agent_extras(state, session_id),
+        Some(CliProvider::ClaudeCode) => {
+            let extras = crate::services::plan_agent::plan_agent_extras(state, session_id)?;
+            // One turn at a time per plan agent: refuse before anything is stored or spawned
+            // (the authoritative claim is `plan_agent_tmux::claim_turn` at spawn).
+            if extras.is_some() && crate::services::plan_agent_tmux::turn_in_flight(state, session_id) {
+                return Err(crate::services::plan_agent_tmux::PLAN_AGENT_BUSY.to_string());
+            }
+            Ok(extras)
+        }
         _ if crate::services::plan_agent::is_plan_agent_session(state, session_id) => {
             Err(crate::services::plan_agent::PLAN_AGENT_PROVIDER_ONLY.to_string())
         }
         _ => Ok(None),
+    }
+}
+
+/// Remove `session_id`'s entry from `active_processes` only when it is the handle with `turn_id`
+/// (the caller's own turn). A stale turn's cleanup can never remove or kill a later turn's handle.
+pub async fn take_own_process(
+    processes: &tokio::sync::Mutex<std::collections::HashMap<String, crate::providers::cli_runner::CliProcess>>,
+    session_id: &str,
+    turn_id: u64,
+) -> Option<crate::providers::cli_runner::CliProcess> {
+    let mut map = processes.lock().await;
+    if map.get(session_id).map(|p| p.turn_id()) == Some(turn_id) {
+        map.remove(session_id)
+    } else {
+        None
     }
 }
 

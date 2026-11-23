@@ -1,6 +1,6 @@
 use crate::db::models::Message;
 use crate::providers::{
-    claude_code, cli_runner, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
+    claude_code, cline, codex, grok, lokalai, ollama_cli, ChunkType, CliProvider,
     StreamChunk,
 };
 use crate::services::{chat_host as chat_host_service, sessions as session_service};
@@ -134,9 +134,17 @@ pub async fn send_chat_message(
     };
 
     // 6. Spawn CLI subprocess
-    let (process, mut rx) = cli_runner::spawn_cli(config, session_id.clone(), parse_fn).await?;
+    let (process, mut rx) = crate::services::plan_agent_tmux::spawn_chat_turn(
+        &state,
+        config,
+        session_id.clone(),
+        parse_fn,
+        plan_extras.is_some(),
+    )
+    .await?;
 
     // Store the process handle so it can be killed
+    let turn_id = process.turn_id();
     {
         let mut processes = state.active_processes.lock().await;
         processes.insert(session_id.clone(), process);
@@ -282,12 +290,12 @@ pub async fn send_chat_message(
             }
         }
 
+        // Only THIS turn's handle (a later turn may already be registered for the session).
+        if let Some(mut proc) =
+            crate::services::chat_host::take_own_process(&active_processes, &sid, turn_id).await
         {
-            let mut processes = active_processes.lock().await;
-            if let Some(mut proc) = processes.remove(&sid) {
-                if should_kill_process && proc.is_running() {
-                    let _ = proc.kill().await;
-                }
+            if should_kill_process && proc.is_running() {
+                let _ = proc.kill().await;
             }
         }
 

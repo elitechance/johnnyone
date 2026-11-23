@@ -127,10 +127,11 @@
     <!-- P4: minimal plain-shell top bar (mock console-states State C) — chip + session name + detach,
          no session tabs / New Terminal chrome. -->
     @let sh = currentSession();
-    <header class="plain-shell-topbar">
+    @let topViewOnly = isPlanAgentShell(sh);
+    <header class="plain-shell-topbar" [class.pa-bar]="topViewOnly">
       <span class="ps-chip">{{ sh?.attached_tmux ? 'tmux' : 'shell' }}</span>
       <span class="ps-name">{{ sh?.title || 'Shell' }}</span>
-      @if (sh) {
+      @if (sh && !topViewOnly) {
         <button type="button" class="ps-rename" title="Rename shell" aria-label="Rename shell" [disabled]="renamingShell()" (click)="renameCurrentShell()">✎</button>
       }
       @if (sh?.provider) {
@@ -147,14 +148,24 @@
         <button type="button" class="ps-view" [class.on]="shellView() === 'raw'"
                 [attr.aria-pressed]="shellView() === 'raw'"
                 (click)="setShellView('raw')">Raw</button>
+        @if (!topViewOnly) {
         <button type="button" class="ps-view" [class.on]="shellView() === 'watchdog'"
                 [attr.aria-pressed]="shellView() === 'watchdog'"
                 (click)="setShellView('watchdog')">Watchdog</button>
+        }
       </div>
-      @if (sh) {
+      <!-- A plan agent can't be closed from here: it ends with its plan (the engine refuses too). -->
+      @if (sh && !topViewOnly) {
         <button class="ps-detach" (click)="closeTerminalPane(sh.id)">
           {{ sh.attached_tmux ? 'detach' : 'close' }}
         </button>
+      }
+      <!-- In the layout flow (a wrapped second row of the bar), never over the pane's first lines. -->
+      @if (topViewOnly) {
+        <div class="ps-view-only" role="note">{{ planAgentViewOnlyNote }}</div>
+        @if (terminalError(); as termErr) {
+          <div class="ps-term-error" role="alert">{{ termErr }}</div>
+        }
       }
     </header>
   }
@@ -165,6 +176,7 @@
            shell session (no per-pane header/tabs, no initiative chrome). -->
       @let sh = currentSession();
       @let shScreen = sh ? (terminalScreens()[sh.id] || null) : null;
+      @let shViewOnly = isPlanAgentShell(sh);
       @if (sh && shellView() === 'transcript') {
         <!-- Append-only transcript, fed by the structured stream lane (D6). Reflows at any width,
              so it does not inherit the mirrored pane's column count. Composer reuses the raw-input
@@ -353,6 +365,7 @@
           <!-- No (paste) handler here ON PURPOSE. This form sits inside `.workspace-shell`, whose
                own (paste) handler already stages the image — paste events bubble. Binding one here
                too ran both and staged every image TWICE. -->
+          @if (!shViewOnly) {
           <form class="st-composer" (ngSubmit)="sendShellMessage()">
             <!-- A textarea, not an input: `input type="text"` cannot hold a newline at all.
                  Enter sends on a real keyboard (Shift+Enter for a newline); on touch, where there
@@ -376,8 +389,9 @@
               [disabled]="shellSending() || (!shellDraft.trim() && shellAttachments().length === 0)"
             >{{ shellSending() ? 'Sending…' : 'Send' }}</button>
           </form>
+          }
         </section>
-      } @else if (sh && shellView() === 'watchdog') {
+      } @else if (sh && shellView() === 'watchdog' && !shViewOnly) {
         <section class="terminal-surface watchdog-settings">
           @if (currentSession(); as wd) {
             <!-- Status strip: says what the watchdog is doing and why. -->
@@ -507,10 +521,10 @@
           [screen]="shScreen"
           [title]="sh.title || 'Shell'"
           [terminalProvider]="sh.provider"
-          [disabled]="false"
+          [disabled]="shViewOnly"
           [mirrorMode]="true"
           [mobileInputMode]="isCompactWorkspace()"
-          [showInput]="true"
+          [showInput]="!shViewOnly"
           [imageAttachments]="pendingAttachmentsForSession(sh.id)"
           [imageSending]="isSendingAttachmentsForSession(sh.id)"
           (rawInput)="onTerminalRawInput($event, sh.id)"

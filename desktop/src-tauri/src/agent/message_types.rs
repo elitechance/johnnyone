@@ -369,6 +369,8 @@ pub struct TerminalCommandAck {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcSessionView {
+    /// `planAgent`: a Plans-tab plan agent's session (view-only pane; no close/archive/rename).
+    pub plan_agent: bool,
     pub id: String,
     pub title: String,
     pub provider: String,

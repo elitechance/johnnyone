@@ -10,6 +10,7 @@ import {
   signal,
   computed,
   effect,
+  untracked,
   type WritableSignal,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
@@ -215,7 +216,7 @@ import {
   shellRoutePath,
   shellViewTogglePath,
 } from '../shells/shells-route';
-import { renameIntent } from '../shells/shells-page-logic';
+import { isPlanAgentShell, PLAN_AGENT_VIEW_ONLY_NOTE, renameIntent } from '../shells/shells-page-logic';
 import { promptSessionRename } from '../shells/session-rename-prompt';
 import {
   clampRailWidth,
@@ -438,6 +439,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   terminalScreen = signal<TerminalScreen | null>(null);
   terminalScreens = signal<Record<string, TerminalScreen>>({});
   terminalError = signal<string | null>(null);
+  /** The session id the plan-agent stale-error clear last ran for (see the constructor effect). */
+  private paErrorClearedFor: string | null = null;
+  /** Plan agent in tmux: its Raw/Transcript surface is view-only (banner, no input). */
+  protected readonly isPlanAgentShell = isPlanAgentShell;
+  protected readonly planAgentViewOnlyNote = PLAN_AGENT_VIEW_ONLY_NOTE;
 
   // Per-session pane tab (Transcript default · Raw terminal; Plan/Diff reserved, D7)
   // and the accumulated structured stream feeding the Transcript surface (D6).
@@ -1759,6 +1765,20 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
           this.tabOrder.set(next);
           this.persistTabOrder(next);
         }
+      },
+      { allowSignalWrites: true },
+    );
+
+    // Plan agent in tmux: opening a plan agent's (view-only) shell starts with no stale error from
+    // whatever shell was open before. Keyed on the id, so a refresh of the same session (which
+    // re-sets `currentSession`) never clears the "view-only" refusal the user just triggered.
+    effect(
+      () => {
+        const s = this.currentSession();
+        const id = s?.id ?? null;
+        if (id === this.paErrorClearedFor) return;
+        this.paErrorClearedFor = id;
+        if (isPlanAgentShell(s)) untracked(() => this.terminalError.set(null));
       },
       { allowSignalWrites: true },
     );
@@ -4038,6 +4058,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   async onTerminalRawInput(data: string, sessionId = this.currentSession()?.id): Promise<void> {
     const session = this.sessions().find((item) => item.id === sessionId);
     if (!session) return;
+    // A plan agent's pane is view-only (the engine refuses its input too): say so, never send.
+    if (isPlanAgentShell(session)) {
+      this.terminalError.set(PLAN_AGENT_VIEW_ONLY_NOTE);
+      return;
+    }
     try {
       if (this.currentSession()?.id !== session.id) {
         await this.selectSession(session.id);

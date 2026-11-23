@@ -111,6 +111,11 @@ pub fn create_session(state: &AppState, input: CreateSessionInput) -> Result<Ses
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // J1's own panes (`johnnyone_*`) are never attach targets: attaching would bypass the rules
+    // that govern them (e.g. a plan agent's pane is view-only) and confuse the orphan sweep.
+    if attach_tmux.as_deref().is_some_and(|n| n.starts_with("johnnyone_")) {
+        return Err("can't attach to a J1-owned tmux session (johnnyone_*)".to_string());
+    }
     let attached = attach_tmux.is_some();
     let provider = if attached {
         "shell".to_string()
@@ -239,6 +244,7 @@ pub fn list_sessions_filtered(
                     watchdog_held_count: row.get(20)?,
                     watchdog_on_blocked: row.get::<_, i64>(21)? != 0,
                     watchdog_on_stale_report: row.get::<_, i64>(22)? != 0,
+                    plan_agent: plan_agent_flag(conn, &row.get::<_, String>(0)?),
                 })
             })
             .map_err(|e| e.to_string())?
@@ -312,6 +318,9 @@ pub fn update_session_provider(
 }
 
 pub async fn archive_session(state: &AppState, id: String) -> Result<Session, String> {
+    // A live plan agent is ended only by its plan's retire path (which revokes its MCP token);
+    // archiving it here would leave a briefing plan with a dead agent and a live token.
+    crate::services::plan_agent::refuse_human_teardown(state, &id)?;
     // Chat-mode subprocess (`chat_host::send_message` spawn) → kill if present.
     {
         let mut processes = state.active_processes.lock().await;
@@ -374,6 +383,8 @@ pub(crate) fn mark_session_archived(state: &AppState, id: &str) -> Result<Option
 }
 
 pub async fn delete_session(state: &AppState, id: String) -> Result<bool, String> {
+    // Same rule as archive: a live plan agent ends only with its plan (retire revokes its token).
+    crate::services::plan_agent::refuse_human_teardown(state, &id)?;
     // NOT the same two-cleanup pattern as archive, despite what this comment used to claim.
     // `archive_session` above reads `attached_tmux` and SKIPS `kill_terminal_session` for an attached
     // session so it never touches the user's own tmux. This function has no such guard: it calls
@@ -494,10 +505,23 @@ fn query_session(conn: &rusqlite::Connection, id: &str) -> Result<Session, Strin
                 watchdog_held_count: row.get(20)?,
                 watchdog_on_blocked: row.get::<_, i64>(21)? != 0,
                 watchdog_on_stale_report: row.get::<_, i64>(22)? != 0,
+                plan_agent: plan_agent_flag(conn, id),
             })
         },
     )
     .map_err(|e| format!("Session not found: {}", e))
+}
+
+/// Is this session some plan's agent (`agent_plans.briefing_session_id`)? A display flag for the
+/// web (`planAgent`); `false` when the table cannot be read — the engine's guards decide on their
+/// own (fail-closed) checks, never on this flag.
+fn plan_agent_flag(conn: &rusqlite::Connection, session_id: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_plans WHERE briefing_session_id = ?1)",
+        params![session_id],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 fn publish_session_update(state: &AppState, session: &Session) {

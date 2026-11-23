@@ -309,6 +309,13 @@ pub async fn kill_terminal_session(state: &AppState, session_id: &str) -> Result
         .map(|_| ())
 }
 
+/// [`kill_terminal_session`] for a HUMAN/relay request (the terminal page's close button): refuses a
+/// live plan agent's pane — only its plan's retire path may end it (and revoke its token).
+pub async fn kill_terminal_session_human(state: &AppState, session_id: &str) -> Result<(), String> {
+    crate::services::plan_agent::refuse_human_teardown(state, session_id)?;
+    kill_terminal_session(state, session_id).await
+}
+
 /// `kill_terminal_session`, reporting whether a live `johnnyone_<id>` pane existed and was
 /// killed (`true`) or there was nothing to kill (`false`). The retire helper uses the flag to
 /// decide whether retirement changed anything (idempotent, event only on change).
@@ -818,19 +825,46 @@ fn session_is_archived(state: &AppState, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Plans tab (validator follow-up F2): a plan's agent runs headless through the j1 MCP server only
-/// (D1/D2). A tmux pane would start an unrestricted interactive CLI that also outlives the agent's
-/// retire (no pane is ever killed for it), so it never gets one.
-fn refuse_plan_agent_pane(state: &AppState, session_id: &str) -> Result<(), String> {
-    if crate::services::plan_agent::is_plan_agent_session(state, session_id) {
-        return Err("plan-agent sessions have no terminal; use the plan's chat".to_string());
+/// Plans tab, plan agent in tmux (D1, 2026-11-23): a plan's agent has a VISIBLE pane
+/// `johnnyone_<sid>`, but only its chat turns create or drive it (`services::plan_agent_tmux`) —
+/// every turn runs the least-privilege `claude --print` with the j1 MCP flags. The terminal paths
+/// may VIEW that pane once it exists; they never create it (a terminal-created pane would start an
+/// unrestricted interactive CLI) and never type into it (data flows only through stream-json).
+///
+/// `target` is the RESOLVED tmux session name: a session whose target is some plan agent's
+/// `johnnyone_<sid>` pane (e.g. an attached row naming it) is treated as that plan agent.
+fn plan_agent_pane_access(
+    state: &AppState,
+    session_id: &str,
+    target: &str,
+    pane_exists: bool,
+    input: bool,
+) -> Result<(), String> {
+    let targets_plan_agent = owned_session_id_from_tmux_name(target)
+        .is_some_and(|owner| crate::services::plan_agent::is_any_plan_agent_session(state, &owner));
+    if !targets_plan_agent && !crate::services::plan_agent::is_plan_agent_session(state, session_id) {
+        return Ok(());
+    }
+    if input {
+        return Err("the plan agent's pane is view-only; use the plan's chat".to_string());
+    }
+    if !pane_exists {
+        return Err("the plan agent's pane starts with its first chat message".to_string());
     }
     Ok(())
 }
 
 #[cfg(test)]
-pub(crate) fn refuse_plan_agent_pane_for_test(state: &AppState, session_id: &str) -> Result<(), String> {
-    refuse_plan_agent_pane(state, session_id)
+pub(crate) fn plan_agent_pane_access_for_test(state: &AppState, session_id: &str, pane_exists: bool, input: bool) -> Result<(), String> {
+    plan_agent_pane_access(state, session_id, &tmux_session_name(session_id), pane_exists, input)
+}
+
+/// The access check exactly as the input path runs it: load the row, resolve its tmux target.
+#[cfg(test)]
+pub(crate) fn plan_agent_input_check_for_test(state: &AppState, session_id: &str) -> Result<(), String> {
+    let config = load_session_config(state, session_id)?;
+    let (target, _) = resolve_tmux_target(&config)?;
+    plan_agent_pane_access(state, session_id, &target, true, true)
 }
 
 async fn ensure_terminal_session(
@@ -844,11 +878,12 @@ async fn ensure_terminal_session(
             "session {session_id} is archived; refusing to resurrect it"
         ));
     }
-    refuse_plan_agent_pane(state, session_id)?;
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
+    let pane_exists = tmux_has_session(&tmux_session_name).await;
+    plan_agent_pane_access(state, session_id, &tmux_session_name, pane_exists, false)?;
 
-    if !tmux_has_session(&tmux_session_name).await {
+    if !pane_exists {
         if attached {
             // Attached view of an external tmux that has since gone away — don't
             // spawn a replacement under its name; report it as not running.
@@ -896,9 +931,9 @@ async fn ensure_terminal_session_for_input(
             "session {session_id} is archived; refusing to resurrect it"
         ));
     }
-    refuse_plan_agent_pane(state, session_id)?;
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
+    plan_agent_pane_access(state, session_id, &tmux_session_name, true, true)?;
 
     if !tmux_has_session(&tmux_session_name).await {
         if attached {
@@ -1732,7 +1767,7 @@ pub async fn list_external_tmux_sessions() -> Result<Vec<ExternalTmuxSession>, S
     Ok(sessions)
 }
 
-fn tmux_session_name(session_id: &str) -> String {
+pub(crate) fn tmux_session_name(session_id: &str) -> String {
     let safe = session_id
         .chars()
         .map(|ch| {

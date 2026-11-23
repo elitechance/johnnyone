@@ -4,42 +4,91 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-/// Handle to a running CLI subprocess.
+/// Boxed future returned by [`ExternalTurn::stop`].
+pub type StopFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// A turn that runs somewhere other than a direct child of the engine — the plan agent's turn runs
+/// inside its tmux pane (`services::plan_agent_tmux`). It is registered in `active_processes` like
+/// a child so Stop and the plan agent's retire can end it the same way.
+pub trait ExternalTurn: Send {
+    /// End the turn (best effort).
+    fn stop(&mut self) -> StopFuture<'_>;
+    /// Whether the turn is still in flight.
+    fn is_running(&self) -> bool;
+}
+
+enum Handle {
+    Child(Child),
+    External(Box<dyn ExternalTurn>),
+}
+
+/// Handle to a running CLI subprocess (or an [`ExternalTurn`]).
 pub struct CliProcess {
-    child: Child,
+    handle: Handle,
     pub session_id: String,
+    /// Unique per handle, so a chat path only ever removes/kills ITS OWN turn from
+    /// `active_processes` (see `chat_host::take_own_process`).
+    turn_id: u64,
+}
+
+static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_turn_id() -> u64 {
+    NEXT_TURN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl CliProcess {
+    /// Wrap a turn that is not a child process.
+    pub fn external(turn: Box<dyn ExternalTurn>, session_id: String) -> Self {
+        Self { handle: Handle::External(turn), session_id, turn_id: next_turn_id() }
+    }
+
+    /// This handle's unique turn id.
+    pub fn turn_id(&self) -> u64 {
+        self.turn_id
+    }
+
     /// Kill the subprocess.
     pub async fn kill(&mut self) -> Result<(), String> {
-        self.child
-            .kill()
-            .await
-            .map_err(|e| format!("Failed to kill process: {}", e))
+        match &mut self.handle {
+            Handle::Child(child) => child
+                .kill()
+                .await
+                .map_err(|e| format!("Failed to kill process: {}", e)),
+            Handle::External(turn) => turn.stop().await,
+        }
     }
 
     /// Check if the subprocess is still running.
     pub fn is_running(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
+        match &mut self.handle {
+            Handle::Child(child) => child.try_wait().ok().flatten().is_none(),
+            Handle::External(turn) => turn.is_running(),
+        }
     }
 
     /// Block until the child exits and return its status (needed for check 1 / 127).
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
-        self.child
-            .wait()
-            .await
-            .map_err(|e| format!("Failed to wait for process: {}", e))
+        match &mut self.handle {
+            Handle::Child(child) => child
+                .wait()
+                .await
+                .map_err(|e| format!("Failed to wait for process: {}", e)),
+            Handle::External(_) => Err("not a child process".to_string()),
+        }
     }
 
     /// OS pid, if the child is still attached.
     pub fn id(&self) -> Option<u32> {
-        self.child.id()
+        match &self.handle {
+            Handle::Child(child) => child.id(),
+            Handle::External(_) => None,
+        }
     }
 
     #[cfg(test)]
     pub fn from_child(child: Child, session_id: String) -> Self {
-        Self { child, session_id }
+        Self { handle: Handle::Child(child), session_id, turn_id: next_turn_id() }
     }
 }
 
@@ -193,14 +242,17 @@ where
         }
     });
 
-    let process = CliProcess { child, session_id };
+    let process = CliProcess { handle: Handle::Child(child), session_id, turn_id: next_turn_id() };
 
     Ok((process, rx))
 }
 
 /// Send input to a running CLI subprocess's stdin.
 pub async fn send_stdin(process: &mut CliProcess, input: &str) -> Result<(), String> {
-    if let Some(stdin) = process.child.stdin.as_mut() {
+    let Handle::Child(child) = &mut process.handle else {
+        return Err("Process stdin not available".to_string());
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
         stdin
             .write_all(input.as_bytes())
             .await

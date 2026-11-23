@@ -58,6 +58,10 @@ type AiSession {
   # is blocked on a question (ignoring the interval), and on a report gap of twice the interval.
   watchdogOnBlocked: Boolean
   watchdogOnStaleReport: Boolean
+  # A Plans-tab plan agent's session (some plan's briefing session): its tmux pane is view-only and
+  # it can't be closed, archived or renamed from a terminal. Nullable for deploy skew (an older
+  # engine does not send it; absent = not a plan agent).
+  planAgent: Boolean
 }
 
 type AiMessage {

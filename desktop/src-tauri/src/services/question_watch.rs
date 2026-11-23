@@ -352,8 +352,11 @@ pub async fn sweep_and_report(
     // 1. Which panes exist. A failure here is fatal to the pass.
     let listing = run_tmux(list_panes_argv()).await?;
 
-    // 2. Which of them are the host's own agent panes.
-    let pane_ids = agent_pane_ids(&listing);
+    // 2. Which of them are the host's own agent panes — minus every plan agent's pane: its data
+    //    flows only through stream-json, never a raw pane read (plan agent in tmux, D1).
+    let pane_ids = watchable_pane_ids(&listing, |sid| {
+        crate::services::plan_agent::is_any_plan_agent_session(state, sid)
+    });
 
     // 3. Capture each one. A pane can die in the gap between the listing and
     //    its capture, so a failed capture drops just that pane from this pass;
@@ -536,6 +539,20 @@ pub fn agent_pane_ids(list_output: &str) -> Vec<String> {
     out
 }
 
+/// [`agent_pane_ids`] minus the panes of sessions `is_plan_agent` claims. A plan agent's pane is
+/// view-only for humans: J1 never captures or reports it (its data path is the turn's stream-json).
+pub fn watchable_pane_ids(list_output: &str, is_plan_agent: impl Fn(&str) -> bool) -> Vec<String> {
+    let excluded: std::collections::HashSet<String> = list_output
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(session, _)| {
+            crate::terminal::owned_session_id_from_tmux_name(session.trim()).is_some_and(|sid| is_plan_agent(&sid))
+        })
+        .map(|(_, pane)| pane.trim().to_string())
+        .collect();
+    agent_pane_ids(list_output).into_iter().filter(|p| !excluded.contains(p)).collect()
+}
+
 /// What the host has already reported, so one question is reported once.
 ///
 /// The memory is keyed by [`QuestionWatch::key`] — the pane id plus a digest
@@ -628,6 +645,31 @@ mod tests {
     // agent, so the pane→session lookup is pure data and tested as such. The
     // rows are `(session_id, tmux_pane_id)` — the two columns
     // `sweep_and_report` reads out of `sessions`.
+
+    /// F-1-12: a plan agent's pane is never captured or reported — it is dropped from the pane set
+    /// BEFORE any capture; other J1 agent panes are still watched.
+    #[tokio::test]
+    async fn plan_agent_pane_is_never_captured() {
+        use crate::services::plan_mcp::fixture::{plan, use_store};
+        let (state, _r) = crate::test_support::test_state();
+        let store = use_store(&state);
+        let p = plan(&state, &store, "A").await;
+        let other = uuid::Uuid::new_v4().to_string();
+        let listing = format!("johnnyone_{}\t%5\njohnnyone_{other}\t%6\nj1\t%1\n", p.session);
+        let ids = watchable_pane_ids(&listing, |sid| crate::services::plan_agent::is_any_plan_agent_session(&state, sid));
+        assert_eq!(ids, vec!["%6".to_string()]);
+        // Still excluded after the plan is accepted (any plan's agent, not only a live one).
+        state
+            .db
+            .with_conn(|c| crate::services::agent_plans::apply_brief_acceptance_at(c, &p.id, "b", Some(1)))
+            .unwrap();
+        let ids = watchable_pane_ids(&listing, |sid| crate::services::plan_agent::is_any_plan_agent_session(&state, sid));
+        assert_eq!(ids, vec!["%6".to_string()]);
+        // So nothing from it can ever be swept.
+        let mut watch = QuestionWatch::new();
+        let screens: Vec<(String, String)> = ids.iter().map(|id| (id.clone(), String::new())).collect();
+        assert!(sweep_known_panes(&[], &screens, &mut watch).is_empty());
+    }
 
     fn row(session_id: &str, pane_id: &str) -> (String, String) {
         (session_id.to_string(), pane_id.to_string())

@@ -681,3 +681,23 @@ describe('sessionsWithTitle', () => {
     expect(sessionsWithTitle(input, 'zzz', 'x')).toEqual(input);
   });
 });
+
+import { isPlanAgentShell, PLAN_AGENT_VIEW_ONLY_NOTE } from './shells-page-logic';
+
+describe('isPlanAgentShell (plan agent in tmux, view-only Raw page)', () => {
+  it('follows the engine-computed planAgent flag only (never the title)', () => {
+    expect(isPlanAgentShell({ planAgent: true })).toBe(true);
+    expect(isPlanAgentShell({ planAgent: false })).toBe(false);
+    // An older engine sends no flag → not a plan agent.
+    expect(isPlanAgentShell({})).toBe(false);
+    expect(isPlanAgentShell({ planAgent: null })).toBe(false);
+    // A renamed plan agent is still one; a title that merely looks like one is not.
+    expect(isPlanAgentShell({ planAgent: true, title: 'renamed' } as { planAgent: boolean })).toBe(true);
+    expect(isPlanAgentShell({ title: 'Plan agent - x' } as { planAgent?: boolean })).toBe(false);
+    expect(isPlanAgentShell(null)).toBe(false);
+    expect(isPlanAgentShell(undefined)).toBe(false);
+  });
+  it('has a banner that points to the chat', () => {
+    expect(PLAN_AGENT_VIEW_ONLY_NOTE).toBe("View-only: talk to the plan agent in its plan's chat.");
+  });
+});
