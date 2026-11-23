@@ -2,6 +2,7 @@ pub mod agent_plans;
 pub mod atomic_fs;
 pub mod chat_host;
 pub mod coordinator_flight;
+pub mod findings;
 pub mod git_history;
 pub mod host_files;
 pub mod kloo_executor;

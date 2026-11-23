@@ -8,6 +8,7 @@ use crate::services::{
     planner_prompts::{self as planner_prompt_service, PlannerPromptSettings},
     prompt_library::{self as prompt_library_service, PromptLibraryEntry},
     providers::{self as provider_service, DetectedTool},
+    findings as findings_service,
     relay as relay_service,
     sessions as session_service, settings as settings_service,
 };
@@ -241,6 +242,60 @@ impl QueryRoot {
     }
 }
 
+/// Severity of a filed finding (findings ledger, master plan §6).
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+enum FindingSeverity {
+    Blocking,
+    Followup,
+}
+
+impl From<FindingSeverity> for findings_service::Severity {
+    fn from(value: FindingSeverity) -> Self {
+        match value {
+            FindingSeverity::Blocking => findings_service::Severity::Blocking,
+            FindingSeverity::Followup => findings_service::Severity::Followup,
+        }
+    }
+}
+
+/// A lens's decision on a claimed fix or a proposed waiver.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+enum FindingOutcome {
+    Verified,
+    Reopened,
+    AcceptWaiver,
+    RejectWaiver,
+}
+
+impl From<FindingOutcome> for findings_service::Outcome {
+    fn from(value: FindingOutcome) -> Self {
+        match value {
+            FindingOutcome::Verified => findings_service::Outcome::Verified,
+            FindingOutcome::Reopened => findings_service::Outcome::Reopened,
+            FindingOutcome::AcceptWaiver => findings_service::Outcome::AcceptWaiver,
+            FindingOutcome::RejectWaiver => findings_service::Outcome::RejectWaiver,
+        }
+    }
+}
+
+/// A human's decision on a finding (`overrideFinding`).
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+enum FindingOverride {
+    AcceptWaiver,
+    RejectWaiver,
+    Reopen,
+}
+
+impl From<FindingOverride> for findings_service::Override {
+    fn from(value: FindingOverride) -> Self {
+        match value {
+            FindingOverride::AcceptWaiver => findings_service::Override::AcceptWaiver,
+            FindingOverride::RejectWaiver => findings_service::Override::RejectWaiver,
+            FindingOverride::Reopen => findings_service::Override::Reopen,
+        }
+    }
+}
+
 struct MutationRoot;
 
 #[Object(rename_fields = "camelCase")]
@@ -278,6 +333,105 @@ impl MutationRoot {
             state, session_id, kind, verdict, findings, summary, severity, reason, evidence,
         )
         .await?;
+        Ok(true)
+    }
+
+    /// Findings ledger (lens only): file one finding against the phase under review. Returns its
+    /// id (`F-<phaseId>-<n>`). Every text field is required and capped at 4,000 characters. From
+    /// review round 3, or from a non-blocking lens, a BLOCKING finding is stored as a FOLLOWUP.
+    /// `reportAgentResult(kind:"verdict")` is still the last call of a review.
+    #[allow(clippy::too_many_arguments)]
+    async fn report_finding(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        severity: FindingSeverity,
+        claim: String,
+        expected: String,
+        saw: String,
+        #[graphql(name = "where")] where_: String,
+        fence: String,
+    ) -> async_graphql::Result<String> {
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::report_finding(
+            state, &session_id, severity.into(), &claim, &expected, &saw, &where_, &fence,
+        )
+        .map_err(async_graphql::Error::new)
+    }
+
+    /// Findings ledger (phase worker only): claim a blocking finding of the current phase is
+    /// fixed, with the evidence (what changed + the command that proves it). Call it before
+    /// `reportAgentResult(kind:"ready")`.
+    async fn claim_fix(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        finding_id: String,
+        evidence: String,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::claim_fix(state, &session_id, &finding_id, &evidence)
+            .map_err(async_graphql::Error::new)?;
+        Ok(true)
+    }
+
+    /// Findings ledger (phase worker only): propose that a blocking finding of the current phase
+    /// should not be fixed here, with the reason. The filing lens accepts or rejects it.
+    async fn propose_waiver(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        finding_id: String,
+        reason: String,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::propose_waiver(state, &session_id, &finding_id, &reason)
+            .map_err(async_graphql::Error::new)?;
+        Ok(true)
+    }
+
+    /// Findings ledger (the filing lens only): VERIFIED / REOPENED a claimed fix, or
+    /// ACCEPT_WAIVER / REJECT_WAIVER a proposed waiver. REOPENED and REJECT_WAIVER need `saw`
+    /// (the command and output line you observed this round).
+    async fn resolve_finding(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        finding_id: String,
+        outcome: FindingOutcome,
+        saw: Option<String>,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::resolve_finding(state, &session_id, &finding_id, outcome.into(), saw.as_deref())
+            .map_err(async_graphql::Error::new)?;
+        Ok(true)
+    }
+
+    /// Findings ledger, human decision: accept or reject a proposed waiver, or reopen a finding,
+    /// through the same state machine. Admin write: only the JohnnyOne app itself
+    /// (`WriteTrust::Webview`, fail closed) may call it, and `reason` is required.
+    async fn override_finding(
+        &self,
+        ctx: &Context<'_>,
+        plan_id: String,
+        finding_id: String,
+        action: FindingOverride,
+        reason: String,
+    ) -> async_graphql::Result<bool> {
+        // Same guard as `set_setting`'s connection keys. Known limit (master plan §6.3): a request
+        // with no `Origin` classifies as Webview, so this stops foreign pages, not local processes.
+        let trust = ctx
+            .data_opt::<origin_guard::WriteTrust>()
+            .copied()
+            .unwrap_or(origin_guard::WriteTrust::Loopback);
+        if trust != origin_guard::WriteTrust::Webview {
+            return Err(async_graphql::Error::new(
+                "overrideFinding: may only be called from the JohnnyOne app itself",
+            ));
+        }
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::override_finding(state, &plan_id, &finding_id, action.into(), &reason)
+            .map_err(async_graphql::Error::new)?;
         Ok(true)
     }
 
@@ -1211,6 +1365,197 @@ mod router_tests {
     async fn body_text(res: axum::http::Response<Body>) -> String {
         let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await.unwrap();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    // ── findings ledger mutations (master plan §6) ──
+
+    use crate::services::findings::{self as ledger, test_seed};
+
+    #[test]
+    fn host_schema_exposes_finding_mutations() {
+        let sdl = super::schema_sdl();
+        for needle in [
+            "reportFinding(sessionId: String!, severity: FindingSeverity!, claim: String!, expected: String!, saw: String!, where: String!, fence: String!): String!",
+            "claimFix(sessionId: String!, findingId: String!, evidence: String!): Boolean!",
+            "proposeWaiver(sessionId: String!, findingId: String!, reason: String!): Boolean!",
+            "resolveFinding(sessionId: String!, findingId: String!, outcome: FindingOutcome!, saw: String): Boolean!",
+            "overrideFinding(planId: String!, findingId: String!, action: FindingOverride!, reason: String!): Boolean!",
+            "enum FindingSeverity",
+            "enum FindingOutcome",
+            "enum FindingOverride",
+            "ACCEPT_WAIVER",
+            "REJECT_WAIVER",
+            "reportAgentResult(",
+        ] {
+            assert!(sdl.contains(needle), "SDL missing {needle:?}:\n{sdl}");
+        }
+    }
+
+    /// An agent's curl: JSON, no `Origin` (master §6, task 04 decision).
+    fn agent_post(query: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphql")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "query": query }).to_string()))
+            .unwrap()
+    }
+
+    fn origin_post(origin: &str, query: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphql")
+            .header(CONTENT_TYPE, "application/json")
+            .header(ORIGIN, origin)
+            .body(Body::from(serde_json::json!({ "query": query }).to_string()))
+            .unwrap()
+    }
+
+    async fn send(state: &AppState, req: Request<Body>) -> serde_json::Value {
+        let res = router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_str(&body_text(res).await).unwrap()
+    }
+
+    fn first_error(v: &serde_json::Value) -> String {
+        v["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected errors[0].message in {v}"))
+            .to_string()
+    }
+
+    fn ledger_fixture(status: &str) -> (AppState, std::path::PathBuf) {
+        let (state, _root) = test_state();
+        let store = crate::test_support::tmp_dir("ledger-router");
+        test_seed::seed(&state, &store, status, "00-x");
+        test_seed::rounds(&state, "00-x", 1);
+        (state, store)
+    }
+
+    fn report_q(sid: &str, claim: &str) -> String {
+        format!(
+            r#"mutation{{reportFinding(sessionId:"{sid}",severity:BLOCKING,claim:"{claim}",expected:"kept",saw:"dropped",where:"findings.rs",fence:"cargo test")}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_rejects_bad_role() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let id = ledger::report_finding(&state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{resolveFinding(sessionId:"{}",findingId:"{id}",outcome:VERIFIED)}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        let msg = first_error(&v);
+        assert!(msg.contains("only a lens"), "{msg}");
+        assert!(msg.contains("claimFix("), "{msg}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "open");
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_rejects_unknown_id() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        ledger::report_finding(&state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{resolveFinding(sessionId:"{}",findingId:"F-00-x-9",outcome:VERIFIED)}}"#,
+                test_seed::QA
+            )),
+        )
+        .await;
+        let msg = first_error(&v);
+        assert!(msg.contains("no finding F-00-x-9 in this plan"), "{msg}");
+        assert!(msg.contains("Open findings for phase 00-x: F-00-x-1"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_rejects_cross_phase_id() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let id = ledger::report_finding(&state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
+        test_seed::set_phase(&state, "01-y");
+        test_seed::set_status(&state, "phase_worker_running");
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{claimFix(sessionId:"{}",findingId:"{id}",evidence:"done")}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        let msg = first_error(&v);
+        assert!(msg.contains("belongs to phase 00-x"), "{msg}");
+        assert!(msg.contains("the current phase is 01-y"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_rejects_empty_claim() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let v = send(&state, agent_post(&report_q(test_seed::QA, "  "))).await;
+        let msg = first_error(&v);
+        assert!(msg.contains("'claim' is empty"), "{msg}");
+        assert!(msg.contains(r#"claim:"saveFinding drops where_ on update""#), "{msg}");
+        assert!(ledger::list_plan(&state, test_seed::PLAN).is_empty());
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_happy_path_round_trip() {
+        let (state, store) = ledger_fixture("phase_review_running");
+        let v = send(&state, agent_post(&report_q(test_seed::QA, "drops where_"))).await;
+        assert_eq!(v["data"]["reportFinding"], "F-00-x-1", "{v}");
+        test_seed::set_status(&state, "phase_worker_running");
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{claimFix(sessionId:"{}",findingId:"F-00-x-1",evidence:"kept where_; tests pass")}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["claimFix"], true, "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, "F-00-x-1").unwrap().state, "claimed");
+        let mirror = std::fs::read_to_string(store.join("phases/00-x/findings.json")).unwrap();
+        assert!(mirror.contains("\"state\": \"claimed\""), "{mirror}");
+    }
+
+    fn waive_proposed(state: &AppState) -> String {
+        let id = ledger::report_finding(state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
+        test_seed::set_status(state, "phase_worker_running");
+        ledger::propose_waiver(state, test_seed::WORKER, &id, "later").unwrap();
+        id
+    }
+
+    fn override_q(id: &str) -> String {
+        format!(
+            r#"mutation{{overrideFinding(planId:"{}",findingId:"{id}",action:ACCEPT_WAIVER,reason:"agreed")}}"#,
+            test_seed::PLAN
+        )
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_override_refused_from_foreign_loopback_origin() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let id = waive_proposed(&state);
+        let v = send(&state, origin_post("http://localhost:3000", &override_q(&id))).await;
+        let msg = first_error(&v);
+        assert!(msg.contains("JohnnyOne app itself"), "{msg}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "waive_proposed");
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_override_allowed_from_webview_origin() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let id = waive_proposed(&state);
+        let v = send(&state, origin_post("tauri://localhost", &override_q(&id))).await;
+        assert_eq!(v["data"]["overrideFinding"], true, "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "waived");
+        let ev = test_seed::events_of(&state, "agent_finding_waived");
+        assert_eq!(ev[0]["actor"], "human");
+        assert!(ev[0].to_string().contains(r#"actor":"human"#));
     }
 
     #[tokio::test]

@@ -112,8 +112,11 @@ pub fn stream_lens_prompt_tail(lens_name: &str) -> String {
          a finding to report, not a reason to stop.\n\n\
          You cannot post your result anywhere: nothing else will see your \
          output except this response stream, so your review IS the report.\n\n\
-         Write your review as free text: what you checked, what you found, and \
-         which labelled document each finding sits in. End your response \
+         Write your review as prose (what you checked, and which labelled \
+         document each finding sits in), but list EACH finding on its own \
+         line starting with \"- \" — one objection per line, nothing else on \
+         that line. Only those \"- \" lines are recorded as findings; prose is \
+         context. With PASS, write no \"- \" lines. End your response \
          with EXACTLY one final line naming your verdict, in this form:\n\n\
          \x20   VERDICT: <token>\n\n\
          Where <token> is exactly one of these four, spelled exactly:\n\
@@ -635,6 +638,9 @@ mod tests {
         ] {
             assert!(tail.contains(token), "missing {token}");
         }
+        // The tail must agree with the ledger import contract (findings::finding_bullets).
+        assert!(tail.contains("one objection per line"));
+        assert!(!tail.contains("free text"));
         assert!(!tail.contains("reportAgentResult"));
         assert!(!tail.contains("127.0.0.1:7788"));
     }
