@@ -10,6 +10,7 @@ import { AiMessage } from '../models/ai-message.model';
 import {
   TURN_FALLBACK_MAX_MS,
   TURN_FALLBACK_POLL_MS,
+  TURN_LIVE_SILENCE_MS,
   classifyDelta,
   draftAfterError,
   errorNoticeText,
@@ -39,6 +40,8 @@ export class AiChatService {
   private pendingTurn: PendingTurn | null = null;
   private turnStartedAt = 0;
   private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Fires when a turn in flight heard nothing live for TURN_LIVE_SILENCE_MS (hotfix live-chat-2). */
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** The currently active session. */
   readonly currentSession = signal<AiSession | null>(null);
@@ -130,6 +133,7 @@ export class AiChatService {
     this.turnStartedAt = Date.now();
     this.pendingTurn = { content, sentAtMs: this.turnStartedAt, baseline: storedCount(this.messages()) };
     if (this.liveDown) this.startTurnFallback();
+    this.armSilenceWatchdog();
 
     this.api.sendRelayMessage({ sessionId: session.id, content }).subscribe({
       next: ({ relayId }) => {
@@ -153,7 +157,8 @@ export class AiChatService {
    * Subscribe to streaming deltas for ONE relay response (keyed by relayId).
    */
   subscribeToDeltas(relayId: string): void {
-    if (!relayId) return;
+    // A turn already settled (the store poll can beat the send's reply) needs no delta socket.
+    if (!relayId || !this.isStreaming()) return;
     this.deltaSubscription?.unsubscribe();
     this.streamingContent = '';
     this.deltaSubscription = this.api.onRelayChatDelta(relayId, this.liveGapHooks()).subscribe({
@@ -218,6 +223,7 @@ export class AiChatService {
     this.messageSubscription?.unsubscribe();
     this.messageSubscription = null;
     this.stopTurnFallback();
+    this.clearSilenceWatchdog();
   }
 
   /**
@@ -290,7 +296,23 @@ export class AiChatService {
     return `relay-${relayId}-assistant`;
   }
 
+  /** (Re)start the live-silence watchdog: any live event pushes it back; silence starts the poll. */
+  private armSilenceWatchdog(): void {
+    this.clearSilenceWatchdog();
+    if (!this.isStreaming()) return;
+    this.silenceTimer = setTimeout(() => {
+      this.silenceTimer = null;
+      if (this.isStreaming()) this.startTurnFallback();
+    }, TURN_LIVE_SILENCE_MS);
+  }
+
+  private clearSilenceWatchdog(): void {
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    this.silenceTimer = null;
+  }
+
   private handleDelta(delta: RelayChatDeltaMsg): void {
+    this.armSilenceWatchdog();
     // Skip control chunks (system/result) — only assistant text accumulates. The final
     // `onRelayChatMessage` reconciles the clean content, so minor noise self-corrects. A FINAL
     // error is a refused/failed turn: show it inline and drop the bubble of a send that stored nothing.
@@ -369,6 +391,11 @@ export class AiChatService {
 
   private finishStreaming(): void {
     this.stopTurnFallback();
+    this.clearSilenceWatchdog();
+    // The turn is over: its per-relay delta subscription ends now, closing its socket cleanly. It
+    // used to stay open until the next send and then drop with a 1006 (hotfix live-chat-2).
+    this.deltaSubscription?.unsubscribe();
+    this.deltaSubscription = null;
     this.pendingUserMessageId = null;
     this.isStreaming.set(false);
     this.streamingMessageId.set(null);
