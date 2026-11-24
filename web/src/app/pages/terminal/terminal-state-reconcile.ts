@@ -103,7 +103,10 @@ export function chooseSessionToSelect(
 ): string | null {
   const activeIds = new Set(activeSessions.map((s) => s.id));
 
-  if (opts.targetId && activeIds.has(opts.targetId)) {
+  // An EXPLICIT target (a `/shells/:id` URL, an "Open transcript" link) is always the one shown —
+  // also when it is not active (an archived/finished agent is then opened READ-ONLY by the page).
+  // It never falls back to another session: that would open a different, typeable shell (G-1-1).
+  if (opts.targetId) {
     return opts.targetId;
   }
 

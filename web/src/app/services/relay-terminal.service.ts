@@ -57,6 +57,11 @@ export class RelayTerminalService {
   private streamSubscriptions = new Map<string, number>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly errorSubject = new Subject<string>();
+  /** Every REJECTED `terminal_command_ack` (visual subscribe, input, resize, kill), with the
+   *  engine's reason — e.g. a finished agent's "job has ended" refusal (G-1-1). */
+  private readonly commandRejectionSubject = new Subject<{ sessionId: string; error: string; kind: string }>();
+  /** What each in-flight request asked (input, resize, terminal_kill, visual_subscribe, …), by id. */
+  private requestKinds = new Map<string, string>();
   private authFailureCount = 0;
   private connectAttemptEverOpened = false;
   private lastDisconnectWasAuthRejection = false; // per Task 04 decision #2: branch refresh/reconnect for auth vs transient
@@ -209,7 +214,7 @@ export class RelayTerminalService {
     socket.send(JSON.stringify({
       type: 'terminal_command',
       data: {
-        requestId: crypto.randomUUID(),
+        requestId: this.newRequestId('input'),
         sessionId,
         data,
         attachments,
@@ -228,7 +233,7 @@ export class RelayTerminalService {
     socket.send(JSON.stringify({
       type: 'terminal_resize',
       data: {
-        requestId: crypto.randomUUID(),
+        requestId: this.newRequestId('resize'),
         sessionId,
         cols: Math.max(20, Math.floor(cols)),
         rows: Math.max(5, Math.floor(rows)),
@@ -288,10 +293,22 @@ export class RelayTerminalService {
     socket.send(JSON.stringify({
       type,
       data: {
-        requestId: crypto.randomUUID(),
+        requestId: this.newRequestId(type),
         sessionId,
       },
     }));
+  }
+
+  /** A fresh request id, remembering what it asks so a rejected ack can be classified (G-2-17). */
+  private newRequestId(kind: string): string {
+    const id = crypto.randomUUID();
+    if (!this.requestKinds) this.requestKinds = new Map();
+    this.requestKinds.set(id, kind);
+    if (this.requestKinds.size > 500) {
+      const oldest = this.requestKinds.keys().next().value;
+      if (oldest !== undefined) this.requestKinds.delete(oldest);
+    }
+    return id;
   }
 
   private sendControlIfOpen(type: 'terminal_visual_subscribe' | 'terminal_visual_unsubscribe' | 'terminal_kill', sessionId: string): void {
@@ -301,7 +318,7 @@ export class RelayTerminalService {
     socket.send(JSON.stringify({
       type,
       data: {
-        requestId: crypto.randomUUID(),
+        requestId: this.newRequestId(type),
         sessionId,
       },
     }));
@@ -322,7 +339,7 @@ export class RelayTerminalService {
     socket.send(JSON.stringify({
       type: 'terminal_command',
       data: {
-        requestId: crypto.randomUUID(),
+        requestId: this.newRequestId(control),
         sessionId,
         data: '',
         control,
@@ -338,7 +355,7 @@ export class RelayTerminalService {
     socket.send(JSON.stringify({
       type: 'terminal_command',
       data: {
-        requestId: crypto.randomUUID(),
+        requestId: this.newRequestId(control),
         sessionId,
         data: '',
         control,
@@ -447,6 +464,11 @@ export class RelayTerminalService {
     }
   }
 
+  /** Rejected terminal commands; the page shows the ones for the session it is showing. */
+  commandRejections(): Observable<{ sessionId: string; error: string; kind: string }> {
+    return this.commandRejectionSubject.asObservable();
+  }
+
   errors(): Observable<string> {
     return this.errorSubject.asObservable();
   }
@@ -506,7 +528,13 @@ export class RelayTerminalService {
       const ack = envelope.data as TerminalCommandAck | undefined;
       if (ack && !ack.accepted) {
         console.error('Terminal command was rejected:', ack.error);
+        if (ack.sessionId) {
+          const kind = this.requestKinds?.get(ack.requestId) ?? 'unknown';
+          const rejection = { sessionId: ack.sessionId, error: ack.error ?? '', kind };
+          this.zone.run(() => this.commandRejectionSubject.next(rejection));
+        }
       }
+      if (ack?.requestId) this.requestKinds?.delete(ack.requestId);
     }
 
     if (envelope.type === 'agent_plan_run_updated') {

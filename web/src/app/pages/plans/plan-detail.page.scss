@@ -197,6 +197,22 @@
     min-height: 360px;
   }
 }
+.turn-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 10px 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--ion-color-danger, #c5000f);
+  background: rgba(var(--ion-color-danger-rgb, 197, 0, 15), 0.08);
+  ion-icon {
+    flex: none;
+    margin-top: 2px;
+  }
+}
+
 .chips-row {
   display: flex;
   flex-wrap: wrap;

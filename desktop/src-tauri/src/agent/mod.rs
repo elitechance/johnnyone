@@ -3590,10 +3590,11 @@ impl AgentService {
         }
 
         // Plans tab 02/07: a plan's agent session gets the j1 MCP config + least-privilege flags; a
-        // plan that left briefing (or a non-claude provider on a plan session) refuses the turn
-        // with an error delta and spawns nothing.
-        let plan_extras =
-            match crate::services::chat_host::plan_agent_turn_extras(&state, &req.session_id, &provider_str) {
+        // plan that left briefing, a non-claude provider on a plan session, or a turn already in
+        // flight (the slot is CLAIMED here, F-2-19) refuses the turn with an error delta and
+        // stores/spawns nothing.
+        let plan_turn =
+            match crate::services::chat_host::claim_plan_agent_turn(&state, &req.session_id, &provider_str) {
                 Ok(x) => x,
                 Err(message) => {
                     Self::send_relay_chat_refusal(&req, &ws_write, &message).await?;
@@ -3608,7 +3609,7 @@ impl AgentService {
                 &model,
                 cli_path_ref,
                 cli_sid_ref,
-                plan_extras.as_ref(),
+                plan_turn.as_ref().map(|t| &t.extras),
             ),
             CliProvider::Codex => codex::build_config(
                 &req.content,
@@ -3656,7 +3657,7 @@ impl AgentService {
                 config,
                 req.session_id.clone(),
                 parse_fn,
-                plan_extras.is_some(),
+                plan_turn.map(|t| t.slot),
             )
             .await?;
         // Registered like the host chat path so `chat_host::stop_generation` (Stop, and the plan
@@ -3679,8 +3680,47 @@ impl AgentService {
         // full per-session global sequencing is a Phase-3 concern.
         let mut stream_seq: u64 = 0;
         let mut tool_chunks: Vec<StreamChunk> = Vec::new();
+        let mut fallback_error: Option<String> = None;
+        let mut finish_reason = "stop".to_string();
+        let mut should_kill_process = false;
 
-        while let Some(chunk) = rx.recv().await {
+        loop {
+            // The same idle timeout as the host paths (F-2-23): a hung turn is killed below instead
+            // of holding the plan agent's slot until a Stop.
+            let chunk = match crate::services::chat_host::recv_turn_chunk(
+                &mut rx,
+                crate::services::chat_host::TURN_IDLE_TIMEOUT,
+            )
+            .await
+            {
+                crate::services::chat_host::TurnRecv::Chunk(chunk) => chunk,
+                crate::services::chat_host::TurnRecv::Closed => {
+                    // A final chunk breaks out below, so a close here is always an early end.
+                    finish_reason = "stream_closed".to_string();
+                    break;
+                }
+                crate::services::chat_host::TurnRecv::TimedOut => {
+                    finish_reason = "timeout".to_string();
+                    should_kill_process = true;
+                    clear_cli_session_id = true;
+                    let message = crate::services::chat_host::TURN_TIMEOUT_MESSAGE.to_string();
+                    fallback_error = Some(message.clone());
+                    // Tell the web, so it leaves its streaming state and shows the reason.
+                    let envelope = AgentEnvelope {
+                        message: AgentMessage::RelayChatDelta(RelayChatDelta {
+                            relay_id: req.relay_id.clone(),
+                            session_id: req.session_id.clone(),
+                            delta: message,
+                            chunk_type: "error".to_string(),
+                            is_final: true,
+                        }),
+                    };
+                    let msg = serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
+                    let mut writer = ws_write.lock().await;
+                    let _ = writer.send(tokio_tungstenite::tungstenite::Message::Text(msg.into())).await;
+                    break;
+                }
+            };
             if chunk.chunk_type == ChunkType::Text {
                 full_content.push_str(&chunk.content);
             }
@@ -3696,6 +3736,8 @@ impl AgentService {
 
             if chunk.chunk_type == ChunkType::Error {
                 clear_cli_session_id = true;
+                fallback_error = Some(chunk.content.clone());
+                finish_reason = "error".to_string();
             }
 
             if chunk.chunk_type == ChunkType::Result {
@@ -3744,9 +3786,18 @@ impl AgentService {
             }
         }
 
-        // The turn is over: drop the registration (a Stop may already have removed + killed it).
-        // Only THIS turn's handle: a later turn may already be registered for the session.
-        let _ = crate::services::chat_host::take_own_process(&state.active_processes, &req.session_id, turn_id).await;
+        // The turn is over: drop the registration (a Stop may already have removed + killed it),
+        // and kill it after an idle timeout. Only THIS turn's handle: a later turn may already be
+        // registered for the session.
+        crate::services::chat_host::end_own_turn(&state.active_processes, &req.session_id, turn_id, should_kill_process)
+            .await;
+        // Stored text keeps a crash/timeout line even after partial output (F-1-10).
+        let (full_content, finish_reason) = crate::services::chat_host::final_assistant_content(
+            &full_content,
+            fallback_error.as_deref(),
+            &[],
+            &finish_reason,
+        );
         let tool_calls = crate::services::chat_host::fold_tool_calls(&tool_chunks);
 
         // Send completion message
@@ -3792,8 +3843,8 @@ impl AgentService {
             ).map_err(|e| e.to_string())?;
 
             conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents, tool_calls) VALUES (?1, ?2, 'assistant', ?3, 'stop', ?4, ?5, ?6, ?7)",
-                rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents, tool_calls],
+                "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents, tool_calls) VALUES (?1, ?2, 'assistant', ?3, ?8, ?4, ?5, ?6, ?7)",
+                rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents, tool_calls, finish_reason],
             ).map_err(|e| e.to_string())?;
 
             if matches!(

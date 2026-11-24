@@ -38,6 +38,8 @@ export class ChatWindowComponent implements AfterViewChecked {
    * Defaults to true — existing callers are unaffected.
    */
   @Input() showComposer = true;
+  /** Passed to the built-in composer: a refused send's text to put back (G-1-3). */
+  @Input() restoredDraft: { text: string; seq: number } | null = null;
   /** Optional per-bubble display tweaks, passed to every `johnny-message-bubble` (null = default). */
   @Input() bubbleDisplay: BubbleDisplay | null = null;
 

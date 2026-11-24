@@ -1142,33 +1142,10 @@ pub async fn start_plan(
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
-    let worker_session_id = ensure_dev_worker_session(&state, &run).await?;
-
-    terminal::attach_terminal_headless(&state, worker_session_id.clone(), 120, 36).await?;
-    // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
-    // attach if a legacy run still has an ACTIVE one (an archived row cannot be attached).
-    if let Some(reviewer_session_id) = run.plan.reviewer_session_id.clone() {
-        if matches!(
-            resolve_plan_session(&state, Some(&reviewer_session_id))?,
-            SessionResolution::Reuse(_)
-        ) {
-            terminal::attach_terminal_headless(&state, reviewer_session_id, 120, 36).await?;
-        }
-    }
-    sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
-
-    state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'phase_worker_running', current_phase_id = ?1, current_phase_index = ?2, phase_run_mode = ?3, updated_at = datetime('now') WHERE id = ?4",
-            params![phase.phase_id, phase.phase_index, phase_run_mode, id],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE agent_plan_phases SET status = 'worker_running', worker_started_at = COALESCE(worker_started_at, datetime('now')), updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2",
-            params![id, phase.phase_id],
-        )
-        .map_err(|e| e.to_string())
-    })?;
+    // Status FIRST, then mint + attach (G-1-11): a Run-from-phase on a completed (approved,
+    // all-passed) plan would otherwise mint a worker whose plan job has "ended", and the
+    // terminal gate (`terminal::decide_pane`) would refuse its pane.
+    let worker_session_id = revive_dev_worker_with(&state, &run, &phase, phase_run_mode, &LiveAttach).await?;
     append_event(
         &state,
         &id,
@@ -1709,17 +1686,16 @@ pub async fn manual_pass_phase(
 pub async fn send_feedback_to_worker(state: AppState, id: String) -> Result<AgentPlanRun, String> {
     let run = get_plan(&state, &id)?;
     if run.plan.run_type == "planning" {
-        let planner_session_id = ensure_planner_session(&state, &run).await?;
+        // Status first (G-1-11): an approved planning run's planner job has "ended", so minting
+        // and attaching before the flip would be refused by the terminal gate.
+        let (planner_session_id, revival) = revive_planner_with(&state, &run, &LiveAttach).await?;
         let minted = run.plan.worker_session_id.as_deref() != Some(planner_session_id.as_str());
         let run = get_plan(&state, &id)?;
-        send_planner_continue(&state, &run, &planner_session_id, minted).await?;
-        state.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE agent_plans SET status = 'planning_planner_running', updated_at = datetime('now') WHERE id = ?1",
-                params![id],
-            )
-            .map_err(|e| e.to_string())
-        })?;
+        if let Err(error) = send_planner_continue(&state, &run, &planner_session_id, minted).await {
+            undo_revival(&state, &revival);
+            return Err(error);
+        }
+        drop(revival);
         append_event(
             &state,
             &id,
@@ -1734,23 +1710,9 @@ pub async fn send_feedback_to_worker(state: AppState, id: String) -> Result<Agen
     let phase_path = Path::new(&run.plan.plan_path)
         .join("phases")
         .join(&phase.phase_id);
-    if !crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
-        let worker_session_id = ensure_dev_worker_session(&state, &run).await?;
-        let prompt = feedback_prompt(&phase);
-        terminal::send_terminal_input(&state, worker_session_id, format!("{}\r", prompt)).await?;
-    }
-    state.db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE agent_plans SET status = 'phase_worker_running', updated_at = datetime('now') WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE agent_plan_phases SET status = 'worker_running', updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2",
-            params![id, phase.phase_id],
-        )
-        .map_err(|e| e.to_string())
-    })?;
+    // Status first (G-1-11), then mint/attach/type; a failure puts the plan back.
+    let kloo = crate::services::task_loop::phase_is_kloo_mode(&phase_path);
+    feedback_dev_worker_with(&state, &run, &phase, kloo, &LiveAttach).await?;
     append_event(
         &state,
         &id,
@@ -4276,11 +4238,19 @@ fn current_worker_session_id(state: &AppState, plan_id: &str) -> Option<String> 
 /// retired (approval), archived (stop) or deleted. A minted pane is attached and given the
 /// startup wait before it is returned.
 async fn ensure_planner_session(state: &AppState, run: &AgentPlanRun) -> Result<String, String> {
+    ensure_planner_session_with(state, run, &LiveAttach).await
+}
+
+async fn ensure_planner_session_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    attach: &dyn WorkerAttach,
+) -> Result<String, String> {
     let (id, minted) =
         resolve_or_mint_worker_column(state, run, format!("T1 Planner - {}", run.plan.title)).await?;
     if minted {
-        terminal::attach_terminal_headless(state, id.clone(), 120, 36).await?;
-        sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
+        attach.attach(state, &id).await?;
+        attach.wait().await;
     }
     Ok(id)
 }
@@ -4289,6 +4259,14 @@ async fn ensure_dev_worker_session(
     state: &AppState,
     run: &AgentPlanRun,
 ) -> Result<String, String> {
+    ensure_dev_worker_session_with(state, run, &LiveAttach).await
+}
+
+async fn ensure_dev_worker_session_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    attach: &dyn WorkerAttach,
+) -> Result<String, String> {
     let (id, minted) =
         resolve_or_mint_worker_column(state, run, format!("T1 Worker - {}", run.plan.title)).await?;
     if !minted {
@@ -4296,9 +4274,325 @@ async fn ensure_dev_worker_session(
     }
     // Brand-new pane can swallow the first prompt without this wait
     // (every other send path in this file sleeps after attach).
-    terminal::attach_terminal_headless(state, id.clone(), 120, 36).await?;
-    sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)).await;
+    attach.attach(state, &id).await?;
+    attach.wait().await;
     Ok(id)
+}
+
+/// Boxed future of [`WorkerAttach`].
+pub(crate) type AttachFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// How a revived/minted agent gets its pane. Production: [`LiveAttach`] (the headless terminal
+/// attach, which goes through `terminal::decide_pane`). Tests pass a fake that never touches tmux.
+pub(crate) trait WorkerAttach: Send + Sync {
+    fn attach<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> AttachFuture<'a>;
+    /// The startup wait after a fresh attach (a brand-new pane can swallow the first prompt).
+    fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    /// Type `text` into the session's pane (the feedback prompt).
+    fn send_input<'a>(&'a self, state: &'a AppState, session_id: &'a str, text: String) -> AttachFuture<'a>;
+}
+
+pub(crate) struct LiveAttach;
+
+impl WorkerAttach for LiveAttach {
+    fn attach<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> AttachFuture<'a> {
+        Box::pin(async move {
+            terminal::attach_terminal_headless(state, session_id.to_string(), 120, 36).await.map(|_| ())
+        })
+    }
+    fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(sleep(Duration::from_millis(TERMINAL_STARTUP_WAIT_MS)))
+    }
+    fn send_input<'a>(&'a self, state: &'a AppState, session_id: &'a str, text: String) -> AttachFuture<'a> {
+        Box::pin(terminal::send_terminal_input(state, session_id.to_string(), text))
+    }
+}
+
+/// What a revival changes, so a failed mint/attach can put it back (G-1-11).
+#[derive(Debug, Clone)]
+pub(crate) struct RevivalSnapshot {
+    plan_id: String,
+    status: String,
+    current_phase_id: Option<String>,
+    current_phase_index: Option<i64>,
+    phase_run_mode: Option<String>,
+    worker_session_id: Option<String>,
+    /// `(phase_id, status, worker_started_at)` of the phase the revival targets.
+    phase: Option<(String, String, Option<String>)>,
+}
+
+pub(crate) fn revival_snapshot(state: &AppState, plan_id: &str, phase_id: Option<&str>) -> Result<RevivalSnapshot, String> {
+    state.db.with_conn(|conn| {
+        let (status, current_phase_id, current_phase_index, phase_run_mode, worker_session_id) = conn
+            .query_row(
+                "SELECT status, current_phase_id, current_phase_index, phase_run_mode, worker_session_id FROM agent_plans WHERE id = ?1",
+                params![plan_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let phase = match phase_id {
+            Some(pid) => conn
+                .query_row(
+                    "SELECT status, worker_started_at FROM agent_plan_phases WHERE plan_id = ?1 AND phase_id = ?2",
+                    params![plan_id, pid],
+                    |r| Ok((pid.to_string(), r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?,
+            None => None,
+        };
+        Ok(RevivalSnapshot {
+            plan_id: plan_id.to_string(),
+            status,
+            current_phase_id,
+            current_phase_index,
+            phase_run_mode,
+            worker_session_id,
+            phase,
+        })
+    })
+}
+
+/// The refusal for a second revival of a plan while one is in flight (a double click).
+pub(crate) const REVIVAL_BUSY: &str = "This plan is already being started; try again in a moment.";
+
+fn revivals_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// One revival at a time per plan (G-2-19): held from the flip until the revival succeeded or
+/// was undone. Released on drop.
+pub(crate) struct RevivalGuard(String);
+
+impl Drop for RevivalGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = revivals_in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+pub(crate) fn claim_revival(plan_id: &str) -> Result<RevivalGuard, String> {
+    let mut set = revivals_in_flight().lock().map_err(|_| "revival lock poisoned".to_string())?;
+    if !set.insert(plan_id.to_string()) {
+        return Err(REVIVAL_BUSY.to_string());
+    }
+    Ok(RevivalGuard(plan_id.to_string()))
+}
+
+/// An in-flight revival: what it saw before, what it WROTE (so the undo is compare-and-set),
+/// the session it minted (if any), and the per-plan guard.
+pub(crate) struct Revival {
+    snap: RevivalSnapshot,
+    wrote_status: &'static str,
+    /// The phase status this revival wrote (the undo only reverts the phase if it still holds it).
+    wrote_phase_status: Option<&'static str>,
+    minted: Option<String>,
+    _guard: RevivalGuard,
+}
+
+/// Claim the plan, snapshot it, and write `status` (plus `extra` columns, and the phase's
+/// `worker_running` when `phase` is given) — the status-first half of every revival.
+fn begin_revival(
+    state: &AppState,
+    plan_id: &str,
+    status: &'static str,
+    phase: Option<(&str, i64, Option<&str>)>,
+    phase_sets_start: bool,
+) -> Result<Revival, String> {
+    let guard = claim_revival(plan_id)?;
+    let snap = revival_snapshot(state, plan_id, phase.map(|p| p.0))?;
+    state.db.with_conn(|conn| {
+        match phase {
+            Some((pid, idx, Some(mode))) => conn.execute(
+                "UPDATE agent_plans SET status = ?1, current_phase_id = ?2, current_phase_index = ?3, phase_run_mode = ?4, updated_at = datetime('now') WHERE id = ?5",
+                params![status, pid, idx, mode, plan_id],
+            ),
+            _ => conn.execute(
+                "UPDATE agent_plans SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
+                params![status, plan_id],
+            ),
+        }
+        .map_err(|e| e.to_string())?;
+        if let Some((pid, _, _)) = phase {
+            let sql = if phase_sets_start {
+                "UPDATE agent_plan_phases SET status = 'worker_running', worker_started_at = COALESCE(worker_started_at, datetime('now')), updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2"
+            } else {
+                "UPDATE agent_plan_phases SET status = 'worker_running', updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2"
+            };
+            conn.execute(sql, params![plan_id, pid]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })?;
+    Ok(Revival {
+        snap,
+        wrote_status: status,
+        wrote_phase_status: phase.map(|_| "worker_running"),
+        minted: None,
+        _guard: guard,
+    })
+}
+
+/// Resolve or mint the worker column; a MINTED session is recorded on `rev` (before its attach,
+/// so a failed attach still knows what to archive) and attached + waited for.
+async fn mint_and_attach(
+    state: &AppState,
+    run: &AgentPlanRun,
+    title: String,
+    attach: &dyn WorkerAttach,
+    rev: &mut Revival,
+) -> Result<String, String> {
+    let (id, minted) = resolve_or_mint_worker_column(state, run, title).await?;
+    if minted {
+        rev.minted = Some(id.clone());
+        attach.attach(state, &id).await?;
+        attach.wait().await;
+    }
+    Ok(id)
+}
+
+/// Put a plan back after a failed revival — COMPARE-AND-SET (G-2-19): only while the plan still
+/// holds exactly what THIS revival wrote (its status, and its minted session — or the untouched
+/// pointer when it minted none). A concurrent Stop, or anything else that moved the plan since,
+/// is left alone, and so is the minted session. Only when the revert applies is the minted
+/// session archived, so no stranded agent row stays behind.
+pub(crate) fn undo_revival(state: &AppState, rev: &Revival) {
+    let snap = &rev.snap;
+    let expected_worker = rev.minted.clone().or_else(|| snap.worker_session_id.clone());
+    let result = state.db.with_conn(|conn| {
+        let changed = conn
+            .execute(
+                "UPDATE agent_plans SET status = ?2, current_phase_id = ?3, current_phase_index = ?4, phase_run_mode = ?5, worker_session_id = ?6, updated_at = datetime('now') \
+                 WHERE id = ?1 AND status = ?7 AND worker_session_id IS ?8",
+                params![
+                    snap.plan_id,
+                    snap.status,
+                    snap.current_phase_id,
+                    snap.current_phase_index,
+                    snap.phase_run_mode,
+                    snap.worker_session_id,
+                    rev.wrote_status,
+                    expected_worker
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if let (Some((pid, status, started)), Some(wrote)) = (&snap.phase, rev.wrote_phase_status) {
+            conn.execute(
+                "UPDATE agent_plan_phases SET status = ?3, worker_started_at = ?4, updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2 AND status = ?5",
+                params![snap.plan_id, pid, status, started, wrote],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(true)
+    });
+    match result {
+        Ok(true) => {
+            if let Some(minted) = rev.minted.as_deref() {
+                if let Err(error) = sessions::mark_session_archived(state, minted) {
+                    tracing::warn!(plan_id = %snap.plan_id, %error, "undo revival: archiving the minted session failed");
+                }
+            }
+            tracing::info!(plan_id = %snap.plan_id, status = %snap.status, "revival failed; plan put back");
+        }
+        Ok(false) => tracing::info!(plan_id = %snap.plan_id, "revival failed, but the plan moved meanwhile; left as is"),
+        Err(error) => tracing::warn!(plan_id = %snap.plan_id, %error, "undo revival failed"),
+    }
+}
+
+/// `start_plan`'s (re)start of a non-kloo phase: move the plan OFF its (possibly terminal) status
+/// FIRST — plan `phase_worker_running` on `phase`, the phase `worker_running` — and only then
+/// mint/attach the worker (and a legacy active reviewer). Any failure puts everything back
+/// ([`undo_revival`]). Returns the worker session id.
+pub(crate) async fn revive_dev_worker_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    phase_run_mode: &str,
+    attach: &dyn WorkerAttach,
+) -> Result<String, String> {
+    let mut rev = begin_revival(
+        state,
+        &run.plan.id,
+        "phase_worker_running",
+        Some((&phase.phase_id, phase.phase_index, Some(phase_run_mode))),
+        true,
+    )?;
+    let attached = async {
+        let worker = mint_and_attach(state, run, format!("T1 Worker - {}", run.plan.title), attach, &mut rev).await?;
+        attach.attach(state, &worker).await?;
+        // Reviewer session is optional now (fan-out uses ephemeral reviewers); only
+        // attach if a legacy run still has an ACTIVE one (an archived row cannot be attached).
+        if let Some(reviewer_session_id) = run.plan.reviewer_session_id.clone() {
+            if matches!(
+                resolve_plan_session(state, Some(&reviewer_session_id))?,
+                SessionResolution::Reuse(_)
+            ) {
+                attach.attach(state, &reviewer_session_id).await?;
+            }
+        }
+        attach.wait().await;
+        Ok::<String, String>(worker)
+    }
+    .await;
+    if attached.is_err() {
+        undo_revival(state, &rev);
+    }
+    attached
+}
+
+/// Feedback to an approved planning run: flip it to `planning_planner_running` FIRST, then
+/// mint/attach the planner; a failure puts it back. Returns the planner and the in-flight
+/// [`Revival`] — the caller undoes it if its own next step (the prompt) fails, and drops it on
+/// success.
+pub(crate) async fn revive_planner_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    attach: &dyn WorkerAttach,
+) -> Result<(String, Revival), String> {
+    let mut rev = begin_revival(state, &run.plan.id, "planning_planner_running", None, false)?;
+    match mint_and_attach(state, run, format!("T1 Planner - {}", run.plan.title), attach, &mut rev).await {
+        Ok(planner) => Ok((planner, rev)),
+        Err(error) => {
+            undo_revival(state, &rev);
+            Err(error)
+        }
+    }
+}
+
+/// `send_feedback_to_worker`'s development branch (G-2-14): flip the plan to
+/// `phase_worker_running` and its phase to `worker_running` FIRST; then (non-kloo) mint/attach the
+/// worker and type the feedback prompt. Any failure puts the plan back ([`undo_revival`]).
+pub(crate) async fn feedback_dev_worker_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    kloo: bool,
+    attach: &dyn WorkerAttach,
+) -> Result<(), String> {
+    let mut rev = begin_revival(
+        state,
+        &run.plan.id,
+        "phase_worker_running",
+        Some((&phase.phase_id, phase.phase_index, None)),
+        false,
+    )?;
+    if kloo {
+        return Ok(());
+    }
+    let typed = async {
+        let worker = mint_and_attach(state, run, format!("T1 Worker - {}", run.plan.title), attach, &mut rev).await?;
+        attach.send_input(state, &worker, format!("{}\r", feedback_prompt(phase))).await
+    }
+    .await;
+    if typed.is_err() {
+        undo_revival(state, &rev);
+    }
+    typed
 }
 
 async fn follow_kloo_outcome(
@@ -5842,7 +6136,7 @@ async fn release_agent_runtime(state: &AppState, panes: &dyn AgentPanes, session
 /// registered role (checked first, like `plan_role_for_session`), else `planner` for the worker
 /// column of a planning run, `worker` for the worker column of any other run, `reviewer` for the
 /// reviewer column. A display lookup only — `plan_role_for_session` stays the report spoof guard.
-fn session_plan_owner(state: &AppState, session_id: &str) -> Option<(String, String)> {
+pub(crate) fn session_plan_owner(state: &AppState, session_id: &str) -> Option<(String, String)> {
     state
         .db
         .with_conn(|conn| {
@@ -21825,6 +22119,238 @@ pub(crate) mod session_lifecycle_tests {
                     .map_err(|e| e.to_string())
             })
             .unwrap()
+    }
+
+    /// The attach the real path would do, judged by the REAL terminal gate at attach time
+    /// (`decide_pane` + `session_job_ended`); never touches tmux. `fail` simulates a broken attach.
+    struct GateAttach {
+        seen: std::sync::Mutex<Vec<(String, crate::terminal::PaneDecision)>>,
+        fail: bool,
+        typed: std::sync::Mutex<Vec<(String, String)>>,
+        /// Runs inside the FIRST attach, before it answers (to interleave a Stop or a second click).
+        during: std::sync::Mutex<Option<Box<dyn FnOnce(AppState) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>>>,
+    }
+
+    impl GateAttach {
+        fn new(fail: bool) -> Self {
+            Self { seen: std::sync::Mutex::new(Vec::new()), fail, typed: std::sync::Mutex::new(Vec::new()), during: std::sync::Mutex::new(None) }
+        }
+        fn during(self, f: impl FnOnce(AppState) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + 'static) -> Self {
+            *self.during.lock().unwrap() = Some(Box::new(f));
+            self
+        }
+        fn seen(&self) -> Vec<(String, crate::terminal::PaneDecision)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl WorkerAttach for GateAttach {
+        fn attach<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> AttachFuture<'a> {
+            let decision = crate::terminal::decide_pane(
+                &crate::terminal::tmux_session_name(session_id),
+                false,
+                false,
+                || crate::services::agent_reaper::session_job_ended(state, session_id),
+            );
+            self.seen.lock().unwrap().push((session_id.to_string(), decision.clone()));
+            let fail = self.fail;
+            let during = self.during.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(f) = during {
+                    f(state.clone()).await;
+                }
+                match decision {
+                    crate::terminal::PaneDecision::Refuse(e) => Err(e),
+                    _ if fail => Err("attach failed".to_string()),
+                    _ => Ok(()),
+                }
+            })
+        }
+        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+        fn send_input<'a>(&'a self, _state: &'a AppState, session_id: &'a str, text: String) -> AttachFuture<'a> {
+            self.typed.lock().unwrap().push((session_id.to_string(), text));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A completed dev run: every phase passed, plan approved, worker retired (PR #75).
+    async fn completed_dev_run(tag: &str) -> (AppState, PathBuf, AgentPlanRun, String) {
+        let (state, root, run) = dev_run(tag);
+        let old = run.plan.worker_session_id.clone().unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute("UPDATE agent_plan_phases SET status = 'passed' WHERE plan_id = ?1", params![run.plan.id])
+                    .map_err(|e| e.to_string())?;
+                update_plan_status_and_health(conn, &run.plan.id, "approved", None).map_err(|e| e.to_string())
+            })
+            .unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(false), &old, "plan_completed").await.unwrap();
+        let run = get_plan(&state, &run.plan.id).unwrap();
+        assert!(run.phases.iter().all(|p| p.status == "passed") && !run.phases.is_empty());
+        (state, root, run, old)
+    }
+
+    /// G-1-11: Run-from-phase on a completed initiative moves the plan off `approved` BEFORE it
+    /// mints and attaches, so the terminal gate lets the new worker's pane be created.
+    #[tokio::test]
+    async fn run_from_phase_on_completed_plan_gets_a_pane() {
+        let (state, root, run, old) = completed_dev_run("revive-ok").await;
+        let phase = run.phases[0].clone();
+        let attach = GateAttach::new(false);
+        let worker = revive_dev_worker_with(&state, &run, &phase, "single", &attach).await.expect("revived");
+        assert_ne!(worker, old, "a fresh worker was minted");
+        let seen = attach.seen();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|(_, d)| *d == crate::terminal::PaneDecision::Create),
+            "the gate refused the revived worker's pane: {seen:?}"
+        );
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "phase_worker_running");
+        assert_eq!(after.plan.worker_session_id.as_deref(), Some(worker.as_str()));
+        assert_eq!(after.phases[0].status, "worker_running");
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("active"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G-1-11: a failed revival leaves no stranded session — the plan is put back and the minted
+    /// session archived (the old pointer restored).
+    #[tokio::test]
+    async fn failed_revival_puts_the_plan_back_and_strands_nothing() {
+        let (state, root, run, old) = completed_dev_run("revive-fail").await;
+        let phase = run.phases[0].clone();
+        let attach = GateAttach::new(true);
+        assert!(revive_dev_worker_with(&state, &run, &phase, "single", &attach).await.is_err());
+        let minted = attach.seen()[0].0.clone();
+        assert_ne!(minted, old);
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "approved");
+        assert_eq!(after.plan.worker_session_id.as_deref(), Some(old.as_str()));
+        assert_eq!(after.phases[0].status, "passed");
+        assert_eq!(session_status(&state, &minted).as_deref(), Some("archived"), "the minted session is not left active");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn plan_status(state: &AppState, plan_id: &str) -> String {
+        get_plan(state, plan_id).unwrap().plan.status
+    }
+
+    /// G-2-19: a second click while a revival is in flight is refused (no state change, nothing
+    /// minted), and the first revival's worker stays live.
+    #[tokio::test]
+    async fn double_revival_never_clobbers_the_first() {
+        let (state, root, run, _old) = completed_dev_run("revive-double").await;
+        let phase = run.phases[0].clone();
+        let second: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>> = Default::default();
+        let (run2, phase2, out) = (run.clone(), phase.clone(), second.clone());
+        let first = GateAttach::new(false).during(move |st| {
+            Box::pin(async move {
+                let failing = GateAttach::new(true);
+                let r = revive_dev_worker_with(&st, &run2, &phase2, "single", &failing).await;
+                *out.lock().unwrap() = Some(r);
+            })
+        });
+        let worker = revive_dev_worker_with(&state, &run, &phase, "single", &first).await.expect("first revival");
+        assert_eq!(second.lock().unwrap().clone(), Some(Err(REVIVAL_BUSY.to_string())));
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "phase_worker_running");
+        assert_eq!(after.plan.worker_session_id.as_deref(), Some(worker.as_str()));
+        assert_eq!(session_status(&state, &worker).as_deref(), Some("active"), "the first worker stays live");
+        // The guard is released: a later revival is accepted again.
+        assert!(claim_revival(&run.plan.id).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G-2-19: a Stop that lands during the attach, then a failed attach: the undo is
+    /// compare-and-set, so the plan STAYS stopped (not put back to approved).
+    #[tokio::test]
+    async fn stop_during_a_failed_revival_stays_stopped() {
+        let (state, root, run, _old) = completed_dev_run("revive-stop").await;
+        let phase = run.phases[0].clone();
+        let plan_id = run.plan.id.clone();
+        let attach = GateAttach::new(true).during(move |st| {
+            Box::pin(async move {
+                st.db
+                    .with_conn(|c| update_plan_status_and_health(c, &plan_id, "stopped", None).map_err(|e| e.to_string()))
+                    .unwrap();
+            })
+        });
+        assert!(revive_dev_worker_with(&state, &run, &phase, "single", &attach).await.is_err());
+        assert_eq!(plan_status(&state, &run.plan.id), "stopped", "the undo overwrote a concurrent Stop");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G-2-14: feedback to a completed dev run's worker (approved, all phases passed): status first,
+    /// so the minted worker's pane is created and the prompt typed; a failure strands nothing.
+    #[tokio::test]
+    async fn feedback_to_a_completed_dev_run_gets_a_pane_and_strands_nothing() {
+        let (state, root, run, old) = completed_dev_run("feedback-ok").await;
+        let phase = run.phases[0].clone();
+        let attach = GateAttach::new(false);
+        feedback_dev_worker_with(&state, &run, &phase, false, &attach).await.expect("feedback sent");
+        let seen = attach.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, crate::terminal::PaneDecision::Create);
+        let worker = seen[0].0.clone();
+        assert_ne!(worker, old);
+        let typed = attach.typed.lock().unwrap().clone();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].0, worker);
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "phase_worker_running");
+        assert_eq!(after.phases[0].status, "worker_running");
+        assert_eq!(after.plan.worker_session_id.as_deref(), Some(worker.as_str()));
+        // A failed attach puts it back and archives the minted row.
+        let (state2, root2, run2, old2) = completed_dev_run("feedback-fail").await;
+        let failing = GateAttach::new(true);
+        assert!(feedback_dev_worker_with(&state2, &run2, &run2.phases[0].clone(), false, &failing).await.is_err());
+        let back = get_plan(&state2, &run2.plan.id).unwrap();
+        assert_eq!(back.plan.status, "approved");
+        assert_eq!(back.phases[0].status, "passed");
+        assert_eq!(back.plan.worker_session_id.as_deref(), Some(old2.as_str()));
+        assert_eq!(session_status(&state2, &failing.seen()[0].0).as_deref(), Some("archived"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// G-1-11: feedback to an approved planning run flips it to `planning_planner_running` first,
+    /// so the freshly minted planner gets its pane.
+    #[tokio::test]
+    async fn feedback_to_an_approved_planning_run_gets_a_planner_pane() {
+        let (state, root, _store, ws) = gate_state();
+        let planning = planning_run(&state, &root, &ws);
+        let planner = planning.plan.worker_session_id.clone().unwrap();
+        state
+            .db
+            .with_conn(|conn| update_plan_status_and_health(conn, &planning.plan.id, "approved", None).map_err(|e| e.to_string()))
+            .unwrap();
+        retire_agent_session_with(&state, &FakePanes::new(false), &planner, "plan_approved").await.unwrap();
+        let run = get_plan(&state, &planning.plan.id).unwrap();
+        let attach = GateAttach::new(false);
+        let (fresh, revival) = revive_planner_with(&state, &run, &attach).await.expect("planner revived");
+        drop(revival);
+        assert_ne!(fresh, planner);
+        assert_eq!(attach.seen(), vec![(fresh.clone(), crate::terminal::PaneDecision::Create)]);
+        assert_eq!(get_plan(&state, &run.plan.id).unwrap().plan.status, "planning_planner_running");
+        // And a failed attach puts it back to approved with the minted planner archived.
+        let (state2, root2, _s2, ws2) = gate_state();
+        let p2 = planning_run(&state2, &root2, &ws2);
+        let old2 = p2.plan.worker_session_id.clone().unwrap();
+        state2
+            .db
+            .with_conn(|conn| update_plan_status_and_health(conn, &p2.plan.id, "approved", None).map_err(|e| e.to_string()))
+            .unwrap();
+        retire_agent_session_with(&state2, &FakePanes::new(false), &old2, "plan_approved").await.unwrap();
+        let run2 = get_plan(&state2, &p2.plan.id).unwrap();
+        let failing = GateAttach::new(true);
+        assert!(revive_planner_with(&state2, &run2, &failing).await.is_err());
+        assert_eq!(get_plan(&state2, &run2.plan.id).unwrap().plan.status, "approved");
+        assert_eq!(session_status(&state2, &failing.seen()[0].0).as_deref(), Some("archived"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
     }
 
     /// Validator finding: a Run/Resume comment on a run whose session was retired must not

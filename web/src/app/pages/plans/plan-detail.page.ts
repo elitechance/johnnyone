@@ -72,7 +72,7 @@ import {
   type OutlinePhaseCard,
   type OutlineTaskRow,
 } from './plan-brief-logic';
-import { AGENT_PILL_LABEL, type CopyState, agentPane, agentState, copyLabel, composerState, extractChoices, toolSummary } from './plan-chat-logic';
+import { AGENT_PILL_LABEL, type CopyState, agentPane, agentState, copyLabel, copyResetMs, composerState, extractChoices, toolSummary } from './plan-chat-logic';
 import { POLL_MS, hasNewerVersion, isDeletedUpdate, pollEnabled, shouldRefetch, turnCompleted } from './plan-live-logic';
 
 type Pane = 'chat' | 'brief' | 'outline';
@@ -197,6 +197,15 @@ export class PlanDetailPage implements OnInit, OnDestroy {
   );
   protected readonly paneCopy = signal<CopyState>('idle');
   protected readonly copyLabel = copyLabel;
+  private copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Show a Copy result, then go back to `Copy` after [`copyResetMs`]. */
+  private setPaneCopy(state: CopyState): void {
+    this.paneCopy.set(state);
+    if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
+    const ms = copyResetMs(state);
+    this.copyResetTimer = ms === null ? null : setTimeout(() => this.paneCopy.set('idle'), ms);
+  }
 
   /**
    * Copy `johnnyone_<sid>` for `tmux attach -r -t …`. When the clipboard is unavailable (no secure
@@ -206,10 +215,9 @@ export class PlanDetailPage implements OnInit, OnDestroy {
     try {
       if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
       await navigator.clipboard.writeText(name);
-      this.paneCopy.set('copied');
-      setTimeout(() => this.paneCopy.set('idle'), 1500);
+      this.setPaneCopy('copied');
     } catch {
-      this.paneCopy.set('failed');
+      this.setPaneCopy('failed');
       if (el) {
         const range = document.createRange();
         range.selectNodeContents(el);
@@ -288,6 +296,7 @@ export class PlanDetailPage implements OnInit, OnDestroy {
     this.pushSub?.unsubscribe();
     this.stopPoll();
     if (this.watchTimer) clearTimeout(this.watchTimer);
+    if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
     document.removeEventListener('visibilitychange', this.onVisibility);
     this.chat.teardownSubscriptions();
   }

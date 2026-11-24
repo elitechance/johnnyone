@@ -216,7 +216,26 @@ import {
   shellRoutePath,
   shellViewTogglePath,
 } from '../shells/shells-route';
-import { isPlanAgentShell, PLAN_AGENT_VIEW_ONLY_NOTE, renameIntent } from '../shells/shells-page-logic';
+import {
+  isReadOnlyShell,
+  paneRefusalNotice,
+  rawPaneView,
+  readOnlyNote,
+  rejectionForView,
+  shouldPollPane,
+  surfacesAsTerminalError,
+  transcriptRowsFromMessages,
+  withoutPaneNotice,
+  withPaneNotice,
+} from './pane-notice-logic';
+import {
+  closeRefusalText,
+  isPlanAgentShell,
+  jobEndedNotice,
+  PLAN_AGENT_VIEW_ONLY_NOTE,
+  renameIntent,
+  visibleShellView,
+} from '../shells/shells-page-logic';
 import { promptSessionRename } from '../shells/session-rename-prompt';
 import {
   clampRailWidth,
@@ -371,6 +390,12 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private sessionUpdateSubscription: Subscription | null = null;
   private sessionDeleteSubscription: Subscription | null = null;
   private relayErrorSubscription: Subscription | null = null;
+  private commandRejectionSubscription: Subscription | null = null;
+  /** Per session: the "Transcript only" notice of a pane the engine refused to start (G-1-1). */
+  protected readonly paneNotices = signal<Record<string, string>>({});
+  protected readonly rawPaneView = rawPaneView;
+  protected readonly isReadOnlyShell = isReadOnlyShell;
+  protected readonly readOnlyNote = readOnlyNote;
   private streamEventsSubscription: Subscription | null = null;
   private resizeTerminalTimeout: ReturnType<typeof setTimeout> | null = null;
   private saveWorkspaceStateTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -443,6 +468,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private paErrorClearedFor: string | null = null;
   /** Plan agent in tmux: its Raw/Transcript surface is view-only (banner, no input). */
   protected readonly isPlanAgentShell = isPlanAgentShell;
+  protected readonly jobEndedNotice = jobEndedNotice;
+  protected readonly visibleShellView = visibleShellView;
   protected readonly planAgentViewOnlyNote = PLAN_AGENT_VIEW_ONLY_NOTE;
 
   // Per-session pane tab (Transcript default · Raw terminal; Plan/Diff reserved, D7)
@@ -1108,6 +1135,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     const id = this.currentSession()?.id;
     if (!id) return [];
     const events = this.transcriptEventsFor(id);
+    // An ended session has no live stream: its Transcript is its stored messages.
+    if (events.length === 0 && isReadOnlyShell({ status: this.currentSession()?.status })) {
+      return transcriptRowsFromMessages(this.messages());
+    }
     const echoes = this.shellEchoes().filter((e) => e.sessionId === id);
     const rows: Array<{
       type: 'you' | 'agent' | 'error' | 'markdown' | 'watchdog';
@@ -2299,9 +2330,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         targetId: targetSessionId,
         currentId: this.currentSession()?.id,
       });
-      if (toSelect) {
-        await this.selectSession(toSelect);
-      } else {
+      // An explicit target is ALWAYS the one opened (read-only when it is not active, G-1-1); if
+      // it cannot be fetched at all, show nothing — never another, typeable session.
+      const selected = toSelect ? await this.selectSession(toSelect) : false;
+      if (!selected && (!toSelect || toSelect === targetSessionId)) {
         this.currentSession.set(null);
         this.messages.set([]);
       }
@@ -2581,7 +2613,7 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
-  async selectSession(id: string): Promise<void> {
+  async selectSession(id: string): Promise<boolean> {
     try {
       const [apiSession, apiMessages] = await Promise.all([
         firstValueFrom(this.api.getSession(id)),
@@ -2590,7 +2622,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       const session = this.mapApiSessionToState(apiSession);
       const messages = apiMessages.map((message) => this.mapApiMessageToState(message));
 
-      this.upsertSession(session);
+      // An ended (archived) session opened by URL is shown READ-ONLY; it never joins the live list.
+      if (!isReadOnlyShell({ status: session.status })) this.upsertSession(session);
       this.currentSession.set(session);
       this.selectedProvider.set(session.provider);
       this.workingDirectory.set(session.working_directory);
@@ -2603,8 +2636,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       this.streamingContent.set('');
       this.streamingMessageId.set(null);
       this.resetStreamingStatus();
+      return true;
     } catch (err) {
       console.error('Failed to select session:', err);
+      return false;
     }
   }
 
@@ -2968,6 +3003,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.terminalSubscription = this.relayTerminal.screens().subscribe({
       next: (screen) => {
         this.terminalScreens.update((screens) => ({ ...screens, [screen.sessionId]: screen }));
+        // A LIVE frame: the pane exists, so a recorded refusal notice no longer applies (G-2-24).
+        this.paneNotices.update((m) => withoutPaneNotice(m, screen.sessionId));
         if (screen.sessionId === this.currentSession()?.id) {
           this.terminalScreen.set(screen);
           this.terminalError.set(null);
@@ -3007,13 +3044,39 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     this.streamEventsSubscription = null;
     this.relayErrorSubscription?.unsubscribe();
     this.relayErrorSubscription = null;
+    this.commandRejectionSubscription?.unsubscribe();
+    this.commandRejectionSubscription = null;
     if (this.resizeTerminalTimeout) {
       clearTimeout(this.resizeTerminalTimeout);
       this.resizeTerminalTimeout = null;
     }
   }
 
+  /**
+   * A rejected terminal command for a session this page shows (the /shells session or the
+   * console's primary one): its reason becomes the terminal error, and a job-ended refusal also
+   * records the pane's "Transcript only" notice. Previously only `console.error`'d (G-1-1).
+   */
+  protected onCommandRejected(ack: { sessionId: string; error: string; kind?: string }): void {
+    const rejection = rejectionForView(
+      { ...ack, accepted: false },
+      [this.currentSession()?.id, this.primarySessionId()],
+    );
+    if (!rejection) return;
+    this.paneNotices.update((m) => withPaneNotice(m, rejection.sessionId, paneRefusalNotice(rejection.error)));
+    // Only an open/type refusal is the terminal error; a refused resize/kill is noise (G-2-17).
+    if (rejection.sessionId === this.currentSession()?.id && surfacesAsTerminalError(ack.kind)) {
+      this.terminalError.set(rejection.error);
+    }
+  }
+
   private subscribeToRelayErrorEvents(): void {
+    if (!this.commandRejectionSubscription) {
+      this.commandRejectionSubscription = this.relayTerminal.commandRejections().subscribe({
+        next: (ack) => this.onCommandRejected(ack),
+        error: (e) => console.error('relay rejection sub:', e),
+      });
+    }
     if (this.relayErrorSubscription) return;
     // Surface service-level bound failures etc into the existing terminalError UI channel
     this.relayErrorSubscription = this.relayTerminal.errors().subscribe({
@@ -3709,9 +3772,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     // Self-scheduling rather than a fixed interval, so the rate can follow the pane. A constant
     // 500ms poll spent the same bandwidth on a session idle for an hour as on one mid-build.
     const tick = async () => {
-      if (this.primaryScreenSessionId !== sessionId) return;
+      // A refused pane is never polled again (G-2-22): no capture, no re-arm.
+      if (!shouldPollPane(sessionId, this.primaryScreenSessionId, this.paneNotices())) return;
       if (!document.hidden) await this.capturePrimaryScreen(sessionId);
-      if (this.primaryScreenSessionId !== sessionId) return;
+      if (!shouldPollPane(sessionId, this.primaryScreenSessionId, this.paneNotices())) return;
       const changed = this.paneChangedRecently(sessionId, CONSOLE_POLL_FAST_MS * 3);
       this.primaryScreenPollInterval = setTimeout(
         () => void tick(),
@@ -3750,9 +3814,17 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       if (screen && this.primaryScreenSessionId === sessionId && this.primarySessionId() === sessionId) {
         this.terminalScreens.update((screens) => ({ ...screens, [sessionId]: screen }));
         this.notePaneContent(sessionId, screen.content);
+        // A live capture: the pane exists again, so any refusal notice is stale.
+        this.paneNotices.update((m) => withoutPaneNotice(m, sessionId));
       }
-    } catch {
-      // best-effort — a transient relay/host hiccup just skips this tick
+    } catch (err) {
+      // A transient relay/host hiccup just skips this tick. A REFUSED pane (a finished agent's
+      // job has ended) is not transient: show the notice and stop polling it (G-1-1).
+      const notice = paneRefusalNotice(err);
+      if (notice) {
+        this.paneNotices.update((m) => withPaneNotice(m, sessionId, notice));
+        if (this.primaryScreenSessionId === sessionId) this.stopPrimaryScreenPoll();
+      }
     }
   }
 
@@ -4444,14 +4516,14 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       }
     } catch (err) {
       console.error('Failed to kill terminal:', err);
-      this.terminalError.set(`Failed to kill terminal: ${String(err)}`);
+      this.terminalError.set(closeRefusalText(err));
     }
 
     try {
       await firstValueFrom(this.api.archiveSession(sessionId));
     } catch (err) {
       console.error('Failed to archive closed terminal session:', err);
-      this.terminalError.set(`Failed to close terminal: ${String(err)}`);
+      this.terminalError.set(closeRefusalText(err));
       return;
     }
 

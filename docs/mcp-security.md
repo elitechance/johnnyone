@@ -43,9 +43,12 @@ mv -f '<n>.rc' '<n>.exit'
   the headless argv did. `turns/` is 0700. Every file in it is 0600: J1 creates the script, prompt
   and jsonl with `create_new` + mode 0600, and the script starts with `umask 077` for the files the
   shell creates (stderr, rc, exit).
-- **One turn at a time.** A plan agent holds a turn slot (`plan_agent_tmux::claim_turn`) from spawn
-  until its turn ends. A second send in the meantime is refused on every chat path, before anything
-  is stored ("The plan agent is still answering the last message. Try again when it finishes."). Turn numbers are reserved
+- **One turn at a time.** A plan agent holds a turn slot (`plan_agent_tmux::claim_turn`) until its
+  turn ends. Every chat path CLAIMS the slot first (`chat_host::claim_plan_agent_turn`), before it
+  stores the user message, and passes the slot into the spawn. A second send in the meantime is
+  refused and stores nothing ("The plan agent is still answering the last message. Try again when
+  it finishes."). The relay sends the refusal as one `error`-kind final delta, which the Plans chat
+  shows inline (and drops the refused message's bubble). Turn numbers are reserved
   with `create_new`, so they never collide. A turn's tail treats a newer turn's script as "this
   turn is over". A chat path only removes or kills its OWN handle from `active_processes`
   (`chat_host::take_own_process`).
@@ -65,13 +68,59 @@ mv -f '<n>.rc' '<n>.exit'
   never from the title.
 - **No terminal escapes in the pane.** Everything the pane prints is stripped of C0 controls (except
   tab and newline), DEL and C1 controls. That covers the viewer's lines (`strip_controls`), the
-  `cat` fallback, the "▶ you:" line and the stderr tail (`SHELL_SANITIZE`). Model, tool or stderr
+  `cat` fallback, the "▶ you:" line and the stderr tail (`SHELL_SANITIZE`, whose C1 substitution
+  loops until nothing matches, so overlapping bytes cannot re-form a C1). Model, tool or stderr
   text can't send OSC 52 clipboard writes or other escape sequences to whoever is watching. The jsonl
   data path is untouched.
 - **Lifecycle.** Stop and retire end an in-flight turn: they cancel the tail and run
-  `respawn-pane -k` with a fixed notice. Accept, delete, replace and any other retire kill the
-  pane through the pane seam (`retire_agent_session_with`). The orphan sweep reaps a pane whose row
+  `respawn-pane -k` with a fixed notice. All three chat paths (including the relay) kill a turn the
+  same way after 120 s without output (`chat_host::TURN_IDLE_TIMEOUT`, `end_own_turn`), which also
+  releases the slot. A turn that streamed text and then crashed or timed out keeps the error line
+  in its stored reply (`chat_host::final_assistant_content`). Accept, delete, replace and any other
+  retire kill the pane through the pane seam (`retire_agent_session_with`). If the
+  `briefing_session_id` lookup fails during a retire, the error is logged and every session that
+  held a token for the plan is retired and revoked anyway. The orphan sweep reaps a pane whose row
   is archived or gone. Retention: `turns/` survives accept and is deleted with the plan.
+- **Engine restart mid-turn.** A turn writes `<n>.started` when it starts and `<n>.settled` when
+  the engine stops following it. At start, `plan_agent_tmux::reconcile_interrupted_turns_with`
+  looks at the latest turn of each LIVE plan agent (plan in briefing, agent row active; a retired,
+  accepted or closed plan's agent is left alone). A turn with `<n>.started` but neither
+  `<n>.exit` nor `<n>.settled` was in flight when the previous engine died. A turn without
+  `<n>.started` came from an older binary, whose Stop/timeout left no marker: nothing is recorded;
+  if its pane is still running it is killed silently (`respawn-pane -k`), then it is settled. If its pane is still running it is killed with `respawn-pane -k` and a fixed notice. A dead
+  or missing pane needs no kill. Either way the turn gets a failed assistant message ("interrupted
+  by an engine restart", `finish_reason = 'interrupted'`) and `<n>.settled`, so it is recorded only
+  once. The turn files stay. Slots are in-memory, so nothing is released; the reconcile holds the
+  session's slot while it works, so it never touches a turn this engine started. Killing was chosen
+  over re-attaching a tail: the request that waited for the reply died with the old engine, so no
+  one would read a re-attached stream.
+- **A finished agent is never resurrected.** The terminal paths (`ensure_terminal_session`,
+  `ensure_terminal_session_for_input`) never CREATE a pane for a worker/reviewer whose plan job
+  has ended (`terminal::decide_pane` + `agent_reaper::session_job_ended`, the sweep's
+  `PlanTerminal` predicate; a paused single-phase worker stays protected; a lookup error refuses).
+  Viewing a pane that still exists is allowed. The refusal says "This agent's job has ended"; an
+  ARCHIVED row of such a worker/reviewer (what the backfill produces) gets the same text
+  (`terminal::archived_refusal`). The web shows "This agent's job has ended. Transcript only."
+  with an Open transcript action instead of a blank Raw screen, on `/shells/:id` and in the
+  initiative console's Raw tab. The refusal reaches the page as a rejected `terminal_command_ack`
+  (`RelayTerminalService.commandRejections`) or a failed capture (`pane-notice-logic.ts`).
+  Revival paths that legitimately bring a finished plan back (Run-from-phase on a completed
+  initiative, feedback to an approved planning run) move the plan OFF its terminal status FIRST
+  and only then mint/attach (`agent_plans::revive_dev_worker_with`, `revive_planner_with`); a
+  failed mint/attach puts the plan back and archives the minted row (`undo_revival`). The undo is
+  compare-and-set: it reverts only while the plan still holds exactly what that revival wrote, so
+  a concurrent Stop is never overwritten. One revival runs per plan at a time (`claim_revival`); a
+  second click is refused ("already being started"). The chat
+  paths refuse an ended non-plan session too, and no CLI is spawned: a worker/reviewer whose job
+  has ended gets `chat_host::CHAT_SESSION_ENDED`; a closed plan's old plan-agent session gets
+  `CHAT_PLAN_AGENT_RETIRED`; any other archived row gets `CHAT_SESSION_ARCHIVED`. A `/shells/:id`
+  URL that names an archived session opens THAT session read-only (its stored messages as the
+  Transcript, the ended notice on Raw, no input), never another session.
+  `chat_host::claim_plan_agent_turn` is the only chat entry point (`plan_agent_turn_extras` is
+  private). At engine start a one-time, idempotent backfill
+  (`agent_reaper::backfill_ended_job_sessions`) archives every still-active worker/reviewer row
+  whose job has ended, with `agent_session_retired {reason:"backfill_job_ended"}`, and spawns
+  nothing.
 - **Live view.** The pane runs the engine binary as a pretty-printer (`--plan-agent-view`), which
   shows the user's line, assistant text, `→ tool(args)` and `✓ v5`. The printer always drains its
   stdin, so it can never break the `tee` that feeds the data path. Before exec'ing it, the script
@@ -119,9 +168,9 @@ mv -f '<n>.rc' '<n>.exit'
 | C1 | Per-session bearer token: 256 bits from the OS RNG, only its SHA-256 is stored, compared in constant time (`subtle`); every request (incl. `initialize`) must present it; the token's session must exist, be active and still be the plan's briefing_session_id | desktop/src-tauri/src/services/mcp_tokens.rs::mint, mcp_tokens.rs::verify, host/mcp.rs::authorize | `token_is_256_bits_hex`, `only_hash_is_stored`, `verify_rejects_malformed_unknown_revoked`, `missing_token_401`, `malformed_token_401`, `unknown_token_401`, `revoked_token_401`, `archived_session_rejected`, `deleted_session_rejected`, `replaced_session_rejected` |
 | C2 | The raw token lives only in a 0600 `mcp.json` inside a 0700 per-plan dir, exactly once, in `mcpServers.j1.headers.Authorization`; argv carries the file PATH only; never in env, logs or events (`RawToken` has a redacting Debug and no Display/Serialize) | mcp_tokens.rs::write_mcp_config, mcp_tokens.rs::RawToken, plan_agent.rs::plan_agent_extras, cli_runner.rs::log_spawn, plan_agent_tmux.rs::turn_script, plan_agent_tmux.rs::start_turn (the tmux command and turn script carry the PATH only; `turns/` 0700, files 0600) | `mcp_config_file_is_0600_in_0700_dir`, `mcp_config_token_only_in_authorization_header`, `raw_token_debug_is_redacted`, `launch_args_never_contain_token` (incl. the tmux command string and turn script), `turn_command_never_contains_token`, `logged_launch_args_contain_no_token`, `token_absent_from_events_and_logs` |
 | C3 | Scope comes from the token only: no tool schema has an initiative/plan id, every schema is `additionalProperties:false`, arguments are validated against the SAME schema `tools/list` advertises; no tool executes a command or writes a file | plan_mcp.rs::TOOLS, plan_mcp.rs::validate, host/mcp.rs::tools_call | `token_a_cannot_touch_plan_b`, `initiative_id_argument_is_a_validation_error`, `every_tool_rejects_unknown_and_mistyped_args`, `every_schema_uses_supported_keywords`, `no_tool_writes_outside_db`, `tools_call_brief_update_increments_version_author_agent` |
-| C4 | Revoke on accept (Start planning), delete, any retire, and replacement; a plan that left briefing answers 403 with the frozen version; revoking deletes `mcp.json` | agent_plans.rs::freeze_and_flip_brief, agent_plans.rs::freeze_flip_and_retire_agent, agent_plans.rs::delete_plan_with, agent_plans.rs::retire_agent_session_with, plan_agent.rs::retire_plan_agent_with, plan_agent.rs::replace_plan_agent_session, mcp_tokens.rs::revoke_for_initiative; retiring also kills the agent's `johnnyone_<sid>` pane, and the orphan sweep reaps one left behind | `accept_revokes_token_and_retires_session`, `delete_revokes_token_and_retires_session`, `retire_revokes_token`, `new_session_token_revokes_old`, `mint_revokes_previous_live_token`, `replacement_stops_and_retires_old_session`, `retired_session_cannot_call_mcp`, `call_after_accept_rejected`, `plan_agent_pane_created_on_first_turn_and_killed_on_every_retire`, `plan_agent_pane_kept_while_live_swept_once_retired`, `stop_cancels_tail_and_kills_only_the_agent_pane`, `plan_agent_cannot_be_closed_from_a_terminal_only_retired` |
+| C4 | Revoke on accept (Start planning), delete, any retire, and replacement; a plan that left briefing answers 403 with the frozen version; revoking deletes `mcp.json` | agent_plans.rs::freeze_and_flip_brief, agent_plans.rs::freeze_flip_and_retire_agent, agent_plans.rs::delete_plan_with, agent_plans.rs::retire_agent_session_with, plan_agent.rs::retire_plan_agent_with, plan_agent.rs::replace_plan_agent_session, mcp_tokens.rs::revoke_for_initiative; retiring also kills the agent's `johnnyone_<sid>` pane, and the orphan sweep reaps one left behind | `accept_revokes_token_and_retires_session`, `delete_revokes_token_and_retires_session`, `retire_revokes_token`, `new_session_token_revokes_old`, `mint_revokes_previous_live_token`, `replacement_stops_and_retires_old_session`, `retired_session_cannot_call_mcp`, `call_after_accept_rejected`, `plan_agent_pane_created_on_first_turn_and_killed_on_every_retire`, `plan_agent_pane_kept_while_live_swept_once_retired`, `stop_cancels_tail_and_kills_only_the_agent_pane`, `plan_agent_cannot_be_closed_from_a_terminal_only_retired`, `retire_survives_a_briefing_lookup_error` |
 | C5 | Transport guard before any parsing: POST only (405), ANY Origin refused (403), Host must be 127.0.0.1 or localhost on the bound port (421), Content-Type application/json (415), body at most 256 KiB incl. chunked (413); `/mcp` is merged beside, not inside, the CORS-enabled origin guard so it never emits an access-control header | host/mcp.rs::check_request, host/mcp.rs::mcp_router, host/mod.rs::router | `check_request_table`, `origin_header_rejected`, `bad_host_rejected`, `non_post_rejected`, `options_preflight_rejected_without_cors`, `non_json_rejected`, `oversized_body_rejected`, `no_cors_headers_on_mcp`, `graphql_route_unchanged` |
-| C6 | Least-privilege agent. PRIMARY: `--tools ""`, an allow-list of NO built-in tools (the CLI then reports zero tools; it cannot go stale when a CLI release adds one). Extra layers: `--allowedTools` is exactly the ten `mcp__j1__*` tools, `--strict-mcp-config` (only the j1 server), `--disallowedTools` lists every built-in that reads/writes/executes/fetches/delegates (incl. Agent, LSP, Skill), `--permission-mode default` (never bypassPermissions); ordinary chats get none of these flags; refused after accept and on any non-claude provider | providers/claude_code.rs::build_config_with, claude_code.rs::PLAN_AGENT_DISALLOWED_TOOLS, chat_host.rs::plan_agent_turn_extras (used by chat_host, agent/mod.rs::handle_relay_chat and commands/chat.rs::send_chat_message), plan_agent_tmux.rs::spawn_chat_turn (the turn runs in the agent's visible `johnnyone_<sid>` pane with exactly those args; data comes only from the turn's stream-json, never from the pane; the prompt goes through a file, never a shell string), terminal.rs::plan_agent_pane_access (the terminal paths may VIEW the pane, never create it or type into it) | `plan_agent_args_least_privilege`, `allowed_tools_are_mcp_j1_only`, `plain_chat_args_unchanged`, `plan_agent_deny_list_matches_the_probe`, `extras_err_after_accept`, `extras_none_for_non_plan_session`, `system_prompt_mentions_tools_only_and_choices_line`, `plan_agent_pane_is_view_only_and_created_by_turns`, `attached_session_targeting_plan_pane_cannot_type`, `create_session_refuses_attaching_johnnyone_names`, `plan_agent_pane_is_never_captured`, `second_send_while_turn_in_flight_is_refused_and_first_unharmed`, `concurrent_starts_never_share_a_turn_number`, `stale_turn_cleanup_never_touches_a_later_turn`, `superseded_turn_tail_ends_even_with_a_live_pane`, `viewer_runs_only_after_identity_and_probe`, `plan_agent_guards_fail_closed_on_lookup_error`, `view_lines_strip_terminal_controls`, `pane_shell_output_strips_terminal_controls`, `prompt_with_shell_metacharacters_cannot_inject`, `shell_quote_round_trips`, `structured_parse_identical_to_headless_path`, `completion_detected_from_jsonl_result_event`, `crash_without_result_is_an_error_with_last_stderr_line`, `pane_killed_mid_turn_is_an_error_not_a_hang` |
+| C6 | Least-privilege agent. PRIMARY: `--tools ""`, an allow-list of NO built-in tools (the CLI then reports zero tools; it cannot go stale when a CLI release adds one). Extra layers: `--allowedTools` is exactly the ten `mcp__j1__*` tools, `--strict-mcp-config` (only the j1 server), `--disallowedTools` lists every built-in that reads/writes/executes/fetches/delegates (incl. Agent, LSP, Skill), `--permission-mode default` (never bypassPermissions); ordinary chats get none of these flags; refused after accept and on any non-claude provider | providers/claude_code.rs::build_config_with, claude_code.rs::PLAN_AGENT_DISALLOWED_TOOLS, chat_host.rs::plan_agent_turn_extras via chat_host.rs::claim_plan_agent_turn (the first step of chat_host, agent/mod.rs::handle_relay_chat and commands/chat.rs::send_chat_message: it also claims the turn slot before anything is stored), plan_agent_tmux.rs::spawn_chat_turn (the turn runs in the agent's visible `johnnyone_<sid>` pane with exactly those args; data comes only from the turn's stream-json, never from the pane; the prompt goes through a file, never a shell string), terminal.rs::plan_agent_pane_access (the terminal paths may VIEW the pane, never create it or type into it) | `plan_agent_args_least_privilege`, `allowed_tools_are_mcp_j1_only`, `plain_chat_args_unchanged`, `plan_agent_deny_list_matches_the_probe`, `extras_err_after_accept`, `extras_none_for_non_plan_session`, `system_prompt_mentions_tools_only_and_choices_line`, `plan_agent_pane_is_view_only_and_created_by_turns`, `attached_session_targeting_plan_pane_cannot_type`, `create_session_refuses_attaching_johnnyone_names`, `plan_agent_pane_is_never_captured`, `second_send_while_turn_in_flight_is_refused_and_first_unharmed`, `concurrent_starts_never_share_a_turn_number`, `stale_turn_cleanup_never_touches_a_later_turn`, `superseded_turn_tail_ends_even_with_a_live_pane`, `viewer_runs_only_after_identity_and_probe`, `plan_agent_guards_fail_closed_on_lookup_error`, `view_lines_strip_terminal_controls`, `pane_shell_output_strips_terminal_controls`, `shell_sanitize_loops_until_no_c1_is_left`, `refused_send_stores_nothing`, `all_chat_paths_claim_before_storing`, `idle_timeout_stops_the_agents_pane_and_frees_the_slot`, `restart_reconcile_records_interrupted_turns_once`, `terminal_paths_never_create_a_pane_for_an_ended_job`, `prompt_with_shell_metacharacters_cannot_inject`, `shell_quote_round_trips`, `structured_parse_identical_to_headless_path`, `completion_detected_from_jsonl_result_event`, `crash_without_result_is_an_error_with_last_stderr_line`, `pane_killed_mid_turn_is_an_error_not_a_hang` |
 | C7 | `repo_search` is read-only and jailed: relative paths only, no `..`, canonicalized start must stay in the workspace, symlinked dirs never followed, symlinked files only when they resolve inside; hard exclusions on the canonical path (initiatives dir, any `.johnnyone` or `plan-agent` component, `mcp.json`, `.env*`); output, line and time caps; an in-process walker, no subprocess | services/repo_search.rs::repo_search_until, repo_search.rs::is_excluded, repo_search.rs::check_relative | `repo_search_finds_literal_case_insensitive`, `repo_search_dotdot_refused`, `repo_search_absolute_refused`, `repo_search_symlink_escape_refused`, `repo_search_output_capped`, `repo_search_time_capped`, `repo_search_skips_ignored_dirs`, `repo_search_never_returns_mcp_tokens`, `repo_search_excludes_real_initiatives_dir_inside_workspace` |
 | C8 | Audit: every accepted write is a brief_version_created event with author agent + sessionId; every refused call that resolves to a plan is an agent_mcp_rejected {reason, method, tool, count} event (fixed labels only — client text is never echoed); planless refusals are a `tracing` warn with a global counter (in the engine log, see Operations); rejections never page Discord | plan_mcp.rs::record_rejection, brief_store.rs::write_version, agent_plans.rs::event_summary | `accepted_write_event_has_agent_and_session`, `rejection_event_has_reason_and_count_no_token`, `rejection_renders_in_timeline`, `unknown_method_32601`, `token_absent_from_events_and_logs` |
 
@@ -326,6 +375,27 @@ The Raw page shows a view-only banner for a plan agent and has no input.
 - `plan_agent_guards_fail_closed_on_lookup_error`
 - `view_lines_strip_terminal_controls`
 - `pane_shell_output_strips_terminal_controls`
+- `shell_sanitize_loops_until_no_c1_is_left`
+- `refused_send_stores_nothing`
+- `all_chat_paths_claim_before_storing`
+- `crash_after_partial_text_keeps_the_crash_line`
+- `idle_timeout_stops_the_agents_pane_and_frees_the_slot`
+- `stop_releases_the_real_slot`
+- `partial_final_result_line_plus_exit_is_a_result`
+- `restart_reconcile_records_interrupted_turns_once`
+- `retire_survives_a_briefing_lookup_error`
+- `terminal_paths_never_create_a_pane_for_an_ended_job`
+- `boot_backfill_archives_ended_jobs_once_and_spawns_nothing`
+- `ensure_terminal_session_refuses_a_finished_jobs_pane_and_creates_nothing`
+- `archived_finished_worker_gets_the_job_ended_refusal`
+- `run_from_phase_on_completed_plan_gets_a_pane`
+- `failed_revival_puts_the_plan_back_and_strands_nothing`
+- `feedback_to_an_approved_planning_run_gets_a_planner_pane`
+- `chat_to_a_finished_or_archived_session_is_refused_and_spawns_nothing`
+- `relay_and_command_paths_use_the_shared_turn_helpers`
+- `double_revival_never_clobbers_the_first`
+- `stop_during_a_failed_revival_stays_stopped`
+- `feedback_to_a_completed_dev_run_gets_a_pane_and_strands_nothing`
 - `repo_search_finds_literal_case_insensitive`
 - `repo_search_dotdot_refused`
 - `repo_search_absolute_refused`

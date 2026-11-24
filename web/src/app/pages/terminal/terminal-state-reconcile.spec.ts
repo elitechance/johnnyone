@@ -106,8 +106,10 @@ describe('chooseSessionToSelect (complaint half b — the live session appears)'
     expect(chooseSessionToSelect([{ id: LIVE }], { currentId: DEAD })).toBeNull();
   });
 
-  it('a stale (dead) targetId / deep-link is ignored and the live session still appears', () => {
-    expect(chooseSessionToSelect([{ id: LIVE }], { targetId: DEAD })).toBe(LIVE);
+  it('an explicit target that is not active is STILL the one opened (read-only) — never another session (G-1-1)', () => {
+    expect(chooseSessionToSelect([{ id: LIVE }], { targetId: DEAD })).toBe(DEAD);
+    expect(chooseSessionToSelect([{ id: LIVE }, { id: OTHER }], { targetId: DEAD, currentId: LIVE })).toBe(DEAD);
+    expect(chooseSessionToSelect([], { targetId: DEAD })).toBe(DEAD);
   });
 
   it('honours a valid current and a valid target (active sessions unaffected)', () => {

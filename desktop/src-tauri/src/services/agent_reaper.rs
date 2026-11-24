@@ -159,10 +159,7 @@ pub fn select_orphan_sessions(
         if links.is_empty() {
             continue;
         }
-        let live_links: Vec<&PlanLink> = links
-            .iter()
-            .filter(|l| !is_terminal_plan_status(&l.plan_status) || !l.job_ended)
-            .collect();
+        let live_links = live_links(links);
         if !live_links.is_empty() {
             let all_ephemeral = live_links.iter().all(|l| l.ephemeral);
             if all_ephemeral && row.created_unix < engine_started_unix {
@@ -174,6 +171,21 @@ pub fn select_orphan_sessions(
     }
     verdicts.sort_by(|a, b| a.tmux_name.cmp(&b.tmux_name));
     verdicts
+}
+
+/// The links that still protect a session: the plan is running, or its job there has not ended
+/// (arm 8 of [`select_orphan_sessions`]).
+pub fn live_links(links: &[PlanLink]) -> Vec<&PlanLink> {
+    links
+        .iter()
+        .filter(|l| !is_terminal_plan_status(&l.plan_status) || !l.job_ended)
+        .collect()
+}
+
+/// A session's job has ended (arm 9, `PlanTerminal`): it has at least one plan link and none is
+/// live. No links (a standalone `/shells` session, a plan agent) → `false`: never "ended".
+pub fn links_job_ended(links: &[PlanLink]) -> bool {
+    !links.is_empty() && live_links(links).is_empty()
 }
 
 /// Master §4 `job_ended` table for one link:
@@ -412,6 +424,75 @@ fn all_phases_passed(conn: &rusqlite::Connection, plan_id: &str) -> Result<bool,
     .map_err(|e| e.to_string())
 }
 
+/// Has the job of `session_id` ended (same facts + predicate as the sweep's `PlanTerminal` arm)?
+/// Used by the pane-creating terminal paths so a finished worker/reviewer is never resurrected
+/// (live incident 2026-11-23: a viewer restarted `claude` for a dev worker done hours earlier).
+pub(crate) fn session_job_ended(state: &AppState, session_id: &str) -> Result<bool, String> {
+    let facts = load_sweep_facts(state, std::slice::from_ref(&session_id.to_string()))?;
+    Ok(facts.links.get(session_id).map(|l| links_job_ended(l)).unwrap_or(false))
+}
+
+/// The reason recorded by [`backfill_ended_job_sessions`].
+pub const BACKFILL_REASON: &str = "backfill_job_ended";
+
+/// One-time boot backfill: archive every `active` worker/reviewer session whose plan job has ended
+/// ([`session_job_ended`]) and append `agent_session_retired {reason:"backfill_job_ended"}` to its
+/// plan. Rows only — no pane is created or killed here (the orphan sweep then reaps an archived
+/// row's pane). Idempotent: `mark_session_archived` is compare-and-set, so a second run finds no
+/// active row to flip and writes nothing. Returns the archived session ids.
+pub(crate) fn backfill_ended_job_sessions(state: &AppState) -> Result<Vec<String>, String> {
+    let candidates: Vec<String> = state.db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT s.id FROM sessions s JOIN agent_plans p \
+                   ON p.worker_session_id = s.id OR p.reviewer_session_id = s.id \
+                 WHERE s.status = 'active' ORDER BY s.id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })?;
+    let mut archived = Vec::new();
+    for sid in candidates {
+        match session_job_ended(state, &sid) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(session_id = %sid, %error, "backfill: job lookup failed; kept");
+                continue;
+            }
+        }
+        let owner = crate::services::agent_plans::session_plan_owner(state, &sid);
+        match crate::services::sessions::mark_session_archived(state, &sid) {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(session_id = %sid, %error, "backfill: archive failed");
+                continue;
+            }
+        }
+        if let Some((plan_id, role)) = owner {
+            if let Err(error) = crate::services::agent_plans::append_event(
+                state,
+                &plan_id,
+                None,
+                "agent_session_retired",
+                serde_json::json!({ "sessionId": sid, "role": role, "reason": BACKFILL_REASON }),
+            ) {
+                tracing::warn!(session_id = %sid, %error, "backfill: event write failed");
+            }
+        }
+        tracing::info!(session_id = %sid, reason = BACKFILL_REASON, "agent_session_retired");
+        archived.push(sid);
+    }
+    tracing::info!(archived = archived.len(), "ended-job session backfill");
+    Ok(archived)
+}
+
 /// One sweep: list → decide → re-validate → retire (row-backed) or kill (rowless) → report.
 /// Every row-backed kill goes through `retire_agent_session_with`, which archives the row and
 /// writes `agent_session_retired` when a plan owns it. One failure never aborts the rest.
@@ -560,6 +641,11 @@ pub fn spawn_orphan_sweep(state: AppState, engine_started_unix: i64) {
     // `tauri::async_runtime::spawn`, NOT a bare tokio spawn: this is called from Tauri's `setup`,
     // which has no tokio reactor entered (see `session_watchdog::spawn_session_watchdog`).
     tauri::async_runtime::spawn(async move {
+        // One-time, before the first sweep: archive rows of finished workers/reviewers that predate
+        // the retire path (PR #75), so the boot sweep then reaps their panes.
+        if let Err(error) = backfill_ended_job_sessions(&state) {
+            tracing::warn!(%error, "ended-job session backfill failed");
+        }
         tokio::time::sleep(std::time::Duration::from_secs(ORPHAN_SWEEP_FIRST_DELAY_SECS)).await;
         tracing::info!(interval_secs = ORPHAN_SWEEP_INTERVAL_SECS, "orphan sweep loop starting");
         let mut ticker =
@@ -1341,6 +1427,89 @@ mod executor_tests {
         assert!(link_job_ended("planning", "done", "planner", false, false));
         assert!(!link_job_ended("development", "done", "qa", true, false), "registered ephemeral still in flight");
         assert!(!link_job_ended("development", "phase_review_running", "qa", true, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Item A: never resurrect a finished plan's agent ──
+
+    /// The terminal paths' decision with the real DB-backed predicate: an ended job's session gets
+    /// NO new pane (viewing an existing pane is still allowed); a running, paused single-phase or
+    /// plain session may get one.
+    #[test]
+    fn terminal_paths_never_create_a_pane_for_an_ended_job() {
+        use crate::terminal::{decide_pane, PaneDecision, AGENT_JOB_ENDED};
+        let (state, root) = state();
+        let decide = |sid: &str, exists: bool| {
+            decide_pane(&format!("johnnyone_{sid}"), exists, false, || session_job_ended(&state, sid))
+        };
+        // The incident: a dev worker whose plan finished hours earlier, row still active.
+        let done = session(&state);
+        let p = plan(&state, "development", "approved", Some(&done));
+        phase(&state, &p, 0, "passed");
+        assert!(session_job_ended(&state, &done).unwrap());
+        assert_eq!(decide(&done, false), PaneDecision::Refuse(AGENT_JOB_ENDED.to_string()));
+        assert!(AGENT_JOB_ENDED.contains("job has ended"), "the web keys off this text");
+        assert_eq!(decide(&done, true), PaneDecision::Attach, "an existing pane may still be viewed");
+        // A reviewer of a terminal plan, and a planner of a done planning run: ended.
+        let rev = session(&state);
+        let p2 = plan(&state, "development", "stopped", None);
+        exec(&state, "UPDATE agent_plans SET reviewer_session_id = ?1 WHERE id = ?2", &[&rev, &p2]);
+        assert_eq!(decide(&rev, false), PaneDecision::Refuse(AGENT_JOB_ENDED.to_string()));
+        // Running plan, paused single-phase worker, standalone shell: protected → Create.
+        let running = session(&state);
+        plan(&state, "development", "phase_worker_running", Some(&running));
+        assert_eq!(decide(&running, false), PaneDecision::Create);
+        let paused = session(&state);
+        let p3 = plan(&state, "development", "approved", Some(&paused));
+        phase(&state, &p3, 0, "passed");
+        phase(&state, &p3, 1, "planned");
+        assert_eq!(decide(&paused, false), PaneDecision::Create);
+        let shell = session(&state);
+        assert_eq!(decide(&shell, false), PaneDecision::Create);
+        // Fails closed on a lookup error; an attached external tmux is never re-created.
+        assert!(matches!(decide_pane("x", false, false, || Err("db".into())), PaneDecision::Refuse(_)));
+        assert!(matches!(decide_pane("x", false, true, || Ok(false)), PaneDecision::Refuse(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn boot_backfill_archives_ended_jobs_once_and_spawns_nothing() {
+        let (state, root) = state();
+        let done = session(&state);
+        let p = plan(&state, "development", "approved", Some(&done));
+        phase(&state, &p, 0, "passed");
+        let rev = session(&state);
+        let p2 = plan(&state, "development", "done", None);
+        exec(&state, "UPDATE agent_plans SET reviewer_session_id = ?1 WHERE id = ?2", &[&rev, &p2]);
+        let running = session(&state);
+        let p3 = plan(&state, "development", "phase_worker_running", Some(&running));
+        let paused = session(&state);
+        let p4 = plan(&state, "development", "approved", Some(&paused));
+        phase(&state, &p4, 0, "passed");
+        phase(&state, &p4, 1, "planned");
+        let shell = session(&state);
+
+        let mut got = backfill_ended_job_sessions(&state).unwrap();
+        got.sort();
+        let mut want = vec![done.clone(), rev.clone()];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(status(&state, &done).as_deref(), Some("archived"));
+        assert_eq!(status(&state, &rev).as_deref(), Some("archived"));
+        for kept in [&running, &paused, &shell] {
+            assert_eq!(status(&state, kept).as_deref(), Some("active"), "{kept} must stay active");
+        }
+        let ev = retired(&state, &p);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["reason"], BACKFILL_REASON);
+        assert_eq!(ev[0]["sessionId"], done.as_str());
+        assert_eq!(ev[0]["role"], "worker");
+        assert_eq!(retired(&state, &p2)[0]["role"], "reviewer");
+        assert!(retired(&state, &p3).is_empty() && retired(&state, &p4).is_empty());
+        // Idempotent: a second boot changes nothing and writes no event.
+        let before = snapshot(&state);
+        assert!(backfill_ended_job_sessions(&state).unwrap().is_empty());
+        assert_eq!(snapshot(&state), before);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -18,9 +18,9 @@ function topbar(): string {
 
 describe('plan-agent shell page (template)', () => {
   it('derives view-only from the engine flag via isPlanAgentShell', () => {
-    expect(HTML).toContain('@let topViewOnly = isPlanAgentShell(sh);');
-    expect(topbar()).toContain('[class.pa-bar]="topViewOnly"');
-    expect(HTML).toContain('@let shViewOnly = isPlanAgentShell(sh);');
+    expect(HTML).toContain('@let topViewOnly = isReadOnlyShell(sh);');
+    expect(topbar()).toContain('[class.pa-bar]="topViewOnly || !!jobEndedNotice(terminalError()) || !!(sh && paneNotices()[sh.id])"');
+    expect(HTML).toContain('@let shViewOnly = isReadOnlyShell(sh);');
   });
 
   it('hides close/detach, rename and the Watchdog view for a plan agent', () => {
@@ -46,6 +46,31 @@ describe('plan-agent shell page (template)', () => {
     expect(HTML).toContain('[disabled]="shViewOnly"');
     expect(HTML).toContain('[showInput]="!shViewOnly"');
     expect(HTML).toContain('@if (!shViewOnly) {\n          <form class="st-composer"');
+  });
+
+  it('a /watchdog URL on a plan agent highlights Raw (the view it renders)', () => {
+    const bar = topbar();
+    expect(bar).toContain('@let shownView = visibleShellView(shellView(), topViewOnly);');
+    expect(bar).toContain(`[class.on]="shownView === 'raw'"`);
+    expect(bar).toContain(`[class.on]="shownView === 'transcript'"`);
+    expect(bar).not.toContain(`[class.on]="shellView() === 'raw'"`);
+  });
+
+  it('shows "job has ended, transcript only" instead of a blank Raw screen', () => {
+    const bar = topbar();
+    expect(bar).toContain('@let topJobEnded = (sh ? paneNotices()[sh.id] : null) || jobEndedNotice(terminalError());');
+    expect(bar).toContain('class="ps-view-only ps-job-ended" role="note"');
+    const ended = HTML.indexOf("} @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh)).kind === 'ended') {");
+    const raw = HTML.indexOf('<johnny-terminal-screen\n          class="terminal-surface plain-shell-screen mirror"');
+    expect(ended).toBeGreaterThan(-1);
+    expect(raw).toBeGreaterThan(ended); // checked BEFORE the raw screen renders
+    expect(HTML.slice(ended, raw)).toContain("(click)=\"setShellView('transcript')\"");
+  });
+
+  it('shows a refused close as the engine sentence, without "Failed to kill terminal: Error:"', () => {
+    expect(TS).not.toContain('`Failed to kill terminal: ${String(err)}`');
+    expect(TS).not.toContain('`Failed to close terminal: ${String(err)}`');
+    expect(TS.match(/this\.terminalError\.set\(closeRefusalText\(err\)\)/g)?.length).toBe(2);
   });
 
   it('clears a stale terminal error when a plan agent shell opens (keyed on the id)', () => {

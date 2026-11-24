@@ -701,3 +701,53 @@ describe('isPlanAgentShell (plan agent in tmux, view-only Raw page)', () => {
     expect(PLAN_AGENT_VIEW_ONLY_NOTE).toBe("View-only: talk to the plan agent in its plan's chat.");
   });
 });
+
+import {
+  AGENT_JOB_ENDED_NOTE,
+  closeRefusalText,
+  jobEndedNotice,
+  visibleShellView,
+} from './shells-page-logic';
+
+describe('jobEndedNotice (never resurrect a finished agent)', () => {
+  it('maps the engine refusal to the transcript-only note', () => {
+    expect(AGENT_JOB_ENDED_NOTE).toBe("This agent's job has ended. Transcript only.");
+    // `terminal::AGENT_JOB_ENDED`, possibly wrapped by the relay.
+    expect(jobEndedNotice("This agent's job has ended; its pane is not restarted. Transcript only.")).toBe(AGENT_JOB_ENDED_NOTE);
+    expect(jobEndedNotice("Error: This agent's job has ended; its pane is not restarted. Transcript only. (job lookup failed: x)")).toBe(AGENT_JOB_ENDED_NOTE);
+  });
+  it('ignores any other error', () => {
+    expect(jobEndedNotice('session x is archived; refusing to resurrect it')).toBeNull();
+    expect(jobEndedNotice(null)).toBeNull();
+    expect(jobEndedNotice(undefined)).toBeNull();
+    expect(jobEndedNotice('')).toBeNull();
+  });
+});
+
+describe('visibleShellView', () => {
+  it('a plan agent (view-only) on /watchdog shows and highlights Raw', () => {
+    expect(visibleShellView('watchdog', true)).toBe('raw');
+    expect(visibleShellView('raw', true)).toBe('raw');
+    expect(visibleShellView('transcript', true)).toBe('transcript');
+  });
+  it('any other shell keeps its view', () => {
+    expect(visibleShellView('watchdog', false)).toBe('watchdog');
+    expect(visibleShellView('raw', false)).toBe('raw');
+  });
+});
+
+describe('closeRefusalText', () => {
+  it('drops the Error: wrapping and keeps the engine sentence', () => {
+    const refusal = "This is a plan's agent: it ends with its plan (Start planning or Delete plan), not from here.";
+    expect(closeRefusalText(new Error(refusal))).toBe(refusal);
+    expect(closeRefusalText(`Error: ${refusal}`)).toBe(refusal);
+    expect(closeRefusalText(`Error: Error: ${refusal}`)).toBe(refusal);
+    expect(closeRefusalText(String(new Error(refusal)))).toBe(refusal);
+    expect(closeRefusalText(refusal)).not.toContain('Failed to kill terminal');
+  });
+  it('never blank', () => {
+    expect(closeRefusalText('')).toBe("Couldn't close the terminal.");
+    expect(closeRefusalText(new Error(''))).toBe("Couldn't close the terminal.");
+    expect(closeRefusalText(undefined)).toBe("Couldn't close the terminal.");
+  });
+});

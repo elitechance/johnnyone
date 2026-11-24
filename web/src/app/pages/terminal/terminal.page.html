@@ -127,8 +127,8 @@
     <!-- P4: minimal plain-shell top bar (mock console-states State C) — chip + session name + detach,
          no session tabs / New Terminal chrome. -->
     @let sh = currentSession();
-    @let topViewOnly = isPlanAgentShell(sh);
-    <header class="plain-shell-topbar" [class.pa-bar]="topViewOnly">
+    @let topViewOnly = isReadOnlyShell(sh);
+    <header class="plain-shell-topbar" [class.pa-bar]="topViewOnly || !!jobEndedNotice(terminalError()) || !!(sh && paneNotices()[sh.id])">
       <span class="ps-chip">{{ sh?.attached_tmux ? 'tmux' : 'shell' }}</span>
       <span class="ps-name">{{ sh?.title || 'Shell' }}</span>
       @if (sh && !topViewOnly) {
@@ -142,11 +142,12 @@
            Transcript is the bare-URL default (the mirrored pane is 172 cols wide and hard-wraps
            below ~55); Raw is the real terminal, still one tap away. -->
       <div class="ps-views" role="group" aria-label="Shell view">
-        <button type="button" class="ps-view" [class.on]="shellView() === 'transcript'"
-                [attr.aria-pressed]="shellView() === 'transcript'"
+        @let shownView = visibleShellView(shellView(), topViewOnly);
+        <button type="button" class="ps-view" [class.on]="shownView === 'transcript'"
+                [attr.aria-pressed]="shownView === 'transcript'"
                 (click)="setShellView('transcript')">Transcript</button>
-        <button type="button" class="ps-view" [class.on]="shellView() === 'raw'"
-                [attr.aria-pressed]="shellView() === 'raw'"
+        <button type="button" class="ps-view" [class.on]="shownView === 'raw'"
+                [attr.aria-pressed]="shownView === 'raw'"
                 (click)="setShellView('raw')">Raw</button>
         @if (!topViewOnly) {
         <button type="button" class="ps-view" [class.on]="shellView() === 'watchdog'"
@@ -161,11 +162,18 @@
         </button>
       }
       <!-- In the layout flow (a wrapped second row of the bar), never over the pane's first lines. -->
+      @let topJobEnded = (sh ? paneNotices()[sh.id] : null) || jobEndedNotice(terminalError());
       @if (topViewOnly) {
-        <div class="ps-view-only" role="note">{{ planAgentViewOnlyNote }}</div>
+        <div class="ps-view-only" role="note">{{ readOnlyNote(sh, planAgentViewOnlyNote, topJobEnded) }}</div>
         @if (terminalError(); as termErr) {
-          <div class="ps-term-error" role="alert">{{ termErr }}</div>
+          @if (!topJobEnded && isPlanAgentShell(sh)) {
+            <div class="ps-term-error" role="alert">{{ termErr }}</div>
+          }
         }
+      }
+      <!-- A finished worker/reviewer: the engine refuses to restart its pane (no blank screen). -->
+      @if (topJobEnded && !topViewOnly) {
+        <div class="ps-view-only ps-job-ended" role="note">{{ topJobEnded }}</div>
       }
     </header>
   }
@@ -176,7 +184,7 @@
            shell session (no per-pane header/tabs, no initiative chrome). -->
       @let sh = currentSession();
       @let shScreen = sh ? (terminalScreens()[sh.id] || null) : null;
-      @let shViewOnly = isPlanAgentShell(sh);
+      @let shViewOnly = isReadOnlyShell(sh);
       @if (sh && shellView() === 'transcript') {
         <!-- Append-only transcript, fed by the structured stream lane (D6). Reflows at any width,
              so it does not inherit the mirrored pane's column count. Composer reuses the raw-input
@@ -514,6 +522,13 @@
                  only above zero, so a healthy session's footnote reads exactly as before. -->
             <div class="wd-footnote">{{ wdNudgeCount() }} sent@if (wdHeldCount() > 0) { · held {{ wdHeldCount() }}×} · {{ wdArmedAgo() }}. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
           }
+        </section>
+      } @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh)).kind === 'ended') {
+        @let shellRaw = rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh));
+        <section class="workspace-empty job-ended" role="note">
+          <div class="empty-title">{{ shellRaw.kind === 'ended' ? shellRaw.note : '' }}</div>
+          <div class="empty-copy">Its pane is not restarted. The Transcript keeps what it did.</div>
+          <button type="button" class="ps-view" (click)="setShellView('transcript')">Open Transcript</button>
         </section>
       } @else if (sh) {
         <johnny-terminal-screen
@@ -989,7 +1004,17 @@
             }
           </section>
         } @else {
-          @if (rawAttachNeeded(primarySessionId(), !!terminalScreens()[primarySessionId() ?? ''])) {
+          @let consoleRaw = rawPaneView(primarySessionId(), !!terminalScreens()[primarySessionId() ?? ''], paneNotices());
+          @if (consoleRaw.kind === 'ended') {
+            <!-- A finished agent: the engine refuses to restart its pane (G-1-1). -->
+            <section class="raw-attach job-ended" role="note">
+              <div class="empty-title">{{ consoleRaw.note }}</div>
+              <div class="empty-copy">Its pane is not restarted. The Transcript keeps what it did.</div>
+              <div class="raw-attach-actions">
+                <a class="primary-action" [routerLink]="consoleRaw.transcriptLink">Open transcript</a>
+              </div>
+            </section>
+          } @else if (consoleRaw.kind === 'attach') {
             <section class="raw-attach">
               <div class="empty-title">No terminal attached</div>
               <div class="empty-copy">

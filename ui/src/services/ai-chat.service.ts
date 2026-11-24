@@ -7,6 +7,7 @@ import {
 } from './johnny-api.service';
 import { AiSession } from '../models/ai-session.model';
 import { AiMessage } from '../models/ai-message.model';
+import { classifyDelta, draftAfterError, errorNoticeText, messagesAfterError } from './ai-chat-logic';
 
 @Injectable({ providedIn: 'root' })
 export class AiChatService {
@@ -15,6 +16,8 @@ export class AiChatService {
   private deltaSubscription: Subscription | null = null;
   private messageSubscription: Subscription | null = null;
   private streamingContent = '';
+  /** The optimistic user bubble of the turn in flight (removed if the turn is refused). */
+  private pendingUserMessageId: string | null = null;
 
   /** The currently active session. */
   readonly currentSession = signal<AiSession | null>(null);
@@ -27,6 +30,19 @@ export class AiChatService {
 
   /** The id of the message currently being streamed. */
   readonly streamingMessageId = signal<string | null>(null);
+
+  /**
+   * The last turn's refusal/failure (an `error`-kind final delta: BUSY, "plan left briefing", a
+   * crash, a timeout), shown inline in the chat. Cleared by the next send and on session load.
+   */
+  readonly turnError = signal<string | null>(null);
+
+  /**
+   * The text of a send the engine refused before storing it (BUSY, …), to put back into the
+   * composer. `seq` changes on every restore so the same text can be restored twice.
+   */
+  readonly restoredDraft = signal<{ text: string; seq: number } | null>(null);
+  private draftSeq = 0;
 
   /** Computed message count for convenience. */
   readonly messageCount = computed(() => this.messages().length);
@@ -41,6 +57,10 @@ export class AiChatService {
     this.isStreaming.set(false);
     this.streamingMessageId.set(null);
     this.streamingContent = '';
+    this.turnError.set(null);
+    this.pendingUserMessageId = null;
+    // A root singleton: another plan's (or an earlier visit's) refused draft must not reappear.
+    this.restoredDraft.set(null);
 
     this.api.getSession(id).subscribe({
       next: (session) => {
@@ -81,6 +101,10 @@ export class AiChatService {
     this.messages.update((msgs) => [...msgs, optimisticMessage]);
     this.isStreaming.set(true);
     this.streamingContent = '';
+    this.turnError.set(null);
+    // A new send supersedes any earlier restore (it was sent, so nothing to put back later).
+    this.restoredDraft.set(null);
+    this.pendingUserMessageId = optimisticMessage.id;
 
     this.api.sendRelayMessage({ sessionId: session.id, content }).subscribe({
       next: ({ relayId }) => {
@@ -90,8 +114,11 @@ export class AiChatService {
       },
       error: (err) => {
         console.error('[AiChatService] Failed to send message:', err);
-        // Remove the optimistic message on failure
+        // Remove the optimistic message on failure, and say why.
         this.messages.update((msgs) => msgs.filter((m) => m.id !== optimisticMessage.id));
+        this.restoredDraft.set({ text: content, seq: ++this.draftSeq });
+        this.turnError.set(errorNoticeText({ delta: err instanceof Error ? err.message : String(err ?? '') }));
+        this.pendingUserMessageId = null;
         this.isStreaming.set(false);
       },
     });
@@ -167,10 +194,20 @@ export class AiChatService {
   }
 
   private handleDelta(delta: RelayChatDeltaMsg): void {
-    // Skip control chunks (system/result/error) — only assistant text accumulates. The final
-    // `onRelayChatMessage` reconciles the clean content, so minor noise self-corrects.
-    const kind = (delta.chunkType || '').toLowerCase();
-    if (kind === 'system' || kind === 'result' || kind === 'error') {
+    // Skip control chunks (system/result) — only assistant text accumulates. The final
+    // `onRelayChatMessage` reconciles the clean content, so minor noise self-corrects. A FINAL
+    // error is a refused/failed turn: show it inline and drop the bubble of a send that stored nothing.
+    const kind = classifyDelta(delta);
+    if (kind === 'error') {
+      const streamedText = this.streamingContent.trim().length > 0;
+      this.turnError.set(errorNoticeText(delta));
+      const draft = draftAfterError(this.messages(), this.pendingUserMessageId, streamedText, delta.delta ?? '');
+      if (draft) this.restoredDraft.set({ text: draft, seq: ++this.draftSeq });
+      this.messages.update((msgs) => messagesAfterError(msgs, this.pendingUserMessageId, streamedText));
+      this.finishStreaming();
+      return;
+    }
+    if (kind === 'control') {
       if (delta.isFinal) this.finishStreaming();
       return;
     }
@@ -232,6 +269,7 @@ export class AiChatService {
   }
 
   private finishStreaming(): void {
+    this.pendingUserMessageId = null;
     this.isStreaming.set(false);
     this.streamingMessageId.set(null);
     this.streamingContent = '';

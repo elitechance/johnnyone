@@ -8,6 +8,7 @@ use johnnyone_desktop_lib::paths::default_db_path;
 use johnnyone_desktop_lib::services::agent_plans;
 use johnnyone_desktop_lib::services::agent_reaper;
 use johnnyone_desktop_lib::services::brief_store;
+use johnnyone_desktop_lib::services::plan_agent_tmux;
 use johnnyone_desktop_lib::services::provider_preflight;
 use johnnyone_desktop_lib::services::question_watch;
 use johnnyone_desktop_lib::services::relay;
@@ -169,6 +170,10 @@ fn main() {
             // behind. Every row-backed kill archives the row and writes `agent_session_retired`.
             // Like the watchdog, a long-lived task on Tauri's tokio runtime.
             agent_reaper::spawn_orphan_sweep(app_state.clone(), engine_started_unix);
+
+            // Plan agent turns the previous engine died while following (no exit sidecar, never
+            // settled): kill a still-running one, record "interrupted by an engine restart".
+            plan_agent_tmux::spawn_restart_reconcile(app_state.clone());
 
             // Plans tab (00/08): every 60 s, start each queued briefing whose conflicting
             // initiatives have finished (`brief_store::release_queued_briefs` → `accept_brief`).

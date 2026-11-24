@@ -3,6 +3,7 @@ import {
   AGENT_PILL_LABEL,
   agentPane,
   copyLabel,
+  copyResetMs,
   agentState,
   composerState,
   extractChoices,
@@ -114,6 +115,13 @@ describe('plan-chat-logic', () => {
     expect(copyLabel('idle')).toBe('Copy');
     expect(copyLabel('copied')).toBe('Copied');
     expect(copyLabel('failed')).toContain('Copy failed');
-    expect(copyLabel('failed')).toContain('selected');
+    expect(copyLabel('failed')).toContain('Ctrl/⌘+C');
+    expect(copyLabel('failed').length).toBeLessThanOrEqual(28); // fits a phone header
+  });
+
+  it('resets the Copy label: Copied after 1.5 s, Copy failed after ~4 s', () => {
+    expect(copyResetMs('copied')).toBe(1500);
+    expect(copyResetMs('failed')).toBe(4000);
+    expect(copyResetMs('idle')).toBeNull();
   });
 });
