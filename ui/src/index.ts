@@ -146,6 +146,7 @@ export {
   escapeHtml,
   highlightCode,
 } from './lib/markdown-render';
+export { toIsoUtc, parseServerTime, formatMessageTime } from './lib/server-time';
 
 // ── Copy core ────────────────────────────────────────────────────────────────
 export {

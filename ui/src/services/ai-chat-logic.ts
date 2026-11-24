@@ -6,6 +6,7 @@
  * shown as an inline notice; it is never appended to the assistant's text.
  */
 import type { AiMessage } from '../models/ai-message.model';
+import { toIsoUtc } from '../lib/server-time';
 
 export interface ChatDeltaLike {
   chunkType?: string | null;
@@ -75,4 +76,9 @@ export function messagesAfterError(
 ): AiMessage[] {
   if (streamedText || !optimisticId) return [...msgs];
   return msgs.filter((m) => m.id !== optimisticId);
+}
+
+/** Stored messages with their engine time (zone-less UTC) as ISO `Z`, so a reload shows the same clock. */
+export function normalizeStoredMessages(msgs: readonly AiMessage[] | null | undefined): AiMessage[] {
+  return (msgs ?? []).map((m) => (m.createdAt ? { ...m, createdAt: toIsoUtc(m.createdAt) } : m));
 }

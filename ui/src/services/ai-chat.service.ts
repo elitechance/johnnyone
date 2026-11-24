@@ -7,7 +7,7 @@ import {
 } from './johnny-api.service';
 import { AiSession } from '../models/ai-session.model';
 import { AiMessage } from '../models/ai-message.model';
-import { classifyDelta, draftAfterError, errorNoticeText, messagesAfterError } from './ai-chat-logic';
+import { classifyDelta, draftAfterError, errorNoticeText, messagesAfterError, normalizeStoredMessages } from './ai-chat-logic';
 
 @Injectable({ providedIn: 'root' })
 export class AiChatService {
@@ -180,7 +180,8 @@ export class AiChatService {
   private fetchMessages(sessionId: string): void {
     this.api.listMessages(sessionId).subscribe({
       next: (messages) => {
-        this.messages.set(messages);
+        // Stored rows carry zone-less UTC times; the live ones are ISO `Z`. One form for both.
+        this.messages.set(normalizeStoredMessages(messages));
       },
       error: (err) => {
         console.error('[AiChatService] Failed to fetch messages:', err);

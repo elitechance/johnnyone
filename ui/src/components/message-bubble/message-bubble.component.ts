@@ -24,6 +24,7 @@ import {
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { AiMessage } from '../../models/ai-message.model';
 import { parseMarkdown, hydrateMermaid } from '../../lib/markdown-render';
+import { formatMessageTime } from '../../lib/server-time';
 import {
   canCopyMessage,
   clearCopyResetTimer,
@@ -226,9 +227,8 @@ export class MessageBubbleComponent implements AfterViewChecked, OnDestroy {
   }
 
   get formattedTime(): string {
-    if (!this.message.createdAt) return '';
-    const date = new Date(this.message.createdAt);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    // Engine times are zone-less UTC (`2026-11-24 13:14:38`); `new Date()` read them as local.
+    return formatMessageTime(this.message.createdAt);
   }
 
   /** Render message content as markdown (for assistant/user) or plain text (for others). */
