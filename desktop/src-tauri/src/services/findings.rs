@@ -4641,10 +4641,13 @@ mod workflow_tests {
         let d = round_digest(&"x".repeat(200), long_slug, pos(3, 7), 1, 0, act(0, 0, 0), &[], "PASS", RoundOutcome::Passed { plan_complete: false });
         assert_eq!(d.plan.chars().count(), DIGEST_TITLE_CHARS);
         assert!(d.line().contains("· phase 3/7 r1:"), "a long slug is left out: {}", d.line());
-        let ids: Vec<String> = (0..80).map(|n| format!("F-{}-{n}", "y".repeat(40))).collect();
+        // Escalated ids of a phase with a long slug: three of them alone exceed 256 characters.
+        let ids: Vec<String> = (0..80).map(|n| format!("F-{}-{n}", "y".repeat(120))).collect();
         let rows: Vec<Finding> = ids.iter().map(|id| row(id, "blocking", "open")).collect();
         let huge = round_digest(&"p".repeat(39), &"z".repeat(300), pos(1, 1), 1, 0, act(0, 0, 0), &rows, "x", RoundOutcome::NeedsYou { escalated: ids });
-        assert!(huge.line().chars().count() <= DIGEST_MAX_CHARS && huge.headline().chars().count() <= DIGEST_MAX_CHARS);
+        assert_eq!(huge.headline().chars().count(), DIGEST_MAX_CHARS, "the embed title is capped");
+        assert!(huge.headline().ends_with('…'));
+        assert_eq!(huge.line().chars().count(), DIGEST_MAX_CHARS);
     }
 
     #[test]
