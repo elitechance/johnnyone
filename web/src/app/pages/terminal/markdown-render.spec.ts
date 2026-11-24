@@ -25,16 +25,12 @@ describe('render core — parseMarkdown', () => {
     expect(html).not.toContain('<svg'); // rendered later by hydrateMermaid, not here
   });
 
-  it('passes raw prose HTML through unsanitized (current shipped posture)', () => {
-    // ACTUAL behavior, pinned as-is: marked v14 does NOT escape raw block/inline
-    // HTML, and message-bubble wraps parseMarkdown's output in
-    // DomSanitizer.bypassSecurityTrustHtml(...). So a prose `<script>` survives
-    // verbatim. This is a strict extract/dedupe phase (D2/D8/D9) — behavior is
-    // preserved, not changed. Hardening this into real sanitization is a tracked
-    // follow-up (see decisions.md "D-followup" / BLOCKER-task03-sanitization.md).
+  it('strips raw prose <script> (sanitized since U-1-1; was the pinned unsanitized posture)', () => {
+    // The follow-up this test used to point at is done: parseMarkdown now sanitizes its output
+    // (DOMPurify + URL allowlist). Full coverage: web/src/app/components/markdown-sanitize.spec.ts.
     const html = parseMarkdown('<script>alert(1)</script> hi');
-    expect(html).toContain('<script>alert(1)</script>');
-    expect(html).not.toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script');
+    expect(html).toContain('hi');
   });
 
   it('escapes html *inside* a code fence (highlightCode path)', () => {
