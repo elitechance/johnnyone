@@ -7,6 +7,9 @@
 --   what was broken to see it fail), `red_output` (the failing output, <= 2 KB, sanitized), and
 --   `red_first` (1 = the claim carries a test AND its red output, 0 = it does not, NULL = never claimed).
 -- * `dispute_reason`: the worker's reason for the latest dispute.
+-- The runner records the `_migrations` row after this batch, outside this transaction. A crash
+-- between COMMIT and that row reruns 032; the rerun is safe only because the copy below names its
+-- columns (it reads the already-rebuilt table the same way).
 BEGIN;
 CREATE TABLE plan_findings_new (
   plan_id        TEXT NOT NULL,
