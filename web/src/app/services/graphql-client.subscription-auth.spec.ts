@@ -351,6 +351,31 @@ describe('turn fallback when live updates are down (bug 2)', () => {
     }
   });
 
+  it('U-2-21: coming back while a turn is in flight settles it from the store (no stuck spinner)', async () => {
+    vi.useFakeTimers();
+    try {
+      let stored: AiMessage[] = [];
+      const { chat, listMessages } = chatWith({ deltas: () => new Subject(), store: () => stored });
+      chat.loadSession('A');
+      chat.sendMessage('hello');
+      chat.teardownSubscriptions(); // the page was left mid-turn: the delta feed is gone
+      chat.resumeSession('A');
+      expect(chat.isStreaming()).toBe(true);
+      stored = [m('u1', 'user', 'hello', nowUtc()), m('a1', 'assistant')];
+      const before = listMessages.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(TURN_FALLBACK_POLL_MS);
+      expect(listMessages.mock.calls.length).toBe(before + 1);
+      expect(chat.isStreaming()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('turnAnsweredInStore: a recent user row with DIFFERENT text is not this turn', () => {
+    const turn = { content: 'hello', sentAtMs: Date.UTC(2026, 10, 24, 13, 14, 0), baseline: 0 };
+    expect(turnAnsweredInStore([m('u', 'user', 'something else', '2026-11-24 13:14:05'), m('a', 'assistant')], turn)).toBe(false);
+  });
+
   it('U-1-3: coming back to the same session re-subscribes and re-reads the store', () => {
     const { chat, listMessages, onRelayChatMessage } = chatWith({ store: () => [] });
     chat.loadSession('A');

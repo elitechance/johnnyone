@@ -6,7 +6,7 @@
  * highlighted code and the mermaid placeholder still render (O3).
  */
 import { describe, expect, it } from 'vitest';
-import { isSafeUrl, parseMarkdown, sanitizeHtml } from '../../../../ui/src/lib/markdown-render';
+import { isSafeUrl, parseMarkdown, safeTextAlign, sanitizeHtml } from '../../../../ui/src/lib/markdown-render';
 
 /** Parse the rendered HTML so assertions look at the DOM, not at substrings. */
 function dom(html: string): HTMLElement {
@@ -106,5 +106,35 @@ describe('markdown output is sanitized (U-1-1)', () => {
 
   it('sanitizeHtml is what parseMarkdown returns through', () => {
     expect(sanitizeHtml('<p onclick="x()">t</p>')).toBe('<p>t</p>');
+  });
+
+  it('U-2-19: style keeps only table text-align; an overlay loses its style', () => {
+    const div = dom(parseMarkdown('<div style="position:fixed;inset:0;z-index:9999">pwn</div>')).querySelector('div');
+    expect(div?.getAttribute('style') ?? null).toBeNull();
+    const mixed = dom(parseMarkdown('<p style="text-align: center; position: fixed">x</p>')).querySelector('p');
+    expect(mixed?.getAttribute('style') ?? null).toBeNull();
+    const host = dom(parseMarkdown('| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |'));
+    expect(Array.from(host.querySelectorAll('th')).map((th) => th.getAttribute('style'))).toEqual([
+      'text-align: left',
+      'text-align: center',
+      'text-align: right',
+    ]);
+    expect(safeTextAlign('text-align:LEFT;')).toBe('left');
+    expect(safeTextAlign('text-align: justify')).toBeNull();
+    expect(safeTextAlign('color: red')).toBeNull();
+  });
+
+  it('U-2-20: GFM task lists keep a visible box (as text, no <input>)', () => {
+    const host = dom(parseMarkdown('- [x] done\n- [ ] todo'));
+    const items = Array.from(host.querySelectorAll('li')).map((li) => li.textContent?.trim());
+    expect(items).toEqual(['☑ done', '☐ todo']);
+    expect(host.querySelector('input')).toBeNull();
+  });
+
+  it('form controls are stripped (form, input, button)', () => {
+    const host = dom(parseMarkdown('<form action="https://evil.example"><input name="pw" type="password"><button>Sign in</button></form>'));
+    expect(host.querySelector('form')).toBeNull();
+    expect(host.querySelector('input')).toBeNull();
+    expect(host.querySelector('button')).toBeNull();
   });
 });

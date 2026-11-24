@@ -193,6 +193,9 @@ export class AiChatService {
     this.liveDown = false;
     this.subscribeToMessages(id);
     this.fetchMessages(id);
+    // A turn still in flight lost its delta feed when the page was left: settle it from the store
+    // (U-2-21), or the spinner stays until a reload. A live reply finishing first stops the poll.
+    if (this.isStreaming()) this.startTurnFallback();
   }
 
   /**

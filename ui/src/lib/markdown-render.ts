@@ -105,6 +105,10 @@ function createMarkdownParser(): Marked {
     );
   };
 
+  // GFM task lists: `input` is forbidden by the sanitizer, so the box is text (U-2-20).
+  renderer.checkbox = ({ checked }) =>
+    checked ? '<span class="md-task done" aria-label="done">☑</span>' : '<span class="md-task" aria-label="to do">☐</span>';
+
   renderer.table = (token) => {
     const renderCell = (cell: (typeof token.header)[number], tag: 'th' | 'td'): string => {
       const align = cell.align ? ` style="text-align: ${cell.align}"` : '';
@@ -147,6 +151,12 @@ export function isSafeUrl(url: string | null | undefined): boolean {
   return SAFE_URL.test(u);
 }
 
+/** The only inline style kept: a lone `text-align: left|center|right` (U-2-19), else `null`. */
+export function safeTextAlign(style: string | null | undefined): 'left' | 'center' | 'right' | null {
+  const m = /^\s*text-align\s*:\s*(left|center|right)\s*;?\s*$/i.exec(style ?? '');
+  return m ? (m[1].toLowerCase() as 'left' | 'center' | 'right') : null;
+}
+
 let purifier: DOMPurifyInstance | null = null;
 
 /**
@@ -160,6 +170,13 @@ function getPurifier(): DOMPurifyInstance | null {
   p.addHook('afterSanitizeAttributes', (node) => {
     for (const name of URL_ATTRS) {
       if (node.hasAttribute?.(name) && !isSafeUrl(node.getAttribute(name))) node.removeAttribute(name);
+    }
+    // `style` is reduced to the table alignment the renderer writes (U-2-19): anything else (a
+    // `position:fixed` overlay drawn over the app, for one) is dropped.
+    if (node.hasAttribute?.('style')) {
+      const align = safeTextAlign(node.getAttribute('style'));
+      if (align) node.setAttribute('style', `text-align: ${align}`);
+      else node.removeAttribute('style');
     }
   });
   purifier = p;

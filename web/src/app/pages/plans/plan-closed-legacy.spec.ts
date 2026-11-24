@@ -39,6 +39,11 @@ describe('a closed plan is "closed", not "not found" (bug 5)', () => {
     // "Open initiative" only when there is a reachable one (U-1-7).
     expect(block).toMatch(/@if \(closedInitiative\(\); as initId\) \{\s*<ion-button fill="clear" \[routerLink\]="\['\/initiatives'\]" \[queryParams\]="\{ initiativeId: initId \}">Open initiative →<\/ion-button>\s*\}/);
     expect(TS).toContain('this.closedInitiative.set(closedPlanInitiativeLink(plan, run.plan));');
+    // Wiring (QA gap): a closed plan resolves its initiative during load(), before the brief branch.
+    const code = TS.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    expect(code).toMatch(/^\s+if \(run\.plan\.status === 'closed'\) await this\.resolveClosedInitiative\(run\.plan\);$/m);
+    expect(code).toMatch(/^\s+const run = await firstValueFrom\(this\.api\.getAgentPlan\(plan\.initiativeId!\)\);$/m);
+    expect(code).toMatch(/^\s+this\.closedInitiative\.set\(null\);$/m);
     expect(HTML).toContain('<h2>Plan not found</h2>'); // still there for a truly missing plan
   });
 });
