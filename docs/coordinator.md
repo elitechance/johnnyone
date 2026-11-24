@@ -408,9 +408,11 @@ must rule on it in the next round. The lens's verdict is held back until it does
 - `WITHDRAW` closes the finding as `withdrawn`.
 
 A stream lens cannot call `resolveFinding`, so it rules from its bullets. When it does not approve,
-a bullet that repeats the claim or names the finding's id ("F-00-x-2 still stands: …") upholds the
-dispute, and that bullet is not imported as a new finding. A dispute is withdrawn only when no bullet
-repeats the claim or names the id, or when the lens approves.
+a bullet that repeats a row's claim or names its id answers that row, fail-safe. A dispute it names
+is upheld, and that bullet is not imported again. A claimed fix it names is reopened, and a proposed
+waiver it names is rejected, with the bullet as SAW. The bullet is still imported as its own finding.
+For example, "F-00-x-1 still fails: …" never verifies F-00-x-1. A dispute is withdrawn only when no
+bullet repeats the claim or names the id, or when the lens approves.
 
 A dispute nobody rules on (its lens left the panel) keeps blocking the phase. A human recovers it
 with `overrideFinding` (REOPEN or WITHDRAW), and can reopen a withdrawn finding.

@@ -2379,8 +2379,9 @@ pub struct Reconciliation {
     pub import: Vec<String>,
 }
 
-/// Match an untyped lens's bullets against the rows it owns, by normalized claim or — for a
-/// disputed row, when the lens did not approve — by a bullet that names the row's id. Pure. A disputed row is withdrawn
+/// Match an untyped lens's bullets against the rows it owns, by normalized claim or — when the lens
+/// did not approve — by a bullet that names the row's id (fail-safe: reopen / reject / uphold).
+/// Pure. A disputed row is withdrawn
 /// only when no bullet repeats its claim AND no bullet names its id (or the lens approved).
 ///
 /// `passing`: the lens's verdict was PASS / PASS_WITH_FOLLOWUPS. An approving lens has accepted the
@@ -2393,9 +2394,11 @@ pub fn reconcile_untyped_lens(owned_rows: &[Finding], bullets: &[String], passin
         let key = normalize_saw(&f.claim);
         bullets.iter().find(|b| normalize_saw(b) == key).cloned()
     };
-    // A DISPUTE the lens still rejects can be answered by naming its id ("F-00-x-2 still stands:
-    // …"): that bullet upholds it and is not imported. Only disputes: a bullet naming a claimed row
-    // ("F-00-x-1 is now fine; but …") is NOT a reopen, and its other objection must be imported.
+    // A bullet from a non-approving lens that names a row's id answers that row, fail-safe:
+    // - a DISPUTE it names is upheld, and the bullet is consumed (it is the same objection);
+    // - a CLAIMED fix / PROPOSED waiver it names is reopened / rejected with the bullet as SAW, AND
+    //   the bullet is still imported as its own finding: "F-1 still fails: <reworded>" must never
+    //   verify F-1, and "F-1 is now fine; but the endpoint leaks tokens" must keep the leak.
     let by_id = |f: &Finding| bullets.iter().find(|b| mentions_id(b, &f.id)).cloned();
     let mut answered_by_id: Vec<String> = Vec::new();
     for f in &live {
@@ -2403,11 +2406,10 @@ pub fn reconcile_untyped_lens(owned_rows: &[Finding], bullets: &[String], passin
             None
         } else {
             bullet_for(f).or_else(|| {
-                if f.state != FindingState::Disputed.as_str() {
-                    return None;
-                }
                 let b = by_id(f)?;
-                answered_by_id.push(b.clone());
+                if f.state == FindingState::Disputed.as_str() {
+                    answered_by_id.push(b.clone());
+                }
                 Some(b)
             })
         };
@@ -4749,14 +4751,25 @@ mod workflow_tests {
     }
 
     #[test]
-    fn stream_lens_id_mention_does_not_reopen_a_claimed_row() {
+    fn stream_lens_id_mention_reopens_a_claimed_row_and_keeps_the_new_objection() {
         let mut c = row("F-00-x-1", "blocking", "claimed");
         c.claim = "save drops where_".into();
+        let mut w = row("F-00-x-2", "blocking", "waive_proposed");
+        w.claim = "no fence".into();
         let bullet = "F-00-x-1 is now fine; but the new endpoint leaks tokens".to_string();
-        let r = reconcile_untyped_lens(&[c], &[bullet.clone()], false);
-        assert_eq!(r.verify, vec!["F-00-x-1".to_string()], "the claimed row is verified: {r:?}");
-        assert!(r.reopen.is_empty(), "{r:?}");
-        assert_eq!(r.import, vec![bullet], "the new objection is imported");
+        let waiver = "F-00-x-2 still needs its fence".to_string();
+        let r = reconcile_untyped_lens(&[c, w], &[bullet.clone(), waiver.clone()], false);
+        // Fail-safe: naming a claimed id reopens it, naming a waived id rejects the waiver…
+        assert_eq!(r.reopen, vec![("F-00-x-1".to_string(), bullet.clone())], "{r:?}");
+        assert_eq!(r.reject_waiver, vec![("F-00-x-2".to_string(), waiver.clone())], "{r:?}");
+        assert!(r.verify.is_empty() && r.accept_waiver.is_empty(), "{r:?}");
+        // …and the bullet's own objection is still imported.
+        assert_eq!(r.import, vec![bullet, waiver], "the bullets are kept as findings");
+        // An approving lens names ids freely: no reopen.
+        let mut c = row("F-00-x-1", "blocking", "claimed");
+        c.claim = "save drops where_".into();
+        let r = reconcile_untyped_lens(&[c], &["F-00-x-1 is fixed".to_string()], true);
+        assert_eq!(r.verify, vec!["F-00-x-1".to_string()]);
     }
 
     #[test]

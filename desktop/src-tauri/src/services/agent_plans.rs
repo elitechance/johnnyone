@@ -22216,7 +22216,7 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
     }
 
     #[tokio::test]
-    async fn workflow_stream_lens_naming_a_claimed_id_keeps_the_new_objection() {
+    async fn workflow_stream_lens_naming_a_claimed_id_reopens_it_and_keeps_the_new_objection() {
         let f = fx();
         let lenses = vec![lens("glm", "lokalai", true)];
         let sink = Mutex::new(Vec::new());
@@ -22227,9 +22227,32 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         let text = format!("- {id} is now fine; but the new endpoint leaks tokens");
         f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &text))], &lenses, &sink).await;
         let rows = f.rows();
-        assert_eq!(ledger::get(&f.state, &f.id, &id).unwrap().state, "verified", "{rows:?}");
+        assert_eq!(ledger::get(&f.state, &f.id, &id).unwrap().state, "reopened", "fail-safe: {rows:?}");
         let new = rows.iter().find(|r| r.id != id).expect("the objection is imported");
         assert_eq!((new.claim.as_str(), new.severity.as_str(), new.state.as_str()), (&text[2..], "blocking", "open"));
+        assert_eq!(gate(&f), "NEEDS_CHANGES");
+    }
+
+    #[tokio::test]
+    async fn workflow_round3_reworded_rejection_of_a_claimed_fix_never_passes() {
+        let f = fx();
+        let lenses = vec![lens("glm", "lokalai", true)];
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", "- the save drops where_"))], &lenses, &sink).await;
+        let id = f.rows()[0].id.clone();
+        f.claim(&id);
+        f.next_round();
+        f.next_round();
+        assert_eq!(ledger::current_round(&f.state, &f.id, "00-x"), 3);
+        let bullet = format!("{id} still fails: where_ is empty after an update");
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &format!("- {bullet}")))], &lenses, &sink).await;
+        let row = ledger::get(&f.state, &f.id, &id).unwrap();
+        assert_eq!((row.state.as_str(), row.last_saw.as_deref()), ("reopened", Some(bullet.as_str())), "not verified");
+        assert!(f.events("agent_finding_verified").is_empty());
+        assert_eq!(gate(&f), "NEEDS_CHANGES", "the gate does not pass a fix the lens rejected");
+        assert_ne!(f.plan_status(), "approved");
+        // The bullet is still kept, as a round-3 follow-up.
+        assert!(f.rows().iter().any(|r| r.id != id && r.claim == bullet && r.severity == "followup"));
     }
 
     #[tokio::test]
@@ -22273,6 +22296,11 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert!(last["line"].as_str().unwrap().ends_with("⚠ needs you"), "{last}");
         let na = f.events("agent_phase_needs_attention").last().unwrap().clone();
         assert_eq!((na["reason"].as_str(), na["digest"].as_bool()), (Some("kloo_review"), Some(true)));
+        // W-3-28: the one post carries the kloo park reason (the plan's error = the review summary).
+        let posted = f.digests.lock().unwrap().last().unwrap().clone();
+        let (line, reason) = posted.split_once('\n').expect("a reason line");
+        assert!(line.ends_with("⚠ needs you"), "{posted}");
+        assert!(reason.contains("2-lens review") && reason.contains("qa: BLOCKED"), "{posted}");
     }
 
     #[test]
