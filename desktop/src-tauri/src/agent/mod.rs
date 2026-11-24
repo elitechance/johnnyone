@@ -19,7 +19,7 @@ use crate::tools::ToolDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use message_types::{
     AgentEnvelope, AgentMessage, AgentPlanRunUpdated, RelayChatComplete, RelayChatDelta,
-    RelayChatRequest, RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted,
+    RelayChatMessage, RelayChatRequest, RpcMessageView, RpcRequest, RpcResponse, RpcSessionView, SessionDeleted,
     SessionUpdated, TerminalCommandAck, TerminalScreen,
 };
 use std::sync::Arc;
@@ -3495,6 +3495,170 @@ impl AgentService {
         })
     }
 
+    /// Follow one relayed chat turn to its end, publishing it through `emit` (the relay socket in
+    /// production, a recorder in tests): every chunk as a `chat_delta`, then — after the turn's
+    /// registration is dropped — the FINAL assistant text as a `chat_message`, then `chat_complete`.
+    ///
+    /// The final `chat_message` is what the web's `onRelayChatMessage` subscription reconciles the
+    /// reply with (live UI bugs 2, item 1). The relay sent only deltas + `chat_complete`, so a reply
+    /// whose deltas were missed (a delta subscription opened after the turn's first chunks — a
+    /// plan-agent pane turn answers in a few large chunks) never arrived live.
+    pub(crate) async fn stream_relay_turn<E, Fut>(
+        state: &AppState,
+        req: &RelayChatRequest,
+        rx: &mut tokio::sync::mpsc::Receiver<StreamChunk>,
+        turn_id: u64,
+        idle: Duration,
+        mut emit: E,
+    ) -> RelayTurnOutcome
+    where
+        E: FnMut(AgentEnvelope) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut full_content = String::new();
+        let mut total_input_tokens: i64 = 0;
+        let mut total_output_tokens: i64 = 0;
+        let mut total_cost_cents: i64 = 0;
+        let mut captured_cli_session_id: Option<String> = None;
+        let mut clear_cli_session_id = false;
+        // Monotonic ordering key for the structured StreamEvent lane (overhaul P2, D6). Per-turn;
+        // full per-session global sequencing is a Phase-3 concern.
+        let mut stream_seq: u64 = 0;
+        let mut tool_chunks: Vec<StreamChunk> = Vec::new();
+        let mut fallback_error: Option<String> = None;
+        let mut finish_reason = "stop".to_string();
+        let mut should_kill_process = false;
+
+        loop {
+            // The same idle timeout as the host paths (F-2-23): a hung turn is killed below instead
+            // of holding the plan agent's slot until a Stop.
+            let chunk = match crate::services::chat_host::recv_turn_chunk(rx, idle).await {
+                crate::services::chat_host::TurnRecv::Chunk(chunk) => chunk,
+                crate::services::chat_host::TurnRecv::Closed => {
+                    // A final chunk breaks out below, so a close here is always an early end.
+                    finish_reason = "stream_closed".to_string();
+                    break;
+                }
+                crate::services::chat_host::TurnRecv::TimedOut => {
+                    finish_reason = "timeout".to_string();
+                    should_kill_process = true;
+                    clear_cli_session_id = true;
+                    let message = crate::services::chat_host::TURN_TIMEOUT_MESSAGE.to_string();
+                    fallback_error = Some(message.clone());
+                    // Tell the web, so it leaves its streaming state and shows the reason.
+                    emit(AgentEnvelope {
+                        message: AgentMessage::RelayChatDelta(RelayChatDelta {
+                            relay_id: req.relay_id.clone(),
+                            session_id: req.session_id.clone(),
+                            delta: message,
+                            chunk_type: "error".to_string(),
+                            is_final: true,
+                        }),
+                    })
+                    .await;
+                    break;
+                }
+            };
+            if chunk.chunk_type == ChunkType::Text {
+                full_content.push_str(&chunk.content);
+            }
+            if matches!(chunk.chunk_type, ChunkType::ToolUse | ChunkType::ToolResult) {
+                tool_chunks.push(chunk.clone());
+            }
+
+            if (chunk.chunk_type == ChunkType::System || chunk.chunk_type == ChunkType::Result)
+                && chunk.session_id.is_some()
+            {
+                captured_cli_session_id = chunk.session_id.clone();
+            }
+
+            if chunk.chunk_type == ChunkType::Error {
+                clear_cli_session_id = true;
+                fallback_error = Some(chunk.content.clone());
+                finish_reason = "error".to_string();
+            }
+
+            if chunk.chunk_type == ChunkType::Result {
+                if let Some(tokens) = chunk.input_tokens {
+                    total_input_tokens = tokens;
+                }
+                if let Some(tokens) = chunk.output_tokens {
+                    total_output_tokens = tokens;
+                }
+                if let Some(cost) = chunk.cost_usd {
+                    total_cost_cents = (cost * 100.0) as i64;
+                }
+            }
+
+            emit(AgentEnvelope {
+                message: AgentMessage::RelayChatDelta(RelayChatDelta {
+                    relay_id: req.relay_id.clone(),
+                    session_id: req.session_id.clone(),
+                    delta: chunk.content.clone(),
+                    chunk_type: format!("{:?}", chunk.chunk_type).to_lowercase(),
+                    is_final: chunk.is_final,
+                }),
+            })
+            .await;
+
+            // Additive: also emit the structured StreamEvent lane (overhaul P2, D6). Purely
+            // parallel to the delta push above — the existing chat path is unchanged. Ignore the
+            // send error when there are no subscribers (matches the terminal/chat_delta convention).
+            if let Some(ev) = Self::stream_event_from_chunk(&req.session_id, stream_seq, &chunk) {
+                stream_seq += 1;
+                let _ = state.stream_event_tx.send(ev);
+            }
+
+            if chunk.is_final {
+                break;
+            }
+        }
+
+        // The turn is over: drop the registration (a Stop may already have removed + killed it),
+        // and kill it after an idle timeout. Only THIS turn's handle: a later turn may already be
+        // registered for the session.
+        crate::services::chat_host::end_own_turn(&state.active_processes, &req.session_id, turn_id, should_kill_process)
+            .await;
+        // Stored text keeps a crash/timeout line even after partial output (F-1-10).
+        let (full_content, finish_reason) = crate::services::chat_host::final_assistant_content(
+            &full_content,
+            fallback_error.as_deref(),
+            &[],
+            &finish_reason,
+        );
+        let tool_calls = crate::services::chat_host::fold_tool_calls(&tool_chunks);
+
+        // The final reply, then the completion.
+        emit(AgentEnvelope {
+            message: AgentMessage::RelayChatMessage(RelayChatMessage {
+                relay_id: req.relay_id.clone(),
+                session_id: req.session_id.clone(),
+                role: "assistant".to_string(),
+                content: full_content.clone(),
+            }),
+        })
+        .await;
+        emit(AgentEnvelope {
+            message: AgentMessage::RelayChatComplete(RelayChatComplete {
+                relay_id: req.relay_id.clone(),
+                session_id: req.session_id.clone(),
+                message_id: uuid::Uuid::new_v4().to_string(),
+            }),
+        })
+        .await;
+
+        RelayTurnOutcome {
+            full_content,
+            finish_reason,
+            total_input_tokens,
+            total_output_tokens,
+            total_cost_cents,
+            captured_cli_session_id,
+            clear_cli_session_id,
+            tool_calls,
+        }
+    }
+
     /// Refuse a relayed chat turn without spawning: one final `error` delta carrying `message`, then
     /// the usual completion, so the web stops its streaming state and shows the reason.
     async fn send_relay_chat_refusal(
@@ -3716,155 +3880,36 @@ impl AgentService {
             .await
             .insert(req.session_id.clone(), process);
 
-        // Stream chunks back through WebSocket as relay deltas
-        let mut full_content = String::new();
-        let mut total_input_tokens: i64 = 0;
-        let mut total_output_tokens: i64 = 0;
-        let mut total_cost_cents: i64 = 0;
-        let mut captured_cli_session_id: Option<String> = None;
-        let mut clear_cli_session_id = false;
-        // Monotonic ordering key for the structured StreamEvent lane (overhaul P2, D6). Per-turn;
-        // full per-session global sequencing is a Phase-3 concern.
-        let mut stream_seq: u64 = 0;
-        let mut tool_chunks: Vec<StreamChunk> = Vec::new();
-        let mut fallback_error: Option<String> = None;
-        let mut finish_reason = "stop".to_string();
-        let mut should_kill_process = false;
-
-        loop {
-            // The same idle timeout as the host paths (F-2-23): a hung turn is killed below instead
-            // of holding the plan agent's slot until a Stop.
-            let chunk = match crate::services::chat_host::recv_turn_chunk(
-                &mut rx,
-                crate::services::chat_host::TURN_IDLE_TIMEOUT,
-            )
-            .await
-            {
-                crate::services::chat_host::TurnRecv::Chunk(chunk) => chunk,
-                crate::services::chat_host::TurnRecv::Closed => {
-                    // A final chunk breaks out below, so a close here is always an early end.
-                    finish_reason = "stream_closed".to_string();
-                    break;
-                }
-                crate::services::chat_host::TurnRecv::TimedOut => {
-                    finish_reason = "timeout".to_string();
-                    should_kill_process = true;
-                    clear_cli_session_id = true;
-                    let message = crate::services::chat_host::TURN_TIMEOUT_MESSAGE.to_string();
-                    fallback_error = Some(message.clone());
-                    // Tell the web, so it leaves its streaming state and shows the reason.
-                    let envelope = AgentEnvelope {
-                        message: AgentMessage::RelayChatDelta(RelayChatDelta {
-                            relay_id: req.relay_id.clone(),
-                            session_id: req.session_id.clone(),
-                            delta: message,
-                            chunk_type: "error".to_string(),
-                            is_final: true,
-                        }),
-                    };
-                    let msg = serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
-                    let mut writer = ws_write.lock().await;
-                    let _ = writer.send(tokio_tungstenite::tungstenite::Message::Text(msg.into())).await;
-                    break;
-                }
-            };
-            if chunk.chunk_type == ChunkType::Text {
-                full_content.push_str(&chunk.content);
+        // Stream the turn back through the relay: every chunk as a delta, then the FINAL message
+        // (the web's `onRelayChatMessage` reconciles the reply with it), then the completion.
+        let emit = |envelope: AgentEnvelope| {
+            let ws_write = ws_write.clone();
+            async move {
+                let Ok(msg) = serde_json::to_string(&envelope) else { return };
+                let mut writer = ws_write.lock().await;
+                let _ = writer
+                    .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                    .await;
             }
-            if matches!(chunk.chunk_type, ChunkType::ToolUse | ChunkType::ToolResult) {
-                tool_chunks.push(chunk.clone());
-            }
-
-            if (chunk.chunk_type == ChunkType::System || chunk.chunk_type == ChunkType::Result)
-                && chunk.session_id.is_some()
-            {
-                captured_cli_session_id = chunk.session_id.clone();
-            }
-
-            if chunk.chunk_type == ChunkType::Error {
-                clear_cli_session_id = true;
-                fallback_error = Some(chunk.content.clone());
-                finish_reason = "error".to_string();
-            }
-
-            if chunk.chunk_type == ChunkType::Result {
-                if let Some(tokens) = chunk.input_tokens {
-                    total_input_tokens = tokens;
-                }
-                if let Some(tokens) = chunk.output_tokens {
-                    total_output_tokens = tokens;
-                }
-                if let Some(cost) = chunk.cost_usd {
-                    total_cost_cents = (cost * 100.0) as i64;
-                }
-            }
-
-            let delta = RelayChatDelta {
-                relay_id: req.relay_id.clone(),
-                session_id: req.session_id.clone(),
-                delta: chunk.content.clone(),
-                chunk_type: format!("{:?}", chunk.chunk_type).to_lowercase(),
-                is_final: chunk.is_final,
-            };
-
-            let envelope = AgentEnvelope {
-                message: AgentMessage::RelayChatDelta(delta),
-            };
-
-            let msg =
-                serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
-
-            let mut writer = ws_write.lock().await;
-            let _ = writer
-                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
-                .await;
-            drop(writer);
-
-            // Additive: also emit the structured StreamEvent lane (overhaul P2, D6). Purely
-            // parallel to the delta push above — the existing chat path is unchanged. Ignore the
-            // send error when there are no subscribers (matches the terminal/chat_delta convention).
-            if let Some(ev) = Self::stream_event_from_chunk(&req.session_id, stream_seq, &chunk) {
-                stream_seq += 1;
-                let _ = state.stream_event_tx.send(ev);
-            }
-
-            if chunk.is_final {
-                break;
-            }
-        }
-
-        // The turn is over: drop the registration (a Stop may already have removed + killed it),
-        // and kill it after an idle timeout. Only THIS turn's handle: a later turn may already be
-        // registered for the session.
-        crate::services::chat_host::end_own_turn(&state.active_processes, &req.session_id, turn_id, should_kill_process)
-            .await;
-        // Stored text keeps a crash/timeout line even after partial output (F-1-10).
-        let (full_content, finish_reason) = crate::services::chat_host::final_assistant_content(
-            &full_content,
-            fallback_error.as_deref(),
-            &[],
-            &finish_reason,
-        );
-        let tool_calls = crate::services::chat_host::fold_tool_calls(&tool_chunks);
-
-        // Send completion message
-        let complete = RelayChatComplete {
-            relay_id: req.relay_id.clone(),
-            session_id: req.session_id.clone(),
-            message_id: uuid::Uuid::new_v4().to_string(),
         };
-
-        let envelope = AgentEnvelope {
-            message: AgentMessage::RelayChatComplete(complete),
-        };
-
-        let msg =
-            serde_json::to_string(&envelope).map_err(|e| format!("Serialize error: {}", e))?;
-
-        let mut writer = ws_write.lock().await;
-        let _ = writer
-            .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
-            .await;
+        let RelayTurnOutcome {
+            full_content,
+            finish_reason,
+            total_input_tokens,
+            total_output_tokens,
+            total_cost_cents,
+            captured_cli_session_id,
+            clear_cli_session_id,
+            tool_calls,
+        } = Self::stream_relay_turn(
+            &state,
+            &req,
+            &mut rx,
+            turn_id,
+            crate::services::chat_host::TURN_IDLE_TIMEOUT,
+            emit,
+        )
+        .await;
 
         // Also save to local SQLite
         let _ = state.db.with_conn(|conn| {
@@ -3928,6 +3973,19 @@ impl AgentService {
 
         Ok(())
     }
+}
+
+/// What one relayed chat turn produced: the stored reply and its accounting
+/// ([`AgentService::stream_relay_turn`]).
+pub(crate) struct RelayTurnOutcome {
+    pub full_content: String,
+    pub finish_reason: String,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cost_cents: i64,
+    pub captured_cli_session_id: Option<String>,
+    pub clear_cli_session_id: bool,
+    pub tool_calls: Option<String>,
 }
 
 #[cfg(test)]
@@ -5765,5 +5823,134 @@ mod plans_rpc_tests {
         // A plan that left briefing no longer lists as a draft.
         let listed = rpc(&state, "list_draft_plans", json!({})).await.unwrap();
         assert!(listed.as_array().unwrap().iter().all(|r| r["id"] != json!(id)));
+    }
+}
+
+/// Live UI bugs 2, item 1: a plan-agent PANE turn (#77: tmux + stream-json `<n>.jsonl` + `.exit`)
+/// is published through the relay seam as deltas, then the final message, then the completion.
+#[cfg(test)]
+mod relay_turn_tests {
+    use super::*;
+    use crate::providers::claude_code;
+    use crate::services::plan_agent_tmux::{fake::FakeTmux, spawn_turn_with, Viewer};
+    use crate::test_support::{test_state, tmp_dir};
+
+    /// A recorded `claude --print --output-format stream-json` plan-agent turn.
+    const TURN: &str = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"cli-1","model":"claude-opus","tools":[]}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me update the brief."}]},"session_id":"cli-1"}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"mcp__j1__brief_update","input":{"field":"why"}}]},"session_id":"cli-1"}"#, "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]},"session_id":"cli-1"}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":" Done."}]},"session_id":"cli-1"}"#, "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"Done.","session_id":"cli-1","total_cost_usd":0.0123,"usage":{"input_tokens":10,"output_tokens":20}}"#, "\n",
+    );
+
+    fn req() -> RelayChatRequest {
+        RelayChatRequest {
+            relay_id: "relay-1".into(),
+            session_id: "S".into(),
+            content: "hi".into(),
+            provider: None,
+            model: None,
+            working_directory: None,
+            user_id: None,
+            tenant_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_turn_publishes_deltas_then_final_message_then_complete() {
+        let (state, _root) = test_state();
+        let dir = tmp_dir("relay-pane-turn").join("turns");
+        let tmux = Arc::new(FakeTmux::default());
+        tmux.set_panes("%1\t0\tjohnnyone_S\n");
+        let cfg = claude_code::build_config_with("hi", "/ws", "", None, None, None);
+        let viewer = Viewer { path: "/v".into(), identity: None };
+        let (process, mut rx, paths) = spawn_turn_with(
+            tmux.clone(), "S", &dir, cfg, &viewer, claude_code::parse_line, Duration::from_millis(5), None,
+        )
+        .await
+        .unwrap();
+        let turn_id = process.turn_id();
+        state.active_processes.lock().await.insert("S".into(), process);
+        // The pane's pipeline writes the turn's data, then the exit sidecar.
+        std::fs::write(&paths.jsonl, TURN).unwrap();
+        std::fs::write(&paths.exit, "0\n").unwrap();
+
+        let published: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = published.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            AgentService::stream_relay_turn(&state, &req(), &mut rx, turn_id, Duration::from_secs(5), move |env| {
+                sink.lock().unwrap().push(serde_json::to_value(&env).unwrap());
+                async {}
+            }),
+        )
+        .await
+        .expect("relay turn hung");
+
+        let published = published.lock().unwrap().clone();
+        let types: Vec<&str> = published.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        let n = types.len();
+        assert!(n >= 4, "{types:?}");
+        assert!(types[..n - 2].iter().all(|t| *t == "chat_delta"), "{types:?}");
+        assert_eq!(&types[n - 2..], ["chat_message", "chat_complete"], "{types:?}");
+
+        // The deltas carry the reply's text, keyed by the request's relay id, and the last is final.
+        let deltas = &published[..n - 2];
+        assert!(deltas.iter().all(|d| d["data"]["relayId"] == "relay-1" && d["data"]["sessionId"] == "S"));
+        let text: String = deltas
+            .iter()
+            .filter(|d| d["data"]["chunkType"] == "text")
+            .map(|d| d["data"]["delta"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(text, "Let me update the brief. Done.");
+        assert_eq!(deltas.last().unwrap()["data"]["isFinal"], true);
+
+        // The final message: the whole reply, for the session's message subscription.
+        let msg = &published[n - 2]["data"];
+        assert_eq!(msg["relayId"], "relay-1");
+        assert_eq!(msg["sessionId"], "S");
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "Let me update the brief. Done.");
+        assert_eq!(published[n - 1]["data"]["relayId"], "relay-1");
+
+        assert_eq!(outcome.full_content, "Let me update the brief. Done.");
+        assert_eq!(outcome.finish_reason, "stop");
+        assert_eq!(outcome.captured_cli_session_id.as_deref(), Some("cli-1"));
+        assert!(outcome.tool_calls.is_some());
+        assert!(state.active_processes.lock().await.get("S").is_none(), "the turn's registration is dropped");
+    }
+
+    #[tokio::test]
+    async fn crashed_pane_turn_still_publishes_its_final_message() {
+        let (state, _root) = test_state();
+        let dir = tmp_dir("relay-pane-crash").join("turns");
+        let tmux = Arc::new(FakeTmux::default());
+        tmux.set_panes("%1\t0\tjohnnyone_S\n");
+        let cfg = claude_code::build_config_with("hi", "/ws", "", None, None, None);
+        let viewer = Viewer { path: "/v".into(), identity: None };
+        let (process, mut rx, paths) = spawn_turn_with(
+            tmux.clone(), "S", &dir, cfg, &viewer, claude_code::parse_line, Duration::from_millis(5), None,
+        )
+        .await
+        .unwrap();
+        let turn_id = process.turn_id();
+        std::fs::write(&paths.jsonl, "").unwrap();
+        std::fs::write(&paths.stderr, "Error: boom\n").unwrap();
+        std::fs::write(&paths.exit, "1\n").unwrap();
+
+        let published: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = published.clone();
+        AgentService::stream_relay_turn(&state, &req(), &mut rx, turn_id, Duration::from_secs(5), move |env| {
+            sink.lock().unwrap().push(serde_json::to_value(&env).unwrap());
+            async {}
+        })
+        .await;
+        let published = published.lock().unwrap().clone();
+        let types: Vec<&str> = published.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["chat_delta", "chat_message", "chat_complete"]);
+        assert_eq!(published[0]["data"]["chunkType"], "error");
+        assert!(published[1]["data"]["content"].as_str().unwrap().contains("Error: boom"));
     }
 }

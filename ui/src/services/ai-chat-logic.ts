@@ -14,13 +14,16 @@ export interface ChatDeltaLike {
   isFinal?: boolean | null;
 }
 
-/** `text` accumulates; `control` (system/result, non-final errors) is skipped; `error` is a final error. */
+/** `text` accumulates; `control` (system/result/tool/stderr, non-final errors) is skipped; `error` is a final error. */
 export type DeltaKind = 'text' | 'control' | 'error';
 
 export function classifyDelta(d: ChatDeltaLike): DeltaKind {
   const kind = (d.chunkType || '').toLowerCase();
   if (kind === 'error') return d.isFinal ? 'error' : 'control';
-  if (kind === 'system' || kind === 'result') return 'control';
+  // Tool calls/results and stderr are not the reply's text (the final message carries the reply).
+  if (kind === 'system' || kind === 'result' || kind === 'tooluse' || kind === 'toolresult' || kind === 'stderr') {
+    return 'control';
+  }
   return 'text';
 }
 
