@@ -21854,6 +21854,143 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert_eq!(sink.lock().unwrap().len(), 1, "only R1 was sent back");
         no_worker_tmux();
     }
+
+    // ── "J1 runs the new workflow", part 1: ready refusal, disputes, red-first, round digest ──
+
+    fn digests(f: &Fx) -> Vec<serde_json::Value> {
+        f.events("agent_review_round_digest")
+    }
+
+    /// Ready from the worker through the real gate; `true` = refused.
+    async fn ready(f: &Fx, nudges: &Mutex<Vec<String>>) -> bool {
+        f.status("phase_worker_running");
+        unclaimed_findings_ready_gate(&f.state, &f.run(), W, &f.phase(), Some(nudges)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn workflow_scenario_three_rounds_ready_dispute_digest() {
+        no_worker_tmux();
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        let nudges = Mutex::new(Vec::new());
+
+        // R1: qa files 3 BLOCKING + 1 FOLLOWUP, NEEDS_CHANGES.
+        let b1 = report(&f, Severity::Blocking, "save drops where_", "where_ missing");
+        let b2 = report(&f, Severity::Blocking, "update loses where_", "where_ empty");
+        let b3 = report(&f, Severity::Blocking, "fence is missing", "no test");
+        let fu = report(&f, Severity::Followup, "rename save helper", "name is vague");
+        f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(gate(&f), "NEEDS_CHANGES");
+        assert!(sink.lock().unwrap()[0].contains("disputeFinding("), "the feedback offers the dispute call");
+
+        // Ready while all three are unanswered: refused, with the ids and the three call templates.
+        assert!(ready(&f, &nudges).await, "ready refused while blockers are unanswered");
+        let refused = f.events("agent_finding_ready_refused");
+        assert_eq!(refused[0]["unanswered"], json!([b1, b2, b3]));
+        {
+            let n = nudges.lock().unwrap();
+            for needle in [b1.as_str(), b2.as_str(), b3.as_str(), "claimFix(", "proposeWaiver(", "disputeFinding("] {
+                assert!(n[0].contains(needle), "{needle}: {}", n[0]);
+            }
+        }
+        // Answer two of them: still refused, naming only the unanswered one.
+        ledger::claim_fix_with_proof(
+            &f.state, W, &b1, "apply writes where_",
+            ledger::RedFirstInput { test: Some("save::keeps_where"), broke_what: Some("dropped the where_ write"), red_output: Some("assertion `left == right` failed") },
+        )
+        .unwrap();
+        ledger::dispute_finding(&f.state, W, &b2, "update copies where_ at save.rs:57").unwrap();
+        assert!(ready(&f, &nudges).await);
+        assert_eq!(f.events("agent_finding_ready_refused")[1]["unanswered"], json!([b3]));
+        // Answer the last one: the ready is accepted.
+        ledger::dispute_finding(&f.state, W, &b3, "the brief names the fence: cargo test save_").unwrap();
+        assert!(!ready(&f, &nudges).await, "ready accepted once every blocker is answered");
+        assert_eq!(f.events("agent_phase_ready_rejected_unclaimed_findings").len(), 2, "both refusals counted by the bounce cap");
+
+        // R2: VERIFIED #1 (red-first), UPHOLD #2, WITHDRAW #3.
+        f.next_round();
+        ledger::resolve_finding(&f.state, QA, &b1, Outcome::Verified, None).unwrap();
+        ledger::resolve_finding(&f.state, QA, &b2, Outcome::Uphold, Some("save.rs:57 copies where_ only when set")).unwrap();
+        ledger::resolve_finding(&f.state, QA, &b3, Outcome::Withdraw, None).unwrap();
+        assert_eq!(ledger::get(&f.state, &f.id, &b2).unwrap().state, "open");
+        assert_eq!(ledger::get(&f.state, &f.id, &b3).unwrap().state, "withdrawn");
+        f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        let r2 = f.events("agent_phase_gate_result").last().unwrap().clone();
+        assert_eq!(r2["verdict"], "NEEDS_CHANGES");
+        assert!(r2["summary"].as_str().unwrap().contains("red-first 1/1"), "{r2}");
+        {
+            let sent = sink.lock().unwrap();
+            let p = sent.last().unwrap();
+            let block = &p[p.find(&format!("### {b2} [qa]")).expect("upheld #2 is sent back")..];
+            assert!(block.contains("dispute: update copies where_ at save.rs:57"), "the dispute is a dead end: {block}");
+            assert!(!p.contains(&format!("### {b3} [qa]")), "a withdrawn finding is not sent back: {p}");
+        }
+
+        // The upheld finding cannot be disputed again; it is fixed (a test, but no red output).
+        f.status("phase_worker_running");
+        assert!(ledger::dispute_finding(&f.state, W, &b2, "still wrong").unwrap_err().contains("already upheld"));
+        ledger::claim_fix_with_proof(
+            &f.state, W, &b2, "update copies where_ always",
+            ledger::RedFirstInput { test: Some("save::update_keeps_where"), broke_what: None, red_output: None },
+        )
+        .unwrap();
+        assert_eq!(ledger::get(&f.state, &f.id, &b2).unwrap().red_first, Some(false));
+        assert!(!ready(&f, &nudges).await);
+
+        // R3: VERIFIED #2 → PASS_WITH_FOLLOWUPS (the follow-up is carried).
+        f.next_round();
+        ledger::resolve_finding(&f.state, QA, &b2, Outcome::Verified, None).unwrap();
+        f.conclude(vec![("qa", verdict("PASS_WITH_FOLLOWUPS", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "approved");
+        assert_eq!(ledger::get(&f.state, &f.id, &fu).unwrap().state, "carried");
+
+        // One digest per round, with the counts, recorded AND handed to the Discord seam.
+        let d = digests(&f);
+        let lines: Vec<String> = d.iter().map(|e| e["line"].as_str().unwrap().to_string()).collect();
+        let title = f.run().plan.title;
+        assert_eq!(
+            lines,
+            vec![
+                format!("{title} · 00-x r1: 0 → 3 open · 0 verified · 0 disputed · 1 follow-up · red-first 0/0"),
+                format!("{title} · 00-x r2: 3 → 1 open · 1 verified · 0 disputed · 1 withdrawn · 1 follow-up · red-first 1/1"),
+                format!("{title} · 00-x r3: 1 → 0 open · 2 verified · 0 disputed · 1 withdrawn · 1 follow-up · red-first 1/2"),
+            ]
+        );
+        assert_eq!(
+            d.iter().map(|e| (e["round"].as_i64().unwrap(), e["gate"].as_str().unwrap().to_string())).collect::<Vec<_>>(),
+            vec![(1, "NEEDS_CHANGES".into()), (2, "NEEDS_CHANGES".into()), (3, "PASS_WITH_FOLLOWUPS".into())]
+        );
+        assert_eq!(*f.digests.lock().unwrap(), lines, "every digest goes through the post seam, once");
+        no_worker_tmux();
+    }
+
+    #[test]
+    fn workflow_new_events_have_readable_summaries() {
+        let summary = |ty: &str, payload: serde_json::Value| {
+            let event = AgentPlanEvent {
+                id: "e".into(), plan_id: "p".into(), phase_id: Some("00-x".into()), phase_index: None, phase_title: None,
+                event_type: ty.into(), actor: String::new(), category: String::new(), summary: String::new(),
+                status_before: None, status_after: None, reason: None, verdict: None, task_id: None,
+                clarification_attempt: None, payload_json: payload.to_string(), created_at: String::new(),
+            };
+            assert_eq!(event_category(ty), "phase", "{ty}");
+            event_summary(&event, &payload)
+        };
+        assert_eq!(
+            summary("agent_finding_ready_refused", json!({ "unanswered": ["F-00-x-1", "F-00-x-3"] })),
+            "Ready refused — unanswered findings F-00-x-1, F-00-x-3"
+        );
+        assert_eq!(
+            summary("agent_review_round_digest", json!({ "line": "P · 00-x r2: 3 → 1 open" })),
+            "Round digest: P · 00-x r2: 3 → 1 open"
+        );
+        assert_eq!(summary("agent_finding_disputed", json!({ "id": "F-1", "round": 2 })), "Finding F-1 disputed by the worker (round 2)");
+        assert_eq!(summary("agent_finding_upheld", json!({ "id": "F-1", "lens": "qa" })), "Finding F-1 upheld by qa — dispute rejected");
+        assert_eq!(summary("agent_finding_withdrawn", json!({ "id": "F-1", "lens": "qa" })), "Finding F-1 withdrawn by qa");
+        // The digest reaches Discord through its own seam, never through the generic event mapper
+        // (that would post it twice).
+        assert!(discord_message_for("agent_review_round_digest", Some("00-x"), &json!({ "line": "x" })).is_none());
+    }
 }
 
 /// Phase 00 of the "retire agent sessions" initiative: `retire_agent_session`, its job-end call

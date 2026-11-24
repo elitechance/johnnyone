@@ -2585,10 +2585,11 @@ pub fn escalation_reason(phase_id: &str, rows: &[Finding]) -> String {
 // One code-built line per phase review round, from the ledger only (never from a model):
 // `"<plan> · <phase> r2: 3 → 1 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3"`.
 
-/// A blocking finding that still needs work or a lens decision, other than a dispute: the "open"
-/// count of the digest (disputes are counted on their own).
+/// The digest's "open": a blocking finding that still keeps the phase from passing — the same
+/// states as [`FindingState::is_unresolved`], a dispute included. `disputed` in the line says how
+/// many of those wait on a ruling.
 fn digest_open_state(state: &str) -> bool {
-    matches!(state, "open" | "reopened" | "claimed" | "waive_proposed")
+    FindingState::parse(state).map_or(false, FindingState::is_unresolved)
 }
 
 /// The counts behind one digest line.
@@ -2598,9 +2599,9 @@ pub struct RoundDigest {
     pub plan: String,
     pub phase_id: String,
     pub round: i64,
-    /// Open blocking findings when the round started.
+    /// Unresolved blocking findings (disputes included) when the round started.
     pub open_before: usize,
-    /// Open blocking findings when the round concluded.
+    /// Unresolved blocking findings (disputes included) when the round concluded.
     pub open_after: usize,
     pub verified: usize,
     pub disputed: usize,
@@ -4083,5 +4084,351 @@ right), leave it out."), "{text}");
         assert!(!text.contains("F-00-x-2"), "{text}");
         let round1 = stream_lens_ledger_section(&rows, "glm", 1);
         assert!(round1.contains("starting with \"- \"") && !round1.contains("F-00-x-1"), "{round1}");
+    }
+}
+
+/// "J1 runs the new workflow", part 1: the dispute edges, red-first marking and the round digest.
+#[cfg(test)]
+mod workflow_tests {
+    use super::test_seed::*;
+    use super::*;
+    use crate::test_support::{test_state, tmp_dir};
+    use Action::*;
+    use FindingState::*;
+
+    // ── transition(): the dispute edges ──
+
+    #[test]
+    fn dispute_edges_are_legal() {
+        assert_eq!(transition(Open, Dispute), Ok(Disputed));
+        assert_eq!(transition(Reopened, Dispute), Ok(Disputed));
+        assert_eq!(transition(Disputed, Uphold), Ok(Open));
+        assert_eq!(transition(Disputed, Withdraw), Ok(Withdrawn));
+        assert_eq!(legal_actions(Disputed), vec![Uphold, Withdraw]);
+        assert!(legal_actions(Withdrawn).is_empty(), "withdrawn is terminal");
+    }
+
+    #[test]
+    fn dispute_illegal_edges_reject_with_reasons() {
+        let reason = |s, a| transition(s, a).unwrap_err().reason;
+        // Only an unanswered finding can be disputed.
+        assert_eq!(reason(Claimed, Dispute), "cannot Dispute a finding in state 'claimed' (legal: Verify, Reopen)");
+        assert_eq!(
+            reason(WaiveProposed, Dispute),
+            "cannot Dispute a finding in state 'waive_proposed' (legal: AcceptWaiver, HumanAcceptWaiver, RejectWaiver, HumanRejectWaiver)"
+        );
+        assert_eq!(reason(Verified, Dispute), "cannot Dispute a finding in state 'verified' (legal: HumanReopen)");
+        assert_eq!(reason(Disputed, Dispute), "cannot Dispute a finding in state 'disputed' (legal: Uphold, Withdraw)");
+        // A disputed finding waits on the lens's ruling; nothing else moves it.
+        for action in [Claim, ProposeWaiver, Verify, Reopen, AcceptWaiver, RejectWaiver, Escalate, Carry, HumanReopen] {
+            assert_eq!(
+                reason(Disputed, action),
+                format!("cannot {} a finding in state 'disputed' (legal: Uphold, Withdraw)", action.name())
+            );
+        }
+        // A ruling needs a dispute.
+        assert_eq!(reason(Open, Uphold), "cannot Uphold a finding in state 'open' (legal: Claim, ProposeWaiver, Carry, Dispute)");
+        assert_eq!(reason(Claimed, Withdraw), "cannot Withdraw a finding in state 'claimed' (legal: Verify, Reopen)");
+        // Withdrawn is closed for every action, the human's included.
+        for action in Action::ALL {
+            assert_eq!(
+                reason(Withdrawn, action),
+                format!("cannot {} a finding in state 'withdrawn' (legal: none; it is closed)", action.name())
+            );
+        }
+    }
+
+    #[test]
+    fn disputed_blocks_the_gate_and_withdrawn_does_not() {
+        let mut f = row("F-00-x-1", "blocking", "disputed");
+        assert_eq!(ledger_gate(&[f.clone()], &[], &[]), LedgerGate::NeedsChanges, "a dispute waits on the lens");
+        f.state = "withdrawn".into();
+        assert_eq!(ledger_gate(&[f.clone()], &[], &[]), LedgerGate::Pass, "withdrawn never blocks");
+        assert!(unclaimed_blocking(&[row("F-00-x-2", "blocking", "disputed")]).is_empty(), "a dispute answers the ready gate");
+        assert_eq!(unresolved_for_lens(&[row("F-00-x-3", "blocking", "disputed")], "qa").len(), 1, "the lens must rule on it");
+    }
+
+    // ── red-first ──
+
+    #[test]
+    fn sanitize_red_output_strips_escapes_and_keeps_the_tail() {
+        let raw = "\u{1b}[31mFAILED\u{1b}[0m test x\r\n\u{1b}]0;title\u{7}left: 1\u{0}\u{8}\r\nright: 2\t!";
+        assert_eq!(sanitize_red_output(raw).as_deref(), Some("FAILED test x\nleft: 1\nright: 2\t!"));
+        assert_eq!(sanitize_red_output("  \u{1b}[0m \n "), None, "nothing left is no output");
+        let long = format!("{}{}", "é".repeat(2_000), "test result: FAILED. 1 failed");
+        let kept = sanitize_red_output(&long).unwrap();
+        assert!(kept.len() <= MAX_RED_OUTPUT_BYTES, "{}", kept.len());
+        assert!(kept.starts_with("…\n") && kept.ends_with("test result: FAILED. 1 failed"), "{kept}");
+    }
+
+    fn fixture(status: &str) -> AppState {
+        let (state, _) = test_state();
+        let store = tmp_dir("ledger-workflow");
+        seed(&state, &store, status, "00-x");
+        rounds(&state, "00-x", 1);
+        state
+    }
+
+    fn report(state: &AppState, claim: &str) -> String {
+        set_status(state, "phase_review_running");
+        report_finding(state, QA, Severity::Blocking, claim, "it works", "it broke", "src/x.rs", "cargo test").unwrap()
+    }
+
+    #[test]
+    fn claim_red_first_marking() {
+        let state = fixture("phase_review_running");
+        let (a, b, c, d) = (report(&state, "a"), report(&state, "b"), report(&state, "c"), report(&state, "d"));
+        set_status(&state, "phase_worker_running");
+        let proof = |test, red| RedFirstInput { test, broke_what: Some("removed the where_ write\nin apply"), red_output: red };
+        // test + red output: red-first.
+        claim_fix_with_proof(&state, WORKER, &a, "fixed", proof(Some("x::keeps_where"), Some("\u{1b}[31massertion failed\u{1b}[0m"))).unwrap();
+        // test but no red output: accepted, marked red_first:false.
+        claim_fix_with_proof(&state, WORKER, &b, "fixed", proof(Some("x::keeps_where"), None)).unwrap();
+        // nothing: accepted, red_first:false.
+        claim_fix(&state, WORKER, &c, "fixed").unwrap();
+        // the template placeholders sent back unfilled are not proof.
+        claim_fix_with_proof(&state, WORKER, &d, "fixed", proof(Some("<red-first: the test>"), Some("<red-first: output>"))).unwrap();
+
+        let ga = get(&state, PLAN, &a).unwrap();
+        assert_eq!(ga.state, "claimed");
+        assert_eq!(ga.red_first, Some(true));
+        assert_eq!(ga.claim_test.as_deref(), Some("x::keeps_where"));
+        assert_eq!(ga.broke_what.as_deref(), Some("removed the where_ write in apply"), "one line");
+        assert_eq!(ga.red_output.as_deref(), Some("assertion failed"), "sanitized");
+        let gb = get(&state, PLAN, &b).unwrap();
+        assert_eq!((gb.state.as_str(), gb.red_first, gb.claim_test.as_deref()), ("claimed", Some(false), Some("x::keeps_where")));
+        assert_eq!(get(&state, PLAN, &c).unwrap().red_first, Some(false));
+        let gd = get(&state, PLAN, &d).unwrap();
+        assert_eq!((gd.red_first, gd.claim_test.as_deref()), (Some(false), None));
+        assert_eq!(get(&state, PLAN, &report(&state, "e")).unwrap().red_first, None, "never claimed");
+
+        let ev = events_of(&state, "agent_finding_claimed");
+        assert_eq!((ev[0]["redFirst"].as_bool(), ev[0]["test"].as_str()), (Some(true), Some("x::keeps_where")));
+        assert_eq!(ev[1]["redFirst"].as_bool(), Some(false));
+        assert_eq!(red_first_ratio(&list_phase(&state, PLAN, "00-x")), (1, 4));
+    }
+
+    #[test]
+    fn lens_prompt_flags_claims_without_red_first_proof() {
+        let mut proven = row("F-00-x-1", "blocking", "claimed");
+        proven.red_first = Some(true);
+        proven.claim_test = Some("x::keeps_where".into());
+        proven.red_output = Some("assertion failed".into());
+        let mut bare = row("F-00-x-2", "blocking", "claimed");
+        bare.red_first = Some(false);
+        bare.claim_test = Some("x::other".into());
+        let mut disputed = row("F-00-x-3", "blocking", "disputed");
+        disputed.dispute_reason = Some("where_ is written at save.rs:42".into());
+        let text = lens_findings_instruction("LSID", "qa", 2, &[proven, bare, disputed]);
+        let block = |id: &str| {
+            let at = text.find(&format!("### {id}")).unwrap();
+            let end = text[at + 4..].find("###").map_or(text.len(), |e| at + 4 + e);
+            text[at..end].to_string()
+        };
+        assert!(block("F-00-x-1").contains("RED-FIRST: yes — test x::keeps_where"), "{text}");
+        assert!(block("F-00-x-2").contains("RED-FIRST: NONE (test named: x::other, but no output of it failing)"), "{text}");
+        assert!(block("F-00-x-2").contains("no red-first proof"), "{text}");
+        assert!(block("F-00-x-3").contains("DISPUTED by the worker: where_ is written at save.rs:42"), "{text}");
+        assert!(text.contains("REOPENED with saw:\"no red-first proof"), "{text}");
+        assert!(text.contains("UPHOLD|WITHDRAW"), "the resolve template offers the rulings: {text}");
+    }
+
+    // ── disputeFinding / resolveFinding(UPHOLD | WITHDRAW) ──
+
+    #[test]
+    fn dispute_upheld_then_cannot_be_disputed_again() {
+        let state = fixture("phase_review_running");
+        let id = report(&state, "a");
+        set_status(&state, "phase_worker_running");
+        dispute_finding(&state, WORKER, &id, "where_ is written at save.rs:42").unwrap();
+        let f = get(&state, PLAN, &id).unwrap();
+        assert_eq!((f.state.as_str(), f.dispute_reason.as_deref()), ("disputed", Some("where_ is written at save.rs:42")));
+        assert_eq!(events_of(&state, "agent_finding_disputed")[0]["reason"], "where_ is written at save.rs:42");
+
+        set_status(&state, "phase_review_running");
+        let err = resolve_finding(&state, QA, &id, Outcome::Uphold, None).unwrap_err();
+        assert!(err.contains("outcome UPHOLD needs 'saw'"), "{err}");
+        let err = resolve_finding(&state, QA, &id, Outcome::Verified, None).unwrap_err();
+        assert!(err.contains("(legal: Uphold, Withdraw)"), "{err}");
+        resolve_finding(&state, QA, &id, Outcome::Uphold, Some("save.rs:42 writes where_ only on insert")).unwrap();
+        let f = get(&state, PLAN, &id).unwrap();
+        assert_eq!((f.state.as_str(), f.last_saw.as_deref()), ("open", Some("save.rs:42 writes where_ only on insert")));
+        assert_eq!(f.reopen_count, 0, "an upheld dispute is not a failed fix");
+        let up = events_of(&state, "agent_finding_upheld");
+        assert_eq!((up[0]["to"].as_str(), up[0]["saw"].as_str()), (Some("open"), Some("save.rs:42 writes where_ only on insert")));
+        assert!(events_of(&state, "agent_finding_open").is_empty());
+        // DEAD ENDS: the dispute is a rejected attempt.
+        let dead = rejected_claims(&finding_events(&state, PLAN), &id);
+        assert_eq!(dead, vec![("dispute: where_ is written at save.rs:42".to_string(), "save.rs:42 writes where_ only on insert".to_string())]);
+
+        set_status(&state, "phase_worker_running");
+        let err = dispute_finding(&state, WORKER, &id, "still wrong").unwrap_err();
+        assert!(err.contains("already upheld a dispute") && err.contains("claimFix"), "{err}");
+        assert_eq!(get(&state, PLAN, &id).unwrap().state, "open");
+    }
+
+    #[test]
+    fn dispute_withdrawn_is_terminal() {
+        let state = fixture("phase_review_running");
+        let id = report(&state, "a");
+        set_status(&state, "phase_worker_running");
+        dispute_finding(&state, WORKER, &id, "the brief puts this out of scope").unwrap();
+        set_status(&state, "phase_review_running");
+        resolve_finding(&state, QA, &id, Outcome::Withdraw, None).unwrap();
+        assert_eq!(get(&state, PLAN, &id).unwrap().state, "withdrawn");
+        assert_eq!(events_of(&state, "agent_finding_withdrawn")[0]["actor"], "lens:qa");
+        let rows = list_phase(&state, PLAN, "00-x");
+        assert_eq!(ledger_gate(&rows, &[], &[]), LedgerGate::Pass);
+        set_status(&state, "phase_worker_running");
+        assert!(claim_fix(&state, WORKER, &id, "x").unwrap_err().contains("state 'withdrawn' (legal: none; it is closed)"));
+    }
+
+    #[test]
+    fn dispute_role_and_window_checks() {
+        let state = fixture("phase_review_running");
+        let id = report(&state, "a");
+        set_status(&state, "phase_worker_running");
+        let err = dispute_finding(&state, QA, &id, "x").unwrap_err();
+        assert!(err.contains("only the phase worker may dispute a finding"), "{err}");
+        set_status(&state, "phase_review_running");
+        let err = dispute_finding(&state, WORKER, &id, "x").unwrap_err();
+        assert!(err.contains("not in a development phase worker turn"), "{err}");
+        set_status(&state, "phase_worker_running");
+        let err = dispute_finding(&state, WORKER, &id, "  ").unwrap_err();
+        assert!(err.contains("'reason' is empty"), "{err}");
+        set_status(&state, "phase_review_running");
+        let fu = report_finding(&state, QA, Severity::Followup, "nit", "e", "s", "w", "f").unwrap();
+        set_status(&state, "phase_worker_running");
+        assert!(dispute_finding(&state, WORKER, &fu, "x").unwrap_err().contains("is a followup"));
+        assert_eq!(events_of(&state, "agent_finding_call_rejected").last().unwrap()["call"], "disputeFinding");
+    }
+
+    #[test]
+    fn stream_lens_rules_on_disputes_from_its_bullets() {
+        let mut kept = row("F-00-x-1", "blocking", "disputed");
+        kept.claim = "save drops where_".into();
+        let mut dropped = row("F-00-x-2", "blocking", "disputed");
+        dropped.claim = "update loses where_".into();
+        let r = reconcile_untyped_lens(&[kept, dropped], &["save drops where_".into()], false);
+        assert_eq!(r.uphold, vec![("F-00-x-1".to_string(), "save drops where_".to_string())]);
+        assert_eq!(r.withdraw, vec!["F-00-x-2".to_string()]);
+        assert!(r.import.is_empty());
+    }
+
+    // ── the round digest ──
+
+    fn row(id: &str, severity: &str, st: &str) -> Finding {
+        Finding {
+            plan_id: PLAN.into(),
+            id: id.into(),
+            phase_id: "00-x".into(),
+            lens: "qa".into(),
+            severity: severity.into(),
+            state: st.into(),
+            round_opened: 1,
+            round_updated: 1,
+            claim: format!("claim of {id}"),
+            expected: String::new(),
+            saw: String::new(),
+            where_: String::new(),
+            fence: String::new(),
+            evidence: None,
+            waive_reason: None,
+            reopen_count: 0,
+            last_saw: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            claim_test: None,
+            broke_what: None,
+            red_output: None,
+            red_first: None,
+            dispute_reason: None,
+        }
+    }
+
+    fn proof(mut f: Finding, red: bool) -> Finding {
+        f.red_first = Some(red);
+        f
+    }
+
+    #[test]
+    fn digest_line_counts_from_the_ledger() {
+        let rows = vec![
+            proof(row("F-00-x-1", "blocking", "verified"), true),
+            proof(row("F-00-x-2", "blocking", "verified"), true),
+            proof(row("F-00-x-3", "blocking", "reopened"), false),
+            row("F-00-x-4", "blocking", "disputed"),
+            row("F-00-x-5", "followup", "open"),
+            row("F-00-x-6", "followup", "carried"),
+        ];
+        let d = round_digest("Ledger  workflow\nplan", "00-x", 2, 3, &rows, "NEEDS_CHANGES");
+        assert_eq!(
+            d.line(),
+            "Ledger workflow plan · 00-x r2: 3 → 2 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3"
+        );
+        assert_eq!((d.open_after, d.verified, d.disputed, d.followups, d.red_first, d.claims), (2, 2, 1, 2, 2, 3));
+        assert_eq!(d.gate, "NEEDS_CHANGES");
+        let mut rows = rows;
+        rows.push(row("F-00-x-7", "blocking", "withdrawn"));
+        rows.push(row("F-00-x-8", "followup", "withdrawn"));
+        let d = round_digest("p", "00-x", 3, 1, &rows, "PASS");
+        assert_eq!(d.line(), "p · 00-x r3: 1 → 2 open · 2 verified · 1 disputed · 2 withdrawn · 2 follow-ups · red-first 2/3");
+        let empty = round_digest("p", "01-y", 1, 0, &[], "PASS");
+        assert_eq!(empty.line(), "p · 01-y r1: 0 → 0 open · 0 verified · 0 disputed · 0 follow-ups · red-first 0/0");
+        let long = round_digest(&"x".repeat(200), "00-x", 1, 0, &[], "PASS");
+        assert_eq!(long.plan.chars().count(), 80);
+    }
+
+    fn ev(ty: &str, phase: &str, payload: serde_json::Value) -> AgentPlanEvent {
+        AgentPlanEvent {
+            id: String::new(),
+            plan_id: PLAN.into(),
+            phase_id: Some(phase.into()),
+            phase_index: None,
+            phase_title: None,
+            event_type: ty.into(),
+            actor: String::new(),
+            category: String::new(),
+            summary: String::new(),
+            status_before: None,
+            status_after: None,
+            reason: None,
+            verdict: None,
+            task_id: None,
+            clarification_attempt: None,
+            payload_json: payload.to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn open_at_round_start_replays_states_before_the_latest_review_start() {
+        let j = |id: &str, to: &str| serde_json::json!({ "id": id, "to": to });
+        let rows = vec![
+            row("F-00-x-1", "blocking", "verified"),
+            row("F-00-x-2", "blocking", "claimed"),
+            row("F-00-x-3", "followup", "open"),
+            row("F-00-x-4", "blocking", "withdrawn"),
+            row("F-00-x-5", "blocking", "open"),
+        ];
+        let events = vec![
+            ev("agent_phase_review_started", "00-x", serde_json::json!({})),
+            ev("agent_finding_opened", "00-x", j("F-00-x-1", "open")),
+            ev("agent_finding_opened", "00-x", j("F-00-x-2", "open")),
+            ev("agent_finding_opened", "00-x", j("F-00-x-3", "open")),
+            ev("agent_finding_opened", "00-x", j("F-00-x-4", "open")),
+            ev("agent_finding_claimed", "00-x", j("F-00-x-1", "claimed")),
+            ev("agent_finding_disputed", "00-x", j("F-00-x-4", "disputed")),
+            ev("agent_finding_opened", "99-other", j("F-00-x-5", "open")),
+            ev("agent_phase_review_started", "99-other", serde_json::json!({})),
+            ev("agent_phase_review_started", "00-x", serde_json::json!({})),
+            // During the round: verified, upheld, a new finding. None of it counts as "before".
+            ev("agent_finding_verified", "00-x", j("F-00-x-1", "verified")),
+            ev("agent_finding_upheld", "00-x", j("F-00-x-4", "open")),
+        ];
+        // #1 claimed + #2 open + #4 disputed = 3 (the follow-up and the other phase's event do not count).
+        assert_eq!(open_at_round_start(&events, "00-x", &rows), 3);
+        assert_eq!(open_at_round_start(&events[..1], "00-x", &rows), 0, "round 1 starts empty");
+        assert_eq!(open_at_round_start(&[], "00-x", &rows), 0);
     }
 }
