@@ -289,7 +289,13 @@ describe('wiring — events rail', () => {
 });
 
 describe('review-loop event labels (round digest, ready refused)', () => {
-  const digestPayload = JSON.stringify({ line: 'Plan · 00-x r2: 3 → 1 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3', round: 2 });
+  const digestPayload = JSON.stringify({ line: 'Plan · phase 1/3 (00-x) r2: 3 → 1 open · +2 verified · 1 dispute upheld · 2 follow-ups · red-first 2/3 → needs changes', round: 2 });
+
+  it('uses the digest format the engine writes (phase N/M, round, outcome at the end)', () => {
+    // Mirrors `RoundDigest::line` (desktop findings.rs): `<plan> · phase N/M (slug) rR: … <outcome>`.
+    const line = (JSON.parse(digestPayload) as { line: string }).line;
+    expect(line).toMatch(/^.+ · phase \d+\/\d+( \([^)]+\))? r\d+:.* (→ needs changes|✅ passed.*|⚠ needs you.*)$/);
+  });
 
   it('prefers the backend summary', () => {
     const row = initiativeTimeline([ev({ eventType: 'agent_review_round_digest', summary: 'Round digest: x', payloadJson: digestPayload })])[0];
@@ -298,7 +304,7 @@ describe('review-loop event labels (round digest, ready refused)', () => {
 
   it('falls back to a readable label with the payload detail, never the raw type', () => {
     expect(eventLabel({ eventType: 'agent_review_round_digest', summary: '', payloadJson: digestPayload })).toBe(
-      'Review round digest: Plan · 00-x r2: 3 → 1 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3',
+      'Review round digest: Plan · phase 1/3 (00-x) r2: 3 → 1 open · +2 verified · 1 dispute upheld · 2 follow-ups · red-first 2/3 → needs changes',
     );
     expect(
       eventLabel({ eventType: 'agent_finding_ready_refused', summary: '', payloadJson: '{"unanswered":["F-00-x-1","F-00-x-3"]}' }),

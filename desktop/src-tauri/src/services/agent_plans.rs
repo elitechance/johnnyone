@@ -6533,7 +6533,7 @@ pub(crate) fn discord_message_for(
     // The round digest already announced this pass (and the plan's completion): one post per round.
     let digested = payload.get("digest").and_then(|v| v.as_bool()) == Some(true);
     match event_type {
-        "agent_phase_gate_result" | "agent_plan_completed" if digested => None,
+        "agent_phase_gate_result" | "agent_plan_completed" | "agent_phase_needs_attention" if digested => None,
         // Phase done.
         "agent_phase_gate_result" if verdict_advances(&verdict) => Some((
             "success",
@@ -7295,16 +7295,51 @@ pub(crate) async fn conclude_review_round_with(
         verdicts.len(),
         verdicts.iter().map(|(l, v)| format!("{l}: {v}")).collect::<Vec<_>>().join(", ")
     );
-    // The round digest: one code-built line from the ledger, recorded and posted every round,
-    // whatever the gate routes to next, saying whether the user must act. A failure here never
-    // fails the round. On a pass it is the round's ONLY Discord post (`pass_phase_with` marks its
-    // own events `digest:true`, which `discord_message_for` skips).
+    // The round digest: one code-built line from the ledger, recorded every round, saying whether
+    // the user must act. A failure here never fails the round. When it IS recorded it becomes the
+    // round's ONLY Discord post: the routing marks its own pass / needs-attention events
+    // `digest:true` (which `discord_message_for` skips) — only then, so a failed digest leaves the
+    // generic posts in place. It is posted only AFTER the routing succeeded, so a pass or a park
+    // that failed half-way is never announced (the coordinator's failure alert covers that case).
     let outcome = round_outcome(state, run, phase, gate, &rows);
     let pos = phase_position(run, phase);
-    match findings::record_round_digest(state, plan_id, &run.plan.title, phase_id, pos, round, gate.as_verdict(), outcome) {
-        Ok(digest) => post_round_digest(state, plan_id, &digest, ctrl),
-        Err(e) => tracing::warn!(plan_id, phase_id, error = %e, "round digest not recorded"),
+    let digest = findings::record_round_digest(state, plan_id, &run.plan.title, phase_id, pos, round, gate.as_verdict(), outcome);
+    if let Err(e) = &digest {
+        tracing::warn!(plan_id, phase_id, error = %e, "round digest not recorded; generic Discord posts stay on");
     }
+    let digested = digest.is_ok();
+    let routed = route_review_round(state, run, phase, gate, round, &rows, &summary, open_lines, lens_notes, digested, ctrl).await;
+    if let (Ok(()), Ok(digest)) = (&routed, &digest) {
+        // A needs-you post carries the reason the coordinator parked the phase (the plan's error).
+        let reason = match digest.outcome {
+            findings::RoundOutcome::NeedsYou { .. } => get_plan(state, plan_id).ok().and_then(|r| r.plan.error).unwrap_or_default(),
+            _ => String::new(),
+        };
+        post_round_digest(state, plan_id, digest, &reason, ctrl);
+    }
+    routed
+}
+
+/// Route a concluded review round: pass (carry follow-ups first) / escalate / park / send back.
+/// `digested`: the round's digest was recorded and will be the round's Discord post, so the pass
+/// and needs-attention events written here are marked `digest:true`.
+#[allow(clippy::too_many_arguments)]
+async fn route_review_round(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    gate: findings::LedgerGate,
+    round: i64,
+    rows: &[findings::Finding],
+    summary: &str,
+    open_lines: Vec<String>,
+    lens_notes: Vec<String>,
+    digested: bool,
+    ctrl: &ReplanCtrl<'_>,
+) -> Result<(), String> {
+    let plan_id = run.plan.id.as_str();
+    let phase_id = phase.phase_id.as_str();
+    let summary = summary.to_string();
     let review = ReviewInsights {
         summary: Some(summary.clone()),
         reason: open_lines.first().cloned().or_else(|| Some(summary.clone())),
@@ -7322,7 +7357,7 @@ pub(crate) async fn conclude_review_round_with(
             } else {
                 "PASS"
             };
-            pass_phase_with(state, plan_id, phase_id, "T2 passed phase", verdict, true).await
+            pass_phase_with(state, plan_id, phase_id, "T2 passed phase", verdict, digested).await
         }
         LedgerGate::Escalate => {
             mark_phase_not_passing(state, run, phase, "needs_changes", &summary)?;
@@ -7334,7 +7369,7 @@ pub(crate) async fn conclude_review_round_with(
                 review_payload("NEEDS_CHANGES", Some("escalated"), &review),
             )?;
             let n = consecutive_non_pass_phase_rounds_in(&all_plan_events(state, run), phase_id);
-            escalate_phase(state, run, phase, n, &findings::escalation_reason(phase_id, &rows)).await
+            escalate_phase(state, run, phase, n, &findings::escalation_reason(phase_id, rows), digested).await
         }
         LedgerGate::NeedsChanges | LedgerGate::Blocked => {
             let blocked = gate == LedgerGate::Blocked;
@@ -7354,11 +7389,11 @@ pub(crate) async fn conclude_review_round_with(
             // Budget cap (kept as is): count includes the gate result just written.
             let n = consecutive_non_pass_phase_rounds_in(&all_plan_events(state, run), phase_id);
             if n >= MAX_REVISION_ROUNDS {
-                return escalate_phase_no_converge(state, run, phase, n, verdict, &summary).await;
+                return escalate_phase_no_converge(state, run, phase, n, verdict, &summary, digested).await;
             }
             let phase_path = Path::new(&run.plan.plan_path).join("phases").join(phase_id);
             if blocked && crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
-                return park_kloo_review(state, run, phase, "BLOCKED", &review).await;
+                return park_kloo_review(state, run, phase, "BLOCKED", &review, digested).await;
             }
             let notes = blocked.then(|| {
                 format!(
@@ -7411,18 +7446,27 @@ fn phase_position(run: &AgentPlanRun, phase: &AgentPlanPhase) -> findings::Phase
 /// (a no-op without a webhook) with the outcome's colour. The embed title is the headline without
 /// the plan title (the embed's Plan field names the plan). Fire-and-forget, like
 /// `maybe_notify_discord`. A test build with no sink posts nothing: no test can reach the network.
-fn post_round_digest(state: &AppState, plan_id: &str, digest: &findings::RoundDigest, ctrl: &ReplanCtrl<'_>) {
+/// `reason` (non-empty for a needs-you round) becomes the embed description; the sink receives it
+/// on a second line.
+fn post_round_digest(
+    state: &AppState,
+    plan_id: &str,
+    digest: &findings::RoundDigest,
+    reason: &str,
+    ctrl: &ReplanCtrl<'_>,
+) {
     if let Some(sink) = ctrl.digest_sink {
-        sink.lock().unwrap().push(digest.line());
+        let entry = if reason.is_empty() { digest.line() } else { format!("{}\n{reason}", digest.line()) };
+        sink.lock().unwrap().push(entry);
         return;
     }
     if cfg!(test) {
         return;
     }
     let (state, plan_id) = (state.clone(), plan_id.to_string());
-    let (severity, headline) = (digest.outcome.severity(), digest.headline());
+    let (severity, headline, reason) = (digest.outcome.severity(), digest.headline(), reason.to_string());
     tokio::spawn(async move {
-        notify_discord(&state, &plan_id, severity, &headline, "").await;
+        notify_discord(&state, &plan_id, severity, &headline, &reason).await;
     });
 }
 
@@ -9476,22 +9520,24 @@ async fn escalate_phase_no_converge(
     round: i64,
     verdict: &str,
     summary: &str,
+    digested: bool,
 ) -> Result<(), String> {
     let reason = format!(
         "Phase {} still not passing after {} review rounds (last: {} — {}). Coordinator paused — needs a human decision.",
         phase.phase_id, round, verdict, summary
     );
-    escalate_phase(state, run, phase, round, &reason).await
+    escalate_phase(state, run, phase, round, &reason, digested).await
 }
 
 /// Park a phase for a human, recording `reason` as the health message and on the
-/// event timeline.
+/// event timeline. `digested`: the round digest announces it (the event is marked `digest:true`).
 async fn escalate_phase(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     round: i64,
     reason: &str,
+    digested: bool,
 ) -> Result<(), String> {
     let reason = reason.to_string();
     state.db.with_conn(|conn| {
@@ -9503,8 +9549,18 @@ async fn escalate_phase(
         &run.plan.id,
         Some(&phase.phase_id),
         "agent_phase_needs_attention",
-        json!({ "reason": reason, "rounds": round }),
+        digest_marked(json!({ "reason": reason, "rounds": round }), digested),
     )
+}
+
+/// `payload` plus `digest:true` when the round digest announces this event.
+fn digest_marked(mut payload: serde_json::Value, digested: bool) -> serde_json::Value {
+    if digested {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("digest".into(), true.into());
+        }
+    }
+    payload
 }
 
 /// Test seam for the planning → development handoff, mirroring [`ReplanCtrl`]. `spawn_dev: false`
@@ -9852,6 +9908,7 @@ async fn park_kloo_review(
     phase: &AgentPlanPhase,
     verdict: &str,
     review: &ReviewInsights,
+    digested: bool,
 ) -> Result<(), String> {
     let summary = review
         .summary
@@ -9871,12 +9928,15 @@ async fn park_kloo_review(
         &run.plan.id,
         Some(&phase.phase_id),
         "agent_phase_needs_attention",
-        json!({
-            "reason": "kloo_review",
-            "verdict": verdict,
-            "summary": review.summary,
-            "findings": review.findings,
-        }),
+        digest_marked(
+            json!({
+                "reason": "kloo_review",
+                "verdict": verdict,
+                "summary": review.summary,
+                "findings": review.findings,
+            }),
+            digested,
+        ),
     )
 }
 
@@ -21893,8 +21953,16 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert!(reason.contains(&b2), "needs_attention names #2: {reason}");
         assert_eq!(sink.lock().unwrap().len(), 2, "an escalated round is not sent back to the worker");
         let last = f.events("agent_review_round_digest").last().unwrap().clone();
-        assert!(last["line"].as_str().unwrap().ends_with(&format!("⚠ needs you: escalated {b2}")), "{last}");
+        let line = last["line"].as_str().unwrap();
+        assert!(line.ends_with(&format!("⚠ needs you: escalated {b2}")), "{last}");
+        assert!(line.contains("1 → 0 open · 1 escalated"), "an escalation never reads as a clean '→ 0 open': {line}");
         assert_eq!(last["outcome"]["kind"], "needsYou");
+        // ONE post for the needs-you round: the digest, carrying the park reason.
+        let na = f.events("agent_phase_needs_attention").last().unwrap().clone();
+        assert_eq!(na["digest"], true);
+        assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &na).is_none());
+        let posted = f.digests.lock().unwrap().last().unwrap().clone();
+        assert!(posted.starts_with(line) && posted.contains("review is not converging") && posted.contains(&b2), "{posted}");
         no_worker_tmux();
     }
 
@@ -22108,6 +22176,51 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert!(discord_message_for("agent_plan_completed", None, &json!({ "digest": true })).is_none());
     }
 
+    /// Make the next insert of an event of type `ty` fail (a DB trigger): a fault seam for tests.
+    fn fail_event_inserts(f: &Fx, ty: &str) {
+        f.state
+            .db
+            .with_conn(|conn| {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_{ty} BEFORE INSERT ON agent_plan_events WHEN NEW.type = '{ty}' \
+                     BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+                ))
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_failed_digest_keeps_the_generic_pass_post() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        fail_event_inserts(&f, "agent_review_round_digest");
+        f.conclude(vec![("qa", verdict("PASS", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "approved", "a failed digest never fails the round");
+        assert!(f.digests.lock().unwrap().is_empty());
+        let pass = f.events("agent_phase_gate_result").last().unwrap().clone();
+        assert!(pass.get("digest").is_none(), "no digest → the pass is not marked: {pass}");
+        assert!(discord_message_for("agent_phase_gate_result", Some("00-x"), &pass).is_some(), "the generic post stays on");
+    }
+
+    #[tokio::test]
+    async fn workflow_digest_is_not_posted_when_the_routing_fails() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        fail_event_inserts(&f, "agent_phase_gate_result");
+        let reports = vec![("qa".to_string(), verdict("PASS", "")), ("pr".to_string(), verdict("PASS", ""))];
+        let ctrl = ReplanCtrl { digest_sink: Some(&f.digests), ..sink_ctrl(&sink) };
+        let err = conclude_review_round_with(&f.state, &f.run(), &f.phase(), reports, &qa_pr(), &ctrl).await.unwrap_err();
+        assert!(err.contains("injected failure"), "{err}");
+        assert!(f.digests.lock().unwrap().is_empty(), "a pass that failed half-way is never announced");
+    }
+
+    #[test]
+    fn workflow_needs_attention_from_other_paths_still_posts() {
+        assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &json!({ "reason": "task_failed" })).is_some());
+        assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &json!({ "reason": "x", "digest": true })).is_none());
+    }
+
     #[test]
     fn workflow_digest_post_without_a_sink_never_spawns_in_tests() {
         // No tokio runtime here: a spawn would panic. With no sink, a test build posts nothing.
@@ -22116,7 +22229,7 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
             "p", "00-x", ledger::PhasePos { n: 1, of: 1 }, 1, 0, ledger::RoundActivity::default(), &[], "PASS",
             ledger::RoundOutcome::Passed { plan_complete: false },
         );
-        post_round_digest(&f.state, &f.id, &digest, &ReplanCtrl::live());
+        post_round_digest(&f.state, &f.id, &digest, "", &ReplanCtrl::live());
     }
 
     #[test]

@@ -2749,6 +2749,8 @@ pub struct RoundDigest {
     pub this_round: RoundActivity,
     /// Disputes still waiting on a ruling at the end of the round.
     pub disputed_pending: usize,
+    /// Escalated findings (the same failure seen twice): not "open", but a human must decide them.
+    pub escalated: usize,
     pub followups: usize,
     /// Worker claims carrying red-first proof / worker claims with a red-first mark.
     pub red_first: usize,
@@ -2777,6 +2779,10 @@ impl RoundDigest {
         let mut parts = Vec::new();
         if self.open_before > 0 || self.open_after > 0 {
             parts.push(format!("{} → {} open", self.open_before, self.open_after));
+        }
+        // "→ 0 open" next to an escalation would read clean on a phone: say it.
+        if self.escalated > 0 {
+            parts.push(format!("{} escalated", self.escalated));
         }
         let a = &self.this_round;
         if a.verified > 0 {
@@ -2898,6 +2904,7 @@ pub fn round_digest(
         open_after: count(&|r| r.is_blocking() && digest_open_state(&r.state)),
         this_round,
         disputed_pending: count(&|r| r.state == FindingState::Disputed.as_str()),
+        escalated: count(&|r| r.state == FindingState::Escalated.as_str()),
         followups: count(&|r| {
             r.severity == Severity::Followup.as_str() && r.state != FindingState::Withdrawn.as_str()
         }),
