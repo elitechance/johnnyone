@@ -32,6 +32,26 @@ import { requireScope } from '../auth/scopes';
 import { verifySessionOwnership, invalidateSessionOwnership } from './session-ownership';
 import { publishToPubSub, relayPublications } from './relay-pubsub';
 
+/**
+ * The node a desktop socket is verified as (hotfix live-chat-2), or `undefined`: a `desktop` socket
+ * whose claimed node id (the id the desktop registered via `registerDesktopNode` and sends as
+ * `nodeId`) is the node the server resolved for this tenant+user from `desktop_nodes`.
+ */
+export function verifiedDesktopNode(
+  tagType: ClientType,
+  claimedNodeId: string | null | undefined,
+  resolvedNodeId: string | null | undefined,
+): string | undefined {
+  const claimed = (claimedNodeId ?? '').trim();
+  if (tagType !== 'desktop' || !claimed || !resolvedNodeId) return undefined;
+  return claimed === resolvedNodeId ? claimed : undefined;
+}
+
+/** Does this socket feed the web's chat subscriptions? Only a verified desktop node. */
+export function mayPublishForSubscriptions(auth: { clientType?: string; desktopNodeId?: string } | null | undefined): boolean {
+  return !!auth && auth.clientType === 'desktop' && !!auth.desktopNodeId;
+}
+
 export class ChatRelayDO implements DurableObject {
   private state: DurableObjectState;
   private env: Record<string, unknown>;
@@ -50,11 +70,16 @@ export class ChatRelayDO implements DurableObject {
     this.env = env || {};
   }
 
-  private acceptAndTag(server: WebSocket, clientType: ClientType, auth: { tenantId: string; userId: string; apiKey?: { id: string; scopes: string[] } }) {
+  private acceptAndTag(
+    server: WebSocket,
+    clientType: ClientType,
+    auth: { tenantId: string; userId: string; apiKey?: { id: string; scopes: string[] } },
+    desktopNodeId?: string,
+  ) {
     const tags = [clientType, `tenant:${auth.tenantId}`, `user:${auth.userId}`];
     this.state.acceptWebSocket(server, tags);
     try {
-      server.serializeAttachment({ tenantId: auth.tenantId, userId: auth.userId, clientType, apiKey: auth.apiKey });
+      server.serializeAttachment({ tenantId: auth.tenantId, userId: auth.userId, clientType, apiKey: auth.apiKey, desktopNodeId });
     } catch {}
   }
 
@@ -217,10 +242,11 @@ export class ChatRelayDO implements DurableObject {
     }
     if (isResolvedForward) {
       // Already forwarded to the target node DO: auth/resolve done upstream, just accept here.
+      // The node the client CLAIMED rides `claimedNodeId`, which only the forwarder below sets.
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       const tagType = clientTypeFromQuery === 'desktop' ? 'desktop' : (clientTypeFromQuery === 'mobile' ? 'mobile' : 'api') as ClientType;
-      this.acceptAndTag(server, tagType, auth);
+      this.acceptAndTag(server, tagType, auth, verifiedDesktopNode(tagType, url.searchParams.get('claimedNodeId'), node.id));
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -233,6 +259,11 @@ export class ChatRelayDO implements DurableObject {
       fwdUrl.pathname = '/websocket-resolved';
       // do not forward client _resolved or nodeId that could be used for bypass; set internal marker via header
       fwdUrl.searchParams.delete('_resolved');
+      // The node id the client claimed (the desktop sends its registered id) is carried to the
+      // accepting DO as `claimedNodeId` — always overwritten here, so a client cannot inject it.
+      const claimedNodeId = fwdUrl.searchParams.get('nodeId') ?? '';
+      fwdUrl.searchParams.delete('claimedNodeId');
+      fwdUrl.searchParams.set('claimedNodeId', claimedNodeId);
       fwdUrl.searchParams.delete('nodeId');
       fwdUrl.searchParams.set('nodeId', node.id);  // set to resolved
       const fwdHeaders = new Headers(request.headers);
@@ -246,7 +277,7 @@ export class ChatRelayDO implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
     const tagType = clientTypeFromQuery === 'desktop' ? 'desktop' : (clientTypeFromQuery === 'mobile' ? 'mobile' : 'api') as ClientType;
-    this.acceptAndTag(server, tagType, auth);
+    this.acceptAndTag(server, tagType, auth, verifiedDesktopNode(tagType, url.searchParams.get('nodeId'), node.id));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -437,9 +468,10 @@ export class ChatRelayDO implements DurableObject {
             this.broadcastTo('api', envelope);
             // The web's graphql-ws subscriptions (`onRelayChatDelta`, `onRelayChatMessage`) read
             // lokal's PubSubDO topics, not these sockets: publish there too (live UI bugs 2, item 1).
-            // An API-key socket ("desktop" is only a query flag at upgrade) never feeds the web's
-            // chat subscriptions (L-1-2); tying publishes to the registered node is a follow-up.
-            if (!authCtx?.apiKey) await this.publishForSubscriptions(envelope, authCtx?.userId);
+            // Only the user's VERIFIED desktop node feeds them (hotfix live-chat-2): JWT or API key
+            // alike (the desktop authenticates with its stored jk_ key), never a browser or another
+            // client that merely set `clientType=desktop` (L-1-2).
+            if (mayPublishForSubscriptions(authCtx)) await this.publishForSubscriptions(envelope, authCtx?.userId);
           }
           // Invalidate ownership cache on delete/archive so revoked sessions stop streaming (Task 05)
           if ((envelope.type === 'session_deleted' ||

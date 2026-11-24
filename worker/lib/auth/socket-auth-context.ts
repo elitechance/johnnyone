@@ -3,6 +3,12 @@ export interface SocketAuth {
   userId: string;
   clientType: 'api' | 'mobile' | 'desktop';
   apiKey?: { id: string; scopes: string[] };
+  /**
+   * The registered desktop node this socket was VERIFIED as at upgrade (hotfix live-chat-2): set
+   * only for a `desktop` socket whose claimed `nodeId` is the node the server resolved for this
+   * tenant+user from the `desktop_nodes` registry. Never taken from a message payload.
+   */
+  desktopNodeId?: string;
 }
 
 /**
@@ -22,6 +28,7 @@ export function getSocketAuth(ws: WebSocket, state: DurableObjectState): SocketA
         userId: direct.userId,
         clientType: (direct.clientType as any) || 'api',
         apiKey: direct.apiKey,
+        desktopNodeId: typeof direct.desktopNodeId === 'string' && direct.desktopNodeId ? direct.desktopNodeId : undefined,
       };
     }
   } catch {}

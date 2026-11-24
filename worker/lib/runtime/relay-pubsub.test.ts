@@ -42,7 +42,7 @@ function makeDo(pubsubNs: unknown) {
 function desktopWs() {
   return {
     send: vi.fn(),
-    deserializeAttachment: () => ({ tenantId: 't1', userId: 'u1', clientType: 'desktop' }),
+    deserializeAttachment: () => ({ tenantId: 't1', userId: 'u1', clientType: 'desktop', desktopNodeId: 'n1' }),
   } as any;
 }
 
@@ -125,7 +125,7 @@ describe('ChatRelayDO feeds the graphql subscriptions', () => {
 
 /** Review findings L-1-1 / L-1-2 / L-1-3 (fence tests folded in from the reviewer). */
 describe('relay publish hardening (L-1-1, L-1-2, L-1-3)', () => {
-  function mk(fetchImpl: (req: Request) => Promise<Response>, attachment: Record<string, unknown> = { tenantId: 't1', userId: 'u1', clientType: 'desktop' }) {
+  function mk(fetchImpl: (req: Request) => Promise<Response>, attachment: Record<string, unknown> = { tenantId: 't1', userId: 'u1', clientType: 'desktop', desktopNodeId: 'n1' }) {
     const published: string[] = [];
     const ns = {
       idFromName: (n: string) => n,
@@ -161,13 +161,23 @@ describe('relay publish hardening (L-1-1, L-1-2, L-1-3)', () => {
     expect(pubsubRoom(await topicFor('u2'))).toBe('r1'); // same room, different topic: nothing delivered
   });
 
-  it('L-1-2: an API-key socket flagged desktop cannot inject deltas or messages', async () => {
+  it('hotfix: the registered desktop node publishes even when it authenticated with a jk_ API key', async () => {
     const { relay, ws, published } = mk(async () => new Response('ok'), {
-      tenantId: 't1', userId: 'u1', clientType: 'desktop', apiKey: { id: 'k', scopes: ['terminal:write'] },
+      tenantId: 't1', userId: 'u1', clientType: 'desktop', desktopNodeId: 'n1', apiKey: { id: 'k', scopes: ['terminal:write'] },
     });
-    await relay.webSocketMessage(ws, d('fake'));
-    await relay.webSocketMessage(ws, JSON.stringify({ type: 'chat_message', data: { relayId: 'r1', sessionId: 's1', content: 'fake' } }));
-    expect(published).toEqual([]);
+    await relay.webSocketMessage(ws, d('live'));
+    expect(published).toEqual(['relay-chat-delta:u1:r1|live']);
+  });
+
+  it('L-1-2: a socket flagged desktop that is NOT a verified node (jk_ or JWT) cannot inject', async () => {
+    for (const apiKey of [{ id: 'k', scopes: ['terminal:write'] }, undefined]) {
+      const { relay, ws, published } = mk(async () => new Response('ok'), {
+        tenantId: 't1', userId: 'u1', clientType: 'desktop', apiKey,
+      });
+      await relay.webSocketMessage(ws, d('fake'));
+      await relay.webSocketMessage(ws, JSON.stringify({ type: 'chat_message', data: { relayId: 'r1', sessionId: 's1', content: 'fake' } }));
+      expect(published).toEqual([]);
+    }
   });
 
   it('L-1-3 (W5): concurrent deliveries keep order when the first publish is slow', async () => {
