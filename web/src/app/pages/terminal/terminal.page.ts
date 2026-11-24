@@ -217,8 +217,8 @@ import {
   shellViewTogglePath,
 } from '../shells/shells-route';
 import {
+  applyHeldRefusals,
   endedNote,
-  heldNotice,
   holdRefusal,
   type HeldRefusal,
   isReadOnlyShell,
@@ -1830,18 +1830,10 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         const ids = [this.currentSession()?.id, this.primarySessionId()];
         const held = this.heldRefusals();
         untracked(() => {
-          const now = Date.now();
-          for (const id of ids) {
-            const notice = heldNotice(held, id, now);
-            if (!id || !notice) continue;
-            this.paneNotices.update((m) => withPaneNotice(m, id, notice));
-            // Applied once: a later live frame may clear the notice, and must not see it come back.
-            this.heldRefusals.update((h) => {
-              const next = { ...h };
-              delete next[id];
-              return next;
-            });
-          }
+          const next = applyHeldRefusals(this.paneNotices(), held, ids, Date.now());
+          if (!next) return;
+          this.paneNotices.set(next.notices);
+          this.heldRefusals.set(next.held);
         });
       },
       { allowSignalWrites: true },

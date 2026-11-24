@@ -196,3 +196,27 @@ export function rawPaneView(
   }
   return rawAttachNeeded(sessionId, hasScreen) ? { kind: 'attach' } : { kind: 'screen' };
 }
+
+/**
+ * Apply the held refusals of the sessions now shown (`ids`: the /shells session and the console's
+ * primary one) as pane notices, each ONCE: an applied entry leaves `held`, so a later live frame that
+ * clears the notice never sees it come back. `null` when nothing applies (no signal writes).
+ */
+export function applyHeldRefusals(
+  notices: Readonly<Record<string, string>>,
+  held: Readonly<Record<string, HeldRefusal>>,
+  ids: ReadonlyArray<string | null | undefined>,
+  now: number,
+): { notices: Record<string, string>; held: Record<string, HeldRefusal> } | null {
+  let nextNotices: Record<string, string> = { ...notices };
+  const nextHeld: Record<string, HeldRefusal> = { ...held };
+  let applied = false;
+  for (const id of ids) {
+    const notice = heldNotice(nextHeld, id, now);
+    if (!id || !notice) continue;
+    nextNotices = withPaneNotice(nextNotices, id, notice);
+    delete nextHeld[id];
+    applied = true;
+  }
+  return applied ? { notices: nextNotices, held: nextHeld } : null;
+}

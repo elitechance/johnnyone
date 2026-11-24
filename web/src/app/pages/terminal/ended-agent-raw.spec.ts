@@ -18,6 +18,7 @@ import { AGENT_JOB_ENDED_NOTE, PLAN_AGENT_VIEW_ONLY_NOTE } from '../shells/shell
 import {
   ARCHIVED_SHELL_NOTE,
   HELD_REFUSAL_TTL_MS,
+  applyHeldRefusals,
   endedNote,
   heldNotice,
   holdRefusal,
@@ -91,10 +92,26 @@ describe('an ended plan agent never shows a blank Raw pane (bug 1)', () => {
     expect(heldNotice(h, 'S79', 79)).toBe(AGENT_JOB_ENDED_NOTE);
   });
 
-  it('the page wires it: the template uses endedNote, rejections are held and applied', () => {
+  it('applyHeldRefusals: applies a shown session\'s held notice once, ignores the rest', () => {
+    const held = holdRefusal(holdRefusal({}, { sessionId: 'PA', accepted: false, error: ENGINE_REFUSAL }, 0), { sessionId: 'BG', accepted: false, error: ENGINE_REFUSAL }, 0);
+    expect(applyHeldRefusals({}, held, [undefined, null], 10)).toBeNull();
+    const r = applyHeldRefusals({ X: 'kept' }, held, ['PA', null], 10)!;
+    expect(r.notices).toEqual({ X: 'kept', PA: AGENT_JOB_ENDED_NOTE });
+    expect(Object.keys(r.held)).toEqual(['BG']);
+    // Applied once: a live frame clears the notice, and the held entry is gone, so it stays cleared.
+    expect(applyHeldRefusals({}, r.held, ['PA'], 20)).toBeNull();
+    // Expired entries never apply.
+    expect(applyHeldRefusals({}, held, ['PA'], HELD_REFUSAL_TTL_MS + 1)).toBeNull();
+  });
+
+  it('the page wires it (anchored to live code lines, not comments)', () => {
     expect(HTML).toContain("rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh)).kind === 'ended'");
     expect(HTML).not.toContain('shViewOnly && !isPlanAgentShell(sh)');
-    expect(TS).toContain('this.heldRefusals.update((h) => holdRefusal(h, { ...ack, accepted: false }, Date.now()));');
-    expect(TS).toContain('const notice = heldNotice(held, id, now);');
+    const code = TS.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    expect(code).toMatch(/^\s+this\.heldRefusals\.update\(\(h\) => holdRefusal\(h, \{ \.\.\.ack, accepted: false \}, Date\.now\(\)\)\);$/m);
+    expect(code).toMatch(/^\s+const ids = \[this\.currentSession\(\)\?\.id, this\.primarySessionId\(\)\];$/m);
+    expect(code).toMatch(/^\s+const held = this\.heldRefusals\(\);$/m);
+    expect(code).toMatch(/^\s+const next = applyHeldRefusals\(this\.paneNotices\(\), held, ids, Date\.now\(\)\);$/m);
+    expect(code).toMatch(/^\s+this\.paneNotices\.set\(next\.notices\);\n\s+this\.heldRefusals\.set\(next\.held\);$/m);
   });
 });
