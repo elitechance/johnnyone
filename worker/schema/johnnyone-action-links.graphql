@@ -1,0 +1,55 @@
+# Discord action links: signed (HS256, ACTION_LINK_SECRET), 120 s, single-use links that do ONE
+# allowlisted thing (answer | approve_plan | run_phase | ack). See worker/lib/action-links/.
+
+type ActionLinkMint {
+  # https://<web>/act?t=<jwt> — the token is a bearer credential; never log it.
+  url: String!
+  jti: String!
+  # exp, seconds since the epoch
+  expiresAt: Int!
+}
+
+type ActionLinkPreview {
+  # valid | expired | used | invalid
+  state: String!
+  act: String
+  label: String
+  target: String
+  expiresAt: Int
+  message: String
+  # for state=used: done | failed | uncertain | superseded | answered | pending
+  outcome: String
+  # the worker's clock (s since epoch); the page counts down against it
+  serverNow: Int!
+}
+
+type ActionLinkResult {
+  ok: Boolean!
+  # expired | used | superseded | invalid | unavailable | uncertain | restarted | answered | failed
+  # (null on success)
+  code: String
+  summary: String!
+}
+
+input CreateActionLinkInput {
+  act: String!
+  # JSON object, action-specific (see actions.ts)
+  args: String!
+  label: String!
+  # optional: sibling links (a Yes/No pair) share a group; redeeming one uses up the rest
+  group: String
+  # optional: human description of the target (plan / agent titles)
+  targetTitle: String
+}
+
+extend type Query {
+  # Token-authorized. Verifies, never consumes.
+  previewActionLink(token: String!): ActionLinkPreview!
+}
+
+extend type Mutation {
+  # Authenticated (the desktop's relay credential + the action's scope).
+  createActionLink(input: CreateActionLinkInput!): ActionLinkMint!
+  # Token-authorized, POST only, single use.
+  runActionLink(token: String!): ActionLinkResult!
+}

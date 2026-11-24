@@ -85,6 +85,19 @@ function isLoginUrl(url: string): boolean {
 }
 
 /**
+ * Is `url` a public page authorized by a token in its own query (`/act?t=<jwt>`, a Discord
+ * action link)? Such a page needs no session, so an expired session must neither navigate away
+ * from it nor carry its URL — the token — into `/login?returnUrl=…` and the browser history.
+ */
+export function isPublicTokenPage(url: string | null | undefined): boolean {
+  if (typeof url !== 'string') return false;
+  const u = url.trim().toLowerCase();
+  if (!u.startsWith('/act')) return false;
+  const next = u[4];
+  return next === undefined || next === '?' || next === '/' || next === '#';
+}
+
+/**
  * The `returnUrl` worth remembering for the page the user is currently on, or
  * `undefined` when there is nothing useful to remember.
  *
@@ -98,6 +111,7 @@ export function captureReturnUrl(currentUrl: string | null | undefined): string 
   const url = currentUrl.trim();
   if (url === '/') return undefined;
   if (isLoginUrl(url)) return undefined;
+  if (isPublicTokenPage(url)) return undefined;
   return url;
 }
 

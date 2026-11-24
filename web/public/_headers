@@ -1,0 +1,9 @@
+# Cloudflare Pages response headers (copied to the build root from web/public).
+# /act?t=<jwt> carries a bearer token for one action (Discord action links): never send the page
+# URL as a Referer, from the very first byte (a meta tag set by the page itself comes too late).
+/act
+  Referrer-Policy: no-referrer
+  Cache-Control: no-store
+/act/*
+  Referrer-Policy: no-referrer
+  Cache-Control: no-store

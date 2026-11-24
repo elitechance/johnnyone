@@ -146,6 +146,13 @@ pub struct AppState {
     /// Rejected plan-agent MCP calls per initiative (phase 02 task 06), seeded from the
     /// `agent_mcp_rejected` event count on first use. Feeds the `count` in each rejection event.
     pub mcp_rejections: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Discord action links this host minted and has not yet seen redeemed, keyed by jti
+    /// (`services::action_links`). The host performs a redeemed link only if it is in here with
+    /// the same action and args, and takes it out as it does — so even a forged-but-validly-signed
+    /// token cannot make this host act. In-memory on purpose: a link lives 120 s. An engine restart
+    /// empties it, so a link minted before the restart is refused with `UNKNOWN_LINK`, which the
+    /// worker reports as its own `restarted` outcome ("J1 restarted, so ask for a new link").
+    pub action_links: crate::services::action_links::Registry,
 }
 
 impl AppState {
@@ -202,6 +209,7 @@ impl AppState {
             kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             lease_pool,
             mcp_rejections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            action_links: Default::default(),
         }
     }
 
@@ -250,6 +258,7 @@ impl AppState {
             kloo_pids: Arc::new(std::sync::Mutex::new(HashMap::new())),
             lease_pool,
             mcp_rejections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            action_links: Default::default(),
         }
     }
 

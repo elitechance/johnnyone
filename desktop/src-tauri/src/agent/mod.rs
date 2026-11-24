@@ -870,6 +870,28 @@ impl AgentService {
         }
     }
 
+    /// One line typed into a session exactly as the console types it: the relay `terminal_command`
+    /// text branch (`prepare_terminal_command_data` for a command with no attachments, then
+    /// `send_terminal_input`), as a function. The `answer` action of a Discord action link uses
+    /// it so a tapped "Yes" reaches the agent the same way a typed "yes" does — same transcript
+    /// row, same report nudge, same first-message brief.
+    pub(crate) async fn deliver_console_reply(
+        state: &Arc<AppState>,
+        session_id: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let command = message_types::TerminalCommand {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            data: format!("{text}\r"),
+            control: None,
+            history_rows: None,
+            attachments: Vec::new(),
+        };
+        let data = Self::prepare_terminal_command_data(state, &command).await?;
+        crate::terminal::send_terminal_input(state, command.session_id, data).await
+    }
+
     /// Unified delivery seam for BOTH human chat messages and watchdog nudges.
     ///
     /// Inserts a `session_reports` row with the given role, arms the shell report nudge
@@ -1450,6 +1472,21 @@ impl AgentService {
             }
             "update_session_watchdog_triggers" => {
                 Self::rpc_update_session_watchdog_triggers(&req.params, state)
+            }
+            // Discord action links (services::action_links): the worker sends these only after it
+            // verified the link's token; the host still re-checks that it minted the link.
+            "perform_action_link" => {
+                let performer = crate::services::action_links::LivePerformer { state: state.clone() };
+                crate::services::action_links::perform(
+                    state,
+                    &performer,
+                    &req.params,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+            }
+            "record_action_link_event" => {
+                crate::services::action_links::record_event(state, &req.params)
             }
             _ => Err(format!("Unknown RPC method: {}", req.method)),
         };

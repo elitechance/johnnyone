@@ -125,8 +125,33 @@ pub fn load_host_settings(state: &AppState) -> HostSettings {
     }
 }
 
+// Tests must never reach a real worker. `resolve` prefers the JOHNNYONE_* env vars, which are SET
+// on a developer machine (real tenant/user ids, the prod worker URL as the default), so under
+// `cfg(test)` it ignores env AND settings and returns only what a test explicitly injects here.
+#[cfg(test)]
+thread_local! {
+    static TEST_RELAY_CONFIG: std::cell::RefCell<Option<RelayConfig>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: the config `RelayConfig::resolve` returns on this thread (None = not connected).
+#[cfg(test)]
+pub fn set_test_relay_config(config: Option<RelayConfig>) {
+    TEST_RELAY_CONFIG.with(|c| *c.borrow_mut() = config);
+}
+
 impl RelayConfig {
     pub fn resolve(state: &AppState) -> Option<Self> {
+        #[cfg(test)]
+        {
+            let _ = state;
+            TEST_RELAY_CONFIG.with(|c| c.borrow().clone())
+        }
+        #[cfg(not(test))]
+        Self::resolve_live(state)
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    fn resolve_live(state: &AppState) -> Option<Self> {
         let worker_url = resolve_worker_url(state);
         let user_id = resolve_user_id(state);
         let tenant_id = resolve_tenant_id(state);

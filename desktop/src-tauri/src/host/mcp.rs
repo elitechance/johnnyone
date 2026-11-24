@@ -88,12 +88,9 @@ impl TransportReject {
 }
 
 /// Is `host` exactly `127.0.0.1:<port>` or `localhost:<port>` (host case-insensitive, exact port)?
+/// The rule lives in `origin_guard::host_matches`, shared with the GraphQL router.
 fn host_allowed(host: &str, bound_port: u16) -> bool {
-    let Some((name, port)) = host.rsplit_once(':') else {
-        return false;
-    };
-    let name = name.to_ascii_lowercase();
-    (name == "127.0.0.1" || name == "localhost") && port == bound_port.to_string()
+    super::origin_guard::host_matches(host, bound_port, super::origin_guard::MCP_HOST_NAMES)
 }
 
 /// The pure transport check, in the order of master §5.3 / task 02.

@@ -3,6 +3,7 @@ use crate::db::models::{
 };
 use crate::events::{ChatCompleteEvent, ChatDeltaEvent};
 use crate::services::{
+    action_links,
     agent_plans,
     chat_host,
     planner_prompts::{self as planner_prompt_service, PlannerPromptSettings},
@@ -302,6 +303,15 @@ impl From<FindingOverride> for findings_service::Override {
             FindingOverride::Reopen => findings_service::Override::Reopen,
         }
     }
+}
+
+/// `mintActionLink`'s result. `url` is a bearer credential for one action.
+#[derive(SimpleObject)]
+#[graphql(rename_fields = "camelCase")]
+struct GqlActionLinkMint {
+    url: String,
+    jti: String,
+    expires_at: i64,
 }
 
 struct MutationRoot;
@@ -626,6 +636,55 @@ impl MutationRoot {
             small_mode,
         );
         Ok(planner_prompt_service::save_prompt_settings(merged)?.into())
+    }
+
+    /// Mint a Discord action link: a signed, 120 s, single-use URL
+    /// (`https://johnnyone.pages.dev/act?t=<jwt>`) that performs ONE allowlisted action after a
+    /// human taps Confirm on the page it opens. `act` is `answer` (args
+    /// `{"sessionId","reply"}`), `approve_plan` (`{"planId"}`), `run_phase`
+    /// (`{"planId","phaseId"}`) or `ack` (`{}`); `args` is that object as a JSON string; `label`
+    /// is the one line the page shows. Anything else is refused. `group` (optional) ties sibling
+    /// links together — mint the Yes and the No of one question with the same group, and
+    /// redeeming either uses the other up.
+    ///
+    /// Order for `answer`: the asking agent must FIRST report `blocked` (its baked
+    /// `reportAgentResult(kind:"blocked")`, i.e. agent_blocked) — or J1's question watcher must
+    /// have seen the pane waiting — and only THEN may a link be minted for it. A session with no
+    /// open question, or whose question was already answered, is refused here, before any link
+    /// exists. The session must be a J1-managed phase agent, not an attached shell or plan agent. The worker signs (the key never
+    /// leaves it) over the relay credential; the URL is a bearer credential — post it as a Discord
+    /// link button and do not log it.
+    ///
+    /// Same caller tier as `setSetting`'s connection keys: an agent's `curl` (no `Origin`) or the
+    /// app itself. A page on a foreign loopback origin is refused, because it could otherwise mint
+    /// a link, read the URL back, and redeem it without any human ever seeing it.
+    async fn mint_action_link(
+        &self,
+        ctx: &Context<'_>,
+        act: String,
+        args: String,
+        label: String,
+        group: Option<String>,
+    ) -> async_graphql::Result<GqlActionLinkMint> {
+        let trust = ctx
+            .data_opt::<origin_guard::WriteTrust>()
+            .copied()
+            .unwrap_or(origin_guard::WriteTrust::Loopback);
+        if trust != origin_guard::WriteTrust::Webview {
+            return Err(async_graphql::Error::new(
+                "mintActionLink: may only be called by a local agent or the JohnnyOne app itself",
+            ));
+        }
+        let state = ctx.data_unchecked::<AppState>();
+        let signer = match ctx.data_opt::<std::sync::Arc<dyn action_links::LinkSigner>>() {
+            // Tests inject a fake signer; production always talks to the worker.
+            Some(fake) => fake.clone(),
+            None => std::sync::Arc::new(action_links::WorkerSigner { state: state.clone() }),
+        };
+        let link = action_links::mint(state, signer.as_ref(), &act, &args, &label, group.as_deref())
+            .await
+            .map_err(async_graphql::Error::new)?;
+        Ok(GqlActionLinkMint { url: link.url, jti: link.jti, expires_at: link.expires_at })
     }
 
     async fn connect_relay(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
@@ -1883,5 +1942,124 @@ mod router_tests {
             "playground HTML missing, got {} bytes",
             text.len()
         );
+    }
+
+    // ── mintActionLink (Discord action links) ──────────────────────────────────────────────────
+
+    struct StubSigner;
+    impl action_links::LinkSigner for StubSigner {
+        fn sign<'a>(&'a self, req: &'a action_links::MintRequest) -> action_links::BoxFut<'a, action_links::MintedLink> {
+            Box::pin(async move {
+                Ok(action_links::MintedLink {
+                    url: format!("https://web.test/act?t=stub-{}", req.act),
+                    jti: "00000000-0000-4000-8000-000000000001".into(),
+                    expires_at: chrono::Utc::now().timestamp() + 120,
+                })
+            })
+        }
+    }
+
+    async fn mint_with_trust(state: &AppState, trust: origin_guard::WriteTrust, q: &str) -> serde_json::Value {
+        let signer: std::sync::Arc<dyn action_links::LinkSigner> = std::sync::Arc::new(StubSigner);
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+            .data(state.clone())
+            .data(signer)
+            .finish();
+        serde_json::to_value(schema.execute(async_graphql::Request::new(q).data(trust)).await).unwrap()
+    }
+
+    const MINT_ACK: &str = r#"mutation{mintActionLink(act:"ack",args:"{}",label:"Got it"){url jti expiresAt}}"#;
+
+    #[tokio::test]
+    async fn mint_action_link_is_refused_from_a_foreign_loopback_origin() {
+        let (state, _) = test_state();
+        // Through the real router (Origin header -> WriteTrust). The label is empty on purpose: if
+        // the trust gate ever regressed, mint would still refuse BEFORE signing, so this test can
+        // never reach a real worker — it would just fail on the message below.
+        let q = r#"mutation{mintActionLink(act:"ack",args:"{}",label:""){url}}"#;
+        let v = send(&state, origin_post("http://localhost:3000", q)).await;
+        assert!(first_error(&v).contains("may only be called"), "{v}");
+        let v = mint_with_trust(&state, origin_guard::WriteTrust::Loopback, MINT_ACK).await;
+        assert!(first_error(&v).contains("may only be called"), "{v}");
+        assert!(state.action_links.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mint_action_link_from_an_agent_returns_the_url_and_registers_the_jti() {
+        let (state, _) = test_state();
+        let v = mint_with_trust(&state, origin_guard::WriteTrust::Webview, MINT_ACK).await;
+        assert_eq!(v["data"]["mintActionLink"]["url"], "https://web.test/act?t=stub-ack", "{v}");
+        assert!(state
+            .action_links
+            .lock()
+            .unwrap()
+            .contains_key("00000000-0000-4000-8000-000000000001"));
+    }
+
+    #[tokio::test]
+    async fn mint_action_link_refuses_a_non_allowlisted_action() {
+        let (state, _) = test_state();
+        let q = r#"mutation{mintActionLink(act:"delete_plan",args:"{}",label:"x"){url}}"#;
+        let v = mint_with_trust(&state, origin_guard::WriteTrust::Webview, q).await;
+        assert!(first_error(&v).contains("not allowlisted"), "{v}");
+        assert!(state.action_links.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mint_action_link_through_the_real_router_never_reaches_a_worker_in_tests() {
+        // H-1-13: a VALID mint from an agent (no Origin → Webview trust) with NO injected signer
+        // takes the production WorkerSigner path — which, under cfg(test), refuses to connect.
+        let (state, _) = test_state();
+        let v = send(&state, agent_post(MINT_ACK)).await;
+        assert_eq!(
+            first_error(&v),
+            crate::services::action_links::NETWORK_DISABLED_IN_TESTS,
+            "{v}"
+        );
+        assert!(state.action_links.lock().unwrap().is_empty());
+    }
+
+    fn host_post(host: &str, sec_fetch_site: Option<&str>, query: &str) -> Request<Body> {
+        let mut b = Request::builder()
+            .method(Method::POST)
+            .uri("/graphql")
+            .header(CONTENT_TYPE, "application/json")
+            .header(axum::http::header::HOST, host);
+        if let Some(sfs) = sec_fetch_site {
+            b = b.header("sec-fetch-site", sfs);
+        }
+        b.body(Body::from(serde_json::json!({ "query": query }).to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_dns_rebinding_request_is_refused_even_when_same_origin() {
+        // H-1-14: a rebinding page on evil.example:7788 is "same-origin" to itself.
+        let (state, _) = test_state();
+        let port = crate::services::mcp_tokens::host_port();
+        for host in [
+            format!("evil.example:{port}"),
+            format!("127.0.0.1.evil.example:{port}"),
+            format!("127.0.0.1:{}", port.wrapping_add(1)),
+            "127.0.0.1".to_string(),
+        ] {
+            let res = router(state.clone())
+                .oneshot(host_post(&host, Some("same-origin"), MINT_ACK))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "Host {host}");
+        }
+        assert!(state.action_links.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_normal_loopback_request_still_works_with_a_host_header() {
+        let (state, _) = test_state();
+        let port = crate::services::mcp_tokens::host_port();
+        for host in [format!("127.0.0.1:{port}"), format!("LOCALHOST:{port}"), format!("[::1]:{port}")] {
+            for sfs in [None, Some("same-origin")] {
+                let v = send(&state, host_post(&host, sfs, "{ health }")).await;
+                assert_eq!(v["data"]["health"], true, "Host {host} {sfs:?}: {v}");
+            }
+        }
     }
 }
