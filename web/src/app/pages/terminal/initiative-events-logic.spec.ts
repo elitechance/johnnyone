@@ -11,6 +11,8 @@ import {
   stageOf,
   actorLabel,
   windowTimeline,
+  eventLabel,
+  EVENT_LABELS,
 } from './initiative-events-logic';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -283,5 +285,40 @@ describe('wiring — events rail', () => {
     const html = readFileSync(resolve(here, 'terminal.page.html'), 'utf8');
     const ts = readFileSync(resolve(here, 'terminal.page.ts'), 'utf8');
     expect(html + ts).toMatch(/windowTimeline/);
+  });
+});
+
+describe('review-loop event labels (round digest, ready refused)', () => {
+  const digestPayload = JSON.stringify({ line: 'Plan · 00-x r2: 3 → 1 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3', round: 2 });
+
+  it('prefers the backend summary', () => {
+    const row = initiativeTimeline([ev({ eventType: 'agent_review_round_digest', summary: 'Round digest: x', payloadJson: digestPayload })])[0];
+    expect(row.title).toBe('Round digest: x');
+  });
+
+  it('falls back to a readable label with the payload detail, never the raw type', () => {
+    expect(eventLabel({ eventType: 'agent_review_round_digest', summary: '', payloadJson: digestPayload })).toBe(
+      'Review round digest: Plan · 00-x r2: 3 → 1 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3',
+    );
+    expect(
+      eventLabel({ eventType: 'agent_finding_ready_refused', summary: '', payloadJson: '{"unanswered":["F-00-x-1","F-00-x-3"]}' }),
+    ).toBe('Ready refused — unanswered findings F-00-x-1, F-00-x-3');
+    expect(eventLabel({ eventType: 'agent_finding_ready_refused', summary: null as unknown as string, payloadJson: 'bad' })).toBe(
+      'Ready refused — unanswered findings',
+    );
+    for (const type of Object.keys(EVENT_LABELS)) {
+      expect(eventLabel({ eventType: type, summary: '', payloadJson: '{}' })).not.toBe(type);
+    }
+    expect(eventLabel({ eventType: 'something_else', summary: '', payloadJson: '{}' })).toBe('something_else');
+  });
+
+  it('places the digest under review (a milestone) and the refusal under development', () => {
+    const [digest, refused] = initiativeTimeline([
+      ev({ id: 'd', eventType: 'agent_review_round_digest', category: 'phase', summary: '', payloadJson: digestPayload }),
+      ev({ id: 'r', eventType: 'agent_finding_ready_refused', category: 'phase', summary: '', payloadJson: '{"unanswered":["F-1"]}' }),
+    ]);
+    expect([digest.stage, digest.milestone]).toEqual(['review', true]);
+    expect([refused.stage, refused.milestone]).toEqual(['development', false]);
+    expect(stageOf('agent_review_round_digest', 'run')).toBe('review');
   });
 });
