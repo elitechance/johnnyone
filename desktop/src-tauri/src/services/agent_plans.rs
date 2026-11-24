@@ -21892,6 +21892,9 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         let reason = f.events("agent_phase_needs_attention").last().unwrap()["reason"].as_str().unwrap().to_string();
         assert!(reason.contains(&b2), "needs_attention names #2: {reason}");
         assert_eq!(sink.lock().unwrap().len(), 2, "an escalated round is not sent back to the worker");
+        let last = f.events("agent_review_round_digest").last().unwrap().clone();
+        assert!(last["line"].as_str().unwrap().ends_with(&format!("⚠ needs you: escalated {b2}")), "{last}");
+        assert_eq!(last["outcome"]["kind"], "needsYou");
         no_worker_tmux();
     }
 
@@ -22031,6 +22034,89 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         );
         assert_eq!(*f.digests.lock().unwrap(), lines, "every digest goes through the post seam, once");
         no_worker_tmux();
+    }
+
+    #[tokio::test]
+    async fn workflow_stream_lens_round3_rephrased_dispute_stays_blocking() {
+        let f = fx();
+        let lenses = vec![lens("glm", "lokalai", true)];
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", "- the save drops where_"))], &lenses, &sink).await;
+        let id = f.rows()[0].id.clone();
+        f.status("phase_worker_running");
+        ledger::dispute_finding(&f.state, W, &id, "save.rs:42 writes where_").unwrap();
+        f.next_round();
+        f.next_round();
+        assert_eq!(ledger::current_round(&f.state, &f.id, "00-x"), 3);
+        let text = format!("The dispute is wrong.\n- {id} still stands: update drops where_ too\nVERDICT: NEEDS_CHANGES");
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &text))], &lenses, &sink).await;
+        let rows = f.rows();
+        assert_eq!(rows.len(), 1, "the rephrased bullet is not imported as a new finding: {rows:?}");
+        assert_eq!((rows[0].state.as_str(), rows[0].severity.as_str()), ("open", "blocking"), "upheld, still blocking");
+        assert!(f.events("agent_finding_withdrawn").is_empty());
+        assert!(f.events("agent_finding_forced_followup").is_empty());
+        assert_eq!(f.events("agent_finding_upheld")[0]["saw"], format!("{id} still stands: update drops where_ too"));
+        assert_eq!(gate(&f), "NEEDS_CHANGES");
+    }
+
+    #[tokio::test]
+    async fn workflow_dispute_from_a_removed_lens_is_recovered_by_a_human() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        let id = f.typed(QA, "drops where_");
+        f.status("phase_worker_running");
+        ledger::dispute_finding(&f.state, W, &id, "where_ is written").unwrap();
+        // qa left the panel: only pr reviews now, and nobody can rule on the dispute.
+        let pr_only = vec![lens("pr", "claude_code", true)];
+        f.next_round();
+        f.conclude(vec![("pr", verdict("PASS", ""))], &pr_only, &sink).await;
+        assert_eq!(gate(&f), "NEEDS_CHANGES", "the stuck dispute blocks");
+        ledger::override_finding(&f.state, &f.id, &id, ledger::Override::Withdraw, "qa lens removed; worker is right").unwrap();
+        assert_eq!(ledger::get(&f.state, &f.id, &id).unwrap().state, "withdrawn");
+        f.next_round();
+        f.conclude(vec![("pr", verdict("PASS", ""))], &pr_only, &sink).await;
+        assert_eq!(f.plan_status(), "approved", "recovered: the phase passes");
+    }
+
+    #[tokio::test]
+    async fn workflow_pass_round_posts_to_discord_once() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        let id = f.typed(QA, "drops where_");
+        f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        f.claim(&id);
+        f.next_round();
+        let before = list_events(&f.state, &f.id, 100_000).unwrap().len();
+        ledger::resolve_finding(&f.state, QA, &id, Outcome::Verified, None).unwrap();
+        f.conclude(vec![("qa", verdict("PASS", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "approved");
+        let round: Vec<AgentPlanEvent> = list_events(&f.state, &f.id, 100_000).unwrap().into_iter().skip(before).collect();
+        let generic: Vec<String> = round
+            .iter()
+            .filter_map(|e| {
+                let p: serde_json::Value = serde_json::from_str(&e.payload_json).unwrap();
+                discord_message_for(&e.event_type, e.phase_id.as_deref(), &p).map(|m| m.1)
+            })
+            .collect();
+        assert!(generic.is_empty(), "no generic Discord post on a digested pass: {generic:?}");
+        let digests = f.digests.lock().unwrap();
+        assert_eq!(digests.len(), 2, "one digest per round: {digests:?}");
+        assert!(digests[1].ends_with("✅ passed"), "{}", digests[1]);
+        // A pass that did NOT come through a digested round still announces itself.
+        assert!(discord_message_for("agent_phase_gate_result", Some("00-x"), &json!({ "verdict": "PASS" })).is_some());
+        assert!(discord_message_for("agent_plan_completed", None, &json!({})).is_some());
+        assert!(discord_message_for("agent_plan_completed", None, &json!({ "digest": true })).is_none());
+    }
+
+    #[test]
+    fn workflow_digest_post_without_a_sink_never_spawns_in_tests() {
+        // No tokio runtime here: a spawn would panic. With no sink, a test build posts nothing.
+        let f = fx();
+        let digest = ledger::round_digest(
+            "p", "00-x", ledger::PhasePos { n: 1, of: 1 }, 1, 0, ledger::RoundActivity::default(), &[], "PASS",
+            ledger::RoundOutcome::Passed { plan_complete: false },
+        );
+        post_round_digest(&f.state, &f.id, &digest, &ReplanCtrl::live());
     }
 
     #[test]
