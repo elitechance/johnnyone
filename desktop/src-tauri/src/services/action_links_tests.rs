@@ -39,21 +39,31 @@ impl LinkSigner for FakeSigner {
 struct FakePerformer {
     calls: StdMutex<Vec<String>>,
     fail: bool,
+    /// The delivery records the reply itself, as a shell-provider agent's console path does.
+    records: Option<AppState>,
+    /// The delivery takes this long (lets two concurrent performs interleave).
+    delay_ms: u64,
 }
 
 impl ActionPerformer for FakePerformer {
-    fn answer<'a>(&'a self, session_id: &'a str, reply: &'a str) -> BoxFut<'a, ()> {
+    fn answer<'a>(&'a self, session_id: &'a str, reply: &'a str) -> BoxFut<'a, bool> {
         self.calls
             .lock()
             .unwrap()
             .push(format!("deliver_console_reply({session_id}, {reply})"));
         let fail = self.fail;
         Box::pin(async move {
-            if fail {
-                Err("pane is gone".into())
-            } else {
-                Ok(())
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
+            if fail {
+                return Err("pane is gone".into());
+            }
+            if let Some(state) = &self.records {
+                agent_plans::record_user_prompt(state, session_id, reply);
+                return Ok(true);
+            }
+            Ok(false)
         })
     }
     fn approve_plan<'a>(&'a self, plan_id: &'a str) -> BoxFut<'a, ()> {
@@ -689,7 +699,7 @@ async fn a_redeemed_answer_is_recorded_so_a_second_link_cannot_answer_again() {
     assert_eq!(performer.calls.lock().unwrap().len(), 1, "typed exactly once");
     // and a fresh link for the same (answered) question is refused at mint
     let err = mint_l(&state, &signer, "answer", &no.to_string(), "L").await.unwrap_err();
-    assert!(err.contains("answered:"), "{err}");
+    assert!(err.contains(MINT_ANSWERED), "{err}");
 }
 
 #[tokio::test]
@@ -746,4 +756,177 @@ async fn unicode_format_characters_are_refused_in_replies_and_labels() {
     assert!(validate_reply("ça va? 日本 ✓").is_ok());
     assert!(validate_label("Proceed with migration 0021? ✓").is_ok());
     assert!(is_format_char('\u{200D}') && !is_format_char('a') && !is_format_char('\u{00A0}'));
+}
+
+// ── follow-ups batch 1 (#79 round 3) ────────────────────────────────────────────────────────────
+
+fn exec(state: &AppState, sql: &str) {
+    state
+        .db
+        .with_conn(|conn| conn.execute_batch(sql).map_err(|e| e.to_string()))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn two_ungrouped_links_redeemed_at_the_same_instant_type_once() {
+    // H-3-43 / H-3-41: both pass the ask check before either records, unless the session's answer
+    // lock is held across check → deliver → record.
+    let (state, _) = test_state();
+    seed(&state);
+    let signer = FakeSigner::default();
+    let performer = FakePerformer {
+        delay_ms: 50,
+        ..Default::default()
+    };
+    let yes = json!({ "sessionId": SESSION, "reply": "yes" });
+    let no = json!({ "sessionId": SESSION, "reply": "no" });
+    let a = mint_l(&state, &signer, "answer", &yes.to_string(), "Yes").await.unwrap();
+    let b = mint_l(&state, &signer, "answer", &no.to_string(), "No").await.unwrap();
+    let (pa, pb) = (params_for(&a, "answer", yes), params_for(&b, "answer", no));
+    let (ra, rb) = tokio::join!(
+        perform(&state, &performer, &pa, now_secs()),
+        perform(&state, &performer, &pb, now_secs()),
+    );
+    assert_eq!(
+        performer.calls.lock().unwrap().len(),
+        1,
+        "typed twice: {:?}",
+        performer.calls.lock().unwrap()
+    );
+    assert!(ra.is_ok() != rb.is_ok(), "exactly one succeeds: {ra:?} / {rb:?}");
+    let err = ra.err().or(rb.err()).unwrap();
+    assert!(err.contains(ANSWERED), "{err}");
+    assert_eq!(transcript_prompts(&state).len(), 1);
+    assert!(lock(&state.action_links).is_empty());
+    assert!(
+        state.answer_locks.lock().unwrap().is_empty(),
+        "the per-session lock is forgotten once nobody holds it"
+    );
+}
+
+#[tokio::test]
+async fn perform_rechecks_the_session_not_only_the_ask() {
+    // H-3-44: a link lives 120 s. A session archived, attached, retyped, handed to the plan agent
+    // or whose plan job ended after the mint must not be typed into, though its ask is still open.
+    let cases: [(&str, &str); 5] = [
+        ("UPDATE sessions SET status = 'archived'", "is archived"),
+        ("UPDATE sessions SET attached_tmux = 1", "not a J1-managed agent"),
+        ("UPDATE sessions SET kind = 'user'", "not a J1-managed agent"),
+        (
+            "UPDATE agent_plans SET worker_session_id = NULL, briefing_session_id = 'sid-al-worker'",
+            "plan agent",
+        ),
+        ("UPDATE agent_plans SET status = 'stopped' WHERE id = 'plan-al'", "plan job has ended"),
+    ];
+    for (sql, expected) in cases {
+        let (state, _) = test_state();
+        seed(&state);
+        let signer = FakeSigner::default();
+        let performer = FakePerformer::default();
+        let args = json!({ "sessionId": SESSION, "reply": "yes" });
+        let link = mint_l(&state, &signer, "answer", &args.to_string(), "L").await.unwrap();
+        exec(&state, sql);
+        assert_eq!(ask_state(&state, SESSION).unwrap(), AskState::Open, "{sql}");
+        let err = perform(&state, &performer, &params_for(&link, "answer", args), now_secs())
+            .await
+            .unwrap_err();
+        assert!(err.contains(expected), "{sql}: {err}");
+        assert!(performer.calls.lock().unwrap().is_empty(), "{sql}: typed anyway");
+        assert!(transcript_prompts(&state).is_empty(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn answer_mint_refuses_a_session_whose_plan_job_ended() {
+    // H-3-37: a finished plan's still-active worker (a leftover pane) is not answerable.
+    let (state, _) = test_state();
+    seed(&state);
+    exec(
+        &state,
+        "UPDATE agent_plan_phases SET status = 'passed' WHERE plan_id = 'plan-al'; \
+         UPDATE agent_plans SET status = 'approved' WHERE id = 'plan-al';",
+    );
+    let signer = FakeSigner::default();
+    let args = json!({ "sessionId": SESSION, "reply": "yes" }).to_string();
+    let err = mint_l(&state, &signer, "answer", &args, "L").await.unwrap_err();
+    assert!(err.contains("plan job has ended"), "{err}");
+    assert!(signer.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mint_tells_the_minting_agent_how_to_recover_from_an_answered_question() {
+    // H-3-40: not the human-facing "nothing was sent" copy.
+    let (state, _) = test_state();
+    seed(&state);
+    report(&state, SESSION, "prompt", "yes");
+    let signer = FakeSigner::default();
+    let args = json!({ "sessionId": SESSION, "reply": "no" }).to_string();
+    let err = mint_l(&state, &signer, "answer", &args, "L").await.unwrap_err();
+    assert!(
+        err.contains("its last question was already answered; report blocked again for a new question, then mint"),
+        "{err}"
+    );
+    assert!(!err.contains("nothing was sent"), "{err}");
+}
+
+#[tokio::test]
+async fn non_cf_invisible_characters_are_refused_in_replies_and_labels() {
+    // H-3-48: Hangul fillers and the braille blank render as nothing but are not Cf.
+    for c in ['\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}', '\u{2800}', '\u{034F}', '\u{17B4}', '\u{17B5}'] {
+        assert!(is_invisible_char(c) && !is_format_char(c), "{c:?}");
+        assert!(validate_reply(&format!("{c}!ls")).is_err(), "{c:?}!ls must be refused");
+        assert!(validate_reply(&format!("ye{c}s")).is_err(), "ye{c:?}s must be refused");
+        assert!(validate_label(&format!("Proceed{c}?")).is_err(), "label with {c:?} must be refused");
+    }
+    assert!(validate_reply("\u{3164}!ls").is_err());
+    assert!(validate_reply("한국어 ㅎ 네").is_ok(), "ordinary Hangul is fine");
+    assert!(validate_label("⠁⠃ braille text").is_ok(), "non-blank braille is fine");
+    let (state, _) = test_state();
+    seed(&state);
+    let signer = FakeSigner::default();
+    let args = json!({ "sessionId": SESSION, "reply": "\u{3164}!ls" }).to_string();
+    assert!(mint_l(&state, &signer, "answer", &args, "L").await.is_err());
+    assert!(signer.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_delivery_that_recorded_the_reply_is_not_recorded_twice() {
+    // H-3-45: a shell-provider agent's console path records the prompt itself.
+    let (state, _) = test_state();
+    seed(&state);
+    let signer = FakeSigner::default();
+    let performer = FakePerformer {
+        records: Some(state.clone()),
+        ..Default::default()
+    };
+    let args = json!({ "sessionId": SESSION, "reply": "yes" });
+    let link = mint_l(&state, &signer, "answer", &args.to_string(), "L").await.unwrap();
+    perform(&state, &performer, &params_for(&link, "answer", args), now_secs()).await.unwrap();
+    assert_eq!(transcript_prompts(&state), vec![("user".to_string(), "yes".to_string())]);
+    assert_eq!(ask_state(&state, SESSION).unwrap(), AskState::Answered);
+}
+
+#[tokio::test]
+async fn the_console_reply_path_says_when_it_recorded_the_prompt() {
+    // H-3-45, the live seam: a shell-provider session's brief path records the prompt (so
+    // `deliver_console_reply` returns true); a plain agent's does not. No tmux is reached.
+    let (state, _) = test_state();
+    seed(&state);
+    let state = Arc::new(state);
+    let (_, recorded) =
+        crate::agent::AgentService::with_shell_brief_recorded(&state, SESSION, "yes\r".into()).await;
+    assert!(!recorded, "a claude_code agent's console path records nothing");
+    assert!(transcript_prompts(&state).is_empty());
+    exec(&state, "UPDATE sessions SET provider = 'shell', setup_commands = 'claude'");
+    let (data, recorded) =
+        crate::agent::AgentService::with_shell_brief_recorded(&state, SESSION, "yes\r".into()).await;
+    assert!(recorded);
+    assert!(data.starts_with("yes [JohnnyOne:"), "{data}");
+    let (_, again) =
+        crate::agent::AgentService::with_shell_brief_recorded(&state, SESSION, "no\r".into()).await;
+    assert!(again, "every message is recorded, not only the briefed first one");
+    assert_eq!(
+        transcript_prompts(&state),
+        vec![("user".to_string(), "yes".to_string()), ("user".to_string(), "no".to_string())]
+    );
 }

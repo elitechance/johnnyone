@@ -875,21 +875,21 @@ impl AgentService {
     /// `send_terminal_input`), as a function. The `answer` action of a Discord action link uses
     /// it so a tapped "Yes" reaches the agent the same way a typed "yes" does — same transcript
     /// row, same report nudge, same first-message brief.
+    ///
+    /// `Ok(true)` when this path already recorded the reply as the session's `prompt` row (a
+    /// shell-provider or attached session, via [`Self::with_shell_brief_recorded`]); the caller
+    /// then must not record it again (H-3-45).
     pub(crate) async fn deliver_console_reply(
         state: &Arc<AppState>,
         session_id: &str,
         text: &str,
-    ) -> Result<(), String> {
-        let command = message_types::TerminalCommand {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            data: format!("{text}\r"),
-            control: None,
-            history_rows: None,
-            attachments: Vec::new(),
-        };
-        let data = Self::prepare_terminal_command_data(state, &command).await?;
-        crate::terminal::send_terminal_input(state, command.session_id, data).await
+    ) -> Result<bool, String> {
+        // `prepare_terminal_command_data` for a command with no attachments, keeping whether the
+        // brief path recorded the prompt.
+        let (data, recorded) =
+            Self::with_shell_brief_recorded(state, session_id, format!("{text}\r")).await;
+        crate::terminal::send_terminal_input(state, session_id.to_string(), data).await?;
+        Ok(recorded)
     }
 
     /// Unified delivery seam for BOTH human chat messages and watchdog nudges.
@@ -951,16 +951,26 @@ impl AgentService {
     }
 
     async fn with_shell_brief(state: &Arc<AppState>, session_id: &str, data: String) -> String {
+        Self::with_shell_brief_recorded(state, session_id, data).await.0
+    }
+
+    /// [`Self::with_shell_brief`], also saying whether it recorded `data` as the session's
+    /// `prompt` row (`true` for a shell-provider or attached session's message).
+    pub(crate) async fn with_shell_brief_recorded(
+        state: &Arc<AppState>,
+        session_id: &str,
+        data: String,
+    ) -> (String, bool) {
         if data.trim().is_empty() {
-            return data;
+            return (data, false);
         }
         // Control keys and navigation are not messages — never brief on those.
         let body = data.trim_end_matches(['\r', '\n']);
         if body.trim().is_empty() || body.chars().any(|c| c.is_control()) {
-            return data;
+            return (data, false);
         }
         if !Self::session_wants_brief(state, session_id) {
-            return data;
+            return (data, false);
         }
         // A slash command is addressed to the CLI, not to the agent. Appending the brief made the
         // brief its arguments (`/compact [JohnnyOne: …]`), so these pass through untouched: no
@@ -968,7 +978,7 @@ impl AgentService {
         // report. Still recorded, so the transcript shows what was sent.
         if crate::terminal_keys::is_cli_slash_command(body) {
             crate::services::agent_plans::record_user_prompt(state, session_id, body);
-            return data;
+            return (data, true);
         }
         // Every user message arms the "answered but never reported" guard, not just the first.
         Self::arm_shell_report_nudge(state, session_id);
@@ -978,7 +988,7 @@ impl AgentService {
         {
             let mut briefed = state.shell_briefed.lock().await;
             if !briefed.insert(session_id.to_string()) {
-                return data;
+                return (data, true);
             }
         }
         let brief = format!(
@@ -992,7 +1002,7 @@ impl AgentService {
              and do this for every reply.]"
         );
         let tail: String = data[body.len()..].to_string();
-        format!("{body}{brief}{tail}")
+        (format!("{body}{brief}{tail}"), true)
     }
 
     /// Nudge a shell agent that answered but never reported.
