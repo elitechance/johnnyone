@@ -34,6 +34,7 @@ import {
   arrowUpOutline,
   closeOutline,
   createOutline,
+  documentTextOutline,
   lockClosedOutline,
   searchOutline,
   trashOutline,
@@ -42,6 +43,7 @@ import {
   AiChatService,
   ChatWindowComponent,
   JohnnyApiService,
+  MarkdownViewComponent,
   StatusPillComponent,
   type AgentPlan,
   type BriefCheckItem,
@@ -56,6 +58,8 @@ import { BriefFieldComponent } from './components/brief-panel/brief-panel.compon
 import { OutlineRowComponent } from './components/outline-panel/outline-panel.component';
 import { VersionChipComponent } from './components/version-strip/version-strip.component';
 import {
+  CLOSED_PLAN_COPY,
+  LEGACY_BRIEF_NOTE,
   changedCounts,
   checkRows,
   detailState,
@@ -63,6 +67,7 @@ import {
   diffView,
   fieldRows,
   isFrozen,
+  legacyBriefMarkdown,
   outlineCards,
   startGate,
   summaryLine,
@@ -121,6 +126,7 @@ type Pane = 'chat' | 'brief' | 'outline';
     BriefFieldComponent,
     OutlineRowComponent,
     VersionChipComponent,
+    MarkdownViewComponent,
   ],
   templateUrl: './plan-detail.page.html',
   styleUrl: './plan-detail.page.scss',
@@ -162,6 +168,10 @@ export class PlanDetailPage implements OnInit, OnDestroy {
   // ── derived view models ──
   protected readonly state = computed(() => detailState(this.loading(), this.error(), this.plan()));
   protected readonly frozen = computed(() => this.state() === 'frozen' || isFrozen(this.latest()));
+  /** A pre-#76 plan's markdown brief, rendered read-only instead of empty fields (bug 6). */
+  protected readonly legacyBrief = computed(() => legacyBriefMarkdown(this.plan(), this.latest(), this.versions()));
+  protected readonly legacyNote = LEGACY_BRIEF_NOTE;
+  protected readonly closedCopy = CLOSED_PLAN_COPY;
   protected readonly rows = computed<FieldRow[]>(() => {
     const l = this.latest();
     return l ? fieldRows(l, this.versions(), this.now()) : [];
@@ -255,6 +265,7 @@ export class PlanDetailPage implements OnInit, OnDestroy {
       'arrow-up-outline': arrowUpOutline,
       'close-outline': closeOutline,
       'create-outline': createOutline,
+      'document-text-outline': documentTextOutline,
       'lock-closed-outline': lockClosedOutline,
       'search-outline': searchOutline,
       'trash-outline': trashOutline,

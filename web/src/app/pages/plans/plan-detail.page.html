@@ -57,6 +57,20 @@
         </ion-card-content>
       </ion-card>
     }
+    @case ('closed') {
+      <!-- Bug 5: a closed (soft-deleted) plan still has its row and title; say so, read-only. -->
+      <ion-card class="state-card empty">
+        <ion-card-content>
+          <ion-icon name="lock-closed-outline" class="big"></ion-icon>
+          <h2>{{ closedCopy.title }}</h2>
+          <p>{{ closedCopy.body }}</p>
+          <div class="state-actions">
+            <ion-button fill="outline" routerLink="/plans">← Back to Plans</ion-button>
+            <ion-button fill="clear" [routerLink]="['/initiatives']" [queryParams]="{ initiativeId: plan()?.initiativeId || id() }">Open initiative →</ion-button>
+          </div>
+        </ion-card-content>
+      </ion-card>
+    }
     @default {
       @if (frozen()) {
         <!-- S9: frozen after Start planning. -->
@@ -129,93 +143,104 @@
 
         <!-- ───────── BRIEF ───────── -->
         <ion-card class="card brief-card">
-          <div class="ch">Brief <span class="r">plan/brief.md is generated from these fields</span></div>
-          <div class="versions">
-            <span class="vl">versions</span>
-            @for (c of chips(); track c.version) {
-              <app-version-chip [chip]="c" [selected]="selectedVersion() === c.version" (click)="showDiff(c.version)" />
-            }
-            @if (selectedVersion() !== null) {
-              <ion-button fill="clear" size="small" class="back" (click)="clearDiff()">Back to latest</ion-button>
-            }
-          </div>
+          <div class="ch">Brief @if (!legacyBrief()) {<span class="r">plan/brief.md is generated from these fields</span>}</div>
+          @if (legacyBrief(); as md) {
+            <!-- Bug 6: a plan approved before the structured brief (#76) has only its markdown brief.
+                 Show it read-only; no empty fields, no checks graded against an empty brief. -->
+            <div class="legacy-brief">
+              <ion-note class="legacy-note">
+                <ion-icon name="document-text-outline" aria-hidden="true"></ion-icon>{{ legacyNote }}
+              </ion-note>
+              <johnny-markdown-view [markdown]="md"></johnny-markdown-view>
+            </div>
+          } @else {
+            <div class="versions">
+              <span class="vl">versions</span>
+              @for (c of chips(); track c.version) {
+                <app-version-chip [chip]="c" [selected]="selectedVersion() === c.version" (click)="showDiff(c.version)" />
+              }
+              @if (selectedVersion() !== null) {
+                <ion-button fill="clear" size="small" class="back" (click)="clearDiff()">Back to latest</ion-button>
+              }
+            </div>
 
-          @if (selectedVersion() !== null) {
-            <!-- S7: the diff of the tapped version against the one before it. Read-only. -->
-            <div class="diff">
-              <div class="diff-h">
-                v{{ (selectedVersion() ?? 1) - 1 }} → v{{ selectedVersion() }}
-                @if (diffLoading()) {<ion-spinner name="dots"></ion-spinner>}
-              </div>
-              @if (selectedVersion() === 1) {
-                <p class="diff-note">v1 is the first version — it was seeded from your ask.</p>
-              } @else {
-                @for (s of diffModel().sections; track s.title) {
-                  <div class="diff-f">{{ s.title }}</div>
-                  @for (d of s.del; track $index) {<del>{{ d }}</del>}
-                  @for (a of s.ins; track $index) {<ins>{{ a }}</ins>}
+            @if (selectedVersion() !== null) {
+              <!-- S7: the diff of the tapped version against the one before it. Read-only. -->
+              <div class="diff">
+                <div class="diff-h">
+                  v{{ (selectedVersion() ?? 1) - 1 }} → v{{ selectedVersion() }}
+                  @if (diffLoading()) {<ion-spinner name="dots"></ion-spinner>}
+                </div>
+                @if (selectedVersion() === 1) {
+                  <p class="diff-note">v1 is the first version — it was seeded from your ask.</p>
+                } @else {
+                  @for (s of diffModel().sections; track s.title) {
+                    <div class="diff-f">{{ s.title }}</div>
+                    @for (d of s.del; track $index) {<del>{{ d }}</del>}
+                    @for (a of s.ins; track $index) {<ins>{{ a }}</ins>}
+                  }
+                  @if (diffModel().unchangedNote) {<p class="diff-note">{{ diffModel().unchangedNote }}</p>}
                 }
-                @if (diffModel().unchangedNote) {<p class="diff-note">{{ diffModel().unchangedNote }}</p>}
+              </div>
+            }
+
+            <div class="fields">
+              @for (r of rows(); track r.key) {
+                <app-brief-field [row]="r" [editing]="editing() === r.key">
+                  <span field-actions>
+                    @if (r.canUndo) {
+                      <ion-button fill="clear" size="small" class="undo" [disabled]="busy()" (click)="undo(r)">
+                        <ion-icon slot="start" name="arrow-undo-outline"></ion-icon>undo
+                      </ion-button>
+                    }
+                    @if (!frozen() && editing() !== r.key) {
+                      <ion-button fill="clear" size="small" [attr.aria-label]="'Edit ' + r.label" (click)="startEdit(r)">
+                        <ion-icon slot="icon-only" name="create-outline"></ion-icon>
+                      </ion-button>
+                    }
+                  </span>
+                  <div field-editor class="editor">
+                    @if (r.isList) {
+                      <div class="where-edit">
+                        @for (w of r.chips; track w) {
+                          <ion-chip>
+                            <ion-label>{{ w }}</ion-label>
+                            <ion-icon name="close-outline" [attr.aria-label]="'Remove ' + w" (click)="removeWhere(w)"></ion-icon>
+                          </ion-chip>
+                        }
+                      </div>
+                      <ion-textarea
+                        [(ngModel)]="newWhere"
+                        [autoGrow]="true"
+                        rows="1"
+                        placeholder="+ path (one per line)"
+                        aria-label="Add a path"
+                      ></ion-textarea>
+                      <div class="ed-actions">
+                        <ion-button fill="outline" size="small" (click)="cancelEdit()">Done</ion-button>
+                        <ion-button size="small" [disabled]="busy()" (click)="addWhere()">Add</ion-button>
+                      </div>
+                    } @else {
+                      <ion-textarea [(ngModel)]="editText" [autoGrow]="true" rows="3" [attr.aria-label]="r.label"></ion-textarea>
+                      <div class="ed-actions">
+                        <ion-button fill="outline" size="small" (click)="cancelEdit()">Cancel</ion-button>
+                        <ion-button size="small" [disabled]="busy()" (click)="saveField(r)">Save</ion-button>
+                      </div>
+                    }
+                  </div>
+                </app-brief-field>
+              }
+            </div>
+
+            <div class="ch sep">Brief check <span class="r">plan.check · run by code</span></div>
+            <div class="checks">
+              @for (c of checkList(); track c.rule) {
+                <div class="check" [attr.data-tone]="c.tone"><span class="ic">{{ c.icon }}</span>{{ c.text }}</div>
+              } @empty {
+                <div class="check muted">No check results yet.</div>
               }
             </div>
           }
-
-          <div class="fields">
-            @for (r of rows(); track r.key) {
-              <app-brief-field [row]="r" [editing]="editing() === r.key">
-                <span field-actions>
-                  @if (r.canUndo) {
-                    <ion-button fill="clear" size="small" class="undo" [disabled]="busy()" (click)="undo(r)">
-                      <ion-icon slot="start" name="arrow-undo-outline"></ion-icon>undo
-                    </ion-button>
-                  }
-                  @if (!frozen() && editing() !== r.key) {
-                    <ion-button fill="clear" size="small" [attr.aria-label]="'Edit ' + r.label" (click)="startEdit(r)">
-                      <ion-icon slot="icon-only" name="create-outline"></ion-icon>
-                    </ion-button>
-                  }
-                </span>
-                <div field-editor class="editor">
-                  @if (r.isList) {
-                    <div class="where-edit">
-                      @for (w of r.chips; track w) {
-                        <ion-chip>
-                          <ion-label>{{ w }}</ion-label>
-                          <ion-icon name="close-outline" [attr.aria-label]="'Remove ' + w" (click)="removeWhere(w)"></ion-icon>
-                        </ion-chip>
-                      }
-                    </div>
-                    <ion-textarea
-                      [(ngModel)]="newWhere"
-                      [autoGrow]="true"
-                      rows="1"
-                      placeholder="+ path (one per line)"
-                      aria-label="Add a path"
-                    ></ion-textarea>
-                    <div class="ed-actions">
-                      <ion-button fill="outline" size="small" (click)="cancelEdit()">Done</ion-button>
-                      <ion-button size="small" [disabled]="busy()" (click)="addWhere()">Add</ion-button>
-                    </div>
-                  } @else {
-                    <ion-textarea [(ngModel)]="editText" [autoGrow]="true" rows="3" [attr.aria-label]="r.label"></ion-textarea>
-                    <div class="ed-actions">
-                      <ion-button fill="outline" size="small" (click)="cancelEdit()">Cancel</ion-button>
-                      <ion-button size="small" [disabled]="busy()" (click)="saveField(r)">Save</ion-button>
-                    </div>
-                  }
-                </div>
-              </app-brief-field>
-            }
-          </div>
-
-          <div class="ch sep">Brief check <span class="r">plan.check · run by code</span></div>
-          <div class="checks">
-            @for (c of checkList(); track c.rule) {
-              <div class="check" [attr.data-tone]="c.tone"><span class="ic">{{ c.icon }}</span>{{ c.text }}</div>
-            } @empty {
-              <div class="check muted">No check results yet.</div>
-            }
-          </div>
         </ion-card>
 
         <!-- ───────── OUTLINE ───────── -->
@@ -278,7 +303,11 @@
                 }
               </div>
             } @empty {
-              <p class="outline-empty">No outline yet — ask the plan agent to draft one, or add a phase.</p>
+              @if (frozen()) {
+                <p class="outline-empty">No draft outline was kept for this plan.</p>
+              } @else {
+                <p class="outline-empty">No outline yet — ask the plan agent to draft one, or add a phase.</p>
+              }
             }
           </div>
         </ion-card>
@@ -287,7 +316,7 @@
   }
 </ion-content>
 
-@if (state() === 'ready' || state() === 'frozen') {
+@if ((state() === 'ready' || state() === 'frozen') && !legacyBrief()) {
   <ion-footer class="sticky">
     <ion-toolbar>
       <div class="bar">

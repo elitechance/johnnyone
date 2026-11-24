@@ -303,9 +303,14 @@ export function diffBase(version: number): number | null {
   return version > 1 ? version - 1 : null;
 }
 
-export type DetailState = 'loading' | 'error' | 'not-found' | 'frozen' | 'ready';
+export type DetailState = 'loading' | 'error' | 'not-found' | 'closed' | 'frozen' | 'ready';
 
-/** S11: what the detail page renders. A not-found error or a closed (deleted) row → not-found; a row that left briefing → the frozen (S9) view. */
+/**
+ * S11: what the detail page renders. A not-found error or no row → not-found; a CLOSED row (the
+ * engine soft-deletes by closing, so the row and its title still exist) → `closed`, a read-only
+ * "This plan is closed" (live UI bug 5: it said "Plan not found … the link is wrong" under the real
+ * title); a row that left briefing → the frozen (S9) view.
+ */
 export function detailState(
   loading: boolean,
   error: string | null | undefined,
@@ -314,7 +319,7 @@ export function detailState(
   if (error) return /not found|no such|unknown plan/i.test(error) ? 'not-found' : 'error';
   if (loading && !plan) return 'loading';
   if (!plan) return loading ? 'loading' : 'not-found';
-  if (plan.status === 'closed') return 'not-found';
+  if (plan.status === 'closed') return 'closed';
   if (plan.initiativeStatus !== 'briefing') return 'frozen';
   return 'ready';
 }
@@ -326,3 +331,30 @@ export function whereItems(raw: string | null | undefined): string[] {
     .map((s) => s.trim())
     .filter(Boolean);
 }
+
+/** The closed-plan card's copy (bug 5). Human, says what happened and what is still there (L7). */
+export const CLOSED_PLAN_COPY = {
+  title: 'This plan is closed',
+  body: "It was closed or deleted, so it can't be edited or chatted with any more. It stays read-only here, and its initiative keeps the history.",
+} as const;
+
+/**
+ * A LEGACY plan (approved before the structured brief, #76): it has no brief versions, only the
+ * markdown `brief` on the plan row. Returns that markdown to render read-only, else `null` (live UI
+ * bug 6: such plans showed six empty fields and "4 failed checks", the check grading an empty brief).
+ * A plan still in briefing is never legacy: a missing version there is a load problem, not history.
+ */
+export function legacyBriefMarkdown(
+  plan: Pick<AgentPlan, 'brief' | 'initiativeStatus'> | null | undefined,
+  latest: BriefVersion | null | undefined,
+  versions: BriefVersionMeta[] | null | undefined,
+): string | null {
+  if (!plan || latest || (versions ?? []).length > 0) return null;
+  if ((plan.initiativeStatus ?? '') === 'briefing') return null;
+  const md = (plan.brief ?? '').trim();
+  return md || null;
+}
+
+/** The note above a legacy brief. */
+export const LEGACY_BRIEF_NOTE =
+  'This plan was approved before briefs had separate fields, so its brief is shown as it was written. It is read-only.';

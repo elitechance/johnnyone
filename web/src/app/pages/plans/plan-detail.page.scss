@@ -407,6 +407,28 @@
   p {
     margin: 0;
   }
+  .state-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+  }
+}
+/* bug 6: a legacy (pre-structured) brief, read-only markdown */
+.legacy-brief {
+  padding: 12px 16px 16px;
+  overflow-wrap: anywhere;
+  .legacy-note {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin-bottom: 12px;
+    font-size: 13px;
+    ion-icon {
+      flex: none;
+      margin-top: 2px;
+    }
+  }
 }
 .frozen {
   display: flex;
