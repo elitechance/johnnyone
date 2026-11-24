@@ -59,6 +59,7 @@ import { OutlineRowComponent } from './components/outline-panel/outline-panel.co
 import { VersionChipComponent } from './components/version-strip/version-strip.component';
 import {
   CLOSED_PLAN_COPY,
+  closedPlanInitiativeLink,
   LEGACY_BRIEF_NOTE,
   changedCounts,
   checkRows,
@@ -172,6 +173,8 @@ export class PlanDetailPage implements OnInit, OnDestroy {
   protected readonly legacyBrief = computed(() => legacyBriefMarkdown(this.plan(), this.latest(), this.versions()));
   protected readonly legacyNote = LEGACY_BRIEF_NOTE;
   protected readonly closedCopy = CLOSED_PLAN_COPY;
+  /** A closed plan's reachable initiative (U-1-7); `null` hides "Open initiative". */
+  protected readonly closedInitiative = signal<string | null>(null);
   protected readonly rows = computed<FieldRow[]>(() => {
     const l = this.latest();
     return l ? fieldRows(l, this.versions(), this.now()) : [];
@@ -321,6 +324,7 @@ export class PlanDetailPage implements OnInit, OnDestroy {
     try {
       const run = await firstValueFrom(this.api.getAgentPlan(this.id()));
       this.plan.set(run.plan);
+      if (run.plan.status === 'closed') await this.resolveClosedInitiative(run.plan);
       if (run.plan.status !== 'closed') {
         await this.loadBrief(false);
         const sid = run.plan.briefingSessionId;
@@ -332,6 +336,18 @@ export class PlanDetailPage implements OnInit, OnDestroy {
     } finally {
       this.loading.set(false);
       this.syncPoll();
+    }
+  }
+
+  /** A closed plan links to its initiative only when that is another, still-open plan (U-1-7). */
+  private async resolveClosedInitiative(plan: AgentPlan): Promise<void> {
+    this.closedInitiative.set(null);
+    if (closedPlanInitiativeLink(plan, { id: plan.initiativeId ?? '', status: 'open' }) === null) return;
+    try {
+      const run = await firstValueFrom(this.api.getAgentPlan(plan.initiativeId!));
+      this.closedInitiative.set(closedPlanInitiativeLink(plan, run.plan));
+    } catch {
+      // Unknown → no link (never a dead end).
     }
   }
 

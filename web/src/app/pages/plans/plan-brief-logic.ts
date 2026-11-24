@@ -335,8 +335,23 @@ export function whereItems(raw: string | null | undefined): string[] {
 /** The closed-plan card's copy (bug 5). Human, says what happened and what is still there (L7). */
 export const CLOSED_PLAN_COPY = {
   title: 'This plan is closed',
-  body: "It was closed or deleted, so it can't be edited or chatted with any more. It stays read-only here, and its initiative keeps the history.",
+  body: "It was closed or deleted, so it can't be edited, and its chat is archived.",
 } as const;
+
+/**
+ * The initiative a CLOSED plan can still link to (U-1-7), else `null`. A planning run IS its own
+ * initiative (`initiativeId === id`), so a link there lands back on this closed plan; and a closed
+ * initiative is a dead end too. `initiative` is that initiative's own row, when it was fetched.
+ */
+export function closedPlanInitiativeLink(
+  plan: Pick<AgentPlan, 'id' | 'initiativeId'> | null | undefined,
+  initiative: Pick<AgentPlan, 'id' | 'status'> | null | undefined,
+): string | null {
+  const target = (plan?.initiativeId ?? '').trim();
+  if (!plan || !target || target === plan.id) return null;
+  if (!initiative || initiative.id !== target || initiative.status === 'closed') return null;
+  return target;
+}
 
 /**
  * A LEGACY plan (approved before the structured brief, #76): it has no brief versions, only the

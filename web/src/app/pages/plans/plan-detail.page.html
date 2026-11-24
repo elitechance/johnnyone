@@ -66,7 +66,9 @@
           <p>{{ closedCopy.body }}</p>
           <div class="state-actions">
             <ion-button fill="outline" routerLink="/plans">← Back to Plans</ion-button>
-            <ion-button fill="clear" [routerLink]="['/initiatives']" [queryParams]="{ initiativeId: plan()?.initiativeId || id() }">Open initiative →</ion-button>
+            @if (closedInitiative(); as initId) {
+              <ion-button fill="clear" [routerLink]="['/initiatives']" [queryParams]="{ initiativeId: initId }">Open initiative →</ion-button>
+            }
           </div>
         </ion-card-content>
       </ion-card>

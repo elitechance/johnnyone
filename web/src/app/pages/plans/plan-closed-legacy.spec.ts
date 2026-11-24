@@ -10,7 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CLOSED_PLAN_COPY, detailState, legacyBriefMarkdown } from './plan-brief-logic';
+import { CLOSED_PLAN_COPY, closedPlanInitiativeLink, detailState, legacyBriefMarkdown } from './plan-brief-logic';
 
 const HTML = readFileSync(resolve(__dirname, 'plan-detail.page.html'), 'utf8');
 const TS = readFileSync(resolve(__dirname, 'plan-detail.page.ts'), 'utf8');
@@ -28,15 +28,30 @@ describe('a closed plan is "closed", not "not found" (bug 5)', () => {
 
   it('the page renders a styled, human closed card with a way back (L7, L10)', () => {
     expect(CLOSED_PLAN_COPY.title).toBe('This plan is closed');
-    expect(CLOSED_PLAN_COPY.body).not.toMatch(/link is wrong|not found/i);
+    expect(CLOSED_PLAN_COPY.body).toBe("It was closed or deleted, so it can't be edited, and its chat is archived.");
+    expect(CLOSED_PLAN_COPY.body).not.toMatch(/link is wrong|not found|keeps the history/i);
     const at = HTML.indexOf("@case ('closed') {");
     expect(at).toBeGreaterThan(-1);
     const block = HTML.slice(at, HTML.indexOf('@default {', at));
     expect(block).toContain('<ion-card class="state-card empty">');
     expect(block).toContain('{{ closedCopy.title }}');
     expect(block).toContain('routerLink="/plans"');
-    expect(block).toContain("[routerLink]=\"['/initiatives']\"");
+    // "Open initiative" only when there is a reachable one (U-1-7).
+    expect(block).toMatch(/@if \(closedInitiative\(\); as initId\) \{\s*<ion-button fill="clear" \[routerLink\]="\['\/initiatives'\]" \[queryParams\]="\{ initiativeId: initId \}">Open initiative →<\/ion-button>\s*\}/);
+    expect(TS).toContain('this.closedInitiative.set(closedPlanInitiativeLink(plan, run.plan));');
     expect(HTML).toContain('<h2>Plan not found</h2>'); // still there for a truly missing plan
+  });
+});
+
+describe('a closed plan links to its initiative only when that leads somewhere (U-1-7)', () => {
+  it('own id, missing, mismatched or closed initiative → no link', () => {
+    const plan = { id: 'dev-1', initiativeId: 'init-1' };
+    expect(closedPlanInitiativeLink(plan, { id: 'init-1', status: 'approved' })).toBe('init-1');
+    expect(closedPlanInitiativeLink({ id: 'p', initiativeId: 'p' }, { id: 'p', status: 'approved' })).toBeNull();
+    expect(closedPlanInitiativeLink(plan, { id: 'init-1', status: 'closed' })).toBeNull();
+    expect(closedPlanInitiativeLink(plan, null)).toBeNull();
+    expect(closedPlanInitiativeLink(plan, { id: 'other', status: 'approved' })).toBeNull();
+    expect(closedPlanInitiativeLink({ id: 'p', initiativeId: '' }, null)).toBeNull();
   });
 });
 
