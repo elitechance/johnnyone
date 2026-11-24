@@ -60,6 +60,7 @@ import { VersionChipComponent } from './components/version-strip/version-strip.c
 import {
   CLOSED_PLAN_COPY,
   closedPlanInitiativeLink,
+  frozenBanner,
   LEGACY_BRIEF_NOTE,
   changedCounts,
   checkRows,
@@ -173,6 +174,7 @@ export class PlanDetailPage implements OnInit, OnDestroy {
   protected readonly legacyBrief = computed(() => legacyBriefMarkdown(this.plan(), this.latest(), this.versions()));
   protected readonly legacyNote = LEGACY_BRIEF_NOTE;
   protected readonly closedCopy = CLOSED_PLAN_COPY;
+  protected readonly frozenBanner = frozenBanner;
   /** A closed plan's reachable initiative (U-1-7); `null` hides "Open initiative". */
   protected readonly closedInitiative = signal<string | null>(null);
   protected readonly rows = computed<FieldRow[]>(() => {

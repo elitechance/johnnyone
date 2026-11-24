@@ -416,7 +416,8 @@
 }
 /* bug 6: a legacy (pre-structured) brief, read-only markdown */
 .legacy-brief {
-  padding: 12px 16px 16px;
+  /* Same side padding as .fields (U-1-9). */
+  padding: 10px 14px 14px;
   overflow-wrap: anywhere;
   .legacy-note {
     display: flex;

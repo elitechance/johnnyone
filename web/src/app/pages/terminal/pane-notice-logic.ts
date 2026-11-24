@@ -220,3 +220,21 @@ export function applyHeldRefusals(
   }
   return applied ? { notices: nextNotices, held: nextHeld } : null;
 }
+
+/**
+ * Does the /shells body show the "job has ended" CARD (U-1-11)? Then the top bar must not repeat the
+ * same notice. The body renders Raw for any view but Transcript, except a Watchdog view on a shell
+ * that has one (a view-only shell's /watchdog renders Raw).
+ */
+export function rawEndedCardShown(
+  view: string,
+  viewOnly: boolean,
+  rawKind: RawPaneView['kind'] | null | undefined,
+): boolean {
+  if (view === 'transcript') return false;
+  if (view === 'watchdog' && !viewOnly) return false;
+  return rawKind === 'ended';
+}
+
+/** The ended card's sub-line (U-1-11). */
+export const ENDED_CARD_SUBCOPY = "It won't restart. The Transcript keeps what it did.";

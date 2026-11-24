@@ -61,7 +61,11 @@ describe('plan agents on /shells (bug 4)', () => {
     const group = html.slice(start, end);
     expect(group).toContain('@for (s of planAgents(); track s.id)');
     expect(group).toContain('(click)="open(s)"');
-    expect(group).toContain('plan agent · view-only');
+    // Phone width (U-1-10): a short tag, one hint for the group, the sub-line is the time only.
+    expect(group).toContain('<span class="tag plan">view-only</span>');
+    expect(group).not.toContain('plan agent · view-only');
+    expect(group).toContain('<div class="grouphint">Talk to a plan agent in its plan\'s chat.</div>');
+    expect(group).toContain('<div class="sub">{{ formatRelTime(toIsoUtc(s.updatedAt || s.createdAt), nowIso()) }}</div>');
     expect(group).not.toContain('renameOne');
     expect(group).not.toContain('clearOne');
   });

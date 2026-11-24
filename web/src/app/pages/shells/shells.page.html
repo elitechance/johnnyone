@@ -89,6 +89,7 @@
         <!-- Plan agents (bug 4): each runs in its own tmux pane (#77). View-only: no rename, no clear;
              you talk to one in its plan's chat. Opening it shows its Transcript / Raw pane. -->
         <div class="grouphdr">Plan agents</div>
+        <div class="grouphint">Talk to a plan agent in its plan's chat.</div>
         @for (s of planAgents(); track s.id) {
           <div class="row" role="link" tabindex="0" (click)="open(s)" (keydown.enter)="open(s)">
             <div class="ic plan">
@@ -97,9 +98,9 @@
             <div class="meta">
               <div class="nm">
                 <span class="nm-t">{{ planAgentRowTitle(s) }}</span>
-                <span class="tag plan">plan agent · view-only</span>
+                <span class="tag plan">view-only</span>
               </div>
-              <div class="sub">{{ formatRelTime(toIsoUtc(s.updatedAt || s.createdAt), nowIso()) }} · talk to it in its plan's chat</div>
+              <div class="sub">{{ formatRelTime(toIsoUtc(s.updatedAt || s.createdAt), nowIso()) }}</div>
             </div>
             <div class="act">View ▸</div>
           </div>

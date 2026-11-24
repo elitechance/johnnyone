@@ -217,8 +217,10 @@ import {
   shellViewTogglePath,
 } from '../shells/shells-route';
 import {
+  ENDED_CARD_SUBCOPY,
   applyHeldRefusals,
   endedNote,
+  rawEndedCardShown,
   holdRefusal,
   type HeldRefusal,
   isReadOnlyShell,
@@ -401,6 +403,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   /** Job-ended refusals that arrived before their session was shown (bug 1 ordering). */
   private readonly heldRefusals = signal<Record<string, HeldRefusal>>({});
   protected readonly endedNote = endedNote;
+  protected readonly rawEndedCardShown = rawEndedCardShown;
+  protected readonly endedCardSubcopy = ENDED_CARD_SUBCOPY;
   protected readonly rawPaneView = rawPaneView;
   protected readonly isReadOnlyShell = isReadOnlyShell;
   protected readonly readOnlyNote = readOnlyNote;

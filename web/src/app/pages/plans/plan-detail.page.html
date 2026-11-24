@@ -78,7 +78,8 @@
         <!-- S9: frozen after Start planning. -->
         <div class="frozen">
           <ion-icon name="lock-closed-outline"></ion-icon>
-          <span><b>Frozen at v{{ frozenAt() }}</b> — planning started.</span>
+          @let fb = frozenBanner(frozenAt());
+          <span><b>{{ fb.lead }}</b>{{ fb.tail }}</span>
           <a [routerLink]="['/initiatives']" [queryParams]="{ initiativeId: id() }">Open initiative →</a>
         </div>
       }

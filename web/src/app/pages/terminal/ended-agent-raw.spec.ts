@@ -17,8 +17,10 @@ import { describe, expect, it } from 'vitest';
 import { AGENT_JOB_ENDED_NOTE, PLAN_AGENT_VIEW_ONLY_NOTE } from '../shells/shells-page-logic';
 import {
   ARCHIVED_SHELL_NOTE,
+  ENDED_CARD_SUBCOPY,
   HELD_REFUSAL_TTL_MS,
   applyHeldRefusals,
+  rawEndedCardShown,
   endedNote,
   heldNotice,
   holdRefusal,
@@ -113,5 +115,18 @@ describe('an ended plan agent never shows a blank Raw pane (bug 1)', () => {
     expect(code).toMatch(/^\s+const held = this\.heldRefusals\(\);$/m);
     expect(code).toMatch(/^\s+const next = applyHeldRefusals\(this\.paneNotices\(\), held, ids, Date\.now\(\)\);$/m);
     expect(code).toMatch(/^\s+this\.paneNotices\.set\(next\.notices\);\n\s+this\.heldRefusals\.set\(next\.held\);$/m);
+  });
+
+  it('U-1-11: the ended notice shows once (card on Raw, bar elsewhere), with the new sub-copy', () => {
+    expect(rawEndedCardShown('raw', true, 'ended')).toBe(true);
+    expect(rawEndedCardShown('watchdog', true, 'ended')).toBe(true); // view-only /watchdog renders Raw
+    expect(rawEndedCardShown('watchdog', false, 'ended')).toBe(false);
+    expect(rawEndedCardShown('transcript', true, 'ended')).toBe(false);
+    expect(rawEndedCardShown('raw', false, 'screen')).toBe(false);
+    expect(ENDED_CARD_SUBCOPY).toBe("It won't restart. The Transcript keeps what it did.");
+    expect(HTML).toContain('<div class="empty-copy">{{ endedCardSubcopy }}</div>');
+    expect(HTML).toContain('@if (topViewOnly && !endedCard) {');
+    expect(HTML).toContain('@if (topJobEnded && !topViewOnly && !endedCard) {');
+    expect(HTML).toContain("@let endedCard = rawEndedCardShown(shellView(), topViewOnly, sh ? rawPaneView(sh.id, !!terminalScreens()[sh.id], paneNotices(), terminalError(), endedNote(sh)).kind : null);");
   });
 });

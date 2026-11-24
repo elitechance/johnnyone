@@ -10,7 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CLOSED_PLAN_COPY, closedPlanInitiativeLink, detailState, legacyBriefMarkdown } from './plan-brief-logic';
+import { CLOSED_PLAN_COPY, closedPlanInitiativeLink, detailState, frozenBanner, legacyBriefMarkdown } from './plan-brief-logic';
 
 const HTML = readFileSync(resolve(__dirname, 'plan-detail.page.html'), 'utf8');
 const TS = readFileSync(resolve(__dirname, 'plan-detail.page.ts'), 'utf8');
@@ -80,5 +80,21 @@ describe('a legacy plan shows its markdown brief, not empty fields + failed chec
     expect(fieldsAt).toBeGreaterThan(elseAt);
     expect(checksAt).toBeGreaterThan(elseAt);
     expect(HTML).toContain("@if ((state() === 'ready' || state() === 'frozen') && !legacyBrief()) {");
+  });
+});
+
+describe('legacy plan polish (U-1-8, U-1-9)', () => {
+  it('U-1-8: no "Frozen at v0" for a legacy plan', () => {
+    expect(frozenBanner(0)).toEqual({ lead: 'Planning started.', tail: '' });
+    expect(frozenBanner(null)).toEqual({ lead: 'Planning started.', tail: '' });
+    expect(frozenBanner(5)).toEqual({ lead: 'Frozen at v5', tail: ' — planning started.' });
+    expect(HTML).toContain('@let fb = frozenBanner(frozenAt());');
+    expect(HTML).not.toContain('Frozen at v{{ frozenAt() }}');
+  });
+
+  it('U-1-9: the legacy brief uses the same 14px side padding as .fields', () => {
+    const scss = readFileSync(resolve(__dirname, 'plan-detail.page.scss'), 'utf8');
+    expect(scss).toMatch(/\.fields \{\s*padding: 10px 14px 4px;/);
+    expect(scss).toMatch(/\.legacy-brief \{[^}]*padding: 10px 14px 14px;/);
   });
 });

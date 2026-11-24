@@ -373,3 +373,12 @@ export function legacyBriefMarkdown(
 /** The note above a legacy brief. */
 export const LEGACY_BRIEF_NOTE =
   'This plan was approved before briefs had separate fields, so its brief is shown as it was written. It is read-only.';
+
+/**
+ * The frozen banner's text (U-1-8). A plan frozen at a real brief version says so; a legacy plan
+ * (no versions, `frozenAt` 0) said "Frozen at v0", so it just says planning started.
+ */
+export function frozenBanner(frozenAt: number | null | undefined): { lead: string; tail: string } {
+  const v = frozenAt ?? 0;
+  return v > 0 ? { lead: `Frozen at v${v}`, tail: ' — planning started.' } : { lead: 'Planning started.', tail: '' };
+}
