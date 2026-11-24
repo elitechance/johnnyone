@@ -54,7 +54,10 @@ pub const PLAN_AGENT_BUSY: &str = "The plan agent is still answering the last me
 /// Shell filter that strips terminal controls from text bound for the pane: C0 (keeping `\t` and
 /// `\n`), DEL, and UTF-8-encoded C1 (U+0080–U+009F). So model/tool/stderr text can never carry
 /// an escape sequence (OSC 52 clipboard writes, title changes, …) into the viewer's terminal.
-pub const SHELL_SANITIZE: &str = r"LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g'";
+/// The C1 substitution LOOPS (`:a … ta`) until nothing matches: a single pass over overlapping
+/// bytes (`\302\302\233\233`) would leave a freshly formed `\302\233` behind (F-3-37).
+pub const SHELL_SANITIZE: &str =
+    r"LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C sed -e ':a' -e 's/\xc2[\x80-\x9f]//g' -e 'ta'";
 
 /// `<plan-agent dir>/turns`.
 pub const TURNS_DIR: &str = "turns";
@@ -106,12 +109,19 @@ pub struct TurnPaths {
     pub stderr: PathBuf,
     pub rc: PathBuf,
     pub exit: PathBuf,
+    /// Written by the engine once it stopped following the turn (its tail ended for any reason,
+    /// or the restart reconcile recorded it). A turn with neither `exit` nor `settled` was in
+    /// flight when the previous engine died.
+    pub settled: PathBuf,
+    /// Written at turn start by an engine that settles its turns. A turn WITHOUT it was started
+    /// by an older binary (no `.settled` support): the restart reconcile settles it silently.
+    pub started: PathBuf,
 }
 
 impl TurnPaths {
     pub fn new(dir: &Path, n: u32) -> Self {
         let f = |ext: &str| dir.join(format!("{n}.{ext}"));
-        Self { n, script: f("sh"), prompt: f("prompt"), jsonl: f("jsonl"), stderr: f("stderr"), rc: f("rc"), exit: f("exit") }
+        Self { n, script: f("sh"), prompt: f("prompt"), jsonl: f("jsonl"), stderr: f("stderr"), rc: f("rc"), exit: f("exit"), settled: f("settled"), started: f("started") }
     }
 }
 
@@ -452,6 +462,8 @@ pub async fn start_turn(
     let (cfg, prompt) = split_prompt(cfg);
     let (paths, mut script_file) = reserve_turn(dir, next_turn_number(dir))?;
     write_new_private(&paths.prompt, prompt.as_bytes())?;
+    // This engine follows the turn and settles it (`<n>.settled`); the reconcile trusts that.
+    write_new_private(&paths.started, b"")?;
     // Create the jsonl up front so the tail can open it before claude writes anything.
     write_new_private(&paths.jsonl, b"")?;
     {
@@ -721,7 +733,9 @@ where
     {
         let (tmux, pane_name, paths, cancel, done) = (tmux.clone(), pane_name.clone(), paths.clone(), cancel.clone(), done.clone());
         tokio::spawn(async move {
-            tail_turn(tmux, pane_name, paths, parse_line, tx, cancel, poll).await;
+            tail_turn(tmux, pane_name, paths.clone(), parse_line, tx, cancel, poll).await;
+            // This engine followed the turn to its end: the restart reconcile must leave it alone.
+            let _ = write_new_private(&paths.settled, b"tail\n");
             done.store(true, Ordering::SeqCst);
             // The turn is over: the plan agent may take the next one.
             drop(slot);
@@ -731,30 +745,49 @@ where
     Ok((CliProcess::external(Box::new(turn), session_id.to_string()), rx, paths))
 }
 
-/// The chat paths' one spawn call: a plan-agent turn (`plan_agent` = the turn carries plan-agent
-/// extras) runs in its tmux pane; every other turn is the unchanged headless `spawn_cli`.
+/// The chat paths' one spawn call: a plan-agent turn (`plan_slot` = the turn slot the chat path
+/// claimed BEFORE storing anything) runs in its tmux pane; every other turn is the unchanged
+/// headless `spawn_cli`.
 pub async fn spawn_chat_turn<F>(
     state: &AppState,
     config: CliSpawnConfig,
     session_id: String,
     parse_line: F,
-    plan_agent: bool,
+    plan_slot: Option<TurnSlot>,
 ) -> Result<(CliProcess, mpsc::Receiver<StreamChunk>), String>
 where
     F: Fn(&str) -> Option<StreamChunk> + Send + Sync + 'static,
 {
-    if !plan_agent {
-        return cli_runner::spawn_cli(config, session_id, parse_line).await;
-    }
-    spawn_plan_agent_turn_with(state, Arc::new(LiveTmux), config, session_id, parse_line).await
+    spawn_chat_turn_with(state, Arc::new(LiveTmux), config, session_id, parse_line, plan_slot).await
 }
 
+/// [`spawn_chat_turn`] with an explicit tmux (tests pass a fake).
+pub(crate) async fn spawn_chat_turn_with<F>(
+    state: &AppState,
+    tmux: Arc<dyn TmuxRunner>,
+    config: CliSpawnConfig,
+    session_id: String,
+    parse_line: F,
+    plan_slot: Option<TurnSlot>,
+) -> Result<(CliProcess, mpsc::Receiver<StreamChunk>), String>
+where
+    F: Fn(&str) -> Option<StreamChunk> + Send + Sync + 'static,
+{
+    match plan_slot {
+        None => cli_runner::spawn_cli(config, session_id, parse_line).await,
+        Some(slot) => spawn_plan_agent_turn_with(state, tmux, config, session_id, parse_line, Some(slot)).await,
+    }
+}
+
+/// Start a plan-agent turn. `slot`: the turn slot the caller already holds (the chat paths claim
+/// it before storing the user message, F-2-19); `None` claims it here.
 pub(crate) async fn spawn_plan_agent_turn_with<F>(
     state: &AppState,
     tmux: Arc<dyn TmuxRunner>,
     config: CliSpawnConfig,
     session_id: String,
     parse_line: F,
+    slot: Option<TurnSlot>,
 ) -> Result<(CliProcess, mpsc::Receiver<StreamChunk>), String>
 where
     F: Fn(&str) -> Option<StreamChunk> + Send + Sync + 'static,
@@ -763,7 +796,11 @@ where
         return Err("not a plan-agent session".to_string());
     };
     // The authoritative one-turn-at-a-time claim (held until the turn's tail ends).
-    let slot = claim_turn(state, &session_id)?;
+    let slot = match slot {
+        Some(slot) if slot.session_id == session_id => slot,
+        Some(_) => return Err("turn slot belongs to another session".to_string()),
+        None => claim_turn(state, &session_id)?,
+    };
     let store = settings_service::resolve_initiatives_dir(state);
     let dir = turns_dir(&store, &initiative_id)?;
     let (process, rx, _) =
@@ -778,6 +815,166 @@ where
         .map_err(|e| e.to_string())
     });
     Ok((process, rx))
+}
+
+// ───────────────────────────── engine restart (item E, F-1-3) ─────────────────────────────
+
+/// The assistant message recorded for a turn the previous engine never finished following.
+pub const INTERRUPTED_BY_RESTART: &str =
+    "The plan agent's turn was interrupted by an engine restart. Send your message again.";
+
+/// The pane notice when the reconcile silently ends an older binary's still-running turn.
+const LEGACY_NOTICE: &str = "── turn ended by J1 (engine restart) ──";
+
+/// The pane notice when the reconcile kills a turn that was still running.
+const INTERRUPTED_NOTICE: &str = "── turn interrupted by an engine restart ──";
+
+/// One turn the reconcile recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedTurn {
+    pub session_id: String,
+    pub n: u32,
+    /// The pane was still running the turn and was killed (`respawn-pane -k`).
+    pub killed: bool,
+}
+
+/// Engine start: for each LIVE plan agent (plan in briefing, agent row active), if its LATEST turn
+/// has a script and `<n>.started` but neither `<n>.exit` nor `<n>.settled` (the previous engine
+/// died while following it). A turn without `<n>.started` came from an older binary and is only
+/// settled, silently.
+/// - pane alive → kill the turn with `respawn-pane -k` and a fixed notice (chosen over
+///   re-attaching a tail: the chat request that was waiting for the reply died with the engine, so
+///   nobody would read a re-attached stream, and the token must not keep a headless turn alive);
+/// - pane dead or gone → nothing to kill.
+///
+/// Either way a failed assistant message ([`INTERRUPTED_BY_RESTART`], `finish_reason =
+/// 'interrupted'`) is recorded — filling the host path's empty placeholder row when it is the
+/// session's last message — and `<n>.settled` is written so a later start never records it twice.
+/// The turn files stay in place; slots are in-memory, so there is nothing to release. The reconcile
+/// holds the session's turn slot while it works, so it can never touch a turn this engine started.
+pub(crate) async fn reconcile_interrupted_turns_with(state: &AppState, tmux: &dyn TmuxRunner) -> Vec<InterruptedTurn> {
+    let agents: Vec<(String, String)> = state
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn
+                // Only a LIVE plan agent (G-1-7): a plan still in briefing whose agent row is active.
+                // A retired/accepted/closed plan's agent gets no "interrupted" message.
+                .prepare(
+                    "SELECT p.id, p.briefing_session_id FROM agent_plans p JOIN sessions s ON s.id = p.briefing_session_id \
+                     WHERE p.initiative_status = 'briefing' AND p.status != 'closed' AND s.status = 'active' ORDER BY p.id",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "plan agent restart reconcile: lookup failed");
+            Vec::new()
+        });
+    let store = settings_service::resolve_initiatives_dir(state);
+    let mut out = Vec::new();
+    let mut listing: Option<String> = None;
+    for (initiative_id, session_id) in agents {
+        let Ok(dir) = turns_dir(&store, &initiative_id) else { continue };
+        let n = next_turn_number(&dir).saturating_sub(1);
+        if n == 0 {
+            continue;
+        }
+        let paths = TurnPaths::new(&dir, n);
+        if !paths.script.exists() || paths.exit.exists() || paths.settled.exists() {
+            continue;
+        }
+        let legacy = !paths.started.exists();
+        // Hold the slot: a turn this engine is running (or starts now) is never touched.
+        let Ok(_slot) = claim_turn(state, &session_id) else { continue };
+        if next_turn_number(&dir) != n + 1 {
+            continue; // a newer turn appeared meanwhile
+        }
+        if listing.is_none() {
+            listing = Some(
+                tmux.run(vec!["list-panes".into(), "-a".into(), "-F".into(), PANES_FORMAT.into()])
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        let pane = pane_of(listing.as_deref().unwrap_or(""), &pane_session_name(&session_id));
+        if legacy {
+            // Started by an older binary that never wrote `.settled` (its Stop/timeout looks the
+            // same as a crash): record NOTHING (G-1-7). A pane still running it is killed
+            // silently (G-2-16) so a headless turn cannot outlive the restart; then it is settled.
+            if let Some((pane_id, false)) = pane {
+                let notice = vec!["printf".to_string(), "%s\\n".to_string(), LEGACY_NOTICE.to_string()];
+                if let Err(error) = tmux.run(respawn_args(&pane_id, &notice)).await {
+                    tracing::warn!(%session_id, %error, "plan agent restart reconcile: legacy kill failed; will retry next start");
+                    continue;
+                }
+            }
+            let _ = write_new_private(&paths.settled, b"legacy\n");
+            continue;
+        }
+        let mut killed = false;
+        if let Some((pane_id, false)) = pane {
+            let notice = vec!["printf".to_string(), "%s\\n".to_string(), INTERRUPTED_NOTICE.to_string()];
+            match tmux.run(respawn_args(&pane_id, &notice)).await {
+                Ok(_) => killed = true,
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "plan agent restart reconcile: kill failed; will retry next start");
+                    continue;
+                }
+            }
+        }
+        if let Err(error) = record_interrupted(state, &session_id) {
+            tracing::warn!(%session_id, %error, "plan agent restart reconcile: message write failed");
+            continue;
+        }
+        let _ = write_new_private(&paths.settled, b"interrupted\n");
+        tracing::info!(%session_id, turn = n, killed, "plan agent turn interrupted by an engine restart");
+        out.push(InterruptedTurn { session_id, n, killed });
+    }
+    out
+}
+
+/// Write the interrupted assistant message: fill the session's trailing empty assistant
+/// placeholder (the host paths insert one before streaming) or insert a new row.
+fn record_interrupted(state: &AppState, session_id: &str) -> Result<(), String> {
+    state.db.with_conn(|conn| {
+        let last: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT id, role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        match last {
+            Some((id, role, content)) if role == "assistant" && content.trim().is_empty() => conn
+                .execute(
+                    "UPDATE messages SET content = ?1, finish_reason = 'interrupted' WHERE id = ?2",
+                    params![INTERRUPTED_BY_RESTART, id],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            _ => conn
+                .execute(
+                    "INSERT INTO messages (id, session_id, role, content, finish_reason) VALUES (?1, ?2, 'assistant', ?3, 'interrupted')",
+                    params![uuid::Uuid::new_v4().to_string(), session_id, INTERRUPTED_BY_RESTART],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        }
+    })
+}
+
+/// Run the reconcile once at engine start against the real tmux.
+pub fn spawn_restart_reconcile(state: AppState) {
+    // `tauri::async_runtime::spawn`: called from Tauri's `setup` (no tokio reactor entered).
+    tauri::async_runtime::spawn(async move {
+        let done = reconcile_interrupted_turns_with(&state, &LiveTmux).await;
+        tracing::info!(interrupted = done.len(), "plan agent restart reconcile");
+    });
 }
 
 /// The recording tmux fake shared by this module's and `plan_agent`'s tests.
@@ -919,7 +1116,7 @@ mod tests {
         let hash = mcp_tokens::sha256_hex(&token);
         let cfg = build_config_with("hello", &p.ws.to_string_lossy(), "", None, Some("cli-1"), Some(&extras));
         let tmux = Arc::new(FakeTmux::default());
-        let (_proc, _rx) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg, p.session.clone(), claude_code::parse_line).await.unwrap();
+        let (_proc, _rx) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg, p.session.clone(), claude_code::parse_line, None).await.unwrap();
         let calls = tmux.calls();
         let new = calls.iter().find(|c| c[0] == "new-session").expect("the turn ran in tmux");
         assert_eq!(new[3], format!("johnnyone_{}", p.session));
@@ -997,7 +1194,7 @@ mod tests {
             assert_eq!(e.metadata().unwrap().permissions().mode() & 0o777, 0o600, "{:?}", e.path());
         }
         names.sort();
-        assert_eq!(names, ["1.exit", "1.jsonl", "1.prompt", "1.sh", "1.stderr"], "rc was renamed to exit");
+        assert_eq!(names, ["1.exit", "1.jsonl", "1.prompt", "1.sh", "1.started", "1.stderr"], "rc was renamed to exit");
     }
 
     /// F-1-16: the script execs the viewer only when the file at its path has the recorded identity
@@ -1115,16 +1312,16 @@ mod tests {
         let extras = plan_agent_extras(&state, &p.session).unwrap().unwrap();
         let cfg = build_config_with("one", &p.ws.to_string_lossy(), "", None, None, Some(&extras));
         let tmux = Arc::new(FakeTmux::default());
-        let (_proc, rx) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg.clone(), p.session.clone(), claude_code::parse_line).await.unwrap();
+        let (_proc, rx) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg.clone(), p.session.clone(), claude_code::parse_line, None).await.unwrap();
         // Turn 1 created the pane and it is running.
         tmux.set_panes(&format!("%4\t0\tjohnnyone_{}\n", p.session));
-        // The chat paths' pre-check refuses before anything is stored…
-        let e = crate::services::chat_host::plan_agent_turn_extras(&state, &p.session, "claude_code").unwrap_err();
+        // The chat paths' claim refuses before anything is stored…
+        let e = crate::services::chat_host::claim_plan_agent_turn(&state, &p.session, "claude_code").err().expect("busy");
         assert_eq!(e, PLAN_AGENT_BUSY);
         // The Plans chat has no Stop control, so the text must not point at one.
         assert_eq!(e, "The plan agent is still answering the last message. Try again when it finishes.");
         // …and the spawn itself refuses (the authoritative claim).
-        let Err(e) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg.clone(), p.session.clone(), claude_code::parse_line).await else {
+        let Err(e) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg.clone(), p.session.clone(), claude_code::parse_line, None).await else {
             panic!("a second turn started while one was in flight");
         };
         assert_eq!(e, PLAN_AGENT_BUSY);
@@ -1138,7 +1335,7 @@ mod tests {
         // Once turn 1 is over, the next send is accepted.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!turn_in_flight(&state, &p.session));
-        assert!(crate::services::chat_host::plan_agent_turn_extras(&state, &p.session, "claude_code").unwrap().is_some());
+        assert!(crate::services::chat_host::claim_plan_agent_turn(&state, &p.session, "claude_code").unwrap().is_some());
     }
 
     #[test]
@@ -1327,6 +1524,456 @@ mod tests {
         let respawns: Vec<_> = tmux.calls().into_iter().filter(|c| c[0] == "respawn-pane").collect();
         assert_eq!(respawns.last().unwrap()[3], "%9");
         assert!(respawns.iter().all(|c| c[3] == "%9"));
+    }
+
+    // ── follow-ups (brief plan-agent-followups) ──
+
+    /// Run the host chat path for a plan agent against a fake tmux, in the background.
+    fn host_turn(
+        state: &AppState,
+        tmux: Arc<FakeTmux>,
+        sid: &str,
+        text: &str,
+        idle: Duration,
+    ) -> tokio::task::JoinHandle<Result<crate::services::chat_host::ChatRunResult, String>> {
+        let (st, sid, text) = (state.clone(), sid.to_string(), text.to_string());
+        tokio::spawn(async move {
+            crate::services::chat_host::send_chat_message_blocking_with(&st, tmux, sid, text, idle).await
+        })
+    }
+
+    fn message_count(state: &AppState, sid: &str) -> i64 {
+        state
+            .db
+            .with_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM messages WHERE session_id = ?1", params![sid], |r| r.get(0))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    fn last_message(state: &AppState, sid: &str) -> (String, String, Option<String>) {
+        state
+            .db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT role, content, finish_reason FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![sid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap()
+    }
+
+    async fn wait_for(path: &Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} never appeared", path.display());
+    }
+
+    /// G (F-3-37): the C1 strip loops — overlapping bytes cannot re-form a C1 after one pass.
+    #[test]
+    fn shell_sanitize_loops_until_no_c1_is_left() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(r"printf 'x\302\302\233\233y' | {SHELL_SANITIZE}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let bytes = out.stdout;
+        assert!(!bytes.windows(2).any(|w| w[0] == 0xc2 && (0x80..=0x9f).contains(&w[1])), "a C1 survived: {bytes:?}");
+        assert_eq!(bytes, b"xy".to_vec());
+    }
+
+    /// C (F-2-19): a send refused because a turn holds the slot stores NOTHING — the claim comes
+    /// before the user-message insert — and spawns nothing.
+    #[tokio::test]
+    async fn refused_send_stores_nothing() {
+        let (state, _r) = test_state();
+        let store = use_store(&state);
+        let p = plan(&state, &store, "A").await;
+        let _held = claim_turn(&state, &p.session).unwrap(); // a turn in flight
+        let tmux = Arc::new(FakeTmux::default());
+        let e = host_turn(&state, tmux.clone(), &p.session, "second", Duration::from_secs(5)).await.unwrap().err().expect("busy");
+        assert_eq!(e, PLAN_AGENT_BUSY);
+        assert_eq!(message_count(&state, &p.session), 0, "a refused send stored a message");
+        assert!(tmux.calls().is_empty(), "a refused send touched tmux");
+        assert_eq!(next_turn_number(&turns_dir(&store, &p.id).unwrap()), 1, "no turn files");
+    }
+
+    /// The body of the function whose signature starts with `sig` (brace-matched). Panics when the
+    /// signature is missing, so a renamed function fails the pin instead of skipping it.
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("signature `{sig}` not found"));
+        let open = at + src[at..].find('{').expect("body brace");
+        let mut depth = 0i32;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[at..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced body for `{sig}`");
+    }
+
+    fn pos(body: &str, needle: &str, name: &str) -> usize {
+        body.find(needle).unwrap_or_else(|| panic!("{name}: `{needle}` not found in the function body"))
+    }
+
+    /// C (G-1-8): every chat path claims the slot before it stores the user message (the Tauri
+    /// command and the relay are not unit-runnable — no AppHandle / socket — so their ORDER is
+    /// pinned, anchored to each function's own body; every anchor must exist).
+    #[test]
+    fn all_chat_paths_claim_before_storing() {
+        for (name, src, sig, insert) in [
+            (
+                "chat_host",
+                include_str!("chat_host.rs"),
+                "pub(crate) async fn send_chat_message_blocking_with(",
+                "'user', ?3)",
+            ),
+            ("commands/chat", include_str!("../commands/chat.rs"), "pub async fn send_chat_message(", "'user', ?3)"),
+            ("relay", include_str!("../agent/mod.rs"), "async fn handle_relay_chat(", "'user', ?3)"),
+        ] {
+            let body = fn_body(src, sig);
+            let claim = pos(body, "let plan_turn", name);
+            assert!(body[claim..claim + 200].contains("claim_plan_agent_turn("), "{name}: plan_turn is the claim");
+            let spawn = claim + pos(&body[claim..], "spawn_chat_turn", name);
+            assert!(body[claim..spawn].contains(".map(|t| &t.extras)"), "{name}: extras come from the claim");
+            assert!(body[spawn..].contains("plan_turn.map(|t| t.slot)"), "{name}: the slot goes into the spawn");
+            let stored = pos(body, insert, name);
+            assert!(claim < stored, "{name}: user message stored before the claim");
+            assert_eq!(body.matches("plan_agent_turn_extras(").count(), 0, "{name}: bypasses the claim");
+        }
+    }
+
+    /// D + F wiring (G-1-6 b/c): the relay loop and the Tauri command use the shared idle-timeout,
+    /// own-turn kill and final-content helpers (the host path is covered behaviourally above).
+    #[test]
+    fn relay_and_command_paths_use_the_shared_turn_helpers() {
+        let relay = fn_body(include_str!("../agent/mod.rs"), "async fn handle_relay_chat(");
+        let recv = pos(relay, "chat_host::recv_turn_chunk(", "relay");
+        assert!(relay[recv..].contains("chat_host::TURN_IDLE_TIMEOUT"), "relay: the shared idle timeout");
+        let timed_out = pos(relay, "TurnRecv::TimedOut => {", "relay");
+        assert!(relay[timed_out..timed_out + 300].contains("should_kill_process = true;"), "relay: a timeout kills");
+        let end = pos(relay, "chat_host::end_own_turn(&state.active_processes, &req.session_id, turn_id, should_kill_process)", "relay");
+        let fin = pos(relay, "chat_host::final_assistant_content(", "relay");
+        let store = pos(relay, "INSERT INTO messages (id, session_id, role, content, finish_reason", "relay");
+        assert!(recv < end && end < fin && fin < store, "relay: recv → end_own_turn → final content → store");
+        assert!(!relay.contains("while let Some(chunk) = rx.recv().await"), "relay: an unbounded wait came back");
+        assert!(!relay.contains("take_own_process("), "relay: bypasses end_own_turn");
+
+        let cmd = fn_body(include_str!("../commands/chat.rs"), "pub async fn send_chat_message(");
+        // G-2-15: the idle-timeout arm sets the kill flag, exactly like the relay.
+        let arm = pos(cmd, "Err(_) => {", "commands/chat");
+        let arm_body = &cmd[arm..arm + 400];
+        assert!(arm_body.contains("finish_reason = \"timeout\".to_string();"), "commands/chat: not the timeout arm");
+        assert!(arm_body.contains("should_kill_process = true;"), "commands/chat: a timeout must kill the turn");
+        let t = pos(cmd, "chat_host::TURN_IDLE_TIMEOUT", "commands/chat");
+        let end = pos(cmd, "chat_host::end_own_turn(&active_processes, &sid, turn_id, should_kill_process)", "commands/chat");
+        let fin = pos(cmd, "chat_host::final_assistant_content(", "commands/chat");
+        let store = pos(cmd, "UPDATE messages SET content = ?1", "commands/chat");
+        assert!(t < end && end < fin && fin < store, "commands/chat: timeout → end_own_turn → final content → store");
+    }
+
+    /// F (F-1-10): text streamed, then the turn crashed — the stored reply keeps the text AND the
+    /// crash line.
+    #[tokio::test]
+    async fn crash_after_partial_text_keeps_the_crash_line() {
+        let (state, _r) = test_state();
+        let store = use_store(&state);
+        let p = plan(&state, &store, "A").await;
+        let tmux = Arc::new(FakeTmux::default());
+        tmux.set_panes(&format!("%4\t0\tjohnnyone_{}\n", p.session));
+        let h = host_turn(&state, tmux.clone(), &p.session, "hi", Duration::from_secs(10));
+        let t = TurnPaths::new(&turns_dir(&store, &p.id).unwrap(), 1);
+        wait_for(&t.script).await;
+        let partial: String = FIXTURE.lines().take(2).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&t.jsonl, partial).unwrap();
+        std::fs::write(&t.stderr, "Error: MCP server j1 failed to start\n").unwrap();
+        std::fs::write(&t.exit, "1\n").unwrap();
+        let r = h.await.unwrap().unwrap();
+        let content = r.assistant_message.content;
+        assert!(content.starts_with("Let me update the brief."), "{content}");
+        assert!(content.ends_with("Plan agent turn failed (exit 1): Error: MCP server j1 failed to start"), "{content}");
+        assert_eq!(r.assistant_message.finish_reason.as_deref(), Some("error"));
+        // The pure rule all 3 paths share.
+        use crate::services::chat_host::final_assistant_content as fin;
+        assert_eq!(fin("text", Some("boom"), &[], "error"), ("text\n\nboom".into(), "error".into()));
+        assert_eq!(fin("text", None, &[], "stop"), ("text".into(), "stop".into()));
+        assert_eq!(fin("", Some("boom"), &[], "stop"), ("boom".into(), "error".into()));
+        assert_eq!(fin("a boom", Some("boom"), &[], "error").0, "a boom", "never twice");
+        assert_eq!(fin("text", Some("t/o"), &[], "timeout").1, "timeout");
+        assert!(fin("", None, &["e1".into()], "stop").0.contains("Recent stderr:\ne1"));
+    }
+
+    /// D + H (F-1-4, F-2-20, F-2-23): an idle-timed-out pane turn is killed through
+    /// `PaneTurn::stop` on the agent's OWN pane, and that releases the real slot.
+    #[tokio::test]
+    async fn idle_timeout_stops_the_agents_pane_and_frees_the_slot() {
+        let (state, _r) = test_state();
+        let store = use_store(&state);
+        let p = plan(&state, &store, "A").await;
+        let tmux = Arc::new(FakeTmux::default());
+        tmux.set_panes(&format!("%3\t0\tj1\n%7\t0\tjohnnyone_{}\n", p.session));
+        let r = host_turn(&state, tmux.clone(), &p.session, "hi", Duration::from_millis(300)).await.unwrap().unwrap();
+        assert_eq!(r.assistant_message.content, crate::services::chat_host::TURN_TIMEOUT_MESSAGE);
+        assert_eq!(r.assistant_message.finish_reason.as_deref(), Some("timeout"));
+        let respawns: Vec<Vec<String>> = tmux.calls().into_iter().filter(|c| c[0] == "respawn-pane").collect();
+        // [0] starts the turn in the existing pane; [1] is the stop.
+        let stop = respawns.last().unwrap();
+        assert_eq!(&stop[..4], &["respawn-pane", "-k", "-t", "%7"]);
+        assert!(stop.join(" ").contains("turn stopped by J1"), "{stop:?}");
+        assert!(respawns.iter().all(|c| c[3] == "%7"), "another pane was touched: {respawns:?}");
+        assert!(state.active_processes.lock().await.get(&p.session).is_none());
+        // The tail saw the cancel and dropped the slot: a new claim succeeds.
+        for _ in 0..100 {
+            if !turn_in_flight(&state, &p.session) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(claim_turn(&state, &p.session).is_ok(), "the timed-out turn still holds the slot");
+    }
+
+    /// G-1-12: a chat to a NON-plan session whose job ended (a finished worker, or an archived row)
+    /// is refused before anything is stored or spawned — the single entry for all 3 chat paths.
+    #[tokio::test]
+    async fn chat_to_a_finished_or_archived_session_is_refused_and_spawns_nothing() {
+        let (state, _r) = test_state();
+        let mk = || {
+            crate::services::sessions::create_session(
+                &state,
+                crate::db::models::CreateSessionInput {
+                    // `shell`: if the gate were missing, the host path would store the message and
+                    // then fail on the shell check — never a real CLI.
+                    provider: Some("shell".into()),
+                    model: None,
+                    working_directory: None,
+                    title: Some("T1 Worker - x".into()),
+                    kind: Some("agent".into()),
+                    setup_commands: None,
+                    tmux_session_name: None,
+                },
+            )
+            .unwrap()
+            .id
+        };
+        let worker = mk();
+        let plan_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, \
+                     worker_provider, reviewer_provider, initiative_id, initiative_status) \
+                     VALUES (?1, 'development', 't', '/w', '/p', 'approved', ?2, 'claude_code', 'claude_code', ?1, 'development')",
+                    params![plan_id, worker],
+                )
+                .map_err(|e| e.to_string())?;
+                c.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status) VALUES ('ph1', ?1, '01-p', 'x', 0, 'passed')",
+                    params![plan_id],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let archived = mk();
+        crate::services::sessions::mark_session_archived(&state, &archived).unwrap();
+        // G-2-21: the job-ended text for the finished worker (archived or not); a plain archived
+        // chat gets the generic archived text.
+        let archived_worker = mk();
+        state
+            .db
+            .with_conn(|c| c.execute("UPDATE agent_plans SET reviewer_session_id = ?1 WHERE id = ?2", params![archived_worker, plan_id]).map_err(|e| e.to_string()))
+            .unwrap();
+        crate::services::sessions::mark_session_archived(&state, &archived_worker).unwrap();
+        for (sid, want) in [
+            (&worker, crate::services::chat_host::CHAT_SESSION_ENDED),
+            (&archived_worker, crate::services::chat_host::CHAT_SESSION_ENDED),
+            (&archived, crate::services::chat_host::CHAT_SESSION_ARCHIVED),
+        ] {
+            let tmux = Arc::new(FakeTmux::default());
+            let e = host_turn(&state, tmux.clone(), sid, "hello", Duration::from_secs(5)).await.unwrap().err().expect("refused");
+            assert_eq!(e, want);
+            assert_eq!(message_count(&state, sid), 0, "a refused chat stored a message");
+            assert!(tmux.calls().is_empty());
+            assert!(crate::services::chat_host::claim_plan_agent_turn(&state, sid, "claude_code").is_err());
+        }
+        // G-2-20: a CLOSED plan's briefing session (its retire failed) is refused, not chatted to.
+        let (st2, _r2) = test_state();
+        let store = use_store(&st2);
+        let p = plan(&st2, &store, "Closed").await;
+        st2.db
+            .with_conn(|c| c.execute("UPDATE agent_plans SET status = 'closed' WHERE id = ?1", params![p.id]).map_err(|e| e.to_string()))
+            .unwrap();
+        let tmux = Arc::new(FakeTmux::default());
+        let e = host_turn(&st2, tmux.clone(), &p.session, "hello", Duration::from_secs(5)).await.unwrap().err().expect("refused");
+        assert_eq!(e, crate::services::chat_host::CHAT_PLAN_AGENT_RETIRED);
+        assert_eq!(message_count(&st2, &p.session), 0);
+        assert!(tmux.calls().is_empty());
+        // A live standalone session and a not-yet-known relay session still chat.
+        let live = mk();
+        assert!(crate::services::chat_host::claim_plan_agent_turn(&state, &live, "claude_code").unwrap().is_none());
+        assert!(crate::services::chat_host::claim_plan_agent_turn(&state, "no-such-row", "claude_code").unwrap().is_none());
+    }
+
+    /// H (F-2-20): Stop (`stop_generation`, also used by retire) releases the REAL slot.
+    #[tokio::test]
+    async fn stop_releases_the_real_slot() {
+        let (state, _r) = test_state();
+        let store = use_store(&state);
+        let p = plan(&state, &store, "A").await;
+        let extras = plan_agent_extras(&state, &p.session).unwrap().unwrap();
+        let cfg = build_config_with("one", &p.ws.to_string_lossy(), "", None, None, Some(&extras));
+        let tmux = Arc::new(FakeTmux::default());
+        tmux.set_panes(&format!("%5\t0\tjohnnyone_{}\n", p.session));
+        let (proc, _rx) = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg, p.session.clone(), claude_code::parse_line, None).await.unwrap();
+        state.active_processes.lock().await.insert(p.session.clone(), proc);
+        assert!(claim_turn(&state, &p.session).is_err(), "held while the turn runs");
+        crate::services::chat_host::stop_generation(&state, p.session.clone()).await.unwrap();
+        for _ in 0..100 {
+            if !turn_in_flight(&state, &p.session) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(claim_turn(&state, &p.session).is_ok(), "Stop did not release the slot");
+        let dir = turns_dir(&store, &p.id).unwrap();
+        assert!(TurnPaths::new(&dir, 1).settled.exists(), "a followed-to-the-end turn is settled");
+    }
+
+    /// H (F-1-2): a final `result` line written WITHOUT a trailing newline, then `.exit`, is still
+    /// read (flush_rest) as the Result chunk — not a crash.
+    #[tokio::test]
+    async fn partial_final_result_line_plus_exit_is_a_result() {
+        let dir = tmp_dir("pat-partial").join("turns");
+        let tmux = Arc::new(FakeTmux::default());
+        tmux.set_panes("%1\t0\tjohnnyone_S\n");
+        let (_p, rx, paths) =
+            spawn_turn_with(tmux.clone(), "S", &dir, plain_cfg("hi"), &nv("/v"), claude_code::parse_line, FAST, None).await.unwrap();
+        std::fs::write(&paths.jsonl, FIXTURE.trim_end_matches('\n')).unwrap();
+        std::fs::write(&paths.exit, "0\n").unwrap();
+        let chunks = collect(rx).await;
+        let last = chunks.last().unwrap();
+        assert_eq!(last.chunk_type, ChunkType::Result, "{chunks:?}");
+        assert!(last.is_final);
+        assert!(chunks.iter().all(|c| c.chunk_type != ChunkType::Error));
+    }
+
+    /// E (F-1-3): engine restart mid-turn.
+    #[tokio::test]
+    async fn restart_reconcile_records_interrupted_turns_once() {
+        let (state, _r) = test_state();
+        let store = use_store(&state);
+        // a: pane alive, turn in flight → killed + recorded (fills the host placeholder row).
+        // b: pane gone → recorded, nothing to kill. c: finished turn (exit). d: settled turn.
+        let (a, b, c, d) = (plan(&state, &store, "A").await, plan(&state, &store, "B").await, plan(&state, &store, "C").await, plan(&state, &store, "D").await);
+        let start = |p: &crate::services::plan_mcp::fixture::Plan| {
+            let dir = turns_dir(&store, &p.id).unwrap();
+            let paths = TurnPaths::new(&dir, 1);
+            (dir, paths)
+        };
+        for p in [&a, &b, &c, &d] {
+            let (dir, _) = start(p);
+            start_turn(&FakeTmux::default(), &p.session, &dir, plain_cfg("hi"), &nv("/v")).await.unwrap();
+        }
+        std::fs::write(&start(&c).1.exit, "0\n").unwrap();
+        std::fs::write(&start(&d).1.settled, "tail\n").unwrap();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute("INSERT INTO messages (id, session_id, role, content) VALUES ('u1', ?1, 'user', 'hi')", params![a.session]).map_err(|e| e.to_string())?;
+                conn.execute("INSERT INTO messages (id, session_id, role, content) VALUES ('a1', ?1, 'assistant', '')", params![a.session]).map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let tmux = FakeTmux::default();
+        tmux.set_panes(&format!("%2\t0\tjohnnyone_{}\n%3\t1\tjohnnyone_{}\n%9\t0\tj1\n", a.session, b.session));
+
+        let got = reconcile_interrupted_turns_with(&state, &tmux).await;
+        let mut got_ids: Vec<(String, bool)> = got.iter().map(|t| (t.session_id.clone(), t.killed)).collect();
+        got_ids.sort();
+        let mut want = vec![(a.session.clone(), true), (b.session.clone(), false)];
+        want.sort();
+        assert_eq!(got_ids, want);
+        let respawns: Vec<Vec<String>> = tmux.calls().into_iter().filter(|c| c[0] == "respawn-pane").collect();
+        assert_eq!(respawns.len(), 1);
+        assert_eq!(&respawns[0][..4], &["respawn-pane", "-k", "-t", "%2"]);
+        assert!(respawns[0].join(" ").contains("interrupted by an engine restart"));
+        // a: the placeholder row now carries the failure; b: a new assistant row.
+        assert_eq!(message_count(&state, &a.session), 2);
+        assert_eq!(last_message(&state, &a.session), ("assistant".into(), INTERRUPTED_BY_RESTART.into(), Some("interrupted".into())));
+        assert_eq!(last_message(&state, &b.session), ("assistant".into(), INTERRUPTED_BY_RESTART.into(), Some("interrupted".into())));
+        assert_eq!(message_count(&state, &c.session) + message_count(&state, &d.session), 0);
+        // The files stay; nothing is held.
+        let (_, pa) = start(&a);
+        assert!(pa.script.exists() && pa.jsonl.exists() && pa.prompt.exists() && !pa.exit.exists());
+        assert!(!turn_in_flight(&state, &a.session));
+        // Idempotent: a second start records nothing and kills nothing.
+        let calls = tmux.calls().len();
+        assert!(reconcile_interrupted_turns_with(&state, &tmux).await.is_empty());
+        assert_eq!(tmux.calls().len(), calls);
+        assert_eq!(message_count(&state, &b.session), 1);
+        // G-1-7: a legacy turn (an older binary: no `.started`) is settled once, silently.
+        let f = plan(&state, &store, "F").await;
+        let (dir, pf) = start(&f);
+        start_turn(&FakeTmux::default(), &f.session, &dir, plain_cfg("hi"), &nv("/v")).await.unwrap();
+        std::fs::remove_file(&pf.started).unwrap();
+        let calls = tmux.calls().len();
+        assert!(reconcile_interrupted_turns_with(&state, &tmux).await.is_empty());
+        assert!(pf.settled.exists(), "legacy turn settled");
+        assert_eq!(message_count(&state, &f.session), 0, "no false 'interrupted' for a legacy turn");
+        assert!(
+            tmux.calls()[calls..].iter().all(|c| c[0] != "respawn-pane"),
+            "a legacy turn without a live pane: nothing killed"
+        );
+        // G-2-16: a legacy turn whose pane is STILL RUNNING is killed silently, then settled.
+        let l = plan(&state, &store, "L").await;
+        let (dir, pl) = start(&l);
+        start_turn(&FakeTmux::default(), &l.session, &dir, plain_cfg("hi"), &nv("/v")).await.unwrap();
+        std::fs::remove_file(&pl.started).unwrap();
+        let live_tmux = FakeTmux::default();
+        live_tmux.set_panes(&format!("%8\t0\tjohnnyone_{}\n", l.session));
+        assert!(reconcile_interrupted_turns_with(&state, &live_tmux).await.is_empty(), "nothing recorded");
+        let kills: Vec<Vec<String>> = live_tmux.calls().into_iter().filter(|c| c[0] == "respawn-pane").collect();
+        assert_eq!(kills.len(), 1);
+        assert_eq!(&kills[0][..4], &["respawn-pane", "-k", "-t", "%8"]);
+        assert!(pl.settled.exists());
+        assert_eq!(message_count(&state, &l.session), 0);
+        // G-1-7: a plan that left briefing (accepted) or whose agent is retired gets nothing.
+        let g = plan(&state, &store, "G").await;
+        let (dir, pg) = start(&g);
+        start_turn(&FakeTmux::default(), &g.session, &dir, plain_cfg("hi"), &nv("/v")).await.unwrap();
+        state
+            .db
+            .with_conn(|c| c.execute("UPDATE agent_plans SET initiative_status = 'planning' WHERE id = ?1", params![g.id]).map_err(|e| e.to_string()))
+            .unwrap();
+        let h = plan(&state, &store, "H").await;
+        let (dir, ph) = start(&h);
+        start_turn(&FakeTmux::default(), &h.session, &dir, plain_cfg("hi"), &nv("/v")).await.unwrap();
+        crate::services::sessions::mark_session_archived(&state, &h.session).unwrap();
+        assert!(reconcile_interrupted_turns_with(&state, &tmux).await.is_empty());
+        assert_eq!(message_count(&state, &g.session) + message_count(&state, &h.session), 0);
+        assert!(!pg.settled.exists() && !ph.settled.exists(), "not touched at all");
+        assert!(tmux.calls()[calls..].iter().all(|c| c[0] != "respawn-pane"), "nothing killed");
+        // A turn this engine is running (slot held) is never touched.
+        let e = plan(&state, &store, "E").await;
+        let (dir, _) = start(&e);
+        start_turn(&FakeTmux::default(), &e.session, &dir, plain_cfg("hi"), &nv("/v")).await.unwrap();
+        let _held = claim_turn(&state, &e.session).unwrap();
+        assert!(reconcile_interrupted_turns_with(&state, &tmux).await.is_empty());
+        assert_eq!(message_count(&state, &e.session), 0);
     }
 
     #[test]

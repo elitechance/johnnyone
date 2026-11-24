@@ -148,27 +148,57 @@ pub(crate) async fn retire_plan_agent_with(state: &AppState, panes: &dyn AgentPa
     if let Err(error) = mcp_tokens::revoke_for_initiative(state, initiative_id, why) {
         tracing::warn!(%initiative_id, %error, "plan agent: token revoke failed");
     }
-    let session: Option<String> = state
-        .db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT briefing_session_id FROM agent_plans WHERE id = ?1",
-                params![initiative_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())
-        })
-        .unwrap_or(None)
-        .flatten();
-    if let Some(sid) = session {
+    let session: Result<Option<Option<String>>, String> = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT briefing_session_id FROM agent_plans WHERE id = ?1",
+            params![initiative_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    });
+    let sessions: Vec<String> = match session {
+        Ok(found) => found.flatten().into_iter().collect(),
+        Err(error) => {
+            // Never skip the session revoke on a lookup error (F-3-39): fall back to every session
+            // that ever held a token for this plan, and retire each (which revokes by session).
+            tracing::warn!(%initiative_id, %error, "plan agent: briefing_session_id lookup failed; retiring by token holder");
+            token_holders(state, initiative_id)
+        }
+    };
+    for sid in sessions {
         retire_agent_session_now(state, panes, &sid, reason).await;
+        // Explicit, so the revoke holds even if the retire above failed part-way.
+        if let Err(error) = mcp_tokens::revoke_for_session(state, &sid, why) {
+            tracing::warn!(%initiative_id, session_id = %sid, %error, "plan agent: session token revoke failed");
+        }
     }
     // Retention: the turn transcripts (`plan-agent/turns/`) are kept through accept and removed with
     // the plan on delete — after the pane is killed, so nothing is still writing them.
     if reason == "plan_deleted" {
         remove_turns(state, initiative_id);
     }
+}
+
+/// Every session that ever held an MCP token for `initiative_id` (the retire fallback).
+fn token_holders(state: &AppState, initiative_id: &str) -> Vec<String> {
+    state
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT session_id FROM mcp_tokens WHERE initiative_id = ?1 ORDER BY session_id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![initiative_id], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!(%initiative_id, %error, "plan agent: token-holder lookup failed");
+            Vec::new()
+        })
 }
 
 fn remove_turns(state: &AppState, initiative_id: &str) {
@@ -382,6 +412,7 @@ mod tests {
             cfg.clone(),
             p.session.clone(),
             crate::providers::claude_code::parse_line,
+            None,
         )
         .await
         .unwrap();
@@ -666,7 +697,7 @@ mod tests {
             "pane excluded from capture"
         );
         assert!(refuse_human_teardown(&state, &sid).is_err(), "teardown refused");
-        assert!(crate::services::chat_host::plan_agent_turn_extras(&state, &sid, "codex").is_err(), "non-claude turn refused");
+        assert!(crate::services::chat_host::claim_plan_agent_turn(&state, &sid, "codex").is_err(), "non-claude turn refused");
     }
 
     // ── task 09: revoke + retire ──
@@ -787,6 +818,41 @@ mod tests {
         assert!(replace_plan_agent_session_with(&state, &panes, &p.id, "x").await.is_err());
     }
 
+    /// G (F-3-39): a DB error on the `briefing_session_id` lookup is logged and the session is
+    /// STILL retired + revoked (found through its token row), not silently skipped.
+    #[test]
+    fn retire_survives_a_briefing_lookup_error() {
+        let ((), logs) = capture_logs(|rt| {
+            rt.block_on(async {
+                let (state, _r) = test_state();
+                let store = use_store(&state);
+                let p = plan(&state, &store, "A").await;
+                assert!(mcp_tokens::has_live_token(&state, &p.id, &p.session).unwrap());
+                // Make the lookup fail (the column is gone); the token table still answers.
+                state
+                    .db
+                    .with_conn(|c| {
+                        c.execute("ALTER TABLE agent_plans RENAME COLUMN briefing_session_id TO briefing_gone", [])
+                            .map_err(|e| e.to_string())
+                    })
+                    .unwrap();
+                let panes = RecordingPanes::default();
+                retire_plan_agent_with(&state, &panes, &p.id, "plan_deleted").await;
+                assert_eq!(*panes.killed.lock().unwrap(), vec![p.session.clone()], "the agent's pane is still killed");
+                let status: String = state
+                    .db
+                    .with_conn(|c| {
+                        c.query_row("SELECT status FROM sessions WHERE id = ?1", params![p.session], |r| r.get(0))
+                            .map_err(|e| e.to_string())
+                    })
+                    .unwrap();
+                assert_eq!(status, "archived");
+                assert!(!mcp_tokens::has_live_token(&state, &p.id, &p.session).unwrap());
+            })
+        });
+        assert!(logs.contains("briefing_session_id lookup failed"), "{logs}");
+    }
+
     #[tokio::test]
     async fn retired_session_cannot_call_mcp() {
         let (state, _r) = test_state();
@@ -821,7 +887,7 @@ mod tests {
             let extras = plan_agent_extras(&state, &p.session).unwrap().unwrap();
             let cfg = build_config_with("hi", &p.ws.to_string_lossy(), "", None, None, Some(&extras));
             let tmux = std::sync::Arc::new(FakeTmux::default());
-            let _turn = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg, p.session.clone(), crate::providers::claude_code::parse_line)
+            let _turn = spawn_plan_agent_turn_with(&state, tmux.clone(), cfg, p.session.clone(), crate::providers::claude_code::parse_line, None)
                 .await
                 .unwrap();
             let calls = tmux.calls();

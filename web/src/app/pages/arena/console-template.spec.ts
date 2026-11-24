@@ -23,7 +23,8 @@ describe('terminal.page.html — the arena is added, nothing is replaced', () =>
       expect(HTML, `the ${tab} branch is gone`).toContain(`activeTab() === '${tab}'`);
     }
     expect(HTML).not.toContain("activeTab() === 'raw'");
-    expect(HTML).toContain('rawAttachNeeded(primarySessionId()');
+    // The Raw fallback decides attach vs screen (vs a refused pane's notice) via rawPaneView → rawAttachNeeded.
+    expect(HTML).toContain('rawPaneView(primarySessionId()');
     expect(HTML).toContain('<johnny-terminal-screen');
   });
 

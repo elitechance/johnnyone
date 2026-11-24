@@ -225,8 +225,18 @@ export type CopyState = 'idle' | 'copied' | 'failed';
 /** The Copy button's text. A failed clipboard write says so (and the page selects the name). */
 export function copyLabel(state: CopyState): string {
   if (state === 'copied') return 'Copied';
-  if (state === 'failed') return 'Copy failed: name selected, press Ctrl/⌘+C';
+  if (state === 'failed') return 'Copy failed: press Ctrl/⌘+C';
   return 'Copy';
+}
+
+/**
+ * How long the Copy button keeps a result before it goes back to `Copy` (ms). `failed` stays a bit
+ * longer so there is time to read it and press Ctrl/⌘+C on the selected name.
+ */
+export function copyResetMs(state: CopyState): number | null {
+  if (state === 'copied') return 1500;
+  if (state === 'failed') return 4000;
+  return null;
 }
 
 /** The chat card pill suffix: `idle` / `working` / `retired`. */

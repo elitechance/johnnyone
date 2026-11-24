@@ -867,42 +867,132 @@ pub(crate) fn plan_agent_input_check_for_test(state: &AppState, session_id: &str
     plan_agent_pane_access(state, session_id, &target, true, true)
 }
 
+/// The refusal when a terminal path would have to CREATE a pane for a session whose plan job has
+/// ended. The web keys its "Transcript only" notice off "job has ended".
+pub const AGENT_JOB_ENDED: &str =
+    "This agent's job has ended; its pane is not restarted. Transcript only.";
+
+/// What a terminal path does about the pane (pure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneDecision {
+    /// The pane exists: attach to it (viewing an ended job's leftover pane is allowed).
+    Attach,
+    /// No pane, and the session may get one.
+    Create,
+    /// No pane, and none may be created.
+    Refuse(String),
+}
+
+/// Decide attach / create / refuse. `job_ended` is asked only when a pane would be created; a
+/// lookup error fails CLOSED (no pane is created on a guess).
+pub(crate) fn decide_pane(
+    tmux_session_name: &str,
+    pane_exists: bool,
+    attached: bool,
+    job_ended: impl FnOnce() -> Result<bool, String>,
+) -> PaneDecision {
+    if pane_exists {
+        return PaneDecision::Attach;
+    }
+    if attached {
+        // Attached view of an external tmux that has since gone away — don't spawn a replacement
+        // under its name; report it as not running.
+        return PaneDecision::Refuse(format!("external tmux session '{tmux_session_name}' is not running"));
+    }
+    match job_ended() {
+        Ok(false) => PaneDecision::Create,
+        Ok(true) => PaneDecision::Refuse(AGENT_JOB_ENDED.to_string()),
+        Err(error) => PaneDecision::Refuse(format!("{AGENT_JOB_ENDED} (job lookup failed: {error})")),
+    }
+}
+
+/// The refusal for an ARCHIVED row: a worker/reviewer whose plan job has ended gets the same
+/// [`AGENT_JOB_ENDED`] text as the live gate (the backfill archives exactly those rows, so the UI's
+/// "Transcript only" notice must match it too); any other archived row keeps the generic text.
+fn archived_refusal(state: &AppState, session_id: &str) -> String {
+    match crate::services::agent_reaper::session_job_ended(state, session_id) {
+        Ok(true) => AGENT_JOB_ENDED.to_string(),
+        _ => format!("session {session_id} is archived; refusing to resurrect it"),
+    }
+}
+
+/// Boxed future of [`PaneOps`].
+type OpsFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// The tmux operations the two `ensure_terminal_session*` paths perform. Production uses
+/// [`LivePaneOps`]; tests pass a recording fake so the job-ended gate is exercised through the
+/// real function without a tmux server.
+trait PaneOps: Send + Sync {
+    fn has_session<'a>(&'a self, name: &'a str) -> OpsFuture<'a, bool>;
+    fn create<'a>(&'a self, name: &'a str, config: &'a SessionConfig, cols: u16, rows: u16) -> OpsFuture<'a, Result<(), String>>;
+    fn first_pane<'a>(&'a self, name: &'a str) -> OpsFuture<'a, Result<String, String>>;
+    fn resize<'a>(&'a self, pane_id: &'a str, cols: u16, rows: u16) -> OpsFuture<'a, Result<(), String>>;
+    fn size<'a>(&'a self, pane_id: &'a str) -> OpsFuture<'a, Result<(u16, u16), String>>;
+}
+
+struct LivePaneOps;
+
+impl PaneOps for LivePaneOps {
+    fn has_session<'a>(&'a self, name: &'a str) -> OpsFuture<'a, bool> {
+        Box::pin(tmux_has_session(name))
+    }
+    fn create<'a>(&'a self, name: &'a str, config: &'a SessionConfig, cols: u16, rows: u16) -> OpsFuture<'a, Result<(), String>> {
+        Box::pin(create_tmux_session(name, config, cols, rows))
+    }
+    fn first_pane<'a>(&'a self, name: &'a str) -> OpsFuture<'a, Result<String, String>> {
+        Box::pin(list_first_pane(name))
+    }
+    fn resize<'a>(&'a self, pane_id: &'a str, cols: u16, rows: u16) -> OpsFuture<'a, Result<(), String>> {
+        Box::pin(resize_pane(pane_id, cols, rows))
+    }
+    fn size<'a>(&'a self, pane_id: &'a str) -> OpsFuture<'a, Result<(u16, u16), String>> {
+        Box::pin(pane_size(pane_id))
+    }
+}
+
 async fn ensure_terminal_session(
     state: &AppState,
     session_id: &str,
     cols: u16,
     rows: u16,
 ) -> Result<TerminalSession, String> {
+    ensure_terminal_session_with(state, &LivePaneOps, session_id, cols, rows).await
+}
+
+async fn ensure_terminal_session_with(
+    state: &AppState,
+    ops: &dyn PaneOps,
+    session_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<TerminalSession, String> {
     if session_is_archived(state, session_id) {
-        return Err(format!(
-            "session {session_id} is archived; refusing to resurrect it"
-        ));
+        return Err(archived_refusal(state, session_id));
     }
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
-    let pane_exists = tmux_has_session(&tmux_session_name).await;
+    let pane_exists = ops.has_session(&tmux_session_name).await;
     plan_agent_pane_access(state, session_id, &tmux_session_name, pane_exists, false)?;
 
-    if !pane_exists {
-        if attached {
-            // Attached view of an external tmux that has since gone away — don't
-            // spawn a replacement under its name; report it as not running.
-            return Err(format!(
-                "external tmux session '{tmux_session_name}' is not running"
-            ));
-        }
-        if let Err(error) = create_tmux_session(&tmux_session_name, &config, cols, rows).await {
-            if !tmux_has_session(&tmux_session_name).await {
+    let decision = decide_pane(&tmux_session_name, pane_exists, attached, || {
+        crate::services::agent_reaper::session_job_ended(state, session_id)
+    });
+    if let PaneDecision::Refuse(error) = decision {
+        return Err(error);
+    }
+    if decision == PaneDecision::Create {
+        if let Err(error) = ops.create(&tmux_session_name, &config, cols, rows).await {
+            if !ops.has_session(&tmux_session_name).await {
                 return Err(error);
             }
         }
     }
 
-    let pane_id = list_first_pane(&tmux_session_name).await?;
+    let pane_id = ops.first_pane(&tmux_session_name).await?;
     // Don't resize an external tmux pane — that would fight the user's own
     // terminal (tmux sessions have a single shared size). Capture it as-is.
     if !attached {
-        resize_pane(&pane_id, cols, rows).await?;
+        ops.resize(&pane_id, cols, rows).await?;
     }
 
     state.db.with_conn(|conn| {
@@ -926,30 +1016,38 @@ async fn ensure_terminal_session_for_input(
     state: &AppState,
     session_id: &str,
 ) -> Result<TerminalSession, String> {
+    ensure_terminal_session_for_input_with(state, &LivePaneOps, session_id).await
+}
+
+async fn ensure_terminal_session_for_input_with(
+    state: &AppState,
+    ops: &dyn PaneOps,
+    session_id: &str,
+) -> Result<TerminalSession, String> {
     if session_is_archived(state, session_id) {
-        return Err(format!(
-            "session {session_id} is archived; refusing to resurrect it"
-        ));
+        return Err(archived_refusal(state, session_id));
     }
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
     plan_agent_pane_access(state, session_id, &tmux_session_name, true, true)?;
 
-    if !tmux_has_session(&tmux_session_name).await {
-        if attached {
-            return Err(format!(
-                "external tmux session '{tmux_session_name}' is not running"
-            ));
-        }
-        if let Err(error) = create_tmux_session(&tmux_session_name, &config, 100, 30).await {
-            if !tmux_has_session(&tmux_session_name).await {
+    let pane_exists = ops.has_session(&tmux_session_name).await;
+    let decision = decide_pane(&tmux_session_name, pane_exists, attached, || {
+        crate::services::agent_reaper::session_job_ended(state, session_id)
+    });
+    if let PaneDecision::Refuse(error) = decision {
+        return Err(error);
+    }
+    if decision == PaneDecision::Create {
+        if let Err(error) = ops.create(&tmux_session_name, &config, 100, 30).await {
+            if !ops.has_session(&tmux_session_name).await {
                 return Err(error);
             }
         }
     }
 
-    let pane_id = list_first_pane(&tmux_session_name).await?;
-    let (cols, rows) = pane_size(&pane_id).await.unwrap_or((100, 30));
+    let pane_id = ops.first_pane(&tmux_session_name).await?;
+    let (cols, rows) = ops.size(&pane_id).await.unwrap_or((100, 30));
 
     state.db.with_conn(|conn| {
         conn.execute(
@@ -1784,6 +1882,125 @@ pub(crate) fn tmux_session_name(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── G-1-6 (a): the job-ended gate THROUGH the real ensure functions (fake tmux) ──
+
+    /// Records every tmux op; `exists` answers `has_session`. Creates nothing.
+    struct FakeOps {
+        exists: bool,
+        created: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeOps {
+        fn new(exists: bool) -> Self {
+            Self { exists, created: std::sync::Mutex::new(Vec::new()) }
+        }
+        fn created(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+
+    impl PaneOps for FakeOps {
+        fn has_session<'a>(&'a self, _name: &'a str) -> OpsFuture<'a, bool> {
+            let e = self.exists || !self.created.lock().unwrap().is_empty();
+            Box::pin(async move { e })
+        }
+        fn create<'a>(&'a self, name: &'a str, _config: &'a SessionConfig, _cols: u16, _rows: u16) -> OpsFuture<'a, Result<(), String>> {
+            self.created.lock().unwrap().push(name.to_string());
+            Box::pin(async { Ok(()) })
+        }
+        fn first_pane<'a>(&'a self, _name: &'a str) -> OpsFuture<'a, Result<String, String>> {
+            Box::pin(async { Ok("%1".to_string()) })
+        }
+        fn resize<'a>(&'a self, _pane_id: &'a str, _cols: u16, _rows: u16) -> OpsFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn size<'a>(&'a self, _pane_id: &'a str) -> OpsFuture<'a, Result<(u16, u16), String>> {
+            Box::pin(async { Ok((100, 30)) })
+        }
+    }
+
+    fn worker_of(state: &AppState, plan_status: &str, phase_status: &str) -> (String, String) {
+        let sid = crate::services::sessions::create_session(
+            state,
+            crate::db::models::CreateSessionInput {
+                provider: Some("shell".into()),
+                model: None,
+                working_directory: None,
+                title: Some("T1 Worker - x".into()),
+                kind: Some("agent".into()),
+                setup_commands: None,
+                tmux_session_name: None,
+            },
+        )
+        .unwrap()
+        .id;
+        let plan = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO agent_plans (id, run_type, title, workspace_path, plan_path, status, worker_session_id, \
+                     worker_provider, reviewer_provider, initiative_id, initiative_status) \
+                     VALUES (?1, 'development', 't', '/w', '/p', ?2, ?3, 'claude_code', 'claude_code', ?1, 'development')",
+                    params![plan, plan_status, sid],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO agent_plan_phases (id, plan_id, phase_id, phase_title, phase_index, status) VALUES (?1, ?2, '01-p', 'x', 0, ?3)",
+                    params![uuid::Uuid::new_v4().to_string(), plan, phase_status],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        (sid, plan)
+    }
+
+    #[tokio::test]
+    async fn ensure_terminal_session_refuses_a_finished_jobs_pane_and_creates_nothing() {
+        let (state, _r) = crate::test_support::test_state();
+        let (done, _) = worker_of(&state, "approved", "passed");
+        // View path.
+        let ops = FakeOps::new(false);
+        let e = ensure_terminal_session_with(&state, &ops, &done, 120, 36).await.err().expect("refused");
+        assert_eq!(e, AGENT_JOB_ENDED);
+        assert!(ops.created().is_empty(), "a pane was created for a finished job");
+        // Input/capture path.
+        let ops = FakeOps::new(false);
+        let e = ensure_terminal_session_for_input_with(&state, &ops, &done).await.err().expect("refused");
+        assert_eq!(e, AGENT_JOB_ENDED);
+        assert!(ops.created().is_empty());
+        // An existing pane may still be viewed.
+        let ops = FakeOps::new(true);
+        assert!(ensure_terminal_session_with(&state, &ops, &done, 120, 36).await.is_ok());
+        assert!(ops.created().is_empty());
+        // A running plan's worker gets its pane (the gate is not a blanket refusal).
+        let (running, _) = worker_of(&state, "phase_worker_running", "worker_running");
+        let ops = FakeOps::new(false);
+        assert!(ensure_terminal_session_with(&state, &ops, &running, 120, 36).await.is_ok());
+        assert_eq!(ops.created(), vec![tmux_session_name(&running)]);
+        let ops = FakeOps::new(false);
+        assert!(ensure_terminal_session_for_input_with(&state, &ops, &running).await.is_ok());
+        assert_eq!(ops.created().len(), 1);
+    }
+
+    /// G-1-1 (3): the backfill ARCHIVES the incident's rows, so the archived refusal of a finished
+    /// job's worker carries the same job-ended text the UI keys off; other archived rows don't.
+    #[tokio::test]
+    async fn archived_finished_worker_gets_the_job_ended_refusal() {
+        let (state, _r) = crate::test_support::test_state();
+        let (done, _) = worker_of(&state, "approved", "passed");
+        crate::services::sessions::mark_session_archived(&state, &done).unwrap();
+        let ops = FakeOps::new(false);
+        assert_eq!(ensure_terminal_session_with(&state, &ops, &done, 120, 36).await.err().unwrap(), AGENT_JOB_ENDED);
+        assert_eq!(ensure_terminal_session_for_input_with(&state, &ops, &done).await.err().unwrap(), AGENT_JOB_ENDED);
+        assert!(ops.created().is_empty());
+        let (running, _) = worker_of(&state, "phase_worker_running", "worker_running");
+        crate::services::sessions::mark_session_archived(&state, &running).unwrap();
+        let e = ensure_terminal_session_with(&state, &ops, &running, 120, 36).await.err().unwrap();
+        assert!(e.contains("is archived; refusing to resurrect it"), "{e}");
+        assert!(ops.created().is_empty());
+    }
 
     #[test]
     fn parse_session_inventory_reads_name_created_attached() {

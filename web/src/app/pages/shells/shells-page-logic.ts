@@ -11,6 +11,7 @@
 import type { AiSession } from '../../../../../ui/src/models/ai-session.model';
 import type { TmuxSession } from '../../../../../ui/src/services/johnny-api.service';
 import { plainTerminalRoute } from '../../components/launcher-menu/launcher-logic';
+import type { ShellView } from './shells-route';
 
 /**
  * A session belongs on the Shells list when it is a raw `CliProvider::Shell` OR an attached external
@@ -391,4 +392,34 @@ export const PLAN_AGENT_VIEW_ONLY_NOTE = "View-only: talk to the plan agent in i
  */
 export function isPlanAgentShell(s: { planAgent?: boolean | null } | null | undefined): boolean {
   return s?.planAgent === true;
+}
+
+/** The shell page's notice for a session whose plan job has ended (the engine refuses a new pane). */
+export const AGENT_JOB_ENDED_NOTE = "This agent's job has ended. Transcript only.";
+
+/**
+ * `AGENT_JOB_ENDED_NOTE` when a terminal error is the engine's "job has ended" refusal
+ * (`terminal::AGENT_JOB_ENDED`: opening Raw/Transcript of a finished worker never restarts it),
+ * else `null`. The Raw view shows this instead of a blank screen.
+ */
+export function jobEndedNotice(error: string | null | undefined): string | null {
+  return /job has ended/i.test(error ?? '') ? AGENT_JOB_ENDED_NOTE : null;
+}
+
+/**
+ * The view the shell toggle highlights. A view-only plan agent has no Watchdog view, so a
+ * `/shells/:id/watchdog` URL renders Raw — and Raw is the button that lights up.
+ */
+export function visibleShellView(view: ShellView, viewOnly: boolean): ShellView {
+  return viewOnly && view === 'watchdog' ? 'raw' : view;
+}
+
+/**
+ * The text for a refused close/kill: the engine's own reason, without the `Failed to kill
+ * terminal:` / `Error:` wrapping (a plan agent's refusal reads as a sentence, not a stack).
+ */
+export function closeRefusalText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '');
+  const text = raw.replace(/^\s*(?:Error:\s*)+/i, '').trim();
+  return text || "Couldn't close the terminal.";
 }

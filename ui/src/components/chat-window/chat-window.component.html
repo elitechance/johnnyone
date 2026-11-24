@@ -45,7 +45,8 @@
       <johnny-message-composer
         (messageSent)="onMessageSent($event)"
         [disabled]="disabled"
-        [placeholder]="placeholder">
+        [placeholder]="placeholder"
+        [restoredDraft]="restoredDraft">
       </johnny-message-composer>
     }
     <div class="chat-actions-slot">

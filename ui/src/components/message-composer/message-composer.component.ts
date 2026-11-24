@@ -11,6 +11,7 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { applyRestoredDraft } from '../../services/ai-chat-logic';
 import {
   IonTextarea,
   IonItem,
@@ -41,6 +42,18 @@ interface ClipboardImageSource {
 export class MessageComposerComponent implements AfterViewInit, OnDestroy {
   @Input() disabled = false;
   @Input() placeholder = 'Type a message...';
+
+  /**
+   * A refused send's text to put back (G-1-3). Applied once per `seq`, and only into an empty
+   * composer, so it never overwrites something typed since.
+   */
+  @Input() set restoredDraft(draft: { text: string; seq: number } | null | undefined) {
+    if (!draft || draft.seq === this.lastDraftSeq) return;
+    this.lastDraftSeq = draft.seq;
+    this.messageText = applyRestoredDraft(this.messageText, draft.text);
+    this.cdr.markForCheck();
+  }
+  private lastDraftSeq = -1;
 
   @Output() messageSent = new EventEmitter<string>();
 

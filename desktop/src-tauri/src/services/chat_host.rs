@@ -21,6 +21,25 @@ pub async fn send_chat_message_blocking(
     session_id: String,
     content: String,
 ) -> Result<ChatRunResult, String> {
+    send_chat_message_blocking_with(
+        state,
+        std::sync::Arc::new(crate::services::plan_agent_tmux::LiveTmux),
+        session_id,
+        content,
+        TURN_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+/// [`send_chat_message_blocking`] with an explicit tmux and idle timeout (tests pass a fake tmux
+/// and a short timeout; nothing else differs).
+pub(crate) async fn send_chat_message_blocking_with(
+    state: &AppState,
+    tmux: std::sync::Arc<dyn crate::services::plan_agent_tmux::TmuxRunner>,
+    session_id: String,
+    content: String,
+    stream_idle_timeout: Duration,
+) -> Result<ChatRunResult, String> {
     let (provider_str, model, working_dir, cli_session_id) =
         state.db.with_conn(|conn| {
             conn.query_row(
@@ -37,9 +56,9 @@ pub async fn send_chat_message_blocking(
         })?;
 
     // Plans tab 02/07: a plan's agent session runs claude_code with the j1 MCP config and
-    // least-privilege flags; any other provider, or a plan that left briefing, refuses the turn
-    // before anything is stored or spawned.
-    let plan_extras = plan_agent_turn_extras(state, &session_id, &provider_str)?;
+    // least-privilege flags; any other provider, a plan that left briefing, or a turn already in
+    // flight (the slot is CLAIMED here, F-2-19) refuses the turn before anything is stored.
+    let plan_turn = claim_plan_agent_turn(state, &session_id, &provider_str)?;
 
     let user_msg_id = Uuid::new_v4().to_string();
     let user_message = state.db.with_conn(|conn| {
@@ -102,7 +121,7 @@ pub async fn send_chat_message_blocking(
             &model,
             cli_path_ref,
             cli_sid_ref,
-            plan_extras.as_ref(),
+            plan_turn.as_ref().map(|t| &t.extras),
         ),
         CliProvider::Codex => {
             codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
@@ -135,14 +154,15 @@ pub async fn send_chat_message_blocking(
         CliProvider::Lokalai => lokalai::parse_line,
     };
 
-    let (process, mut rx) = // A plan-agent turn runs visibly in its `johnnyone_<sid>` pane; its data still comes only from
+    // A plan-agent turn runs visibly in its `johnnyone_<sid>` pane; its data still comes only from
     // the turn's stream-json (`plan_agent_tmux`). Every other turn is the headless `spawn_cli`.
-    crate::services::plan_agent_tmux::spawn_chat_turn(
+    let (process, mut rx) = crate::services::plan_agent_tmux::spawn_chat_turn_with(
         state,
+        tmux,
         config,
         session_id.clone(),
         parse_fn,
-        plan_extras.is_some(),
+        plan_turn.map(|t| t.slot),
     )
     .await?;
 
@@ -161,7 +181,6 @@ pub async fn send_chat_message_blocking(
         .map_err(|e| format!("Failed to create assistant message: {}", e))
     })?;
 
-    let stream_idle_timeout = Duration::from_secs(120);
     let mut full_content = String::new();
     let mut total_input_tokens: i64 = 0;
     let mut total_output_tokens: i64 = 0;
@@ -175,20 +194,18 @@ pub async fn send_chat_message_blocking(
     let mut tool_chunks: Vec<StreamChunk> = Vec::new();
 
     loop {
-        let chunk = match timeout(stream_idle_timeout, rx.recv()).await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => {
+        let chunk = match recv_turn_chunk(&mut rx, stream_idle_timeout).await {
+            TurnRecv::Chunk(chunk) => chunk,
+            TurnRecv::Closed => {
                 if !saw_final_chunk {
                     finish_reason = "stream_closed".to_string();
                 }
                 break;
             }
-            Err(_) => {
+            TurnRecv::TimedOut => {
                 finish_reason = "timeout".to_string();
                 should_kill_process = true;
-                let message =
-                    "Response timed out waiting for model output. Please retry.".to_string();
-                fallback_error = Some(message.clone());
+                fallback_error = Some(TURN_TIMEOUT_MESSAGE.to_string());
 
                 let _ = state.db.with_conn(|conn| {
                     conn.execute(
@@ -265,33 +282,12 @@ pub async fn send_chat_message_blocking(
     }
 
     // Only THIS turn's handle: a later turn may already be registered under the same session.
-    if let Some(mut proc) = take_own_process(&state.active_processes, &session_id, turn_id).await {
-        if should_kill_process && proc.is_running() {
-            let _ = proc.kill().await;
-        }
-    }
+    end_own_turn(&state.active_processes, &session_id, turn_id, should_kill_process).await;
 
-    if full_content.trim().is_empty() {
-        if let Some(error) = fallback_error {
-            full_content = error;
-            if finish_reason == "stop" {
-                finish_reason = "error".to_string();
-            }
-        } else if !stderr_lines.is_empty() {
-            full_content = format!(
-                "Generation ended without assistant text. Recent stderr:\n{}",
-                stderr_lines.join("\n")
-            );
-            if finish_reason == "stop" {
-                finish_reason = "stderr".to_string();
-            }
-        } else {
-            full_content = "Generation ended without assistant text. Please retry.".to_string();
-            if finish_reason == "stop" {
-                finish_reason = "empty".to_string();
-            }
-        }
-    }
+    let (content, reason) =
+        final_assistant_content(&full_content, fallback_error.as_deref(), &stderr_lines, &finish_reason);
+    full_content = content;
+    finish_reason = reason;
 
     if !full_content.trim().is_empty() && !saw_final_chunk {
         let _ = state.chat_delta_tx.send(ChatDeltaEvent {
@@ -424,23 +420,20 @@ async fn send_simulated_chat_message(
     })
 }
 
-/// Plan-agent extras for one chat turn, shared by this host path and the relay path
-/// (`AgentService::handle_relay_chat`). `Ok(None)` for every non-plan session (unchanged behaviour);
-/// `Err` refuses the turn: a plan session on another provider, or a plan that left briefing.
-pub fn plan_agent_turn_extras(
+/// Plan-agent extras for one chat turn. `Ok(None)` for every non-plan session; `Err` refuses the
+/// turn: a plan session on another provider, or a plan that left briefing. PRIVATE on purpose
+/// (G-1-13): it does not claim the turn slot, so every chat path goes through
+/// [`claim_plan_agent_turn`], the only entry point.
+fn plan_agent_turn_extras(
     state: &AppState,
     session_id: &str,
     provider: &str,
 ) -> Result<Option<claude_code::LaunchExtras>, String> {
     match CliProvider::from_str(provider) {
         Some(CliProvider::ClaudeCode) => {
-            let extras = crate::services::plan_agent::plan_agent_extras(state, session_id)?;
-            // One turn at a time per plan agent: refuse before anything is stored or spawned
-            // (the authoritative claim is `plan_agent_tmux::claim_turn` at spawn).
-            if extras.is_some() && crate::services::plan_agent_tmux::turn_in_flight(state, session_id) {
-                return Err(crate::services::plan_agent_tmux::PLAN_AGENT_BUSY.to_string());
-            }
-            Ok(extras)
+            // One turn at a time is enforced by the CLAIM in [`claim_plan_agent_turn`], which every
+            // chat path makes before it stores anything.
+            crate::services::plan_agent::plan_agent_extras(state, session_id)
         }
         _ if crate::services::plan_agent::is_plan_agent_session(state, session_id) => {
             Err(crate::services::plan_agent::PLAN_AGENT_PROVIDER_ONLY.to_string())
@@ -462,6 +455,149 @@ pub async fn take_own_process(
     } else {
         None
     }
+}
+
+/// How long a chat turn may go without a chunk before it is killed (all 3 chat paths).
+pub const TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The stored/shown text of an idle-timed-out turn.
+pub const TURN_TIMEOUT_MESSAGE: &str = "Response timed out waiting for model output. Please retry.";
+
+/// One wait on a turn's chunk stream.
+#[derive(Debug)]
+pub enum TurnRecv {
+    Chunk(StreamChunk),
+    /// The stream ended (turn over, or stopped).
+    Closed,
+    /// No chunk within the idle timeout.
+    TimedOut,
+}
+
+/// Wait up to `idle` for the turn's next chunk.
+pub async fn recv_turn_chunk(rx: &mut tokio::sync::mpsc::Receiver<StreamChunk>, idle: Duration) -> TurnRecv {
+    match timeout(idle, rx.recv()).await {
+        Ok(Some(chunk)) => TurnRecv::Chunk(chunk),
+        Ok(None) => TurnRecv::Closed,
+        Err(_) => TurnRecv::TimedOut,
+    }
+}
+
+/// The turn is over: drop THIS turn's registration and, when `kill` (an idle timeout), kill its
+/// process — for a plan-agent pane turn that is `PaneTurn::stop` (`respawn-pane -k` on the agent's
+/// own pane), which also ends its tail and so releases the turn slot. `true` when it killed.
+pub async fn end_own_turn(
+    processes: &tokio::sync::Mutex<std::collections::HashMap<String, crate::providers::cli_runner::CliProcess>>,
+    session_id: &str,
+    turn_id: u64,
+    kill: bool,
+) -> bool {
+    let Some(mut proc) = take_own_process(processes, session_id, turn_id).await else {
+        return false;
+    };
+    if kill && proc.is_running() {
+        if let Err(error) = proc.kill().await {
+            tracing::warn!(%session_id, %error, "chat turn: kill after idle timeout failed");
+        }
+        return true;
+    }
+    false
+}
+
+/// The stored assistant text + finish reason of a finished turn (pure; all 3 chat paths):
+/// - streamed text AND an error (a crash/timeout after partial output, F-1-10) → the text, a blank
+///   line, then the error line — the crash is never dropped;
+/// - streamed text only → the text;
+/// - no text → the error, else the recent stderr, else a generic "ended without text" line.
+///
+/// A `"stop"` reason becomes `error` / `stderr` / `empty` when the fallback explains the end.
+pub fn final_assistant_content(
+    full_content: &str,
+    error: Option<&str>,
+    stderr_lines: &[String],
+    finish_reason: &str,
+) -> (String, String) {
+    let upgrade = |to: &str| if finish_reason == "stop" { to.to_string() } else { finish_reason.to_string() };
+    if !full_content.trim().is_empty() {
+        return match error {
+            Some(e) if !e.trim().is_empty() && !full_content.contains(e.trim()) => {
+                (format!("{}\n\n{}", full_content.trim_end(), e.trim()), upgrade("error"))
+            }
+            _ => (full_content.to_string(), finish_reason.to_string()),
+        };
+    }
+    if let Some(e) = error {
+        (e.to_string(), upgrade("error"))
+    } else if !stderr_lines.is_empty() {
+        (
+            format!("Generation ended without assistant text. Recent stderr:\n{}", stderr_lines.join("\n")),
+            upgrade("stderr"),
+        )
+    } else {
+        ("Generation ended without assistant text. Please retry.".to_string(), upgrade("empty"))
+    }
+}
+
+/// A claimed plan-agent turn: its launch extras and the held one-turn-at-a-time slot.
+pub struct PlanAgentTurn {
+    pub extras: claude_code::LaunchExtras,
+    pub slot: crate::services::plan_agent_tmux::TurnSlot,
+}
+
+/// The refusal for a chat turn on a session that has ended (archived, or a worker/reviewer whose
+/// plan job has ended): the chat paths never start a CLI for it (G-1-12, the same resurrection
+/// class as `terminal::AGENT_JOB_ENDED`).
+pub const CHAT_SESSION_ENDED: &str =
+    "This agent's job has ended; it does not take new messages. Transcript only.";
+
+/// The refusal for a plain archived session that is not a finished agent (G-2-21).
+pub const CHAT_SESSION_ARCHIVED: &str = "This session is archived; it does not take new messages.";
+
+/// The refusal for a closed plan's old plan-agent session reached through the non-plan branch
+/// (its retire failed or never ran, G-2-20).
+pub const CHAT_PLAN_AGENT_RETIRED: &str = "This plan's agent is retired; it does not take new messages.";
+
+/// The ONLY entry point of the 3 chat paths (host, relay, Tauri command), and their FIRST step,
+/// before any message is stored:
+/// - a plan's agent → its extras plus the CLAIMED turn slot, so a second send is refused with
+///   `PLAN_AGENT_BUSY` before it stores anything (F-2-19). The slot travels into the spawn and is
+///   released when the turn's tail ends (or on drop, if the turn never starts);
+/// - any other session → `Ok(None)`, unless it has ENDED: an archived row, or a worker/reviewer
+///   whose plan job has ended (`agent_reaper::session_job_ended`) → `Err(CHAT_SESSION_ENDED)`, so
+///   no headless CLI is spawned for it. A missing row (a relay "Mobile Session" seen for the first
+///   time) is not ended.
+pub fn claim_plan_agent_turn(
+    state: &AppState,
+    session_id: &str,
+    provider: &str,
+) -> Result<Option<PlanAgentTurn>, String> {
+    let Some(extras) = plan_agent_turn_extras(state, session_id, provider)? else {
+        refuse_ended_session(state, session_id)?;
+        return Ok(None);
+    };
+    let slot = crate::services::plan_agent_tmux::claim_turn(state, session_id)?;
+    Ok(Some(PlanAgentTurn { extras, slot }))
+}
+
+fn refuse_ended_session(state: &AppState, session_id: &str) -> Result<(), String> {
+    let status: Option<String> = state.db.with_conn(|conn| {
+        use rusqlite::OptionalExtension;
+        conn.query_row("SELECT status FROM sessions WHERE id = ?1", params![session_id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())
+    })?;
+    let Some(status) = status else { return Ok(()) };
+    if crate::services::agent_reaper::session_job_ended(state, session_id)? {
+        return Err(CHAT_SESSION_ENDED.to_string());
+    }
+    // Reached only when no LIVE plan owns the session as its agent: a session that is still some
+    // (closed) plan's briefing session is a retired plan agent (fails closed on a lookup error).
+    if crate::services::plan_agent::is_any_plan_agent_session(state, session_id) {
+        return Err(CHAT_PLAN_AGENT_RETIRED.to_string());
+    }
+    if status == "archived" {
+        return Err(CHAT_SESSION_ARCHIVED.to_string());
+    }
+    Ok(())
 }
 
 /// Max chars of a tool result kept in `messages.tool_calls`.

@@ -111,8 +111,9 @@ describe('phase-00 cross-task integration — dead session pruned, live session 
     // session is the only thing left to show.
     expect(chooseSessionToSelect(activeSessions, { currentId: DEAD })).toBeNull();
     expect(chooseSessionToSelect(activeSessions, {})).toBe(LIVE);
-    // A stale dead deep-link is ignored; the live session still appears.
-    expect(chooseSessionToSelect(activeSessions, { targetId: DEAD })).toBe(LIVE);
+    // An EXPLICIT deep-link is honoured as-is (G-1-1): the page opens it read-only, or shows
+    // nothing if it no longer exists — it never silently opens a different, typeable session.
+    expect(chooseSessionToSelect(activeSessions, { targetId: DEAD })).toBe(DEAD);
   });
 
   it('empty-state variant: dead id is the ONLY persisted session, no active session → both stores cleared, selection null', () => {

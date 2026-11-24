@@ -8,7 +8,7 @@ use crate::state::app_state::AppState;
 use rusqlite::params;
 use serde::Serialize;
 use tauri::{Emitter, State};
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 /// Delta event emitted to the frontend during streaming.
@@ -45,9 +45,10 @@ pub async fn send_chat_message(
 
     // Plans tab 02/07 (validator follow-up F1): this Tauri command is a third chat path. A plan's
     // agent session gets the same j1 MCP config + least-privilege flags as `chat_host` and the relay,
-    // and is refused after accept or on a non-claude provider — before anything is stored.
-    let plan_extras =
-        crate::services::chat_host::plan_agent_turn_extras(&state, &session_id, &provider_str)?;
+    // and is refused after accept, on a non-claude provider, or while a turn is in flight (the
+    // slot is CLAIMED here, F-2-19) — before anything is stored.
+    let plan_turn =
+        crate::services::chat_host::claim_plan_agent_turn(&state, &session_id, &provider_str)?;
 
     // 2. Save user message to SQLite
     let user_msg_id = Uuid::new_v4().to_string();
@@ -99,7 +100,7 @@ pub async fn send_chat_message(
             &model,
             cli_path_ref,
             cli_sid_ref,
-            plan_extras.as_ref(),
+            plan_turn.as_ref().map(|t| &t.extras),
         ),
         CliProvider::Codex => {
             codex::build_config(&content, &working_dir, &model, cli_path_ref, cli_sid_ref)
@@ -139,7 +140,7 @@ pub async fn send_chat_message(
         config,
         session_id.clone(),
         parse_fn,
-        plan_extras.is_some(),
+        plan_turn.map(|t| t.slot),
     )
     .await?;
 
@@ -167,7 +168,7 @@ pub async fn send_chat_message(
     let amid = assistant_msg_id.clone();
 
     tokio::spawn(async move {
-        let stream_idle_timeout = Duration::from_secs(120);
+        let stream_idle_timeout = crate::services::chat_host::TURN_IDLE_TIMEOUT;
         let mut full_content = String::new();
         let mut total_input_tokens: i64 = 0;
         let mut total_output_tokens: i64 = 0;
@@ -192,8 +193,7 @@ pub async fn send_chat_message(
                     finish_reason = "timeout".to_string();
                     should_kill_process = true;
 
-                    let message =
-                        "Response timed out waiting for model output. Please retry.".to_string();
+                    let message = crate::services::chat_host::TURN_TIMEOUT_MESSAGE.to_string();
                     fallback_error = Some(message.clone());
 
                     let _ = db.with_conn(|conn| {
@@ -291,38 +291,17 @@ pub async fn send_chat_message(
         }
 
         // Only THIS turn's handle (a later turn may already be registered for the session).
-        if let Some(mut proc) =
-            crate::services::chat_host::take_own_process(&active_processes, &sid, turn_id).await
-        {
-            if should_kill_process && proc.is_running() {
-                let _ = proc.kill().await;
-            }
-        }
+        crate::services::chat_host::end_own_turn(&active_processes, &sid, turn_id, should_kill_process).await;
 
-        let mut used_fallback_content = false;
-        if full_content.trim().is_empty() {
-            used_fallback_content = true;
-
-            if let Some(error) = fallback_error {
-                full_content = error;
-                if finish_reason == "stop" {
-                    finish_reason = "error".to_string();
-                }
-            } else if !stderr_lines.is_empty() {
-                full_content = format!(
-                    "Generation ended without assistant text. Recent stderr:\n{}",
-                    stderr_lines.join("\n")
-                );
-                if finish_reason == "stop" {
-                    finish_reason = "stderr".to_string();
-                }
-            } else {
-                full_content = "Generation ended without assistant text. Please retry.".to_string();
-                if finish_reason == "stop" {
-                    finish_reason = "empty".to_string();
-                }
-            }
-        }
+        let used_fallback_content = full_content.trim().is_empty();
+        let (content, reason) = crate::services::chat_host::final_assistant_content(
+            &full_content,
+            fallback_error.as_deref(),
+            &stderr_lines,
+            &finish_reason,
+        );
+        full_content = content;
+        finish_reason = reason;
 
         if used_fallback_content {
             let fallback_delta = ChatDelta {

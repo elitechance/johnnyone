@@ -104,11 +104,17 @@
             [streamingMessageId]="chat.streamingMessageId()"
             [disabled]="composer().disabled"
             [placeholder]="composer().placeholder"
+            [restoredDraft]="chat.restoredDraft()"
             [bubbleDisplay]="bubbleDisplay"
             emptyTitle="Tell the plan agent what you want to build."
             emptyDescription="It drafts the brief and the outline on the right, one versioned change at a time."
             (messageSent)="send($event)"
           >
+            @if (chat.turnError(); as err) {
+              <div chat-meta class="turn-error" role="alert">
+                <ion-icon name="alert-circle-outline" aria-hidden="true"></ion-icon><span>{{ err }}</span>
+              </div>
+            }
             <div chat-meta class="chips-row">
               @for (c of choices(); track c) {
                 <ion-chip outline="true" (click)="send(c)">{{ c }}</ion-chip>
