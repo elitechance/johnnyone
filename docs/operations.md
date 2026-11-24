@@ -161,6 +161,31 @@ desktop **before or with** that worker. **Do not deploy** the auth
 worker from an agent. Full L1–L7 / D12 procedure:
 `/home/creepy/Documents/Workspace/.johnnyone/initiatives/a53df1e5-4dd6-4226-9506-83698bcbd643/plan/phases/03-acceptance/artifacts/human-cutover.md`.
 
+### `JOHNNYONE_HOST_ADDR`: keep it on loopback
+
+The engine binds its host API on `JOHNNYONE_HOST_ADDR` (default `127.0.0.1:7788`). Keep it on
+loopback. Do not bind `0.0.0.0` or a LAN IP: the GraphQL surface trusts any caller that sends no
+`Origin` (that is how the agents' `curl`s work), including `setSetting` and `mintActionLink`.
+
+Three guards sit in front of it. They do different jobs:
+
+- **Peer address** (`host/origin_guard.rs`, `reject_non_loopback_peer`). This is the outermost layer
+  over GraphQL, its websocket and `/mcp`. A TCP peer that is not loopback (`127.0.0.0/8`, `::1`,
+  `::ffff:127.x`) gets **HTTP 403 "non-loopback peer refused"**, whatever headers it sends. This is
+  the only guard that stops another machine, if the host is ever bound off loopback. It has no
+  opt-out.
+- **Host header** (`host_header_allowed`). A `Host` that is not `127.0.0.1`, `localhost` or `[::1]`
+  on the bound port gets 403 "unexpected Host header". `/mcp` accepts only `127.0.0.1` and
+  `localhost`. The client writes this header, so it is a **DNS-rebinding defence only**: a non-browser
+  client can send `Host: 127.0.0.1:7788` from anywhere.
+- **Origin** (`allow_request_with`). This refuses cross-site browser pages. It is a **browser
+  defence only**: a request with no `Origin` is allowed.
+
+Treat the peer guard as defence in depth, not as permission to bind off loopback. The only supported
+way to reach the host API (:7788) from another machine is an SSH tunnel to the loopback address,
+`ssh -L 7788:127.0.0.1:7788 <host>`, so the engine sees a loopback peer and a loopback `Host`. The
+web UI's remote path is the relay (`docs/host-transport.md`).
+
 ## Providers (CLI TUIs)
 
 Terminal-mode providers run the CLI in a tmux pane (`desktop/src-tauri/src/
@@ -368,6 +393,29 @@ rebuild and relink the CLI before deploying:
 cd lokal/apps/lokal-infra
 npm run -w @lokal/cli build
 ```
+
+**6. Discord action links: the secret, migration 0005 and the base URL**
+
+Action links (`worker/lib/action-links/`, host side `desktop/src-tauri/src/services/action_links.rs`)
+need three things on the worker before they work:
+
+- **`ACTION_LINK_SECRET`**: the HS256 key that signs every link, at least 32 characters. It is a
+  wrangler secret listed under `secrets:` in `lokal.yaml`, and it never goes in git. Set it once per
+  environment (`wrangler secret put ACTION_LINK_SECRET`, against the generated config under
+  `~/.lokal/simulators/johnnyone/<env>/`). While it is unset, minting and redeeming **fail closed**:
+  `mintActionLink` errors and every `/act` link is refused. Rotating it voids every outstanding link,
+  which is harmless because a link lives 120 s.
+- **D1 migration `0005_action_links.sql`**: creates `action_link_redemptions` (the single-use
+  ledger), `action_link_events` (the audit) and `action_link_mints`. `lokal cf worker deploy`
+  applies it with the other pending migrations. Check with `lokal cf db status --env prod` first.
+  It was edited in place before its first deploy, so if any D1 already shows 0005 as applied from
+  an earlier build, compare its tables with the file before relying on it.
+- **`ACTION_LINK_BASE_URL`** (optional var): the web origin that serves `/act`, which is the origin
+  every minted URL points at. It defaults to `https://johnnyone.pages.dev`. Set it only for a
+  staging or local worker whose console is served elsewhere, or the links will open production.
+
+The host keeps the minted-link registry in memory, so restarting the engine within 2 minutes of a
+mint makes those links answer "J1 restarted, so ask for a new link". This is expected.
 
 ### Setting up the `lokal` CLI (not installed by default)
 

@@ -201,7 +201,7 @@ fn main() {
                     }
                 };
                 tracing::info!(addr = %bind_addr, "Embedded host GraphQL listener up");
-                if let Err(e) = axum::serve(listener, app).await {
+                if let Err(e) = host::serve(listener, app).await {
                     tracing::error!(%e, "Embedded host listener exited");
                 }
             });

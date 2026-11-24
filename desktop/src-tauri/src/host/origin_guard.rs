@@ -271,6 +271,48 @@ pub fn host_header_allowed(host: Option<&str>, bound_port: u16) -> bool {
     }
 }
 
+/// Is this TCP peer allowed to reach the host at all (C-1-7)? Only a loopback peer is. The Host
+/// and Origin guards judge headers the CLIENT writes, so they stop browsers and DNS rebinding, not a
+/// LAN machine: `curl -H 'Host: 127.0.0.1:7788' http://<lan-ip>:7788/graphql` passes both. With a
+/// non-loopback `JOHNNYONE_HOST_ADDR` bind, this is what keeps such a peer out. IPv4-mapped IPv6
+/// (`::ffff:127.0.0.1`) counts as loopback. `None` (no `ConnectInfo`) is an in-process caller (the
+/// `oneshot` tests); the real listener always records the peer ([`super::serve`]).
+pub fn peer_allowed(peer: Option<std::net::SocketAddr>) -> bool {
+    match peer {
+        None => true,
+        Some(addr) => addr.ip().to_canonical().is_loopback(),
+    }
+}
+
+/// Outermost layer of the whole host router (GraphQL, its websocket, and `/mcp`): refuse a
+/// non-loopback peer with 403 before any other guard runs. No opt-out: nothing legitimate reaches
+/// the host from another machine; remote access is `ssh -L 7788:127.0.0.1:7788`.
+pub async fn reject_non_loopback_peer(req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    // No ConnectInfo is allowed (in-process callers), which is safe only while main.rs serves
+    // through `host::serve`. A real request without it means that wiring broke and this guard is
+    // silently off (C-2-17): say so loudly, once. The `main_serves_through_host_serve` test fences
+    // the wiring itself.
+    #[cfg(not(test))]
+    if peer.is_none() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "Host API: a request arrived without its peer address (ConnectInfo); the \
+                 non-loopback peer guard is OFF. main.rs must serve through host::serve."
+            )
+        });
+    }
+    if !peer_allowed(peer) {
+        log_rejection_once(&format!("peer {}", peer.map(|p| p.ip().to_string()).unwrap_or_default()));
+        return (StatusCode::FORBIDDEN, "non-loopback peer refused\n").into_response();
+    }
+    next.run(req).await
+}
+
 pub async fn reject_cross_site(req: Request, next: Next) -> Response {
     let headers = req.headers();
     let host = headers

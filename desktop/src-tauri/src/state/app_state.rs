@@ -153,6 +153,10 @@ pub struct AppState {
     /// empties it, so a link minted before the restart is refused with `UNKNOWN_LINK`, which the
     /// worker reports as its own `restarted` outcome ("J1 restarted, so ask for a new link").
     pub action_links: crate::services::action_links::Registry,
+    /// One async lock per session that an answer link is being performed on, held across the
+    /// ask check, the delivery and the record (H-3-43): two ungrouped links for the same question
+    /// tapped at the same instant type once, not twice (`services::action_links::perform`).
+    pub answer_locks: crate::services::action_links::AnswerLocks,
 }
 
 impl AppState {
@@ -210,6 +214,7 @@ impl AppState {
             lease_pool,
             mcp_rejections: Arc::new(std::sync::Mutex::new(HashMap::new())),
             action_links: Default::default(),
+            answer_locks: Default::default(),
         }
     }
 
@@ -259,6 +264,7 @@ impl AppState {
             lease_pool,
             mcp_rejections: Arc::new(std::sync::Mutex::new(HashMap::new())),
             action_links: Default::default(),
+            answer_locks: Default::default(),
         }
     }
 

@@ -25,6 +25,14 @@
 //!
 //! Audit: every mint, preview, redeem and rejection that can be tied to a plan becomes an
 //! `action_link_*` plan event carrying the jti — never the token or URL.
+//!
+//! For a minting agent (the alert-discord skill), two rules for `answer` links:
+//! - **always group a question's options** (one `group` for its Yes / No / ...). Ungrouped links
+//!   for one question are only serialised here ([`lock_answer`]): the first tap answers, a later
+//!   one is refused as answered. The lock serialises link against link only: a reply typed in
+//!   the console does not take it;
+//! - **use a new group for each question.** A group closes once any of its links is redeemed
+//!   (done, failed or answered), and minting into a closed group is refused.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -75,7 +83,24 @@ fn valid_phase(v: &str) -> bool {
 
 fn has_control(v: &str) -> bool {
     v.chars()
-        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}' || is_format_char(c))
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+}
+
+/// Any character that renders as nothing: Cf ([`is_format_char`]) or [`is_invisible_char`].
+fn has_invisible(v: &str) -> bool {
+    v.chars().any(|c| is_format_char(c) || is_invisible_char(c))
+}
+
+/// Characters outside Cf that still render as nothing (H-3-48): the Hangul fillers (U+115F,
+/// U+1160, U+3164, U+FFA0), the braille blank (U+2800), the combining grapheme joiner (U+034F)
+/// and the Khmer inherent vowels (U+17B4, U+17B5). None is whitespace, so `"\u{3164}!ls"` would
+/// pass a first-character check while a CLI's own trimming may still read it as `!ls`. Same set
+/// as the worker's `INVISIBLE_RE`.
+pub fn is_invisible_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{034F}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}'
+    )
 }
 
 /// Unicode general category Cf (format characters: zero-width space/joiners, bidi controls, BOM,
@@ -125,6 +150,9 @@ pub fn validate_reply(reply: &str) -> Result<(), String> {
     if has_control(reply) {
         return Err("reply must be one line with no control characters".into());
     }
+    if has_invisible(reply) {
+        return Err("reply must not contain invisible characters".into());
+    }
     if let Some(first) = reply.trim_start().chars().next() {
         if REPLY_FORBIDDEN_FIRST.contains(&first) {
             return Err(format!("reply must not start with {first}"));
@@ -150,6 +178,9 @@ pub fn validate_label(label: &str) -> Result<(), String> {
     }
     if has_control(label) {
         return Err("label must be one line with no control characters".into());
+    }
+    if has_invisible(label) {
+        return Err("label must not contain invisible characters".into());
     }
     Ok(())
 }
@@ -274,6 +305,50 @@ pub struct Registered {
 
 pub type Registry = Arc<Mutex<HashMap<String, Registered>>>;
 
+/// Per-session async locks for performing answer links (H-3-43). See [`lock_answer`].
+pub type AnswerLocks = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Holds one session's answer lock; on drop, forgets the session's entry once nobody else holds
+/// or waits on it, so the map does not grow with every session ever answered.
+pub struct AnswerGuard {
+    locks: AnswerLocks,
+    session_id: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for AnswerGuard {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut map = self.locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if map
+            .get(&self.session_id)
+            .is_some_and(|l| Arc::strong_count(l) == 1)
+        {
+            map.remove(&self.session_id);
+        }
+    }
+}
+
+/// Wait for, then hold, `session_id`'s answer lock. `perform` holds it from the session/ask
+/// check through the delivery to the transcript record, so two links answering the same session
+/// run one after the other: the second sees the first's recorded answer and is refused. Waiters
+/// clone the `Arc` under the map's mutex, so a guard's drop never removes a lock still in use.
+pub async fn lock_answer(state: &AppState, session_id: &str) -> AnswerGuard {
+    let lock = {
+        let mut map = state
+            .answer_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(session_id.to_string()).or_default().clone()
+    };
+    let guard = lock.lock_owned().await;
+    AnswerGuard {
+        locks: state.answer_locks.clone(),
+        session_id: session_id.to_string(),
+        guard: Some(guard),
+    }
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -393,7 +468,10 @@ async fn sign_with(config: &RelayConfig, req: &MintRequest) -> Result<MintedLink
 
 /// Seam: who performs an action. Production: [`LivePerformer`], the console's own paths.
 pub trait ActionPerformer: Send + Sync {
-    fn answer<'a>(&'a self, session_id: &'a str, reply: &'a str) -> BoxFut<'a, ()>;
+    /// Type `reply` into the session. `Ok(true)` when the delivery itself already recorded the
+    /// reply as the session's `prompt` row (a shell-provider or attached agent's console path
+    /// does, H-3-45), so `perform` does not record it a second time.
+    fn answer<'a>(&'a self, session_id: &'a str, reply: &'a str) -> BoxFut<'a, bool>;
     fn approve_plan<'a>(&'a self, plan_id: &'a str) -> BoxFut<'a, ()>;
     fn run_phase<'a>(&'a self, plan_id: &'a str, phase_id: &'a str) -> BoxFut<'a, ()>;
 }
@@ -403,7 +481,7 @@ pub struct LivePerformer {
 }
 
 impl ActionPerformer for LivePerformer {
-    fn answer<'a>(&'a self, session_id: &'a str, reply: &'a str) -> BoxFut<'a, ()> {
+    fn answer<'a>(&'a self, session_id: &'a str, reply: &'a str) -> BoxFut<'a, bool> {
         Box::pin(crate::agent::AgentService::deliver_console_reply(
             &self.state,
             session_id,
@@ -515,26 +593,61 @@ pub fn ask_state(state: &AppState, session_id: &str) -> Result<AskState, String>
 /// `answered:` and shows "The agent already got an answer, so nothing was sent."
 pub const ANSWERED: &str = "answered: the agent already got an answer, so nothing was sent";
 
-/// `answer` may target only a J1-managed agent that is asking: an active `kind = 'agent'`
-/// session J1 spawned for a plan (not an attached external tmux, not archived, not the plan agent
-/// of the Plans tab), whose latest report is an open ask. Returns the agent's display name.
-fn check_answer_target(state: &AppState, session_id: &str) -> Result<String, String> {
-    let facts = session_facts(state, session_id)?
-        .ok_or_else(|| format!("session {session_id} does not exist"))?;
+/// The mint-time refusal for a question that already got its answer. Worded for the minting
+/// agent (H-3-40): what happened and what to do next.
+pub const MINT_ANSWERED: &str =
+    "its last question was already answered; report blocked again for a new question, then mint";
+
+/// The session half of an answer link's target check, run at mint AND again at perform (H-3-44),
+/// since a link lives 120 s: the session is an active `kind = 'agent'` session J1 spawned for a
+/// plan (not an attached external tmux, not archived, not the plan agent of the Plans tab), whose
+/// plan job has not ended (H-3-37: a finished plan's worker can keep a leftover pane). Returns the
+/// session's facts with its owning `(plan_id, role)`.
+fn check_answer_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(SessionFacts, String, String), SessionRefusal> {
+    let other = |message: String| SessionRefusal { ended: false, message };
+    let ended = |message: String| SessionRefusal { ended: true, message };
+    let facts = session_facts(state, session_id)
+        .map_err(other)?
+        .ok_or_else(|| ended(format!("session {session_id} does not exist")))?;
     if facts.status != "active" {
-        return Err(format!("session {session_id} is {}", facts.status));
+        return Err(ended(format!("session {session_id} is {}", facts.status)));
     }
     if facts.attached_tmux || facts.kind != "agent" {
-        return Err(format!("session {session_id} is not a J1-managed agent"));
+        return Err(other(format!("session {session_id} is not a J1-managed agent")));
     }
     let (plan_id, role) = agent_plans::session_plan_owner(state, session_id)
-        .ok_or_else(|| format!("session {session_id} does not belong to a plan"))?;
+        .ok_or_else(|| other(format!("session {session_id} does not belong to a plan")))?;
     if role == "plan_agent" {
-        return Err(format!("session {session_id} is a plan agent, not a phase agent"));
+        return Err(other(format!("session {session_id} is a plan agent, not a phase agent")));
     }
+    // Fail closed: a lookup error refuses the link rather than typing into a finished job.
+    if crate::services::agent_reaper::session_job_ended(state, session_id).map_err(other)? {
+        return Err(ended(format!("session {session_id}'s plan job has ended")));
+    }
+    Ok((facts, plan_id, role))
+}
+
+/// Why [`check_answer_session`] refused. `ended` = the session is gone, archived, or its plan job
+/// ended — the case the human sees as "That agent's session has ended" (C-1-1).
+struct SessionRefusal {
+    ended: bool,
+    message: String,
+}
+
+/// The perform-time prefix for an answer whose session ended since the mint. The worker matches
+/// on `ended:` and shows "That agent's session has ended, so nothing was sent." (C-1-1).
+pub const ENDED: &str = "ended:";
+
+/// `answer` may target only a J1-managed agent that is asking ([`check_answer_session`]), whose
+/// latest report is an open ask. Returns the agent's display name.
+fn check_answer_target(state: &AppState, session_id: &str) -> Result<String, String> {
+    let (facts, plan_id, role) = check_answer_session(state, session_id).map_err(|r| r.message)?;
     match ask_state(state, session_id)? {
         AskState::Open => {}
-        AskState::Answered => return Err(format!("session {session_id}: {ANSWERED}")),
+        AskState::Answered => return Err(format!("session {session_id}: {MINT_ANSWERED}")),
         AskState::NoAsk => {
             return Err(format!(
                 "session {session_id} has no open question: report blocked (agent_blocked) first, then mint"
@@ -705,7 +818,22 @@ pub async fn perform(
     if now > entry.expires_at + SKEW_SECS {
         return refuse("the link expired");
     }
+    // An answer holds its session's lock from the checks below until its reply is recorded
+    // (H-3-43): a second link for the same question waits here, then finds it answered.
+    let _answer_guard = match &action {
+        LinkAction::Answer { session_id, .. } => Some(lock_answer(state, session_id).await),
+        _ => None,
+    };
     if let LinkAction::Answer { session_id, .. } = &action {
+        // The session may have been archived, attached, or its plan job ended since the mint
+        // (H-3-44): the same session checks as at mint, not only the ask.
+        if let Err(r) = check_answer_session(state, session_id) {
+            return if r.ended {
+                refuse(&format!("{ENDED} {}", r.message))
+            } else {
+                refuse(&r.message)
+            };
+        }
         // The question may have been answered (console, or another link) since the mint.
         match ask_state(state, session_id) {
             Ok(AskState::Open) => {}
@@ -716,17 +844,22 @@ pub async fn perform(
 
     let result = match &action {
         LinkAction::Answer { session_id, reply } => performer.answer(session_id, reply).await,
-        LinkAction::ApprovePlan { plan_id } => performer.approve_plan(plan_id).await,
-        LinkAction::RunPhase { plan_id, phase_id } => performer.run_phase(plan_id, phase_id).await,
-        LinkAction::Ack { .. } => Ok(()),
+        LinkAction::ApprovePlan { plan_id } => performer.approve_plan(plan_id).await.map(|()| false),
+        LinkAction::RunPhase { plan_id, phase_id } => {
+            performer.run_phase(plan_id, phase_id).await.map(|()| false)
+        }
+        LinkAction::Ack { .. } => Ok(false),
     };
     match result {
-        Ok(()) => {
+        Ok(recorded) => {
             if let LinkAction::Answer { session_id, reply } = &action {
                 // The tapped reply is the human's answer: record it as the console records a typed
                 // one, so the transcript shows it and the ask reads as answered (H-2-28) — a second
-                // link for the same question is then refused instead of typing again.
-                agent_plans::record_session_note(state, session_id, "prompt", "user", reply, None);
+                // link for the same question is then refused instead of typing again. Unless the
+                // delivery already recorded it (H-3-45), which would show it twice.
+                if !recorded {
+                    agent_plans::record_session_note(state, session_id, "prompt", "user", reply, None);
+                }
             }
             tracing::info!(jti, act = action.act(), "action link performed");
             timeline(

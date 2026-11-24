@@ -16,6 +16,7 @@ import {
   type ActionLinkDeps,
 } from './action-links';
 import { signActionToken, base64UrlEncode, ACTION_LINK_AUD, ACTION_LINK_ISS, type ActionClaims } from './token';
+import { validateLabel, validateReply } from './actions';
 import createActionLink from '../../resolvers/ai/create-action-link';
 import runActionLink from '../../resolvers/ai/run-action-link';
 import previewActionLinkResolver from '../../resolvers/ai/preview-action-link';
@@ -669,6 +670,26 @@ describe('action links: review round 2', () => {
     await expect(mintActionLink(f.deps, ID, { ...ANSWER2('ça va ✓'), label: 'Proceed? 日本 ✓' })).resolves.toBeTruthy();
   });
 
+  it('H-3-48: non-Cf invisible characters (Hangul fillers, braille blank) are refused too', async () => {
+    const f = makeDeps();
+    for (const c of ['\u115F', '\u1160', '\u3164', '\uFFA0', '\u2800', '\u034F', '\u17B4', '\u17B5']) {
+      expect(validateReply(`${c}!ls`), JSON.stringify(c)).not.toBeNull();
+      expect(validateReply(`ye${c}s`), JSON.stringify(c)).not.toBeNull();
+      expect(validateLabel(`Proceed${c}?`), JSON.stringify(c)).not.toBeNull();
+    }
+    await expect(mintActionLink(f.deps, ID, ANSWER2('\u3164!ls'))).rejects.toThrow(/createActionLink/);
+    await expect(mintActionLink(f.deps, ID, { ...ANSWER2('yes'), label: 'Proceed\u3164?' })).rejects.toThrow(/label/);
+    // C-1-2: invisible is its own message, not "control characters".
+    expect(validateReply('ye\u3164s')).toBe('reply must not contain invisible characters');
+    expect(validateReply('ye\u200Bs')).toBe('reply must not contain invisible characters');
+    expect(validateLabel('Proceed\u2800?')).toBe('label must not contain invisible characters');
+    expect(validateReply('yes\rno')).toBe('reply must be one line with no control characters');
+    expect(validateReply('한국어 ㅎ 네')).toBeNull();
+    expect(validateLabel('⠁⠃ braille text')).toBeNull();
+    const m = await mintActionLink(f.deps, ID, { ...RUN_PHASE, targetTitle: 'Disc\u3164ord\u2800 links' });
+    expect((await previewActionLink(f.deps, tokenOf(m.url), null)).target).toBe('Run phase 02-api: Discord links');
+  });
+
   it('H-2-31: a format character in the desktop-supplied target title is dropped, not shown', async () => {
     const f = makeDeps();
     const m = await mintActionLink(f.deps, ID, { ...RUN_PHASE, targetTitle: 'Disc\u200Bord\u202E links' });
@@ -710,6 +731,29 @@ describe('action links: review round 2', () => {
       summary: 'Another answer was already chosen.',
     });
     expect(f.performs()).toHaveLength(1);
+  });
+
+  it('C-1-1: the desktop\'s "ended" refusal becomes its own code and used-outcome', async () => {
+    const f = makeDeps({
+      relay: async (_i, method) => {
+        if (method === 'perform_action_link') throw new Error('perform_action_link: ended: session sess-1 is archived');
+        return true;
+      },
+    });
+    const m = await mint(f.deps, ANSWER2('yes'));
+    expect(await redeemActionLink(f.deps, m.token, null, 'POST')).toEqual({
+      ok: false,
+      code: 'ended',
+      summary: "That agent's session has ended, so nothing was sent.",
+    });
+    expect(await previewActionLink(f.deps, m.token, null)).toMatchObject({
+      state: 'used',
+      outcome: 'ended',
+      message: "That agent's session had ended, so nothing was sent.",
+    });
+    // A plain failure (and a message that merely contains "ended") stays generic.
+    expect(relayFailureCode("perform_action_link: session sess-1's plan job has ended")).toBe('failed');
+    expect(relayFailureCode('perform_action_link: pane is gone')).toBe('failed');
   });
 
   it('H-2-24b: the desktop\'s "answered" refusal becomes its own code and used-outcome', async () => {

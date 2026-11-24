@@ -63,6 +63,20 @@ pub fn router(state: AppState) -> Router {
     )
     .with_state(schema)
     .merge(mcp::mcp_router(mcp_state))
+    // Outermost, over GraphQL AND /mcp: a non-loopback TCP peer is refused whatever headers it
+    // sends (C-1-7). Needs the peer address, which only [`serve`] records.
+    .layer(axum::middleware::from_fn(origin_guard::reject_non_loopback_peer))
+}
+
+/// Serve the host router on `listener`, recording each connection's peer address
+/// (`ConnectInfo<SocketAddr>`) so [`origin_guard::reject_non_loopback_peer`] can refuse a
+/// non-loopback peer. `main.rs` must serve through this, not a bare `axum::serve`.
+pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 /// `HeaderMap` must come BEFORE `GraphQLRequest`: the latter consumes the body,
@@ -647,13 +661,23 @@ impl MutationRoot {
     /// links together — mint the Yes and the No of one question with the same group, and
     /// redeeming either uses the other up.
     ///
+    /// Two rules for a question's `answer` links:
+    /// - **Always group a question's options.** Mint every option of one question (Yes / No /
+    ///   "use option 2") with the same `group`. Ungrouped links for one question are only
+    ///   serialised on this host: the first tap answers, a later one is refused as answered.
+    ///   A group also uses up the siblings on the worker and tells the human so.
+    /// - **Use a new group for each question.** A group is single-use. Once any link in it was
+    ///   redeemed (done, failed or answered), the group is closed and minting into it is refused,
+    ///   so never reuse a group id. Derive it from something unique to the question.
+    ///
     /// Order for `answer`: the asking agent must FIRST report `blocked` (its baked
     /// `reportAgentResult(kind:"blocked")`, i.e. agent_blocked) — or J1's question watcher must
     /// have seen the pane waiting — and only THEN may a link be minted for it. A session with no
     /// open question, or whose question was already answered, is refused here, before any link
-    /// exists. The session must be a J1-managed phase agent, not an attached shell or plan agent. The worker signs (the key never
-    /// leaves it) over the relay credential; the URL is a bearer credential — post it as a Discord
-    /// link button and do not log it.
+    /// exists. The session must be a J1-managed phase agent (not an attached shell or plan agent)
+    /// whose plan job has not ended; the same session checks run again when the link is tapped.
+    /// The worker signs (the key never leaves it) over the relay credential; the URL is a bearer
+    /// credential — post it as a Discord link button and do not log it.
     ///
     /// Same caller tier as `setSetting`'s connection keys: an agent's `curl` (no `Origin`) or the
     /// app itself. A page on a foreign loopback origin is refused, because it could otherwise mint
@@ -1438,6 +1462,97 @@ mod router_tests {
     async fn body_text(res: axum::http::Response<Body>) -> String {
         let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await.unwrap();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    // ── C-1-7: the peer-address guard ──
+
+    fn with_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
+        let addr: std::net::SocketAddr = peer.parse().unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        req
+    }
+
+    /// A LAN client that forges `Host: 127.0.0.1:7788` and sends no `Origin` passes the Host and
+    /// Origin guards; the peer guard refuses it on GraphQL and on /mcp. Loopback peers still work.
+    #[tokio::test]
+    async fn a_non_loopback_peer_is_refused_even_with_a_loopback_host_header() {
+        let (state, _r) = test_state();
+        for peer in ["192.168.1.50:51000", "10.0.0.7:4000", "[2001:db8::1]:4000", "[::ffff:192.168.1.50]:4000"] {
+            for uri in ["/graphql", "/mcp"] {
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("host", "127.0.0.1:7788")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({ "query": "mutation{mintActionLink(act:\"ack\",args:\"{}\",label:\"x\"){url}}" }).to_string()))
+                    .unwrap();
+                let res = router(state.clone()).oneshot(with_peer(req, peer)).await.unwrap();
+                assert_eq!(res.status(), StatusCode::FORBIDDEN, "{peer} {uri}");
+                assert_eq!(body_text(res).await, "non-loopback peer refused\n");
+            }
+        }
+        // The GraphQL websocket too: a real upgrade request, refused before the upgrade.
+        for peer in ["192.168.1.50:51000", "[2001:db8::1]:4000"] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/graphql/ws")
+                .header("host", "127.0.0.1:7788")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .header("sec-websocket-protocol", "graphql-transport-ws")
+                .body(Body::empty())
+                .unwrap();
+            let res = router(state.clone()).oneshot(with_peer(req, peer)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{peer} /graphql/ws");
+        }
+        for peer in ["127.0.0.1:51000", "[::1]:51000", "[::ffff:127.0.0.1]:51000"] {
+            let res = router(state.clone())
+                .oneshot(with_peer(agent_post("{ __typename }"), peer))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{peer}");
+        }
+    }
+
+    /// C-2-17: the peer guard allows a request with no `ConnectInfo`, which is safe only because
+    /// main.rs serves the host router through [`super::serve`]. A bare `axum::serve` there would
+    /// silently switch the guard off, so pin the wiring at the source.
+    #[test]
+    fn main_serves_through_host_serve() {
+        let main_rs = include_str!("../main.rs");
+        assert!(
+            main_rs.contains("host::serve(listener, app)"),
+            "main.rs must serve the host router through host::serve (it records the peer address)"
+        );
+        assert!(
+            !main_rs.contains("axum::serve("),
+            "main.rs serves through a bare axum::serve: the non-loopback peer guard would be off"
+        );
+    }
+
+    /// `serve` (what main.rs uses) records the peer, so the guard above has an address to judge.
+    /// Loopback only: binds 127.0.0.1:0 and talks to itself.
+    #[tokio::test]
+    async fn serve_records_the_peer_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = axum::Router::new().route(
+            "/peer",
+            axum::routing::get(|axum::extract::ConnectInfo(a): axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
+                format!("peer={}", a.ip())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(super::serve(listener, app));
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        conn.write_all(b"GET /peer HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut out = String::new();
+        conn.read_to_string(&mut out).await.unwrap();
+        server.abort();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(out.contains("peer=127.0.0.1"), "{out}");
     }
 
     // ── findings ledger mutations (master plan §6) ──

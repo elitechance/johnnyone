@@ -212,3 +212,22 @@ describe('act page: review round 2', () => {
     expect(usedCopy('answered')).toBe(ACT_COPY.answered);
   });
 });
+
+describe('act page: follow-ups round 1', () => {
+  it('C-1-1: an answer link whose agent session ended (archived) says so, on Confirm and on reuse', () => {
+    // The worker's `ended` code: the desktop refused with `ended: session … is archived`.
+    expect(viewFromResult({ ok: false, code: 'ended', summary: '' })).toEqual({
+      kind: 'used',
+      label: null,
+      message: "That agent's session has ended, so nothing was sent.",
+      outcome: 'ended',
+    });
+    expect(usedCopy('ended')).toBe("That agent's session had ended, so nothing was sent.");
+    expect(
+      viewFromPreview(
+        { state: 'used', act: 'answer', label: 'Yes', target: null, expiresAt: null, message: null, outcome: 'ended' },
+        0,
+      ),
+    ).toMatchObject({ kind: 'used', message: "That agent's session had ended, so nothing was sent." });
+  });
+});

@@ -34,6 +34,7 @@
 import {
   actionScope,
   describeTarget,
+  INVISIBLE_RE,
   validateActionArgs,
   validateLabel,
   type ActionArgs,
@@ -90,6 +91,7 @@ export type RejectCode =
   | 'uncertain'
   | 'restarted'
   | 'answered'
+  | 'ended'
   | 'failed';
 
 /** The user-facing copy for each outcome. Deliberately generic: it reveals nothing about why. */
@@ -102,11 +104,12 @@ export const ACTION_LINK_COPY: Record<RejectCode, string> = {
   restarted: 'J1 restarted since this link was made, so ask for a new link.',
   superseded: 'Another answer was already chosen.',
   answered: 'The agent already got an answer, so nothing was sent.',
+  ended: "That agent's session has ended, so nothing was sent.",
   failed: 'J1 could not do this. This link is now used up; open J1 to check what happened.',
 };
 
 /** How a used link ended, as the preview reports it (H-1-5). */
-export type UsedOutcome = 'done' | 'failed' | 'uncertain' | 'superseded' | 'answered' | 'pending';
+export type UsedOutcome = 'done' | 'failed' | 'uncertain' | 'superseded' | 'answered' | 'ended' | 'pending';
 
 export const USED_COPY: Record<UsedOutcome, string> = {
   done: 'Already done ✓',
@@ -114,6 +117,7 @@ export const USED_COPY: Record<UsedOutcome, string> = {
   uncertain: ACTION_LINK_COPY.uncertain,
   superseded: 'Another answer was already chosen.',
   answered: 'The agent already got an answer, so nothing was sent.',
+  ended: "That agent's session had ended, so nothing was sent.",
   pending: 'This link is being used right now; check J1 in a moment.',
 };
 
@@ -155,8 +159,9 @@ export interface RunResult {
 export class MintError extends Error {}
 
 const GROUP_RE = /^[A-Za-z0-9_-]{1,64}$/;
-// eslint-disable-next-line no-control-regex
 const TITLE_FORMAT_RE = /\p{Cf}/gu;
+const TITLE_INVISIBLE_RE = new RegExp(INVISIBLE_RE.source, 'gu');
+// eslint-disable-next-line no-control-regex
 const TITLE_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
 
 function parseArgs(raw: string): unknown {
@@ -225,7 +230,7 @@ function timeline(deps: ActionLinkDeps, link: Link, kind: string, reason: string
 
 function cleanTitle(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  const t = raw.replace(TITLE_CONTROL_RE, ' ').replace(TITLE_FORMAT_RE, '').trim();
+  const t = raw.replace(TITLE_CONTROL_RE, ' ').replace(TITLE_FORMAT_RE, '').replace(TITLE_INVISIBLE_RE, '').trim();
   return t ? [...t].slice(0, 120).join('') : null;
 }
 
@@ -386,8 +391,16 @@ async function usedOutcome(db: D1Database, jti: string): Promise<UsedOutcome | n
   const row = await db.prepare('SELECT status FROM action_link_redemptions WHERE jti = ?').bind(jti).first<{ status: string }>();
   if (!row) return null;
   switch (row.status) {
+    case 'failed': {
+      // An ended session is stored as 'failed' (the status CHECK predates it); the audit row's
+      // reason tells the two apart (C-1-1).
+      const ended = await db
+        .prepare(`SELECT 1 AS ok FROM action_link_events WHERE jti = ? AND kind = 'reject' AND reason = ?`)
+        .bind(jti, `redeem: ${ENDED_REASON}`)
+        .first<{ ok: number }>();
+      return ended ? 'ended' : 'failed';
+    }
     case 'done':
-    case 'failed':
     case 'uncertain':
     case 'superseded':
     case 'answered':
@@ -456,11 +469,16 @@ export async function previewActionLink(
   };
 }
 
+/** The audit reason of a redeem refused because the agent's session ended (C-1-1). */
+const ENDED_REASON = 'desktop_ended';
+
 /** Classify a relay failure. A timeout may still have acted, so it is `uncertain` (H-1-1). */
 export function relayFailureCode(message: string): RejectCode {
   if (/timed out|timeout/i.test(message)) return 'uncertain';
   if (/unknown_link/.test(message)) return 'restarted';
   if (/answered:/.test(message)) return 'answered';
+  // The host's `ended:` prefix (action_links.rs `ENDED`): the session ended since the mint.
+  if (/(^|\s)ended:/.test(message)) return 'ended';
   if (/No online backend app found|Desktop not connected/i.test(message)) return 'unavailable';
   return 'failed';
 }

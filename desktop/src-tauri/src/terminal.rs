@@ -810,19 +810,49 @@ async fn start_capture_loop(
 /// True when the session row is `archived`. A subscribe/refresh/input that races
 /// an archive must NOT re-create the tmux or flip the row back to `active` — that
 /// resurrection is why "closed" terminals reappeared after a refresh.
+///
+/// Fails CLOSED (G-3-35): a lookup error reads as archived (and is logged), so a broken DB
+/// can never resurrect a closed pane. A missing row is not an error here — it is not archived,
+/// and the caller's own config lookup refuses it next.
+#[cfg(test)]
 fn session_is_archived(state: &AppState, session_id: &str) -> bool {
-    state
-        .db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT status FROM sessions WHERE id = ?1",
-                params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|e| e.to_string())
-        })
-        .map(|status| status == "archived")
-        .unwrap_or(false)
+    session_archived_lookup(state, session_id).unwrap_or(true)
+}
+
+/// The refusal when the archived guard could not read the session's status (C-1-3): not
+/// "archived", which would be a guess, but a retryable failure.
+pub const SESSION_STATUS_UNKNOWN: &str = "Could not check this session's status. Try again.";
+
+/// The guard both `ensure_terminal_session*` paths run first: `Ok` only for a session known not
+/// to be archived. An archived row gets [`archived_refusal`]; a failed lookup (fail closed)
+/// gets [`SESSION_STATUS_UNKNOWN`].
+fn refuse_if_archived(state: &AppState, session_id: &str) -> Result<(), String> {
+    match session_archived_lookup(state, session_id) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(archived_refusal(state, session_id)),
+        Err(()) => Err(SESSION_STATUS_UNKNOWN.to_string()),
+    }
+}
+
+/// `Ok(archived?)`, or `Err(())` (logged) when the status could not be read.
+fn session_archived_lookup(state: &AppState, session_id: &str) -> Result<bool, ()> {
+    use rusqlite::OptionalExtension;
+    let status = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    });
+    match status {
+        Ok(status) => Ok(status.as_deref() == Some("archived")),
+        Err(error) => {
+            tracing::warn!(session_id, %error, "session status lookup failed; treating the session as archived");
+            Err(())
+        }
+    }
 }
 
 /// Plans tab, plan agent in tmux (D1, 2026-11-23): a plan's agent has a VISIBLE pane
@@ -966,9 +996,7 @@ async fn ensure_terminal_session_with(
     cols: u16,
     rows: u16,
 ) -> Result<TerminalSession, String> {
-    if session_is_archived(state, session_id) {
-        return Err(archived_refusal(state, session_id));
-    }
+    refuse_if_archived(state, session_id)?;
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
     let pane_exists = ops.has_session(&tmux_session_name).await;
@@ -1024,9 +1052,7 @@ async fn ensure_terminal_session_for_input_with(
     ops: &dyn PaneOps,
     session_id: &str,
 ) -> Result<TerminalSession, String> {
-    if session_is_archived(state, session_id) {
-        return Err(archived_refusal(state, session_id));
-    }
+    refuse_if_archived(state, session_id)?;
     let config = load_session_config(state, session_id)?;
     let (tmux_session_name, attached) = resolve_tmux_target(&config)?;
     plan_agent_pane_access(state, session_id, &tmux_session_name, true, true)?;
@@ -2000,6 +2026,37 @@ mod tests {
         let e = ensure_terminal_session_with(&state, &ops, &running, 120, 36).await.err().unwrap();
         assert!(e.contains("is archived; refusing to resurrect it"), "{e}");
         assert!(ops.created().is_empty());
+    }
+
+    /// G-3-35: the archived guard fails CLOSED. A status lookup that errors reads as archived, so
+    /// a broken DB never lets a subscribe/input re-create a closed pane; a missing row is still
+    /// "not archived" (the config lookup after it refuses that).
+    #[tokio::test]
+    async fn session_is_archived_fails_closed_on_a_db_error() {
+        let (state, _r) = crate::test_support::test_state();
+        let (running, _) = worker_of(&state, "phase_worker_running", "worker_running");
+        assert!(!session_is_archived(&state, &running));
+        assert!(!session_is_archived(&state, "no-such-session"));
+        crate::services::sessions::mark_session_archived(&state, &running).unwrap();
+        assert!(session_is_archived(&state, &running));
+        let (other, _) = worker_of(&state, "phase_worker_running", "worker_running");
+        // Break the lookup itself: the `status` column is gone, so the SELECT errors.
+        state
+            .db
+            .with_conn(|conn| {
+                conn.execute_batch("ALTER TABLE sessions RENAME COLUMN status TO status_broken")
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(session_is_archived(&state, &other), "a DB error must read as archived");
+        let ops = FakeOps::new(false);
+        // C-1-3: refused with a retryable "could not check", not a false "is archived".
+        let e = ensure_terminal_session_with(&state, &ops, &other, 120, 36).await.err().unwrap();
+        assert_eq!(e, "Could not check this session's status. Try again.");
+        assert_eq!(e, SESSION_STATUS_UNKNOWN);
+        let e = ensure_terminal_session_for_input_with(&state, &ops, &other).await.err().unwrap();
+        assert_eq!(e, SESSION_STATUS_UNKNOWN);
+        assert!(ops.created().is_empty(), "a pane was created despite the failed lookup");
     }
 
     #[test]
