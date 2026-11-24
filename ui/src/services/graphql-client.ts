@@ -2,6 +2,7 @@ import { Injectable, InjectionToken, inject } from '@angular/core';
 import { Observable, from } from 'rxjs';
 import { switchMap } from 'rxjs/operators';
 import {
+  CLIENT_CLOSE_CODE,
   KEEPALIVE_MS,
   RECONNECT_STABLE_MS,
   SubscriptionClosedError,
@@ -144,7 +145,8 @@ export class GraphQLClient {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ id: operationId, type: 'complete' }));
         }
-        socket.close();
+        // A clean, explicit close (hotfix live-chat-2): never left to drop with a 1006.
+        socket.close(CLIENT_CLOSE_CODE, 'complete');
       };
 
       /** An auth failure refreshes the token and reconnects once; anything else ends the stream. */

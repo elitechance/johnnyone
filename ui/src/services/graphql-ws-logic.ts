@@ -53,7 +53,12 @@ export class SubscriptionClosedError extends Error {
 // answers `pong`) and reconnects a dropped — not refused — socket with a bounded backoff.
 
 /** Client `ping` interval while a subscription socket is open (below Cloudflare's ~100 s idle cut). */
-export const KEEPALIVE_MS = 25_000;
+// Hotfix live-chat-2: the live test saw delta sockets drop with 1006 ~20 s after opening, before a
+// 25 s ping ever went out; ping well inside that.
+export const KEEPALIVE_MS = 10_000;
+
+/** The close code the client uses when IT ends a subscription (a clean close, not a 1005/1006). */
+export const CLIENT_CLOSE_CODE = 1000;
 /** Reconnect attempts in a row before the error surfaces (the chat then settles from the store). */
 export const RECONNECT_MAX_ATTEMPTS = 5;
 /** A connection that stayed up this long resets the attempt count. */

@@ -131,6 +131,13 @@ export function turnAnsweredInStore(stored: readonly AiMessage[], turn: PendingT
 /** Poll cadence and give-up time for the fallback. */
 export const TURN_FALLBACK_POLL_MS = 3_000;
 export const TURN_FALLBACK_MAX_MS = 10 * 60_000;
+/**
+ * Live-silence watchdog (hotfix live-chat-2): a turn in flight that hears NOTHING live (no delta,
+ * no final message) for this long is settled from the store too. The fallback used to start only
+ * on a subscription ERROR; with healthy-looking sockets that never deliver, the page sat on
+ * "Waiting for the plan agent…" for minutes. Re-armed by every live event.
+ */
+export const TURN_LIVE_SILENCE_MS = 8_000;
 
 /**
  * Is the latest turn's reply already in the list as a STORED row (L-1-5)? True when an assistant row
