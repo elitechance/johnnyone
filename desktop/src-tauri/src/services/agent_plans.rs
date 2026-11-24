@@ -4110,10 +4110,12 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
     enter_phase_review(state, &run.plan.id, &phase).await
 }
 
-/// Ready gate (F2): every open / reopened BLOCKING finding must be claimed or waived before the
-/// phase goes back to review. Records `agent_finding_nudge {reason:"unclaimed_blocking", ids}`, then
-/// bounces through the shared `bounce_ready_or_escalate` under a `*ready_rejected*` type, so the
-/// shared `MAX_READY_BOUNCES` cap counts it. Returns true when the ready was bounced.
+/// Ready gate: every open / reopened BLOCKING finding must be answered — claimed, waiver proposed or
+/// disputed — before the phase goes back to review. Records
+/// `agent_finding_ready_refused {unanswered:[ids]}`, then bounces through the shared
+/// `bounce_ready_or_escalate` under a `*ready_rejected*` type, so the shared `MAX_READY_BOUNCES` cap
+/// counts it. The nudge is code-built: the unanswered ids plus the exact call templates. Returns
+/// true when the ready was refused.
 async fn unclaimed_findings_ready_gate(
     state: &AppState,
     run: &AgentPlanRun,
@@ -4131,8 +4133,8 @@ async fn unclaimed_findings_ready_gate(
         state,
         &run.plan.id,
         Some(&phase.phase_id),
-        "agent_finding_nudge",
-        json!({ "reason": "unclaimed_blocking", "ids": ids, "sessionId": session_id }),
+        "agent_finding_ready_refused",
+        json!({ "unanswered": ids, "ids": ids, "sessionId": session_id }),
     )?;
     let last = findings::last_rejection(state, &run.plan.id, session_id);
     let text = findings::worker_nudge_text(&ids, session_id, last.as_deref());
@@ -4722,6 +4724,9 @@ pub(crate) struct ReplanCtrl<'a> {
     /// Test seam (F2): when set, worker feedback / nudge text is pushed here instead of being
     /// typed into a tmux session, and no worker session is created.
     pub worker_sink: Option<&'a std::sync::Mutex<Vec<String>>>,
+    /// Test seam: when set, each review round's digest line is pushed here instead of being posted
+    /// to Discord (`notify_discord`). Live (`None`) posts it when a webhook is configured.
+    pub digest_sink: Option<&'a std::sync::Mutex<Vec<String>>>,
 }
 
 impl ReplanCtrl<'static> {
@@ -4734,6 +4739,7 @@ impl ReplanCtrl<'static> {
             skip_execute: false,
             spawn_log: None,
             worker_sink: None,
+            digest_sink: None,
         }
     }
 }
@@ -7280,11 +7286,18 @@ pub(crate) async fn conclude_review_round_with(
         .filter(|f| f.severity == "blocking" && f.state_enum().map_or(false, |s| s.is_unresolved()))
         .map(|f| format!("{}: {}", f.id, f.claim.split_whitespace().collect::<Vec<_>>().join(" ")))
         .collect();
+    let (red_first, claims) = findings::red_first_ratio(&rows);
     let summary = format!(
-        "{}-lens review — {}",
+        "{}-lens review — {} · red-first {red_first}/{claims}",
         verdicts.len(),
         verdicts.iter().map(|(l, v)| format!("{l}: {v}")).collect::<Vec<_>>().join(", ")
     );
+    // The round digest: one code-built line from the ledger, recorded and posted every round,
+    // whatever the gate routes to next. A failure here never fails the round.
+    match findings::record_round_digest(state, plan_id, &run.plan.title, phase_id, round, gate.as_verdict()) {
+        Ok(digest) => post_round_digest(state, plan_id, &digest.line(), ctrl),
+        Err(e) => tracing::warn!(plan_id, phase_id, error = %e, "round digest not recorded"),
+    }
     let review = ReviewInsights {
         summary: Some(summary.clone()),
         reason: open_lines.first().cloned().or_else(|| Some(summary.clone())),
@@ -7349,6 +7362,19 @@ pub(crate) async fn conclude_review_round_with(
             send_ledger_feedback_with(state, run, phase, round, notes, ctrl).await
         }
     }
+}
+
+/// Post a round digest line: to `ctrl.digest_sink` in tests, else to Discord through
+/// `notify_discord` (a no-op without a webhook). Fire-and-forget, like `maybe_notify_discord`.
+fn post_round_digest(state: &AppState, plan_id: &str, line: &str, ctrl: &ReplanCtrl<'_>) {
+    if let Some(sink) = ctrl.digest_sink {
+        sink.lock().unwrap().push(line.to_string());
+        return;
+    }
+    let (state, plan_id, headline) = (state.clone(), plan_id.to_string(), format!("📊 {line}"));
+    tokio::spawn(async move {
+        notify_discord(&state, &plan_id, "info", &headline, "").await;
+    });
 }
 
 fn consecutive_non_pass_phase_rounds_in(events: &[AgentPlanEvent], phase_id: &str) -> i64 {
@@ -11917,6 +11943,11 @@ pub(crate) fn event_category(event_type: &str) -> &'static str {
         | "agent_finding_forced_followup"
         | "agent_finding_legacy_import"
         | "agent_finding_nudge"
+        | "agent_finding_disputed"
+        | "agent_finding_upheld"
+        | "agent_finding_withdrawn"
+        | "agent_finding_ready_refused"
+        | "agent_review_round_digest"
         | "agent_phase_ready_rejected_unclaimed_findings"
         | "agent_finding_call_rejected"
         | "agent_lens_verdict_mismatch"
@@ -12218,7 +12249,8 @@ pub(crate) fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value)
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
         t if t.starts_with("agent_finding_")
             || t == "agent_phase_ready_rejected_unclaimed_findings"
-            || t == "agent_lens_verdict_mismatch" =>
+            || t == "agent_lens_verdict_mismatch"
+            || t == "agent_review_round_digest" =>
         {
             finding_event_summary(t, payload).unwrap_or_else(|| humanize_event_type(t))
         }
@@ -12263,6 +12295,20 @@ fn finding_event_summary(event_type: &str, payload: &serde_json::Value) -> Optio
         "agent_finding_reopened" => format!("Finding {id} reopened{in_round}"),
         "agent_finding_escalated" => format!("Finding {id} escalated — same failure seen twice{in_round}"),
         "agent_finding_carried" => format!("Finding {id} carried as a follow-up"),
+        "agent_finding_disputed" => format!("Finding {id} disputed by the worker{in_round}"),
+        "agent_finding_upheld" => format!("Finding {id} upheld by {lens} — dispute rejected{in_round}"),
+        "agent_finding_withdrawn" => format!("Finding {id} withdrawn by {lens}{in_round}"),
+        "agent_finding_ready_refused" => {
+            let unanswered = payload
+                .get("unanswered")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or(ids.clone());
+            format!("Ready refused — unanswered findings {unanswered}")
+        }
+        "agent_review_round_digest" => {
+            payload_str(payload, "line").map(|l| format!("Round digest: {l}")).unwrap_or_else(|| "Round digest".into())
+        }
         "agent_finding_forced_followup" => {
             format!("Finding {id} from {lens} stored as a follow-up{in_round}")
         }
@@ -18596,6 +18642,7 @@ mod replan_tests {
             skip_execute: true,
             spawn_log: Some(spawn_log),
             worker_sink: None,
+            digest_sink: None,
         }
     }
 
@@ -21083,6 +21130,8 @@ mod ledger_loop_tests {
         state: AppState,
         plan: PathBuf,
         id: String,
+        /// Digest lines `conclude_review_round_with` would have posted to Discord (the seam).
+        digests: Mutex<Vec<String>>,
     }
 
     /// A claude-worker (non-kloo) development plan with one phase `00-x`, single-phase mode,
@@ -21133,7 +21182,7 @@ mod ledger_loop_tests {
         register_review_session(&state, &id, PR, "pr").unwrap();
         append_event(&state, &id, Some("00-x"), "agent_phase_started", json!({})).unwrap();
         append_event(&state, &id, Some("00-x"), "agent_phase_review_started", json!({})).unwrap();
-        Fx { state, plan, id }
+        Fx { state, plan, id, digests: Mutex::new(Vec::new()) }
     }
 
     impl Fx {
@@ -21179,7 +21228,7 @@ mod ledger_loop_tests {
             ledger::claim_fix(&self.state, W, id, "fixed it; cargo test x passes").unwrap();
         }
         async fn conclude(&self, reports: Vec<(&str, AgentReport)>, lenses: &[ValidationLens], sink: &Mutex<Vec<String>>) {
-            let ctrl = sink_ctrl(sink);
+            let ctrl = ReplanCtrl { digest_sink: Some(&self.digests), ..sink_ctrl(sink) };
             let reports = reports.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
             conclude_review_round_with(&self.state, &self.run(), &self.phase(), reports, lenses, &ctrl)
                 .await
@@ -21196,6 +21245,7 @@ mod ledger_loop_tests {
             skip_execute: true,
             spawn_log: None,
             worker_sink: Some(sink),
+            digest_sink: None,
         }
     }
 
@@ -21434,12 +21484,16 @@ mod ledger_loop_tests {
         let sink = Mutex::new(Vec::new());
         let bounced = unclaimed_findings_ready_gate(&f.state, &f.run(), W, &f.phase(), Some(&sink)).await.unwrap();
         assert!(bounced);
-        let nudge = f.events("agent_finding_nudge");
-        assert_eq!((nudge[0]["reason"].as_str(), nudge[0]["ids"][0].as_str()), (Some("unclaimed_blocking"), Some(id.as_str())));
+        let refused = f.events("agent_finding_ready_refused");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["unanswered"], json!([id]));
+        assert!(f.events("agent_finding_nudge").is_empty(), "the ready refusal has its own event");
         assert_eq!(f.events("agent_phase_ready_rejected_unclaimed_findings").len(), 1);
         let sent = sink.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains(&id) && sent[0].contains("claimFix("), "{}", sent[0]);
+        for call in ["claimFix(", "proposeWaiver(", "disputeFinding("] {
+            assert!(sent[0].contains(&id) && sent[0].contains(call), "{call}: {}", sent[0]);
+        }
         drop(sent);
         // Once claimed, the gate lets the ready through.
         f.claim(&id);

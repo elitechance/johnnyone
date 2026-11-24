@@ -38,6 +38,7 @@ const MIGRATION_028: &str = include_str!("../../migrations/028_add_watchdog_held
 const MIGRATION_029: &str = include_str!("../../migrations/029_add_watchdog_triggers.sql");
 const MIGRATION_030: &str = include_str!("../../migrations/030_add_plan_findings.sql");
 const MIGRATION_031: &str = include_str!("../../migrations/031_add_brief_versions.sql");
+const MIGRATION_032: &str = include_str!("../../migrations/032_findings_dispute_red_first.sql");
 
 /// Map an execution `status` to the initiative `health` axis. The SQL health seeding in
 /// `BACKFILL_017` and this fn must agree (pinned by `health_from_status_maps_all_axes`).
@@ -116,6 +117,7 @@ fn run_migrations_through(conn: &Connection, max_version: i64) -> Result<(), Str
         (29, "029_add_watchdog_triggers", MIGRATION_029),
         (30, "030_add_plan_findings", MIGRATION_030),
         (31, "031_add_brief_versions", MIGRATION_031),
+        (32, "032_findings_dispute_red_first", MIGRATION_032),
     ];
 
     // Guard the shared version namespace. Versions are hand-assigned integers, and branches that
@@ -246,8 +248,8 @@ mod tests {
     fn migration_030_creates_plan_findings() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        run_migrations(&conn).expect("first run_migrations");
-        run_migrations(&conn).expect("second run_migrations (idempotent)");
+        run_migrations_through(&conn, 30).expect("first run_migrations");
+        run_migrations_through(&conn, 30).expect("second run_migrations (idempotent)");
 
         assert_eq!(
             column_names(&conn, "plan_findings"),
@@ -535,7 +537,7 @@ mod tests {
             "a 030 DB must not have the 031 columns yet"
         );
         insert_legacy_row(&conn, "keep", "planning", "draft");
-        run_migrations(&conn).expect("upgrade 030 → 031");
+        run_migrations_through(&conn, 31).expect("upgrade 030 → 031");
         let max: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
@@ -550,5 +552,68 @@ mod tests {
         assert_eq!(title, "t", "the pre-existing row survives the upgrade");
         assert_eq!(accepted, None);
         assert_eq!(queued, None);
+    }
+
+    #[test]
+    fn migration_032_rebuilds_plan_findings_keeping_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run_migrations_through(&conn, 31).expect("migrate to 031");
+        insert_legacy_row(&conn, "p1", "development", "phase_review_running");
+        conn.execute(
+            "INSERT INTO plan_findings
+                (plan_id, id, phase_id, lens, severity, state, round_opened, round_updated, claim, evidence, reopen_count, last_saw)
+             VALUES ('p1', 'F-00-x-1', '00-x', 'qa', 'blocking', 'claimed', 1, 2, 'c', 'ev', 1, 'saw1')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO plan_findings (plan_id, id, phase_id, lens, severity, state, round_opened, round_updated, claim)
+                 VALUES ('p1', 'F-00-x-2', '00-x', 'qa', 'blocking', 'disputed', 1, 1, 'c')",
+                [],
+            )
+            .is_err(),
+            "a 031 DB must refuse 'disputed'"
+        );
+        run_migrations(&conn).expect("upgrade 031 → 032");
+        run_migrations(&conn).expect("idempotent");
+        let cols = column_names(&conn, "plan_findings");
+        for c in ["claim_test", "broke_what", "red_output", "red_first", "dispute_reason"] {
+            assert!(cols.iter().any(|x| x == c), "missing {c}: {cols:?}");
+        }
+        let (state, evidence, reopen, last, red): (String, String, i64, String, Option<i64>) = conn
+            .query_row(
+                "SELECT state, evidence, reopen_count, last_saw, red_first FROM plan_findings WHERE id='F-00-x-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), evidence.as_str(), reopen, last.as_str(), red), ("claimed", "ev", 1, "saw1", None));
+        let insert = |id: &str, state: &str| {
+            conn.execute(
+                "INSERT INTO plan_findings (plan_id, id, phase_id, lens, severity, state, round_opened, round_updated, claim)
+                 VALUES ('p1', ?1, '00-x', 'qa', 'blocking', ?2, 1, 1, 'c')",
+                params![id, state],
+            )
+        };
+        insert("F-00-x-2", "disputed").expect("disputed is a legal state now");
+        insert("F-00-x-3", "withdrawn").expect("withdrawn is a legal state now");
+        assert!(insert("F-00-x-4", "bogus").is_err(), "the CHECK still rejects unknown states");
+        assert!(
+            conn.execute("UPDATE plan_findings SET red_first = 2 WHERE id='F-00-x-1'", []).is_err(),
+            "red_first is 0/1/NULL"
+        );
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_plan_findings_phase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        conn.execute("DELETE FROM agent_plans WHERE id='p1'", []).unwrap();
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM plan_findings", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "the rebuilt table keeps ON DELETE CASCADE");
     }
 }

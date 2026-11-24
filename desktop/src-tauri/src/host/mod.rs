@@ -281,13 +281,17 @@ impl From<FindingSeverity> for findings_service::Severity {
     }
 }
 
-/// A lens's decision on a claimed fix or a proposed waiver.
+/// A lens's decision on a claimed fix, a proposed waiver or a dispute.
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
 enum FindingOutcome {
     Verified,
     Reopened,
     AcceptWaiver,
     RejectWaiver,
+    /// The disputed finding stands: back to open with the lens's `saw`.
+    Uphold,
+    /// The disputed finding is withdrawn (terminal, not blocking).
+    Withdraw,
 }
 
 impl From<FindingOutcome> for findings_service::Outcome {
@@ -297,6 +301,8 @@ impl From<FindingOutcome> for findings_service::Outcome {
             FindingOutcome::Reopened => findings_service::Outcome::Reopened,
             FindingOutcome::AcceptWaiver => findings_service::Outcome::AcceptWaiver,
             FindingOutcome::RejectWaiver => findings_service::Outcome::RejectWaiver,
+            FindingOutcome::Uphold => findings_service::Outcome::Uphold,
+            FindingOutcome::Withdraw => findings_service::Outcome::Withdraw,
         }
     }
 }
@@ -393,16 +399,44 @@ impl MutationRoot {
 
     /// Findings ledger (phase worker only): claim a blocking finding of the current phase is
     /// fixed, with the evidence (what changed + the command that proves it). Call it before
-    /// `reportAgentResult(kind:"ready")`.
+    /// `reportAgentResult(kind:"ready")`. Red-first proof (optional, encouraged): `test` (the test
+    /// that proves the fix), `brokeWhat` (the line broken to watch it fail) and `redOutput` (its
+    /// failing output; sanitized, kept to 2 KB). Without `test` AND `redOutput` the claim is
+    /// recorded `red_first: false`.
+    #[allow(clippy::too_many_arguments)]
     async fn claim_fix(
         &self,
         ctx: &Context<'_>,
         session_id: String,
         finding_id: String,
         evidence: String,
+        test: Option<String>,
+        broke_what: Option<String>,
+        red_output: Option<String>,
     ) -> async_graphql::Result<bool> {
         let state = ctx.data_unchecked::<AppState>();
-        findings_service::claim_fix(state, &session_id, &finding_id, &evidence)
+        let proof = findings_service::RedFirstInput {
+            test: test.as_deref(),
+            broke_what: broke_what.as_deref(),
+            red_output: red_output.as_deref(),
+        };
+        findings_service::claim_fix_with_proof(state, &session_id, &finding_id, &evidence, proof)
+            .map_err(async_graphql::Error::new)?;
+        Ok(true)
+    }
+
+    /// Findings ledger (phase worker only): dispute a blocking finding of the current phase — it
+    /// is wrong — with the reason and its evidence. The filing lens must rule on it next round:
+    /// `resolveFinding(outcome: UPHOLD | WITHDRAW)`.
+    async fn dispute_finding(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        finding_id: String,
+        reason: String,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::dispute_finding(state, &session_id, &finding_id, &reason)
             .map_err(async_graphql::Error::new)?;
         Ok(true)
     }
@@ -422,9 +456,9 @@ impl MutationRoot {
         Ok(true)
     }
 
-    /// Findings ledger (the filing lens only): VERIFIED / REOPENED a claimed fix, or
-    /// ACCEPT_WAIVER / REJECT_WAIVER a proposed waiver. REOPENED and REJECT_WAIVER need `saw`
-    /// (the command and output line you observed this round).
+    /// Findings ledger (the filing lens only): VERIFIED / REOPENED a claimed fix,
+    /// ACCEPT_WAIVER / REJECT_WAIVER a proposed waiver, or UPHOLD / WITHDRAW a dispute. REOPENED,
+    /// REJECT_WAIVER and UPHOLD need `saw` (the command and output line you observed this round).
     async fn resolve_finding(
         &self,
         ctx: &Context<'_>,
@@ -1564,7 +1598,8 @@ mod router_tests {
         let sdl = super::schema_sdl();
         for needle in [
             "reportFinding(sessionId: String!, severity: FindingSeverity!, claim: String!, expected: String!, saw: String!, where: String!, fence: String!): String!",
-            "claimFix(sessionId: String!, findingId: String!, evidence: String!): Boolean!",
+            "claimFix(sessionId: String!, findingId: String!, evidence: String!, test: String, brokeWhat: String, redOutput: String): Boolean!",
+            "disputeFinding(sessionId: String!, findingId: String!, reason: String!): Boolean!",
             "proposeWaiver(sessionId: String!, findingId: String!, reason: String!): Boolean!",
             "resolveFinding(sessionId: String!, findingId: String!, outcome: FindingOutcome!, saw: String): Boolean!",
             "overrideFinding(planId: String!, findingId: String!, action: FindingOverride!, reason: String!): Boolean!",
@@ -1573,6 +1608,8 @@ mod router_tests {
             "enum FindingOverride",
             "ACCEPT_WAIVER",
             "REJECT_WAIVER",
+            "UPHOLD",
+            "WITHDRAW",
             "reportAgentResult(",
         ] {
             assert!(sdl.contains(needle), "SDL missing {needle:?}:\n{sdl}");

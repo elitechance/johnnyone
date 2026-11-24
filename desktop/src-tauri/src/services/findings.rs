@@ -37,10 +37,15 @@ pub enum FindingState {
     WaiveProposed,
     Escalated,
     Carried,
+    /// The worker disagrees with the finding (`disputeFinding`); the filing lens rules on it next
+    /// round with UPHOLD (back to `open`) or WITHDRAW.
+    Disputed,
+    /// The filing lens withdrew the finding after a dispute. Terminal; never blocks the phase.
+    Withdrawn,
 }
 
 impl FindingState {
-    pub const ALL: [FindingState; 8] = [
+    pub const ALL: [FindingState; 10] = [
         FindingState::Open,
         FindingState::Claimed,
         FindingState::Verified,
@@ -49,6 +54,8 @@ impl FindingState {
         FindingState::WaiveProposed,
         FindingState::Escalated,
         FindingState::Carried,
+        FindingState::Disputed,
+        FindingState::Withdrawn,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -61,6 +68,8 @@ impl FindingState {
             FindingState::WaiveProposed => "waive_proposed",
             FindingState::Escalated => "escalated",
             FindingState::Carried => "carried",
+            FindingState::Disputed => "disputed",
+            FindingState::Withdrawn => "withdrawn",
         }
     }
 
@@ -68,7 +77,8 @@ impl FindingState {
         FindingState::ALL.into_iter().find(|st| st.as_str() == s)
     }
 
-    /// Still needs work or a decision: the states that keep a blocking finding from passing.
+    /// Still needs work or a decision: the states that keep a blocking finding from passing. A
+    /// `disputed` finding waits on the lens's ruling, so it still blocks until UPHOLD / WITHDRAW.
     pub fn is_unresolved(self) -> bool {
         matches!(
             self,
@@ -76,6 +86,7 @@ impl FindingState {
                 | FindingState::Reopened
                 | FindingState::Claimed
                 | FindingState::WaiveProposed
+                | FindingState::Disputed
         )
     }
 }
@@ -124,10 +135,16 @@ pub enum Action {
     HumanAcceptWaiver,
     HumanRejectWaiver,
     HumanReopen,
+    /// Worker: "this finding is wrong" (`disputeFinding`).
+    Dispute,
+    /// Lens: the dispute is rejected; the finding is open again with the lens's SAW.
+    Uphold,
+    /// Lens: the dispute is accepted; the finding is withdrawn.
+    Withdraw,
 }
 
 impl Action {
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 14] = [
         Action::Claim,
         Action::ProposeWaiver,
         Action::Verify,
@@ -139,6 +156,9 @@ impl Action {
         Action::HumanAcceptWaiver,
         Action::HumanRejectWaiver,
         Action::HumanReopen,
+        Action::Dispute,
+        Action::Uphold,
+        Action::Withdraw,
     ];
 
     pub fn name(self) -> &'static str {
@@ -154,6 +174,9 @@ impl Action {
             Action::HumanAcceptWaiver => "HumanAcceptWaiver",
             Action::HumanRejectWaiver => "HumanRejectWaiver",
             Action::HumanReopen => "HumanReopen",
+            Action::Dispute => "Dispute",
+            Action::Uphold => "Uphold",
+            Action::Withdraw => "Withdraw",
         }
     }
 }
@@ -175,7 +198,9 @@ impl std::error::Error for Reject {}
 
 // ───────────────────────── the state machine ─────────────────────────
 
-/// THE edge table (overview §4.1): `(from, action, to)`. 16 edges. [`legal_actions`] and
+/// THE edge table (overview §4.1): `(from, action, to)`. 20 edges: the 16 of the ledger (#74) plus
+/// the dispute path — the worker disputes an open / reopened finding, the filing lens upholds it
+/// (back to `open`) or withdraws it (`withdrawn`, terminal: no edge leaves it). [`legal_actions`] and
 /// [`transition`] both read it, so the reject text can never name an edge that does not exist.
 const EDGES: &[(FindingState, Action, FindingState)] = {
     use Action::*;
@@ -197,6 +222,10 @@ const EDGES: &[(FindingState, Action, FindingState)] = {
         (Waived, HumanReopen, Reopened),
         (Escalated, HumanReopen, Reopened),
         (Escalated, HumanAcceptWaiver, Waived),
+        (Open, Dispute, Disputed),
+        (Reopened, Dispute, Disputed),
+        (Disputed, Uphold, Open),
+        (Disputed, Withdraw, Withdrawn),
     ]
 };
 
@@ -261,6 +290,16 @@ pub struct Finding {
     pub last_saw: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// The latest claim's red-first proof (migration 032): the test named as proof, what was broken
+    /// to see it fail, and the failing output (sanitized, at most [`MAX_RED_OUTPUT_BYTES`]).
+    pub claim_test: Option<String>,
+    pub broke_what: Option<String>,
+    pub red_output: Option<String>,
+    /// `Some(true)`: the latest claim carries a test AND its red output. `Some(false)`: claimed
+    /// without that proof. `None`: never claimed.
+    pub red_first: Option<bool>,
+    /// The worker's reason for the latest dispute.
+    pub dispute_reason: Option<String>,
 }
 
 impl Finding {
@@ -306,13 +345,18 @@ impl Finding {
             last_saw: row.get(16)?,
             created_at: row.get(17)?,
             updated_at: row.get(18)?,
+            claim_test: row.get(19)?,
+            broke_what: row.get(20)?,
+            red_output: row.get(21)?,
+            red_first: row.get::<_, Option<i64>>(22)?.map(|v| v != 0),
+            dispute_reason: row.get(23)?,
         })
     }
 }
 
 const SELECT_COLUMNS: &str = "plan_id, id, phase_id, lens, severity, state, round_opened, \
     round_updated, claim, expected, saw, where_, fence, evidence, waive_reason, reopen_count, \
-    last_saw, created_at, updated_at";
+    last_saw, created_at, updated_at, claim_test, broke_what, red_output, red_first, dispute_reason";
 
 fn id_seq(id: &str, phase_id: &str) -> Option<i64> {
     id.strip_prefix(&format!("F-{phase_id}-"))?.parse().ok()
@@ -334,6 +378,22 @@ pub struct NewFinding {
     pub fence: String,
 }
 
+/// A claim's red-first proof, as `claimFix` received it (already trimmed / sanitized).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedFirst {
+    pub test: Option<String>,
+    pub broke_what: Option<String>,
+    pub red_output: Option<String>,
+}
+
+impl RedFirst {
+    /// Red-first proof is a named test AND the output seen when it failed. A test without its red
+    /// output is accepted, but it is not proof that the test can fail.
+    pub fn is_proof(&self) -> bool {
+        self.test.is_some() && self.red_output.is_some()
+    }
+}
+
 /// The per-call inputs of [`apply`]. Only the fields the action uses are read.
 #[derive(Debug, Clone, Default)]
 pub struct ActionInput {
@@ -346,6 +406,8 @@ pub struct ActionInput {
     pub reason: Option<String>,
     /// Who acted: `worker`, `lens:<name>`, `coordinator`, `human`. Goes into the event payload.
     pub actor: String,
+    /// Claim only: the red-first proof. `None` is a claim without any (marked `red_first: false`).
+    pub red_first: Option<RedFirst>,
 }
 
 /// Why [`apply`] failed: an illegal transition (the [`Reject`] text, verbatim) or a store error.
@@ -521,7 +583,17 @@ pub fn apply(
             next.state = to.as_str().to_string();
             next.round_updated = input.round;
             match action {
-                Action::Claim => next.evidence = input.evidence.clone(),
+                Action::Claim => {
+                    next.evidence = input.evidence.clone();
+                    let proof = input.red_first.clone().unwrap_or_default();
+                    next.red_first = Some(proof.is_proof());
+                    next.claim_test = proof.test;
+                    next.broke_what = proof.broke_what;
+                    next.red_output = proof.red_output;
+                }
+                Action::Dispute => next.dispute_reason = input.reason.clone(),
+                // The lens rejected the dispute: the finding is open again with what the lens saw.
+                Action::Uphold => next.last_saw = input.saw.clone().or_else(|| next.last_saw.clone()),
                 Action::ProposeWaiver | Action::AcceptWaiver | Action::HumanAcceptWaiver => {
                     if input.reason.is_some() {
                         next.waive_reason = input.reason.clone();
@@ -531,13 +603,15 @@ pub fn apply(
                     next.reopen_count += 1;
                     next.last_saw = input.saw.clone().or_else(|| input.reason.clone());
                 }
-                Action::Verify | Action::Escalate | Action::Carry | Action::HumanReopen => {}
+                Action::Verify | Action::Escalate | Action::Carry | Action::HumanReopen | Action::Withdraw => {}
             }
             // The ONLY statement in the engine that writes `plan_findings.state`.
             tx.execute(
                 "UPDATE plan_findings
                     SET state = ?3, round_updated = ?4, evidence = ?5, waive_reason = ?6,
-                        reopen_count = ?7, last_saw = ?8, updated_at = datetime('now')
+                        reopen_count = ?7, last_saw = ?8, claim_test = ?9, broke_what = ?10,
+                        red_output = ?11, red_first = ?12, dispute_reason = ?13,
+                        updated_at = datetime('now')
                   WHERE plan_id = ?1 AND id = ?2",
                 params![
                     plan_id,
@@ -547,7 +621,12 @@ pub fn apply(
                     next.evidence,
                     next.waive_reason,
                     next.reopen_count,
-                    next.last_saw
+                    next.last_saw,
+                    next.claim_test,
+                    next.broke_what,
+                    next.red_output,
+                    next.red_first.map(i64::from),
+                    next.dispute_reason
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -584,18 +663,32 @@ pub fn apply(
         obj.insert("reopenCount".into(), after.reopen_count.into());
         obj.insert("saw".into(), after.last_saw.clone().into());
     }
+    if action == Action::Claim {
+        obj.insert("redFirst".into(), after.red_first.unwrap_or(false).into());
+        obj.insert("test".into(), after.claim_test.clone().into());
+        obj.insert("brokeWhat".into(), after.broke_what.clone().into());
+        obj.insert("redOutput".into(), after.red_output.clone().into());
+    }
+    if action == Action::Uphold {
+        obj.insert("saw".into(), after.last_saw.clone().into());
+    }
     if let Some(reason) = &input.reason {
         obj.entry("reason").or_insert_with(|| reason.clone().into());
     }
-    super::agent_plans::append_event(
-        state,
-        plan_id,
-        Some(&after.phase_id),
-        &format!("agent_finding_{}", after.state),
-        payload,
-    )?;
+    super::agent_plans::append_event(state, plan_id, Some(&after.phase_id), &event_type_for(action, &after), payload)?;
     refresh_mirrors(state, plan_id, &after.phase_id, action == Action::Carry);
     Ok(after)
+}
+
+/// The event an applied action records: `agent_finding_<new state>`, except an UPHOLD, which lands
+/// in `open` but is recorded as `agent_finding_upheld` so it is never confused with a new finding
+/// (`agent_finding_opened`).
+fn event_type_for(action: Action, after: &Finding) -> String {
+    if action == Action::Uphold {
+        "agent_finding_upheld".to_string()
+    } else {
+        format!("agent_finding_{}", after.state)
+    }
 }
 
 // ────────────────────────────── mirrors ──────────────────────────────
@@ -733,6 +826,9 @@ pub fn rejected_claims(events: &[AgentPlanEvent], finding_id: &str) -> Vec<(Stri
                     .unwrap_or("");
                 pending = Some(format!("waiver: {reason}"));
             }
+            "agent_finding_disputed" => pending = Some(format!("dispute: {}", s("reason"))),
+            // The lens upheld the finding: the dispute is a dead end, paired with the lens's SAW.
+            "agent_finding_upheld" => out.push((pending.take().unwrap_or_default(), s("saw"))),
             "agent_finding_reopened" => {
                 let from = s("from");
                 if from == "claimed" || from == "waive_proposed" {
@@ -983,17 +1079,19 @@ pub fn verdict_mismatches(rows: &[Finding], verdicts: &[(String, String)]) -> Ve
         .collect()
 }
 
-/// Blocking findings the worker has not acted on (open / reopened): the worker nudge list.
+/// Blocking findings the worker has not answered (open / reopened: no claim, no waiver proposal, no
+/// dispute): the ready gate's refusal list and the worker nudge list.
 pub fn unclaimed_blocking(rows: &[Finding]) -> Vec<&Finding> {
     rows.iter()
         .filter(|r| r.is_blocking() && matches!(r.state.as_str(), "open" | "reopened"))
         .collect()
 }
 
-/// Findings filed by `lens` that wait on that lens (claimed / waive_proposed): the lens nudge list.
+/// Findings filed by `lens` that wait on that lens (claimed / waive_proposed / disputed): the lens
+/// nudge list. A disputed finding must be ruled on (UPHOLD / WITHDRAW) before the verdict.
 pub fn unresolved_for_lens<'a>(rows: &'a [Finding], lens: &str) -> Vec<&'a Finding> {
     rows.iter()
-        .filter(|r| r.lens == lens && matches!(r.state.as_str(), "claimed" | "waive_proposed"))
+        .filter(|r| r.lens == lens && matches!(r.state.as_str(), "claimed" | "waive_proposed" | "disputed"))
         .collect()
 }
 
@@ -1014,6 +1112,10 @@ pub enum Outcome {
     Reopened,
     AcceptWaiver,
     RejectWaiver,
+    /// A disputed finding stands: back to `open` with the lens's SAW.
+    Uphold,
+    /// A disputed finding is withdrawn (terminal, not blocking).
+    Withdraw,
 }
 
 impl Outcome {
@@ -1023,6 +1125,8 @@ impl Outcome {
             Outcome::Reopened => "REOPENED",
             Outcome::AcceptWaiver => "ACCEPT_WAIVER",
             Outcome::RejectWaiver => "REJECT_WAIVER",
+            Outcome::Uphold => "UPHOLD",
+            Outcome::Withdraw => "WITHDRAW",
         }
     }
 
@@ -1032,6 +1136,8 @@ impl Outcome {
             Outcome::Reopened => Action::Reopen,
             Outcome::AcceptWaiver => Action::AcceptWaiver,
             Outcome::RejectWaiver => Action::RejectWaiver,
+            Outcome::Uphold => Action::Uphold,
+            Outcome::Withdraw => Action::Withdraw,
         }
     }
 }
@@ -1055,9 +1161,9 @@ impl Override {
 }
 
 const LENS_CALLS: &str = "A lens calls reportFinding(sessionId, severity, claim, expected, saw, where, fence) \
-     and resolveFinding(sessionId, findingId, outcome: VERIFIED|REOPENED|ACCEPT_WAIVER|REJECT_WAIVER, saw).";
-const WORKER_CALLS: &str = "The phase worker calls claimFix(sessionId, findingId, evidence) or \
-     proposeWaiver(sessionId, findingId, reason).";
+     and resolveFinding(sessionId, findingId, outcome: VERIFIED|REOPENED|ACCEPT_WAIVER|REJECT_WAIVER|UPHOLD|WITHDRAW, saw).";
+const WORKER_CALLS: &str = "The phase worker calls claimFix(sessionId, findingId, evidence, test, brokeWhat, redOutput), \
+     proposeWaiver(sessionId, findingId, reason) or disputeFinding(sessionId, findingId, reason).";
 
 /// Who is calling, resolved from the session id.
 struct Caller {
@@ -1171,14 +1277,19 @@ fn require_role(call: &str, caller: &Caller, worker: bool) -> Result<(), String>
     if !is_lens_role(&caller.role) && !caller.is_worker() {
         return Err(format!(
             "{call}: {} and that role cannot use the findings ledger. Only the phase worker \
-             (claimFix, proposeWaiver) and the review lenses (reportFinding, resolveFinding) can.",
+             (claimFix, proposeWaiver, disputeFinding) and the review lenses (reportFinding, \
+             resolveFinding) can.",
             caller.describe()
         ));
     }
     match (worker, caller.is_worker()) {
         (true, false) => Err(format!(
             "{call}: only the phase worker may {}; {}. {LENS_CALLS}",
-            if call == "claimFix" { "claim a fix" } else { "propose a waiver" },
+            match call {
+                "claimFix" => "claim a fix",
+                "disputeFinding" => "dispute a finding",
+                _ => "propose a waiver",
+            },
             caller.describe()
         )),
         (false, true) => Err(format!(
@@ -1201,7 +1312,7 @@ fn require_window(call: &str, caller: &Caller, worker: bool) -> Result<String, S
     let (want, what) = if worker {
         (
             "phase_worker_running",
-            "Claim fixes and propose waivers while you are working on the phase, before you report ready.",
+            "Claim fixes, propose waivers and dispute findings while you are working on the phase, before you report ready.",
         )
     } else {
         (
@@ -1410,21 +1521,176 @@ fn apply_err(e: ApplyError) -> String {
     e.to_string()
 }
 
-/// `claimFix`: the phase worker says a blocking finding is fixed, with evidence.
+/// The most bytes of `redOutput` a claim keeps (brief: "short, ≤ 2 KB").
+pub const MAX_RED_OUTPUT_BYTES: usize = 2_048;
+
+/// The red-first fields of a `claimFix` call, as sent (all optional).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RedFirstInput<'a> {
+    pub test: Option<&'a str>,
+    pub broke_what: Option<&'a str>,
+    pub red_output: Option<&'a str>,
+}
+
+/// Terminal output made safe to store and to quote in a prompt: ANSI escape sequences and control
+/// characters removed (newline and tab kept, `\r\n` / `\r` become `\n`), trimmed, and capped at
+/// [`MAX_RED_OUTPUT_BYTES`]. Over the cap the TAIL is kept (a test run's failure summary is at the
+/// end), marked with a leading `…`. `None` when nothing is left.
+pub fn sanitize_red_output(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len().min(MAX_RED_OUTPUT_BYTES * 2));
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // CSI `ESC [ … final-byte`, OSC `ESC ] … BEL|ESC \\`, or a two-char escape.
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        while let Some(d) = chars.next() {
+                            if ('\u{40}'..='\u{7e}').contains(&d) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        chars.next();
+                        while let Some(d) = chars.next() {
+                            if d == '\u{7}' {
+                                break;
+                            }
+                            if d == '\u{1b}' {
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        chars.next();
+                    }
+                    None => {}
+                }
+            }
+            '\r' => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
+                }
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= MAX_RED_OUTPUT_BYTES {
+        return Some(trimmed.to_string());
+    }
+    let marker = "…\n";
+    let budget = MAX_RED_OUTPUT_BYTES - marker.len();
+    let mut start = trimmed.len() - budget;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("{marker}{}", &trimmed[start..]))
+}
+
+/// Validate and normalize the red-first fields of a claim. `test` and `brokeWhat` are one line each
+/// (capped like every field); `redOutput` is sanitized by [`sanitize_red_output`].
+fn red_first_fields(call: &str, input: RedFirstInput<'_>) -> Result<RedFirst, String> {
+    let line = |field: &str, v: Option<&str>| -> Result<Option<String>, String> {
+        match v.map(one_line).filter(|v| !v.is_empty() && !is_template_placeholder(v)) {
+            Some(v) => {
+                check_len(call, field, &v)?;
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
+    };
+    Ok(RedFirst {
+        test: line("test", input.test)?,
+        broke_what: line("brokeWhat", input.broke_what)?,
+        red_output: input
+            .red_output
+            .filter(|v| !is_template_placeholder(v))
+            .and_then(sanitize_red_output),
+    })
+}
+
+/// `claimFix`: the phase worker says a blocking finding is fixed, with evidence (no red-first proof).
 pub fn claim_fix(state: &AppState, session_id: &str, finding_id: &str, evidence: &str) -> Result<(), String> {
+    claim_fix_with_proof(state, session_id, finding_id, evidence, RedFirstInput::default())
+}
+
+/// `claimFix` with its red-first fields: `test` (the test that proves the fix), `brokeWhat` (what
+/// was broken to watch it fail) and `redOutput` (what it printed then). A claim is accepted with or
+/// without them; it is recorded `red_first: true` only with BOTH a test and its red output, and the
+/// lens is told to treat a claim without that proof with more suspicion.
+pub fn claim_fix_with_proof(
+    state: &AppState,
+    session_id: &str,
+    finding_id: &str,
+    evidence: &str,
+    proof: RedFirstInput<'_>,
+) -> Result<(), String> {
     const CALL: &str = "claimFix";
     guarded(state, CALL, session_id, |caller| {
         let (f, round) = worker_finding(state, CALL, caller, finding_id)?;
         let evidence = require_text(CALL, "evidence", evidence, "Say what changed and what proves it, e.g. evidence:\"apply now writes where_; cargo test findings:: -> 23 passed\".")?;
+        let proof = red_first_fields(CALL, proof)?;
         apply(
             state,
             &caller.plan_id,
             &f.id,
             Action::Claim,
-            ActionInput { round, evidence: Some(evidence), actor: "worker".into(), ..Default::default() },
+            ActionInput {
+                round,
+                evidence: Some(evidence),
+                actor: "worker".into(),
+                red_first: Some(proof),
+                ..Default::default()
+            },
         )
         .map(|_| ())
         .map_err(apply_err)
+    })
+}
+
+/// `disputeFinding`: the phase worker says a blocking finding is wrong, with the reason. The filing
+/// lens rules on it next round (UPHOLD → open with its SAW, WITHDRAW → withdrawn). A finding the
+/// lens already upheld once cannot be disputed again — fix it or propose a waiver.
+pub fn dispute_finding(state: &AppState, session_id: &str, finding_id: &str, reason: &str) -> Result<(), String> {
+    const CALL: &str = "disputeFinding";
+    guarded(state, CALL, session_id, |caller| {
+        let (f, round) = worker_finding(state, CALL, caller, finding_id)?;
+        let reason = require_text(CALL, "reason", reason, "Say why the finding is wrong, with the evidence, e.g. reason:\"where_ is written at save.rs:42; cargo test save_keeps_where -> 1 passed\".")?;
+        if was_upheld(state, &caller.plan_id, &f.id) {
+            return Err(format!(
+                "{CALL}: lens '{}' already upheld a dispute of {}; it cannot be disputed again. Fix it and call \
+                 claimFix, or call proposeWaiver with a reason.",
+                f.lens, f.id
+            ));
+        }
+        apply(
+            state,
+            &caller.plan_id,
+            &f.id,
+            Action::Dispute,
+            ActionInput { round, reason: Some(reason), actor: "worker".into(), ..Default::default() },
+        )
+        .map(|_| ())
+        .map_err(apply_err)
+    })
+}
+
+/// Has the filing lens upheld a dispute of this finding before?
+fn was_upheld(state: &AppState, plan_id: &str, finding_id: &str) -> bool {
+    events_where(state, plan_id, "type = 'agent_finding_upheld'").iter().any(|e| {
+        serde_json::from_str::<serde_json::Value>(&e.payload_json)
+            .ok()
+            .and_then(|p| p.get("id").and_then(|v| v.as_str()).map(|id| id == finding_id))
+            .unwrap_or(false)
     })
 }
 
@@ -1478,16 +1744,18 @@ pub fn resolve_finding(
             }
             _ => None,
         };
-        let needs_saw = matches!(outcome, Outcome::Reopened | Outcome::RejectWaiver);
+        let needs_saw = matches!(outcome, Outcome::Reopened | Outcome::RejectWaiver | Outcome::Uphold);
         if needs_saw && saw.is_none() {
             return Err(format!(
                 "{CALL}: outcome {} needs 'saw' — what you observed this round (command + output \
-                 line), e.g. saw:\"cargo test findings:: -> 1 failed: where_ was empty\".",
+                 line), e.g. saw:\"cargo test findings:: -> 1 failed: where_ was empty\". For UPHOLD, \
+                 'saw' is why the finding stands despite the dispute.",
                 outcome.name()
             ));
         }
         let round = current_round(state, &caller.plan_id, &phase_id);
-        let escalate = needs_saw && escalation_due(&f, saw.as_deref().unwrap_or(""));
+        let escalate = matches!(outcome, Outcome::Reopened | Outcome::RejectWaiver)
+            && escalation_due(&f, saw.as_deref().unwrap_or(""));
         let actor = format!("lens:{}", caller.role);
         let input = ActionInput {
             round,
@@ -1581,7 +1849,7 @@ fn resolve_finding_template(session_id: &str, body_path: &str) -> String {
         &format!(
             "mutation($id:String!,$o:FindingOutcome!,$s:String){{resolveFinding(sessionId:\\\"{session_id}\\\",findingId:$id,outcome:$o,saw:$s)}}"
         ),
-        "{\n    \"id\": \"<the finding id, e.g. F-00-x-1>\",\n    \"o\": \"<VERIFIED|REOPENED|ACCEPT_WAIVER|REJECT_WAIVER>\",\n    \"s\": \"<REOPENED / REJECT_WAIVER only: what you observed this round (command + output line)>\"\n  }",
+        "{\n    \"id\": \"<the finding id, e.g. F-00-x-1>\",\n    \"o\": \"<VERIFIED|REOPENED|ACCEPT_WAIVER|REJECT_WAIVER|UPHOLD|WITHDRAW>\",\n    \"s\": \"<REOPENED / REJECT_WAIVER / UPHOLD only: what you observed this round (command + output line)>\"\n  }",
     )
 }
 
@@ -1589,10 +1857,32 @@ fn claim_fix_template(session_id: &str, body_path: &str) -> String {
     body_call(
         body_path,
         &format!(
-            "mutation($id:String!,$e:String!){{claimFix(sessionId:\\\"{session_id}\\\",findingId:$id,evidence:$e)}}"
+            "mutation($id:String!,$e:String!,$t:String,$b:String,$r:String){{claimFix(sessionId:\\\"{session_id}\\\",findingId:$id,evidence:$e,test:$t,brokeWhat:$b,redOutput:$r)}}"
         ),
-        "{\n    \"id\": \"<the finding id, e.g. F-00-x-1>\",\n    \"e\": \"<what you changed and the command + result that proves it>\"\n  }",
+        "{\n    \"id\": \"<the finding id, e.g. F-00-x-1>\",\n    \"e\": \"<what you changed and the command + result that proves it>\",\n    \"t\": \"<red-first: the test that proves the fix, e.g. findings::tests::apply_keeps_where>\",\n    \"b\": \"<red-first: the one line you broke to watch that test fail>\",\n    \"r\": \"<red-first: what the test printed when it FAILED (short; the assertion line)>\"\n  }",
     )
+}
+
+fn dispute_finding_template(session_id: &str, body_path: &str) -> String {
+    body_call(
+        body_path,
+        &format!(
+            "mutation($id:String!,$r:String!){{disputeFinding(sessionId:\\\"{session_id}\\\",findingId:$id,reason:$r)}}"
+        ),
+        "{\n    \"id\": \"<the finding id>\",\n    \"r\": \"<why the finding is wrong, with the evidence (file:line, command + output)>\"\n  }",
+    )
+}
+
+/// How a worker proves a fix red-first, said the same way everywhere a claim is asked for.
+const RED_FIRST_HOW: &str = "Red-first proof: before you claim, break the line your fix guards, run the test named as proof and \
+watch it FAIL, then restore the fix and watch it pass. Send that test as \"t\", the line you broke as \"b\" and the failing \
+output as \"r\". A claim without them is accepted but marked red_first:false, and the lens treats it with more suspicion. \
+With no red-first proof, send null for \"t\", \"b\" and \"r\".";
+
+/// A template placeholder sent back unfilled (`<red-first: …>`) is not proof.
+fn is_template_placeholder(v: &str) -> bool {
+    let v = v.trim();
+    v.starts_with('<') && v.ends_with('>')
 }
 
 fn propose_waiver_template(session_id: &str, body_path: &str) -> String {
@@ -1619,9 +1909,12 @@ findings is read against an incomplete ledger.\n"
     let mine = unresolved_for_lens(rows, lens);
     if round >= 2 && !mine.is_empty() {
         out.push_str(
-            "\nResolve these first. The worker claimed a fix or proposed a waiver for each finding you filed. Check it \
-against the code and the fence, then call resolveFinding once per id: VERIFIED or REOPENED for a claimed fix, \
-ACCEPT_WAIVER or REJECT_WAIVER for a proposed waiver. REOPENED and REJECT_WAIVER need 'saw'.\n",
+            "\nResolve these first. The worker claimed a fix, proposed a waiver or disputed each finding you filed. Check \
+it against the code and the fence, then call resolveFinding once per id: VERIFIED or REOPENED for a claimed fix, \
+ACCEPT_WAIVER or REJECT_WAIVER for a proposed waiver, UPHOLD or WITHDRAW for a dispute (you MUST rule on every \
+dispute). REOPENED, REJECT_WAIVER and UPHOLD need 'saw'.\n\
+A claimed fix WITHOUT red-first proof (no test seen failing before the fix) deserves more suspicion: run its test \
+yourself, and if you are not convinced, REOPENED with saw:\"no red-first proof: <what you checked>\".\n",
         );
         for f in mine {
             out.push_str(&format!("\n### {}: {}\n", f.id, one_line(&f.claim)));
@@ -1630,10 +1923,16 @@ ACCEPT_WAIVER or REJECT_WAIVER for a proposed waiver. REOPENED and REJECT_WAIVER
                     "- WAIVER PROPOSED: {}\n",
                     one_line(f.waive_reason.as_deref().unwrap_or("-"))
                 ));
+            } else if f.state == FindingState::Disputed.as_str() {
+                out.push_str(&format!(
+                    "- DISPUTED by the worker: {}\n- Rule on it: UPHOLD (it stands; saw = why) or WITHDRAW (the worker is right).\n",
+                    one_line(f.dispute_reason.as_deref().unwrap_or("-"))
+                ));
             } else {
                 out.push_str(&format!(
-                    "- CLAIMED FIX: {}\n",
-                    one_line(f.evidence.as_deref().unwrap_or("-"))
+                    "- CLAIMED FIX: {}\n{}",
+                    one_line(f.evidence.as_deref().unwrap_or("-")),
+                    red_first_lines(f)
                 ));
             }
             out.push_str(&format!(
@@ -1658,6 +1957,31 @@ through reportFinding.\n",
         report_finding_template(session_id, &body)
     ));
     out
+}
+
+/// The red-first lines a lens reads under a claimed fix.
+fn red_first_lines(f: &Finding) -> String {
+    if f.red_first == Some(true) {
+        format!(
+            "- RED-FIRST: yes — test {}; broke: {}; red output:\n{}\n",
+            f.claim_test.as_deref().unwrap_or("-"),
+            f.broke_what.as_deref().unwrap_or("-"),
+            f.red_output
+                .as_deref()
+                .unwrap_or("-")
+                .lines()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    } else {
+        let test = f
+            .claim_test
+            .as_deref()
+            .map(|t| format!(" (test named: {t}, but no output of it failing)"))
+            .unwrap_or_default();
+        format!("- RED-FIRST: NONE{test} — treat this claim with more suspicion; ask for it with REOPENED saw:\"no red-first proof\" if unconvinced.\n")
+    }
 }
 
 /// One finding as the fixer reads it: id, claim, EXPECTED, SAW, WHERE, FENCE and DEAD ENDS.
@@ -1721,11 +2045,13 @@ pub fn worker_feedback_prompt(
         out.push('\n');
     }
     out.push_str(&format!(
-        "For EACH finding above, either fix it and claim the fix:\n{}\n\nor, if it should not be fixed in this phase, propose a waiver:\n{}\n\n\
-Claim or waive EVERY listed id ({}) before you report ready; a ready report with an unclaimed finding is sent back. \
-Do not start later phases. Update task status/decisions/artifacts, then report ready again.",
+        "For EACH finding above, either fix it and claim the fix:\n{}\n{RED_FIRST_HOW}\n\nor, if it should not be fixed in this phase, propose a waiver:\n{}\n\n\
+or, if the finding is wrong, dispute it (the lens rules on it next round):\n{}\n\n\
+Answer EVERY listed id ({}) with a claim, a waiver or a dispute before you report ready; a ready report with an \
+unanswered finding is refused. Do not start later phases. Update task status/decisions/artifacts, then report ready again.",
         claim_fix_template(worker_session_id, &body),
         propose_waiver_template(worker_session_id, &body),
+        dispute_finding_template(worker_session_id, &body),
         if todo.is_empty() { "none".to_string() } else { todo.iter().map(|f| f.id.as_str()).collect::<Vec<_>>().join(", ") }
     ));
     out
@@ -1846,16 +2172,20 @@ fn quote_rejection(last_rejection: Option<&str>) -> String {
     }
 }
 
-/// The worker's ready bounce when blocking findings are still unclaimed.
+/// The worker's ready refusal (code-built) when blocking findings are still unanswered: every
+/// unanswered id, then the exact call templates for the three answers.
 pub fn worker_nudge_text(ids: &[String], session_id: &str, last_rejection: Option<&str>) -> String {
     let body = finding_body_path(session_id);
     format!(
-        "Your ready report was not accepted: blocking finding(s) {} are neither claimed nor waived. For each id, call \
-claimFix (fixed, with evidence) or proposeWaiver (with a reason), then report ready again.{}\nclaimFix call:\n{}\n\nproposeWaiver call:\n{}",
+        "Your ready report was refused: blocking finding(s) {} have no answer — no claim, no waiver proposal, no dispute. \
+For each id, call claimFix (fixed, with evidence and red-first proof), proposeWaiver (not fixed here, with a reason) or \
+disputeFinding (the finding is wrong, with the evidence), then report ready again.{}\nclaimFix call:\n{}\n{RED_FIRST_HOW}\n\n\
+proposeWaiver call:\n{}\n\ndisputeFinding call:\n{}",
         ids.join(", "),
         quote_rejection(last_rejection),
         claim_fix_template(session_id, &body),
         propose_waiver_template(session_id, &body),
+        dispute_finding_template(session_id, &body),
     )
 }
 
@@ -1917,7 +2247,8 @@ pub fn lens_nudge_text(
     let head = match reason {
         NudgeReason::UnresolvedClaims(ids) => format!(
             "Your {lens} verdict was not accepted yet: finding(s) {} you filed are waiting on you. Call resolveFinding \
-for each (VERIFIED / REOPENED for a claimed fix, ACCEPT_WAIVER / REJECT_WAIVER for a waiver), then send your verdict again.\n\
+for each (VERIFIED / REOPENED for a claimed fix, ACCEPT_WAIVER / REJECT_WAIVER for a waiver, UPHOLD / WITHDRAW for a \
+dispute), then send your verdict again.\n\
 resolveFinding call:\n{}",
             ids.join(", "),
             resolve_finding_template(session_id, &body)
@@ -1985,6 +2316,10 @@ pub struct Reconciliation {
     pub reopen: Vec<(String, String)>,
     pub accept_waiver: Vec<String>,
     pub reject_waiver: Vec<(String, String)>,
+    /// Disputed rows the lens repeated (the finding stands): UPHOLD with the bullet as SAW.
+    pub uphold: Vec<(String, String)>,
+    /// Disputed rows the lens left out: WITHDRAW.
+    pub withdraw: Vec<String>,
     pub import: Vec<String>,
 }
 
@@ -2007,6 +2342,8 @@ pub fn reconcile_untyped_lens(owned_rows: &[Finding], bullets: &[String], passin
             ("claimed", None) => r.verify.push(f.id.clone()),
             ("waive_proposed", Some(b)) => r.reject_waiver.push((f.id.clone(), b)),
             ("waive_proposed", None) => r.accept_waiver.push(f.id.clone()),
+            ("disputed", Some(b)) => r.uphold.push((f.id.clone(), b)),
+            ("disputed", None) => r.withdraw.push(f.id.clone()),
             _ => {} // open / reopened: no-op, never re-imported
         }
     }
@@ -2048,6 +2385,7 @@ pub fn apply_reconciliation(
         reason,
         evidence,
         actor: "coordinator".into(),
+        red_first: None,
     };
     for id in &r.verify {
         let evidence = format!("lens {lens} round {round} no longer reports it");
@@ -2055,6 +2393,13 @@ pub fn apply_reconciliation(
     }
     for id in &r.accept_waiver {
         apply(state, plan_id, id, Action::AcceptWaiver, input(None, None, None)).map_err(|e| e.to_string())?;
+    }
+    for (id, bullet) in &r.uphold {
+        apply(state, plan_id, id, Action::Uphold, input(Some(bullet.clone()), None, None)).map_err(|e| e.to_string())?;
+    }
+    for id in &r.withdraw {
+        let reason = format!("lens {lens} round {round} no longer reports it");
+        apply(state, plan_id, id, Action::Withdraw, input(None, Some(reason), None)).map_err(|e| e.to_string())?;
     }
     for (action, list) in [(Action::Reopen, &r.reopen), (Action::RejectWaiver, &r.reject_waiver)] {
         for (id, bullet) in list {
@@ -2135,15 +2480,22 @@ PASS_WITH_FOLLOWUPS each is a follow-up. With PASS, write no \"- \" lines.\n",
         return out;
     }
     out.push_str(
-        "\n## Findings you raised earlier\n\nThe worker claimed a fix or proposed a waiver for each of these. \
-If it is still wrong, repeat its claim text as a bullet; if it is fixed, leave it out.\n",
+        "\n## Findings you raised earlier\n\nThe worker claimed a fix, proposed a waiver or disputed each of these. \
+If it is still wrong (or the dispute is wrong), repeat its claim text as a bullet; if it is fixed (or the dispute is \
+right), leave it out. A claimed fix without red-first proof deserves more suspicion.\n",
     );
     for f in mine {
         out.push_str(&format!("\n### {}\n- CLAIM: {}\n", f.id, one_line(&f.claim)));
         if f.state == FindingState::WaiveProposed.as_str() {
             out.push_str(&format!("- WAIVER PROPOSED: {}\n", one_line(f.waive_reason.as_deref().unwrap_or("-"))));
+        } else if f.state == FindingState::Disputed.as_str() {
+            out.push_str(&format!("- DISPUTED: {}\n", one_line(f.dispute_reason.as_deref().unwrap_or("-"))));
         } else {
-            out.push_str(&format!("- CLAIMED FIX: {}\n", one_line(f.evidence.as_deref().unwrap_or("-"))));
+            out.push_str(&format!(
+                "- CLAIMED FIX: {}\n{}",
+                one_line(f.evidence.as_deref().unwrap_or("-")),
+                red_first_lines(f)
+            ));
         }
         out.push_str(&format!(
             "- EXPECTED: {}\n- SAW: {}\n",
@@ -2228,6 +2580,149 @@ pub fn escalation_reason(phase_id: &str, rows: &[Finding]) -> String {
     )
 }
 
+// ───────────────────────── the round digest ─────────────────────────
+//
+// One code-built line per phase review round, from the ledger only (never from a model):
+// `"<plan> · <phase> r2: 3 → 1 open · 2 verified · 1 disputed · 2 follow-ups · red-first 2/3"`.
+
+/// A blocking finding that still needs work or a lens decision, other than a dispute: the "open"
+/// count of the digest (disputes are counted on their own).
+fn digest_open_state(state: &str) -> bool {
+    matches!(state, "open" | "reopened" | "claimed" | "waive_proposed")
+}
+
+/// The counts behind one digest line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundDigest {
+    pub plan: String,
+    pub phase_id: String,
+    pub round: i64,
+    /// Open blocking findings when the round started.
+    pub open_before: usize,
+    /// Open blocking findings when the round concluded.
+    pub open_after: usize,
+    pub verified: usize,
+    pub disputed: usize,
+    pub withdrawn: usize,
+    pub followups: usize,
+    /// Claims carrying red-first proof / every claim with a recorded red-first mark.
+    pub red_first: usize,
+    pub claims: usize,
+    /// The ledger gate's verdict for the round.
+    pub gate: String,
+}
+
+impl RoundDigest {
+    /// The one line (also the Discord headline). `withdrawn` appears only when there is one.
+    pub fn line(&self) -> String {
+        let mut parts = vec![
+            format!("{} → {} open", self.open_before, self.open_after),
+            format!("{} verified", self.verified),
+            format!("{} disputed", self.disputed),
+        ];
+        if self.withdrawn > 0 {
+            parts.push(format!("{} withdrawn", self.withdrawn));
+        }
+        parts.push(format!("{} follow-up{}", self.followups, if self.followups == 1 { "" } else { "s" }));
+        parts.push(format!("red-first {}/{}", self.red_first, self.claims));
+        format!("{} · {} r{}: {}", self.plan, self.phase_id, self.round, parts.join(" · "))
+    }
+}
+
+/// `red-first n/m` over a phase's rows: claims recorded with proof / claims recorded at all.
+pub fn red_first_ratio(rows: &[Finding]) -> (usize, usize) {
+    let claims: Vec<bool> = rows.iter().filter_map(|r| r.red_first).collect();
+    (claims.iter().filter(|p| **p).count(), claims.len())
+}
+
+/// Open blocking findings at the start of the phase's current review round, replayed from the event
+/// log: each finding's latest `to` state before the round's `agent_phase_review_started`. Pure.
+/// `events` is oldest-first and holds the phase's `agent_finding_*` and review-start events.
+pub fn open_at_round_start(events: &[AgentPlanEvent], phase_id: &str, rows: &[Finding]) -> usize {
+    let Some(start) = events
+        .iter()
+        .rposition(|e| e.event_type == "agent_phase_review_started" && e.phase_id.as_deref() == Some(phase_id))
+    else {
+        return 0;
+    };
+    let mut states: BTreeMap<String, String> = BTreeMap::new();
+    for e in &events[..start] {
+        if !e.event_type.starts_with("agent_finding_") || e.phase_id.as_deref() != Some(phase_id) {
+            continue;
+        }
+        let p: serde_json::Value = serde_json::from_str(&e.payload_json).unwrap_or_default();
+        if let (Some(id), Some(to)) = (p.get("id").and_then(|v| v.as_str()), p.get("to").and_then(|v| v.as_str())) {
+            states.insert(id.to_string(), to.to_string());
+        }
+    }
+    rows.iter()
+        .filter(|r| r.is_blocking())
+        .filter(|r| states.get(&r.id).map_or(false, |st| digest_open_state(st)))
+        .count()
+}
+
+/// Build the digest from the ledger. Pure: `rows` is the phase's rows at the end of the round.
+pub fn round_digest(
+    plan_title: &str,
+    phase_id: &str,
+    round: i64,
+    open_before: usize,
+    rows: &[Finding],
+    gate: &str,
+) -> RoundDigest {
+    let count = |pred: &dyn Fn(&Finding) -> bool| rows.iter().filter(|r| pred(r)).count();
+    let (red_first, claims) = red_first_ratio(rows);
+    let plan = one_line(plan_title);
+    let plan = if plan.chars().count() > 80 {
+        format!("{}…", plan.chars().take(79).collect::<String>())
+    } else {
+        plan
+    };
+    RoundDigest {
+        plan,
+        phase_id: phase_id.to_string(),
+        round,
+        open_before,
+        open_after: count(&|r| r.is_blocking() && digest_open_state(&r.state)),
+        verified: count(&|r| r.state == FindingState::Verified.as_str()),
+        disputed: count(&|r| r.state == FindingState::Disputed.as_str()),
+        withdrawn: count(&|r| r.state == FindingState::Withdrawn.as_str()),
+        followups: count(&|r| {
+            r.severity == Severity::Followup.as_str() && r.state != FindingState::Withdrawn.as_str()
+        }),
+        red_first,
+        claims,
+        gate: gate.to_string(),
+    }
+}
+
+/// Build the round's digest from the ledger and append `agent_review_round_digest` (payload: the
+/// counts plus `line`). Returns the digest; the caller posts `line()` to Discord.
+pub fn record_round_digest(
+    state: &AppState,
+    plan_id: &str,
+    plan_title: &str,
+    phase_id: &str,
+    round: i64,
+    gate: &str,
+) -> Result<RoundDigest, String> {
+    let rows = list_phase(state, plan_id, phase_id);
+    let events = events_where(
+        state,
+        plan_id,
+        "(type LIKE 'agent_finding_%' OR type = 'agent_phase_review_started')",
+    );
+    let digest = round_digest(plan_title, phase_id, round, open_at_round_start(&events, phase_id, &rows), &rows, gate);
+    let mut payload = serde_json::to_value(&digest).map_err(|e| e.to_string())?;
+    payload
+        .as_object_mut()
+        .expect("json object")
+        .insert("line".into(), digest.line().into());
+    super::agent_plans::append_event(state, plan_id, Some(phase_id), "agent_review_round_digest", payload)?;
+    Ok(digest)
+}
+
 // ─────────────────────────────── tests ───────────────────────────────
 
 #[cfg(test)]
@@ -2243,7 +2738,7 @@ mod tests {
 
     /// The literal edge table from overview §4.1, written out independently of `EDGES`, so
     /// deleting an edge from the code turns this red.
-    const EXPECTED_EDGES: [(FindingState, Action, FindingState); 16] = [
+    const EXPECTED_EDGES: [(FindingState, Action, FindingState); 20] = [
         (Open, Claim, Claimed),
         (Reopened, Claim, Claimed),
         (Open, ProposeWaiver, WaiveProposed),
@@ -2260,6 +2755,11 @@ mod tests {
         (Waived, HumanReopen, Reopened),
         (Escalated, HumanReopen, Reopened),
         (Escalated, HumanAcceptWaiver, Waived),
+        // The dispute path.
+        (Open, Dispute, Disputed),
+        (Reopened, Dispute, Disputed),
+        (Disputed, Uphold, Open),
+        (Disputed, Withdraw, Withdrawn),
     ];
 
     #[test]
@@ -2293,7 +2793,7 @@ mod tests {
                 rejected += 1;
             }
         }
-        assert_eq!(rejected, 8 * 11 - 16);
+        assert_eq!(rejected, 10 * 14 - 20);
     }
 
     #[test]
@@ -2301,7 +2801,7 @@ mod tests {
         let reason = |s, a| transition(s, a).unwrap_err().reason;
         assert_eq!(
             reason(Open, Verify),
-            "cannot Verify a finding in state 'open' (legal: Claim, ProposeWaiver, Carry)"
+            "cannot Verify a finding in state 'open' (legal: Claim, ProposeWaiver, Carry, Dispute)"
         );
         assert_eq!(
             reason(Verified, Claim),
@@ -2313,7 +2813,7 @@ mod tests {
         );
         assert_eq!(
             reason(Open, Escalate),
-            "cannot Escalate a finding in state 'open' (legal: Claim, ProposeWaiver, Carry)"
+            "cannot Escalate a finding in state 'open' (legal: Claim, ProposeWaiver, Carry, Dispute)"
         );
         for action in Action::ALL {
             assert_eq!(
@@ -2337,7 +2837,10 @@ mod tests {
             "waive_proposed",
             "escalated",
             "carried",
+            "disputed",
+            "withdrawn",
         ];
+        assert_eq!(db.len(), FindingState::ALL.len());
         for (state, s) in FindingState::ALL.into_iter().zip(db) {
             assert_eq!(state.as_str(), s);
             assert_eq!(FindingState::parse(s), Some(state));
@@ -2705,6 +3208,11 @@ mod tests {
             last_saw: None,
             created_at: String::new(),
             updated_at: String::new(),
+            claim_test: None,
+            broke_what: None,
+            red_output: None,
+            red_first: None,
+            dispute_reason: None,
         }
     }
 
@@ -3068,7 +3576,7 @@ mod service_tests {
         assert_err(
             claim_fix(&state, QA, &id, "e"),
             "only the phase worker may claim a fix; you are lens 'qa'",
-            "resolveFinding(sessionId, findingId, outcome: VERIFIED|REOPENED|ACCEPT_WAIVER|REJECT_WAIVER, saw)",
+            "resolveFinding(sessionId, findingId, outcome: VERIFIED|REOPENED|ACCEPT_WAIVER|REJECT_WAIVER|UPHOLD|WITHDRAW, saw)",
         );
     }
 
@@ -3287,7 +3795,7 @@ mod service_tests {
         let (state, _) = fixture("phase_review_running");
         let id = report(&state, QA, "a").unwrap();
         let err = override_finding(&state, PLAN, &id, Override::Reopen, "why not").unwrap_err();
-        assert_eq!(err, "cannot HumanReopen a finding in state 'open' (legal: Claim, ProposeWaiver, Carry)");
+        assert_eq!(err, "cannot HumanReopen a finding in state 'open' (legal: Claim, ProposeWaiver, Carry, Dispute)");
         assert_eq!(state_of(&state, &id), "open");
         assert!(override_finding(&state, "other-plan", &id, Override::Reopen, "x").unwrap_err().contains("no finding"));
     }
@@ -3330,6 +3838,11 @@ mod ledger_loop_pure_tests {
             last_saw: None,
             created_at: String::new(),
             updated_at: String::new(),
+            claim_test: None,
+            broke_what: None,
+            red_output: None,
+            red_first: None,
+            dispute_reason: None,
         }
     }
 
@@ -3432,7 +3945,8 @@ mod ledger_loop_pure_tests {
         assert!(text.contains("claimFix(sessionId:\\\"WSID-42\\\""), "{text}");
         assert!(text.contains("proposeWaiver(sessionId:\\\"WSID-42\\\""), "{text}");
         assert!(text.contains(&finding_body_path("WSID-42")), "{text}");
-        assert!(text.contains("Claim or waive EVERY listed id (F-00-x-1) before you report ready"), "{text}");
+        assert!(text.contains("disputeFinding(sessionId:\\\"WSID-42\\\""), "{text}");
+        assert!(text.contains("Answer EVERY listed id (F-00-x-1) with a claim, a waiver or a dispute before you report ready"), "{text}");
     }
 
     #[test]
@@ -3564,7 +4078,8 @@ mod ledger_loop_pure_tests {
         let text = stream_lens_ledger_section(&rows, "glm", 2);
         assert!(text.contains("### F-00-x-1") && text.contains("CLAIMED FIX: fixed in apply"), "{text}");
         assert!(text.contains("EXPECTED: expected of F-00-x-1"), "{text}");
-        assert!(text.contains("If it is still wrong, repeat its claim text as a bullet; if it is fixed, leave it out."));
+        assert!(text.contains("If it is still wrong (or the dispute is wrong), repeat its claim text as a bullet; if it is fixed (or the dispute is \
+right), leave it out."), "{text}");
         assert!(!text.contains("F-00-x-2"), "{text}");
         let round1 = stream_lens_ledger_section(&rows, "glm", 1);
         assert!(round1.contains("starting with \"- \"") && !round1.contains("F-00-x-1"), "{round1}");
