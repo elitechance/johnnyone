@@ -29,7 +29,8 @@
 //! For a minting agent (the alert-discord skill), two rules for `answer` links:
 //! - **always group a question's options** (one `group` for its Yes / No / ...). Ungrouped links
 //!   for one question are only serialised here ([`lock_answer`]): the first tap answers, a later
-//!   one is refused as answered;
+//!   one is refused as answered. The lock serialises link against link only: a reply typed in
+//!   the console does not take it;
 //! - **use a new group for each question.** A group closes once any of its links is redeemed
 //!   (done, failed or answered), and minting into a closed group is refused.
 
@@ -605,31 +606,45 @@ pub const MINT_ANSWERED: &str =
 fn check_answer_session(
     state: &AppState,
     session_id: &str,
-) -> Result<(SessionFacts, String, String), String> {
-    let facts = session_facts(state, session_id)?
-        .ok_or_else(|| format!("session {session_id} does not exist"))?;
+) -> Result<(SessionFacts, String, String), SessionRefusal> {
+    let other = |message: String| SessionRefusal { ended: false, message };
+    let ended = |message: String| SessionRefusal { ended: true, message };
+    let facts = session_facts(state, session_id)
+        .map_err(other)?
+        .ok_or_else(|| ended(format!("session {session_id} does not exist")))?;
     if facts.status != "active" {
-        return Err(format!("session {session_id} is {}", facts.status));
+        return Err(ended(format!("session {session_id} is {}", facts.status)));
     }
     if facts.attached_tmux || facts.kind != "agent" {
-        return Err(format!("session {session_id} is not a J1-managed agent"));
+        return Err(other(format!("session {session_id} is not a J1-managed agent")));
     }
     let (plan_id, role) = agent_plans::session_plan_owner(state, session_id)
-        .ok_or_else(|| format!("session {session_id} does not belong to a plan"))?;
+        .ok_or_else(|| other(format!("session {session_id} does not belong to a plan")))?;
     if role == "plan_agent" {
-        return Err(format!("session {session_id} is a plan agent, not a phase agent"));
+        return Err(other(format!("session {session_id} is a plan agent, not a phase agent")));
     }
     // Fail closed: a lookup error refuses the link rather than typing into a finished job.
-    if crate::services::agent_reaper::session_job_ended(state, session_id)? {
-        return Err(format!("session {session_id}'s plan job has ended"));
+    if crate::services::agent_reaper::session_job_ended(state, session_id).map_err(other)? {
+        return Err(ended(format!("session {session_id}'s plan job has ended")));
     }
     Ok((facts, plan_id, role))
 }
 
+/// Why [`check_answer_session`] refused. `ended` = the session is gone, archived, or its plan job
+/// ended — the case the human sees as "That agent's session has ended" (C-1-1).
+struct SessionRefusal {
+    ended: bool,
+    message: String,
+}
+
+/// The perform-time prefix for an answer whose session ended since the mint. The worker matches
+/// on `ended:` and shows "That agent's session has ended, so nothing was sent." (C-1-1).
+pub const ENDED: &str = "ended:";
+
 /// `answer` may target only a J1-managed agent that is asking ([`check_answer_session`]), whose
 /// latest report is an open ask. Returns the agent's display name.
 fn check_answer_target(state: &AppState, session_id: &str) -> Result<String, String> {
-    let (facts, plan_id, role) = check_answer_session(state, session_id)?;
+    let (facts, plan_id, role) = check_answer_session(state, session_id).map_err(|r| r.message)?;
     match ask_state(state, session_id)? {
         AskState::Open => {}
         AskState::Answered => return Err(format!("session {session_id}: {MINT_ANSWERED}")),
@@ -812,8 +827,12 @@ pub async fn perform(
     if let LinkAction::Answer { session_id, .. } = &action {
         // The session may have been archived, attached, or its plan job ended since the mint
         // (H-3-44): the same session checks as at mint, not only the ask.
-        if let Err(e) = check_answer_session(state, session_id) {
-            return refuse(&e);
+        if let Err(r) = check_answer_session(state, session_id) {
+            return if r.ended {
+                refuse(&format!("{ENDED} {}", r.message))
+            } else {
+                refuse(&r.message)
+            };
         }
         // The question may have been answered (console, or another link) since the mint.
         match ask_state(state, session_id) {

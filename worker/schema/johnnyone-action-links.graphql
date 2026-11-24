@@ -17,7 +17,7 @@ type ActionLinkPreview {
   target: String
   expiresAt: Int
   message: String
-  # for state=used: done | failed | uncertain | superseded | answered | pending
+  # for state=used: done | failed | uncertain | superseded | answered | ended | pending
   outcome: String
   # the worker's clock (s since epoch); the page counts down against it
   serverNow: Int!
@@ -25,7 +25,7 @@ type ActionLinkPreview {
 
 type ActionLinkResult {
   ok: Boolean!
-  # expired | used | superseded | invalid | unavailable | uncertain | restarted | answered | failed
+  # expired | used | superseded | invalid | unavailable | uncertain | restarted | answered | ended | failed
   # (null on success)
   code: String
   summary: String!

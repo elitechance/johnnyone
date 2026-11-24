@@ -938,3 +938,29 @@ fn invisible_and_control_characters_get_their_own_messages() {
     assert_eq!(validate_reply("yes\rno").unwrap_err(), "reply must be one line with no control characters");
     assert_eq!(validate_label("a\nb").unwrap_err(), "label must be one line with no control characters");
 }
+
+#[tokio::test]
+async fn a_session_that_ended_since_the_mint_is_refused_with_the_ended_code() {
+    // C-1-1: archived / gone / plan job ended → `ended:` (the worker's own outcome); a session that
+    // changed kind keeps a plain refusal.
+    let cases: [(&str, bool); 4] = [
+        ("UPDATE sessions SET status = 'archived'", true),
+        ("UPDATE agent_plans SET status = 'stopped' WHERE id = 'plan-al'", true),
+        ("PRAGMA foreign_keys = OFF; DELETE FROM sessions WHERE id = 'sid-al-worker'; PRAGMA foreign_keys = ON;", true),
+        ("UPDATE sessions SET attached_tmux = 1", false),
+    ];
+    for (sql, ended) in cases {
+        let (state, _) = test_state();
+        seed(&state);
+        let signer = FakeSigner::default();
+        let performer = FakePerformer::default();
+        let args = json!({ "sessionId": SESSION, "reply": "yes" });
+        let link = mint_l(&state, &signer, "answer", &args.to_string(), "L").await.unwrap();
+        exec(&state, sql);
+        let err = perform(&state, &performer, &params_for(&link, "answer", args), now_secs())
+            .await
+            .unwrap_err();
+        assert_eq!(err.starts_with(&format!("perform_action_link: {ENDED} ")), ended, "{sql}: {err}");
+        assert!(performer.calls.lock().unwrap().is_empty(), "{sql}");
+    }
+}

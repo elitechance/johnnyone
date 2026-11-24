@@ -733,6 +733,29 @@ describe('action links: review round 2', () => {
     expect(f.performs()).toHaveLength(1);
   });
 
+  it('C-1-1: the desktop\'s "ended" refusal becomes its own code and used-outcome', async () => {
+    const f = makeDeps({
+      relay: async (_i, method) => {
+        if (method === 'perform_action_link') throw new Error('perform_action_link: ended: session sess-1 is archived');
+        return true;
+      },
+    });
+    const m = await mint(f.deps, ANSWER2('yes'));
+    expect(await redeemActionLink(f.deps, m.token, null, 'POST')).toEqual({
+      ok: false,
+      code: 'ended',
+      summary: "That agent's session has ended, so nothing was sent.",
+    });
+    expect(await previewActionLink(f.deps, m.token, null)).toMatchObject({
+      state: 'used',
+      outcome: 'ended',
+      message: "That agent's session had ended, so nothing was sent.",
+    });
+    // A plain failure (and a message that merely contains "ended") stays generic.
+    expect(relayFailureCode("perform_action_link: session sess-1's plan job has ended")).toBe('failed');
+    expect(relayFailureCode('perform_action_link: pane is gone')).toBe('failed');
+  });
+
   it('H-2-24b: the desktop\'s "answered" refusal becomes its own code and used-outcome', async () => {
     const f = makeDeps({
       relay: async (_i, method) => {

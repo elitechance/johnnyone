@@ -25,7 +25,7 @@ export interface ActionLinkPreview {
   /** exp, seconds since the epoch */
   expiresAt: number | null;
   message: string | null;
-  /** For `used`: done | failed | uncertain | superseded | pending. */
+  /** For `used`: done | failed | uncertain | superseded | answered | ended | pending. */
   outcome?: string | null;
   /** The worker's clock (s). The countdown runs against it, not the phone's. */
   serverNow?: number | null;
@@ -66,6 +66,9 @@ export const ACT_COPY = {
   usedFailed: 'Tried, but J1 could not do it, so check J1.',
   superseded: 'Another answer was already chosen.',
   answered: 'The agent already got an answer, so nothing was sent.',
+  /** The agent's session ended (archived, or its plan job finished) since the link was made. */
+  ended: "That agent's session has ended, so nothing was sent.",
+  usedEnded: "That agent's session had ended, so nothing was sent.",
   cancelled: 'Cancelled. Nothing happened, and the link was not used.',
 } as const;
 
@@ -112,6 +115,8 @@ export function usedCopy(outcome: string | null | undefined): string {
       return ACT_COPY.superseded;
     case 'answered':
       return ACT_COPY.answered;
+    case 'ended':
+      return ACT_COPY.usedEnded;
     default:
       return ACT_COPY.used;
   }
@@ -178,6 +183,8 @@ export function viewFromResult(r: ActionLinkResult): ActView {
       return { kind: 'used', label: null, message: ACT_COPY.superseded, outcome: 'superseded' };
     case 'answered':
       return { kind: 'used', label: null, message: ACT_COPY.answered, outcome: 'answered' };
+    case 'ended':
+      return { kind: 'used', label: null, message: ACT_COPY.ended, outcome: 'ended' };
     case 'uncertain':
       return { kind: 'failed', message: ACT_COPY.uncertain };
     case 'restarted':
