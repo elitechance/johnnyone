@@ -4110,10 +4110,12 @@ async fn run_development_worker_phase(state: &AppState, run: &AgentPlanRun) -> R
     enter_phase_review(state, &run.plan.id, &phase).await
 }
 
-/// Ready gate (F2): every open / reopened BLOCKING finding must be claimed or waived before the
-/// phase goes back to review. Records `agent_finding_nudge {reason:"unclaimed_blocking", ids}`, then
-/// bounces through the shared `bounce_ready_or_escalate` under a `*ready_rejected*` type, so the
-/// shared `MAX_READY_BOUNCES` cap counts it. Returns true when the ready was bounced.
+/// Ready gate: every open / reopened BLOCKING finding must be answered — claimed, waiver proposed or
+/// disputed — before the phase goes back to review. Records
+/// `agent_finding_ready_refused {unanswered:[ids]}`, then bounces through the shared
+/// `bounce_ready_or_escalate` under a `*ready_rejected*` type, so the shared `MAX_READY_BOUNCES` cap
+/// counts it. The nudge is code-built: the unanswered ids plus the exact call templates. Returns
+/// true when the ready was refused.
 async fn unclaimed_findings_ready_gate(
     state: &AppState,
     run: &AgentPlanRun,
@@ -4131,8 +4133,8 @@ async fn unclaimed_findings_ready_gate(
         state,
         &run.plan.id,
         Some(&phase.phase_id),
-        "agent_finding_nudge",
-        json!({ "reason": "unclaimed_blocking", "ids": ids, "sessionId": session_id }),
+        "agent_finding_ready_refused",
+        json!({ "unanswered": ids, "ids": ids, "sessionId": session_id }),
     )?;
     let last = findings::last_rejection(state, &run.plan.id, session_id);
     let text = findings::worker_nudge_text(&ids, session_id, last.as_deref());
@@ -4722,6 +4724,9 @@ pub(crate) struct ReplanCtrl<'a> {
     /// Test seam (F2): when set, worker feedback / nudge text is pushed here instead of being
     /// typed into a tmux session, and no worker session is created.
     pub worker_sink: Option<&'a std::sync::Mutex<Vec<String>>>,
+    /// Test seam: when set, each review round's digest line is pushed here instead of being posted
+    /// to Discord (`notify_discord`). Live (`None`) posts it when a webhook is configured.
+    pub digest_sink: Option<&'a std::sync::Mutex<Vec<String>>>,
 }
 
 impl ReplanCtrl<'static> {
@@ -4734,6 +4739,7 @@ impl ReplanCtrl<'static> {
             skip_execute: false,
             spawn_log: None,
             worker_sink: None,
+            digest_sink: None,
         }
     }
 }
@@ -6524,7 +6530,10 @@ pub(crate) fn discord_message_for(
     // (b) a phase or plan being DONE (a PASS). We do NOT alert on starts, or on
     // every T2 result — a non-PASS review just loops back to T1 silently and is
     // visible in the web lens panel.
+    // The round digest already announced this pass (and the plan's completion): one post per round.
+    let digested = payload.get("digest").and_then(|v| v.as_bool()) == Some(true);
     match event_type {
+        "agent_phase_gate_result" | "agent_plan_completed" | "agent_phase_needs_attention" if digested => None,
         // Phase done.
         "agent_phase_gate_result" if verdict_advances(&verdict) => Some((
             "success",
@@ -7280,11 +7289,57 @@ pub(crate) async fn conclude_review_round_with(
         .filter(|f| f.severity == "blocking" && f.state_enum().map_or(false, |s| s.is_unresolved()))
         .map(|f| format!("{}: {}", f.id, f.claim.split_whitespace().collect::<Vec<_>>().join(" ")))
         .collect();
+    let (red_first, claims) = findings::red_first_ratio(&rows);
     let summary = format!(
-        "{}-lens review — {}",
+        "{}-lens review — {} · red-first {red_first}/{claims}",
         verdicts.len(),
         verdicts.iter().map(|(l, v)| format!("{l}: {v}")).collect::<Vec<_>>().join(", ")
     );
+    // The round digest: one code-built line from the ledger, recorded every round, saying whether
+    // the user must act. A failure here never fails the round. When it IS recorded it becomes the
+    // round's ONLY Discord post: the routing marks its own pass / needs-attention events
+    // `digest:true` (which `discord_message_for` skips) — only then, so a failed digest leaves the
+    // generic posts in place. It is posted only AFTER the routing succeeded, so a pass or a park
+    // that failed half-way is never announced (the coordinator's failure alert covers that case).
+    let outcome = round_outcome(state, run, phase, gate, &rows);
+    let pos = phase_position(run, phase);
+    let digest = findings::record_round_digest(state, plan_id, &run.plan.title, phase_id, pos, round, gate.as_verdict(), outcome);
+    if let Err(e) = &digest {
+        tracing::warn!(plan_id, phase_id, error = %e, "round digest not recorded; generic Discord posts stay on");
+    }
+    let digested = digest.is_ok();
+    let routed = route_review_round(state, run, phase, gate, round, &rows, &summary, open_lines, lens_notes, digested, ctrl).await;
+    if let (Ok(()), Ok(digest)) = (&routed, &digest) {
+        // A needs-you post carries the reason the coordinator parked the phase (the plan's error).
+        let reason = match digest.outcome {
+            findings::RoundOutcome::NeedsYou { .. } => get_plan(state, plan_id).ok().and_then(|r| r.plan.error).unwrap_or_default(),
+            _ => String::new(),
+        };
+        post_round_digest(state, plan_id, digest, &reason, ctrl);
+    }
+    routed
+}
+
+/// Route a concluded review round: pass (carry follow-ups first) / escalate / park / send back.
+/// `digested`: the round's digest was recorded and will be the round's Discord post, so the pass
+/// and needs-attention events written here are marked `digest:true`.
+#[allow(clippy::too_many_arguments)]
+async fn route_review_round(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    gate: findings::LedgerGate,
+    round: i64,
+    rows: &[findings::Finding],
+    summary: &str,
+    open_lines: Vec<String>,
+    lens_notes: Vec<String>,
+    digested: bool,
+    ctrl: &ReplanCtrl<'_>,
+) -> Result<(), String> {
+    let plan_id = run.plan.id.as_str();
+    let phase_id = phase.phase_id.as_str();
+    let summary = summary.to_string();
     let review = ReviewInsights {
         summary: Some(summary.clone()),
         reason: open_lines.first().cloned().or_else(|| Some(summary.clone())),
@@ -7302,7 +7357,7 @@ pub(crate) async fn conclude_review_round_with(
             } else {
                 "PASS"
             };
-            pass_phase(state, plan_id, phase_id, "T2 passed phase", verdict).await
+            pass_phase_with(state, plan_id, phase_id, "T2 passed phase", verdict, digested).await
         }
         LedgerGate::Escalate => {
             mark_phase_not_passing(state, run, phase, "needs_changes", &summary)?;
@@ -7314,7 +7369,7 @@ pub(crate) async fn conclude_review_round_with(
                 review_payload("NEEDS_CHANGES", Some("escalated"), &review),
             )?;
             let n = consecutive_non_pass_phase_rounds_in(&all_plan_events(state, run), phase_id);
-            escalate_phase(state, run, phase, n, &findings::escalation_reason(phase_id, &rows)).await
+            escalate_phase(state, run, phase, n, &findings::escalation_reason(phase_id, rows), digested).await
         }
         LedgerGate::NeedsChanges | LedgerGate::Blocked => {
             let blocked = gate == LedgerGate::Blocked;
@@ -7334,11 +7389,11 @@ pub(crate) async fn conclude_review_round_with(
             // Budget cap (kept as is): count includes the gate result just written.
             let n = consecutive_non_pass_phase_rounds_in(&all_plan_events(state, run), phase_id);
             if n >= MAX_REVISION_ROUNDS {
-                return escalate_phase_no_converge(state, run, phase, n, verdict, &summary).await;
+                return escalate_phase_no_converge(state, run, phase, n, verdict, &summary, digested).await;
             }
             let phase_path = Path::new(&run.plan.plan_path).join("phases").join(phase_id);
             if blocked && crate::services::task_loop::phase_is_kloo_mode(&phase_path) {
-                return park_kloo_review(state, run, phase, "BLOCKED", &review).await;
+                return park_kloo_review(state, run, phase, "BLOCKED", &review, digested).await;
             }
             let notes = blocked.then(|| {
                 format!(
@@ -7349,6 +7404,70 @@ pub(crate) async fn conclude_review_round_with(
             send_ledger_feedback_with(state, run, phase, round, notes, ctrl).await
         }
     }
+}
+
+/// What a review round leads to, decided BEFORE the gate routes, with the same rules the routing
+/// applies: a pass; an escalated finding, a parked kloo BLOCKED review or the round cap (the gate
+/// result about to be written makes `n + 1` non-passing rounds) → needs you; else needs changes.
+fn round_outcome(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    gate: findings::LedgerGate,
+    rows: &[findings::Finding],
+) -> findings::RoundOutcome {
+    use findings::{LedgerGate, RoundOutcome};
+    match gate {
+        LedgerGate::Pass | LedgerGate::PassWithFollowups => RoundOutcome::Passed {
+            plan_complete: run.plan.phase_run_mode != "single"
+                && !run.phases.iter().any(|p| p.phase_index == phase.phase_index + 1),
+        },
+        LedgerGate::Escalate => RoundOutcome::NeedsYou { escalated: findings::escalated_ids(rows) },
+        LedgerGate::NeedsChanges | LedgerGate::Blocked => {
+            let rounds = consecutive_non_pass_phase_rounds_in(&all_plan_events(state, run), &phase.phase_id) + 1;
+            let phase_path = Path::new(&run.plan.plan_path).join("phases").join(&phase.phase_id);
+            let parked = gate == LedgerGate::Blocked && crate::services::task_loop::phase_is_kloo_mode(&phase_path);
+            if rounds >= MAX_REVISION_ROUNDS || parked {
+                RoundOutcome::NeedsYou { escalated: Vec::new() }
+            } else {
+                RoundOutcome::NeedsChanges
+            }
+        }
+    }
+}
+
+/// "phase N/M": the phase's 1-based position among the run's phases.
+fn phase_position(run: &AgentPlanRun, phase: &AgentPlanPhase) -> findings::PhasePos {
+    let before = run.phases.iter().filter(|p| p.phase_index < phase.phase_index).count();
+    findings::PhasePos { n: before + 1, of: run.phases.len().max(before + 1) }
+}
+
+/// Post a round digest: to `ctrl.digest_sink` in tests, else to Discord through `notify_discord`
+/// (a no-op without a webhook) with the outcome's colour. The embed title is the headline without
+/// the plan title (the embed's Plan field names the plan). Fire-and-forget, like
+/// `maybe_notify_discord`. A test build with no sink posts nothing: no test can reach the network.
+/// `reason` (non-empty for a needs-you round) becomes the embed description; the sink receives it
+/// on a second line.
+fn post_round_digest(
+    state: &AppState,
+    plan_id: &str,
+    digest: &findings::RoundDigest,
+    reason: &str,
+    ctrl: &ReplanCtrl<'_>,
+) {
+    if let Some(sink) = ctrl.digest_sink {
+        let entry = if reason.is_empty() { digest.line() } else { format!("{}\n{reason}", digest.line()) };
+        sink.lock().unwrap().push(entry);
+        return;
+    }
+    if cfg!(test) {
+        return;
+    }
+    let (state, plan_id) = (state.clone(), plan_id.to_string());
+    let (severity, headline, reason) = (digest.outcome.severity(), digest.headline(), reason.to_string());
+    tokio::spawn(async move {
+        notify_discord(&state, &plan_id, severity, &headline, &reason).await;
+    });
 }
 
 fn consecutive_non_pass_phase_rounds_in(events: &[AgentPlanEvent], phase_id: &str) -> i64 {
@@ -9401,22 +9520,24 @@ async fn escalate_phase_no_converge(
     round: i64,
     verdict: &str,
     summary: &str,
+    digested: bool,
 ) -> Result<(), String> {
     let reason = format!(
         "Phase {} still not passing after {} review rounds (last: {} — {}). Coordinator paused — needs a human decision.",
         phase.phase_id, round, verdict, summary
     );
-    escalate_phase(state, run, phase, round, &reason).await
+    escalate_phase(state, run, phase, round, &reason, digested).await
 }
 
 /// Park a phase for a human, recording `reason` as the health message and on the
-/// event timeline.
+/// event timeline. `digested`: the round digest announces it (the event is marked `digest:true`).
 async fn escalate_phase(
     state: &AppState,
     run: &AgentPlanRun,
     phase: &AgentPlanPhase,
     round: i64,
     reason: &str,
+    digested: bool,
 ) -> Result<(), String> {
     let reason = reason.to_string();
     state.db.with_conn(|conn| {
@@ -9428,8 +9549,18 @@ async fn escalate_phase(
         &run.plan.id,
         Some(&phase.phase_id),
         "agent_phase_needs_attention",
-        json!({ "reason": reason, "rounds": round }),
+        digest_marked(json!({ "reason": reason, "rounds": round }), digested),
     )
+}
+
+/// `payload` plus `digest:true` when the round digest announces this event.
+fn digest_marked(mut payload: serde_json::Value, digested: bool) -> serde_json::Value {
+    if digested {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("digest".into(), true.into());
+        }
+    }
+    payload
 }
 
 /// Test seam for the planning → development handoff, mirroring [`ReplanCtrl`]. `spawn_dev: false`
@@ -9777,6 +9908,7 @@ async fn park_kloo_review(
     phase: &AgentPlanPhase,
     verdict: &str,
     review: &ReviewInsights,
+    digested: bool,
 ) -> Result<(), String> {
     let summary = review
         .summary
@@ -9796,12 +9928,15 @@ async fn park_kloo_review(
         &run.plan.id,
         Some(&phase.phase_id),
         "agent_phase_needs_attention",
-        json!({
-            "reason": "kloo_review",
-            "verdict": verdict,
-            "summary": review.summary,
-            "findings": review.findings,
-        }),
+        digest_marked(
+            json!({
+                "reason": "kloo_review",
+                "verdict": verdict,
+                "summary": review.summary,
+                "findings": review.findings,
+            }),
+            digested,
+        ),
     )
 }
 
@@ -9916,6 +10051,20 @@ async fn pass_phase(
     summary: &str,
     verdict: &str,
 ) -> Result<(), String> {
+    pass_phase_with(state, plan_id, phase_id, summary, verdict, false).await
+}
+
+/// [`pass_phase`], told whether the round's digest already announced the pass. `digested` marks the
+/// pass's `agent_phase_gate_result` and `agent_plan_completed` with `digest:true`, so Discord gets
+/// ONE post for the round (the digest) instead of the digest plus "phase passed".
+async fn pass_phase_with(
+    state: &AppState,
+    plan_id: &str,
+    phase_id: &str,
+    summary: &str,
+    verdict: &str,
+    digested: bool,
+) -> Result<(), String> {
     let run = get_plan(state, plan_id)?;
     let phase = find_phase(&run, phase_id)?;
     // The verdict the gate actually reached, not a literal 'pass' — a phase passed with
@@ -10006,7 +10155,7 @@ async fn pass_phase(
         plan_id,
         Some(phase_id),
         "agent_phase_gate_result",
-        json!({ "verdict": "PASS" }),
+        if digested { json!({ "verdict": "PASS", "digest": true }) } else { json!({ "verdict": "PASS" }) },
     )?;
 
     if should_continue {
@@ -10029,7 +10178,13 @@ async fn pass_phase(
             json!({}),
         )?;
         } else {
-            append_event(state, plan_id, None, "agent_plan_completed", json!({}))?;
+            append_event(
+                state,
+                plan_id,
+                None,
+                "agent_plan_completed",
+                if digested { json!({ "digest": true }) } else { json!({}) },
+            )?;
             // Feature 3: dev-only docs-commit agent — update + commit the app repo's
             // docs (commit only). Failures are logged + surfaced but never un-approve
             // the plan (it is already complete).
@@ -11917,6 +12072,11 @@ pub(crate) fn event_category(event_type: &str) -> &'static str {
         | "agent_finding_forced_followup"
         | "agent_finding_legacy_import"
         | "agent_finding_nudge"
+        | "agent_finding_disputed"
+        | "agent_finding_upheld"
+        | "agent_finding_withdrawn"
+        | "agent_finding_ready_refused"
+        | "agent_review_round_digest"
         | "agent_phase_ready_rejected_unclaimed_findings"
         | "agent_finding_call_rejected"
         | "agent_lens_verdict_mismatch"
@@ -12218,7 +12378,8 @@ pub(crate) fn event_summary(event: &AgentPlanEvent, payload: &serde_json::Value)
         "agent_plan_phases_refreshed" => "Refreshed phases from plan files".to_string(),
         t if t.starts_with("agent_finding_")
             || t == "agent_phase_ready_rejected_unclaimed_findings"
-            || t == "agent_lens_verdict_mismatch" =>
+            || t == "agent_lens_verdict_mismatch"
+            || t == "agent_review_round_digest" =>
         {
             finding_event_summary(t, payload).unwrap_or_else(|| humanize_event_type(t))
         }
@@ -12263,6 +12424,20 @@ fn finding_event_summary(event_type: &str, payload: &serde_json::Value) -> Optio
         "agent_finding_reopened" => format!("Finding {id} reopened{in_round}"),
         "agent_finding_escalated" => format!("Finding {id} escalated — same failure seen twice{in_round}"),
         "agent_finding_carried" => format!("Finding {id} carried as a follow-up"),
+        "agent_finding_disputed" => format!("Finding {id} disputed by the worker{in_round}"),
+        "agent_finding_upheld" => format!("Finding {id} upheld by {lens} — dispute rejected{in_round}"),
+        "agent_finding_withdrawn" => format!("Finding {id} withdrawn by {lens}{in_round}"),
+        "agent_finding_ready_refused" => {
+            let unanswered = payload
+                .get("unanswered")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or(ids.clone());
+            format!("Ready refused — unanswered findings {unanswered}")
+        }
+        "agent_review_round_digest" => {
+            payload_str(payload, "line").map(|l| format!("Round digest: {l}")).unwrap_or_else(|| "Round digest".into())
+        }
         "agent_finding_forced_followup" => {
             format!("Finding {id} from {lens} stored as a follow-up{in_round}")
         }
@@ -18596,6 +18771,7 @@ mod replan_tests {
             skip_execute: true,
             spawn_log: Some(spawn_log),
             worker_sink: None,
+            digest_sink: None,
         }
     }
 
@@ -21083,6 +21259,8 @@ mod ledger_loop_tests {
         state: AppState,
         plan: PathBuf,
         id: String,
+        /// Digest lines `conclude_review_round_with` would have posted to Discord (the seam).
+        digests: Mutex<Vec<String>>,
     }
 
     /// A claude-worker (non-kloo) development plan with one phase `00-x`, single-phase mode,
@@ -21133,7 +21311,7 @@ mod ledger_loop_tests {
         register_review_session(&state, &id, PR, "pr").unwrap();
         append_event(&state, &id, Some("00-x"), "agent_phase_started", json!({})).unwrap();
         append_event(&state, &id, Some("00-x"), "agent_phase_review_started", json!({})).unwrap();
-        Fx { state, plan, id }
+        Fx { state, plan, id, digests: Mutex::new(Vec::new()) }
     }
 
     impl Fx {
@@ -21179,7 +21357,7 @@ mod ledger_loop_tests {
             ledger::claim_fix(&self.state, W, id, "fixed it; cargo test x passes").unwrap();
         }
         async fn conclude(&self, reports: Vec<(&str, AgentReport)>, lenses: &[ValidationLens], sink: &Mutex<Vec<String>>) {
-            let ctrl = sink_ctrl(sink);
+            let ctrl = ReplanCtrl { digest_sink: Some(&self.digests), ..sink_ctrl(sink) };
             let reports = reports.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
             conclude_review_round_with(&self.state, &self.run(), &self.phase(), reports, lenses, &ctrl)
                 .await
@@ -21196,6 +21374,7 @@ mod ledger_loop_tests {
             skip_execute: true,
             spawn_log: None,
             worker_sink: Some(sink),
+            digest_sink: None,
         }
     }
 
@@ -21434,12 +21613,16 @@ mod ledger_loop_tests {
         let sink = Mutex::new(Vec::new());
         let bounced = unclaimed_findings_ready_gate(&f.state, &f.run(), W, &f.phase(), Some(&sink)).await.unwrap();
         assert!(bounced);
-        let nudge = f.events("agent_finding_nudge");
-        assert_eq!((nudge[0]["reason"].as_str(), nudge[0]["ids"][0].as_str()), (Some("unclaimed_blocking"), Some(id.as_str())));
+        let refused = f.events("agent_finding_ready_refused");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["unanswered"], json!([id]));
+        assert!(f.events("agent_finding_nudge").is_empty(), "the ready refusal has its own event");
         assert_eq!(f.events("agent_phase_ready_rejected_unclaimed_findings").len(), 1);
         let sent = sink.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains(&id) && sent[0].contains("claimFix("), "{}", sent[0]);
+        for call in ["claimFix(", "proposeWaiver(", "disputeFinding("] {
+            assert!(sent[0].contains(&id) && sent[0].contains(call), "{call}: {}", sent[0]);
+        }
         drop(sent);
         // Once claimed, the gate lets the ready through.
         f.claim(&id);
@@ -21769,6 +21952,17 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         let reason = f.events("agent_phase_needs_attention").last().unwrap()["reason"].as_str().unwrap().to_string();
         assert!(reason.contains(&b2), "needs_attention names #2: {reason}");
         assert_eq!(sink.lock().unwrap().len(), 2, "an escalated round is not sent back to the worker");
+        let last = f.events("agent_review_round_digest").last().unwrap().clone();
+        let line = last["line"].as_str().unwrap();
+        assert!(line.ends_with(&format!("⚠ needs you: escalated {b2}")), "{last}");
+        assert!(line.contains("1 → 0 open · 1 escalated"), "an escalation never reads as a clean '→ 0 open': {line}");
+        assert_eq!(last["outcome"]["kind"], "needsYou");
+        // ONE post for the needs-you round: the digest, carrying the park reason.
+        let na = f.events("agent_phase_needs_attention").last().unwrap().clone();
+        assert_eq!(na["digest"], true);
+        assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &na).is_none());
+        let posted = f.digests.lock().unwrap().last().unwrap().clone();
+        assert!(posted.starts_with(line) && posted.contains("review is not converging") && posted.contains(&b2), "{posted}");
         no_worker_tmux();
     }
 
@@ -21799,6 +21993,359 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert_eq!(f.plan_status(), "approved", "single-phase run: phase passed");
         assert_eq!(sink.lock().unwrap().len(), 1, "only R1 was sent back");
         no_worker_tmux();
+    }
+
+    // ── "J1 runs the new workflow", part 1: ready refusal, disputes, red-first, round digest ──
+
+    fn digests(f: &Fx) -> Vec<serde_json::Value> {
+        f.events("agent_review_round_digest")
+    }
+
+    /// Ready from the worker through the real gate; `true` = refused.
+    async fn ready(f: &Fx, nudges: &Mutex<Vec<String>>) -> bool {
+        f.status("phase_worker_running");
+        unclaimed_findings_ready_gate(&f.state, &f.run(), W, &f.phase(), Some(nudges)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn workflow_scenario_three_rounds_ready_dispute_digest() {
+        no_worker_tmux();
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        let nudges = Mutex::new(Vec::new());
+
+        // R1: qa files 3 BLOCKING + 1 FOLLOWUP, NEEDS_CHANGES.
+        let b1 = report(&f, Severity::Blocking, "save drops where_", "where_ missing");
+        let b2 = report(&f, Severity::Blocking, "update loses where_", "where_ empty");
+        let b3 = report(&f, Severity::Blocking, "fence is missing", "no test");
+        let fu = report(&f, Severity::Followup, "rename save helper", "name is vague");
+        f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(gate(&f), "NEEDS_CHANGES");
+        assert!(sink.lock().unwrap()[0].contains("disputeFinding("), "the feedback offers the dispute call");
+
+        // Ready while all three are unanswered: refused, with the ids and the three call templates.
+        assert!(ready(&f, &nudges).await, "ready refused while blockers are unanswered");
+        let refused = f.events("agent_finding_ready_refused");
+        assert_eq!(refused[0]["unanswered"], json!([b1, b2, b3]));
+        {
+            let n = nudges.lock().unwrap();
+            for needle in [b1.as_str(), b2.as_str(), b3.as_str(), "claimFix(", "proposeWaiver(", "disputeFinding("] {
+                assert!(n[0].contains(needle), "{needle}: {}", n[0]);
+            }
+        }
+        // Answer two of them: still refused, naming only the unanswered one.
+        ledger::claim_fix_with_proof(
+            &f.state, W, &b1, "apply writes where_",
+            ledger::RedFirstInput { test: Some("save::keeps_where"), broke_what: Some("dropped the where_ write"), red_output: Some("assertion `left == right` failed") },
+        )
+        .unwrap();
+        ledger::dispute_finding(&f.state, W, &b2, "update copies where_ at save.rs:57").unwrap();
+        assert!(ready(&f, &nudges).await);
+        assert_eq!(f.events("agent_finding_ready_refused")[1]["unanswered"], json!([b3]));
+        // Answer the last one: the ready is accepted.
+        ledger::dispute_finding(&f.state, W, &b3, "the brief names the fence: cargo test save_").unwrap();
+        assert!(!ready(&f, &nudges).await, "ready accepted once every blocker is answered");
+        assert_eq!(f.events("agent_phase_ready_rejected_unclaimed_findings").len(), 2, "both refusals counted by the bounce cap");
+
+        // R2: VERIFIED #1 (red-first), UPHOLD #2, WITHDRAW #3.
+        f.next_round();
+        ledger::resolve_finding(&f.state, QA, &b1, Outcome::Verified, None).unwrap();
+        ledger::resolve_finding(&f.state, QA, &b2, Outcome::Uphold, Some("save.rs:57 copies where_ only when set")).unwrap();
+        ledger::resolve_finding(&f.state, QA, &b3, Outcome::Withdraw, None).unwrap();
+        assert_eq!(ledger::get(&f.state, &f.id, &b2).unwrap().state, "open");
+        assert_eq!(ledger::get(&f.state, &f.id, &b3).unwrap().state, "withdrawn");
+        f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        let r2 = f.events("agent_phase_gate_result").last().unwrap().clone();
+        assert_eq!(r2["verdict"], "NEEDS_CHANGES");
+        assert!(r2["summary"].as_str().unwrap().contains("red-first 1/1"), "{r2}");
+        {
+            let sent = sink.lock().unwrap();
+            let p = sent.last().unwrap();
+            let block = &p[p.find(&format!("### {b2} [qa]")).expect("upheld #2 is sent back")..];
+            assert!(block.contains("dispute: update copies where_ at save.rs:57"), "the dispute is a dead end: {block}");
+            assert!(!p.contains(&format!("### {b3} [qa]")), "a withdrawn finding is not sent back: {p}");
+        }
+
+        // The upheld finding cannot be disputed again; it is fixed (a test, but no red output).
+        f.status("phase_worker_running");
+        assert!(ledger::dispute_finding(&f.state, W, &b2, "still wrong").unwrap_err().contains("already upheld"));
+        ledger::claim_fix_with_proof(
+            &f.state, W, &b2, "update copies where_ always",
+            ledger::RedFirstInput { test: Some("save::update_keeps_where"), broke_what: None, red_output: None },
+        )
+        .unwrap();
+        assert_eq!(ledger::get(&f.state, &f.id, &b2).unwrap().red_first, Some(false));
+        assert!(!ready(&f, &nudges).await);
+
+        // R3: VERIFIED #2 → PASS_WITH_FOLLOWUPS (the follow-up is carried).
+        f.next_round();
+        ledger::resolve_finding(&f.state, QA, &b2, Outcome::Verified, None).unwrap();
+        f.conclude(vec![("qa", verdict("PASS_WITH_FOLLOWUPS", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "approved");
+        assert_eq!(ledger::get(&f.state, &f.id, &fu).unwrap().state, "carried");
+
+        // One digest per round, with the counts, recorded AND handed to the Discord seam.
+        let d = digests(&f);
+        let lines: Vec<String> = d.iter().map(|e| e["line"].as_str().unwrap().to_string()).collect();
+        let title = f.run().plan.title;
+        assert_eq!(
+            lines,
+            vec![
+                format!("{title} · phase 1/1 (00-x) r1: 0 → 3 open · 1 follow-up → needs changes"),
+                format!("{title} · phase 1/1 (00-x) r2: 3 → 1 open · +1 verified · 1 dispute upheld · 1 withdrawn · 1 follow-up · red-first 1/1 → needs changes"),
+                format!("{title} · phase 1/1 (00-x) r3: 1 → 0 open · +1 verified · 1 follow-up · red-first 1/2 ✅ passed"),
+            ]
+        );
+        assert_eq!(
+            d.iter().map(|e| (e["round"].as_i64().unwrap(), e["gate"].as_str().unwrap().to_string())).collect::<Vec<_>>(),
+            vec![(1, "NEEDS_CHANGES".into()), (2, "NEEDS_CHANGES".into()), (3, "PASS_WITH_FOLLOWUPS".into())]
+        );
+        assert_eq!(*f.digests.lock().unwrap(), lines, "every digest goes through the post seam, once");
+        no_worker_tmux();
+    }
+
+    #[tokio::test]
+    async fn workflow_stream_lens_round3_rephrased_dispute_stays_blocking() {
+        let f = fx();
+        let lenses = vec![lens("glm", "lokalai", true)];
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", "- the save drops where_"))], &lenses, &sink).await;
+        let id = f.rows()[0].id.clone();
+        f.status("phase_worker_running");
+        ledger::dispute_finding(&f.state, W, &id, "save.rs:42 writes where_").unwrap();
+        f.next_round();
+        f.next_round();
+        assert_eq!(ledger::current_round(&f.state, &f.id, "00-x"), 3);
+        let text = format!("The dispute is wrong.\n- {id} still stands: update drops where_ too\nVERDICT: NEEDS_CHANGES");
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &text))], &lenses, &sink).await;
+        let rows = f.rows();
+        assert_eq!(rows.len(), 1, "the rephrased bullet is not imported as a new finding: {rows:?}");
+        assert_eq!((rows[0].state.as_str(), rows[0].severity.as_str()), ("open", "blocking"), "upheld, still blocking");
+        assert!(f.events("agent_finding_withdrawn").is_empty());
+        assert!(f.events("agent_finding_forced_followup").is_empty());
+        assert_eq!(f.events("agent_finding_upheld")[0]["saw"], format!("{id} still stands: update drops where_ too"));
+        assert_eq!(gate(&f), "NEEDS_CHANGES");
+    }
+
+    #[tokio::test]
+    async fn workflow_dispute_from_a_removed_lens_is_recovered_by_a_human() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        let id = f.typed(QA, "drops where_");
+        f.status("phase_worker_running");
+        ledger::dispute_finding(&f.state, W, &id, "where_ is written").unwrap();
+        // qa left the panel: only pr reviews now, and nobody can rule on the dispute.
+        let pr_only = vec![lens("pr", "claude_code", true)];
+        f.next_round();
+        f.conclude(vec![("pr", verdict("PASS", ""))], &pr_only, &sink).await;
+        assert_eq!(gate(&f), "NEEDS_CHANGES", "the stuck dispute blocks");
+        ledger::override_finding(&f.state, &f.id, &id, ledger::Override::Withdraw, "qa lens removed; worker is right").unwrap();
+        assert_eq!(ledger::get(&f.state, &f.id, &id).unwrap().state, "withdrawn");
+        f.next_round();
+        f.conclude(vec![("pr", verdict("PASS", ""))], &pr_only, &sink).await;
+        assert_eq!(f.plan_status(), "approved", "recovered: the phase passes");
+    }
+
+    #[tokio::test]
+    async fn workflow_pass_round_posts_to_discord_once() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        let id = f.typed(QA, "drops where_");
+        f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        f.claim(&id);
+        f.next_round();
+        let before = list_events(&f.state, &f.id, 100_000).unwrap().len();
+        ledger::resolve_finding(&f.state, QA, &id, Outcome::Verified, None).unwrap();
+        f.conclude(vec![("qa", verdict("PASS", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "approved");
+        let round: Vec<AgentPlanEvent> = list_events(&f.state, &f.id, 100_000).unwrap().into_iter().skip(before).collect();
+        let generic: Vec<String> = round
+            .iter()
+            .filter_map(|e| {
+                let p: serde_json::Value = serde_json::from_str(&e.payload_json).unwrap();
+                discord_message_for(&e.event_type, e.phase_id.as_deref(), &p).map(|m| m.1)
+            })
+            .collect();
+        assert!(generic.is_empty(), "no generic Discord post on a digested pass: {generic:?}");
+        let digests = f.digests.lock().unwrap();
+        assert_eq!(digests.len(), 2, "one digest per round: {digests:?}");
+        assert!(digests[1].ends_with("✅ passed"), "{}", digests[1]);
+        // A pass that did NOT come through a digested round still announces itself.
+        assert!(discord_message_for("agent_phase_gate_result", Some("00-x"), &json!({ "verdict": "PASS" })).is_some());
+        assert!(discord_message_for("agent_plan_completed", None, &json!({})).is_some());
+        assert!(discord_message_for("agent_plan_completed", None, &json!({ "digest": true })).is_none());
+    }
+
+    /// Make the next insert of an event of type `ty` fail (a DB trigger): a fault seam for tests.
+    fn fail_event_inserts(f: &Fx, ty: &str) {
+        f.state
+            .db
+            .with_conn(|conn| {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_{ty} BEFORE INSERT ON agent_plan_events WHEN NEW.type = '{ty}' \
+                     BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+                ))
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_failed_digest_keeps_the_generic_pass_post() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        fail_event_inserts(&f, "agent_review_round_digest");
+        f.conclude(vec![("qa", verdict("PASS", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "approved", "a failed digest never fails the round");
+        assert!(f.digests.lock().unwrap().is_empty());
+        let pass = f.events("agent_phase_gate_result").last().unwrap().clone();
+        assert!(pass.get("digest").is_none(), "no digest → the pass is not marked: {pass}");
+        assert!(discord_message_for("agent_phase_gate_result", Some("00-x"), &pass).is_some(), "the generic post stays on");
+    }
+
+    #[tokio::test]
+    async fn workflow_digest_is_not_posted_when_the_routing_fails() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        fail_event_inserts(&f, "agent_phase_gate_result");
+        let reports = vec![("qa".to_string(), verdict("PASS", "")), ("pr".to_string(), verdict("PASS", ""))];
+        let ctrl = ReplanCtrl { digest_sink: Some(&f.digests), ..sink_ctrl(&sink) };
+        let err = conclude_review_round_with(&f.state, &f.run(), &f.phase(), reports, &qa_pr(), &ctrl).await.unwrap_err();
+        assert!(err.contains("injected failure"), "{err}");
+        assert!(f.digests.lock().unwrap().is_empty(), "a pass that failed half-way is never announced");
+    }
+
+    #[tokio::test]
+    async fn workflow_stream_lens_naming_a_claimed_id_reopens_it_and_keeps_the_new_objection() {
+        let f = fx();
+        let lenses = vec![lens("glm", "lokalai", true)];
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", "- the save drops where_"))], &lenses, &sink).await;
+        let id = f.rows()[0].id.clone();
+        f.claim(&id);
+        f.next_round();
+        let text = format!("- {id} is now fine; but the new endpoint leaks tokens");
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &text))], &lenses, &sink).await;
+        let rows = f.rows();
+        assert_eq!(ledger::get(&f.state, &f.id, &id).unwrap().state, "reopened", "fail-safe: {rows:?}");
+        let new = rows.iter().find(|r| r.id != id).expect("the objection is imported");
+        assert_eq!((new.claim.as_str(), new.severity.as_str(), new.state.as_str()), (&text[2..], "blocking", "open"));
+        assert_eq!(gate(&f), "NEEDS_CHANGES");
+    }
+
+    #[tokio::test]
+    async fn workflow_round3_reworded_rejection_of_a_claimed_fix_never_passes() {
+        let f = fx();
+        let lenses = vec![lens("glm", "lokalai", true)];
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", "- the save drops where_"))], &lenses, &sink).await;
+        let id = f.rows()[0].id.clone();
+        f.claim(&id);
+        f.next_round();
+        f.next_round();
+        assert_eq!(ledger::current_round(&f.state, &f.id, "00-x"), 3);
+        let bullet = format!("{id} still fails: where_ is empty after an update");
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &format!("- {bullet}")))], &lenses, &sink).await;
+        let row = ledger::get(&f.state, &f.id, &id).unwrap();
+        assert_eq!((row.state.as_str(), row.last_saw.as_deref()), ("reopened", Some(bullet.as_str())), "not verified");
+        assert!(f.events("agent_finding_verified").is_empty());
+        assert_eq!(gate(&f), "NEEDS_CHANGES", "the gate does not pass a fix the lens rejected");
+        assert_ne!(f.plan_status(), "approved");
+        // The bullet is still kept, as a round-3 follow-up.
+        assert!(f.rows().iter().any(|r| r.id != id && r.claim == bullet && r.severity == "followup"));
+    }
+
+    #[tokio::test]
+    async fn workflow_manual_pass_still_posts_to_discord() {
+        let f = fx();
+        pass_phase(&f.state, &f.id, "00-x", "Manual pass", "PASS").await.unwrap();
+        let pass = f.events("agent_phase_gate_result").last().unwrap().clone();
+        assert!(pass.get("digest").is_none(), "{pass}");
+        assert!(discord_message_for("agent_phase_gate_result", Some("00-x"), &pass).is_some());
+    }
+
+    #[tokio::test]
+    async fn workflow_round_cap_is_a_needs_you_digest() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        f.typed(QA, "drops where_");
+        for r in 1..=MAX_REVISION_ROUNDS {
+            if r > 1 {
+                f.next_round();
+            }
+            f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        }
+        assert_eq!(f.plan_status(), "needs_attention");
+        let d = digests(&f);
+        assert!(d[d.len() - 2]["line"].as_str().unwrap().ends_with("→ needs changes"));
+        let last = d.last().unwrap();
+        assert!(last["line"].as_str().unwrap().ends_with("⚠ needs you"), "{last}");
+        let posted = f.digests.lock().unwrap().last().unwrap().clone();
+        assert!(posted.contains("still not passing after 6 review rounds"), "the reason rides in the post: {posted}");
+        assert_eq!(f.events("agent_phase_needs_attention").last().unwrap()["digest"], true);
+    }
+
+    #[tokio::test]
+    async fn workflow_parked_kloo_review_is_a_needs_you_digest() {
+        let f = fx();
+        std::fs::write(f.plan.join("phases/00-x/tasks/01-a/task.yml"), "id: 01-a\n").unwrap();
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("qa", verdict("BLOCKED", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "needs_attention");
+        let last = digests(&f).last().unwrap().clone();
+        assert!(last["line"].as_str().unwrap().ends_with("⚠ needs you"), "{last}");
+        let na = f.events("agent_phase_needs_attention").last().unwrap().clone();
+        assert_eq!((na["reason"].as_str(), na["digest"].as_bool()), (Some("kloo_review"), Some(true)));
+        // W-3-28: the one post carries the kloo park reason (the plan's error = the review summary).
+        let posted = f.digests.lock().unwrap().last().unwrap().clone();
+        let (line, reason) = posted.split_once('\n').expect("a reason line");
+        assert!(line.ends_with("⚠ needs you"), "{posted}");
+        assert!(reason.contains("2-lens review") && reason.contains("qa: BLOCKED"), "{posted}");
+    }
+
+    #[test]
+    fn workflow_needs_attention_from_other_paths_still_posts() {
+        assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &json!({ "reason": "task_failed" })).is_some());
+        assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &json!({ "reason": "x", "digest": true })).is_none());
+    }
+
+    #[test]
+    fn workflow_digest_post_without_a_sink_never_spawns_in_tests() {
+        // No tokio runtime here: a spawn would panic. With no sink, a test build posts nothing.
+        let f = fx();
+        let digest = ledger::round_digest(
+            "p", "00-x", ledger::PhasePos { n: 1, of: 1 }, 1, 0, ledger::RoundActivity::default(), &[], "PASS",
+            ledger::RoundOutcome::Passed { plan_complete: false },
+        );
+        post_round_digest(&f.state, &f.id, &digest, "", &ReplanCtrl::live());
+    }
+
+    #[test]
+    fn workflow_new_events_have_readable_summaries() {
+        let summary = |ty: &str, payload: serde_json::Value| {
+            let event = AgentPlanEvent {
+                id: "e".into(), plan_id: "p".into(), phase_id: Some("00-x".into()), phase_index: None, phase_title: None,
+                event_type: ty.into(), actor: String::new(), category: String::new(), summary: String::new(),
+                status_before: None, status_after: None, reason: None, verdict: None, task_id: None,
+                clarification_attempt: None, payload_json: payload.to_string(), created_at: String::new(),
+            };
+            assert_eq!(event_category(ty), "phase", "{ty}");
+            event_summary(&event, &payload)
+        };
+        assert_eq!(
+            summary("agent_finding_ready_refused", json!({ "unanswered": ["F-00-x-1", "F-00-x-3"] })),
+            "Ready refused — unanswered findings F-00-x-1, F-00-x-3"
+        );
+        assert_eq!(
+            summary("agent_review_round_digest", json!({ "line": "P · 00-x r2: 3 → 1 open" })),
+            "Round digest: P · 00-x r2: 3 → 1 open"
+        );
+        assert_eq!(summary("agent_finding_disputed", json!({ "id": "F-1", "round": 2 })), "Finding F-1 disputed by the worker (round 2)");
+        assert_eq!(summary("agent_finding_upheld", json!({ "id": "F-1", "lens": "qa" })), "Finding F-1 upheld by qa — dispute rejected");
+        assert_eq!(summary("agent_finding_withdrawn", json!({ "id": "F-1", "lens": "qa" })), "Finding F-1 withdrawn by qa");
+        // The digest reaches Discord through its own seam, never through the generic event mapper
+        // (that would post it twice).
+        assert!(discord_message_for("agent_review_round_digest", Some("00-x"), &json!({ "line": "x" })).is_none());
     }
 }
 

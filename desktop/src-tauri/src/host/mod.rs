@@ -281,13 +281,17 @@ impl From<FindingSeverity> for findings_service::Severity {
     }
 }
 
-/// A lens's decision on a claimed fix or a proposed waiver.
+/// A lens's decision on a claimed fix, a proposed waiver or a dispute.
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
 enum FindingOutcome {
     Verified,
     Reopened,
     AcceptWaiver,
     RejectWaiver,
+    /// The disputed finding stands: back to open with the lens's `saw`.
+    Uphold,
+    /// The disputed finding is withdrawn (terminal, not blocking).
+    Withdraw,
 }
 
 impl From<FindingOutcome> for findings_service::Outcome {
@@ -297,6 +301,8 @@ impl From<FindingOutcome> for findings_service::Outcome {
             FindingOutcome::Reopened => findings_service::Outcome::Reopened,
             FindingOutcome::AcceptWaiver => findings_service::Outcome::AcceptWaiver,
             FindingOutcome::RejectWaiver => findings_service::Outcome::RejectWaiver,
+            FindingOutcome::Uphold => findings_service::Outcome::Uphold,
+            FindingOutcome::Withdraw => findings_service::Outcome::Withdraw,
         }
     }
 }
@@ -307,6 +313,8 @@ enum FindingOverride {
     AcceptWaiver,
     RejectWaiver,
     Reopen,
+    /// Withdraw a disputed finding whose lens will never rule (e.g. it left the panel).
+    Withdraw,
 }
 
 impl From<FindingOverride> for findings_service::Override {
@@ -315,6 +323,7 @@ impl From<FindingOverride> for findings_service::Override {
             FindingOverride::AcceptWaiver => findings_service::Override::AcceptWaiver,
             FindingOverride::RejectWaiver => findings_service::Override::RejectWaiver,
             FindingOverride::Reopen => findings_service::Override::Reopen,
+            FindingOverride::Withdraw => findings_service::Override::Withdraw,
         }
     }
 }
@@ -393,16 +402,44 @@ impl MutationRoot {
 
     /// Findings ledger (phase worker only): claim a blocking finding of the current phase is
     /// fixed, with the evidence (what changed + the command that proves it). Call it before
-    /// `reportAgentResult(kind:"ready")`.
+    /// `reportAgentResult(kind:"ready")`. Red-first proof (optional, encouraged): `test` (the test
+    /// that proves the fix), `brokeWhat` (the line broken to watch it fail) and `redOutput` (its
+    /// failing output; sanitized, kept to 2 KB). Without `test` AND `redOutput` the claim is
+    /// recorded `red_first: false`.
+    #[allow(clippy::too_many_arguments)]
     async fn claim_fix(
         &self,
         ctx: &Context<'_>,
         session_id: String,
         finding_id: String,
         evidence: String,
+        test: Option<String>,
+        broke_what: Option<String>,
+        red_output: Option<String>,
     ) -> async_graphql::Result<bool> {
         let state = ctx.data_unchecked::<AppState>();
-        findings_service::claim_fix(state, &session_id, &finding_id, &evidence)
+        let proof = findings_service::RedFirstInput {
+            test: test.as_deref(),
+            broke_what: broke_what.as_deref(),
+            red_output: red_output.as_deref(),
+        };
+        findings_service::claim_fix_with_proof(state, &session_id, &finding_id, &evidence, proof)
+            .map_err(async_graphql::Error::new)?;
+        Ok(true)
+    }
+
+    /// Findings ledger (phase worker only): dispute a blocking finding of the current phase — it
+    /// is wrong — with the reason and its evidence. The filing lens must rule on it next round:
+    /// `resolveFinding(outcome: UPHOLD | WITHDRAW)`.
+    async fn dispute_finding(
+        &self,
+        ctx: &Context<'_>,
+        session_id: String,
+        finding_id: String,
+        reason: String,
+    ) -> async_graphql::Result<bool> {
+        let state = ctx.data_unchecked::<AppState>();
+        findings_service::dispute_finding(state, &session_id, &finding_id, &reason)
             .map_err(async_graphql::Error::new)?;
         Ok(true)
     }
@@ -422,9 +459,9 @@ impl MutationRoot {
         Ok(true)
     }
 
-    /// Findings ledger (the filing lens only): VERIFIED / REOPENED a claimed fix, or
-    /// ACCEPT_WAIVER / REJECT_WAIVER a proposed waiver. REOPENED and REJECT_WAIVER need `saw`
-    /// (the command and output line you observed this round).
+    /// Findings ledger (the filing lens only): VERIFIED / REOPENED a claimed fix,
+    /// ACCEPT_WAIVER / REJECT_WAIVER a proposed waiver, or UPHOLD / WITHDRAW a dispute. REOPENED,
+    /// REJECT_WAIVER and UPHOLD need `saw` (the command and output line you observed this round).
     async fn resolve_finding(
         &self,
         ctx: &Context<'_>,
@@ -1564,7 +1601,8 @@ mod router_tests {
         let sdl = super::schema_sdl();
         for needle in [
             "reportFinding(sessionId: String!, severity: FindingSeverity!, claim: String!, expected: String!, saw: String!, where: String!, fence: String!): String!",
-            "claimFix(sessionId: String!, findingId: String!, evidence: String!): Boolean!",
+            "claimFix(sessionId: String!, findingId: String!, evidence: String!, test: String, brokeWhat: String, redOutput: String): Boolean!",
+            "disputeFinding(sessionId: String!, findingId: String!, reason: String!): Boolean!",
             "proposeWaiver(sessionId: String!, findingId: String!, reason: String!): Boolean!",
             "resolveFinding(sessionId: String!, findingId: String!, outcome: FindingOutcome!, saw: String): Boolean!",
             "overrideFinding(planId: String!, findingId: String!, action: FindingOverride!, reason: String!): Boolean!",
@@ -1573,6 +1611,8 @@ mod router_tests {
             "enum FindingOverride",
             "ACCEPT_WAIVER",
             "REJECT_WAIVER",
+            "UPHOLD",
+            "WITHDRAW",
             "reportAgentResult(",
         ] {
             assert!(sdl.contains(needle), "SDL missing {needle:?}:\n{sdl}");
@@ -1710,6 +1750,47 @@ mod router_tests {
         assert!(mirror.contains("\"state\": \"claimed\""), "{mirror}");
     }
 
+    #[tokio::test]
+    async fn finding_mutation_red_first_claim_and_dispute_round_trip() {
+        let (state, store) = ledger_fixture("phase_review_running");
+        send(&state, agent_post(&report_q(test_seed::QA, "drops where_"))).await;
+        send(&state, agent_post(&report_q(test_seed::QA, "loses fence"))).await;
+        test_seed::set_status(&state, "phase_worker_running");
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{claimFix(sessionId:"{}",findingId:"F-00-x-1",evidence:"kept where_",test:"x::keeps_where",brokeWhat:"dropped the write",redOutput:"assertion failed")}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["claimFix"], true, "{v}");
+        let f = ledger::get(&state, test_seed::PLAN, "F-00-x-1").unwrap();
+        assert_eq!((f.red_first, f.claim_test.as_deref()), (Some(true), Some("x::keeps_where")));
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{disputeFinding(sessionId:"{}",findingId:"F-00-x-2",reason:"the fence is in tests/x.rs:9")}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["disputeFinding"], true, "{v}");
+        let mirror = std::fs::read_to_string(store.join("phases/00-x/findings.json")).unwrap();
+        assert!(mirror.contains("\"state\": \"disputed\"") && mirror.contains("\"redFirst\": true"), "{mirror}");
+        test_seed::set_status(&state, "phase_review_running");
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{resolveFinding(sessionId:"{}",findingId:"F-00-x-2",outcome:WITHDRAW)}}"#,
+                test_seed::QA
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["resolveFinding"], true, "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, "F-00-x-2").unwrap().state, "withdrawn");
+    }
+
     fn waive_proposed(state: &AppState) -> String {
         let id = ledger::report_finding(state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
         test_seed::set_status(state, "phase_worker_running");
@@ -1744,6 +1825,25 @@ mod router_tests {
         let ev = test_seed::events_of(&state, "agent_finding_waived");
         assert_eq!(ev[0]["actor"], "human");
         assert!(ev[0].to_string().contains(r#"actor":"human"#));
+    }
+
+    #[tokio::test]
+    async fn finding_mutation_override_withdraw_from_webview_and_refused_from_foreign_origin() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let id = ledger::report_finding(&state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
+        test_seed::set_status(&state, "phase_worker_running");
+        ledger::dispute_finding(&state, test_seed::WORKER, &id, "wrong").unwrap();
+        let q = format!(
+            r#"mutation{{overrideFinding(planId:"{}",findingId:"{id}",action:WITHDRAW,reason:"qa lens removed")}}"#,
+            test_seed::PLAN
+        );
+        let v = send(&state, origin_post("http://localhost:3000", &q)).await;
+        assert!(first_error(&v).contains("JohnnyOne app itself"), "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "disputed");
+        let v = send(&state, origin_post("tauri://localhost", &q)).await;
+        assert_eq!(v["data"]["overrideFinding"], true, "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "withdrawn");
+        assert_eq!(test_seed::events_of(&state, "agent_finding_withdrawn")[0]["actor"], "human");
     }
 
     #[tokio::test]

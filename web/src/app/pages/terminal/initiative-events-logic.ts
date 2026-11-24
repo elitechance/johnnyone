@@ -46,7 +46,49 @@ const MILESTONE_TYPES = new Set<string>([
   'agent_phase_task_failed',
   'planning_check_failed',
   'agent_phase_preflight_failed',
+  // One code-built line per phase review round: `<plan> · phase N/M (slug) rR: open → open · this round's
+  // verified / disputes ruled · follow-ups · red-first n/m <outcome>` (→ needs changes / ✅ passed / ⚠ needs you).
+  'agent_review_round_digest',
 ]);
+
+/** Readable labels for event types the timeline must never show raw. The backend `summary` wins when
+ *  present; this map is the fallback (an older host, or an empty summary). */
+export const EVENT_LABELS: Readonly<Record<string, string>> = {
+  agent_review_round_digest: 'Review round digest',
+  agent_finding_ready_refused: 'Ready refused — unanswered findings',
+  agent_finding_disputed: 'Finding disputed by the worker',
+  agent_finding_upheld: 'Dispute rejected — finding upheld',
+  agent_finding_withdrawn: 'Finding withdrawn',
+};
+
+/** Parse `payloadJson` to an object, or `{}` (tolerant of bad JSON). */
+function payloadOf(payloadJson: string | null | undefined): Record<string, unknown> {
+  if (!payloadJson) return {};
+  try {
+    const parsed = JSON.parse(payloadJson) as unknown;
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The row title: the backend summary; else, for the labelled types, the label plus the payload's
+ *  detail (the digest's `line`, the refused `unanswered` ids); else the raw type. */
+export function eventLabel(ev: Pick<AgentPlanEvent, 'eventType' | 'summary' | 'payloadJson'>): string {
+  const summary = (ev.summary ?? '').trim();
+  if (summary) return summary;
+  const label = EVENT_LABELS[ev.eventType];
+  if (!label) return ev.eventType;
+  const payload = payloadOf(ev.payloadJson);
+  if (ev.eventType === 'agent_review_round_digest' && typeof payload['line'] === 'string' && payload['line'].trim()) {
+    return `${label}: ${payload['line'].trim()}`;
+  }
+  const ids = payload['unanswered'];
+  if (ev.eventType === 'agent_finding_ready_refused' && Array.isArray(ids) && ids.length) {
+    return `${label} ${ids.filter((id) => typeof id === 'string').join(', ')}`;
+  }
+  return label;
+}
 
 /** Map an event_type → the SDLC stage its row belongs under. */
 export function stageOf(eventType: string, category: string): TimelineStage {
@@ -55,7 +97,11 @@ export function stageOf(eventType: string, category: string): TimelineStage {
     case 'agent_lens_review_started':
     case 'agent_lens_verdict':
     case 'agent_phase_gate_result':
+    case 'agent_review_round_digest':
       return 'review';
+    // The worker's ready was refused: still the development stage (the worker owes answers).
+    case 'agent_finding_ready_refused':
+      return 'development';
     case 'agent_plan_completed':
     case 'agent_single_phase_completed':
       return 'done';
@@ -145,7 +191,7 @@ export function initiativeTimeline(events: AgentPlanEvent[] | null | undefined):
       stage: stageOf(ev.eventType, ev.category),
       actor: (ev.actor ?? '').trim(),
       actorLabel: actorLabel(ev.actor),
-      title: (ev.summary ?? '').trim() || ev.eventType,
+      title: eventLabel(ev),
       phaseLabel: phaseLabelOf(ev),
       lens: lensOf(ev.payloadJson),
       verdict,
