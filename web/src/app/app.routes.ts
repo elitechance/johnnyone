@@ -200,6 +200,14 @@ export const appRoutes: Route[] = [
     loadComponent: () =>
       import('./pages/install/install.page').then((m) => m.InstallPage),
   },
+  // Discord action links. Public on purpose (no authGuard): the signed, 120 s, single-use token
+  // in `?t=` authorizes exactly one action, and loading the page never performs it — only its
+  // Confirm POST does. See pages/act/act-page-logic.ts.
+  {
+    path: 'act',
+    title: 'Confirm action',
+    loadComponent: () => import('./pages/act/act.page').then((m) => m.ActPage),
+  },
   {
     path: '**',
     redirectTo: 'initiatives',

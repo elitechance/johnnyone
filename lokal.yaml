@@ -123,3 +123,6 @@ environments:
 
 secrets:
   - JWT_SECRET
+  # HS256 key for Discord action links (worker/lib/action-links/). >= 32 chars; set with
+  # `wrangler secret put ACTION_LINK_SECRET` — never in git. Unset = minting and redeeming fail closed.
+  - ACTION_LINK_SECRET

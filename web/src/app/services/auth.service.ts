@@ -8,7 +8,7 @@ import {
   shouldRefreshNow,
   timerDelayMs,
 } from './auth-session-logic';
-import { loginUrlWithReturn } from './return-url-logic';
+import { isPublicTokenPage, loginUrlWithReturn } from './return-url-logic';
 
 export interface AuthUser {
   id: string;
@@ -171,6 +171,9 @@ export class AuthService implements OnDestroy {
     localStorage.removeItem(AuthService.EXPIRES_IN_KEY);
     this.syncAuthState();
     this.currentUser.set(null);
+    // A Discord action-link page (/act?t=…) is public: an expired session there is irrelevant,
+    // and navigating away would lose the link (and put its token in /login?returnUrl).
+    if (reason === 'expired' && isPublicTokenPage(this.currentBrowserUrl())) return;
     void this.router.navigateByUrl(
       reason === 'expired' ? loginUrlWithReturn(this.currentBrowserUrl()) : '/login',
     );

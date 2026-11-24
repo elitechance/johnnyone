@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import {
   captureReturnUrl,
   DEFAULT_RETURN_URL,
+  isPublicTokenPage,
   isSafeReturnUrl,
   loginUrlWithReturn,
   safeReturnUrl,
@@ -140,5 +141,18 @@ describe('loginUrlWithReturn', () => {
     const url = loginUrlWithReturn(deep);
     const raw = decodeURIComponent(url.slice('/login?returnUrl='.length));
     expect(safeReturnUrl(raw)).toBe(deep);
+  });
+});
+
+describe('action-link pages never become a returnUrl (H-1-18)', () => {
+  it('recognises /act and only /act', () => {
+    for (const u of ['/act', '/act?t=a.b.c', '/ACT#x', '/act/']) expect(isPublicTokenPage(u), u).toBe(true);
+    for (const u of ['/actions', '/activity', '/initiatives?x=/act', null, undefined, '']) {
+      expect(isPublicTokenPage(u as any), String(u)).toBe(false);
+    }
+  });
+  it('the token never reaches /login?returnUrl', () => {
+    expect(captureReturnUrl('/act?t=aaa.bbb.ccc')).toBeUndefined();
+    expect(loginUrlWithReturn('/act?t=aaa.bbb.ccc')).toBe('/login');
   });
 });

@@ -242,8 +242,44 @@ fn log_accepted_origin_once(origin: &str) {
 /// Axum middleware. Must sit OUTSIDE the CORS layer so it also gates the
 /// `OPTIONS` preflight, which `CorsLayer` otherwise answers without calling the
 /// inner service.
+/// Loopback names the host GraphQL surface answers to. `/mcp` uses the narrower
+/// [`MCP_HOST_NAMES`] through the same [`host_matches`].
+pub const GRAPHQL_HOST_NAMES: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
+/// The names `/mcp` accepts (unchanged: it never answered to `[::1]`).
+pub const MCP_HOST_NAMES: &[&str] = &["127.0.0.1", "localhost"];
+
+/// Is `host` exactly `<name>:<bound_port>` for one of `names` (name case-insensitive, exact
+/// port)? The one Host rule, shared by `/mcp` (`mcp::check_request`) and the GraphQL router.
+pub fn host_matches(host: &str, bound_port: u16, names: &[&str]) -> bool {
+    let Some((name, port)) = host.trim().rsplit_once(':') else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    names.contains(&name.as_str()) && port == bound_port.to_string()
+}
+
+/// DNS-rebinding guard for the GraphQL surface (H-1-14). A rebinding page is served from
+/// `evil.example:7788` and later resolves to 127.0.0.1, so every request it makes is
+/// `Sec-Fetch-Site: same-origin` — which [`allow_request_with`] trusts — but its `Host` header is
+/// still `evil.example:7788`. So: a PRESENT Host must be a loopback name on our port. An absent
+/// Host is allowed: no browser can send one (HTTP/1.1 requires it), and in-process callers
+/// (`oneshot` tests) have none.
+pub fn host_header_allowed(host: Option<&str>, bound_port: u16) -> bool {
+    match host {
+        None => true,
+        Some(h) => host_matches(h, bound_port, GRAPHQL_HOST_NAMES),
+    }
+}
+
 pub async fn reject_cross_site(req: Request, next: Next) -> Response {
     let headers = req.headers();
+    let host = headers
+        .get(axum::http::header::HOST)
+        .map(|v| v.to_str().unwrap_or("\u{0}"));
+    if !host_header_allowed(host, crate::services::mcp_tokens::host_port()) {
+        log_rejection_once(&format!("host {}", host.unwrap_or("<none>")));
+        return (StatusCode::FORBIDDEN, "unexpected Host header\n").into_response();
+    }
     let origin = headers.get(ORIGIN).and_then(|v| v.to_str().ok());
     let sec_fetch_site = headers.get(&SEC_FETCH_SITE).and_then(|v| v.to_str().ok());
 

@@ -148,7 +148,27 @@ const PROTECTED_SNAPSHOT = [
   'resolvers/ai/update-outline-item-position.ts',
   'resolvers/ai/delete-outline-item.ts',
   'resolvers/ai/update-planning-queue.ts',
+  // Discord action links: mint is identity-gated like every other write. Preview and run are
+  // TOKEN-AUTHORIZED instead — see TOKEN_AUTHORIZED below.
+  'resolvers/ai/create-action-link.ts',
 ];
+
+/**
+ * Resolvers authorized by a signed, single-action token INSTEAD of a session identity. A phone
+ * tap on a Discord link has no login, by design. They reach D1 and the relay only through
+ * lib/action-links (which verifies the token before anything else), so the grep classifier does
+ * not see them as protected. Because that is also how a resolver could slip PAST the classifier,
+ * the action-link wiring is fenced here instead:
+ *  - only create-action-link (identity-gated) and the entries below may import it;
+ *  - each entry's only work is the one pinned call into lib/action-links;
+ *  - it never reads or writes ctx.auth (the identity it acts as comes from the verified token and
+ *    is passed to the relay explicitly — memoising it onto ctx would let a second field of the
+ *    same GraphQL document run as the minter).
+ */
+const TOKEN_AUTHORIZED: Record<string, RegExp> = {
+  'resolvers/ai/preview-action-link.ts': /return preview\(depsFromCtx\(ctx\), args\.token, requestTenant\(ctx\)\);/,
+  'resolvers/ai/run-action-link.ts': /return redeemActionLink\(depsFromCtx\(ctx\), args\.token, requestTenant\(ctx\), requestMethod\(ctx\)\);/,
+};
 
 describe('resolver auth audit', () => {
   const desktopSrc = sourceBySuffix(helperSources, '/desktop-rpc.ts');
@@ -171,6 +191,23 @@ describe('resolver auth audit', () => {
     expect(unsafe, `unprotected resolvers: ${unsafe.join(', ')}`).toEqual([]);
     expect(protectedPaths.length).toBeGreaterThanOrEqual(78);
     expect(protectedPaths.sort()).toEqual([...PROTECTED_SNAPSHOT].sort());
+  });
+
+  it('token-authorized resolvers keep their pinned shape and never touch ctx.auth', () => {
+    for (const [rel, shape] of Object.entries(TOKEN_AUTHORIZED)) {
+      const hit = Object.entries(resolverSources).find(([k]) => relativeResolverPath(k) === rel);
+      expect(hit, `missing ${rel}`).toBeTruthy();
+      const src = hit![1].replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      expect(src, rel).toMatch(shape);
+      expect(src, rel).not.toMatch(/ctx\.auth|ctx\.db|CHAT_RELAY_DO|desktopRpc|relayRpc|requireIdentity/);
+    }
+    const wired = Object.entries(resolverSources)
+      .filter(([, src]) => src.includes('lib/action-links/'))
+      .map(([k]) => relativeResolverPath(k))
+      .sort();
+    expect(wired).toEqual(['resolvers/ai/create-action-link.ts', ...Object.keys(TOKEN_AUTHORIZED)].sort());
+    const create = Object.entries(resolverSources).find(([k]) => relativeResolverPath(k) === 'resolvers/ai/create-action-link.ts')![1];
+    expect(create).toMatch(/default async function createActionLink\([^)]*\) \{\s*const identity = await requireIdentity\(ctx\);/);
   });
 
   it('classifier rejects a sample that uses ctx.db without a choke-point call', () => {

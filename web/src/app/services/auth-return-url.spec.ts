@@ -128,6 +128,19 @@ describe('session expiry keeps the current URL (returnUrl)', () => {
     );
   });
 
+  it('expiry on a Discord action-link page (/act?t=…) stays put and never captures the token', () => {
+    // H-1-18: /act is public and its URL carries a bearer token.
+    for (const at of ['/act?t=aaa.bbb.ccc', '/act', '/ACT?t=x.y.z#h']) {
+      const { auth, navigateByUrl } = makeAuth(at);
+      auth.logout('expired');
+      expect(navigateByUrl).not.toHaveBeenCalled();
+    }
+    // a deliberate sign-out from there still goes to /login, with nothing captured
+    const { auth, navigateByUrl } = makeAuth('/act?t=aaa.bbb.ccc');
+    auth.logout();
+    expect(destination(navigateByUrl)).toBe('/login');
+  });
+
   it('expiry while already on /login does not self-reference', () => {
     for (const at of ['/login', '/login?returnUrl=%2Fterminal', '/login#x']) {
       const { auth, navigateByUrl } = makeAuth(at);
