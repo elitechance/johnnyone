@@ -52,7 +52,7 @@ describe('subscription auth — generated graphql-ws fixture (D13)', () => {
     const subscribe = vi.fn().mockReturnValue('iter');
     const ctx = jwtWsFixture({ subscribe });
     await onDelta.subscribe(null, { relayId: 'rel-1' }, ctx as any);
-    expect(subscribe).toHaveBeenCalledWith('relay-chat-delta:rel-1');
+    expect(subscribe).toHaveBeenCalledWith('relay-chat-delta:u1:rel-1');
   });
 
   it('graphql-ws isAuthenticated:false (jk_/failed JWT) → UNAUTHENTICATED even if db would validate a jk_ row', async () => {

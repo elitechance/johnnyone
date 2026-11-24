@@ -9,8 +9,10 @@ interface ResolverContext {
 
 export default {
   subscribe: async (_parent: unknown, args: { relayId: string }, ctx: ResolverContext) => {
-    await requireIdentity(ctx as any);
-    return ctx.pubsub.subscribe(`relay-chat-delta:${args.relayId}`);
+    // Owner-scoped (L-1-1): the relay publishes a turn's deltas under the desktop owner's id, so a
+    // relayId alone never lets another user read them. Room stays the relayId (last segment).
+    const id = await requireIdentity(ctx as any);
+    return ctx.pubsub.subscribe(`relay-chat-delta:${id.userId}:${args.relayId}`);
   },
   resolve: (payload: unknown) => payload,
 };

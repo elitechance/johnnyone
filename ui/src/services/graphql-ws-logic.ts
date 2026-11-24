@@ -44,3 +44,43 @@ export class SubscriptionClosedError extends Error {
     this.name = 'SubscriptionClosedError';
   }
 }
+
+// ── keepalive + reconnect (live UI bugs 2, item 1) ──
+//
+// The live test saw the message subscription die with a `1006` (abnormal close) a few minutes into
+// an idle plan chat: nothing crossed the socket while the agent worked, and an idle WebSocket
+// through Cloudflare is dropped. The client now pings (graphql-transport-ws `ping`; the server
+// answers `pong`) and reconnects a dropped — not refused — socket with a bounded backoff.
+
+/** Client `ping` interval while a subscription socket is open (below Cloudflare's ~100 s idle cut). */
+export const KEEPALIVE_MS = 25_000;
+/** Reconnect attempts in a row before the error surfaces (the chat then settles from the store). */
+export const RECONNECT_MAX_ATTEMPTS = 5;
+/** A connection that stayed up this long resets the attempt count. */
+export const RECONNECT_STABLE_MS = 30_000;
+
+/**
+ * Close codes that mean "the connection dropped", not "the server refused you": 1001 going away,
+ * 1005 no status, 1006 abnormal, 1011 internal error, 1012 restart, 1013 try again, 1014 bad gateway.
+ * graphql-ws's own 44xx/4500 closes are refusals and are never retried here (4401/4403 get the
+ * auth refresh instead).
+ */
+const DROPPED_CODES = new Set([1001, 1005, 1006, 1011, 1012, 1013, 1014]);
+
+/** Reconnect after this close? Only a drop, and only while attempts remain. */
+export function shouldReconnectClose(code: number, attemptsSoFar: number): boolean {
+  return DROPPED_CODES.has(code) && attemptsSoFar < RECONNECT_MAX_ATTEMPTS;
+}
+
+/** Reconnect jitter: ±20% of the backoff (L-1-4), so many tabs dropped together do not reconnect in step. */
+export const RECONNECT_JITTER = 0.2;
+
+/**
+ * Backoff before reconnect attempt `attempt` (0-based): 1 s, 2 s, 4 s, 8 s, capped at 15 s, then
+ * jittered ±20% by `rand` (a `Math.random()` draw in [0, 1); 0.5 = no jitter). Never below 800 ms.
+ */
+export function reconnectDelayMs(attempt: number, rand = 0.5): number {
+  const base = Math.min(1000 * 2 ** Math.max(0, attempt), 15_000);
+  const r = Math.min(Math.max(rand, 0), 1);
+  return Math.round(base * (1 - RECONNECT_JITTER + 2 * RECONNECT_JITTER * r));
+}

@@ -2,7 +2,7 @@ import { Injectable, inject } from '@angular/core';
 import { SessionReport } from '../models/stream-event.model';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
-import { GraphQLClient } from './graphql-client';
+import { GraphQLClient, type SubscribeOptions } from './graphql-client';
 import { plansDocument } from './plans-api-documents';
 import { AiSession } from '../models/ai-session.model';
 import { AiMessage, AiMessageDelta } from '../models/ai-message.model';
@@ -824,7 +824,7 @@ export class JohnnyApiService {
 
   /** Live streaming deltas for ONE relay chat response, keyed by the `relayId` returned from
    *  `sendRelayMessage`. (The worker has no session-level delta subscription — deltas are per-request.) */
-  onRelayChatDelta(relayId: string): Observable<RelayChatDeltaMsg> {
+  onRelayChatDelta(relayId: string, opts?: SubscribeOptions): Observable<RelayChatDeltaMsg> {
     return this.gql
       .subscribe<{ onRelayChatDelta: RelayChatDeltaMsg }>(
         `subscription OnRelayChatDelta($relayId: String!) {
@@ -832,13 +832,14 @@ export class JohnnyApiService {
             relayId sessionId delta chunkType isFinal
           }
         }`,
-        { relayId }
+        { relayId },
+        opts,
       )
       .pipe(map((data) => data.onRelayChatDelta));
   }
 
   /** Completed relay chat messages for a session (user + assistant), as they are persisted. */
-  onRelayChatMessage(sessionId: string): Observable<RelayChatMessageMsg> {
+  onRelayChatMessage(sessionId: string, opts?: SubscribeOptions): Observable<RelayChatMessageMsg> {
     return this.gql
       .subscribe<{ onRelayChatMessage: RelayChatMessageMsg }>(
         `subscription OnRelayChatMessage($sessionId: String!) {
@@ -846,7 +847,8 @@ export class JohnnyApiService {
             relayId sessionId role content
           }
         }`,
-        { sessionId }
+        { sessionId },
+        opts,
       )
       .pipe(map((data) => data.onRelayChatMessage));
   }

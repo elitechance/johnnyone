@@ -1,7 +1,27 @@
 import { Injectable, InjectionToken, inject } from '@angular/core';
 import { Observable, from } from 'rxjs';
 import { switchMap } from 'rxjs/operators';
-import { SubscriptionClosedError, closeIsAuthFailure, connectionInitPayload, shouldRetrySubscriptionAuth } from './graphql-ws-logic';
+import {
+  KEEPALIVE_MS,
+  RECONNECT_STABLE_MS,
+  SubscriptionClosedError,
+  closeIsAuthFailure,
+  connectionInitPayload,
+  reconnectDelayMs,
+  shouldReconnectClose,
+  shouldRetrySubscriptionAuth,
+} from './graphql-ws-logic';
+
+/** Per-subscription options. */
+export interface SubscribeOptions {
+  /**
+   * Called when a dropped socket (1006, …) reconnected and the subscription is live again. Events
+   * published while it was down are lost: a caller that cares re-reads its state here.
+   */
+  onReconnected?: () => void;
+  /** Called when the socket dropped and a reconnect is scheduled (the stream is not over yet). */
+  onDropped?: () => void;
+}
 
 export const GRAPHQL_API_URL = new InjectionToken<string>('GRAPHQL_API_URL', {
   providedIn: 'root',
@@ -91,7 +111,7 @@ export class GraphQLClient {
     return this.request<T>(mutation, variables);
   }
 
-  subscribe<T>(subscription: string, variables?: Record<string, unknown>): Observable<T> {
+  subscribe<T>(subscription: string, variables?: Record<string, unknown>, opts: SubscribeOptions = {}): Observable<T> {
     return new Observable<T>((subscriber) => {
       let ws: WebSocket | null = null;
       let closed = false;
@@ -99,10 +119,23 @@ export class GraphQLClient {
       let completed = false;
       /** One refresh-and-reconnect per subscription after an auth failure (bug 2), never a loop. */
       let authRetried = false;
+      /** Reconnects in a row after dropped sockets (bounded; reset once a connection is stable). */
+      let dropAttempts = 0;
+      /** This connection is a reconnect after a drop (tell the caller once it is acked). */
+      let reconnecting = false;
+      let ackedAt = 0;
+      let keepalive: ReturnType<typeof setInterval> | null = null;
+      let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
       const operationId = crypto.randomUUID();
+
+      const stopKeepalive = () => {
+        if (keepalive) clearInterval(keepalive);
+        keepalive = null;
+      };
 
       /** Close a socket without its handlers firing (a replaced or finished connection). */
       const closeQuietly = (socket: WebSocket | null) => {
+        stopKeepalive();
         if (!socket) return;
         socket.onopen = null;
         socket.onmessage = null;
@@ -117,6 +150,7 @@ export class GraphQLClient {
       /** An auth failure refreshes the token and reconnects once; anything else ends the stream. */
       const fail = (error: Error) => {
         if (closed) return;
+        stopKeepalive();
         const refresh = this.authRefresh;
         if (refresh && shouldRetrySubscriptionAuth(authRetried, true, isSubscriptionAuthFailure(error))) {
           authRetried = true;
@@ -135,9 +169,30 @@ export class GraphQLClient {
         subscriber.error(error);
       };
 
+      /** A dropped socket (1006, …): reconnect with backoff, a bounded number of times in a row. */
+      const dropped = (code: number, reason: string) => {
+        if (closed) return;
+        stopKeepalive();
+        if (ackedAt && Date.now() - ackedAt >= RECONNECT_STABLE_MS) dropAttempts = 0;
+        if (!shouldReconnectClose(code, dropAttempts)) {
+          fail(new SubscriptionClosedError(code, reason));
+          return;
+        }
+        const delay = reconnectDelayMs(dropAttempts, Math.random());
+        dropAttempts += 1;
+        reconnecting = true;
+        ws = null;
+        opts.onDropped?.();
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (!closed) connect();
+        }, delay);
+      };
+
       const connect = () => {
         const socket = new WebSocket(this.wsUrl, 'graphql-transport-ws');
         ws = socket;
+        ackedAt = 0;
 
         socket.onopen = () => {
           // The token is read at CONNECT time (so a reconnect after a refresh sends the new one) and
@@ -155,6 +210,7 @@ export class GraphQLClient {
 
           switch (message.type) {
             case 'connection_ack':
+              ackedAt = Date.now();
               socket.send(
                 JSON.stringify({
                   id: operationId,
@@ -162,6 +218,19 @@ export class GraphQLClient {
                   payload: { query: subscription, variables },
                 })
               );
+              // Keepalive: an idle socket is dropped upstream (the live 1006).
+              stopKeepalive();
+              keepalive = setInterval(() => {
+                if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }));
+              }, KEEPALIVE_MS);
+              if (reconnecting) {
+                reconnecting = false;
+                opts.onReconnected?.();
+              }
+              break;
+
+            case 'ping':
+              socket.send(JSON.stringify({ type: 'pong' }));
               break;
 
             case 'next':
@@ -182,21 +251,27 @@ export class GraphQLClient {
 
             case 'complete':
               completed = true;
+              stopKeepalive();
               subscriber.complete();
               break;
           }
         };
 
-        socket.onerror = () => {
-          fail(new Error('WebSocket connection error'));
-        };
+        // A failed connection always closes next (WHATWG): the close decides drop vs refusal.
+        socket.onerror = () => undefined;
 
         // ANY close before `complete` ends the stream as an error (U-1-4): graphql-ws closes CLEANLY
         // with 4400/4401/4403/4500, and treating a clean close as "fine" left the subscription hanging
-        // with no error, so the chat's fallback never started. 4401/4403 get the one auth refresh.
+        // with no error, so the chat's fallback never started. 4401/4403 get the one auth refresh; a
+        // DROPPED socket (1006, …) reconnects with backoff first (item 1).
         socket.onclose = (event) => {
           if (completed) return;
-          fail(new SubscriptionClosedError(event.code, (event as CloseEvent).reason ?? ''));
+          const reason = (event as CloseEvent).reason ?? '';
+          if (shouldReconnectClose(event.code, 0)) {
+            dropped(event.code, reason);
+            return;
+          }
+          fail(new SubscriptionClosedError(event.code, reason));
         };
       };
 
@@ -204,6 +279,8 @@ export class GraphQLClient {
 
       return () => {
         closed = true;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
         closeQuietly(ws);
         ws = null;
       };

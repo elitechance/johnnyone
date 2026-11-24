@@ -30,6 +30,7 @@ import { getSocketAuth } from '../auth/socket-auth-context';
 import { isTokenLike, validateApiKeyToken, updateLastUsed } from '../auth/api-key';
 import { requireScope } from '../auth/scopes';
 import { verifySessionOwnership, invalidateSessionOwnership } from './session-ownership';
+import { publishToPubSub, relayPublications } from './relay-pubsub';
 
 export class ChatRelayDO implements DurableObject {
   private state: DurableObjectState;
@@ -38,6 +39,11 @@ export class ChatRelayDO implements DurableObject {
     resolve: (value: PendingRpcResult) => void;
     timer: ReturnType<typeof setTimeout>;
   }> = new Map();
+  /**
+   * Subscription publishes, chained so a turn's deltas reach the pubsub topic in the order the
+   * desktop sent them (an await on another DO's fetch lets the next socket message run).
+   */
+  private publishChain: Promise<void> = Promise.resolve();
 
   constructor(state: DurableObjectState, env: Record<string, unknown>) {
     this.state = state;
@@ -429,6 +435,11 @@ export class ChatRelayDO implements DurableObject {
           if (clientType === 'desktop') {
             this.broadcastTo('mobile', envelope);
             this.broadcastTo('api', envelope);
+            // The web's graphql-ws subscriptions (`onRelayChatDelta`, `onRelayChatMessage`) read
+            // lokal's PubSubDO topics, not these sockets: publish there too (live UI bugs 2, item 1).
+            // An API-key socket ("desktop" is only a query flag at upgrade) never feeds the web's
+            // chat subscriptions (L-1-2); tying publishes to the registered node is a follow-up.
+            if (!authCtx?.apiKey) await this.publishForSubscriptions(envelope, authCtx?.userId);
           }
           // Invalidate ownership cache on delete/archive so revoked sessions stop streaming (Task 05)
           if ((envelope.type === 'session_deleted' ||
@@ -462,6 +473,22 @@ export class ChatRelayDO implements DurableObject {
 
   webSocketError(): void {
     // No cleanup needed — runtime manages tagged WebSockets
+  }
+
+  /** Publish a desktop envelope to its graphql subscription topics, in arrival order. */
+  private publishForSubscriptions(envelope: RelayEnvelope, ownerUserId: string | undefined): Promise<void> {
+    const pubs = relayPublications(envelope, ownerUserId);
+    if (pubs.length === 0) return this.publishChain;
+    this.publishChain = this.publishChain.then(async () => {
+      for (const pub of pubs) {
+        try {
+          await publishToPubSub(this.env, pub);
+        } catch {
+          // Best-effort: the web settles a turn from the store if live updates are lost.
+        }
+      }
+    });
+    return this.publishChain;
   }
 
   /**

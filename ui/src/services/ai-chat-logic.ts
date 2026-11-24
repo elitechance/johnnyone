@@ -14,13 +14,16 @@ export interface ChatDeltaLike {
   isFinal?: boolean | null;
 }
 
-/** `text` accumulates; `control` (system/result, non-final errors) is skipped; `error` is a final error. */
+/** `text` accumulates; `control` (system/result/tool/stderr, non-final errors) is skipped; `error` is a final error. */
 export type DeltaKind = 'text' | 'control' | 'error';
 
 export function classifyDelta(d: ChatDeltaLike): DeltaKind {
   const kind = (d.chunkType || '').toLowerCase();
   if (kind === 'error') return d.isFinal ? 'error' : 'control';
-  if (kind === 'system' || kind === 'result') return 'control';
+  // Tool calls/results and stderr are not the reply's text (the final message carries the reply).
+  if (kind === 'system' || kind === 'result' || kind === 'tooluse' || kind === 'toolresult' || kind === 'stderr') {
+    return 'control';
+  }
   return 'text';
 }
 
@@ -128,3 +131,20 @@ export function turnAnsweredInStore(stored: readonly AiMessage[], turn: PendingT
 /** Poll cadence and give-up time for the fallback. */
 export const TURN_FALLBACK_POLL_MS = 3_000;
 export const TURN_FALLBACK_MAX_MS = 10 * 60_000;
+
+/**
+ * Is the latest turn's reply already in the list as a STORED row (L-1-5)? True when an assistant row
+ * that came from the store (not a live `relay-` placeholder, not an optimistic `temp-` bubble) sits
+ * after the last user message. The live final message must then not append a second copy (the store
+ * poll or a refetch got there first).
+ */
+export function replyAlreadyStored(messages: ReadonlyArray<Pick<AiMessage, 'id' | 'role'>>): boolean {
+  let lastUser = -1;
+  messages.forEach((m, i) => {
+    if (m.role === 'user') lastUser = i;
+  });
+  if (lastUser < 0) return false;
+  return messages
+    .slice(lastUser + 1)
+    .some((m) => m.role === 'assistant' && !m.id.startsWith('relay-') && !m.id.startsWith('temp-'));
+}

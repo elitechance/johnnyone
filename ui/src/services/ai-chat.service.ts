@@ -15,6 +15,7 @@ import {
   errorNoticeText,
   messagesAfterError,
   normalizeStoredMessages,
+  replyAlreadyStored,
   storedCount,
   turnAnsweredInStore,
   type PendingTurn,
@@ -155,7 +156,7 @@ export class AiChatService {
     if (!relayId) return;
     this.deltaSubscription?.unsubscribe();
     this.streamingContent = '';
-    this.deltaSubscription = this.api.onRelayChatDelta(relayId).subscribe({
+    this.deltaSubscription = this.api.onRelayChatDelta(relayId, this.liveGapHooks()).subscribe({
       next: (delta) => this.handleDelta(delta),
       error: (err) => {
         console.error('[AiChatService] Delta subscription error:', err);
@@ -172,7 +173,7 @@ export class AiChatService {
     if (!id) return;
 
     this.messageSubscription?.unsubscribe();
-    this.messageSubscription = this.api.onRelayChatMessage(id).subscribe({
+    this.messageSubscription = this.api.onRelayChatMessage(id, this.liveGapHooks()).subscribe({
       next: (message) => this.handleNewMessage(message),
       error: (err) => {
         console.error('[AiChatService] Message subscription error:', err);
@@ -217,6 +218,18 @@ export class AiChatService {
     this.messageSubscription?.unsubscribe();
     this.messageSubscription = null;
     this.stopTurnFallback();
+  }
+
+  /**
+   * A live socket dropped (1006, …) and is reconnecting (item 1): events published in the gap are
+   * lost, so a turn in flight is settled from the store meanwhile. A live reply arriving first stops
+   * the poll (`finishStreaming`).
+   */
+  private liveGapHooks() {
+    return {
+      onDropped: () => this.startTurnFallback(),
+      onReconnected: () => this.startTurnFallback(),
+    };
   }
 
   /** A live subscription failed: from now on a turn in flight is settled from the store. */
@@ -347,6 +360,8 @@ export class AiChatService {
         updated[existingIdx] = { ...updated[existingIdx], content: message.content };
         return updated;
       }
+      // The store poll / a refetch already shows this turn's reply: never a second copy (L-1-5).
+      if (replyAlreadyStored(msgs)) return msgs;
       return [...msgs, finalized];
     });
     this.finishStreaming();
