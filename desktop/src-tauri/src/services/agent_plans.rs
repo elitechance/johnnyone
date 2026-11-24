@@ -6530,7 +6530,10 @@ pub(crate) fn discord_message_for(
     // (b) a phase or plan being DONE (a PASS). We do NOT alert on starts, or on
     // every T2 result — a non-PASS review just loops back to T1 silently and is
     // visible in the web lens panel.
+    // The round digest already announced this pass (and the plan's completion): one post per round.
+    let digested = payload.get("digest").and_then(|v| v.as_bool()) == Some(true);
     match event_type {
+        "agent_phase_gate_result" | "agent_plan_completed" if digested => None,
         // Phase done.
         "agent_phase_gate_result" if verdict_advances(&verdict) => Some((
             "success",
@@ -7293,9 +7296,13 @@ pub(crate) async fn conclude_review_round_with(
         verdicts.iter().map(|(l, v)| format!("{l}: {v}")).collect::<Vec<_>>().join(", ")
     );
     // The round digest: one code-built line from the ledger, recorded and posted every round,
-    // whatever the gate routes to next. A failure here never fails the round.
-    match findings::record_round_digest(state, plan_id, &run.plan.title, phase_id, round, gate.as_verdict()) {
-        Ok(digest) => post_round_digest(state, plan_id, &digest.line(), ctrl),
+    // whatever the gate routes to next, saying whether the user must act. A failure here never
+    // fails the round. On a pass it is the round's ONLY Discord post (`pass_phase_with` marks its
+    // own events `digest:true`, which `discord_message_for` skips).
+    let outcome = round_outcome(state, run, phase, gate, &rows);
+    let pos = phase_position(run, phase);
+    match findings::record_round_digest(state, plan_id, &run.plan.title, phase_id, pos, round, gate.as_verdict(), outcome) {
+        Ok(digest) => post_round_digest(state, plan_id, &digest, ctrl),
         Err(e) => tracing::warn!(plan_id, phase_id, error = %e, "round digest not recorded"),
     }
     let review = ReviewInsights {
@@ -7315,7 +7322,7 @@ pub(crate) async fn conclude_review_round_with(
             } else {
                 "PASS"
             };
-            pass_phase(state, plan_id, phase_id, "T2 passed phase", verdict).await
+            pass_phase_with(state, plan_id, phase_id, "T2 passed phase", verdict, true).await
         }
         LedgerGate::Escalate => {
             mark_phase_not_passing(state, run, phase, "needs_changes", &summary)?;
@@ -7364,16 +7371,58 @@ pub(crate) async fn conclude_review_round_with(
     }
 }
 
-/// Post a round digest line: to `ctrl.digest_sink` in tests, else to Discord through
-/// `notify_discord` (a no-op without a webhook). Fire-and-forget, like `maybe_notify_discord`.
-fn post_round_digest(state: &AppState, plan_id: &str, line: &str, ctrl: &ReplanCtrl<'_>) {
+/// What a review round leads to, decided BEFORE the gate routes, with the same rules the routing
+/// applies: a pass; an escalated finding, a parked kloo BLOCKED review or the round cap (the gate
+/// result about to be written makes `n + 1` non-passing rounds) → needs you; else needs changes.
+fn round_outcome(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    gate: findings::LedgerGate,
+    rows: &[findings::Finding],
+) -> findings::RoundOutcome {
+    use findings::{LedgerGate, RoundOutcome};
+    match gate {
+        LedgerGate::Pass | LedgerGate::PassWithFollowups => RoundOutcome::Passed {
+            plan_complete: run.plan.phase_run_mode != "single"
+                && !run.phases.iter().any(|p| p.phase_index == phase.phase_index + 1),
+        },
+        LedgerGate::Escalate => RoundOutcome::NeedsYou { escalated: findings::escalated_ids(rows) },
+        LedgerGate::NeedsChanges | LedgerGate::Blocked => {
+            let rounds = consecutive_non_pass_phase_rounds_in(&all_plan_events(state, run), &phase.phase_id) + 1;
+            let phase_path = Path::new(&run.plan.plan_path).join("phases").join(&phase.phase_id);
+            let parked = gate == LedgerGate::Blocked && crate::services::task_loop::phase_is_kloo_mode(&phase_path);
+            if rounds >= MAX_REVISION_ROUNDS || parked {
+                RoundOutcome::NeedsYou { escalated: Vec::new() }
+            } else {
+                RoundOutcome::NeedsChanges
+            }
+        }
+    }
+}
+
+/// "phase N/M": the phase's 1-based position among the run's phases.
+fn phase_position(run: &AgentPlanRun, phase: &AgentPlanPhase) -> findings::PhasePos {
+    let before = run.phases.iter().filter(|p| p.phase_index < phase.phase_index).count();
+    findings::PhasePos { n: before + 1, of: run.phases.len().max(before + 1) }
+}
+
+/// Post a round digest: to `ctrl.digest_sink` in tests, else to Discord through `notify_discord`
+/// (a no-op without a webhook) with the outcome's colour. The embed title is the headline without
+/// the plan title (the embed's Plan field names the plan). Fire-and-forget, like
+/// `maybe_notify_discord`. A test build with no sink posts nothing: no test can reach the network.
+fn post_round_digest(state: &AppState, plan_id: &str, digest: &findings::RoundDigest, ctrl: &ReplanCtrl<'_>) {
     if let Some(sink) = ctrl.digest_sink {
-        sink.lock().unwrap().push(line.to_string());
+        sink.lock().unwrap().push(digest.line());
         return;
     }
-    let (state, plan_id, headline) = (state.clone(), plan_id.to_string(), format!("📊 {line}"));
+    if cfg!(test) {
+        return;
+    }
+    let (state, plan_id) = (state.clone(), plan_id.to_string());
+    let (severity, headline) = (digest.outcome.severity(), digest.headline());
     tokio::spawn(async move {
-        notify_discord(&state, &plan_id, "info", &headline, "").await;
+        notify_discord(&state, &plan_id, severity, &headline, "").await;
     });
 }
 
@@ -9942,6 +9991,20 @@ async fn pass_phase(
     summary: &str,
     verdict: &str,
 ) -> Result<(), String> {
+    pass_phase_with(state, plan_id, phase_id, summary, verdict, false).await
+}
+
+/// [`pass_phase`], told whether the round's digest already announced the pass. `digested` marks the
+/// pass's `agent_phase_gate_result` and `agent_plan_completed` with `digest:true`, so Discord gets
+/// ONE post for the round (the digest) instead of the digest plus "phase passed".
+async fn pass_phase_with(
+    state: &AppState,
+    plan_id: &str,
+    phase_id: &str,
+    summary: &str,
+    verdict: &str,
+    digested: bool,
+) -> Result<(), String> {
     let run = get_plan(state, plan_id)?;
     let phase = find_phase(&run, phase_id)?;
     // The verdict the gate actually reached, not a literal 'pass' — a phase passed with
@@ -10032,7 +10095,7 @@ async fn pass_phase(
         plan_id,
         Some(phase_id),
         "agent_phase_gate_result",
-        json!({ "verdict": "PASS" }),
+        if digested { json!({ "verdict": "PASS", "digest": true }) } else { json!({ "verdict": "PASS" }) },
     )?;
 
     if should_continue {
@@ -10055,7 +10118,13 @@ async fn pass_phase(
             json!({}),
         )?;
         } else {
-            append_event(state, plan_id, None, "agent_plan_completed", json!({}))?;
+            append_event(
+                state,
+                plan_id,
+                None,
+                "agent_plan_completed",
+                if digested { json!({ "digest": true }) } else { json!({}) },
+            )?;
             // Feature 3: dev-only docs-commit agent — update + commit the app repo's
             // docs (commit only). Failures are logged + surfaced but never un-approve
             // the plan (it is already complete).
@@ -21951,9 +22020,9 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert_eq!(
             lines,
             vec![
-                format!("{title} · 00-x r1: 0 → 3 open · 0 verified · 0 disputed · 1 follow-up · red-first 0/0"),
-                format!("{title} · 00-x r2: 3 → 1 open · 1 verified · 0 disputed · 1 withdrawn · 1 follow-up · red-first 1/1"),
-                format!("{title} · 00-x r3: 1 → 0 open · 2 verified · 0 disputed · 1 withdrawn · 1 follow-up · red-first 1/2"),
+                format!("{title} · phase 1/1 (00-x) r1: 0 → 3 open · 1 follow-up → needs changes"),
+                format!("{title} · phase 1/1 (00-x) r2: 3 → 1 open · +1 verified · 1 dispute upheld · 1 withdrawn · 1 follow-up · red-first 1/1 → needs changes"),
+                format!("{title} · phase 1/1 (00-x) r3: 1 → 0 open · +1 verified · 1 follow-up · red-first 1/2 ✅ passed"),
             ]
         );
         assert_eq!(

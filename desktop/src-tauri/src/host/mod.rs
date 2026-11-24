@@ -313,6 +313,8 @@ enum FindingOverride {
     AcceptWaiver,
     RejectWaiver,
     Reopen,
+    /// Withdraw a disputed finding whose lens will never rule (e.g. it left the panel).
+    Withdraw,
 }
 
 impl From<FindingOverride> for findings_service::Override {
@@ -321,6 +323,7 @@ impl From<FindingOverride> for findings_service::Override {
             FindingOverride::AcceptWaiver => findings_service::Override::AcceptWaiver,
             FindingOverride::RejectWaiver => findings_service::Override::RejectWaiver,
             FindingOverride::Reopen => findings_service::Override::Reopen,
+            FindingOverride::Withdraw => findings_service::Override::Withdraw,
         }
     }
 }
