@@ -1152,7 +1152,10 @@ pub async fn start_plan(
 /// (approved, all-passed) plan would otherwise mint a worker whose plan job has "ended", and the
 /// terminal gate (`terminal::decide_pane`) would refuse its pane. The revival (its per-plan guard)
 /// is held until the prompt is delivered (G-3-33), so a second click meanwhile is refused with
-/// [`REVIVAL_BUSY`] instead of delivering the phase prompt twice.
+/// [`REVIVAL_BUSY`] instead of delivering the phase prompt twice. If the prompt cannot be
+/// delivered (C-1-4), the revival is undone ([`undo_revival`]: the plan put back, a minted worker
+/// archived) and `agent_phase_start_failed` is recorded, rather than leaving the plan
+/// `phase_worker_running` on a worker that never got its task.
 pub(crate) async fn start_dev_phase_with(
     state: &AppState,
     run: &AgentPlanRun,
@@ -1161,14 +1164,30 @@ pub(crate) async fn start_dev_phase_with(
     attach: &dyn WorkerAttach,
 ) -> Result<(), String> {
     let (worker_session_id, revival) = revive_dev_worker_held(state, run, phase, phase_run_mode, attach).await?;
-    append_event(state, &run.plan.id, Some(&phase.phase_id), "agent_phase_started", json!({}))?;
-    // Re-read: `ensure_dev_worker_session` may have minted a fresh worker (the stored one was
-    // retired at completion), and the prompt's report curl must name the CURRENT session.
-    let run = get_plan(state, &run.plan.id)?;
-    let prompt = worker_phase_prompt(state, &run, phase)?;
-    attach.deliver_prompt(state, &worker_session_id, &prompt).await?;
+    let plan_id = run.plan.id.as_str();
+    let delivered = async {
+        append_event(state, plan_id, Some(&phase.phase_id), "agent_phase_started", json!({}))?;
+        // Re-read: `ensure_dev_worker_session` may have minted a fresh worker (the stored one was
+        // retired at completion), and the prompt's report curl must name the CURRENT session.
+        let run = get_plan(state, plan_id)?;
+        let prompt = worker_phase_prompt(state, &run, phase)?;
+        attach.deliver_prompt(state, &worker_session_id, &prompt).await
+    }
+    .await;
+    if let Err(error) = &delivered {
+        undo_revival(state, &revival);
+        if let Err(e) = append_event(
+            state,
+            plan_id,
+            Some(&phase.phase_id),
+            "agent_phase_start_failed",
+            json!({ "error": error, "workerSessionId": worker_session_id }),
+        ) {
+            tracing::warn!(plan_id, error = %e, "failed to record agent_phase_start_failed");
+        }
+    }
     drop(revival);
-    Ok(())
+    delivered
 }
 
 /// Validate an optional human comment/guidance attached to a run/resume.
@@ -22358,21 +22377,34 @@ pub(crate) mod session_lifecycle_tests {
     /// to another RUNNING status keeps the minted session.
     #[tokio::test]
     async fn stop_during_a_failed_revival_archives_the_minted_session() {
-        for (moved_to, minted_after) in [("stopped", "archived"), ("phase_review_running", "active")] {
+        for (moved_to, minted_after) in [("stopped", "archived"), ("phase_review_running", "active"), ("<deleted>", "archived")] {
             let (state, root, run, old) = completed_dev_run(&format!("revive-stop-mint-{moved_to}")).await;
             let phase = run.phases[0].clone();
             let plan_id = run.plan.id.clone();
             let attach = GateAttach::new(true).during(move |st| {
                 Box::pin(async move {
                     st.db
-                        .with_conn(|c| update_plan_status_and_health(c, &plan_id, moved_to, None).map_err(|e| e.to_string()))
+                        .with_conn(|c| {
+                            if moved_to == "<deleted>" {
+                                // C-1-11: the plan is hard-deleted while the revival is in flight.
+                                c.execute_batch("PRAGMA foreign_keys = OFF").map_err(|e| e.to_string())?;
+                                c.execute("DELETE FROM agent_plans WHERE id = ?1", params![plan_id]).map_err(|e| e.to_string())?;
+                                c.execute_batch("PRAGMA foreign_keys = ON").map_err(|e| e.to_string())
+                            } else {
+                                update_plan_status_and_health(c, &plan_id, moved_to, None).map(|_| ()).map_err(|e| e.to_string())
+                            }
+                        })
                         .unwrap();
                 })
             });
             assert!(revive_dev_worker_with(&state, &run, &phase, "single", &attach).await.is_err());
             let minted = attach.seen()[0].0.clone();
             assert_ne!(minted, old, "a session was minted");
-            assert_eq!(plan_status(&state, &run.plan.id), moved_to, "the undo overwrote the concurrent move");
+            if moved_to == "<deleted>" {
+                assert!(get_plan(&state, &run.plan.id).is_err(), "the plan stays deleted");
+            } else {
+                assert_eq!(plan_status(&state, &run.plan.id), moved_to, "the undo overwrote the concurrent move");
+            }
             assert_eq!(session_status(&state, &minted).as_deref(), Some(minted_after), "moved to {moved_to}");
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -22411,6 +22443,8 @@ pub(crate) mod session_lifecycle_tests {
         inner: GateAttach,
         plan_id: String,
         busy_during_prompt: std::sync::Mutex<Vec<bool>>,
+        /// The delivery fails (folder-trust prompt, pane gone, ...).
+        fail_prompt: bool,
     }
 
     impl WorkerAttach for PromptProbe {
@@ -22427,6 +22461,9 @@ pub(crate) mod session_lifecycle_tests {
             // A second click now: refused while the first still holds the revival.
             let busy = matches!(claim_revival(&self.plan_id), Err(e) if e == REVIVAL_BUSY);
             self.busy_during_prompt.lock().unwrap().push(busy);
+            if self.fail_prompt {
+                return Box::pin(async { Err("agent CLI is waiting on a folder-trust prompt".to_string()) });
+            }
             self.inner.send_input(state, session_id, format!("{prompt}\r"))
         }
     }
@@ -22441,6 +22478,7 @@ pub(crate) mod session_lifecycle_tests {
             inner: GateAttach::new(false),
             plan_id: run.plan.id.clone(),
             busy_during_prompt: std::sync::Mutex::new(Vec::new()),
+            fail_prompt: false,
         };
         start_dev_phase_with(&state, &run, &phase, "single", &probe).await.expect("phase started");
         assert_eq!(probe.busy_during_prompt.lock().unwrap().clone(), vec![true], "a second click during the prompt was not refused");
@@ -22448,6 +22486,43 @@ pub(crate) mod session_lifecycle_tests {
         assert_eq!(typed.len(), 1, "the phase prompt is delivered once");
         assert_eq!(plan_status(&state, &run.plan.id), "phase_worker_running");
         assert!(claim_revival(&run.plan.id).is_ok(), "released once the prompt is delivered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C-1-4: a failed phase-prompt delivery undoes the revival (plan and phase put back, the
+    /// minted worker archived), records `agent_phase_start_failed`, and releases the claim.
+    #[tokio::test]
+    async fn run_from_phase_undoes_the_revival_when_the_prompt_is_not_delivered() {
+        let (state, root, run, old) = completed_dev_run("revive-prompt-fail").await;
+        let phase = run.phases[0].clone();
+        let probe = PromptProbe {
+            inner: GateAttach::new(false),
+            plan_id: run.plan.id.clone(),
+            busy_during_prompt: std::sync::Mutex::new(Vec::new()),
+            fail_prompt: true,
+        };
+        let err = start_dev_phase_with(&state, &run, &phase, "single", &probe).await.unwrap_err();
+        assert!(err.contains("folder-trust"), "{err}");
+        let minted = probe.inner.seen()[0].0.clone();
+        assert_ne!(minted, old);
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "approved", "not left phase_worker_running");
+        assert_eq!(after.plan.worker_session_id.as_deref(), Some(old.as_str()));
+        assert_eq!(after.phases[0].status, "passed");
+        assert_eq!(session_status(&state, &minted).as_deref(), Some("archived"), "no prompt-less worker left active");
+        let failed: i64 = state
+            .db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM agent_plan_events WHERE plan_id = ?1 AND type = 'agent_phase_start_failed'",
+                    params![run.plan.id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(failed, 1);
+        assert!(claim_revival(&run.plan.id).is_ok(), "the claim was released");
         let _ = std::fs::remove_dir_all(&root);
     }
 

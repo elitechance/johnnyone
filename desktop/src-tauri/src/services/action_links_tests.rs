@@ -927,3 +927,14 @@ async fn the_console_reply_path_says_when_it_recorded_the_prompt() {
         vec![("user".to_string(), "yes".to_string()), ("user".to_string(), "no".to_string())]
     );
 }
+
+#[test]
+fn invisible_and_control_characters_get_their_own_messages() {
+    // C-1-2: an invisible character is not a "control character".
+    for c in ['\u{200B}', '\u{3164}', '\u{2800}', '\u{FEFF}'] {
+        assert_eq!(validate_reply(&format!("ye{c}s")).unwrap_err(), "reply must not contain invisible characters");
+        assert_eq!(validate_label(&format!("Proceed{c}?")).unwrap_err(), "label must not contain invisible characters");
+    }
+    assert_eq!(validate_reply("yes\rno").unwrap_err(), "reply must be one line with no control characters");
+    assert_eq!(validate_label("a\nb").unwrap_err(), "label must be one line with no control characters");
+}

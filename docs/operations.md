@@ -161,16 +161,29 @@ desktop **before or with** that worker. **Do not deploy** the auth
 worker from an agent. Full L1–L7 / D12 procedure:
 `/home/creepy/Documents/Workspace/.johnnyone/initiatives/a53df1e5-4dd6-4226-9506-83698bcbd643/plan/phases/03-acceptance/artifacts/human-cutover.md`.
 
-### `JOHNNYONE_HOST_ADDR`: the host only answers to loopback names
+### `JOHNNYONE_HOST_ADDR`: keep it on loopback
 
-The engine binds its host API on `JOHNNYONE_HOST_ADDR` (default `127.0.0.1:7788`). Since the DNS-rebinding
-guard (`host/origin_guard.rs`, `host_header_allowed`), every GraphQL request whose `Host` header is
-not `127.0.0.1`, `localhost` or `[::1]` **on the bound port** gets **HTTP 403 "unexpected Host
-header"**. `/mcp` is narrower: `127.0.0.1` and `localhost` only. So binding a non-loopback address
-(`0.0.0.0:7788`, a LAN IP) no longer exposes the API. A remote client reaching it by that address
-sends that address as its `Host`, and every request is refused. To reach the host from another
-machine, tunnel to its loopback address (for example `ssh -L 7788:127.0.0.1:7788`), so the request
-arrives with a loopback `Host`.
+The engine binds its host API on `JOHNNYONE_HOST_ADDR` (default `127.0.0.1:7788`). Keep it on
+loopback. Do not bind `0.0.0.0` or a LAN IP: the GraphQL surface trusts any caller that sends no
+`Origin` (that is how the agents' `curl`s work), including `setSetting` and `mintActionLink`.
+
+Three guards sit in front of it. They do different jobs:
+
+- **Peer address** (`host/origin_guard.rs`, `reject_non_loopback_peer`). This is the outermost layer
+  over GraphQL, its websocket and `/mcp`. A TCP peer that is not loopback (`127.0.0.0/8`, `::1`,
+  `::ffff:127.x`) gets **HTTP 403 "non-loopback peer refused"**, whatever headers it sends. This is
+  the only guard that stops another machine, if the host is ever bound off loopback. It has no
+  opt-out.
+- **Host header** (`host_header_allowed`). A `Host` that is not `127.0.0.1`, `localhost` or `[::1]`
+  on the bound port gets 403 "unexpected Host header". `/mcp` accepts only `127.0.0.1` and
+  `localhost`. The client writes this header, so it is a **DNS-rebinding defence only**: a non-browser
+  client can send `Host: 127.0.0.1:7788` from anywhere.
+- **Origin** (`allow_request_with`). This refuses cross-site browser pages. It is a **browser
+  defence only**: a request with no `Origin` is allowed.
+
+Treat the peer guard as defence in depth, not as permission to bind off loopback. The only supported
+remote access is an SSH tunnel to the loopback address, `ssh -L 7788:127.0.0.1:7788 <host>`. The
+engine then sees a loopback peer and a loopback `Host`.
 
 ## Providers (CLI TUIs)
 

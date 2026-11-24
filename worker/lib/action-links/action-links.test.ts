@@ -679,6 +679,11 @@ describe('action links: review round 2', () => {
     }
     await expect(mintActionLink(f.deps, ID, ANSWER2('\u3164!ls'))).rejects.toThrow(/createActionLink/);
     await expect(mintActionLink(f.deps, ID, { ...ANSWER2('yes'), label: 'Proceed\u3164?' })).rejects.toThrow(/label/);
+    // C-1-2: invisible is its own message, not "control characters".
+    expect(validateReply('ye\u3164s')).toBe('reply must not contain invisible characters');
+    expect(validateReply('ye\u200Bs')).toBe('reply must not contain invisible characters');
+    expect(validateLabel('Proceed\u2800?')).toBe('label must not contain invisible characters');
+    expect(validateReply('yes\rno')).toBe('reply must be one line with no control characters');
     expect(validateReply('한국어 ㅎ 네')).toBeNull();
     expect(validateLabel('⠁⠃ braille text')).toBeNull();
     const m = await mintActionLink(f.deps, ID, { ...RUN_PHASE, targetTitle: 'Disc\u3164ord\u2800 links' });

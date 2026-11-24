@@ -63,6 +63,20 @@ pub fn router(state: AppState) -> Router {
     )
     .with_state(schema)
     .merge(mcp::mcp_router(mcp_state))
+    // Outermost, over GraphQL AND /mcp: a non-loopback TCP peer is refused whatever headers it
+    // sends (C-1-7). Needs the peer address, which only [`serve`] records.
+    .layer(axum::middleware::from_fn(origin_guard::reject_non_loopback_peer))
+}
+
+/// Serve the host router on `listener`, recording each connection's peer address
+/// (`ConnectInfo<SocketAddr>`) so [`origin_guard::reject_non_loopback_peer`] can refuse a
+/// non-loopback peer. `main.rs` must serve through this, not a bare `axum::serve`.
+pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 /// `HeaderMap` must come BEFORE `GraphQLRequest`: the latter consumes the body,
@@ -1448,6 +1462,65 @@ mod router_tests {
     async fn body_text(res: axum::http::Response<Body>) -> String {
         let bytes = axum::body::to_bytes(res.into_body(), 256 * 1024).await.unwrap();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    // ── C-1-7: the peer-address guard ──
+
+    fn with_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
+        let addr: std::net::SocketAddr = peer.parse().unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        req
+    }
+
+    /// A LAN client that forges `Host: 127.0.0.1:7788` and sends no `Origin` passes the Host and
+    /// Origin guards; the peer guard refuses it on GraphQL and on /mcp. Loopback peers still work.
+    #[tokio::test]
+    async fn a_non_loopback_peer_is_refused_even_with_a_loopback_host_header() {
+        let (state, _r) = test_state();
+        for peer in ["192.168.1.50:51000", "10.0.0.7:4000", "[2001:db8::1]:4000", "[::ffff:192.168.1.50]:4000"] {
+            for uri in ["/graphql", "/mcp"] {
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("host", "127.0.0.1:7788")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({ "query": "mutation{mintActionLink(act:\"ack\",args:\"{}\",label:\"x\"){url}}" }).to_string()))
+                    .unwrap();
+                let res = router(state.clone()).oneshot(with_peer(req, peer)).await.unwrap();
+                assert_eq!(res.status(), StatusCode::FORBIDDEN, "{peer} {uri}");
+                assert_eq!(body_text(res).await, "non-loopback peer refused\n");
+            }
+        }
+        for peer in ["127.0.0.1:51000", "[::1]:51000", "[::ffff:127.0.0.1]:51000"] {
+            let res = router(state.clone())
+                .oneshot(with_peer(agent_post("{ __typename }"), peer))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{peer}");
+        }
+    }
+
+    /// `serve` (what main.rs uses) records the peer, so the guard above has an address to judge.
+    /// Loopback only: binds 127.0.0.1:0 and talks to itself.
+    #[tokio::test]
+    async fn serve_records_the_peer_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = axum::Router::new().route(
+            "/peer",
+            axum::routing::get(|axum::extract::ConnectInfo(a): axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
+                format!("peer={}", a.ip())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(super::serve(listener, app));
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        conn.write_all(b"GET /peer HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut out = String::new();
+        conn.read_to_string(&mut out).await.unwrap();
+        server.abort();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(out.contains("peer=127.0.0.1"), "{out}");
     }
 
     // ── findings ledger mutations (master plan §6) ──

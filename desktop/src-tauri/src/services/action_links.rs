@@ -81,13 +81,13 @@ fn valid_phase(v: &str) -> bool {
 }
 
 fn has_control(v: &str) -> bool {
-    v.chars().any(|c| {
-        c.is_control()
-            || c == '\u{2028}'
-            || c == '\u{2029}'
-            || is_format_char(c)
-            || is_invisible_char(c)
-    })
+    v.chars()
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+}
+
+/// Any character that renders as nothing: Cf ([`is_format_char`]) or [`is_invisible_char`].
+fn has_invisible(v: &str) -> bool {
+    v.chars().any(|c| is_format_char(c) || is_invisible_char(c))
 }
 
 /// Characters outside Cf that still render as nothing (H-3-48): the Hangul fillers (U+115F,
@@ -149,6 +149,9 @@ pub fn validate_reply(reply: &str) -> Result<(), String> {
     if has_control(reply) {
         return Err("reply must be one line with no control characters".into());
     }
+    if has_invisible(reply) {
+        return Err("reply must not contain invisible characters".into());
+    }
     if let Some(first) = reply.trim_start().chars().next() {
         if REPLY_FORBIDDEN_FIRST.contains(&first) {
             return Err(format!("reply must not start with {first}"));
@@ -174,6 +177,9 @@ pub fn validate_label(label: &str) -> Result<(), String> {
     }
     if has_control(label) {
         return Err("label must be one line with no control characters".into());
+    }
+    if has_invisible(label) {
+        return Err("label must not contain invisible characters".into());
     }
     Ok(())
 }

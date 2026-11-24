@@ -84,7 +84,7 @@ export const INVISIBLE_RE = /[\u034F\u115F\u1160\u17B4\u17B5\u2800\u3164\uFFA0]/
 
 export function validateReply(reply: string): string | null {
   if (reply.trim().length === 0) return 'reply must not be empty';
-  if (FORMAT_RE.test(reply) || INVISIBLE_RE.test(reply)) return 'reply must not contain invisible format characters';
+  if (FORMAT_RE.test(reply) || INVISIBLE_RE.test(reply)) return 'reply must not contain invisible characters';
   if ([...reply].length > REPLY_MAX) return `reply must be at most ${REPLY_MAX} characters`;
   if (CONTROL_RE.test(reply)) return 'reply must be one line with no control characters';
   // A reply is typed into an agent CLI, where a leading `!` runs a shell command (bash mode),
@@ -99,7 +99,7 @@ export function validateLabel(label: unknown): string | null {
   if (typeof label !== 'string' || label.trim().length === 0) return 'label is required';
   if ([...label].length > LABEL_MAX) return `label must be at most ${LABEL_MAX} characters`;
   if (CONTROL_RE.test(label)) return 'label must be one line with no control characters';
-  if (FORMAT_RE.test(label) || INVISIBLE_RE.test(label)) return 'label must not contain invisible format characters';
+  if (FORMAT_RE.test(label) || INVISIBLE_RE.test(label)) return 'label must not contain invisible characters';
   return null;
 }
 
