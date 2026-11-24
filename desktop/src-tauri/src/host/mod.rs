@@ -1747,6 +1747,47 @@ mod router_tests {
         assert!(mirror.contains("\"state\": \"claimed\""), "{mirror}");
     }
 
+    #[tokio::test]
+    async fn finding_mutation_red_first_claim_and_dispute_round_trip() {
+        let (state, store) = ledger_fixture("phase_review_running");
+        send(&state, agent_post(&report_q(test_seed::QA, "drops where_"))).await;
+        send(&state, agent_post(&report_q(test_seed::QA, "loses fence"))).await;
+        test_seed::set_status(&state, "phase_worker_running");
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{claimFix(sessionId:"{}",findingId:"F-00-x-1",evidence:"kept where_",test:"x::keeps_where",brokeWhat:"dropped the write",redOutput:"assertion failed")}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["claimFix"], true, "{v}");
+        let f = ledger::get(&state, test_seed::PLAN, "F-00-x-1").unwrap();
+        assert_eq!((f.red_first, f.claim_test.as_deref()), (Some(true), Some("x::keeps_where")));
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{disputeFinding(sessionId:"{}",findingId:"F-00-x-2",reason:"the fence is in tests/x.rs:9")}}"#,
+                test_seed::WORKER
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["disputeFinding"], true, "{v}");
+        let mirror = std::fs::read_to_string(store.join("phases/00-x/findings.json")).unwrap();
+        assert!(mirror.contains("\"state\": \"disputed\"") && mirror.contains("\"redFirst\": true"), "{mirror}");
+        test_seed::set_status(&state, "phase_review_running");
+        let v = send(
+            &state,
+            agent_post(&format!(
+                r#"mutation{{resolveFinding(sessionId:"{}",findingId:"F-00-x-2",outcome:WITHDRAW)}}"#,
+                test_seed::QA
+            )),
+        )
+        .await;
+        assert_eq!(v["data"]["resolveFinding"], true, "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, "F-00-x-2").unwrap().state, "withdrawn");
+    }
+
     fn waive_proposed(state: &AppState) -> String {
         let id = ledger::report_finding(state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
         test_seed::set_status(state, "phase_worker_running");
