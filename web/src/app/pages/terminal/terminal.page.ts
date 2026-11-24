@@ -217,6 +217,10 @@ import {
   shellViewTogglePath,
 } from '../shells/shells-route';
 import {
+  endedNote,
+  heldNotice,
+  holdRefusal,
+  type HeldRefusal,
   isReadOnlyShell,
   paneRefusalNotice,
   rawPaneView,
@@ -393,6 +397,9 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private commandRejectionSubscription: Subscription | null = null;
   /** Per session: the "Transcript only" notice of a pane the engine refused to start (G-1-1). */
   protected readonly paneNotices = signal<Record<string, string>>({});
+  /** Job-ended refusals that arrived before their session was shown (bug 1 ordering). */
+  private readonly heldRefusals = signal<Record<string, HeldRefusal>>({});
+  protected readonly endedNote = endedNote;
   protected readonly rawPaneView = rawPaneView;
   protected readonly isReadOnlyShell = isReadOnlyShell;
   protected readonly readOnlyNote = readOnlyNote;
@@ -1814,6 +1821,30 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       { allowSignalWrites: true },
     );
 
+    // A job-ended refusal that arrived before its session was shown becomes the pane's notice as
+    // soon as the session is (bug 1): the /shells session, or the console's primary session.
+    effect(
+      () => {
+        const ids = [this.currentSession()?.id, this.primarySessionId()];
+        const held = this.heldRefusals();
+        untracked(() => {
+          const now = Date.now();
+          for (const id of ids) {
+            const notice = heldNotice(held, id, now);
+            if (!id || !notice) continue;
+            this.paneNotices.update((m) => withPaneNotice(m, id, notice));
+            // Applied once: a later live frame may clear the notice, and must not see it come back.
+            this.heldRefusals.update((h) => {
+              const next = { ...h };
+              delete next[id];
+              return next;
+            });
+          }
+        });
+      },
+      { allowSignalWrites: true },
+    );
+
     // Hydrate the transcript from persisted reports when a shell opens.
     //
     // The live lane only delivers what arrives while connected, so a reload — or simply opening a
@@ -3062,7 +3093,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       { ...ack, accepted: false },
       [this.currentSession()?.id, this.primarySessionId()],
     );
-    if (!rejection) return;
+    if (!rejection) {
+      // The ack can beat `getSession` (the page has not resolved the session yet). A job-ended
+      // refusal is held briefly and applied once the session is shown, instead of being lost and
+      // leaving a blank pane (live UI bug 1).
+      this.heldRefusals.update((h) => holdRefusal(h, { ...ack, accepted: false }, Date.now()));
+      return;
+    }
     this.paneNotices.update((m) => withPaneNotice(m, rejection.sessionId, paneRefusalNotice(rejection.error)));
     // Only an open/type refusal is the terminal error; a refused resize/kill is noise (G-2-17).
     if (rejection.sessionId === this.currentSession()?.id && surfacesAsTerminalError(ack.kind)) {

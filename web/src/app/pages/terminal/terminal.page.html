@@ -523,8 +523,8 @@
             <div class="wd-footnote">{{ wdNudgeCount() }} sent@if (wdHeldCount() > 0) { · held {{ wdHeldCount() }}×} · {{ wdArmedAgo() }}. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
           }
         </section>
-      } @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh)).kind === 'ended') {
-        @let shellRaw = rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh));
+      } @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh)).kind === 'ended') {
+        @let shellRaw = rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh));
         <section class="workspace-empty job-ended" role="note">
           <div class="empty-title">{{ shellRaw.kind === 'ended' ? shellRaw.note : '' }}</div>
           <div class="empty-copy">Its pane is not restarted. The Transcript keeps what it did.</div>

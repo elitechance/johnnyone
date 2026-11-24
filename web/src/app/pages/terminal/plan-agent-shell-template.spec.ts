@@ -60,7 +60,7 @@ describe('plan-agent shell page (template)', () => {
     const bar = topbar();
     expect(bar).toContain('@let topJobEnded = (sh ? paneNotices()[sh.id] : null) || jobEndedNotice(terminalError());');
     expect(bar).toContain('class="ps-view-only ps-job-ended" role="note"');
-    const ended = HTML.indexOf("} @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh)).kind === 'ended') {");
+    const ended = HTML.indexOf("} @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh)).kind === 'ended') {");
     const raw = HTML.indexOf('<johnny-terminal-screen\n          class="terminal-surface plain-shell-screen mirror"');
     expect(ended).toBeGreaterThan(-1);
     expect(raw).toBeGreaterThan(ended); // checked BEFORE the raw screen renders
