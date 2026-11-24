@@ -437,7 +437,9 @@ export class ChatRelayDO implements DurableObject {
             this.broadcastTo('api', envelope);
             // The web's graphql-ws subscriptions (`onRelayChatDelta`, `onRelayChatMessage`) read
             // lokal's PubSubDO topics, not these sockets: publish there too (live UI bugs 2, item 1).
-            await this.publishForSubscriptions(envelope, authCtx?.userId);
+            // An API-key socket ("desktop" is only a query flag at upgrade) never feeds the web's
+            // chat subscriptions (L-1-2); tying publishes to the registered node is a follow-up.
+            if (!authCtx?.apiKey) await this.publishForSubscriptions(envelope, authCtx?.userId);
           }
           // Invalidate ownership cache on delete/archive so revoked sessions stop streaming (Task 05)
           if ((envelope.type === 'session_deleted' ||

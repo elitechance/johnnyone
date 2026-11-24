@@ -72,7 +72,15 @@ export function shouldReconnectClose(code: number, attemptsSoFar: number): boole
   return DROPPED_CODES.has(code) && attemptsSoFar < RECONNECT_MAX_ATTEMPTS;
 }
 
-/** Backoff before reconnect attempt `attempt` (0-based): 1 s, 2 s, 4 s, 8 s, capped at 15 s. */
-export function reconnectDelayMs(attempt: number): number {
-  return Math.min(1000 * 2 ** Math.max(0, attempt), 15_000);
+/** Reconnect jitter: ±20% of the backoff (L-1-4), so many tabs dropped together do not reconnect in step. */
+export const RECONNECT_JITTER = 0.2;
+
+/**
+ * Backoff before reconnect attempt `attempt` (0-based): 1 s, 2 s, 4 s, 8 s, capped at 15 s, then
+ * jittered ±20% by `rand` (a `Math.random()` draw in [0, 1); 0.5 = no jitter). Never below 800 ms.
+ */
+export function reconnectDelayMs(attempt: number, rand = 0.5): number {
+  const base = Math.min(1000 * 2 ** Math.max(0, attempt), 15_000);
+  const r = Math.min(Math.max(rand, 0), 1);
+  return Math.round(base * (1 - RECONNECT_JITTER + 2 * RECONNECT_JITTER * r));
 }

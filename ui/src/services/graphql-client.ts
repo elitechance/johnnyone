@@ -178,7 +178,7 @@ export class GraphQLClient {
           fail(new SubscriptionClosedError(code, reason));
           return;
         }
-        const delay = reconnectDelayMs(dropAttempts);
+        const delay = reconnectDelayMs(dropAttempts, Math.random());
         dropAttempts += 1;
         reconnecting = true;
         ws = null;

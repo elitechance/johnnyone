@@ -1665,18 +1665,24 @@ mod tests {
         // The relay's turn loop is the `stream_relay_turn` seam (live UI bugs 2, item 1; its
         // behaviour is unit-tested in `agent::relay_turn_tests`); `handle_relay_chat` calls it with
         // the shared idle timeout, then stores.
+        // The store is the `persist` hook the seam calls once the turn is over (L-1-5: before the
+        // final message is published).
         let handler = fn_body(include_str!("../agent/mod.rs"), "async fn handle_relay_chat(");
-        let call = pos(handler, "Self::stream_relay_turn(", "relay");
-        assert!(handler[call..call + 300].contains("chat_host::TURN_IDLE_TIMEOUT"), "relay: the shared idle timeout");
+        let hook = pos(handler, "let persist = |o: &RelayTurnOutcome| {", "relay");
         let store = pos(handler, "INSERT INTO messages (id, session_id, role, content, finish_reason", "relay");
-        assert!(call < store, "relay: the turn is followed to its end before it is stored");
+        let call = pos(handler, "Self::stream_relay_turn(", "relay");
+        assert!(handler[call..].contains("chat_host::TURN_IDLE_TIMEOUT"), "relay: the shared idle timeout");
+        assert!(handler[call..].contains("persist,"), "relay: the store is the seam persist hook");
+        assert!(hook < store && store < call, "relay: the store lives in the persist hook");
         let relay = fn_body(include_str!("../agent/mod.rs"), "pub(crate) async fn stream_relay_turn<");
         let recv = pos(relay, "chat_host::recv_turn_chunk(", "relay");
         let timed_out = pos(relay, "TurnRecv::TimedOut => {", "relay");
         assert!(relay[timed_out..timed_out + 300].contains("should_kill_process = true;"), "relay: a timeout kills");
         let end = pos(relay, "chat_host::end_own_turn(&state.active_processes, &req.session_id, turn_id, should_kill_process)", "relay");
         let fin = pos(relay, "chat_host::final_assistant_content(", "relay");
-        assert!(recv < end && end < fin, "relay: recv → end_own_turn → final content");
+        let persisted = pos(relay, "persist(&outcome);", "relay");
+        let message = pos(relay, "AgentMessage::RelayChatMessage(", "relay");
+        assert!(recv < end && end < fin && fin < persisted && persisted < message, "relay: recv → end_own_turn → final content → store → final message");
         for body in [handler, relay] {
             assert!(!body.contains("while let Some(chunk) = rx.recv().await"), "relay: an unbounded wait came back");
             assert!(!body.contains("take_own_process("), "relay: bypasses end_own_turn");

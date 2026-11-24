@@ -2,7 +2,7 @@
  * Relay → GraphQL subscription bridge (live UI bugs 2, item 1).
  *
  * The web's plan chat listens through graphql-ws subscriptions:
- *  - `onRelayChatDelta(relayId)`   → pubsub topic `relay-chat-delta:<relayId>`
+ *  - `onRelayChatDelta(relayId)`   → pubsub topic `relay-chat-delta:<userId>:<relayId>`
  *  - `onRelayChatMessage(sessionId)` → pubsub topic `relay-chat-message:<userId>:<sessionId>`
  *
  * Those topics live in lokal's generated `PubSubDO` (binding `PUBSUB_DO`, one DO per "room" = the
@@ -23,12 +23,23 @@ export interface RelayPublication {
   data: Record<string, unknown>;
 }
 
+/** The delta topic: owner-scoped (L-1-1), so only the desktop owner's subscription matches. */
+export function relayDeltaTopic(userId: string, relayId: string): string {
+  return `relay-chat-delta:${userId}:${relayId}`;
+}
+
+/** The message topic of a user's session. */
+export function relayMessageTopic(userId: string, sessionId: string): string {
+  return `relay-chat-message:${userId}:${sessionId}`;
+}
+
 /**
  * The subscription publications for one desktop→client envelope. Pure.
- * - `chat_delta` → the delta topic of its relayId;
- * - `chat_message` → the message topic of the desktop's OWNER (`ownerUserId`, the socket's
- *   authenticated user — never a client-supplied id) and the session.
- * Anything else, or an envelope missing its keys, publishes nothing.
+ * Both topics are scoped to the desktop's OWNER (`ownerUserId`, the socket's authenticated user —
+ * never an id from the payload):
+ * - `chat_delta` → the owner's delta topic of its relayId;
+ * - `chat_message` → the owner's message topic of the session.
+ * No owner, anything else, or an envelope missing its keys publishes nothing.
  */
 export function relayPublications(
   envelope: { type?: string; relayId?: string; sessionId?: string; data?: unknown },
@@ -37,11 +48,12 @@ export function relayPublications(
   const data = (envelope.data && typeof envelope.data === 'object' ? envelope.data : {}) as Record<string, unknown>;
   const relayId = String(data['relayId'] ?? envelope.relayId ?? '');
   const sessionId = String(data['sessionId'] ?? envelope.sessionId ?? '');
+  if (!ownerUserId) return [];
   if (envelope.type === 'chat_delta') {
     if (!relayId) return [];
     return [
       {
-        topic: `relay-chat-delta:${relayId}`,
+        topic: relayDeltaTopic(ownerUserId, relayId),
         data: {
           relayId,
           sessionId,
@@ -53,10 +65,10 @@ export function relayPublications(
     ];
   }
   if (envelope.type === 'chat_message') {
-    if (!sessionId || !ownerUserId) return [];
+    if (!sessionId) return [];
     return [
       {
-        topic: `relay-chat-message:${ownerUserId}:${sessionId}`,
+        topic: relayMessageTopic(ownerUserId, sessionId),
         data: {
           relayId,
           sessionId,

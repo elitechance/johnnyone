@@ -13,13 +13,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GraphQLClient } from '../../../../ui/src/services/graphql-client';
 import {
   KEEPALIVE_MS,
+  RECONNECT_JITTER,
   RECONNECT_MAX_ATTEMPTS,
   RECONNECT_STABLE_MS,
   SubscriptionClosedError,
   reconnectDelayMs,
   shouldReconnectClose,
 } from '../../../../ui/src/services/graphql-ws-logic';
-import { TURN_FALLBACK_POLL_MS, classifyDelta } from '../../../../ui/src/services/ai-chat-logic';
+import { TURN_FALLBACK_POLL_MS, classifyDelta, replyAlreadyStored } from '../../../../ui/src/services/ai-chat-logic';
 import { AiChatService } from '../../../../ui/src/services/ai-chat.service';
 import { JohnnyApiService, type RelayChatDeltaMsg, type RelayChatMessageMsg } from '../../../../ui/src/services/johnny-api.service';
 
@@ -75,6 +76,8 @@ function makeClient() {
 }
 
 const types = (ws: FakeSocket) => ws.sent.map((m) => m.type);
+/** The longest a reconnect may wait for `attempt` (jitter at its top). */
+const maxDelay = (attempt: number) => reconnectDelayMs(attempt, 1);
 
 describe('subscription keepalive + reconnect (item 1)', () => {
   beforeEach(() => {
@@ -126,7 +129,7 @@ describe('subscription keepalive + reconnect (item 1)', () => {
     expect(error).not.toHaveBeenCalled();
     expect(onDropped).toHaveBeenCalledTimes(1);
     expect(FakeSocket.all.length).toBe(1);
-    vi.advanceTimersByTime(reconnectDelayMs(0));
+    vi.advanceTimersByTime(maxDelay(0));
     expect(FakeSocket.all.length).toBe(2);
     const second = FakeSocket.all[1];
     second.live();
@@ -145,7 +148,7 @@ describe('subscription keepalive + reconnect (item 1)', () => {
     makeClient().subscribe('subscription { x }').subscribe({ error });
     FakeSocket.all[0].drop(); // never even connected
     for (let i = 0; i < RECONNECT_MAX_ATTEMPTS; i++) {
-      vi.advanceTimersByTime(reconnectDelayMs(i));
+      vi.advanceTimersByTime(maxDelay(i));
       expect(FakeSocket.all.length).toBe(i + 2);
       FakeSocket.all[i + 1].drop();
     }
@@ -164,9 +167,30 @@ describe('subscription keepalive + reconnect (item 1)', () => {
       ws.live();
       vi.advanceTimersByTime(RECONNECT_STABLE_MS);
       ws.drop();
-      vi.advanceTimersByTime(reconnectDelayMs(0));
+      vi.advanceTimersByTime(maxDelay(0));
     }
     expect(error).not.toHaveBeenCalled();
+  });
+
+  it('L-1-4: the reconnect waits its jittered backoff (±20%), never sooner', () => {
+    expect(reconnectDelayMs(0, 0)).toBe(800);
+    expect(reconnectDelayMs(0, 1)).toBe(1200);
+    expect(reconnectDelayMs(4, 0)).toBe(15000 * (1 - RECONNECT_JITTER));
+    expect(reconnectDelayMs(2, 0.5)).toBe(4000);
+    for (const r of [0, 0.999]) {
+      const rnd = vi.spyOn(Math, 'random').mockReturnValue(r);
+      FakeSocket.all = [];
+      makeClient().subscribe('subscription { x }').subscribe({ error: () => undefined });
+      FakeSocket.all[0].live();
+      FakeSocket.all[0].drop();
+      const wait = reconnectDelayMs(0, r);
+      expect(wait).toBeGreaterThanOrEqual(800);
+      vi.advanceTimersByTime(wait - 1);
+      expect(FakeSocket.all.length, `no socket before ${wait} ms`).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(FakeSocket.all.length).toBe(2);
+      rnd.mockRestore();
+    }
   });
 
   it('unsubscribing during the backoff never reconnects', () => {
@@ -185,7 +209,7 @@ describe('subscription keepalive + reconnect (item 1)', () => {
     expect(shouldReconnectClose(1001, 0)).toBe(true);
     expect(shouldReconnectClose(1006, RECONNECT_MAX_ATTEMPTS)).toBe(false);
     for (const code of [1000, 4400, 4401, 4403, 4500]) expect(shouldReconnectClose(code, 0)).toBe(false);
-    expect([0, 1, 2, 3, 4, 10].map(reconnectDelayMs)).toEqual([1000, 2000, 4000, 8000, 15000, 15000]);
+    expect([0, 1, 2, 3, 4, 10].map((a) => reconnectDelayMs(a))).toEqual([1000, 2000, 4000, 8000, 15000, 15000]);
     expect(KEEPALIVE_MS).toBeLessThan(100_000);
   });
 });
@@ -261,6 +285,43 @@ describe('the plan chat reply arrives live (item 1)', () => {
     vi.advanceTimersByTime(TURN_FALLBACK_POLL_MS);
     expect(c.isStreaming()).toBe(false);
     expect(c.messages().at(-1)?.content).toBe('stored answer');
+  });
+
+  it('L-1-5: a final message after the store already showed the reply never duplicates it', () => {
+    vi.useFakeTimers();
+    let hooks: { onDropped?: () => void } | undefined;
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    let served: unknown[] = [];
+    const messages = new Subject<RelayChatMessageMsg>();
+    const { chat: c } = chat({
+      listMessages: vi.fn(() => of(served)),
+      onRelayChatMessage: (_id: string, opts: { onDropped?: () => void }) => {
+        hooks = opts;
+        return messages;
+      },
+    });
+    c.loadSession('S');
+    c.sendMessage('hi');
+    served = [
+      { id: 'u', sessionId: 'S', role: 'user', content: 'hi', createdAt: now },
+      { id: 'a', sessionId: 'S', role: 'assistant', content: 'Answer', createdAt: now },
+    ];
+    hooks?.onDropped?.();
+    vi.advanceTimersByTime(TURN_FALLBACK_POLL_MS); // the store poll settles the turn first
+    messages.next({ relayId: 'r1', sessionId: 'S', role: 'assistant', content: 'Answer' }); // then live
+    expect(c.messages().map((m) => [m.role, m.content])).toEqual([
+      ['user', 'hi'],
+      ['assistant', 'Answer'],
+    ]);
+  });
+
+  it('L-1-5: replyAlreadyStored only counts stored assistant rows after the last user message', () => {
+    const r = (id: string, role: 'user' | 'assistant') => ({ id, role });
+    expect(replyAlreadyStored([r('u1', 'user'), r('a1', 'assistant')])).toBe(true);
+    expect(replyAlreadyStored([r('a0', 'assistant'), r('u1', 'user')])).toBe(false);
+    expect(replyAlreadyStored([r('u1', 'user'), r('relay-r1-assistant', 'assistant')])).toBe(false);
+    expect(replyAlreadyStored([r('temp-1', 'user')])).toBe(false);
+    expect(replyAlreadyStored([])).toBe(false);
   });
 
   it('tool and stderr deltas are not reply text', () => {

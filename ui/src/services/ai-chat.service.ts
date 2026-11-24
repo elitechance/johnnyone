@@ -15,6 +15,7 @@ import {
   errorNoticeText,
   messagesAfterError,
   normalizeStoredMessages,
+  replyAlreadyStored,
   storedCount,
   turnAnsweredInStore,
   type PendingTurn,
@@ -359,6 +360,8 @@ export class AiChatService {
         updated[existingIdx] = { ...updated[existingIdx], content: message.content };
         return updated;
       }
+      // The store poll / a refetch already shows this turn's reply: never a second copy (L-1-5).
+      if (replyAlreadyStored(msgs)) return msgs;
       return [...msgs, finalized];
     });
     this.finishStreaming();

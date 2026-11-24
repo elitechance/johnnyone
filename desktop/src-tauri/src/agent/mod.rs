@@ -3497,23 +3497,26 @@ impl AgentService {
 
     /// Follow one relayed chat turn to its end, publishing it through `emit` (the relay socket in
     /// production, a recorder in tests): every chunk as a `chat_delta`, then — after the turn's
-    /// registration is dropped — the FINAL assistant text as a `chat_message`, then `chat_complete`.
+    /// registration is dropped and `persist` STORED the reply (L-1-5) — the FINAL assistant text as
+    /// a `chat_message`, then `chat_complete`.
     ///
     /// The final `chat_message` is what the web's `onRelayChatMessage` subscription reconciles the
     /// reply with (live UI bugs 2, item 1). The relay sent only deltas + `chat_complete`, so a reply
     /// whose deltas were missed (a delta subscription opened after the turn's first chunks — a
     /// plan-agent pane turn answers in a few large chunks) never arrived live.
-    pub(crate) async fn stream_relay_turn<E, Fut>(
+    pub(crate) async fn stream_relay_turn<E, Fut, P>(
         state: &AppState,
         req: &RelayChatRequest,
         rx: &mut tokio::sync::mpsc::Receiver<StreamChunk>,
         turn_id: u64,
         idle: Duration,
         mut emit: E,
+        persist: P,
     ) -> RelayTurnOutcome
     where
         E: FnMut(AgentEnvelope) -> Fut,
         Fut: std::future::Future<Output = ()>,
+        P: FnOnce(&RelayTurnOutcome),
     {
         let mut full_content = String::new();
         let mut total_input_tokens: i64 = 0;
@@ -3627,14 +3630,24 @@ impl AgentService {
             &finish_reason,
         );
         let tool_calls = crate::services::chat_host::fold_tool_calls(&tool_chunks);
-
-        // The final reply, then the completion.
+        let outcome = RelayTurnOutcome {
+            full_content,
+            finish_reason,
+            total_input_tokens,
+            total_output_tokens,
+            total_cost_cents,
+            captured_cli_session_id,
+            clear_cli_session_id,
+            tool_calls,
+        };
+        // Store first (L-1-5), then the final reply, then the completion.
+        persist(&outcome);
         emit(AgentEnvelope {
             message: AgentMessage::RelayChatMessage(RelayChatMessage {
                 relay_id: req.relay_id.clone(),
                 session_id: req.session_id.clone(),
                 role: "assistant".to_string(),
-                content: full_content.clone(),
+                content: outcome.full_content.clone(),
             }),
         })
         .await;
@@ -3647,16 +3660,7 @@ impl AgentService {
         })
         .await;
 
-        RelayTurnOutcome {
-            full_content,
-            finish_reason,
-            total_input_tokens,
-            total_output_tokens,
-            total_cost_cents,
-            captured_cli_session_id,
-            clear_cli_session_id,
-            tool_calls,
-        }
+        outcome
     }
 
     /// Refuse a relayed chat turn without spawning: one final `error` delta carrying `message`, then
@@ -3892,84 +3896,88 @@ impl AgentService {
                     .await;
             }
         };
-        let RelayTurnOutcome {
-            full_content,
-            finish_reason,
-            total_input_tokens,
-            total_output_tokens,
-            total_cost_cents,
-            captured_cli_session_id,
-            clear_cli_session_id,
-            tool_calls,
-        } = Self::stream_relay_turn(
+        // The reply is STORED before its final `chat_message` goes out (L-1-5): a web refetch on that
+        // message must find the row, or the reply would vanish until the next refresh.
+        let persist = |o: &RelayTurnOutcome| {
+            let (full_content, finish_reason, total_input_tokens, total_output_tokens, total_cost_cents) = (
+                o.full_content.clone(),
+                o.finish_reason.clone(),
+                o.total_input_tokens,
+                o.total_output_tokens,
+                o.total_cost_cents,
+            );
+            let (captured_cli_session_id, clear_cli_session_id, tool_calls) =
+                (o.captured_cli_session_id.clone(), o.clear_cli_session_id, o.tool_calls.clone());
+            // Also save to local SQLite
+            let _ = state.db.with_conn(|conn| {
+                let session_id = &req.session_id;
+                let user_msg_id = uuid::Uuid::new_v4().to_string();
+                let assistant_msg_id = uuid::Uuid::new_v4().to_string();
+
+                // Ensure session exists locally
+                conn.execute(
+                    "INSERT OR IGNORE INTO sessions (id, title, provider, model, working_directory) VALUES (?1, 'Mobile Session', ?2, ?3, ?4)",
+                    rusqlite::params![session_id, provider_key, model, working_dir],
+                ).map_err(|e| e.to_string())?;
+
+                // Keep local session config aligned with the resolved relay config.
+                conn.execute(
+                    "UPDATE sessions SET provider = ?1, model = ?2, working_directory = ?3, updated_at = datetime('now') WHERE id = ?4",
+                    rusqlite::params![provider_key, model, working_dir, session_id],
+                ).map_err(|e| e.to_string())?;
+
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content) VALUES (?1, ?2, 'user', ?3)",
+                    rusqlite::params![user_msg_id, session_id, req.content],
+                ).map_err(|e| e.to_string())?;
+
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents, tool_calls) VALUES (?1, ?2, 'assistant', ?3, ?8, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents, tool_calls, finish_reason],
+                ).map_err(|e| e.to_string())?;
+
+                if matches!(
+                    provider,
+                    CliProvider::ClaudeCode | CliProvider::Codex | CliProvider::Grok
+                ) {
+                    if clear_cli_session_id {
+                        conn.execute(
+                            "UPDATE sessions SET cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",
+                            rusqlite::params![session_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else if let Some(ref cli_sid) = captured_cli_session_id {
+                        conn.execute(
+                            "UPDATE sessions SET cli_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+                            rusqlite::params![cli_sid, session_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+
+                conn.execute(
+                    "UPDATE sessions SET total_input_tokens = total_input_tokens + ?1, total_output_tokens = total_output_tokens + ?2, total_cost_cents = total_cost_cents + ?3, updated_at = datetime('now') WHERE id = ?4",
+                    rusqlite::params![total_input_tokens, total_output_tokens, total_cost_cents, session_id],
+                )
+                .map_err(|e| e.to_string())?;
+
+                conn.execute(
+                    "INSERT INTO usage_log (session_id, message_id, provider, model, input_tokens, output_tokens, cost_cents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![session_id, assistant_msg_id, provider_key, model, total_input_tokens, total_output_tokens, total_cost_cents],
+                )
+                .map_err(|e| e.to_string())
+            });
+        };
+        Self::stream_relay_turn(
             &state,
             &req,
             &mut rx,
             turn_id,
             crate::services::chat_host::TURN_IDLE_TIMEOUT,
             emit,
+            persist,
         )
         .await;
-
-        // Also save to local SQLite
-        let _ = state.db.with_conn(|conn| {
-            let session_id = &req.session_id;
-            let user_msg_id = uuid::Uuid::new_v4().to_string();
-            let assistant_msg_id = uuid::Uuid::new_v4().to_string();
-
-            // Ensure session exists locally
-            conn.execute(
-                "INSERT OR IGNORE INTO sessions (id, title, provider, model, working_directory) VALUES (?1, 'Mobile Session', ?2, ?3, ?4)",
-                rusqlite::params![session_id, provider_key, model, working_dir],
-            ).map_err(|e| e.to_string())?;
-
-            // Keep local session config aligned with the resolved relay config.
-            conn.execute(
-                "UPDATE sessions SET provider = ?1, model = ?2, working_directory = ?3, updated_at = datetime('now') WHERE id = ?4",
-                rusqlite::params![provider_key, model, working_dir, session_id],
-            ).map_err(|e| e.to_string())?;
-
-            conn.execute(
-                "INSERT INTO messages (id, session_id, role, content) VALUES (?1, ?2, 'user', ?3)",
-                rusqlite::params![user_msg_id, session_id, req.content],
-            ).map_err(|e| e.to_string())?;
-
-            conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, finish_reason, input_tokens, output_tokens, cost_cents, tool_calls) VALUES (?1, ?2, 'assistant', ?3, ?8, ?4, ?5, ?6, ?7)",
-                rusqlite::params![assistant_msg_id, session_id, full_content, total_input_tokens, total_output_tokens, total_cost_cents, tool_calls, finish_reason],
-            ).map_err(|e| e.to_string())?;
-
-            if matches!(
-                provider,
-                CliProvider::ClaudeCode | CliProvider::Codex | CliProvider::Grok
-            ) {
-                if clear_cli_session_id {
-                    conn.execute(
-                        "UPDATE sessions SET cli_session_id = NULL, updated_at = datetime('now') WHERE id = ?1",
-                        rusqlite::params![session_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                } else if let Some(ref cli_sid) = captured_cli_session_id {
-                    conn.execute(
-                        "UPDATE sessions SET cli_session_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-                        rusqlite::params![cli_sid, session_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-            }
-
-            conn.execute(
-                "UPDATE sessions SET total_input_tokens = total_input_tokens + ?1, total_output_tokens = total_output_tokens + ?2, total_cost_cents = total_cost_cents + ?3, updated_at = datetime('now') WHERE id = ?4",
-                rusqlite::params![total_input_tokens, total_output_tokens, total_cost_cents, session_id],
-            )
-            .map_err(|e| e.to_string())?;
-
-            conn.execute(
-                "INSERT INTO usage_log (session_id, message_id, provider, model, input_tokens, output_tokens, cost_cents) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![session_id, assistant_msg_id, provider_key, model, total_input_tokens, total_output_tokens, total_cost_cents],
-            )
-            .map_err(|e| e.to_string())
-        });
 
         Ok(())
     }
@@ -5879,17 +5887,35 @@ mod relay_turn_tests {
 
         let published: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
         let sink = published.clone();
+        let stored_sink = published.clone();
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            AgentService::stream_relay_turn(&state, &req(), &mut rx, turn_id, Duration::from_secs(5), move |env| {
-                sink.lock().unwrap().push(serde_json::to_value(&env).unwrap());
-                async {}
-            }),
+            AgentService::stream_relay_turn(
+                &state,
+                &req(),
+                &mut rx,
+                turn_id,
+                Duration::from_secs(5),
+                move |env| {
+                    sink.lock().unwrap().push(serde_json::to_value(&env).unwrap());
+                    async {}
+                },
+                move |o: &RelayTurnOutcome| {
+                    // L-1-5: the reply is stored BEFORE the final message is published.
+                    stored_sink.lock().unwrap().push(serde_json::json!({ "type": "stored", "content": o.full_content }));
+                },
+            ),
         )
         .await
         .expect("relay turn hung");
 
-        let published = published.lock().unwrap().clone();
+        let mut published = published.lock().unwrap().clone();
+        // L-1-5: stored (once, with the whole reply) BEFORE the final message goes out.
+        let at = published.iter().position(|v| v["type"] == "stored").expect("persist ran");
+        assert_eq!(published.iter().filter(|v| v["type"] == "stored").count(), 1);
+        assert_eq!(published[at]["content"], "Let me update the brief. Done.");
+        assert_eq!(published[at + 1]["type"], "chat_message", "stored right before the final message");
+        published.remove(at);
         let types: Vec<&str> = published.iter().map(|v| v["type"].as_str().unwrap()).collect();
         let n = types.len();
         assert!(n >= 4, "{types:?}");
@@ -5942,11 +5968,26 @@ mod relay_turn_tests {
 
         let published: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
         let sink = published.clone();
-        AgentService::stream_relay_turn(&state, &req(), &mut rx, turn_id, Duration::from_secs(5), move |env| {
-            sink.lock().unwrap().push(serde_json::to_value(&env).unwrap());
-            async {}
-        })
+        let stored = Arc::new(std::sync::Mutex::new(0usize));
+        let stored_in = stored.clone();
+        let sink_count = published.clone();
+        AgentService::stream_relay_turn(
+            &state,
+            &req(),
+            &mut rx,
+            turn_id,
+            Duration::from_secs(5),
+            move |env| {
+                sink.lock().unwrap().push(serde_json::to_value(&env).unwrap());
+                async {}
+            },
+            move |_o: &RelayTurnOutcome| {
+                // Only the error delta went out before the reply was stored.
+                *stored_in.lock().unwrap() = sink_count.lock().unwrap().len();
+            },
+        )
         .await;
+        assert_eq!(*stored.lock().unwrap(), 1, "stored before the final message");
         let published = published.lock().unwrap().clone();
         let types: Vec<&str> = published.iter().map(|v| v["type"].as_str().unwrap()).collect();
         assert_eq!(types, ["chat_delta", "chat_message", "chat_complete"]);
