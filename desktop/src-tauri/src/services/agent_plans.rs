@@ -1142,26 +1142,33 @@ pub async fn start_plan(
         spawn_coordinator_loop(state.clone(), id.clone()).await;
         return get_plan(&state, &id);
     }
-    // Status FIRST, then mint + attach (G-1-11): a Run-from-phase on a completed (approved,
-    // all-passed) plan would otherwise mint a worker whose plan job has "ended", and the
-    // terminal gate (`terminal::decide_pane`) would refuse its pane.
-    let worker_session_id = revive_dev_worker_with(&state, &run, &phase, phase_run_mode, &LiveAttach).await?;
-    append_event(
-        &state,
-        &id,
-        Some(&phase.phase_id),
-        "agent_phase_started",
-        json!({}),
-    )?;
-
-    // Re-read: `ensure_dev_worker_session` may have minted a fresh worker (the stored one was
-    // retired at completion), and the prompt's report curl must name the CURRENT session.
-    let run = get_plan(&state, &id)?;
-    let prompt = worker_phase_prompt(&state, &run, &phase)?;
-    deliver_agent_prompt(&state, &worker_session_id, &prompt).await?;
-
+    start_dev_phase_with(&state, &run, &phase, phase_run_mode, &LiveAttach).await?;
     spawn_coordinator_loop(state.clone(), id.clone()).await;
     get_plan(&state, &id)
+}
+
+/// `start_plan`'s (re)start of a non-kloo phase: revive the worker, record the start, and deliver
+/// the phase prompt. Status FIRST, then mint + attach (G-1-11): a Run-from-phase on a completed
+/// (approved, all-passed) plan would otherwise mint a worker whose plan job has "ended", and the
+/// terminal gate (`terminal::decide_pane`) would refuse its pane. The revival (its per-plan guard)
+/// is held until the prompt is delivered (G-3-33), so a second click meanwhile is refused with
+/// [`REVIVAL_BUSY`] instead of delivering the phase prompt twice.
+pub(crate) async fn start_dev_phase_with(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    phase_run_mode: &str,
+    attach: &dyn WorkerAttach,
+) -> Result<(), String> {
+    let (worker_session_id, revival) = revive_dev_worker_held(state, run, phase, phase_run_mode, attach).await?;
+    append_event(state, &run.plan.id, Some(&phase.phase_id), "agent_phase_started", json!({}))?;
+    // Re-read: `ensure_dev_worker_session` may have minted a fresh worker (the stored one was
+    // retired at completion), and the prompt's report curl must name the CURRENT session.
+    let run = get_plan(state, &run.plan.id)?;
+    let prompt = worker_phase_prompt(state, &run, phase)?;
+    attach.deliver_prompt(state, &worker_session_id, &prompt).await?;
+    drop(revival);
+    Ok(())
 }
 
 /// Validate an optional human comment/guidance attached to a run/resume.
@@ -4291,6 +4298,11 @@ pub(crate) trait WorkerAttach: Send + Sync {
     fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
     /// Type `text` into the session's pane (the feedback prompt).
     fn send_input<'a>(&'a self, state: &'a AppState, session_id: &'a str, text: String) -> AttachFuture<'a>;
+    /// Deliver a phase prompt and wait until the pane shows it. Production: `deliver_agent_prompt`
+    /// (retries, folder-trust detection); a fake just types it.
+    fn deliver_prompt<'a>(&'a self, state: &'a AppState, session_id: &'a str, prompt: &'a str) -> AttachFuture<'a> {
+        self.send_input(state, session_id, format!("{prompt}\r"))
+    }
 }
 
 pub(crate) struct LiveAttach;
@@ -4306,6 +4318,9 @@ impl WorkerAttach for LiveAttach {
     }
     fn send_input<'a>(&'a self, state: &'a AppState, session_id: &'a str, text: String) -> AttachFuture<'a> {
         Box::pin(terminal::send_terminal_input(state, session_id.to_string(), text))
+    }
+    fn deliver_prompt<'a>(&'a self, state: &'a AppState, session_id: &'a str, prompt: &'a str) -> AttachFuture<'a> {
+        Box::pin(deliver_agent_prompt(state, session_id, prompt))
     }
 }
 
@@ -4368,14 +4383,16 @@ pub(crate) struct RevivalGuard(String);
 
 impl Drop for RevivalGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = revivals_in_flight().lock() {
-            set.remove(&self.0);
-        }
+        // A poisoned set (a panic while it was held) is still a valid set of plan ids (G-3-32).
+        revivals_in_flight()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
     }
 }
 
 pub(crate) fn claim_revival(plan_id: &str) -> Result<RevivalGuard, String> {
-    let mut set = revivals_in_flight().lock().map_err(|_| "revival lock poisoned".to_string())?;
+    let mut set = revivals_in_flight().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !set.insert(plan_id.to_string()) {
         return Err(REVIVAL_BUSY.to_string());
     }
@@ -4393,6 +4410,9 @@ pub(crate) struct Revival {
     _guard: RevivalGuard,
 }
 
+/// The refusal when the plan's status changed between a revival's snapshot and its flip (G-3-31).
+pub(crate) const REVIVAL_MOVED: &str = "This plan changed while it was being started; reload it and try again.";
+
 /// Claim the plan, snapshot it, and write `status` (plus `extra` columns, and the phase's
 /// `worker_running` when `phase` is given) — the status-first half of every revival.
 fn begin_revival(
@@ -4404,18 +4424,38 @@ fn begin_revival(
 ) -> Result<Revival, String> {
     let guard = claim_revival(plan_id)?;
     let snap = revival_snapshot(state, plan_id, phase.map(|p| p.0))?;
+    begin_revival_from(state, guard, snap, status, phase, phase_sets_start)
+}
+
+/// The flip half of [`begin_revival`], COMPARE-AND-SET against the snapshot (G-3-31): the plan is
+/// written only while its status is still the one the snapshot saw. A Stop (or anything else)
+/// that lands between the snapshot and the flip is left alone and the revival is refused with
+/// [`REVIVAL_MOVED`] — otherwise the undo would later "restore" a status the plan no longer had.
+fn begin_revival_from(
+    state: &AppState,
+    guard: RevivalGuard,
+    snap: RevivalSnapshot,
+    status: &'static str,
+    phase: Option<(&str, i64, Option<&str>)>,
+    phase_sets_start: bool,
+) -> Result<Revival, String> {
+    let plan_id = snap.plan_id.as_str();
     state.db.with_conn(|conn| {
-        match phase {
+        let changed = match phase {
             Some((pid, idx, Some(mode))) => conn.execute(
-                "UPDATE agent_plans SET status = ?1, current_phase_id = ?2, current_phase_index = ?3, phase_run_mode = ?4, updated_at = datetime('now') WHERE id = ?5",
-                params![status, pid, idx, mode, plan_id],
+                "UPDATE agent_plans SET status = ?1, current_phase_id = ?2, current_phase_index = ?3, phase_run_mode = ?4, updated_at = datetime('now') WHERE id = ?5 AND status = ?6",
+                params![status, pid, idx, mode, plan_id, snap.status],
             ),
             _ => conn.execute(
-                "UPDATE agent_plans SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![status, plan_id],
+                "UPDATE agent_plans SET status = ?1, updated_at = datetime('now') WHERE id = ?2 AND status = ?3",
+                params![status, plan_id, snap.status],
             ),
         }
         .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            tracing::info!(plan_id, snapshot = %snap.status, "revival refused: the plan moved since its snapshot");
+            return Err(REVIVAL_MOVED.to_string());
+        }
         if let Some((pid, _, _)) = phase {
             let sql = if phase_sets_start {
                 "UPDATE agent_plan_phases SET status = 'worker_running', worker_started_at = COALESCE(worker_started_at, datetime('now')), updated_at = datetime('now') WHERE plan_id = ?1 AND phase_id = ?2"
@@ -4456,8 +4496,9 @@ async fn mint_and_attach(
 /// Put a plan back after a failed revival — COMPARE-AND-SET (G-2-19): only while the plan still
 /// holds exactly what THIS revival wrote (its status, and its minted session — or the untouched
 /// pointer when it minted none). A concurrent Stop, or anything else that moved the plan since,
-/// is left alone, and so is the minted session. Only when the revert applies is the minted
-/// session archived, so no stranded agent row stays behind.
+/// is left alone. When the revert applies, the minted session is archived, so no stranded agent
+/// row stays behind; when it does not, the minted session is archived only if the plan is now
+/// terminal (G-3-30) — a plan that moved on to another running status keeps it.
 pub(crate) fn undo_revival(state: &AppState, rev: &Revival) {
     let snap = &rev.snap;
     let expected_worker = rev.minted.clone().or_else(|| snap.worker_session_id.clone());
@@ -4499,15 +4540,43 @@ pub(crate) fn undo_revival(state: &AppState, rev: &Revival) {
             }
             tracing::info!(plan_id = %snap.plan_id, status = %snap.status, "revival failed; plan put back");
         }
-        Ok(false) => tracing::info!(plan_id = %snap.plan_id, "revival failed, but the plan moved meanwhile; left as is"),
+        Ok(false) => {
+            tracing::info!(plan_id = %snap.plan_id, "revival failed, but the plan moved meanwhile; left as is");
+            // G-3-30: a Stop raced the mint. The plan is left as the Stop wrote it, but a session
+            // this revival minted would stay active with no pane and nothing to run. When the plan
+            // is now terminal, nothing will use it: archive it. A plan that moved on to another
+            // running status keeps it (it may be what the plan now points at).
+            let Some(minted) = rev.minted.as_deref() else { return };
+            match plan_status_now(state, &snap.plan_id) {
+                Ok(Some(status)) if crate::services::agent_reaper::is_terminal_plan_status(&status) => {
+                    if let Err(error) = sessions::mark_session_archived(state, minted) {
+                        tracing::warn!(plan_id = %snap.plan_id, %error, "undo revival: archiving the minted session failed");
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    // The plan is gone: its minted session has no owner either.
+                    if let Err(error) = sessions::mark_session_archived(state, minted) {
+                        tracing::warn!(plan_id = %snap.plan_id, %error, "undo revival: archiving the minted session failed");
+                    }
+                }
+                Err(error) => tracing::warn!(plan_id = %snap.plan_id, %error, "undo revival: plan status lookup failed; minted session kept"),
+            }
+        }
         Err(error) => tracing::warn!(plan_id = %snap.plan_id, %error, "undo revival failed"),
     }
 }
 
-/// `start_plan`'s (re)start of a non-kloo phase: move the plan OFF its (possibly terminal) status
-/// FIRST — plan `phase_worker_running` on `phase`, the phase `worker_running` — and only then
-/// mint/attach the worker (and a legacy active reviewer). Any failure puts everything back
-/// ([`undo_revival`]). Returns the worker session id.
+fn plan_status_now(state: &AppState, plan_id: &str) -> Result<Option<String>, String> {
+    state.db.with_conn(|conn| {
+        conn.query_row("SELECT status FROM agent_plans WHERE id = ?1", params![plan_id], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// [`revive_dev_worker_held`], releasing the revival as soon as the worker is attached.
+#[cfg(test)]
 pub(crate) async fn revive_dev_worker_with(
     state: &AppState,
     run: &AgentPlanRun,
@@ -4515,6 +4584,23 @@ pub(crate) async fn revive_dev_worker_with(
     phase_run_mode: &str,
     attach: &dyn WorkerAttach,
 ) -> Result<String, String> {
+    revive_dev_worker_held(state, run, phase, phase_run_mode, attach)
+        .await
+        .map(|(worker, _revival)| worker)
+}
+
+/// `start_plan`'s (re)start of a non-kloo phase: move the plan OFF its (possibly terminal) status
+/// FIRST — plan `phase_worker_running` on `phase`, the phase `worker_running` — and only then
+/// mint/attach the worker (and a legacy active reviewer). Any failure puts everything back
+/// ([`undo_revival`]). Returns the worker session id and the in-flight [`Revival`], which the
+/// caller holds until its own next step (the phase prompt) is done (G-3-33).
+pub(crate) async fn revive_dev_worker_held(
+    state: &AppState,
+    run: &AgentPlanRun,
+    phase: &AgentPlanPhase,
+    phase_run_mode: &str,
+    attach: &dyn WorkerAttach,
+) -> Result<(String, Revival), String> {
     let mut rev = begin_revival(
         state,
         &run.plan.id,
@@ -4539,10 +4625,13 @@ pub(crate) async fn revive_dev_worker_with(
         Ok::<String, String>(worker)
     }
     .await;
-    if attached.is_err() {
-        undo_revival(state, &rev);
+    match attached {
+        Ok(worker) => Ok((worker, rev)),
+        Err(error) => {
+            undo_revival(state, &rev);
+            Err(error)
+        }
     }
-    attached
 }
 
 /// Feedback to an approved planning run: flip it to `planning_planner_running` FIRST, then
@@ -22262,6 +22351,120 @@ pub(crate) mod session_lifecycle_tests {
         // The guard is released: a later revival is accepted again.
         assert!(claim_revival(&run.plan.id).is_ok());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G-3-30: a Stop raced the mint, then the attach failed: the plan stays stopped AND the
+    /// session this revival minted is archived (not left active with no pane). A plan that moved
+    /// to another RUNNING status keeps the minted session.
+    #[tokio::test]
+    async fn stop_during_a_failed_revival_archives_the_minted_session() {
+        for (moved_to, minted_after) in [("stopped", "archived"), ("phase_review_running", "active")] {
+            let (state, root, run, old) = completed_dev_run(&format!("revive-stop-mint-{moved_to}")).await;
+            let phase = run.phases[0].clone();
+            let plan_id = run.plan.id.clone();
+            let attach = GateAttach::new(true).during(move |st| {
+                Box::pin(async move {
+                    st.db
+                        .with_conn(|c| update_plan_status_and_health(c, &plan_id, moved_to, None).map_err(|e| e.to_string()))
+                        .unwrap();
+                })
+            });
+            assert!(revive_dev_worker_with(&state, &run, &phase, "single", &attach).await.is_err());
+            let minted = attach.seen()[0].0.clone();
+            assert_ne!(minted, old, "a session was minted");
+            assert_eq!(plan_status(&state, &run.plan.id), moved_to, "the undo overwrote the concurrent move");
+            assert_eq!(session_status(&state, &minted).as_deref(), Some(minted_after), "moved to {moved_to}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// G-3-31: the revival's flip is compare-and-set against its snapshot. A Stop that lands
+    /// between the snapshot and the flip is kept, nothing is flipped, and the claim is released.
+    #[tokio::test]
+    async fn a_stop_between_snapshot_and_flip_refuses_the_revival() {
+        let (state, root, run, _old) = completed_dev_run("revive-cas").await;
+        let phase = run.phases[0].clone();
+        let guard = claim_revival(&run.plan.id).unwrap();
+        let snap = revival_snapshot(&state, &run.plan.id, Some(&phase.phase_id)).unwrap();
+        state
+            .db
+            .with_conn(|c| update_plan_status_and_health(c, &run.plan.id, "stopped", None).map_err(|e| e.to_string()))
+            .unwrap();
+        let r = begin_revival_from(
+            &state,
+            guard,
+            snap,
+            "phase_worker_running",
+            Some((&phase.phase_id, phase.phase_index, Some("single"))),
+            true,
+        );
+        assert_eq!(r.err().as_deref(), Some(REVIVAL_MOVED));
+        let after = get_plan(&state, &run.plan.id).unwrap();
+        assert_eq!(after.plan.status, "stopped");
+        assert_eq!(after.phases[0].status, "passed", "the phase was not flipped either");
+        assert!(claim_revival(&run.plan.id).is_ok(), "the claim was released");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Records whether a second revival of the plan was refused WHILE the prompt was delivered.
+    struct PromptProbe {
+        inner: GateAttach,
+        plan_id: String,
+        busy_during_prompt: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl WorkerAttach for PromptProbe {
+        fn attach<'a>(&'a self, state: &'a AppState, session_id: &'a str) -> AttachFuture<'a> {
+            self.inner.attach(state, session_id)
+        }
+        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.inner.wait()
+        }
+        fn send_input<'a>(&'a self, state: &'a AppState, session_id: &'a str, text: String) -> AttachFuture<'a> {
+            self.inner.send_input(state, session_id, text)
+        }
+        fn deliver_prompt<'a>(&'a self, state: &'a AppState, session_id: &'a str, prompt: &'a str) -> AttachFuture<'a> {
+            // A second click now: refused while the first still holds the revival.
+            let busy = matches!(claim_revival(&self.plan_id), Err(e) if e == REVIVAL_BUSY);
+            self.busy_during_prompt.lock().unwrap().push(busy);
+            self.inner.send_input(state, session_id, format!("{prompt}\r"))
+        }
+    }
+
+    /// G-3-33: Run-from-phase keeps the per-plan revival claim until the phase prompt is
+    /// delivered, so a second click cannot deliver the prompt twice; the claim is released after.
+    #[tokio::test]
+    async fn run_from_phase_holds_the_revival_until_the_prompt_is_delivered() {
+        let (state, root, run, _old) = completed_dev_run("revive-prompt").await;
+        let phase = run.phases[0].clone();
+        let probe = PromptProbe {
+            inner: GateAttach::new(false),
+            plan_id: run.plan.id.clone(),
+            busy_during_prompt: std::sync::Mutex::new(Vec::new()),
+        };
+        start_dev_phase_with(&state, &run, &phase, "single", &probe).await.expect("phase started");
+        assert_eq!(probe.busy_during_prompt.lock().unwrap().clone(), vec![true], "a second click during the prompt was not refused");
+        let typed = probe.inner.typed.lock().unwrap().clone();
+        assert_eq!(typed.len(), 1, "the phase prompt is delivered once");
+        assert_eq!(plan_status(&state, &run.plan.id), "phase_worker_running");
+        assert!(claim_revival(&run.plan.id).is_ok(), "released once the prompt is delivered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G-3-32: a panic while the revival set was locked poisons it; revivals still work.
+    #[test]
+    fn a_poisoned_revival_lock_does_not_block_revivals() {
+        let _ = std::thread::spawn(|| {
+            let _held = revivals_in_flight().lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison the revival set (expected in this test)");
+        })
+        .join();
+        assert!(revivals_in_flight().is_poisoned());
+        let id = format!("poison-{}", uuid::Uuid::new_v4());
+        let guard = claim_revival(&id).expect("claimed despite the poison");
+        assert_eq!(claim_revival(&id).err().as_deref(), Some(REVIVAL_BUSY));
+        drop(guard);
+        assert!(claim_revival(&id).is_ok(), "the guard's drop released it despite the poison");
     }
 
     /// G-2-19: a Stop that lands during the attach, then a failed attach: the undo is

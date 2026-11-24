@@ -25,6 +25,13 @@
 //!
 //! Audit: every mint, preview, redeem and rejection that can be tied to a plan becomes an
 //! `action_link_*` plan event carrying the jti — never the token or URL.
+//!
+//! For a minting agent (the alert-discord skill), two rules for `answer` links:
+//! - **always group a question's options** (one `group` for its Yes / No / ...). Ungrouped links
+//!   for one question are only serialised here ([`lock_answer`]): the first tap answers, a later
+//!   one is refused as answered;
+//! - **use a new group for each question.** A group closes once any of its links is redeemed
+//!   (done, failed or answered), and minting into a closed group is refused.
 
 use std::collections::HashMap;
 use std::future::Future;
