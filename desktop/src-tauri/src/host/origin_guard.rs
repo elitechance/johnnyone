@@ -292,6 +292,20 @@ pub async fn reject_non_loopback_peer(req: Request, next: Next) -> Response {
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0);
+    // No ConnectInfo is allowed (in-process callers), which is safe only while main.rs serves
+    // through `host::serve`. A real request without it means that wiring broke and this guard is
+    // silently off (C-2-17): say so loudly, once. The `main_serves_through_host_serve` test fences
+    // the wiring itself.
+    #[cfg(not(test))]
+    if peer.is_none() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "Host API: a request arrived without its peer address (ConnectInfo); the \
+                 non-loopback peer guard is OFF. main.rs must serve through host::serve."
+            )
+        });
+    }
     if !peer_allowed(peer) {
         log_rejection_once(&format!("peer {}", peer.map(|p| p.ip().to_string()).unwrap_or_default()));
         return (StatusCode::FORBIDDEN, "non-loopback peer refused\n").into_response();

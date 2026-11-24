@@ -182,8 +182,9 @@ Three guards sit in front of it. They do different jobs:
   defence only**: a request with no `Origin` is allowed.
 
 Treat the peer guard as defence in depth, not as permission to bind off loopback. The only supported
-remote access is an SSH tunnel to the loopback address, `ssh -L 7788:127.0.0.1:7788 <host>`. The
-engine then sees a loopback peer and a loopback `Host`.
+way to reach the host API (:7788) from another machine is an SSH tunnel to the loopback address,
+`ssh -L 7788:127.0.0.1:7788 <host>`, so the engine sees a loopback peer and a loopback `Host`. The
+web UI's remote path is the relay (`docs/host-transport.md`).
 
 ## Providers (CLI TUIs)
 

@@ -821,7 +821,7 @@ fn session_is_archived(state: &AppState, session_id: &str) -> bool {
 
 /// The refusal when the archived guard could not read the session's status (C-1-3): not
 /// "archived", which would be a guess, but a retryable failure.
-pub const SESSION_STATUS_UNKNOWN: &str = "could not check this session's status; try again";
+pub const SESSION_STATUS_UNKNOWN: &str = "Could not check this session's status. Try again.";
 
 /// The guard both `ensure_terminal_session*` paths run first: `Ok` only for a session known not
 /// to be archived. An archived row gets [`archived_refusal`]; a failed lookup (fail closed)
@@ -2052,6 +2052,7 @@ mod tests {
         let ops = FakeOps::new(false);
         // C-1-3: refused with a retryable "could not check", not a false "is archived".
         let e = ensure_terminal_session_with(&state, &ops, &other, 120, 36).await.err().unwrap();
+        assert_eq!(e, "Could not check this session's status. Try again.");
         assert_eq!(e, SESSION_STATUS_UNKNOWN);
         let e = ensure_terminal_session_for_input_with(&state, &ops, &other).await.err().unwrap();
         assert_eq!(e, SESSION_STATUS_UNKNOWN);

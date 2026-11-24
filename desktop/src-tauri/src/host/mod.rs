@@ -1491,6 +1491,22 @@ mod router_tests {
                 assert_eq!(body_text(res).await, "non-loopback peer refused\n");
             }
         }
+        // The GraphQL websocket too: a real upgrade request, refused before the upgrade.
+        for peer in ["192.168.1.50:51000", "[2001:db8::1]:4000"] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/graphql/ws")
+                .header("host", "127.0.0.1:7788")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .header("sec-websocket-protocol", "graphql-transport-ws")
+                .body(Body::empty())
+                .unwrap();
+            let res = router(state.clone()).oneshot(with_peer(req, peer)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{peer} /graphql/ws");
+        }
         for peer in ["127.0.0.1:51000", "[::1]:51000", "[::ffff:127.0.0.1]:51000"] {
             let res = router(state.clone())
                 .oneshot(with_peer(agent_post("{ __typename }"), peer))
@@ -1498,6 +1514,22 @@ mod router_tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "{peer}");
         }
+    }
+
+    /// C-2-17: the peer guard allows a request with no `ConnectInfo`, which is safe only because
+    /// main.rs serves the host router through [`super::serve`]. A bare `axum::serve` there would
+    /// silently switch the guard off, so pin the wiring at the source.
+    #[test]
+    fn main_serves_through_host_serve() {
+        let main_rs = include_str!("../main.rs");
+        assert!(
+            main_rs.contains("host::serve(listener, app)"),
+            "main.rs must serve the host router through host::serve (it records the peer address)"
+        );
+        assert!(
+            !main_rs.contains("axum::serve("),
+            "main.rs serves through a bare axum::serve: the non-loopback peer guard would be off"
+        );
     }
 
     /// `serve` (what main.rs uses) records the peer, so the guard above has an address to judge.
