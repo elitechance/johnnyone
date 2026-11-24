@@ -12,6 +12,8 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { applyRestoredDraft } from '../../services/ai-chat-logic';
+import { addIcons } from 'ionicons';
+import { close, send } from 'ionicons/icons';
 import {
   IonTextarea,
   IonItem,
@@ -72,7 +74,11 @@ export class MessageComposerComponent implements AfterViewInit, OnDestroy {
     void this.onPaste(event);
   };
 
-  constructor(private cdr: ChangeDetectorRef) {}
+  constructor(private cdr: ChangeDetectorRef) {
+    // Register the composer's glyphs. Unregistered, Ionicons treats the name as a URL and throws
+    // "Failed to construct 'URL': Invalid base URL" (live UI bug 7), and the Send button is blank.
+    addIcons({ send, close });
+  }
 
   async ngAfterViewInit(): Promise<void> {
     try {

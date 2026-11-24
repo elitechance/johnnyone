@@ -50,6 +50,11 @@ export function endedNote(s: { planAgent?: boolean | null; status?: string | nul
   return s?.planAgent === true ? AGENT_JOB_ENDED_NOTE : ARCHIVED_SHELL_NOTE;
 }
 
+/** Does this shell get the watchdog chip? Not a read-only one (plan agent or ended) (bug 7). */
+export function showsWatchdog(s: { planAgent?: boolean | null; status?: string | null } | null | undefined): boolean {
+  return !!s && !isReadOnlyShell(s);
+}
+
 /** The view-only banner text for a read-only shell. */
 export function readOnlyNote(
   s: { planAgent?: boolean | null; status?: string | null } | null | undefined,

@@ -227,6 +227,7 @@ import {
   readOnlyNote,
   rejectionForView,
   shouldPollPane,
+  showsWatchdog,
   surfacesAsTerminalError,
   transcriptRowsFromMessages,
   withoutPaneNotice,
@@ -834,7 +835,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     nudgeSecsAgo: number;
   } {
     const sh = this.currentSession();
-    if (!sh) return null;
+    // A plan agent (or an ended session) is view-only and has no watchdog: no "Watchdog off ⚙" bar.
+    if (!sh || !showsWatchdog(sh)) return null;
     const now = Date.now();
     const pane = this.terminalScreens()[sh.id];
     const paneLastAt = pane ? (this.paneChangedAt.get(sh.id) ?? now) : now;
