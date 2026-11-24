@@ -787,12 +787,9 @@ async fn two_ungrouped_links_redeemed_at_the_same_instant_type_once() {
         perform(&state, &performer, &pa, now_secs()),
         perform(&state, &performer, &pb, now_secs()),
     );
-    assert_eq!(
-        performer.calls.lock().unwrap().len(),
-        1,
-        "typed twice: {:?}",
-        performer.calls.lock().unwrap()
-    );
+    // Snapshot first: locking `calls` again inside the assert message would self-deadlock.
+    let calls = performer.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "typed twice: {calls:?}");
     assert!(ra.is_ok() != rb.is_ok(), "exactly one succeeds: {ra:?} / {rb:?}");
     let err = ra.err().or(rb.err()).unwrap();
     assert!(err.contains(ANSWERED), "{err}");

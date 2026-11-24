@@ -161,6 +161,17 @@ desktop **before or with** that worker. **Do not deploy** the auth
 worker from an agent. Full L1–L7 / D12 procedure:
 `/home/creepy/Documents/Workspace/.johnnyone/initiatives/a53df1e5-4dd6-4226-9506-83698bcbd643/plan/phases/03-acceptance/artifacts/human-cutover.md`.
 
+### `JOHNNYONE_HOST_ADDR`: the host only answers to loopback names
+
+The engine binds its host API on `JOHNNYONE_HOST_ADDR` (default `127.0.0.1:7788`). Since the DNS-rebinding
+guard (`host/origin_guard.rs`, `host_header_allowed`), every GraphQL request whose `Host` header is
+not `127.0.0.1`, `localhost` or `[::1]` **on the bound port** gets **HTTP 403 "unexpected Host
+header"**. `/mcp` is narrower: `127.0.0.1` and `localhost` only. So binding a non-loopback address
+(`0.0.0.0:7788`, a LAN IP) no longer exposes the API. A remote client reaching it by that address
+sends that address as its `Host`, and every request is refused. To reach the host from another
+machine, tunnel to its loopback address (for example `ssh -L 7788:127.0.0.1:7788`), so the request
+arrives with a loopback `Host`.
+
 ## Providers (CLI TUIs)
 
 Terminal-mode providers run the CLI in a tmux pane (`desktop/src-tauri/src/
@@ -368,6 +379,29 @@ rebuild and relink the CLI before deploying:
 cd lokal/apps/lokal-infra
 npm run -w @lokal/cli build
 ```
+
+**6. Discord action links: the secret, migration 0005 and the base URL**
+
+Action links (`worker/lib/action-links/`, host side `desktop/src-tauri/src/services/action_links.rs`)
+need three things on the worker before they work:
+
+- **`ACTION_LINK_SECRET`**: the HS256 key that signs every link, at least 32 characters. It is a
+  wrangler secret listed under `secrets:` in `lokal.yaml`, and it never goes in git. Set it once per
+  environment (`wrangler secret put ACTION_LINK_SECRET`, against the generated config under
+  `~/.lokal/simulators/johnnyone/<env>/`). While it is unset, minting and redeeming **fail closed**:
+  `mintActionLink` errors and every `/act` link is refused. Rotating it voids every outstanding link,
+  which is harmless because a link lives 120 s.
+- **D1 migration `0005_action_links.sql`**: creates `action_link_redemptions` (the single-use
+  ledger), `action_link_events` (the audit) and `action_link_mints`. `lokal cf worker deploy`
+  applies it with the other pending migrations. Check with `lokal cf db status --env prod` first.
+  It was edited in place before its first deploy, so if any D1 already shows 0005 as applied from
+  an earlier build, compare its tables with the file before relying on it.
+- **`ACTION_LINK_BASE_URL`** (optional var): the web origin that serves `/act`, which is the origin
+  every minted URL points at. It defaults to `https://johnnyone.pages.dev`. Set it only for a
+  staging or local worker whose console is served elsewhere, or the links will open production.
+
+The host keeps the minted-link registry in memory, so restarting the engine within 2 minutes of a
+mint makes those links answer "J1 restarted, so ask for a new link". This is expected.
 
 ### Setting up the `lokal` CLI (not installed by default)
 

@@ -34,6 +34,7 @@
 import {
   actionScope,
   describeTarget,
+  INVISIBLE_RE,
   validateActionArgs,
   validateLabel,
   type ActionArgs,
@@ -155,8 +156,9 @@ export interface RunResult {
 export class MintError extends Error {}
 
 const GROUP_RE = /^[A-Za-z0-9_-]{1,64}$/;
-// eslint-disable-next-line no-control-regex
 const TITLE_FORMAT_RE = /\p{Cf}/gu;
+const TITLE_INVISIBLE_RE = new RegExp(INVISIBLE_RE.source, 'gu');
+// eslint-disable-next-line no-control-regex
 const TITLE_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
 
 function parseArgs(raw: string): unknown {
@@ -225,7 +227,7 @@ function timeline(deps: ActionLinkDeps, link: Link, kind: string, reason: string
 
 function cleanTitle(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  const t = raw.replace(TITLE_CONTROL_RE, ' ').replace(TITLE_FORMAT_RE, '').trim();
+  const t = raw.replace(TITLE_CONTROL_RE, ' ').replace(TITLE_FORMAT_RE, '').replace(TITLE_INVISIBLE_RE, '').trim();
   return t ? [...t].slice(0, 120).join('') : null;
 }
 

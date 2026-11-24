@@ -86,11 +86,12 @@ mv -f '<n>.rc' '<n>.exit'
   looks at the latest turn of each LIVE plan agent (plan in briefing, agent row active; a retired,
   accepted or closed plan's agent is left alone). A turn with `<n>.started` but neither
   `<n>.exit` nor `<n>.settled` was in flight when the previous engine died. A turn without
-  `<n>.started` came from an older binary, whose Stop/timeout left no marker: nothing is recorded;
-  if its pane is still running it is killed silently (`respawn-pane -k`), then it is settled. If its pane is still running it is killed with `respawn-pane -k` and a fixed notice. A dead
-  or missing pane needs no kill. Either way the turn gets a failed assistant message ("interrupted
-  by an engine restart", `finish_reason = 'interrupted'`) and `<n>.settled`, so it is recorded only
-  once. The turn files stay. Slots are in-memory, so nothing is released; the reconcile holds the
+  `<n>.started` came from an older binary, whose Stop/timeout left no marker: nothing is recorded
+  in the chat; if its pane is still running it is killed (`respawn-pane -k`, the pane then shows a
+  fixed notice), and the turn is settled. An in-flight turn's pane, if still running, is killed the
+  same way. A dead or missing pane needs no kill. Either way an in-flight turn gets a failed
+  assistant message ("interrupted by an engine restart", `finish_reason = 'interrupted'`) and
+  `<n>.settled`, so it is recorded only once. The turn files stay. Slots are in-memory, so nothing is released; the reconcile holds the
   session's slot while it works, so it never touches a turn this engine started. Killing was chosen
   over re-attaching a tail: the request that waited for the reply died with the old engine, so no
   one would read a re-attached stream.

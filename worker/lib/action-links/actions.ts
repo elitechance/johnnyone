@@ -29,6 +29,7 @@ const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PHASE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 // Any C0/C1 control char, DEL, or a Unicode line/paragraph separator. A reply is typed into a
 // TUI: a newline would submit early, an ESC would start a key sequence.
+// eslint-disable-next-line no-control-regex
 const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 export function isActionKind(v: unknown): v is ActionKind {
@@ -73,9 +74,17 @@ function onlyKeys(args: Record<string, unknown>, allowed: string[], required: st
  */
 export const FORMAT_RE = /\p{Cf}/u;
 
+/**
+ * Characters outside Cf that still render as nothing (H-3-48): the Hangul fillers (U+115F, U+1160,
+ * U+3164, U+FFA0), the braille blank (U+2800), the combining grapheme joiner (U+034F) and the Khmer
+ * inherent vowels (U+17B4, U+17B5). None is whitespace, so `'\u3164!ls'` passes a first-character
+ * check. The host rejects the same set (`is_invisible_char` in action_links.rs).
+ */
+export const INVISIBLE_RE = /[\u034F\u115F\u1160\u17B4\u17B5\u2800\u3164\uFFA0]/u;
+
 export function validateReply(reply: string): string | null {
   if (reply.trim().length === 0) return 'reply must not be empty';
-  if (FORMAT_RE.test(reply)) return 'reply must not contain invisible format characters';
+  if (FORMAT_RE.test(reply) || INVISIBLE_RE.test(reply)) return 'reply must not contain invisible format characters';
   if ([...reply].length > REPLY_MAX) return `reply must be at most ${REPLY_MAX} characters`;
   if (CONTROL_RE.test(reply)) return 'reply must be one line with no control characters';
   // A reply is typed into an agent CLI, where a leading `!` runs a shell command (bash mode),
@@ -90,7 +99,7 @@ export function validateLabel(label: unknown): string | null {
   if (typeof label !== 'string' || label.trim().length === 0) return 'label is required';
   if ([...label].length > LABEL_MAX) return `label must be at most ${LABEL_MAX} characters`;
   if (CONTROL_RE.test(label)) return 'label must be one line with no control characters';
-  if (FORMAT_RE.test(label)) return 'label must not contain invisible format characters';
+  if (FORMAT_RE.test(label) || INVISIBLE_RE.test(label)) return 'label must not contain invisible format characters';
   return null;
 }
 

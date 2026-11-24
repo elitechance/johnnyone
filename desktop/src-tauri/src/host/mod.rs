@@ -647,13 +647,23 @@ impl MutationRoot {
     /// links together — mint the Yes and the No of one question with the same group, and
     /// redeeming either uses the other up.
     ///
+    /// Two rules for a question's `answer` links:
+    /// - **Always group a question's options.** Mint every option of one question (Yes / No /
+    ///   "use option 2") with the same `group`. Ungrouped links for one question are only
+    ///   serialised on this host: the first tap answers, a later one is refused as answered.
+    ///   A group also uses up the siblings on the worker and tells the human so.
+    /// - **Use a new group for each question.** A group is single-use. Once any link in it was
+    ///   redeemed (done, failed or answered), the group is closed and minting into it is refused,
+    ///   so never reuse a group id. Derive it from something unique to the question.
+    ///
     /// Order for `answer`: the asking agent must FIRST report `blocked` (its baked
     /// `reportAgentResult(kind:"blocked")`, i.e. agent_blocked) — or J1's question watcher must
     /// have seen the pane waiting — and only THEN may a link be minted for it. A session with no
     /// open question, or whose question was already answered, is refused here, before any link
-    /// exists. The session must be a J1-managed phase agent, not an attached shell or plan agent. The worker signs (the key never
-    /// leaves it) over the relay credential; the URL is a bearer credential — post it as a Discord
-    /// link button and do not log it.
+    /// exists. The session must be a J1-managed phase agent (not an attached shell or plan agent)
+    /// whose plan job has not ended; the same session checks run again when the link is tapped.
+    /// The worker signs (the key never leaves it) over the relay credential; the URL is a bearer
+    /// credential — post it as a Discord link button and do not log it.
     ///
     /// Same caller tier as `setSetting`'s connection keys: an agent's `curl` (no `Origin`) or the
     /// app itself. A page on a foreign loopback origin is refused, because it could otherwise mint
