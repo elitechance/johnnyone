@@ -1,7 +1,7 @@
 import { Injectable, InjectionToken, inject } from '@angular/core';
 import { Observable, from } from 'rxjs';
 import { switchMap } from 'rxjs/operators';
-import { connectionInitPayload, shouldRetrySubscriptionAuth } from './graphql-ws-logic';
+import { SubscriptionClosedError, closeIsAuthFailure, connectionInitPayload, shouldRetrySubscriptionAuth } from './graphql-ws-logic';
 
 export const GRAPHQL_API_URL = new InjectionToken<string>('GRAPHQL_API_URL', {
   providedIn: 'root',
@@ -95,6 +95,8 @@ export class GraphQLClient {
     return new Observable<T>((subscriber) => {
       let ws: WebSocket | null = null;
       let closed = false;
+      /** The server sent `complete`: a close after that is the normal end, not an error. */
+      let completed = false;
       /** One refresh-and-reconnect per subscription after an auth failure (bug 2), never a loop. */
       let authRetried = false;
       const operationId = crypto.randomUUID();
@@ -116,7 +118,7 @@ export class GraphQLClient {
       const fail = (error: Error) => {
         if (closed) return;
         const refresh = this.authRefresh;
-        if (refresh && shouldRetrySubscriptionAuth(authRetried, true, isExpiredTokenError(error))) {
+        if (refresh && shouldRetrySubscriptionAuth(authRetried, true, isSubscriptionAuthFailure(error))) {
           authRetried = true;
           closeQuietly(ws);
           ws = null;
@@ -179,19 +181,22 @@ export class GraphQLClient {
               break;
 
             case 'complete':
+              completed = true;
               subscriber.complete();
               break;
           }
         };
 
         socket.onerror = () => {
-          subscriber.error(new Error('WebSocket connection error'));
+          fail(new Error('WebSocket connection error'));
         };
 
+        // ANY close before `complete` ends the stream as an error (U-1-4): graphql-ws closes CLEANLY
+        // with 4400/4401/4403/4500, and treating a clean close as "fine" left the subscription hanging
+        // with no error, so the chat's fallback never started. 4401/4403 get the one auth refresh.
         socket.onclose = (event) => {
-          if (!event.wasClean) {
-            subscriber.error(new Error(`WebSocket closed unexpectedly: ${event.code}`));
-          }
+          if (completed) return;
+          fail(new SubscriptionClosedError(event.code, (event as CloseEvent).reason ?? ''));
         };
       };
 
@@ -420,6 +425,12 @@ export class HttpStatusError extends Error {
  * A response carrying *applied* data is never retried: part of the operation
  * may already have been performed, so replaying it could double a write.
  */
+/** An auth failure on a subscription: an UNAUTHENTICATED payload, or a 4401/4403 close (U-1-4). */
+function isSubscriptionAuthFailure(error: unknown): boolean {
+  if (error instanceof SubscriptionClosedError) return closeIsAuthFailure(error.code);
+  return isExpiredTokenError(error);
+}
+
 function isExpiredTokenError(error: unknown): boolean {
   if (error instanceof HttpStatusError) return error.status === 401;
   if (!(error instanceof GraphQLRequestError)) return false;

@@ -6,7 +6,7 @@
  * shown as an inline notice; it is never appended to the assistant's text.
  */
 import type { AiMessage } from '../models/ai-message.model';
-import { toIsoUtc } from '../lib/server-time';
+import { parseServerTime, toIsoUtc } from '../lib/server-time';
 
 export interface ChatDeltaLike {
   chunkType?: string | null;
@@ -93,14 +93,36 @@ export function storedCount(msgs: readonly AiMessage[]): number {
   return msgs.filter((m) => !isLocalMessageId(m.id)).length;
 }
 
+/** The turn the fallback is waiting on: what was sent, when, and how many rows were then stored. */
+export interface PendingTurn {
+  content: string;
+  sentAtMs: number;
+  /** Stored rows visible at send (a LOWER bound: an earlier reply may still be a local row). */
+  baseline: number;
+}
+
+/** Engine and browser clocks may differ a little; a stored row this much "before" the send still counts. */
+export const TURN_CLOCK_SKEW_MS = 120_000;
+
 /**
- * The live-update FALLBACK (bug 2): with the subscription down, has the turn sent when the chat
- * held `baseline` stored rows been answered? Yes once the store has grown past the baseline and
- * its newest row is the assistant's (the user's own row lands first, then the reply).
+ * The live-update FALLBACK (bug 2, U-1-2): with the subscription down, has `turn` been answered?
+ * Only once the store holds THIS turn's own user row (same text, stored no earlier than the send
+ * minus clock skew, at or after the baseline) AND an assistant row after it. Counting rows alone
+ * settled early: the baseline undercounts when an earlier reply was still a local `relay-` row, so
+ * that earlier reply looked like the new one and the turn ended with no reply shown.
  */
-export function turnAnsweredInStore(stored: readonly AiMessage[], baseline: number): boolean {
-  const last = stored[stored.length - 1];
-  return stored.length > baseline && last?.role === 'assistant';
+export function turnAnsweredInStore(stored: readonly AiMessage[], turn: PendingTurn): boolean {
+  const want = turn.content.trim();
+  let own = -1;
+  for (let i = stored.length - 1; i >= Math.max(0, turn.baseline); i--) {
+    const m = stored[i];
+    if (m.role !== 'user' || (m.content ?? '').trim() !== want) continue;
+    const at = parseServerTime(m.createdAt)?.getTime();
+    if (at !== undefined && at < turn.sentAtMs - TURN_CLOCK_SKEW_MS) continue;
+    own = i;
+    break;
+  }
+  return own >= 0 && stored.slice(own + 1).some((m) => m.role === 'assistant');
 }
 
 /** Poll cadence and give-up time for the fallback. */

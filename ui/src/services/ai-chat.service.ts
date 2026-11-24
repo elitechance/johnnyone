@@ -17,6 +17,7 @@ import {
   normalizeStoredMessages,
   storedCount,
   turnAnsweredInStore,
+  type PendingTurn,
 } from './ai-chat-logic';
 
 @Injectable({ providedIn: 'root' })
@@ -34,7 +35,7 @@ export class AiChatService {
    * stored messages instead.
    */
   private liveDown = false;
-  private turnBaseline = 0;
+  private pendingTurn: PendingTurn | null = null;
   private turnStartedAt = 0;
   private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -125,8 +126,8 @@ export class AiChatService {
     // A new send supersedes any earlier restore (it was sent, so nothing to put back later).
     this.restoredDraft.set(null);
     this.pendingUserMessageId = optimisticMessage.id;
-    this.turnBaseline = storedCount(this.messages());
     this.turnStartedAt = Date.now();
+    this.pendingTurn = { content, sentAtMs: this.turnStartedAt, baseline: storedCount(this.messages()) };
     if (this.liveDown) this.startTurnFallback();
 
     this.api.sendRelayMessage({ sessionId: session.id, content }).subscribe({
@@ -181,6 +182,20 @@ export class AiChatService {
   }
 
   /**
+   * Come back to the session already loaded (U-1-3): the page tore the subscriptions down when it
+   * was left, so re-subscribe to its messages and re-read the store. Any other id is a full load.
+   */
+  resumeSession(id: string): void {
+    if (this.currentSession()?.id !== id) {
+      this.loadSession(id);
+      return;
+    }
+    this.liveDown = false;
+    this.subscribeToMessages(id);
+    this.fetchMessages(id);
+  }
+
+  /**
    * Re-read the current session's messages from the host. The live relay message carries only the
    * text; the stored row also carries `toolCalls`, so a page that shows tool calls refetches once a
    * turn completes (Plans tab).
@@ -229,7 +244,7 @@ export class AiChatService {
       next: (messages) => {
         if (this.currentSession()?.id !== id || !this.isStreaming()) return;
         const stored = normalizeStoredMessages(messages);
-        if (turnAnsweredInStore(stored, this.turnBaseline)) {
+        if (this.pendingTurn && turnAnsweredInStore(stored, this.pendingTurn)) {
           this.messages.set(stored);
           this.finishStreaming();
         } else {

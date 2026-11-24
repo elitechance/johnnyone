@@ -328,8 +328,8 @@ export class PlanDetailPage implements OnInit, OnDestroy {
       if (run.plan.status !== 'closed') {
         await this.loadBrief(false);
         const sid = run.plan.briefingSessionId;
-        if (sid && this.chat.currentSession()?.id !== sid) this.chat.loadSession(sid);
-        else if (sid) this.chat.refreshMessages();
+        // Same session as last visit: re-subscribe too (leaving the page tore the live feed down, U-1-3).
+        if (sid) this.chat.resumeSession(sid);
       }
     } catch (err) {
       this.error.set(`Couldn't load this plan: ${message(err)}`);

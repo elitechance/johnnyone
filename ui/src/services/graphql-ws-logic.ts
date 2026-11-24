@@ -25,3 +25,22 @@ export function shouldRetrySubscriptionAuth(
 ): boolean {
   return !alreadyRetried && canRefresh && isAuthFailure;
 }
+
+/**
+ * graphql-ws close codes that mean "your credentials": 4401 Unauthorized, 4403 Forbidden (U-1-4).
+ * These get the one refresh-and-reconnect; any other early close just ends the stream as an error.
+ */
+export function closeIsAuthFailure(code: number): boolean {
+  return code === 4401 || code === 4403;
+}
+
+/** A subscription socket that closed before the server sent `complete` (U-1-4). */
+export class SubscriptionClosedError extends Error {
+  constructor(
+    public readonly code: number,
+    public readonly reason = '',
+  ) {
+    super(`Subscription closed before it completed: ${code}${reason ? ` ${reason}` : ''}`);
+    this.name = 'SubscriptionClosedError';
+  }
+}
