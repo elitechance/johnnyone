@@ -1,6 +1,7 @@
 import { Injectable, InjectionToken, inject } from '@angular/core';
 import { Observable, from } from 'rxjs';
 import { switchMap } from 'rxjs/operators';
+import { connectionInitPayload, shouldRetrySubscriptionAuth } from './graphql-ws-logic';
 
 export const GRAPHQL_API_URL = new InjectionToken<string>('GRAPHQL_API_URL', {
   providedIn: 'root',
@@ -93,29 +94,66 @@ export class GraphQLClient {
   subscribe<T>(subscription: string, variables?: Record<string, unknown>): Observable<T> {
     return new Observable<T>((subscriber) => {
       let ws: WebSocket | null = null;
+      let closed = false;
+      /** One refresh-and-reconnect per subscription after an auth failure (bug 2), never a loop. */
+      let authRetried = false;
       const operationId = crypto.randomUUID();
 
-      const connect = () => {
-        ws = new WebSocket(this.wsUrl, 'graphql-transport-ws');
+      /** Close a socket without its handlers firing (a replaced or finished connection). */
+      const closeQuietly = (socket: WebSocket | null) => {
+        if (!socket) return;
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ id: operationId, type: 'complete' }));
+        }
+        socket.close();
+      };
 
-        ws.onopen = () => {
-          const headers = this.buildHeaders(false);
-          ws!.send(
+      /** An auth failure refreshes the token and reconnects once; anything else ends the stream. */
+      const fail = (error: Error) => {
+        if (closed) return;
+        const refresh = this.authRefresh;
+        if (refresh && shouldRetrySubscriptionAuth(authRetried, true, isExpiredTokenError(error))) {
+          authRetried = true;
+          closeQuietly(ws);
+          ws = null;
+          this.refreshAuthOnce(refresh).then(
+            () => {
+              if (!closed) connect();
+            },
+            () => {
+              if (!closed) subscriber.error(error);
+            },
+          );
+          return;
+        }
+        subscriber.error(error);
+      };
+
+      const connect = () => {
+        const socket = new WebSocket(this.wsUrl, 'graphql-transport-ws');
+        ws = socket;
+
+        socket.onopen = () => {
+          // The token is read at CONNECT time (so a reconnect after a refresh sends the new one) and
+          // sent at the payload's top level, which is where the worker reads it (bug 2).
+          socket.send(
             JSON.stringify({
               type: 'connection_init',
-              payload: {
-                headers,
-              },
+              payload: connectionInitPayload(this.buildHeaders(false)),
             })
           );
         };
 
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
           const message = JSON.parse(event.data);
 
           switch (message.type) {
             case 'connection_ack':
-              ws!.send(
+              socket.send(
                 JSON.stringify({
                   id: operationId,
                   type: 'subscribe',
@@ -126,14 +164,14 @@ export class GraphQLClient {
 
             case 'next':
               if (message.payload?.errors?.length) {
-                subscriber.error(new GraphQLRequestError(message.payload.errors));
+                fail(new GraphQLRequestError(message.payload.errors));
               } else if (message.payload?.data) {
                 subscriber.next(message.payload.data as T);
               }
               break;
 
             case 'error':
-              subscriber.error(
+              fail(
                 new GraphQLRequestError(
                   Array.isArray(message.payload) ? message.payload : [{ message: 'Subscription error' }]
                 )
@@ -146,11 +184,11 @@ export class GraphQLClient {
           }
         };
 
-        ws.onerror = () => {
+        socket.onerror = () => {
           subscriber.error(new Error('WebSocket connection error'));
         };
 
-        ws.onclose = (event) => {
+        socket.onclose = (event) => {
           if (!event.wasClean) {
             subscriber.error(new Error(`WebSocket closed unexpectedly: ${event.code}`));
           }
@@ -160,13 +198,9 @@ export class GraphQLClient {
       connect();
 
       return () => {
-        if (ws) {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ id: operationId, type: 'complete' }));
-          }
-          ws.close();
-          ws = null;
-        }
+        closed = true;
+        closeQuietly(ws);
+        ws = null;
       };
     });
   }

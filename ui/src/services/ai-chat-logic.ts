@@ -82,3 +82,27 @@ export function messagesAfterError(
 export function normalizeStoredMessages(msgs: readonly AiMessage[] | null | undefined): AiMessage[] {
   return (msgs ?? []).map((m) => (m.createdAt ? { ...m, createdAt: toIsoUtc(m.createdAt) } : m));
 }
+
+/** A local (not yet stored) bubble: the optimistic user send or the streamed assistant reply. */
+export function isLocalMessageId(id: string | null | undefined): boolean {
+  return /^(temp-|relay-)/.test(id ?? '');
+}
+
+/** How many STORED rows the chat shows (the baseline a turn's answer is detected against). */
+export function storedCount(msgs: readonly AiMessage[]): number {
+  return msgs.filter((m) => !isLocalMessageId(m.id)).length;
+}
+
+/**
+ * The live-update FALLBACK (bug 2): with the subscription down, has the turn sent when the chat
+ * held `baseline` stored rows been answered? Yes once the store has grown past the baseline and
+ * its newest row is the assistant's (the user's own row lands first, then the reply).
+ */
+export function turnAnsweredInStore(stored: readonly AiMessage[], baseline: number): boolean {
+  const last = stored[stored.length - 1];
+  return stored.length > baseline && last?.role === 'assistant';
+}
+
+/** Poll cadence and give-up time for the fallback. */
+export const TURN_FALLBACK_POLL_MS = 3_000;
+export const TURN_FALLBACK_MAX_MS = 10 * 60_000;
