@@ -8,6 +8,7 @@
 import { Marked, marked } from 'marked';
 import hljs from 'highlight.js/lib/common';
 import mermaid from 'mermaid';
+import DOMPurify, { type DOMPurify as DOMPurifyInstance } from 'dompurify';
 
 // One-time mermaid bootstrap (idempotent — mermaid guards reinit internally).
 mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'dark' });
@@ -104,6 +105,10 @@ function createMarkdownParser(): Marked {
     );
   };
 
+  // GFM task lists: `input` is forbidden by the sanitizer, so the box is text (U-2-20).
+  renderer.checkbox = ({ checked }) =>
+    checked ? '<span class="md-task done" aria-label="done">☑</span>' : '<span class="md-task" aria-label="to do">☐</span>';
+
   renderer.table = (token) => {
     const renderCell = (cell: (typeof token.header)[number], tag: 'th' | 'td'): string => {
       const align = cell.align ? ` style="text-align: ${cell.align}"` : '';
@@ -132,9 +137,73 @@ function createMarkdownParser(): Marked {
 // Module singleton — one parser instance for the whole app.
 const markdownParser = createMarkdownParser();
 
-/** Parse markdown → HTML string (code highlighted, mermaid fences as placeholders). */
+/**
+ * URLs a rendered link or image may carry: http(s), mailto, and relative / fragment URLs (no
+ * scheme). Everything else (`javascript:`, `data:`, `vbscript:`, `file:`, …) is removed (U-1-1).
+ */
+const SAFE_URL = /^(?:(?:https?|mailto):|[^a-z]|[a-z0-9+.-]*(?:[^a-z0-9+.:-]|$))/i;
+const URL_ATTRS = ['href', 'src', 'xlink:href', 'action', 'formaction', 'srcset', 'poster', 'background'];
+
+/** Is `url` allowed in a rendered href/src? Leading whitespace/controls are ignored, as browsers do. */
+export function isSafeUrl(url: string | null | undefined): boolean {
+  // eslint-disable-next-line no-control-regex
+  const u = (url ?? '').replace(/[\u0000-\u0020\u007f-\u009f]/g, '');
+  return SAFE_URL.test(u);
+}
+
+/** The only inline style kept: a lone `text-align: left|center|right` (U-2-19), else `null`. */
+export function safeTextAlign(style: string | null | undefined): 'left' | 'center' | 'right' | null {
+  const m = /^\s*text-align\s*:\s*(left|center|right)\s*;?\s*$/i.exec(style ?? '');
+  return m ? (m[1].toLowerCase() as 'left' | 'center' | 'right') : null;
+}
+
+let purifier: DOMPurifyInstance | null = null;
+
+/**
+ * A PRIVATE DOMPurify instance (mermaid imports the same module and sanitizes its SVG with the
+ * default one; our hooks must not change that). `null` where there is no DOM.
+ */
+function getPurifier(): DOMPurifyInstance | null {
+  if (purifier) return purifier;
+  if (typeof window === 'undefined') return null;
+  const p = DOMPurify(window);
+  p.addHook('afterSanitizeAttributes', (node) => {
+    for (const name of URL_ATTRS) {
+      if (node.hasAttribute?.(name) && !isSafeUrl(node.getAttribute(name))) node.removeAttribute(name);
+    }
+    // `style` is reduced to the table alignment the renderer writes (U-2-19): anything else (a
+    // `position:fixed` overlay drawn over the app, for one) is dropped.
+    if (node.hasAttribute?.('style')) {
+      const align = safeTextAlign(node.getAttribute('style'));
+      if (align) node.setAttribute('style', `text-align: ${align}`);
+      else node.removeAttribute('style');
+    }
+  });
+  purifier = p;
+  return p;
+}
+
+/**
+ * Sanitize rendered markdown (U-1-1). The markdown is agent-written (briefs, plan docs, chat,
+ * transcripts) and the result is bound with `bypassSecurityTrustHtml`, so without this an
+ * `<img onerror>` or a `javascript:` link ran in the app's origin, next to the access token.
+ * Keeps what the renderer emits: tables (with `style="text-align"`), highlighted code, and the
+ * mermaid placeholder (`data-mermaid-src`, `role`, `aria-label`) that `hydrateMermaid` fills.
+ */
+export function sanitizeHtml(html: string): string {
+  const p = getPurifier();
+  if (!p) return escapeHtml(html);
+  return p.sanitize(html, {
+    USE_PROFILES: { html: true },
+    ALLOW_DATA_ATTR: true,
+    ALLOWED_URI_REGEXP: SAFE_URL,
+    FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'iframe', 'object', 'embed'],
+  }) as string;
+}
+
+/** Parse markdown → SANITIZED HTML string (code highlighted, mermaid fences as placeholders). */
 export function parseMarkdown(md: string): string {
-  return markdownParser.parse(md) as string;
+  return sanitizeHtml(markdownParser.parse(md) as string);
 }
 
 /**

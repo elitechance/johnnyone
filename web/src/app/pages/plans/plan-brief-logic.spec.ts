@@ -180,7 +180,7 @@ describe('plan-brief-logic', () => {
     expect(detailState(false, 'Plan not found: abc', null)).toBe('not-found');
     expect(detailState(false, 'plan abc not found', null)).toBe('not-found');
     expect(detailState(false, null, null)).toBe('not-found');
-    expect(detailState(false, null, { status: 'closed', initiativeStatus: 'briefing' })).toBe('not-found');
+    expect(detailState(false, null, { status: 'closed', initiativeStatus: 'briefing' })).toBe('closed');
     expect(detailState(false, null, { status: 'draft', initiativeStatus: 'planning' })).toBe('frozen');
     expect(detailState(false, null, briefing)).toBe('ready');
     expect(detailState(true, null, briefing)).toBe('ready'); // a refresh keeps the page

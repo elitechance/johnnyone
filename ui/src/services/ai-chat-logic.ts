@@ -6,6 +6,7 @@
  * shown as an inline notice; it is never appended to the assistant's text.
  */
 import type { AiMessage } from '../models/ai-message.model';
+import { parseServerTime, toIsoUtc } from '../lib/server-time';
 
 export interface ChatDeltaLike {
   chunkType?: string | null;
@@ -76,3 +77,54 @@ export function messagesAfterError(
   if (streamedText || !optimisticId) return [...msgs];
   return msgs.filter((m) => m.id !== optimisticId);
 }
+
+/** Stored messages with their engine time (zone-less UTC) as ISO `Z`, so a reload shows the same clock. */
+export function normalizeStoredMessages(msgs: readonly AiMessage[] | null | undefined): AiMessage[] {
+  return (msgs ?? []).map((m) => (m.createdAt ? { ...m, createdAt: toIsoUtc(m.createdAt) } : m));
+}
+
+/** A local (not yet stored) bubble: the optimistic user send or the streamed assistant reply. */
+export function isLocalMessageId(id: string | null | undefined): boolean {
+  return /^(temp-|relay-)/.test(id ?? '');
+}
+
+/** How many STORED rows the chat shows (the baseline a turn's answer is detected against). */
+export function storedCount(msgs: readonly AiMessage[]): number {
+  return msgs.filter((m) => !isLocalMessageId(m.id)).length;
+}
+
+/** The turn the fallback is waiting on: what was sent, when, and how many rows were then stored. */
+export interface PendingTurn {
+  content: string;
+  sentAtMs: number;
+  /** Stored rows visible at send (a LOWER bound: an earlier reply may still be a local row). */
+  baseline: number;
+}
+
+/** Engine and browser clocks may differ a little; a stored row this much "before" the send still counts. */
+export const TURN_CLOCK_SKEW_MS = 120_000;
+
+/**
+ * The live-update FALLBACK (bug 2, U-1-2): with the subscription down, has `turn` been answered?
+ * Only once the store holds THIS turn's own user row (same text, stored no earlier than the send
+ * minus clock skew, at or after the baseline) AND an assistant row after it. Counting rows alone
+ * settled early: the baseline undercounts when an earlier reply was still a local `relay-` row, so
+ * that earlier reply looked like the new one and the turn ended with no reply shown.
+ */
+export function turnAnsweredInStore(stored: readonly AiMessage[], turn: PendingTurn): boolean {
+  const want = turn.content.trim();
+  let own = -1;
+  for (let i = stored.length - 1; i >= Math.max(0, turn.baseline); i--) {
+    const m = stored[i];
+    if (m.role !== 'user' || (m.content ?? '').trim() !== want) continue;
+    const at = parseServerTime(m.createdAt)?.getTime();
+    if (at !== undefined && at < turn.sentAtMs - TURN_CLOCK_SKEW_MS) continue;
+    own = i;
+    break;
+  }
+  return own >= 0 && stored.slice(own + 1).some((m) => m.role === 'assistant');
+}
+
+/** Poll cadence and give-up time for the fallback. */
+export const TURN_FALLBACK_POLL_MS = 3_000;
+export const TURN_FALLBACK_MAX_MS = 10 * 60_000;

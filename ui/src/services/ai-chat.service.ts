@@ -7,7 +7,18 @@ import {
 } from './johnny-api.service';
 import { AiSession } from '../models/ai-session.model';
 import { AiMessage } from '../models/ai-message.model';
-import { classifyDelta, draftAfterError, errorNoticeText, messagesAfterError } from './ai-chat-logic';
+import {
+  TURN_FALLBACK_MAX_MS,
+  TURN_FALLBACK_POLL_MS,
+  classifyDelta,
+  draftAfterError,
+  errorNoticeText,
+  messagesAfterError,
+  normalizeStoredMessages,
+  storedCount,
+  turnAnsweredInStore,
+  type PendingTurn,
+} from './ai-chat-logic';
 
 @Injectable({ providedIn: 'root' })
 export class AiChatService {
@@ -18,6 +29,15 @@ export class AiChatService {
   private streamingContent = '';
   /** The optimistic user bubble of the turn in flight (removed if the turn is refused). */
   private pendingUserMessageId: string | null = null;
+  /**
+   * Live-update fallback (bug 2). A subscription that errors (auth, socket) used to leave the reply
+   * at "working" until a reload. Once live is down, a turn in flight is settled by polling the
+   * stored messages instead.
+   */
+  private liveDown = false;
+  private pendingTurn: PendingTurn | null = null;
+  private turnStartedAt = 0;
+  private fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** The currently active session. */
   readonly currentSession = signal<AiSession | null>(null);
@@ -59,6 +79,7 @@ export class AiChatService {
     this.streamingContent = '';
     this.turnError.set(null);
     this.pendingUserMessageId = null;
+    this.liveDown = false;
     // A root singleton: another plan's (or an earlier visit's) refused draft must not reappear.
     this.restoredDraft.set(null);
 
@@ -105,6 +126,9 @@ export class AiChatService {
     // A new send supersedes any earlier restore (it was sent, so nothing to put back later).
     this.restoredDraft.set(null);
     this.pendingUserMessageId = optimisticMessage.id;
+    this.turnStartedAt = Date.now();
+    this.pendingTurn = { content, sentAtMs: this.turnStartedAt, baseline: storedCount(this.messages()) };
+    if (this.liveDown) this.startTurnFallback();
 
     this.api.sendRelayMessage({ sessionId: session.id, content }).subscribe({
       next: ({ relayId }) => {
@@ -135,6 +159,7 @@ export class AiChatService {
       next: (delta) => this.handleDelta(delta),
       error: (err) => {
         console.error('[AiChatService] Delta subscription error:', err);
+        this.onLiveError();
       },
     });
   }
@@ -151,8 +176,26 @@ export class AiChatService {
       next: (message) => this.handleNewMessage(message),
       error: (err) => {
         console.error('[AiChatService] Message subscription error:', err);
+        this.onLiveError();
       },
     });
+  }
+
+  /**
+   * Come back to the session already loaded (U-1-3): the page tore the subscriptions down when it
+   * was left, so re-subscribe to its messages and re-read the store. Any other id is a full load.
+   */
+  resumeSession(id: string): void {
+    if (this.currentSession()?.id !== id) {
+      this.loadSession(id);
+      return;
+    }
+    this.liveDown = false;
+    this.subscribeToMessages(id);
+    this.fetchMessages(id);
+    // A turn still in flight lost its delta feed when the page was left: settle it from the store
+    // (U-2-21), or the spinner stays until a reload. A live reply finishing first stops the poll.
+    if (this.isStreaming()) this.startTurnFallback();
   }
 
   /**
@@ -173,6 +216,46 @@ export class AiChatService {
     this.deltaSubscription = null;
     this.messageSubscription?.unsubscribe();
     this.messageSubscription = null;
+    this.stopTurnFallback();
+  }
+
+  /** A live subscription failed: from now on a turn in flight is settled from the store. */
+  private onLiveError(): void {
+    this.liveDown = true;
+    this.startTurnFallback();
+  }
+
+  private startTurnFallback(): void {
+    if (this.fallbackTimer || !this.isStreaming()) return;
+    this.fallbackTimer = setTimeout(() => this.fallbackTick(), TURN_FALLBACK_POLL_MS);
+  }
+
+  private stopTurnFallback(): void {
+    if (this.fallbackTimer) clearTimeout(this.fallbackTimer);
+    this.fallbackTimer = null;
+  }
+
+  private fallbackTick(): void {
+    this.fallbackTimer = null;
+    const id = this.currentSession()?.id;
+    if (!id || !this.isStreaming()) return;
+    if (Date.now() - this.turnStartedAt > TURN_FALLBACK_MAX_MS) {
+      this.finishStreaming();
+      return;
+    }
+    this.api.listMessages(id).subscribe({
+      next: (messages) => {
+        if (this.currentSession()?.id !== id || !this.isStreaming()) return;
+        const stored = normalizeStoredMessages(messages);
+        if (this.pendingTurn && turnAnsweredInStore(stored, this.pendingTurn)) {
+          this.messages.set(stored);
+          this.finishStreaming();
+        } else {
+          this.startTurnFallback();
+        }
+      },
+      error: () => this.startTurnFallback(),
+    });
   }
 
   // ── Private Helpers ───────────────────────────────────────────────────
@@ -180,7 +263,8 @@ export class AiChatService {
   private fetchMessages(sessionId: string): void {
     this.api.listMessages(sessionId).subscribe({
       next: (messages) => {
-        this.messages.set(messages);
+        // Stored rows carry zone-less UTC times; the live ones are ISO `Z`. One form for both.
+        this.messages.set(normalizeStoredMessages(messages));
       },
       error: (err) => {
         console.error('[AiChatService] Failed to fetch messages:', err);
@@ -269,6 +353,7 @@ export class AiChatService {
   }
 
   private finishStreaming(): void {
+    this.stopTurnFallback();
     this.pendingUserMessageId = null;
     this.isStreaming.set(false);
     this.streamingMessageId.set(null);

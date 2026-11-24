@@ -127,7 +127,7 @@ describe('page wiring (template/ts as text)', () => {
     expect(consoleBlock).toContain("@if (consoleRaw.kind === 'ended') {");
     expect(consoleBlock).toContain('{{ consoleRaw.note }}');
     expect(consoleBlock).toContain('[routerLink]="consoleRaw.transcriptLink">Open transcript</a>');
-    expect(HTML).toContain("} @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh)).kind === 'ended') {");
+    expect(HTML).toContain("} @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh)).kind === 'ended') {");
   });
 });
 

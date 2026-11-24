@@ -74,7 +74,7 @@
                       {{ shellRowState(s) === 'shell' ? 'shell' : shellRowState(s) === 'detached' ? 'detached' : 'attached tmux' }}
                     </span>
                   </div>
-                  <div class="sub">{{ formatRelTime((s.updatedAt || s.createdAt), nowIso()) }}</div>
+                  <div class="sub">{{ formatRelTime(toIsoUtc(s.updatedAt || s.createdAt), nowIso()) }}</div>
                 </div>
                 <div class="act">Open ▸</div>
                 <button type="button" class="ia" title="Rename shell" aria-label="Rename shell" [disabled]="busy()" (click)="renameOne(s); $event.stopPropagation()">✎</button>
@@ -82,6 +82,28 @@
               </div>
             }
           }
+        }
+      }
+
+      @if (planAgents().length > 0) {
+        <!-- Plan agents (bug 4): each runs in its own tmux pane (#77). View-only: no rename, no clear;
+             you talk to one in its plan's chat. Opening it shows its Transcript / Raw pane. -->
+        <div class="grouphdr">Plan agents</div>
+        <div class="grouphint">Talk to a plan agent in its plan's chat.</div>
+        @for (s of planAgents(); track s.id) {
+          <div class="row" role="link" tabindex="0" (click)="open(s)" (keydown.enter)="open(s)">
+            <div class="ic plan">
+              <ion-icon name="sparkles-outline"></ion-icon>
+            </div>
+            <div class="meta">
+              <div class="nm">
+                <span class="nm-t">{{ planAgentRowTitle(s) }}</span>
+                <span class="tag plan">view-only</span>
+              </div>
+              <div class="sub">{{ formatRelTime(toIsoUtc(s.updatedAt || s.createdAt), nowIso()) }}</div>
+            </div>
+            <div class="act">View ▸</div>
+          </div>
         }
       }
 

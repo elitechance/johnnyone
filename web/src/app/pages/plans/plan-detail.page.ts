@@ -34,6 +34,7 @@ import {
   arrowUpOutline,
   closeOutline,
   createOutline,
+  documentTextOutline,
   lockClosedOutline,
   searchOutline,
   trashOutline,
@@ -42,6 +43,7 @@ import {
   AiChatService,
   ChatWindowComponent,
   JohnnyApiService,
+  MarkdownViewComponent,
   StatusPillComponent,
   type AgentPlan,
   type BriefCheckItem,
@@ -56,6 +58,10 @@ import { BriefFieldComponent } from './components/brief-panel/brief-panel.compon
 import { OutlineRowComponent } from './components/outline-panel/outline-panel.component';
 import { VersionChipComponent } from './components/version-strip/version-strip.component';
 import {
+  CLOSED_PLAN_COPY,
+  closedPlanInitiativeLink,
+  frozenBanner,
+  LEGACY_BRIEF_NOTE,
   changedCounts,
   checkRows,
   detailState,
@@ -63,6 +69,7 @@ import {
   diffView,
   fieldRows,
   isFrozen,
+  legacyBriefMarkdown,
   outlineCards,
   startGate,
   summaryLine,
@@ -121,6 +128,7 @@ type Pane = 'chat' | 'brief' | 'outline';
     BriefFieldComponent,
     OutlineRowComponent,
     VersionChipComponent,
+    MarkdownViewComponent,
   ],
   templateUrl: './plan-detail.page.html',
   styleUrl: './plan-detail.page.scss',
@@ -162,6 +170,13 @@ export class PlanDetailPage implements OnInit, OnDestroy {
   // ── derived view models ──
   protected readonly state = computed(() => detailState(this.loading(), this.error(), this.plan()));
   protected readonly frozen = computed(() => this.state() === 'frozen' || isFrozen(this.latest()));
+  /** A pre-#76 plan's markdown brief, rendered read-only instead of empty fields (bug 6). */
+  protected readonly legacyBrief = computed(() => legacyBriefMarkdown(this.plan(), this.latest(), this.versions()));
+  protected readonly legacyNote = LEGACY_BRIEF_NOTE;
+  protected readonly closedCopy = CLOSED_PLAN_COPY;
+  protected readonly frozenBanner = frozenBanner;
+  /** A closed plan's reachable initiative (U-1-7); `null` hides "Open initiative". */
+  protected readonly closedInitiative = signal<string | null>(null);
   protected readonly rows = computed<FieldRow[]>(() => {
     const l = this.latest();
     return l ? fieldRows(l, this.versions(), this.now()) : [];
@@ -255,6 +270,7 @@ export class PlanDetailPage implements OnInit, OnDestroy {
       'arrow-up-outline': arrowUpOutline,
       'close-outline': closeOutline,
       'create-outline': createOutline,
+      'document-text-outline': documentTextOutline,
       'lock-closed-outline': lockClosedOutline,
       'search-outline': searchOutline,
       'trash-outline': trashOutline,
@@ -310,17 +326,30 @@ export class PlanDetailPage implements OnInit, OnDestroy {
     try {
       const run = await firstValueFrom(this.api.getAgentPlan(this.id()));
       this.plan.set(run.plan);
+      if (run.plan.status === 'closed') await this.resolveClosedInitiative(run.plan);
       if (run.plan.status !== 'closed') {
         await this.loadBrief(false);
         const sid = run.plan.briefingSessionId;
-        if (sid && this.chat.currentSession()?.id !== sid) this.chat.loadSession(sid);
-        else if (sid) this.chat.refreshMessages();
+        // Same session as last visit: re-subscribe too (leaving the page tore the live feed down, U-1-3).
+        if (sid) this.chat.resumeSession(sid);
       }
     } catch (err) {
       this.error.set(`Couldn't load this plan: ${message(err)}`);
     } finally {
       this.loading.set(false);
       this.syncPoll();
+    }
+  }
+
+  /** A closed plan links to its initiative only when that is another, still-open plan (U-1-7). */
+  private async resolveClosedInitiative(plan: AgentPlan): Promise<void> {
+    this.closedInitiative.set(null);
+    if (closedPlanInitiativeLink(plan, { id: plan.initiativeId ?? '', status: 'open' }) === null) return;
+    try {
+      const run = await firstValueFrom(this.api.getAgentPlan(plan.initiativeId!));
+      this.closedInitiative.set(closedPlanInitiativeLink(plan, run.plan));
+    } catch {
+      // Unknown → no link (never a dead end).
     }
   }
 

@@ -6,7 +6,7 @@
  * (`/shells/:id` Raw and the initiative console's Raw tab) render the same "Transcript only"
  * notice instead of a blank terminal.
  */
-import { jobEndedNotice } from '../shells/shells-page-logic';
+import { AGENT_JOB_ENDED_NOTE, jobEndedNotice } from '../shells/shells-page-logic';
 import { shellRoutePath } from '../shells/shells-route';
 import { rawAttachNeeded } from './console-tabs-logic';
 
@@ -34,14 +34,73 @@ export function isReadOnlyShell(s: { planAgent?: boolean | null; status?: string
   return s.planAgent === true || (!!s.status && s.status !== 'active');
 }
 
+/** Has this session ENDED (archived/closed)? Status only: a live plan agent is view-only, not ended. */
+export function isEndedSession(s: { status?: string | null } | null | undefined): boolean {
+  return !!s?.status && s.status !== 'active';
+}
+
+/**
+ * The "Transcript only" note for an ENDED session, or `null` while it is active. An ended plan agent
+ * says its job has ended (live UI bug 1: an archived plan agent's Raw pane was blank, because the
+ * archived-means-ended rule skipped plan agents and their pane is never requested, so no refusal
+ * ever arrived to fill it in).
+ */
+export function endedNote(s: { planAgent?: boolean | null; status?: string | null } | null | undefined): string | null {
+  if (!isEndedSession(s)) return null;
+  return s?.planAgent === true ? AGENT_JOB_ENDED_NOTE : ARCHIVED_SHELL_NOTE;
+}
+
+/** Does this shell get the watchdog chip? Not a read-only one (plan agent or ended) (bug 7). */
+export function showsWatchdog(s: { planAgent?: boolean | null; status?: string | null } | null | undefined): boolean {
+  return !!s && !isReadOnlyShell(s);
+}
+
 /** The view-only banner text for a read-only shell. */
 export function readOnlyNote(
   s: { planAgent?: boolean | null; status?: string | null } | null | undefined,
   planAgentNote: string,
   jobEnded: string | null,
 ): string {
-  if (s?.planAgent === true) return planAgentNote;
+  // A plan agent whose job has ended says so (not "talk to it in the chat", it no longer answers).
+  if (s?.planAgent === true) return jobEnded ?? endedNote(s) ?? planAgentNote;
   return jobEnded ?? ARCHIVED_SHELL_NOTE;
+}
+
+/** A job-ended refusal for a session this page is not showing YET (bug 1 ordering), kept briefly. */
+export interface HeldRefusal {
+  notice: string;
+  at: number;
+}
+
+/** How long a held refusal waits for its session to be shown; and how many are kept at most. */
+export const HELD_REFUSAL_TTL_MS = 60_000;
+const HELD_REFUSAL_MAX = 50;
+
+/**
+ * Hold a job-ended refusal that `rejectionForView` dropped because the page had not resolved the
+ * session yet (the ack can beat `getSession`). Anything else is left out. Never mutates.
+ */
+export function holdRefusal(
+  held: Readonly<Record<string, HeldRefusal>>,
+  ack: { sessionId?: string | null; accepted?: boolean | null; error?: string | null } | null | undefined,
+  now: number,
+): Record<string, HeldRefusal> {
+  const notice = ack && !ack.accepted ? jobEndedNotice(ack.error) : null;
+  if (!ack?.sessionId || !notice) return { ...held };
+  const fresh = Object.entries(held).filter(([, h]) => now - h.at <= HELD_REFUSAL_TTL_MS);
+  const next = Object.fromEntries(fresh.slice(-(HELD_REFUSAL_MAX - 1)));
+  next[ack.sessionId] = { notice, at: now };
+  return next;
+}
+
+/** The held notice for `sessionId` when it is still fresh, else `null`. */
+export function heldNotice(
+  held: Readonly<Record<string, HeldRefusal>>,
+  sessionId: string | null | undefined,
+  now: number,
+): string | null {
+  const h = sessionId ? held[sessionId] : undefined;
+  return h && now - h.at <= HELD_REFUSAL_TTL_MS ? h.notice : null;
 }
 
 /** Keep polling the console's primary pane? Not once the engine refused it (G-2-22). */
@@ -123,15 +182,59 @@ export function rawPaneView(
   hasScreen: boolean,
   notices: Readonly<Record<string, string>>,
   terminalError?: string | null,
-  ended?: boolean,
+  ended?: boolean | string | null,
 ): RawPaneView {
   const sid = (sessionId ?? '').trim();
   if (sid) {
     // A recorded refusal, or an ended (archived) session, wins over ANY screen: a screen here can
-    // only be a cached, non-live frame (a live one clears the notice) (G-2-24).
-    const recorded = notices[sid] ?? (ended ? ARCHIVED_SHELL_NOTE : null);
+    // only be a cached, non-live frame (a live one clears the notice) (G-2-24). `ended` may carry
+    // the note itself (`endedNote`), e.g. the job-ended text for a plan agent.
+    const endedText = typeof ended === 'string' ? ended : ended ? ARCHIVED_SHELL_NOTE : null;
+    const recorded = notices[sid] ?? endedText;
     const note = recorded ?? (hasScreen ? null : jobEndedNotice(terminalError));
     if (note) return { kind: 'ended', note, transcriptLink: shellRoutePath(sid, 'transcript') };
   }
   return rawAttachNeeded(sessionId, hasScreen) ? { kind: 'attach' } : { kind: 'screen' };
 }
+
+/**
+ * Apply the held refusals of the sessions now shown (`ids`: the /shells session and the console's
+ * primary one) as pane notices, each ONCE: an applied entry leaves `held`, so a later live frame that
+ * clears the notice never sees it come back. `null` when nothing applies (no signal writes).
+ */
+export function applyHeldRefusals(
+  notices: Readonly<Record<string, string>>,
+  held: Readonly<Record<string, HeldRefusal>>,
+  ids: ReadonlyArray<string | null | undefined>,
+  now: number,
+): { notices: Record<string, string>; held: Record<string, HeldRefusal> } | null {
+  let nextNotices: Record<string, string> = { ...notices };
+  const nextHeld: Record<string, HeldRefusal> = { ...held };
+  let applied = false;
+  for (const id of ids) {
+    const notice = heldNotice(nextHeld, id, now);
+    if (!id || !notice) continue;
+    nextNotices = withPaneNotice(nextNotices, id, notice);
+    delete nextHeld[id];
+    applied = true;
+  }
+  return applied ? { notices: nextNotices, held: nextHeld } : null;
+}
+
+/**
+ * Does the /shells body show the "job has ended" CARD (U-1-11)? Then the top bar must not repeat the
+ * same notice. The body renders Raw for any view but Transcript, except a Watchdog view on a shell
+ * that has one (a view-only shell's /watchdog renders Raw).
+ */
+export function rawEndedCardShown(
+  view: string,
+  viewOnly: boolean,
+  rawKind: RawPaneView['kind'] | null | undefined,
+): boolean {
+  if (view === 'transcript') return false;
+  if (view === 'watchdog' && !viewOnly) return false;
+  return rawKind === 'ended';
+}
+
+/** The ended card's sub-line (U-1-11). */
+export const ENDED_CARD_SUBCOPY = "It won't restart. The Transcript keeps what it did.";

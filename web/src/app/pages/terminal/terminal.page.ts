@@ -217,12 +217,19 @@ import {
   shellViewTogglePath,
 } from '../shells/shells-route';
 import {
+  ENDED_CARD_SUBCOPY,
+  applyHeldRefusals,
+  endedNote,
+  rawEndedCardShown,
+  holdRefusal,
+  type HeldRefusal,
   isReadOnlyShell,
   paneRefusalNotice,
   rawPaneView,
   readOnlyNote,
   rejectionForView,
   shouldPollPane,
+  showsWatchdog,
   surfacesAsTerminalError,
   transcriptRowsFromMessages,
   withoutPaneNotice,
@@ -393,6 +400,11 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
   private commandRejectionSubscription: Subscription | null = null;
   /** Per session: the "Transcript only" notice of a pane the engine refused to start (G-1-1). */
   protected readonly paneNotices = signal<Record<string, string>>({});
+  /** Job-ended refusals that arrived before their session was shown (bug 1 ordering). */
+  private readonly heldRefusals = signal<Record<string, HeldRefusal>>({});
+  protected readonly endedNote = endedNote;
+  protected readonly rawEndedCardShown = rawEndedCardShown;
+  protected readonly endedCardSubcopy = ENDED_CARD_SUBCOPY;
   protected readonly rawPaneView = rawPaneView;
   protected readonly isReadOnlyShell = isReadOnlyShell;
   protected readonly readOnlyNote = readOnlyNote;
@@ -827,7 +839,8 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
     nudgeSecsAgo: number;
   } {
     const sh = this.currentSession();
-    if (!sh) return null;
+    // A plan agent (or an ended session) is view-only and has no watchdog: no "Watchdog off ⚙" bar.
+    if (!sh || !showsWatchdog(sh)) return null;
     const now = Date.now();
     const pane = this.terminalScreens()[sh.id];
     const paneLastAt = pane ? (this.paneChangedAt.get(sh.id) ?? now) : now;
@@ -1810,6 +1823,22 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
         if (id === this.paErrorClearedFor) return;
         this.paErrorClearedFor = id;
         if (isPlanAgentShell(s)) untracked(() => this.terminalError.set(null));
+      },
+      { allowSignalWrites: true },
+    );
+
+    // A job-ended refusal that arrived before its session was shown becomes the pane's notice as
+    // soon as the session is (bug 1): the /shells session, or the console's primary session.
+    effect(
+      () => {
+        const ids = [this.currentSession()?.id, this.primarySessionId()];
+        const held = this.heldRefusals();
+        untracked(() => {
+          const next = applyHeldRefusals(this.paneNotices(), held, ids, Date.now());
+          if (!next) return;
+          this.paneNotices.set(next.notices);
+          this.heldRefusals.set(next.held);
+        });
       },
       { allowSignalWrites: true },
     );
@@ -3062,7 +3091,13 @@ export class TerminalPage implements OnInit, AfterViewInit, OnDestroy {
       { ...ack, accepted: false },
       [this.currentSession()?.id, this.primarySessionId()],
     );
-    if (!rejection) return;
+    if (!rejection) {
+      // The ack can beat `getSession` (the page has not resolved the session yet). A job-ended
+      // refusal is held briefly and applied once the session is shown, instead of being lost and
+      // leaving a blank pane (live UI bug 1).
+      this.heldRefusals.update((h) => holdRefusal(h, { ...ack, accepted: false }, Date.now()));
+      return;
+    }
     this.paneNotices.update((m) => withPaneNotice(m, rejection.sessionId, paneRefusalNotice(rejection.error)));
     // Only an open/type refusal is the terminal error; a refused resize/kill is noise (G-2-17).
     if (rejection.sessionId === this.currentSession()?.id && surfacesAsTerminalError(ack.kind)) {

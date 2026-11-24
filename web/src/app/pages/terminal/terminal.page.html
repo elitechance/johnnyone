@@ -163,7 +163,9 @@
       }
       <!-- In the layout flow (a wrapped second row of the bar), never over the pane's first lines. -->
       @let topJobEnded = (sh ? paneNotices()[sh.id] : null) || jobEndedNotice(terminalError());
-      @if (topViewOnly) {
+      <!-- When the body shows the "job has ended" card, the bar does not repeat it (U-1-11). -->
+      @let endedCard = rawEndedCardShown(shellView(), topViewOnly, sh ? rawPaneView(sh.id, !!terminalScreens()[sh.id], paneNotices(), terminalError(), endedNote(sh)).kind : null);
+      @if (topViewOnly && !endedCard) {
         <div class="ps-view-only" role="note">{{ readOnlyNote(sh, planAgentViewOnlyNote, topJobEnded) }}</div>
         @if (terminalError(); as termErr) {
           @if (!topJobEnded && isPlanAgentShell(sh)) {
@@ -172,7 +174,7 @@
         }
       }
       <!-- A finished worker/reviewer: the engine refuses to restart its pane (no blank screen). -->
-      @if (topJobEnded && !topViewOnly) {
+      @if (topJobEnded && !topViewOnly && !endedCard) {
         <div class="ps-view-only ps-job-ended" role="note">{{ topJobEnded }}</div>
       }
     </header>
@@ -523,11 +525,11 @@
             <div class="wd-footnote">{{ wdNudgeCount() }} sent@if (wdHeldCount() > 0) { · held {{ wdHeldCount() }}×} · {{ wdArmedAgo() }}. Every nudge is in the <b>Transcript</b> — there is no second log to read.</div>
           }
         </section>
-      } @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh)).kind === 'ended') {
-        @let shellRaw = rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), shViewOnly && !isPlanAgentShell(sh));
+      } @else if (sh && rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh)).kind === 'ended') {
+        @let shellRaw = rawPaneView(sh.id, !!shScreen, paneNotices(), terminalError(), endedNote(sh));
         <section class="workspace-empty job-ended" role="note">
           <div class="empty-title">{{ shellRaw.kind === 'ended' ? shellRaw.note : '' }}</div>
-          <div class="empty-copy">Its pane is not restarted. The Transcript keeps what it did.</div>
+          <div class="empty-copy">{{ endedCardSubcopy }}</div>
           <button type="button" class="ps-view" (click)="setShellView('transcript')">Open Transcript</button>
         </section>
       } @else if (sh) {
@@ -1009,7 +1011,7 @@
             <!-- A finished agent: the engine refuses to restart its pane (G-1-1). -->
             <section class="raw-attach job-ended" role="note">
               <div class="empty-title">{{ consoleRaw.note }}</div>
-              <div class="empty-copy">Its pane is not restarted. The Transcript keeps what it did.</div>
+              <div class="empty-copy">{{ endedCardSubcopy }}</div>
               <div class="raw-attach-actions">
                 <a class="primary-action" [routerLink]="consoleRaw.transcriptLink">Open transcript</a>
               </div>
