@@ -67,10 +67,22 @@
   &.tmux {
     color: var(--ion-color-primary, #5b9dff);
   }
+
+  &.plan {
+    color: var(--ion-color-tertiary, #b18cff);
+  }
 }
 
 .meta {
   min-width: 0;
+}
+
+// A plan agent's title can be long; at phone width it truncates instead of pushing the row wide.
+.nm-t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nm {
@@ -102,6 +114,13 @@
   &.tmux {
     background: color-mix(in srgb, var(--ion-color-primary, #5b9dff) 18%, transparent);
     color: var(--ion-color-primary, #5b9dff);
+  }
+
+  &.plan {
+    background: color-mix(in srgb, var(--ion-color-tertiary, #b18cff) 18%, transparent);
+    color: var(--ion-color-tertiary, #b18cff);
+    white-space: nowrap;
+    flex: none;
   }
 }
 

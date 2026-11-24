@@ -16,13 +16,15 @@ import {
   PopoverController,
 } from '@ionic/angular/standalone';
 import { addIcons } from 'ionicons';
-import { addOutline, terminalOutline, gitNetworkOutline, refreshOutline } from 'ionicons/icons';
-import { JohnnyApiService, type AiSession, type TmuxSession } from '@johnnyone/ui';
+import { addOutline, terminalOutline, gitNetworkOutline, refreshOutline, helpCircleOutline, sparklesOutline } from 'ionicons/icons';
+import { JohnnyApiService, toIsoUtc, type AiSession, type TmuxSession } from '@johnnyone/ui';
 import { firstValueFrom } from 'rxjs';
 import { LauncherMenuComponent } from '../../components/launcher-menu/launcher-menu.component';
 import { attachTmuxInput } from '../../components/launcher-menu/launcher-logic';
 import {
   partitionShells,
+  planAgentSessions,
+  planAgentRowTitle,
   attachableTmux,
   shellSessionLabel,
   shellRowState,
@@ -91,13 +93,20 @@ export class ShellsPage implements OnInit {
   protected readonly nowIso = signal(new Date().toISOString());
 
   protected readonly shells = computed(() => partitionShells(this.sessions()));
+  /** Active plan agents (bug 4): listed apart from the shells, view-only, never cleared. */
+  protected readonly planAgents = computed(() => planAgentSessions(this.sessions()));
   protected readonly attachable = computed(() => attachableTmux(this.tmux(), this.sessions()));
-  protected readonly isEmpty = computed(() => this.shells().length === 0 && this.attachable().length === 0);
+  protected readonly isEmpty = computed(
+    () => this.shells().length === 0 && this.planAgents().length === 0 && this.attachable().length === 0,
+  );
 
   // Expose the pure helpers to the template.
   protected readonly shellSessionLabel = shellSessionLabel;
   protected readonly shellRowState = shellRowState;
   protected readonly formatRelTime = formatRelTime;
+  protected readonly planAgentRowTitle = planAgentRowTitle;
+  /** Engine times are zone-less UTC; normalise before `formatRelTime` (same rule as the chat). */
+  protected readonly toIsoUtc = toIsoUtc;
 
   constructor() {
     // Row/badge glyphs — the popover self-registers the launcher icons, but this page renders its own.
@@ -106,6 +115,8 @@ export class ShellsPage implements OnInit {
       'terminal-outline': terminalOutline,
       'git-network-outline': gitNetworkOutline,
       'refresh-outline': refreshOutline,
+      'help-circle-outline': helpCircleOutline,
+      'sparkles-outline': sparklesOutline,
     });
   }
 

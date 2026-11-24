@@ -33,6 +33,25 @@ export function partitionShells(sessions: AiSession[]): AiSession[] {
 }
 
 /**
+ * The ACTIVE plan agents for the "Plan agents" group (live UI bug 4). A plan agent runs in its own
+ * tmux pane (#77) but is a `claude_code` session with `attachedTmux:false`, so `isShellSession`
+ * drops it and it was missing from /shells. It is listed separately, labelled view-only, and is
+ * never a Clear target (`clearTargetIds` still takes `shells()` only). Newest first.
+ */
+export function planAgentSessions(sessions: AiSession[]): AiSession[] {
+  const key = (s: AiSession): string => s.updatedAt ?? s.createdAt ?? '';
+  return sessions
+    .filter((s) => isPlanAgentShell(s) && !isShellSession(s) && (s.status ?? 'active') === 'active')
+    .sort((a, b) => key(b).localeCompare(key(a)));
+}
+
+/** A plan agent row's title: the session title without the engine's `Briefing - ` prefix. */
+export function planAgentRowTitle(s: Pick<AiSession, 'title'>): string {
+  const t = (s.title ?? '').trim().replace(/^Briefing\s*-\s*/i, '');
+  return t || 'Plan agent';
+}
+
+/**
  * External tmux panes that are **not already attached** by one of our sessions — so a pane you already
  * attached does not show up in both the "active shells" and "attachable" groups.
  *
