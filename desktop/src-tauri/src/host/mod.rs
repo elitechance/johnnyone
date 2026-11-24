@@ -1828,6 +1828,25 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn finding_mutation_override_withdraw_from_webview_and_refused_from_foreign_origin() {
+        let (state, _) = ledger_fixture("phase_review_running");
+        let id = ledger::report_finding(&state, test_seed::QA, ledger::Severity::Blocking, "c", "e", "s", "w", "f").unwrap();
+        test_seed::set_status(&state, "phase_worker_running");
+        ledger::dispute_finding(&state, test_seed::WORKER, &id, "wrong").unwrap();
+        let q = format!(
+            r#"mutation{{overrideFinding(planId:"{}",findingId:"{id}",action:WITHDRAW,reason:"qa lens removed")}}"#,
+            test_seed::PLAN
+        );
+        let v = send(&state, origin_post("http://localhost:3000", &q)).await;
+        assert!(first_error(&v).contains("JohnnyOne app itself"), "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "disputed");
+        let v = send(&state, origin_post("tauri://localhost", &q)).await;
+        assert_eq!(v["data"]["overrideFinding"], true, "{v}");
+        assert_eq!(ledger::get(&state, test_seed::PLAN, &id).unwrap().state, "withdrawn");
+        assert_eq!(test_seed::events_of(&state, "agent_finding_withdrawn")[0]["actor"], "human");
+    }
+
+    #[tokio::test]
     async fn attacker_cannot_redirect_worker_url_and_steal_the_relay_token() {
         let (state, _root) = test_state();
         let probe = state.clone();

@@ -22215,6 +22215,66 @@ Overall the work is complete and faithful to the brief.\n\nVERDICT: PASS";
         assert!(f.digests.lock().unwrap().is_empty(), "a pass that failed half-way is never announced");
     }
 
+    #[tokio::test]
+    async fn workflow_stream_lens_naming_a_claimed_id_keeps_the_new_objection() {
+        let f = fx();
+        let lenses = vec![lens("glm", "lokalai", true)];
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", "- the save drops where_"))], &lenses, &sink).await;
+        let id = f.rows()[0].id.clone();
+        f.claim(&id);
+        f.next_round();
+        let text = format!("- {id} is now fine; but the new endpoint leaks tokens");
+        f.conclude(vec![("glm", verdict("NEEDS_CHANGES", &text))], &lenses, &sink).await;
+        let rows = f.rows();
+        assert_eq!(ledger::get(&f.state, &f.id, &id).unwrap().state, "verified", "{rows:?}");
+        let new = rows.iter().find(|r| r.id != id).expect("the objection is imported");
+        assert_eq!((new.claim.as_str(), new.severity.as_str(), new.state.as_str()), (&text[2..], "blocking", "open"));
+    }
+
+    #[tokio::test]
+    async fn workflow_manual_pass_still_posts_to_discord() {
+        let f = fx();
+        pass_phase(&f.state, &f.id, "00-x", "Manual pass", "PASS").await.unwrap();
+        let pass = f.events("agent_phase_gate_result").last().unwrap().clone();
+        assert!(pass.get("digest").is_none(), "{pass}");
+        assert!(discord_message_for("agent_phase_gate_result", Some("00-x"), &pass).is_some());
+    }
+
+    #[tokio::test]
+    async fn workflow_round_cap_is_a_needs_you_digest() {
+        let f = fx();
+        let sink = Mutex::new(Vec::new());
+        f.typed(QA, "drops where_");
+        for r in 1..=MAX_REVISION_ROUNDS {
+            if r > 1 {
+                f.next_round();
+            }
+            f.conclude(vec![("qa", verdict("NEEDS_CHANGES", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        }
+        assert_eq!(f.plan_status(), "needs_attention");
+        let d = digests(&f);
+        assert!(d[d.len() - 2]["line"].as_str().unwrap().ends_with("→ needs changes"));
+        let last = d.last().unwrap();
+        assert!(last["line"].as_str().unwrap().ends_with("⚠ needs you"), "{last}");
+        let posted = f.digests.lock().unwrap().last().unwrap().clone();
+        assert!(posted.contains("still not passing after 6 review rounds"), "the reason rides in the post: {posted}");
+        assert_eq!(f.events("agent_phase_needs_attention").last().unwrap()["digest"], true);
+    }
+
+    #[tokio::test]
+    async fn workflow_parked_kloo_review_is_a_needs_you_digest() {
+        let f = fx();
+        std::fs::write(f.plan.join("phases/00-x/tasks/01-a/task.yml"), "id: 01-a\n").unwrap();
+        let sink = Mutex::new(Vec::new());
+        f.conclude(vec![("qa", verdict("BLOCKED", "")), ("pr", verdict("PASS", ""))], &qa_pr(), &sink).await;
+        assert_eq!(f.plan_status(), "needs_attention");
+        let last = digests(&f).last().unwrap().clone();
+        assert!(last["line"].as_str().unwrap().ends_with("⚠ needs you"), "{last}");
+        let na = f.events("agent_phase_needs_attention").last().unwrap().clone();
+        assert_eq!((na["reason"].as_str(), na["digest"].as_bool()), (Some("kloo_review"), Some(true)));
+    }
+
     #[test]
     fn workflow_needs_attention_from_other_paths_still_posts() {
         assert!(discord_message_for("agent_phase_needs_attention", Some("00-x"), &json!({ "reason": "task_failed" })).is_some());

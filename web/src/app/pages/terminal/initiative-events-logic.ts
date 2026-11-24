@@ -46,7 +46,8 @@ const MILESTONE_TYPES = new Set<string>([
   'agent_phase_task_failed',
   'planning_check_failed',
   'agent_phase_preflight_failed',
-  // One code-built line per phase review round (open → open, verified, disputed, red-first).
+  // One code-built line per phase review round: `<plan> · phase N/M (slug) rR: open → open · this round's
+  // verified / disputes ruled · follow-ups · red-first n/m <outcome>` (→ needs changes / ✅ passed / ⚠ needs you).
   'agent_review_round_digest',
 ]);
 
